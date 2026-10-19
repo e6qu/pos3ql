@@ -223,11 +223,12 @@ impl<'arena> DmlRowImages<'arena> {
             })
     }
 
-    fn finish(mut self) -> Self {
+    fn finish(mut self) -> Result<Self, SqlError> {
         self.rows
             .as_mut_slice()
+            .map_err(|_| arena_full())?
             .sort_unstable_by_key(|row| (row.table, row.rowid));
-        self
+        Ok(self)
     }
 
     pub(super) fn bytes(&self, table: usize, rowid: u64) -> Result<&'arena [u8], SqlError> {
@@ -20709,9 +20710,18 @@ impl PlpgsqlExecHost<'_> {
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
-                engine.commit_txn_with_triggers(txn, guc, arena, responder)?;
-                cursors.on_commit();
+                // The procedure stack cannot be replayed after transaction
+                // control. Drain this explicit boundary, promoting all earlier
+                // commits in log order before continuing the same invocation.
+                match engine.commit_txn_with_triggers(txn, guc, arena, responder) {
+                    Err(error)
+                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            && txn.staged_commit().is_some() => {}
+                    result => result?,
+                }
                 engine.commit_wal()?;
+                engine.finish_staged_transaction(txn, guc)?;
+                cursors.on_commit();
                 next
             }
             PlpgsqlTransactionCommand::Rollback(next) => {
@@ -22825,7 +22835,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         responder.command_complete("SET")?;
                         Ok(Ok(()))
                     } else {
-                        match super::apply_current_transaction_setting(txn, *characteristics) {
+                        match super::apply_current_transaction_setting(&engine.storage, txn, *characteristics) {
                             Ok(()) => {
                                 responder.command_complete("SET")?;
                                 Ok(Ok(()))
@@ -22852,7 +22862,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         Err(error) => Ok(Err(error)),
                     }
                 }
-                Stmt::Checkpoint => engine.execute_checkpoint_statement(responder),
+                Stmt::Checkpoint => engine.execute_checkpoint_statement(txn, responder),
                 Stmt::Vacuum { targets, options } => {
                     engine.execute_vacuum_statement(targets, *options, txn, responder)
                 }
@@ -59660,51 +59670,15 @@ where
                     },
                     None => sel,
                 };
-                let mut count = 0usize;
-                let invocation_cursor = super::query::active_routine_invocations()
-                    .map(|(invocations, _)| invocations.cursor());
-                {
-                    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-                    if let Err(e) = super::query::select_into_rows_recycling(
-                        storage,
-                        txn.txid,
-                        sel,
-                        arena,
-                        params,
-                        None,
-                        Some(&dry),
-                        &mut |_| {
-                            count += 1;
-                            Ok(())
-                        },
-                    ) {
-                        return sql_fail(e);
-                    }
-                }
-                if let Some((invocations, _)) = super::query::active_routine_invocations()
-                    && let Some(cursor) = invocation_cursor
-                {
-                    invocations.restore_cursor(cursor);
-                }
-                let empty: &[u8] = &[];
-                let rows: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
-                    Ok(rows) => rows,
-                    Err(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "INSERT ... SELECT result exceeds the statement arena"
-                        ));
-                    }
-                };
-                let mut at = 0usize;
+                let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
                 let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
-                    rows[at] = encode_projected_pub(vals, arena)?;
-                    at += 1;
+                    let encoded = encode_projected_persistent_pub(vals, arena)?;
+                    rows.push(encoded).map_err(|_| super::eval::arena_full())?;
                     Ok(())
                 };
                 {
                     let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    if let Err(e) = super::query::select_into_rows(
+                    if let Err(e) = super::query::select_into_rows_recycling(
                         storage,
                         txn.txid,
                         sel,
@@ -59717,7 +59691,7 @@ where
                         return sql_fail(e);
                     }
                 }
-                (&*rows, count)
+                (rows.as_slice(), rows.len())
             };
 
         let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
@@ -68830,7 +68804,7 @@ pub(super) fn collect_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
         super::query::dml_indexed_candidates(
@@ -68921,7 +68895,7 @@ pub(super) fn collect_matches<'a>(
     // map is hash-addressed, so restore the monotonic row identity assigned
     // when the heap image was first appended before locks and writes begin.
     scratch.sort_unstable_by_key(|row| row.sort_key());
-    Ok(images.finish())
+    images.finish()
 }
 
 /// Collects target rows that join at least one row of the extra `from` tables
@@ -69003,7 +68977,7 @@ fn collect_join_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
@@ -69082,7 +69056,7 @@ fn collect_join_matches<'a>(
             },
         )?;
     }
-    Ok(images.finish())
+    images.finish()
 }
 
 /// Trigger-program variant of `collect_join_matches`. Its transition source
@@ -69169,7 +69143,7 @@ fn collect_join_matches_with_transition<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
@@ -69250,7 +69224,7 @@ fn collect_join_matches_with_transition<'a>(
             },
         )?;
     }
-    Ok(images.finish())
+    images.finish()
 }
 
 fn store_row(

@@ -1,22 +1,23 @@
 # Blocked defects
 
-This file records defects whose repair is prevented by an external blocker
-or genuine intractability. Fixable defects must be fixed in the change that
-finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
+Record only defects whose repair is prevented by an external blocker or genuine
+intractability. Fix every fixable defect in the PR that finds it. Planned work
+and incomplete architecture belong in [PLAN.md](PLAN.md).
 
-No externally blocked defects are currently recorded. Remaining work, including
-complete type publication, bounded heap capture/remapping and cleanup walks,
-checkpoint coordination, object deletion and execution workers, belongs in PLAN.md.
-Completed contracts, accepted storage formats and explicit type limits belong
-in their owning technical guides. Startup checks checkpoint and commit record
-formats, writer identities and allocator counters before changing writer
-ownership. Statement and transaction completion schedule history cleanup;
-bounded passes must preserve active readers, skipped work and later releases.
-Unsupported older pos3ql versions are not defects.
+No externally blocked defects are currently recorded. Fixable failures stay in
+the PR that finds them. The [current plan](PLAN.md) identifies the remaining
+storage implementation and qualification work. Passing focused tests does not
+qualify an unfinished implementation for merging. Qualification includes compiled
+regressions, delayed-publication recovery, control-request fairness, credential permissions, descriptor reuse, merge retry
+layouts, completed merge retention through earlier cleanup, retained read-completion
+wakeups, one-time function and sequence effects
+across cold reads, saved query results and sorting, immutable arena-list snapshots,
+accurate build identities, and complete
+workflows on the final head.
 
-For a new entry, include a reproducer, affected boundary, observed behavior,
-and the specific blocker that prevents a fix. Remove it when repaired; preserve
-provenance in the implementing change rather than adding a resolved-work journal.
+For an entry, include a reproducer, affected boundary, observed behavior and
+the specific blocker. Remove repaired entries; preserve provenance in their
+implementing changes instead of keeping a resolved-work journal.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -1,14 +1,13 @@
 //! Server-side TLS for the PostgreSQL wire protocol.
 //!
 //! rustls is the one whitelisted dependency (TLS is never hand-rolled); this
-//! module and [`crate::object_store::http::tls`] are its only doors. The [`rustls::ServerConfig`]
+//! module and [`crate::object_store::tls`] are its only doors. The [`rustls::ServerConfig`]
 //! is built at startup, before the allocator freezes; every *runtime* rustls
 //! call — session construction, the handshake pump, record I/O, teardown — runs
 //! inside [`crate::mem::guard::tls_scope`], so its allocations are charged
 //! against `tls_pool_bytes` and abort loudly past it.
 //!
-//! Unlike the blocking object-store client ([`crate::object_store::http::tls`] wraps `StreamOwned`), the
-//! server socket is non-blocking and driven by the kqueue reactor, so this uses
+//! The nonblocking server socket follows reactor readiness, using
 //! the low-level `read_tls`/`process_new_packets`/`write_tls` API and translates
 //! rustls's read/write wants into the reactor's read/write interest.
 
@@ -21,8 +20,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::mem::guard;
 
 /// Budget headroom to reserve per concurrent server-side TLS session (rustls
-/// record buffers plus handshake state); the `tls_pool_bytes` pool is grown by
-/// `max_connections` of these when server TLS is on.
+/// record buffers plus handshake state). Startup reserves `max_connections`
+/// of these when server TLS is enabled.
 pub const SERVER_SESSION_BYTES: usize = 128 * 1024;
 
 /// Builds the server TLS configuration from a certificate chain and a private
@@ -77,7 +76,13 @@ impl ServerSession {
     pub fn new(config: &Arc<rustls::ServerConfig>) -> std::io::Result<Self> {
         let inner =
             guard::tls_scope(|| rustls::ServerConnection::new(config.clone()).map(Box::new))
-                .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
+                .map_err(|error| {
+                    crate::object_store::tls::protocol_error(
+                        "tls_server_session",
+                        std::io::ErrorKind::InvalidInput,
+                        error,
+                    )
+                })?;
         Ok(Self { inner: Some(inner) })
     }
 
@@ -156,9 +161,13 @@ impl ServerSession {
                 match session.read_tls(socket) {
                     Ok(0) => break, // socket EOF; deliver any buffered plaintext below
                     Ok(_) => {
-                        session
-                            .process_new_packets()
-                            .map_err(|e| std::io::Error::other(format!("tls: {e}")))?;
+                        session.process_new_packets().map_err(|error| {
+                            crate::object_store::tls::protocol_error(
+                                "tls_server_records",
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            )
+                        })?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -228,5 +237,24 @@ impl Drop for ServerSession {
         // Free rustls's buffers inside a scope so the guard credits the pool
         // (a free outside a scope is not credited, and would leak tls_pool_bytes).
         guard::tls_scope(|| drop(self.inner.take()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_object_tls_server_setup_error_is_allocation_free() {
+        let mut config = build_server_config(
+            "tests/data/tls-test-cert.pem",
+            "tests/data/tls-test-key.pem",
+        )
+        .unwrap();
+        Arc::get_mut(&mut config).unwrap().max_fragment_size = Some(1);
+        let error = crate::mem::guard::forbid_alloc(|| ServerSession::new(&config))
+            .err()
+            .expect("invalid record size must reject session setup");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

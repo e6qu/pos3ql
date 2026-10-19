@@ -4,11 +4,20 @@ use super::row_ownership::{acquire, try_mutex};
 use super::*;
 
 impl Storage {
+    /// Retain before scanning row metadata. Row publication observes this owner
+    /// under the same row lock, so a deletion cannot disappear after capture.
+    pub(crate) fn retain_checkpoint_deletions(&self, slot: usize) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.tables[slot].checkpoint_deletions)
+    }
+
     /// Publication still owns storage exclusively until every saved-file list
     /// is installed; only then may unneeded deletion markers disappear.
-    pub(crate) fn clear_tombstones(&mut self, slot: usize) {
+    pub(crate) fn clear_tombstones(&mut self, slot: usize, through_lsn: u64) {
         self.tables[slot].rows.write().retain(|_, state| {
-            state.committed.is_some() || !state.history.is_empty() || state.pending.is_some()
+            state.committed.is_some()
+                || state.committed_lsn > through_lsn
+                || !state.history.is_empty()
+                || state.pending.is_some()
         });
     }
 
@@ -377,8 +386,15 @@ mod tests {
                     .insert((DELETED + index) as u64, *state)
                     .unwrap();
             }
-            storage.clear_tombstones(table);
-            assert_eq!(storage.tables[table].rows.len(), retained.len());
+            let mut later_delete = deleted;
+            later_delete.committed_lsn = 8;
+            later_delete.checkpoint_change_lsn = 8;
+            storage.tables[table]
+                .rows
+                .insert((DELETED + retained.len()) as u64, later_delete)
+                .unwrap();
+            storage.clear_tombstones(table, 7);
+            assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
             for rowid in 0..DELETED {
                 assert!(storage.tables[table].rows.get(&(rowid as u64)).is_none());
             }
@@ -388,7 +404,15 @@ mod tests {
                     Some(*state)
                 );
             }
-            storage.clear_tombstones(table);
+            storage.clear_tombstones(table, 7);
+            assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
+            assert_eq!(
+                storage.tables[table]
+                    .rows
+                    .get(&((DELETED + retained.len()) as u64)),
+                Some(later_delete)
+            );
+            storage.clear_tombstones(table, 8);
             assert_eq!(storage.tables[table].rows.len(), retained.len());
         });
     }

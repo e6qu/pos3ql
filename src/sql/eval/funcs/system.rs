@@ -1347,7 +1347,8 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Text(concat!(
                     "PostgreSQL 18.4 (pos3ql ",
                     env!("CARGO_PKG_VERSION"),
-                    ") on aarch64-apple-darwin"
+                    ") on ",
+                    env!("POS3QL_BUILD_TARGET")
                 )))
             }
             "pg_input_is_valid" => {

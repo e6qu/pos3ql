@@ -113,7 +113,7 @@ impl ValueIndexWriter {
         }
     }
 
-    pub(crate) fn budget_bytes() -> usize {
+    pub(crate) const fn budget_bytes() -> usize {
         MAX_PAYLOAD + BLOCK_FILTER_BYTES + MAX_PAYLOAD + NavigationWriter::budget_bytes()
     }
 
@@ -146,9 +146,9 @@ impl ValueIndexWriter {
             .reset(position, covering, kind == NavigationKind::Posting);
     }
 
-    pub(crate) fn append_navigation(
+    pub(crate) fn append_navigation<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         identity: (u64, u64, u64),
         key: &[u8],
         payload: Option<&[u8]>,
@@ -163,9 +163,9 @@ impl ValueIndexWriter {
         Ok(())
     }
 
-    pub(crate) fn append(
+    pub(crate) fn append<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         hash: u64,
         rowid: u64,
         commit_lsn: u64,
@@ -175,9 +175,9 @@ impl ValueIndexWriter {
         self.append_inner(store, (hash, rowid, commit_lsn), key, None, compare)
     }
 
-    pub(crate) fn append_covering(
+    pub(crate) fn append_covering<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         identity: (u64, u64, u64),
         key: &[u8],
         payload: &[u8],
@@ -186,9 +186,9 @@ impl ValueIndexWriter {
         self.append_inner(store, identity, key, Some(payload), compare)
     }
 
-    fn append_inner(
+    fn append_inner<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         identity: (u64, u64, u64),
         key: &[u8],
         payload: Option<&[u8]>,
@@ -249,11 +249,14 @@ impl ValueIndexWriter {
         Ok(())
     }
 
-    fn flush(&mut self, store: &mut dyn BlockStore) -> Result<(), ValueIndexError> {
+    fn flush<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), ValueIndexError> {
         if self.pending_len == 0 {
             return Ok(());
         }
-        let id = store.put(
+        let id = store.write_block(
             &self.pending[..self.pending_len],
             BlockType::ValueIndexData,
             0,
@@ -312,7 +315,10 @@ impl ValueIndexWriter {
     /// Publishes one immutable roster node pointing at the previously written
     /// node. Only one node's identities stay resident, so generation size is
     /// not bounded by a single roster block.
-    fn flush_roster(&mut self, store: &mut dyn BlockStore) -> Result<(), ValueIndexError> {
+    fn flush_roster<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), ValueIndexError> {
         let count = u32::try_from(self.block_count).map_err(|_| ValueIndexError::Corrupt)?;
         self.roster[..4].copy_from_slice(
             &(count
@@ -336,7 +342,7 @@ impl ValueIndexWriter {
         // break write-idempotency for an identical rebuilt index. The lsn is
         // vestigial in the block (never read back); `published_lsn` rides the
         // handle into the manifest instead.
-        self.roster_tail = Some(store.put(
+        self.roster_tail = Some(store.write_block(
             &self.roster[..self.roster_len],
             BlockType::ValueIndexRoster,
             0,
@@ -346,9 +352,9 @@ impl ValueIndexWriter {
         Ok(())
     }
 
-    pub(crate) fn finish(
+    pub(crate) fn finish<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         published_lsn: u64,
     ) -> Result<Option<ValueIndexHandle>, ValueIndexError> {
         self.flush(store)?;

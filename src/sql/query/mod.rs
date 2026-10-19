@@ -541,6 +541,49 @@ pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationS
     })
 }
 
+thread_local! {
+    static ACTIVE_READ_EFFECTS: Cell<Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>> = const { Cell::new(None) };
+}
+
+pub(crate) struct StatementReadEffectScope<'a> {
+    previous: Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>,
+    _reads: Option<&'a crate::checkpoint::AtomicBlockReadScope>,
+}
+
+impl Drop for StatementReadEffectScope<'_> {
+    fn drop(&mut self) {
+        ACTIVE_READ_EFFECTS.with(|active| active.set(self.previous));
+    }
+}
+
+pub(crate) fn enter_statement_read_effect_scope(
+    reads: Option<&crate::checkpoint::AtomicBlockReadScope>,
+) -> StatementReadEffectScope<'_> {
+    let previous = ACTIVE_READ_EFFECTS.with(|active| {
+        let previous = active.get();
+        if let Some(reads) = reads {
+            active.set(Some(core::ptr::NonNull::from(reads)));
+        }
+        previous
+    });
+    StatementReadEffectScope {
+        previous,
+        _reads: reads,
+    }
+}
+
+/// A statement can yield before its first effect. After an effect starts,
+/// remaining reads use the atomic client until that whole statement ends.
+pub(crate) fn protect_statement_effects() {
+    ACTIVE_READ_EFFECTS.with(|active| {
+        if let Some(reads) = active.get() {
+            // The scope's borrow pins this stack value through every nested
+            // executor call; dropping the scope restores the enclosing pointer.
+            unsafe { reads.as_ref() }.activate();
+        }
+    });
+}
+
 impl<'a> RoutineInvocationState<'a> {
     pub(crate) fn new(arena: &'a Arena) -> Self {
         Self {
@@ -554,14 +597,6 @@ impl<'a> RoutineInvocationState<'a> {
     pub(crate) fn begin_attempt(&self) {
         self.next.set(0);
         self.pending.set(None);
-    }
-
-    pub(crate) fn cursor(&self) -> usize {
-        self.next.get()
-    }
-
-    pub(crate) fn restore_cursor(&self, cursor: usize) {
-        self.next.set(cursor);
     }
 
     pub(crate) fn resolve<'query>(
@@ -2834,20 +2869,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
     }
 
-    fn routine_invocation_cursor(&self) -> Option<usize> {
-        self.invocations
-            .map(RoutineInvocationState::cursor)
-            .or_else(|| active_routine_invocations().map(|(state, _)| state.cursor()))
-    }
-
-    fn restore_routine_invocation_cursor(&self, cursor: usize) {
-        if let Some(invocations) = self.invocations {
-            invocations.restore_cursor(cursor);
-        } else if let Some((invocations, _)) = active_routine_invocations() {
-            invocations.restore_cursor(cursor);
-        }
-    }
-
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
@@ -4610,6 +4631,89 @@ pub(super) fn resolve_order_target<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     resolve_position_target(expression, items, Some(scope), arena, "ORDER BY")
+}
+
+#[derive(Clone, Copy)]
+enum SortKeySource {
+    Projection(usize),
+    EarlierKey(usize),
+    Expression,
+}
+
+/// A sort key retains the output slot selected by an alias or position.
+/// Equal expressions in two output slots can have different volatile values.
+#[derive(Clone, Copy)]
+pub(super) struct ResolvedSortKey<'a> {
+    expression: &'a Expr<'a>,
+    source: SortKeySource,
+}
+
+impl<'a> ResolvedSortKey<'a> {
+    pub(super) fn value(
+        self,
+        projected: &[Datum<'a>],
+        earlier: &[Datum<'a>],
+        evaluate: impl FnOnce(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+    ) -> Result<Datum<'a>, SqlError> {
+        match self.source {
+            SortKeySource::Projection(index) => Ok(projected[index]),
+            SortKeySource::EarlierKey(index) => Ok(earlier[index]),
+            SortKeySource::Expression => evaluate(self.expression),
+        }
+    }
+}
+
+pub(super) fn resolve_sort_key<'a>(
+    original: &'a Expr<'a>,
+    items: &'a [SelectItem<'a>],
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    earlier: &[Option<ResolvedSortKey<'a>>],
+) -> Result<ResolvedSortKey<'a>, SqlError> {
+    let expression = resolve_order_target(original, items, scope, arena)?;
+    let source = if let Expr::Int(position) = original {
+        // Resolution above checked this against the expanded output width.
+        SortKeySource::Projection(*position as usize - 1)
+    } else {
+        let mut index = 0;
+        let mut equal_output = None;
+        let mut named_output = None;
+        for item in items {
+            match item {
+                SelectItem::Expr {
+                    expression: output,
+                    alias,
+                } => {
+                    if matches!(original, Expr::Column { qualifier: None, name }
+                        if *name == alias.unwrap_or(super::exec::derived_name(output)))
+                    {
+                        named_output = Some(index);
+                        break;
+                    }
+                    if equal_output.is_none() && **output == *expression {
+                        equal_output = Some(index);
+                    }
+                    index += 1;
+                }
+                SelectItem::Wildcard => index += scope.star_columns(),
+                SelectItem::TableWildcard(qualifier) => {
+                    index += scope.qualified_star_columns(qualifier)?;
+                }
+                SelectItem::RecordStar(base) => index += record_star_width(base, scope),
+            }
+        }
+        if let Some(index) = named_output.or(equal_output) {
+            SortKeySource::Projection(index)
+        } else if let Some(index) = earlier
+            .iter()
+            .position(|key| key.is_some_and(|key| *key.expression == *expression))
+        {
+            SortKeySource::EarlierKey(index)
+        } else {
+            SortKeySource::Expression
+        }
+    };
+    Ok(ResolvedSortKey { expression, source })
 }
 
 /// An `ORDER BY` / `GROUP BY` target: a bare integer is a 1-based position in

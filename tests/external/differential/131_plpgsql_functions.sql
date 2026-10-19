@@ -632,3 +632,117 @@ DROP ROLE plpgsql_dynamic_admin_owner;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;
+
+-- A read after a function returns must not repeat its session effects.
+CREATE TABLE replay_effect_rows(value integer PRIMARY KEY);
+INSERT INTO replay_effect_rows VALUES (10), (20);
+CREATE SEQUENCE replay_effect_sequence;
+CREATE FUNCTION replay_effect_prepare() RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'PREPARE replay_effect_plan(integer) AS SELECT $1 + 1';
+  RETURN 1;
+END
+$$;
+WITH effect AS MATERIALIZED (SELECT replay_effect_prepare() AS n)
+SELECT n, (SELECT sum(value) FROM replay_effect_rows WHERE value >= effect.n)
+FROM effect;
+EXECUTE replay_effect_plan(41);
+WITH effect AS MATERIALIZED (SELECT nextval('replay_effect_sequence') AS n)
+SELECT n + (SELECT sum(value) FROM replay_effect_rows WHERE value >= effect.n)
+FROM effect;
+SELECT currval('replay_effect_sequence');
+DEALLOCATE replay_effect_plan;
+DROP FUNCTION replay_effect_prepare();
+DROP SEQUENCE replay_effect_sequence;
+DROP TABLE replay_effect_rows;
+
+
+-- Saving and sorting query results evaluates each session change once.
+SET application_name = 'seed';
+WITH effect AS MATERIALIZED (
+  SELECT set_config('application_name', current_setting('application_name') || '-once', false) AS label
+)
+SELECT label, current_setting('application_name') FROM effect;
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+RESET application_name;
+
+
+-- INSERT SELECT saves source rows once before writing the destination.
+CREATE TABLE saved_effect_rows(label text);
+SET application_name = 'i';
+INSERT INTO saved_effect_rows
+SELECT set_config('application_name', current_setting('application_name') || 'x', false)
+FROM generate_series(1, 3) AS g(i);
+SELECT label FROM saved_effect_rows ORDER BY label;
+SELECT current_setting('application_name');
+DROP TABLE saved_effect_rows;
+
+-- Scalar and record subqueries do not repeat projections or filters to size a result.
+SET application_name = 'g';
+SELECT 'gx' IN (
+  SELECT set_config('application_name', current_setting('application_name') || 'x', false)
+  FROM generate_series(1, 2) AS g(i) GROUP BY i
+);
+SELECT current_setting('application_name');
+SET application_name = 'r';
+SELECT ('rx', 1) IN (
+  SELECT set_config('application_name', current_setting('application_name') || 'x', false), i
+  FROM generate_series(1, 2) AS g(i)
+);
+SELECT current_setting('application_name');
+SET application_name = 'p';
+SELECT 'px' IN (
+  SELECT 'px' FROM generate_series(1, 2) AS g(i)
+  WHERE set_config('application_name', current_setting('application_name') || 'x', false) IS NOT NULL
+);
+SELECT current_setting('application_name');
+RESET application_name;
+
+
+-- A sort key reuses its selected output slot in every projection route.
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) GROUP BY i ORDER BY label;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label,
+       row_number() OVER (ORDER BY i) AS ordinal
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT g.*, set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY 2;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT (ROW(i, i + 10)).*,
+       set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY 3;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT i FROM generate_series(1, 3) AS g(i)
+ORDER BY set_config('application_name', current_setting('application_name') || 'x', false),
+         set_config('application_name', current_setting('application_name') || 'x', false);
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT DISTINCT ON (set_config('application_name', current_setting('application_name') || 'x', false))
+       set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+RESET application_name;
+
+CREATE SEQUENCE sort_identity;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY b, a;
+SELECT currval('sort_identity');
+ALTER SEQUENCE sort_identity RESTART WITH 1;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY 2, 1;
+SELECT currval('sort_identity');
+ALTER SEQUENCE sort_identity RESTART WITH 1;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY nextval('sort_identity') % 3, b;
+SELECT currval('sort_identity');
+DROP SEQUENCE sort_identity;

@@ -12,15 +12,16 @@ errors, and client behavior with actual PostgreSQL 18. There are still
 [compatibility limits](docs/postgresql-18-compatibility.md); the PostgreSQL
 name alone is not a promise that every feature or extension works.
 
-**Queries still execute one at a time in each server process.** The recent
-work protects data that a reader still needs while other work changes it.
-That is preparation for concurrent execution. We have not yet enabled several
-queries to execute together or demonstrated production performance and failover
-on separate machines.
+**SQL uses one CPU worker per server process.** Object-store requests can overlap:
+independent reads have separate request slots, and transactions can share a
+durable log upload while other connections continue. This does not run one SQL
+query on several CPU workers. Production performance and failover on separate
+machines still need qualification.
 
-For example, you can connect with `psql`, save a row, and recover it from object
-storage after losing both local caches. We still need to show that a slow report
-fetching uncached data lets another customer update an unrelated order promptly.
+For example, a cached invoice can be read while another connection waits for
+storage. A successful order commit must survive loss of both local caches.
+The [plan](PLAN.md) lists the remaining implementation and evidence required
+for final qualification and the later execution and deployment work.
 
 See [what works today](docs/implemented-baseline.md) and the
 [remaining plan](PLAN.md) for the details and the evidence still needed.
@@ -64,6 +65,23 @@ In durable mode, transactions can share an upload and commit-record update.
 Each success response waits for that work. Checkpoints organize saved data for
 recovery and later reads. [Object storage](docs/object-storage.md) and
 [durable formats](docs/durable-format.md) explain the failure and upgrade rules.
+
+## Choose how transactions share data
+
+Every configuration must select `transaction_mode = mvcc` or
+`transaction_mode = locking`; the server requires `--config`.
+
+- `mvcc` retains older row values while readers need them. For example, a
+  repeatable-read report can keep seeing an order's earlier status while
+  another transaction changes it.
+- `locking` keeps current committed row values. Conflicting work waits on
+  relation locks; work on unrelated tables can continue. This mode supports
+  read committed, including PostgreSQL's equivalent read uncommitted mode.
+  Repeatable read, serializable and exported snapshots return `0A000`
+  because their guarantees require retained versions.
+
+The mode is fixed for the server's lifetime. Uncommitted changes and savepoint
+undo remain private in both modes; disabling MVCC does not disable rollback.
 
 ## Getting started
 

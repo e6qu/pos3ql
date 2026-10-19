@@ -52,10 +52,14 @@ fail explicitly. Responses disable caching and close the connection.
 
 In durable mode, `/readyz` and `/metrics` read and validate the writer fence.
 This detects a displaced idle process before it can continue serving routed
-reads. The request uses the existing fixed object client and allocates no
-runtime memory, but it can wait on object-store latency. `/livez` remains a
-local event-loop probe for separating process failure from durable-tier
-failure. Readiness also turns false when commit publication or remote checkpoint work
+reads. One separate client and each waiting request's receipt are reserved at
+startup. Concurrent checks can share an unfinished read; each keeps its result,
+and a new check never consumes cached readiness. Slow storage delays those
+responses while cached SQL queries, `/livez` and `/capacity` continue.
+For example, a report can return while a monitor waits to verify ownership.
+Transport failures retry within the existing three-attempt, 30-second request
+limits; a displaced writer stays fenced. No runtime memory grows.
+`/livez` separates process failure from durable-tier failure. Readiness also turns false when commit publication or remote checkpoint work
 fails and returns true after a successful durable publication or completion of
 its pending remote cleanup. A skipped
 maintenance turn, local heap cleanup, or temporary-file spill cannot clear a
@@ -121,11 +125,22 @@ Rotate without interrupting durable work:
 5. Revoke the prior credential and confirm durable writes and checkpoints
    continue.
 
-The candidate is parsed without runtime allocation and tested by a conditional
-writer-fence renewal before any client adopts it. Invalid permissions, syntax,
-authentication, connectivity, or lost writer ownership retain the installed
-credential, make readiness return 503, increment the failure counter, and emit
-an error without credential values. Correct the file and reload again.
+The candidate is parsed without runtime allocation. A separate reserved client
+conditionally renews the writer fence, then reads back the exact result. Both
+read and write access must succeed before any ordinary client adopts it.
+For example, an account allowed to read orders but forbidden to save them is
+rejected.
+
+Validation yields while cached queries and other object requests continue.
+After validation, new asynchronous requests briefly wait while existing signed
+requests finish; their retained data is preserved. The new credentials then
+install and waiting requests resume. Continuous traffic cannot keep adding work
+ahead of this handoff.
+
+Invalid permissions, syntax, authentication, connectivity, or lost writer
+ownership retain the installed credential, make readiness return 503, increment
+the failure counter, and emit an error without credential values. Correct the
+file and reload again.
 
 ## Release archive
 

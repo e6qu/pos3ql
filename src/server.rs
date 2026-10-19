@@ -24,6 +24,7 @@ const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
 /// bounded subscription count is checked against this disjoint range at setup.
 const SUBSCRIPTION_TOKEN_BASE: u64 = u64::MAX - 1_000_000;
 const OPERATIONS_LISTENER_TOKEN: u64 = u64::MAX - 2_000_000;
+const WRITER_PROBE_TOKEN: u64 = u64::MAX - 3_000_000;
 const OPERATIONS_TOKEN_BASE: u64 = 1 << 63;
 const OPERATIONS_REQUEST_BYTES: usize = 2048;
 const OPERATIONS_RESPONSE_BYTES: usize = 16 * 1024;
@@ -125,6 +126,9 @@ pub struct Server {
     shutdown_read: i32,
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
+    upload_fds: FixedVec<Option<i32>>,
+    writer_probe_fd: Option<i32>,
+    read_capacity_generation: u64,
     subscriptions: FixedVec<SubscriptionWorker>,
     operations_listener: Option<TcpListener>,
     operations_slots: FixedVec<OperationsSlot>,
@@ -135,6 +139,7 @@ pub struct Server {
     durability_ready: bool,
     ownership_ready: bool,
     credentials_ready: bool,
+    credential_reload_pending: bool,
     credentials_file: crate::util::StackStr<{ crate::object_store::CREDENTIAL_FILE_BYTES }>,
 }
 
@@ -145,6 +150,7 @@ struct Slot {
     want_write: bool,
     query_dispatch_pending: bool,
     pending_response: Option<PendingQueryResponse>,
+    detached_commit: bool,
 }
 
 /// Engine work returned to the reactor with the exact lease and session
@@ -154,6 +160,7 @@ struct QueryDispatchCompletion {
     generation: u32,
     workspace: QueryWorkspaceId,
     identity: ExecutionIdentity,
+    required_lsn: Option<u64>,
     response: PendingResponse,
     cancel_request: Option<CancelRequest>,
 }
@@ -229,6 +236,7 @@ impl QueryDispatchQueue {
 /// A response waiting at the shared publication barrier after its statement
 /// workspace has been released.
 struct PendingQueryResponse {
+    required_lsn: Option<u64>,
     response: PendingResponse,
     identity: ExecutionIdentity,
 }
@@ -354,6 +362,13 @@ struct OperationsSlot {
     stream: Option<TcpStream>,
     request: crate::mem::buffer::FixedBuf,
     response: crate::mem::buffer::FixedBuf,
+    writer_probe: Option<OperationsProbe>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationsProbe {
+    endpoint: OperationsEndpoint,
+    ticket: Option<crate::checkpoint::WriterProbeTicket>,
 }
 
 #[derive(Default)]
@@ -402,6 +417,7 @@ struct SubscriptionWorker {
     registered_sql_fd: Option<i32>,
     sql_want_write: bool,
     cleanup: Option<(u64, crate::storage::SqlName)>,
+    detached_commit: bool,
 }
 
 const SUBSCRIPTION_FILTER_BYTES: usize = 4096;
@@ -739,10 +755,28 @@ impl From<BudgetError> for ServerSetupError {
 
 impl Server {
     fn block_read_slots(config: &Config) -> usize {
-        let plan =
-            crate::store::StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
-        if config.object_store_on && (plan.ram.units > 0 || plan.disk.units > 0) {
+        if config.object_store_on {
             config.object_store_get_slots
+        } else {
+            0
+        }
+    }
+
+    fn writer_probe_slots(config: &Config) -> usize {
+        usize::from(config.object_store_on && !config.operations_listen_addr.is_empty())
+    }
+
+    fn upload_slots(config: &Config) -> usize {
+        if config.object_store_on {
+            config
+                .object_store_put_slots
+                .saturating_add(config.object_store_block_put_slots)
+                .saturating_add(crate::checkpoint::MANIFEST_UPLOAD_SLOTS)
+                .saturating_add(if config.object_store_credentials_file.is_empty() {
+                    0
+                } else {
+                    crate::checkpoint::CREDENTIAL_UPLOAD_SLOTS
+                })
         } else {
             0
         }
@@ -758,13 +792,16 @@ impl Server {
             config.operations_max_connections
         };
         let block_reads = Self::block_read_slots(config);
+        let uploads = Self::upload_slots(config);
         Reactor::budget_bytes(
             connections
                 + 2
                 + block_reads
+                + uploads
                 + 2 * config.max_subscriptions
                 + usize::from(operations_connections != 0)
-                + operations_connections,
+                + operations_connections
+                + Self::writer_probe_slots(config),
         ) + 128
             + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
             + QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections)
@@ -774,7 +811,7 @@ impl Server {
                     + core::mem::size_of::<u32>()
                     + OPERATIONS_REQUEST_BYTES
                     + OPERATIONS_RESPONSE_BYTES)
-            + block_reads * core::mem::size_of::<Option<i32>>()
+            + (block_reads + uploads) * core::mem::size_of::<Option<i32>>()
             + Self::extra_budget_bytes(config)
     }
 
@@ -822,18 +859,30 @@ impl Server {
         };
 
         let block_read_slots = Self::block_read_slots(config);
-        #[allow(
-            unused_mut,
-            reason = "the Linux epoll backend records fixed read/write interest"
-        )]
+        let upload_slots = Self::upload_slots(config);
+        if block_read_slots
+            .saturating_add(upload_slots)
+            .saturating_add(config.max_subscriptions.saturating_mul(2))
+            >= 999_998
+        {
+            return Err(ServerSetupError::Io(
+                "object request slots",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest and credential clients and max_subscriptions exceed reactor token capacity",
+                ),
+            ));
+        }
         let mut reactor = Reactor::new(
             budget,
             max_conns
                 + 2
                 + block_read_slots
+                + upload_slots
                 + 2 * config.max_subscriptions
                 + usize::from(operations_listener.is_some())
-                + operations_connections,
+                + operations_connections
+                + Self::writer_probe_slots(config),
         )
         .map_err(|e| match e {
             crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
@@ -856,6 +905,7 @@ impl Server {
             QueryWorkspaceLeases::new(budget, config.query_workspace_slots, max_conns)?;
         let query_dispatches = QueryDispatchQueue::new(budget, config.query_workspace_slots)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
+        let mut upload_fds = FixedVec::new(budget, "upload_fds", upload_slots)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
         let mut operations_slots =
@@ -872,6 +922,9 @@ impl Server {
                 .push(None)
                 .expect("sized from object_store_get_slots");
         }
+        for _ in 0..upload_slots {
+            upload_fds.push(None).expect("configured upload slots");
+        }
         for i in (0..max_conns as u32).rev() {
             slots
                 .push(Slot {
@@ -881,6 +934,7 @@ impl Server {
                     want_write: false,
                     query_dispatch_pending: false,
                     pending_response: None,
+                    detached_commit: false,
                 })
                 .expect("sized to max_conns");
             free.push(i).expect("sized to max_conns");
@@ -947,6 +1001,7 @@ impl Server {
                     registered_sql_fd: None,
                     sql_want_write: false,
                     cleanup: None,
+                    detached_commit: false,
                 })
                 .expect("sized to max_subscriptions");
         }
@@ -964,6 +1019,7 @@ impl Server {
                         "operations_response",
                         OPERATIONS_RESPONSE_BYTES,
                     )?,
+                    writer_probe: None,
                 })
                 .expect("sized to operations_max_connections");
             operations_free
@@ -1087,6 +1143,9 @@ impl Server {
             tls_config,
             shutdown_read: pipe_fds[0],
             block_read_fds,
+            upload_fds,
+            writer_probe_fd: None,
+            read_capacity_generation: 0,
             subscriptions,
             operations_listener,
             operations_slots,
@@ -1122,6 +1181,7 @@ impl Server {
             durability_ready: true,
             ownership_ready: true,
             credentials_ready: true,
+            credential_reload_pending: false,
             credentials_file: crate::util::StackStr::from_str(
                 &config.object_store_credentials_file,
             ),
@@ -1150,6 +1210,14 @@ impl Server {
     pub fn run(&mut self) -> std::io::Result<()> {
         self.engine.enable_async_block_reads();
         self.reconcile_subscriptions()?;
+        self.engine.commit_wal().map_err(|error| {
+            crate::logging::error_args(
+                "startup_publication_failed",
+                format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+            );
+            std::io::Error::from(std::io::ErrorKind::Other)
+        })?;
+        self.engine.enable_async_durability();
         let mut checkpoint_schedule = CheckpointSchedule::default();
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             // Local cleanup runs while downloads wait. Once only object I/O
@@ -1159,39 +1227,42 @@ impl Server {
                 self.engine.checkpoint_can_progress(),
                 Instant::now(),
             );
-            let hedge_timeout = self
+            let read_timeout = self
                 .engine
-                .next_block_read_hedge_deadline()
+                .next_block_read_deadline()
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
             let timeout = [
                 checkpoint_timeout,
                 self.next_lock_wait_timeout(),
                 self.next_replication_keepalive_timeout(),
                 self.next_termination_timeout(),
-                hedge_timeout,
+                read_timeout,
+                self.engine
+                    .writer_probe()
+                    .and_then(|probe| probe.deadline())
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+                self.buffered_subscription_work().then_some(Duration::ZERO),
+                (self.engine.read_capacity_generation() != self.read_capacity_generation)
+                    .then_some(Duration::ZERO),
+                self.engine
+                    .next_publication_deadline()
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
             ]
             .into_iter()
             .flatten()
             .min();
             let n = self.reactor.poll(timeout)?;
-            // Retry any journal publication left by a failed prior turn once,
-            // before another statement can observe the local-only commit.
-            // All readable connections in this poll then share the one
-            // publication barrier at the end of the turn.
-            let retrying_durable_publication = self.engine.durable_retry_pending();
-            let publication_ready = match self.engine.commit_wal() {
-                Ok(()) => {
-                    if retrying_durable_publication {
-                        self.durability_ready = true;
-                    }
-                    true
-                }
-                Err(_) => {
-                    self.durability_ready = false;
-                    false
-                }
-            };
-            let mut completed_block_read = false;
+            let before_durable = self.engine.durable_lsn();
+            let mut publication_error = self.engine.advance_wal_publication(Instant::now()).err();
+            if self.engine.fatal_commit_failure().is_some() {
+                self.shutdown();
+                return Err(std::io::Error::from(std::io::ErrorKind::Other));
+            }
+            self.durability_ready = !self.engine.publication_failed();
+            let publication_ready = self.durability_ready;
+            let capacity = self.engine.read_capacity_generation();
+            let mut completed_block_read = capacity != self.read_capacity_generation;
+            self.read_capacity_generation = capacity;
             for i in 0..n {
                 let event = self.reactor.event(i);
                 if event.token == SHUTDOWN_TOKEN {
@@ -1207,6 +1278,11 @@ impl Server {
                     self.accept_operations_pending();
                 } else if let Some(slot) = self.block_slot(event.token) {
                     completed_block_read |= self.advance_block_io(slot)?;
+                } else if event.token == WRITER_PROBE_TOKEN {
+                    // The owned control GET advances once after this event batch.
+                } else if self.upload_slot(event.token).is_some() {
+                    // All upload slots advance together below, including slots
+                    // whose connect or request send just became writable.
                 } else if let Some((subscription, sql)) = self.subscription_slot(event.token) {
                     if publication_ready {
                         self.advance_subscription(
@@ -1227,6 +1303,13 @@ impl Server {
                     );
                 }
             }
+            if let Some(probe) = self.engine.writer_probe() {
+                probe.advance(Instant::now());
+            }
+            // Reconcile a cancelled control descriptor before other clients
+            // can open sockets and reuse its integer descriptor.
+            self.sync_writer_probe_interest()?;
+            self.advance_operations_probes();
             self.drain_query_dispatches();
             if publication_ready {
                 if completed_block_read {
@@ -1236,20 +1319,53 @@ impl Server {
                 // no socket readiness and no lock-generation change.
                 self.wake_lock_waiters();
             }
-            let (had_responses, responses_durable) = self.finish_response_batch();
-            if publication_ready && responses_durable {
+            if let Err(error) = self.engine.advance_wal_publication(Instant::now()) {
+                publication_error = Some(error);
+            }
+            self.durability_ready = !self.engine.publication_failed();
+            if let Some(error) = &publication_error {
+                crate::logging::error_args(
+                    "commit_publication_failed",
+                    format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                );
+            }
+            let mut had_responses = self.finish_response_batch(publication_error.as_ref());
+            self.finish_detached_commits();
+            self.advance_subscription_commits()?;
+            if self.durability_ready && self.engine.durable_lsn() > before_durable {
+                self.wake_io_waiters();
+                self.wake_lock_waiters();
+                had_responses |= self.finish_response_batch(None);
+            }
+            if self.engine.fatal_commit_failure().is_some() {
+                self.shutdown();
+                return Err(std::io::Error::from(std::io::ErrorKind::Other));
+            }
+            if self.durability_ready {
                 self.process_committed_side_effects();
                 self.pump_replication_streams();
                 self.reconcile_subscriptions()?;
+                for slot in 0..self.subscriptions.len() {
+                    let worker = &self.subscriptions[slot];
+                    if worker.registered_fd.is_some()
+                        && !worker.apply.awaiting_durability()
+                        && worker.client.has_buffered_frame()
+                    {
+                        self.advance_subscription(slot, false, true, false)?;
+                    }
+                }
             }
             if RELOAD_REQUESTED.swap(false, Ordering::SeqCst)
                 || self.engine.take_object_store_credentials_reload()
             {
                 self.reload_object_store_credentials();
             }
+            self.advance_object_store_credential_reload();
             self.close_expired_terminations();
-            self.engine
-                .issue_due_block_read_hedges(std::time::Instant::now());
+            if self.engine.advance_block_read_deadlines(Instant::now()) && self.durability_ready {
+                self.wake_io_waiters();
+                had_responses |= self.finish_response_batch(None);
+            }
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }
@@ -1257,6 +1373,8 @@ impl Server {
             // Reconcile after it does so every pending read has reactor
             // interest before this loop can block again.
             self.sync_block_read_interest()?;
+            self.sync_upload_interest()?;
+            self.sync_writer_probe_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -1264,11 +1382,22 @@ impl Server {
             // pressure requires publication before dispatch resumes; bucket
             // errors back off.
             if checkpoint_schedule.should_run(
-                self.engine.checkpoint_work_pending() || (had_responses && responses_durable),
+                self.engine.checkpoint_work_pending() || had_responses,
                 Instant::now(),
             ) {
                 let beat = self.engine.checkpoint_beat();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
+                self.durability_ready &= !self.engine.publication_failed();
+                if matches!(
+                    beat,
+                    CheckpointBeat::Durable
+                        | CheckpointBeat::DurableWithLocalFailure
+                        | CheckpointBeat::LocalFailure
+                        | CheckpointBeat::StorageFailure
+                ) {
+                    self.wake_io_waiters();
+                    self.finish_response_batch(publication_error.as_ref());
+                }
             }
         }
         self.shutdown();
@@ -1297,20 +1426,31 @@ impl Server {
                 self.release(i);
             }
         }
-        if self.engine.checkpoint_enabled() {
-            match self.engine.checkpoint() {
-                Ok(true) => stderr_line(
-                    b"final checkpoint written
-",
-                ),
-                Ok(false) => {}
-                Err(_) => stderr_line(
-                    b"final checkpoint failed; journal is durable
-",
-                ),
+        for slot in 0..self.subscriptions.len() {
+            if self.subscriptions[slot].name.is_some() {
+                self.unbind_subscription(slot);
             }
         }
-        // Ensure the journal is durable even if no checkpoint ran.
+        if self.engine.fatal_commit_failure().is_some() || self.engine.commit_wal().is_err() {
+            stderr_line(b"shutdown publication unresolved; recovery required\n");
+            return;
+        }
+        self.finish_detached_commits();
+        if self.advance_subscription_commits().is_err() {
+            stderr_line(b"shutdown subscription commit cleanup failed\n");
+            return;
+        }
+        if self.engine.staged_commits_pending() {
+            stderr_line(b"shutdown retains unresolved transaction owners\n");
+            return;
+        }
+        if self.engine.checkpoint_enabled() {
+            match self.engine.checkpoint() {
+                Ok(true) => stderr_line(b"final checkpoint written\n"),
+                Ok(false) => {}
+                Err(_) => stderr_line(b"final checkpoint failed; journal is durable\n"),
+            }
+        }
         if self.engine.commit_wal().is_err() {
             stderr_line(b"final WAL upload failed\n");
         } else if self.engine.mark_clean_shutdown().is_err() {
@@ -1476,6 +1616,9 @@ impl Server {
             assert!(self.slots[dispatch.owner].conn.is_open());
             assert!(self.slots[dispatch.owner].query_dispatch_pending);
             self.engine.select_query_workspace(dispatch.workspace);
+            self.engine
+                .bind_query_connection(self.slots[dispatch.owner].conn.id());
+            let before_lsn = self.engine.journal_lsn();
             let response = match dispatch.kind {
                 QueryDispatchKind::Readable => Some(self.slots[dispatch.owner].conn.on_readable(
                     &mut self.engine,
@@ -1502,6 +1645,16 @@ impl Server {
                 generation: dispatch.generation,
                 workspace: dispatch.workspace,
                 identity: self.engine.execution_identity(),
+                required_lsn: if self.engine.journal_lsn() > before_lsn {
+                    Some(self.engine.journal_lsn())
+                } else {
+                    self.slots[dispatch.owner]
+                        .conn
+                        .txn
+                        .staged_commit()
+                        .filter(|staged| staged.barrier == crate::sql::txn::CommitBarrier::Journal)
+                        .map(|staged| staged.lsn)
+                },
                 response,
                 cancel_request: self.slots[dispatch.owner].conn.take_cancel_request(),
             };
@@ -1538,6 +1691,7 @@ impl Server {
             )
         } else {
             self.slots[completion.owner].pending_response = Some(PendingQueryResponse {
+                required_lsn: completion.required_lsn,
                 response: completion.response,
                 identity: completion.identity,
             });
@@ -1584,35 +1738,45 @@ impl Server {
     /// Publishes all journal records produced during one reactor turn, then
     /// releases every buffered response. The fixed slot array is also the
     /// fixed-capacity group-commit queue.
-    fn finish_response_batch(&mut self) -> (bool, bool) {
-        let had_responses = self
-            .slots
-            .iter()
-            .any(|slot| slot.pending_response.is_some());
-        if !had_responses {
-            return (false, true);
-        }
-        let retrying_durable_publication = self.engine.durable_retry_pending();
-        let publication_error = self.engine.commit_wal().err();
-        if publication_error.is_some() {
-            self.durability_ready = false;
-        } else if retrying_durable_publication {
-            self.durability_ready = true;
-        }
+    fn finish_response_batch(
+        &mut self,
+        publication_error: Option<&crate::sql::eval::SqlError>,
+    ) -> bool {
+        let mut released = false;
         for index in 0..self.slots.len() {
-            let Some(pending) = self.slots[index].pending_response.take() else {
+            let Some(pending) = &self.slots[index].pending_response else {
                 continue;
             };
+            if publication_error.is_none()
+                && pending
+                    .required_lsn
+                    .is_some_and(|lsn| lsn > self.engine.durable_lsn())
+            {
+                continue;
+            }
+            let pending = self.slots[index]
+                .pending_response
+                .take()
+                .expect("checked buffered response");
             self.engine.restore_execution_identity(pending.identity);
+            let error = pending
+                .required_lsn
+                .filter(|lsn| *lsn > self.engine.durable_lsn())
+                .and(publication_error);
             let after = self.slots[index]
                 .conn
-                .finish_response(pending.response, publication_error.as_ref());
+                .finish_response(pending.response, error);
             self.complete_dispatch(index, after);
+            released = true;
         }
-        (true, publication_error.is_none())
+        released
     }
 
     fn complete_dispatch(&mut self, index: usize, after: After) {
+        if !self.slots[index].conn.owns_pending_object_reads() {
+            self.engine
+                .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
+        }
         match after {
             After::Close => self.release(index),
             After::Continue => {
@@ -1799,7 +1963,8 @@ impl Server {
                 }
                 (registered, wanted) => {
                     if let Some(fd) = registered {
-                        self.reactor.deregister(fd)?;
+                        self.reactor
+                            .deregister_owned(fd, BLOCK_IO_TOKEN - slot as u64)?;
                     }
                     if let Some(fd) = wanted {
                         self.reactor
@@ -1808,8 +1973,79 @@ impl Server {
                     self.block_read_fds[slot] = wanted;
                 }
             }
+            if let Some(fd) = wanted {
+                self.reactor.set_write_interest(
+                    fd,
+                    BLOCK_IO_TOKEN - slot as u64,
+                    self.engine.pending_block_read_wants_write(slot),
+                )?;
+            }
         }
         Ok(())
+    }
+
+    fn sync_upload_interest(&mut self) -> std::io::Result<()> {
+        assert_eq!(self.upload_fds.len(), self.engine.upload_slots());
+        for slot in 0..self.upload_fds.len() {
+            let wanted = self.engine.pending_upload_fd(slot);
+            let token = BLOCK_IO_TOKEN - (self.block_read_fds.len() + slot) as u64;
+            match (self.upload_fds[slot], wanted) {
+                (Some(old), Some(fd)) if old == fd => {
+                    self.reactor.register_read(fd, token)?;
+                }
+                (registered, wanted) => {
+                    if let Some(fd) = registered {
+                        self.reactor.deregister_owned(fd, token)?;
+                    }
+                    if let Some(fd) = wanted {
+                        self.reactor.register_read(fd, token)?;
+                    }
+                    self.upload_fds[slot] = wanted;
+                }
+            }
+            if let Some(fd) = wanted {
+                self.reactor.set_write_interest(
+                    fd,
+                    token,
+                    self.engine.pending_upload_wants_write(slot),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_writer_probe_interest(&mut self) -> std::io::Result<()> {
+        let wanted = self.engine.writer_probe().and_then(|probe| probe.fd());
+        match (self.writer_probe_fd, wanted) {
+            (Some(old), Some(fd)) if old == fd => {
+                self.reactor.register_read(fd, WRITER_PROBE_TOKEN)?;
+            }
+            (registered, wanted) => {
+                if let Some(fd) = registered {
+                    self.reactor.deregister_owned(fd, WRITER_PROBE_TOKEN)?;
+                }
+                if let Some(fd) = wanted {
+                    self.reactor.register_read(fd, WRITER_PROBE_TOKEN)?;
+                }
+                self.writer_probe_fd = wanted;
+            }
+        }
+        if let Some(fd) = wanted {
+            let writable = self
+                .engine
+                .writer_probe()
+                .expect("reserved probe")
+                .wants_write();
+            self.reactor
+                .set_write_interest(fd, WRITER_PROBE_TOKEN, writable)?;
+        }
+        Ok(())
+    }
+
+    fn upload_slot(&self, token: u64) -> Option<usize> {
+        let offset = BLOCK_IO_TOKEN.checked_sub(token)? as usize;
+        let slot = offset.checked_sub(self.block_read_fds.len())?;
+        (slot < self.upload_fds.len()).then_some(slot)
     }
 
     fn block_slot(&self, token: u64) -> Option<usize> {
@@ -1832,14 +2068,23 @@ impl Server {
     fn unbind_subscription(&mut self, slot: usize) {
         let worker = &mut self.subscriptions[slot];
         if let Some(fd) = worker.registered_fd.take() {
-            let _ = self.reactor.deregister(fd);
+            let _ = self
+                .reactor
+                .deregister_owned(fd, Self::subscription_token(slot, false));
         }
         if let Some(fd) = worker.registered_sql_fd.take() {
-            let _ = self.reactor.deregister(fd);
+            let _ = self
+                .reactor
+                .deregister_owned(fd, Self::subscription_token(slot, true));
         }
         worker.apply.stop(&mut self.engine);
         worker.client.unbind();
         worker.sql.unbind();
+        if worker.apply.awaiting_durability() {
+            worker.detached_commit = true;
+            return;
+        }
+        worker.detached_commit = false;
         worker.apply.unbind();
         worker.bootstrap.stage = SubscriptionBootstrapStage::Idle;
         worker.bootstrap.snapshot = None;
@@ -1861,6 +2106,10 @@ impl Server {
     fn reconcile_subscriptions(&mut self) -> std::io::Result<()> {
         let now = std::time::Instant::now();
         for slot in 0..self.subscriptions.len() {
+            if self.subscriptions[slot].apply.awaiting_durability() {
+                self.sync_subscription_interest(slot)?;
+                continue;
+            }
             if let Some(cleanup) = self.engine.subscription_cleanup_runtime(slot) {
                 if self.subscriptions[slot].cleanup == Some((cleanup.created_at, cleanup.name)) {
                     self.sync_subscription_interest(slot)?;
@@ -1921,13 +2170,17 @@ impl Server {
                     worker
                         .apply
                         .bind(runtime.stream, runtime.confirmed_lsn, runtime.behavior)
-                        .map_err(|_| std::io::Error::other("bind subscription apply"))?;
+                        .map_err(|error| {
+                            log_subscription_error(Some(runtime.stream.name()), &error);
+                            std::io::Error::from(std::io::ErrorKind::InvalidData)
+                        })?;
                     let bind = match runtime.bootstrap {
                         crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data } => {
                             let bootstrap_slot = runtime.bootstrap_slot.ok_or_else(|| {
-                                std::io::Error::other(
-                                    "managed subscription bootstrap has no publisher slot",
-                                )
+                                stderr_line(
+                                    b"managed subscription bootstrap has no publisher slot\n",
+                                );
+                                std::io::Error::from(std::io::ErrorKind::InvalidData)
                             })?;
                             worker.bootstrap.stage = SubscriptionBootstrapStage::AwaitingSnapshot;
                             worker.bootstrap.snapshot = None;
@@ -1950,9 +2203,10 @@ impl Server {
                         | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
                         | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
                             let bootstrap_slot = runtime.bootstrap_slot.ok_or_else(|| {
-                                std::io::Error::other(
-                                    "subscription synchronization has no temporary slot",
-                                )
+                                stderr_line(
+                                    b"subscription synchronization has no temporary slot\n",
+                                );
+                                std::io::Error::from(std::io::ErrorKind::InvalidData)
                             })?;
                             worker.bootstrap.stage = SubscriptionBootstrapStage::AwaitingSnapshot;
                             worker.bootstrap.snapshot = None;
@@ -1972,7 +2226,8 @@ impl Server {
                         }
                         crate::storage::SubscriptionBootstrap::Ready if runtime.enabled => {
                             let publisher_slot = runtime.slot.ok_or_else(|| {
-                                std::io::Error::other("enabled subscription has no publisher slot")
+                                stderr_line(b"enabled subscription has no publisher slot\n");
+                                std::io::Error::from(std::io::ErrorKind::InvalidData)
                             })?;
                             worker.client.bind(
                                 crate::pg::replication_client::ReplicationClientSetup {
@@ -2020,6 +2275,11 @@ impl Server {
         let Some(fd) = worker.registered_fd else {
             return Ok(());
         };
+        self.reactor.set_read_interest(
+            fd,
+            Self::subscription_token(slot, false),
+            !worker.apply.awaiting_durability(),
+        )?;
         let wanted = worker.client.wants_write();
         if wanted != worker.want_write {
             self.reactor
@@ -2102,7 +2362,9 @@ impl Server {
         let binding = worker.definition.ok_or(())?;
         if binding.drop_bootstrap_slot {
             if let Some(fd) = worker.registered_fd.take() {
-                let _ = self.reactor.deregister(fd);
+                let _ = self
+                    .reactor
+                    .deregister_owned(fd, Self::subscription_token(slot, false));
             }
             worker.client.unbind();
             worker
@@ -2136,6 +2398,46 @@ impl Server {
         Ok(true)
     }
 
+    fn advance_subscription_commits(&mut self) -> std::io::Result<()> {
+        for slot in 0..self.subscriptions.len() {
+            if !self.subscriptions[slot].apply.awaiting_durability() {
+                continue;
+            }
+            let result = self.subscriptions[slot].apply.poll_commit(&mut self.engine);
+            match result {
+                Ok(crate::pg::subscription_apply::ApplyResult::Acknowledge {
+                    flushed_lsn,
+                    reply_requested,
+                }) => {
+                    if self.subscriptions[slot].detached_commit
+                        || self.subscriptions[slot]
+                            .client
+                            .acknowledge(flushed_lsn, reply_requested)
+                            .is_err()
+                    {
+                        self.unbind_subscription(slot);
+                    } else {
+                        self.sync_subscription_interest(slot)?;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log_subscription_error(self.subscriptions[slot].name, &error);
+                    self.unbind_subscription(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn buffered_subscription_work(&self) -> bool {
+        self.subscriptions.iter().any(|worker| {
+            worker.registered_fd.is_some()
+                && !worker.apply.awaiting_durability()
+                && worker.client.has_buffered_frame()
+        })
+    }
+
     fn advance_subscription(
         &mut self,
         slot: usize,
@@ -2153,14 +2455,17 @@ impl Server {
         if writable && worker.client.writable().is_err() {
             failed = true;
         }
-        if !failed && readable {
+        if !failed && readable && !worker.apply.awaiting_durability() {
             let mut acknowledgement = None;
-            let readable = worker.client.readable(|event| {
+            let readable = worker.client.readable(1, |event| {
                 let crate::pg::replication_client::ClientEvent::Replication(frame) = event else {
                     return Ok(());
                 };
                 match worker.apply.receive(&mut self.engine, frame) {
-                    Ok(crate::pg::subscription_apply::ApplyResult::None) => Ok(()),
+                    Ok(
+                        crate::pg::subscription_apply::ApplyResult::None
+                        | crate::pg::subscription_apply::ApplyResult::AwaitingDurability,
+                    ) => Ok(()),
                     Ok(crate::pg::subscription_apply::ApplyResult::Acknowledge {
                         flushed_lsn,
                         reply_requested,
@@ -2302,7 +2607,7 @@ impl Server {
         let mut table_ready = false;
         if !failed && readable {
             let stage = worker.bootstrap.stage;
-            let result = worker.sql.readable(|event| {
+            let result = worker.sql.readable(usize::MAX, |event| {
                 let crate::pg::replication_client::ClientEvent::Sql(event) = event else {
                     return Err(crate::pg::replication_client::ClientError::PublisherError);
                 };
@@ -2616,8 +2921,8 @@ impl Server {
         self.wake_waiters(false);
     }
 
-    /// Retries statements parked on an object read only after that read has
-    /// completed. Readable client sockets do not make a pending object GET
+    /// Retries statements after object reads, commit publication or a
+    /// requested checkpoint completes. Readable client sockets do not make a pending object GET
     /// complete, so combining this with lock wakeups would spin the reactor.
     fn wake_io_waiters(&mut self) {
         self.wake_waiters(true);
@@ -2629,6 +2934,7 @@ impl Server {
         // unblocked connection is considered in the same reactor turn.
         for _ in 0..=self.slots.len() {
             let generation = self.engine.lock_generation();
+            let read_generation = self.engine.read_capacity_generation();
             for index in 0..self.slots.len() {
                 if !self.slots[index].conn.is_open() || self.slots[index].pending_response.is_some()
                 {
@@ -2656,7 +2962,9 @@ impl Server {
                 });
             }
             self.drain_query_dispatches();
-            if self.engine.lock_generation() == generation {
+            if self.engine.lock_generation() == generation
+                && self.engine.read_capacity_generation() == read_generation
+            {
                 break;
             }
         }
@@ -2733,6 +3041,23 @@ impl Server {
     }
 
     fn release(&mut self, index: usize) {
+        self.engine
+            .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
+        if self.slots[index].conn.txn.staged_commit().is_some() {
+            assert!(!self.slots[index].query_dispatch_pending);
+            let handoff = self.query_workspaces.cancel(index);
+            let slot = &mut self.slots[index];
+            if let Some(stream) = slot.conn.close() {
+                let _ = self.reactor.deregister(stream.as_raw_fd());
+                drop(stream);
+            }
+            slot.want_read = false;
+            slot.want_write = false;
+            slot.pending_response = None;
+            slot.detached_commit = true;
+            self.wake_query_workspace_handoff(handoff);
+            return;
+        }
         // Every transport exit reaches this choke point. Roll back here so an
         // I/O-interest failure, notification overflow, or replication close
         // cannot strand transaction state or locks.
@@ -2766,12 +3091,38 @@ impl Server {
         slot.want_write = false;
         slot.query_dispatch_pending = false;
         slot.pending_response = None;
+        slot.detached_commit = false;
         self.free
             .push(index as u32)
             .expect("released slot cannot exceed capacity");
         self.operations_metrics.postgres_closed =
             self.operations_metrics.postgres_closed.saturating_add(1);
         self.wake_query_workspace_handoff(workspace_handoff);
+    }
+
+    fn finish_detached_commits(&mut self) {
+        for index in 0..self.slots.len() {
+            if !self.slots[index].detached_commit {
+                continue;
+            }
+            let identity = self.slots[index].conn.execution_identity();
+            self.engine.restore_execution_identity(identity);
+            let slot = &mut self.slots[index];
+            match self
+                .engine
+                .finish_staged_transaction(&mut slot.conn.txn, &slot.conn.guc)
+            {
+                Ok(()) => self.release(index),
+                Err(error) if error.sqlstate == crate::sql::eval::sqlstate::INTERNAL_IO_WAIT => {}
+                Err(error) => {
+                    self.durability_ready = false;
+                    crate::logging::error_args(
+                        "detached_commit_completion_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                }
+            }
+        }
     }
 
     fn pump_replication_streams(&mut self) {
@@ -2839,7 +3190,40 @@ impl Server {
             return;
         }
         if readable && self.operations_slots[index].response.is_empty() {
-            self.read_operations(index);
+            if self.operations_slots[index].writer_probe.is_some() {
+                let mut extra = [0u8; 1];
+                let read = self.operations_slots[index]
+                    .stream
+                    .as_mut()
+                    .expect("open operational slot")
+                    .read(&mut extra);
+                match read {
+                    Ok(0) => {
+                        // A complete HTTP request may half-close its send side.
+                        let fd = self.operations_slots[index]
+                            .stream
+                            .as_ref()
+                            .unwrap()
+                            .as_raw_fd();
+                        if self
+                            .reactor
+                            .set_read_interest(fd, Self::operations_token(index), false)
+                            .is_err()
+                        {
+                            self.release_operations(index);
+                        }
+                    }
+                    Ok(_) => self.queue_operations_error(index, 400, "unexpected request data\n"),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => self.release_operations(index),
+                }
+            } else {
+                self.read_operations(index);
+            }
         }
         if writable
             && index < self.operations_slots.len()
@@ -2900,6 +3284,22 @@ impl Server {
     fn answer_operations(&mut self, index: usize, endpoint: OperationsEndpoint) {
         self.operations_metrics.http_requests =
             self.operations_metrics.http_requests.saturating_add(1);
+        if matches!(
+            endpoint,
+            OperationsEndpoint::Ready | OperationsEndpoint::Metrics
+        ) && self.engine.checkpoint_enabled()
+        {
+            self.operations_slots[index].writer_probe = Some(OperationsProbe {
+                endpoint,
+                ticket: None,
+            });
+            self.advance_operations_probes();
+            return;
+        }
+        self.answer_operations_after_probe(index, endpoint);
+    }
+
+    fn answer_operations_after_probe(&mut self, index: usize, endpoint: OperationsEndpoint) {
         match endpoint {
             OperationsEndpoint::Live => {
                 self.queue_operations_response(
@@ -2910,7 +3310,6 @@ impl Server {
                 );
             }
             OperationsEndpoint::Ready => {
-                self.refresh_writer_readiness();
                 if self.ready() {
                     self.queue_operations_response(
                         index,
@@ -2930,7 +3329,6 @@ impl Server {
                 }
             }
             OperationsEndpoint::Metrics => {
-                self.refresh_writer_readiness();
                 let mut body = crate::util::StackStr::<12000>::new();
                 self.render_metrics(&mut body);
                 if body.is_truncated() {
@@ -2968,7 +3366,7 @@ impl Server {
         if self.credentials_file.is_empty() {
             return;
         }
-        if self.engine.object_store_reads_busy() {
+        if self.credential_reload_pending {
             RELOAD_REQUESTED.store(true, Ordering::SeqCst);
             return;
         }
@@ -2988,8 +3386,23 @@ impl Server {
                     return;
                 }
             };
-        match self.engine.rotate_object_store_credentials(credentials) {
-            Ok(()) => {
+        match self
+            .engine
+            .begin_object_store_credential_reload(credentials)
+        {
+            Ok(()) => self.credential_reload_pending = true,
+            Err(_) => self.record_credential_reload_failure(),
+        }
+    }
+
+    fn advance_object_store_credential_reload(&mut self) {
+        if !self.credential_reload_pending {
+            return;
+        }
+        match self.engine.advance_object_store_credential_reload() {
+            Ok(crate::checkpoint::CredentialReloadStep::Pending) => {}
+            Ok(crate::checkpoint::CredentialReloadStep::Installed) => {
+                self.credential_reload_pending = false;
                 self.credentials_ready = true;
                 self.ownership_ready = true;
                 self.operations_metrics.credential_reload_successes = self
@@ -3000,23 +3413,94 @@ impl Server {
                     "object_store_credentials_reloaded",
                     "object-store credentials validated and installed",
                 );
+                self.advance_operations_probes();
             }
             Err(_) => {
-                self.credentials_ready = false;
-                self.operations_metrics.credential_reload_failures = self
-                    .operations_metrics
-                    .credential_reload_failures
-                    .saturating_add(1);
-                crate::logging::error(
-                    "object_store_credentials_reload_failed",
-                    "candidate failed writer-fence validation; installed credentials retained",
-                );
+                self.credential_reload_pending = false;
+                self.record_credential_reload_failure();
             }
         }
     }
 
-    fn refresh_writer_readiness(&mut self) {
-        self.ownership_ready = self.engine.verify_writer_ownership().is_ok();
+    fn record_credential_reload_failure(&mut self) {
+        self.credentials_ready = false;
+        self.operations_metrics.credential_reload_failures = self
+            .operations_metrics
+            .credential_reload_failures
+            .saturating_add(1);
+        crate::logging::error(
+            "object_store_credentials_reload_failed",
+            "candidate failed writer-fence validation; installed credentials retained",
+        );
+    }
+
+    fn advance_operations_probes(&mut self) {
+        for index in 0..self.operations_slots.len() {
+            let Some(OperationsProbe {
+                endpoint,
+                ticket: Some(ticket),
+            }) = self.operations_slots[index].writer_probe
+            else {
+                continue;
+            };
+            if let Some(result) = self
+                .engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .take(ticket)
+            {
+                self.operations_slots[index].writer_probe = None;
+                self.ownership_ready = result.is_ok();
+                if let Err(error) = result {
+                    crate::logging::error_args(
+                        "writer_probe_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                }
+                self.answer_operations_after_probe(index, endpoint);
+            }
+        }
+        for index in 0..self.operations_slots.len() {
+            let Some(waiting) = self.operations_slots[index].writer_probe else {
+                continue;
+            };
+            if waiting.ticket.is_some() {
+                continue;
+            }
+            match self
+                .engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .request(index)
+            {
+                Ok(ticket) => {
+                    self.operations_slots[index].writer_probe =
+                        Some(OperationsProbe { ticket, ..waiting });
+                }
+                Err(error) => {
+                    self.operations_slots[index].writer_probe = None;
+                    self.ownership_ready = false;
+                    crate::logging::error_args(
+                        "writer_probe_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    self.answer_operations_after_probe(index, waiting.endpoint);
+                }
+            }
+        }
+    }
+
+    fn cancel_operations_probe(&mut self, index: usize) {
+        if let Some(OperationsProbe {
+            ticket: Some(ticket),
+            ..
+        }) = self.operations_slots[index].writer_probe.take()
+        {
+            self.engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .cancel(ticket);
+        }
     }
 
     fn render_metrics(&self, out: &mut crate::util::StackStr<12000>) {
@@ -3185,6 +3669,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         body: &str,
     ) {
         use core::fmt::Write as _;
+        self.cancel_operations_probe(index);
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
@@ -3247,6 +3732,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
     }
 
     fn release_operations(&mut self, index: usize) {
+        self.cancel_operations_probe(index);
         let slot = &mut self.operations_slots[index];
         if let Some(stream) = slot.stream.take() {
             let _ = self.reactor.deregister(stream.as_raw_fd());
@@ -3956,13 +4442,13 @@ mod tests {
     }
 
     #[test]
-    fn cacheless_object_storage_uses_synchronous_block_reads() {
+    fn cacheless_object_storage_reserves_concurrent_block_reads() {
         let mut config = crate::config::Config::default_dev();
         config.object_store_on = true;
         config.object_store_get_slots = 7;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
-        assert_eq!(Server::block_read_slots(&config), 0);
+        assert_eq!(Server::block_read_slots(&config), 7);
 
         config.block_cache_bytes = crate::store::MAX_PAYLOAD;
         assert_eq!(Server::block_read_slots(&config), 7);

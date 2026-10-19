@@ -2,6 +2,7 @@
 name = "pos3ql"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 # Dependency policy: std + libc only. libc provides raw syscall bindings
 # (kqueue/epoll, sockets, low-level file I/O) that have no std equivalent.

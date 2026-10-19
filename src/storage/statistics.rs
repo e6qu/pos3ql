@@ -74,14 +74,37 @@ impl TableStatisticsOwner {
         // New ANALYZE publication advances this revision; resets preserve it.
     }
 
-    pub(super) fn clear_dirty(&self) {
-        let mut state = self.write();
-        state.dirty = false;
-        state.wal_dirty = false;
-    }
-
     pub(super) fn clear_wal(&self) {
         self.write().wal_dirty = false;
+    }
+}
+
+pub(crate) struct CheckpointStatistics {
+    table: usize,
+    created_at: u64,
+    state: Arc<RwLock<StatisticsState>>,
+    image: TableStatistics,
+    revision: u64,
+}
+
+impl CheckpointStatistics {
+    pub(crate) fn acknowledge(self, storage: &Storage) {
+        let table = &storage.tables[self.table];
+        assert!(
+            Arc::ptr_eq(&self.state, &table.statistics.state),
+            "checkpoint statistics belong to another storage owner"
+        );
+        let definition = table.definition.read();
+        if definition.identity.created_at != self.created_at || !definition.identity.live() {
+            return;
+        }
+        let mut state = self.state.write().expect("table statistics lock poisoned");
+        if state.relation_revision == self.revision && state.committed == self.image {
+            state.dirty = false;
+            if state.pending.is_none() {
+                state.wal_dirty = false;
+            }
+        }
     }
 }
 
@@ -460,6 +483,19 @@ impl Storage {
         }
     }
 
+    pub(crate) fn capture_checkpoint_statistics(&self, table_slot: usize) -> CheckpointStatistics {
+        let table = &self.tables[table_slot];
+        let definition = table.definition.read();
+        let state = table.statistics.read();
+        CheckpointStatistics {
+            table: table_slot,
+            created_at: definition.identity.created_at,
+            state: Arc::clone(&table.statistics.state),
+            image: state.committed,
+            revision: state.relation_revision,
+        }
+    }
+
     pub(crate) fn statistics_dirty(&self) -> bool {
         self.tables
             .iter()
@@ -766,6 +802,41 @@ mod tests {
             captured.receipt.acknowledge();
             assert!(!storage.statistics_wal_dirty(table));
             crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
+        });
+    }
+
+    #[test]
+    fn parallel_physical_manifest_statistics_ack_preserves_later_and_pending_analysis() {
+        let (storage, _budget, table) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage.commit_table_statistics(table, 7);
+            let old = storage.capture_checkpoint_statistics(table);
+            storage.write_table_statistics(table, 9, image(2)).unwrap();
+            old.acknowledge(&storage);
+            assert!(storage.statistics_dirty());
+            assert!(storage.statistics_wal_dirty(table));
+            storage.commit_table_statistics(table, 9);
+
+            let mut same_counts = image(2);
+            same_counts.columns[0].distinct_values = 999;
+            storage
+                .write_table_statistics(table, 11, same_counts)
+                .unwrap();
+            let pending = storage.capture_checkpoint_statistics(table);
+            pending.acknowledge(&storage);
+            assert!(
+                storage.statistics_wal_dirty(table),
+                "a saved committed image cannot acknowledge private column statistics"
+            );
+            storage.commit_table_statistics(table, 11);
+            assert!(storage.statistics_dirty());
+            assert_eq!(storage.table_statistics(table, 0), same_counts);
+
+            let current = storage.capture_checkpoint_statistics(table);
+            current.acknowledge(&storage);
+            assert!(!storage.statistics_dirty());
+            assert!(!storage.statistics_wal_dirty(table));
         });
     }
 }

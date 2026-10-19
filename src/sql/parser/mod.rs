@@ -5525,7 +5525,9 @@ impl<'a> Parser<'a> {
         // written order, so a constraint can reference a column added later in
         // the same statement. A stable insertion sort by pass keeps the written
         // order within a pass and allocates nothing.
-        let actions = buffer.as_mut_slice();
+        let actions = buffer
+            .as_mut_slice()
+            .map_err(|_| self.arena_full("ALTER TABLE actions exceed statement arena"))?;
         for i in 1..actions.len() {
             let mut j = i;
             while j > 0 && alter_pass(&actions[j - 1]) > alter_pass(&actions[j]) {
@@ -6648,20 +6650,24 @@ impl<'a> Parser<'a> {
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
                 if let Some(previous) = assignments
-                    .as_slice()
+                    .borrowed_slice()
                     .iter()
                     .position(|(previous, _)| previous == name)
                 {
                     if !subscripts.is_empty()
                         && matches!(
-                            *assignments.as_slice()[previous].1,
+                            *assignments.borrowed_slice()[previous].1,
                             Expr::Call {
                                 name: "__jsonb_subscript_set",
                                 ..
                             }
                         )
                     {
-                        assignments.as_mut_slice()[previous].1 = *value;
+                        assignments
+                            .as_mut_slice()
+                            .map_err(|_| self.arena_full("assignments exceed statement arena"))?
+                            [previous]
+                            .1 = *value;
                         continue;
                     }
                     return Err(self.err_here("multiple assignments to the same column"));

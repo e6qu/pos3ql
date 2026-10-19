@@ -179,14 +179,82 @@ impl Drop for TriggerSqlScope<'_> {
     }
 }
 
-struct SuspendedStatementSnapshot {
-    lease: crate::storage::StatementSnapshotLease,
+// Utility commands retain their invocation context even without a row snapshot.
+pub(super) struct SuspendedStatement {
+    pub(super) lease: Option<crate::storage::StatementSnapshotLease>,
     command: u32,
     clock: super::datetime::StatementClock,
     deadline: i64,
+    context: super::exec::PlpgsqlTransactionContext,
+}
+
+pub(crate) fn validate_isolation_mode(
+    mode: crate::config::TransactionMode,
+    isolation: super::ast::TransactionIsolation,
+) -> Result<(), super::eval::SqlError> {
+    if mode == crate::config::TransactionMode::Locking
+        && matches!(
+            isolation,
+            super::ast::TransactionIsolation::RepeatableRead
+                | super::ast::TransactionIsolation::Serializable
+        )
+    {
+        return Err(crate::sql_err!(
+            super::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction_mode = locking supports READ COMMITTED and READ UNCOMMITTED only"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitTarget {
+    Ordinary,
+    Prepare {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
+    CommitPrepared {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
+    RollbackPrepared {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitBarrier {
+    NoJournal,
+    Journal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagedCommit {
+    pub lsn: u64,
+    pub barrier: CommitBarrier,
+    pub queue: Option<super::commit::Ticket>,
+    pub target: CommitTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CommitControl {
+    mode: TxnMode,
+    txid: u32,
+    isolation: TransactionIsolation,
+    read_only: bool,
+    deferrable: bool,
+    replication_apply: bool,
+    snapshot_lsn: Option<u64>,
+    snapshot_taken: bool,
+    transaction_start: Option<i64>,
+    command_id: u32,
+    command_counter: u32,
 }
 
 pub struct TxnState {
+    staged_commit: Option<StagedCommit>,
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
@@ -207,7 +275,8 @@ pub struct TxnState {
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
     transaction_start: Option<i64>,
-    suspended_statement: Option<SuspendedStatementSnapshot>,
+    suspended_statement: Option<SuspendedStatement>,
+    pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
@@ -893,6 +962,7 @@ impl TxnState {
                 .expect("sized to descriptor capacity");
         }
         Ok(Self {
+            staged_commit: None,
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
@@ -906,6 +976,7 @@ impl TxnState {
             snapshot_taken: false,
             transaction_start: None,
             suspended_statement: None,
+            checkpoint_request: None,
             command_id: 1,
             command_counter: 1,
             trigger_depth: 0,
@@ -1140,36 +1211,107 @@ impl TxnState {
         super::datetime::restore_transaction_clock(start);
     }
 
+    pub(super) fn commit_control(&self) -> CommitControl {
+        CommitControl {
+            mode: self.mode,
+            txid: self.txid,
+            isolation: self.isolation,
+            read_only: self.read_only,
+            deferrable: self.deferrable,
+            replication_apply: self.replication_apply,
+            snapshot_lsn: self.snapshot_lsn,
+            snapshot_taken: self.snapshot_taken,
+            transaction_start: self.transaction_start,
+            command_id: self.command_id,
+            command_counter: self.command_counter,
+        }
+    }
+
+    pub(super) fn install_commit_wait(&mut self, control: CommitControl, staged: StagedCommit) {
+        assert!(
+            !self.is_active() && self.staged_commit.is_none(),
+            "empty commit buffer"
+        );
+        self.mode = control.mode;
+        self.txid = control.txid;
+        self.isolation = control.isolation;
+        self.read_only = control.read_only;
+        self.deferrable = control.deferrable;
+        self.replication_apply = control.replication_apply;
+        self.snapshot_lsn = control.snapshot_lsn;
+        self.snapshot_taken = control.snapshot_taken;
+        self.transaction_start = control.transaction_start;
+        self.command_id = control.command_id;
+        self.command_counter = control.command_counter;
+        self.staged_commit = Some(staged);
+    }
+
+    pub(crate) fn staged_commit(&self) -> Option<StagedCommit> {
+        self.staged_commit
+    }
+
+    pub(crate) fn stage_commit(&mut self, lsn: u64, target: CommitTarget, barrier: CommitBarrier) {
+        assert!(
+            self.staged_commit.is_none(),
+            "commit staging is performed once"
+        );
+        self.staged_commit = Some(StagedCommit {
+            queue: None,
+            lsn,
+            target,
+            barrier,
+        });
+    }
+
+    pub(crate) fn take_staged_commit(&mut self) -> Option<StagedCommit> {
+        self.staged_commit.take()
+    }
+
     pub(crate) fn suspended_statement_deadline(&self) -> Option<i64> {
         self.suspended_statement
             .as_ref()
             .map(|suspended| suspended.deadline)
     }
 
-    pub(crate) fn suspend_statement_snapshot(
+    pub(super) fn suspended_statement_context(
+        &self,
+    ) -> Option<super::exec::PlpgsqlTransactionContext> {
+        self.suspended_statement.as_ref().map(|state| state.context)
+    }
+
+    pub(super) fn suspend_statement(
         &mut self,
-        lease: crate::storage::StatementSnapshotLease,
+        lease: Option<crate::storage::StatementSnapshotLease>,
         clock: super::datetime::StatementClock,
         deadline: i64,
+        context: super::exec::PlpgsqlTransactionContext,
     ) {
-        self.suspended_statement = Some(SuspendedStatementSnapshot {
+        if let Some(suspended) = &self.suspended_statement {
+            assert!(lease.is_none(), "one retained statement snapshot");
+            assert!(
+                suspended.context == context,
+                "one command invocation context"
+            );
+            return;
+        }
+        self.suspended_statement = Some(SuspendedStatement {
             lease,
             command: self.command_id,
             clock,
             deadline,
+            context,
         });
     }
 
-    pub(crate) fn resume_statement_snapshot(
-        &mut self,
-    ) -> Option<crate::storage::StatementSnapshotLease> {
+    pub(super) fn resume_statement(&mut self) -> Option<SuspendedStatement> {
         let suspended = self.suspended_statement.take()?;
         self.command_id = suspended.command;
-        Some(suspended.lease)
+        Some(suspended)
     }
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.checkpoint_request = None;
     }
 
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
@@ -2334,6 +2476,7 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.staged_commit = None;
         self.mode = TxnMode::Idle;
         self.command_id = 0;
         self.command_counter = 0;
@@ -2348,6 +2491,7 @@ impl TxnState {
         self.snapshot_taken = false;
         self.transaction_start = None;
         self.suspended_statement = None;
+        self.checkpoint_request = None;
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();

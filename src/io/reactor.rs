@@ -21,7 +21,16 @@ pub struct Reactor {
     /// Translated events, same capacity.
     events: Box<[Event]>,
     ready: usize,
+    owners: Box<[Registration]>,
 }
+
+#[derive(Clone, Copy)]
+struct Registration {
+    fd: RawFd,
+    token: u64,
+}
+
+const EMPTY_REGISTRATION: Registration = Registration { fd: -1, token: 0 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Event {
@@ -47,7 +56,7 @@ impl Reactor {
         budget
             .draw_array(
                 max_events,
-                size_of::<libc::kevent>() + size_of::<Event>(),
+                size_of::<libc::kevent>() + size_of::<Event>() + size_of::<Registration>(),
                 "reactor_events",
             )
             .map_err(ReactorSetupError::Budget)?;
@@ -61,59 +70,101 @@ impl Reactor {
             raw: vec![zero_kevent; max_events].into_boxed_slice(),
             events: vec![EMPTY_EVENT; max_events].into_boxed_slice(),
             ready: 0,
+            owners: vec![EMPTY_REGISTRATION; max_events].into_boxed_slice(),
         })
     }
 
     /// Registers permanent read interest for `fd`, reported with `token`.
-    pub fn register_read(&self, fd: RawFd, token: u64) -> std::io::Result<()> {
-        self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)
+    pub fn register_read(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
+        let index = self.owner_index(fd)?;
+        if self.owners[index].fd == fd && self.owners[index].token != token {
+            self.remove_filter(fd, libc::EVFILT_WRITE)?;
+        }
+        self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)?;
+        self.owners[index] = Registration { fd, token };
+        Ok(())
     }
 
     /// Sets read-readiness reporting without requiring callers to track
     /// whether a filter is currently installed.
-    pub fn set_read_interest(&self, fd: RawFd, token: u64, enabled: bool) -> std::io::Result<()> {
-        let result = if enabled {
-            self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)
+    pub fn set_read_interest(
+        &mut self,
+        fd: RawFd,
+        token: u64,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        let index = self.owner_index(fd)?;
+        if enabled {
+            self.change(fd, libc::EVFILT_READ, libc::EV_ADD, token)?;
         } else {
-            self.change(fd, libc::EVFILT_READ, libc::EV_DELETE, token)
-        };
-        match result {
-            Err(e) if !enabled && e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            other => other,
+            self.remove_filter(fd, libc::EVFILT_READ)?;
         }
+        self.owners[index] = Registration { fd, token };
+        Ok(())
     }
 
-    /// Turns write-readiness reporting for `fd` on or offset. Disabling when
+    /// Turns write-readiness reporting for `fd` on or off. Disabling when
     /// not enabled is a no-op so callers can treat this as setting the
     /// desired state rather than tracking transitions.
-    pub fn set_write_interest(&self, fd: RawFd, token: u64, enabled: bool) -> std::io::Result<()> {
-        let result = if enabled {
-            self.change(fd, libc::EVFILT_WRITE, libc::EV_ADD, token)
+    pub fn set_write_interest(
+        &mut self,
+        fd: RawFd,
+        token: u64,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        let index = self.owner_index(fd)?;
+        if enabled {
+            self.change(fd, libc::EVFILT_WRITE, libc::EV_ADD, token)?;
         } else {
-            self.change(fd, libc::EVFILT_WRITE, libc::EV_DELETE, token)
-        };
-        match result {
-            Err(e) if !enabled && e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            other => other,
+            self.remove_filter(fd, libc::EVFILT_WRITE)?;
         }
+        self.owners[index] = Registration { fd, token };
+        Ok(())
     }
 
-    /// Removes all interest for `fd`. Callers close the fd afterwards;
-    /// closing also removes kqueue registrations, so ENOENT here is fine.
-    pub fn deregister(&self, fd: RawFd) -> std::io::Result<()> {
-        for filter in [libc::EVFILT_READ, libc::EVFILT_WRITE] {
-            match self.change(fd, filter, libc::EV_DELETE, 0) {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
-                Err(e) => return Err(e),
-            }
+    /// Removes only the remembered owner, preserving a reused descriptor.
+    pub fn deregister_owned(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
+        if self
+            .owners
+            .iter()
+            .any(|owner| owner.fd == fd && owner.token == token)
+        {
+            self.deregister(fd)?;
         }
         Ok(())
     }
 
+    pub fn deregister(&mut self, fd: RawFd) -> std::io::Result<()> {
+        self.remove_filter(fd, libc::EVFILT_READ)?;
+        self.remove_filter(fd, libc::EVFILT_WRITE)?;
+        if let Some(owner) = self.owners.iter_mut().find(|owner| owner.fd == fd) {
+            *owner = EMPTY_REGISTRATION;
+        }
+        Ok(())
+    }
+
+    fn owner_index(&self, fd: RawFd) -> std::io::Result<usize> {
+        self.owners
+            .iter()
+            .position(|owner| owner.fd == fd)
+            .or_else(|| self.owners.iter().position(|owner| owner.fd == -1))
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    fn remove_filter(&self, fd: RawFd, filter: i16) -> std::io::Result<()> {
+        match self.change(fd, filter, libc::EV_DELETE, 0) {
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::EBADF)) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Bytes `new` will draw from the budget for a given event capacity.
     pub const fn budget_bytes(max_events: usize) -> usize {
-        max_events * (size_of::<libc::kevent>() + size_of::<Event>())
+        max_events * (size_of::<libc::kevent>() + size_of::<Event>() + size_of::<Registration>())
     }
 
     /// Like [`Self::wait`], but returns only the count; events are fetched
@@ -171,7 +222,7 @@ impl Reactor {
 
     /// Registers a level-triggered read on `fd` that stays readable while
     /// data is pending; used for the shutdown self-pipe.
-    pub fn register_read_oneshot(&self, fd: RawFd, token: u64) -> std::io::Result<()> {
+    pub fn register_read_oneshot(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
         self.register_read(fd, token)
     }
 

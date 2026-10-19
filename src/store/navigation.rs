@@ -350,7 +350,7 @@ impl NavigationWriter {
         }
     }
 
-    pub(crate) fn budget_bytes() -> usize {
+    pub(crate) const fn budget_bytes() -> usize {
         NODE_BYTES * LEVELS
     }
 
@@ -367,9 +367,9 @@ impl NavigationWriter {
         };
     }
 
-    pub(crate) fn append(
+    pub(crate) fn append<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         id: BlockId,
         entries: u64,
         summary: NavigationSummary,
@@ -392,9 +392,9 @@ impl NavigationWriter {
         )
     }
 
-    fn push(
+    fn push<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         level: usize,
         reference: NavigationReference,
     ) -> Result<(), ValueIndexError> {
@@ -418,9 +418,9 @@ impl NavigationWriter {
         Ok(())
     }
 
-    fn publish(
+    fn publish<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         level: usize,
     ) -> Result<NavigationReference, ValueIndexError> {
         let at = level * NODE_BYTES;
@@ -431,7 +431,7 @@ impl NavigationWriter {
         header[2] = self.position;
         header[3] = u8::from(self.covering);
         header[4..6].copy_from_slice(&(self.counts[level] as u16).to_le_bytes());
-        let id = store.put(
+        let id = store.write_block(
             &self.nodes[at..at + HEADER + self.counts[level] * REFERENCE],
             self.block_type,
             0,
@@ -447,9 +447,9 @@ impl NavigationWriter {
         Ok(reference)
     }
 
-    pub(crate) fn finish(
+    pub(crate) fn finish<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
     ) -> Result<BlockId, ValueIndexError> {
         for level in 0..LEVELS {
             if self.counts[level + 1..].iter().all(|count| *count == 0) {

@@ -1628,7 +1628,7 @@ mod tests {
             assert_eq!(budget.used(), 0);
         }
         assert!(
-            crate::config::Config::parse("memtable_bytes = 4GiB")
+            crate::config::Config::parse("transaction_mode = mvcc\nmemtable_bytes = 4GiB")
                 .unwrap_err()
                 .message
                 .contains("row-location")

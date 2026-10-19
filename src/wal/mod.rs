@@ -2356,6 +2356,7 @@ impl Wal {
     pub fn next_committed_after(
         &self,
         floor: u64,
+        ceiling: u64,
         scratch: &mut FixedBuf,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<Option<u64>, SqlError> {
@@ -2387,6 +2388,10 @@ impl Wal {
                 ));
             }
             previous_lsn = lsn;
+            if lsn > ceiling {
+                scratch.clear();
+                return Ok(None);
+            }
             if lsn <= floor {
                 offset += total as u64;
                 continue;
@@ -15792,17 +15797,35 @@ mod tests {
         wal.commit();
         let mut scratch = FixedBuf::new(&mut budget, "cursor scratch", 4096).unwrap();
         assert!(
-            wal.next_committed_after(0, &mut scratch, |_, _| Ok(()))
+            wal.next_committed_after(0, u64::MAX, &mut scratch, |_, _| Ok(()))
                 .unwrap()
                 .is_none()
         );
 
         let commit_lsn = wal.commit_stage(1, 0).unwrap();
         wal.commit();
+        for ceiling in [0, commit_lsn - 1] {
+            assert_eq!(
+                wal.next_committed_after(0, ceiling, &mut scratch, |_, _| {
+                    panic!("an unpublished transaction must not reach logical decoding")
+                })
+                .unwrap(),
+                None
+            );
+            assert!(scratch.is_empty());
+        }
+        assert_eq!(
+            wal.next_committed_after(0, commit_lsn, &mut scratch, |lsn, _| {
+                assert_eq!(lsn, commit_lsn);
+                Ok(())
+            })
+            .unwrap(),
+            Some(commit_lsn)
+        );
         let mut seen = [(0u64, 0u8); 3];
         let mut count = 0;
         assert_eq!(
-            wal.next_committed_after(0, &mut scratch, |lsn, record| {
+            wal.next_committed_after(0, u64::MAX, &mut scratch, |lsn, record| {
                 let mut at = 0;
                 while at < record.len() {
                     let length =
@@ -15826,7 +15849,7 @@ mod tests {
         assert_eq!(seen[1].1, KIND_DELETE);
         assert_eq!(seen[2].1, KIND_COMMIT);
         let mut transaction_id = 0;
-        wal.next_committed_after(0, &mut scratch, |_, transaction| {
+        wal.next_committed_after(0, u64::MAX, &mut scratch, |_, transaction| {
             let commit = &transaction[transaction.len() - Wal::commit_boundary_bytes()..];
             if let WalOp::Commit {
                 transaction_id: value,
@@ -15840,7 +15863,7 @@ mod tests {
         .unwrap();
         assert_eq!(transaction_id, 1);
         assert!(
-            wal.next_committed_after(commit_lsn, &mut scratch, |_, _| Ok(()))
+            wal.next_committed_after(commit_lsn, u64::MAX, &mut scratch, |_, _| Ok(()))
                 .unwrap()
                 .is_none()
         );

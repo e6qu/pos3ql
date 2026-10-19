@@ -39,13 +39,16 @@ pub(crate) struct PreparedTransactions {
 #[derive(Clone, Copy)]
 enum PreparedTransactionImage {
     Preparing(PreparedTransactionMetadata),
-    Prepared(PreparedTransactionMetadata),
+    Prepared {
+        metadata: PreparedTransactionMetadata,
+        resolver: Option<u32>,
+    },
 }
 
 impl PreparedTransactionImage {
     fn metadata(self) -> PreparedTransactionMetadata {
         match self {
-            Self::Preparing(metadata) | Self::Prepared(metadata) => metadata,
+            Self::Preparing(metadata) | Self::Prepared { metadata, .. } => metadata,
         }
     }
 
@@ -58,7 +61,10 @@ impl PreparedTransactionImage {
         }
         match (metadata.first_lsn, metadata.prepared_lsn) {
             (0, 0) => Ok(Self::Preparing(metadata)),
-            (first, prepared) if first > 0 && prepared >= first => Ok(Self::Prepared(metadata)),
+            (first, prepared) if first > 0 && prepared >= first => Ok(Self::Prepared {
+                metadata,
+                resolver: None,
+            }),
             _ => Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "invalid prepared transaction WAL range"
@@ -159,7 +165,10 @@ impl PreparedTransactions {
         };
         metadata.first_lsn = first_lsn;
         metadata.prepared_lsn = prepared_lsn;
-        self.slots[index].metadata = Some(PreparedTransactionImage::Prepared(metadata));
+        self.slots[index].metadata = Some(PreparedTransactionImage::Prepared {
+            metadata,
+            resolver: None,
+        });
     }
 
     pub(crate) fn entries(
@@ -178,9 +187,39 @@ impl PreparedTransactions {
             .iter()
             .enumerate()
             .filter_map(|(index, slot)| match slot.metadata {
-                Some(PreparedTransactionImage::Prepared(metadata)) => Some((index, metadata)),
+                Some(PreparedTransactionImage::Prepared { metadata, .. }) => {
+                    Some((index, metadata))
+                }
                 Some(PreparedTransactionImage::Preparing(_)) | None => None,
             })
+    }
+
+    pub(crate) fn resolution_blocker(&self, index: usize, requester: u32) -> Option<u32> {
+        match self.slots[index]
+            .metadata
+            .expect("prepared slot is reserved")
+        {
+            PreparedTransactionImage::Preparing(metadata) => Some(metadata.transaction_id),
+            PreparedTransactionImage::Prepared { resolver, .. } => {
+                resolver.filter(|owner| *owner != requester)
+            }
+        }
+    }
+
+    pub(crate) fn claim_resolution(&mut self, index: usize, transaction: u32) {
+        let Some(PreparedTransactionImage::Prepared { metadata, resolver }) =
+            self.slots[index].metadata
+        else {
+            panic!("resolution requires a fully published prepared transaction");
+        };
+        assert!(
+            resolver.is_none_or(|owner| owner == transaction),
+            "prepared resolution has one owner"
+        );
+        self.slots[index].metadata = Some(PreparedTransactionImage::Prepared {
+            metadata,
+            resolver: Some(transaction),
+        });
     }
 
     pub(crate) fn release(&mut self, index: usize) {

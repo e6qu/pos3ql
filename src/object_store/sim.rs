@@ -52,6 +52,8 @@ pub(crate) struct FaultPlan {
     /// A PUT that applies but whose response is lost — the caller sees an
     /// I/O error and cannot know the object landed.
     pub(crate) ambiguous_put_per_mille: u32,
+    /// Lose only conditional PUT responses, keeping immutable data uploads healthy.
+    pub(crate) ambiguous_conditional_put_per_mille: u32,
     /// One bit of a GET body flipped in flight (the stored object stays
     /// intact). A reader that believes the bytes has no integrity checking.
     pub(crate) rot_per_mille: u32,
@@ -286,7 +288,11 @@ impl SimClient {
             ),
         }
         let ambiguous_per_mille = bucket.faults.ambiguous_put_per_mille;
-        if bucket.roll(ambiguous_per_mille) {
+        let conditional_per_mille = bucket.faults.ambiguous_conditional_put_per_mille;
+        let conditional_response_lost = conditional_per_mille != 0
+            && !matches!(precondition, Precondition::None)
+            && bucket.roll(conditional_per_mille);
+        if bucket.roll(ambiguous_per_mille) || conditional_response_lost {
             // Applied above — the response is what got lost.
             return Err(io_fault("simulated ambiguous PUT (applied, response lost)"));
         }

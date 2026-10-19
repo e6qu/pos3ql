@@ -484,6 +484,7 @@ impl Conn {
                 budget,
                 config.max_sequences,
                 config.max_savepoints_per_transaction,
+                config.transaction_mode,
             )?,
             scram: ScramFlow::new(),
             role_scram: None,
@@ -606,6 +607,10 @@ impl Conn {
             || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
+    pub(crate) fn owns_pending_object_reads(&self) -> bool {
+        self.parked && self.parked_for_io && self.txn.staged_commit().is_none()
+    }
+
     pub(crate) fn wants_read(&self) -> bool {
         matches!(self.termination, TerminationState::Draining { .. })
             || (!self.parked && matches!(self.termination, TerminationState::Open))
@@ -680,7 +685,7 @@ impl Conn {
     }
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
-        if !self.parked {
+        if !self.parked || self.txn.staged_commit().is_some() {
             return false;
         }
         let extended = self.recv.readable().first() != Some(&wire::FMSG_QUERY);
@@ -879,12 +884,26 @@ impl Conn {
             // boundary.  The journal remains available for a later retry,
             // but this client receives an explicit unknown-outcome error.
             self.send.truncate_to(output_mark);
+            let staged = self.txn.staged_commit().is_some();
+            if staged {
+                self.recv.clear();
+                self.finish_lock_wait();
+                self.replication_completion_pending = false;
+                self.start_termination();
+                pending.after = After::Continue;
+            }
             let mut responder = Responder::new(&mut self.send);
-            if responder
-                .error(error.sqlstate, error.message.as_str())
-                .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
-                .is_err()
-            {
+            let sent = if staged {
+                responder.fatal(
+                    "08007",
+                    "commit outcome is unknown; reconnect before checking it",
+                )
+            } else {
+                responder
+                    .error(error.sqlstate, error.message.as_str())
+                    .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+            };
+            if sent.is_err() {
                 pending.after = After::Close;
             }
         }
@@ -1729,7 +1748,7 @@ impl Conn {
 
         if self.copy.is_some() {
             let step = self.process_copy_message(engine, msg_type, total);
-            if !matches!(step, Step::Close) {
+            if !matches!(step, Step::Close | Step::Parked) {
                 self.recv.consume(total);
             }
             return step;
@@ -1767,6 +1786,14 @@ impl Conn {
                         &mut responder,
                     )
                 {
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        && self.txn.staged_commit().is_some()
+                    {
+                        let generation = engine.lock_generation();
+                        self.park(true, generation);
+                        engine.park_backend_statement(self.id, true);
+                        return Step::Parked;
+                    }
                     self.cursors.on_rollback();
                     if responder
                         .error(error.sqlstate, error.message.as_str())
@@ -1809,6 +1836,30 @@ impl Conn {
     }
 
     fn handle_function_call(&mut self, engine: &mut Engine, total: usize) -> Step {
+        if self.txn.staged_commit().is_some() {
+            match engine.finish_staged_transaction(&mut self.txn, &self.guc) {
+                Ok(()) => {
+                    return if Responder::new(&mut self.send)
+                        .ready_for_query(self.txn.status_byte())
+                        .is_ok()
+                    {
+                        self.finish_lock_wait();
+                        Step::Continue
+                    } else {
+                        Step::Close
+                    };
+                }
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                    self.park(true, engine.lock_generation());
+                    return Step::Parked;
+                }
+                Err(error) => {
+                    let _ = Responder::new(&mut self.send)
+                        .error(error.sqlstate, error.message.as_str());
+                    return Step::Close;
+                }
+            }
+        }
         const MAX_FAST_PATH_ARGUMENTS: usize = 3;
         self.arena.reset();
         let payload = &self.recv.readable()[5..total];
@@ -1928,7 +1979,12 @@ impl Conn {
             )
         };
         match result {
-            Ok(_) => Step::Continue,
+            Ok(crate::sql::ExtendedExecutionStatus::Complete(_)) => Step::Continue,
+            Ok(crate::sql::ExtendedExecutionStatus::Blocked { io_wait }) => {
+                self.park(io_wait, engine.lock_generation());
+                engine.park_backend_statement(self.id, io_wait);
+                Step::Parked
+            }
             Err(WireFull) => Step::Close,
         }
     }
@@ -2510,9 +2566,9 @@ impl Conn {
             }
             self.copy_buf.clear();
         }
-        let copy = self.copy.take().expect("in copy-in mode");
+        let mut copy = self.copy.take().expect("in copy-in mode");
         let extended = copy.extended;
-        let outcome = match copy.failed {
+        let outcome = match copy.failed.take() {
             Some(e) => {
                 engine.copy_abort(&mut self.txn, &self.guc);
                 Err(e)
@@ -2526,11 +2582,25 @@ impl Conn {
                         &self.guc,
                         &mut responder,
                         &self.copy_transition_scratch,
+                        if extended {
+                            crate::sql::CopyFinishMode::Statement
+                        } else {
+                            crate::sql::CopyFinishMode::ImplicitTransaction
+                        },
                     )
                     .map(|()| copy.count)
             }
         };
+        if matches!(&outcome, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+            && self.txn.staged_commit().is_some()
+        {
+            self.copy = Some(copy);
+            self.park(true, engine.lock_generation());
+            engine.park_backend_statement(self.id, true);
+            return Step::Parked;
+        }
         self.copy_transition_scratch.clear();
+        self.finish_lock_wait();
         let failed = outcome.is_err();
         engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
@@ -5495,6 +5565,579 @@ mod tests {
     }
 
     #[test]
+    fn parallel_commit_copy_done_retains_its_frame_and_runs_triggers_once() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) -> Step {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            crate::mem::guard::forbid_alloc(|| conn.process_message(engine))
+        }
+        fn assert_rows(response: &[u8]) {
+            assert!(!has_backend_message(response, wire::MSG_ERROR_RESPONSE));
+            for expected in [
+                &b"D\0\0\0\x0c\0\x01\0\0\0\x0223"[..],
+                &b"D\0\0\0\x10\0\x02\0\0\0\x011\0\0\0\x012"[..],
+            ] {
+                assert!(
+                    response
+                        .windows(expected.len())
+                        .any(|bytes| bytes == expected),
+                    "{}",
+                    String::from_utf8_lossy(response)
+                );
+            }
+        }
+        const RESULTS: &[u8] = b"SELECT sum(id) FROM copy_pending; \
+            SELECT count(*), sum(n) FROM copy_pending_audit\0";
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            for binary in [false, true] {
+                let mode_name = match mode {
+                    crate::config::TransactionMode::Mvcc => "mvcc",
+                    crate::config::TransactionMode::Locking => "locking",
+                };
+                let name = format!("copy-done-{mode_name}-{binary}-{}", std::process::id());
+                let directory = std::env::temp_dir().join(&name);
+                let mut config = Config::default_dev();
+                config.transaction_mode = mode;
+                config.data_dir = directory.to_string_lossy().into_owned();
+                config.max_tables = 8;
+                config.table_rows = 64;
+                config.max_connections = 4;
+                config.wal_bytes = 1 << 20;
+                config.wal_buffer_bytes = 1 << 16;
+                config.wal_upload_buffer_bytes = 1 << 16;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.object_store_bucket = name;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut conn = Conn::new(&config, &mut budget).unwrap();
+                conn.phase = Phase::Ready;
+                // Initial publication populates the simulator's remote fixtures.
+                assert!(conn.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"CREATE TABLE copy_pending(id integer PRIMARY KEY); \
+                          CREATE TABLE copy_pending_audit(n bigint); \
+                          CREATE FUNCTION copy_pending_row() RETURNS trigger LANGUAGE plpgsql AS \
+                            'BEGIN NEW.id := NEW.id + 10; RETURN NEW; END'; \
+                          CREATE FUNCTION copy_pending_statement() RETURNS trigger LANGUAGE plpgsql AS \
+                            'BEGIN INSERT INTO copy_pending_audit SELECT count(*) FROM inserted_rows; RETURN NULL; END'; \
+                          CREATE TRIGGER copy_pending_row BEFORE INSERT ON copy_pending \
+                            FOR EACH ROW EXECUTE FUNCTION copy_pending_row(); \
+                          CREATE TRIGGER copy_pending_statement AFTER INSERT ON copy_pending \
+                            REFERENCING NEW TABLE AS inserted_rows \
+                            FOR EACH STATEMENT EXECUTE FUNCTION copy_pending_statement()\0"
+                )));
+                assert!(matches!(conn.process_message(&mut engine), Step::Continue));
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                engine.commit_wal().unwrap();
+                engine.enable_async_durability();
+                assert!(matches!(
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_QUERY,
+                        if binary {
+                            b"COPY copy_pending FROM STDIN (FORMAT binary) WHERE id > 0\0"
+                        } else {
+                            b"COPY copy_pending FROM STDIN WHERE id > 0\0"
+                        },
+                    ),
+                    Step::Continue
+                ));
+                let mut data = Vec::new();
+                if binary {
+                    data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+                    data.extend_from_slice(&[0; 8]);
+                    for id in [1i32, -1, 2] {
+                        data.extend_from_slice(&1i16.to_be_bytes());
+                        data.extend_from_slice(&4i32.to_be_bytes());
+                        data.extend_from_slice(&id.to_be_bytes());
+                    }
+                    data.extend_from_slice(&(-1i16).to_be_bytes());
+                } else {
+                    data.extend_from_slice(b"1\n-1\n2\n");
+                }
+                for chunk in data.chunks(3) {
+                    assert!(matches!(
+                        message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, chunk),
+                        Step::Continue
+                    ));
+                }
+                assert_eq!(conn.copy.as_ref().unwrap().count, 2);
+                assert!(matches!(
+                    message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, &[]),
+                    Step::Parked
+                ));
+                let done = frontend(wire::FMSG_COPY_DONE, &[]);
+                assert_eq!(conn.recv.readable(), done);
+                assert!(conn.send.is_empty());
+                assert!(conn.txn.staged_commit().is_some());
+                assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, RESULTS)));
+                let queued_bytes = conn.recv.len();
+                let journal_lsn = engine.journal_lsn();
+                for _ in 0..2 {
+                    let pending = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, 0, true).unwrap()
+                    });
+                    assert_eq!(pending.after, After::Continue);
+                    assert!(conn.parked);
+                    assert_eq!(conn.recv.len(), queued_bytes);
+                    assert!(conn.send.is_empty());
+                    assert_eq!(engine.journal_lsn(), journal_lsn);
+                }
+                // Simulator uploads allocate their remote fixture objects.
+                engine.commit_wal().unwrap();
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+                assert!(!conn.parked);
+                assert!(!conn.parked_for_io);
+                assert!(conn.recv.is_empty());
+                assert!(conn.copy.is_none());
+                assert!(conn.copy_transition_scratch.is_empty());
+                assert!(conn.txn.staged_commit().is_none());
+                assert_eq!(
+                    conn.send
+                        .readable()
+                        .windows(7)
+                        .filter(|bytes| *bytes == b"COPY 2\0")
+                        .count(),
+                    1
+                );
+                assert_rows(conn.send.readable());
+                drop(conn);
+                drop(engine);
+                std::fs::remove_dir_all(&directory).unwrap();
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut conn = Conn::new(&config, &mut budget).unwrap();
+                conn.phase = Phase::Ready;
+                assert!(matches!(
+                    message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
+                    Step::Continue
+                ));
+                assert_rows(conn.send.readable());
+                drop(conn);
+                drop(engine);
+                std::fs::remove_dir_all(directory).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_checkpoint_protocol_parks_resumes_and_cancels_without_replaying_commands() {
+        for (extended, cancel) in [(false, false), (true, false), (false, true)] {
+            let name = format!(
+                "checkpoint-protocol-{extended}-{cancel}-{}",
+                std::process::id()
+            );
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 4;
+            config.table_rows = 16;
+            config.max_connections = 2;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 16;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
+            config.max_value_indexes = 2;
+            config.value_index_rows = 16;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let mut other = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let role = engine.role_login("postgres").unwrap().slot;
+            for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
+                let (server, _) = listener.accept().unwrap();
+                server.set_nonblocking(true).unwrap();
+                connection.open(server, id);
+                connection.phase = Phase::Ready;
+                engine
+                    .register_backend(
+                        id,
+                        crate::storage::DatabaseOid::POSTGRES,
+                        role,
+                        "",
+                        None,
+                        -1,
+                        connection.backend_start,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.enable_async_durability();
+            if extended {
+                conn.recv
+                    .append(&frontend(wire::FMSG_PARSE, b"\0CHECKPOINT\0\0\0"));
+                conn.recv
+                    .append(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+                conn.recv
+                    .append(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+                conn.recv.append(&frontend(wire::FMSG_SYNC, &[]));
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"SELECT 17\0"));
+            } else {
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"CHECKPOINT; SELECT 17\0"));
+            }
+            let mut parked = false;
+            for _ in 0..4 {
+                match crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)) {
+                    Step::Continue => {}
+                    Step::Parked => {
+                        parked = true;
+                        break;
+                    }
+                    _ => panic!("CHECKPOINT must park before completion"),
+                }
+            }
+            assert!(parked && conn.parked);
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_COMMAND_COMPLETE
+            ));
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            let pending = crate::mem::guard::forbid_alloc(|| {
+                conn.retry_parked(&mut engine, 0, true).unwrap()
+            });
+            assert_eq!(pending.after, After::Continue);
+            assert!(conn.parked, "an early wakeup must retain the same request");
+            other
+                .recv
+                .append(&frontend(wire::FMSG_QUERY, b"SELECT 23\0"));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| other.process_message(&mut engine)),
+                Step::Continue
+            ));
+            assert!(
+                has_backend_message(other.send.readable(), wire::MSG_DATA_ROW),
+                "another connection can query while CHECKPOINT waits"
+            );
+            if cancel {
+                assert!(crate::mem::guard::forbid_alloc(
+                    || conn.cancel_parked(&mut engine)
+                ));
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(5)
+                        .any(|bytes| bytes == b"57014")
+                );
+                assert!(
+                    !conn
+                        .send
+                        .readable()
+                        .windows(11)
+                        .any(|bytes| bytes == b"CHECKPOINT\0")
+                );
+                conn.send.clear();
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"SELECT 17\0"));
+                assert!(matches!(
+                    crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+                    Step::Continue
+                ));
+            } else {
+                let mut saved = false;
+                for _ in 0..128 {
+                    engine
+                        .advance_wal_publication(std::time::Instant::now())
+                        .unwrap();
+                    if engine.checkpoint_beat() == crate::sql::CheckpointBeat::Durable {
+                        saved = true;
+                        break;
+                    }
+                }
+                assert!(saved);
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert_eq!(
+                    conn.send
+                        .readable()
+                        .windows(11)
+                        .filter(|bytes| *bytes == b"CHECKPOINT\0")
+                        .count(),
+                    1,
+                    "resume completes the original command exactly once"
+                );
+            }
+            assert!(
+                conn.send
+                    .readable()
+                    .windows(13)
+                    .any(|bytes| bytes == b"D\0\0\0\x0c\0\x01\0\0\0\x0217")
+            );
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            assert!(engine.fatal_commit_failure().is_none());
+            engine.drop_connection(73);
+            engine.drop_connection(74);
+            drop(conn);
+            drop(other);
+            drop(client);
+            drop(other_client);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
+    fn parallel_commit_prepared_protocol_keeps_the_connection_after_resolution() {
+        fn request(conn: &mut Conn, engine: &mut Engine, input: &[u8]) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(input));
+            for _ in 0..32 {
+                match crate::mem::guard::forbid_alloc(|| conn.process_message(engine)) {
+                    Step::Continue => {}
+                    Step::NeedMoreData => break,
+                    Step::Parked => {
+                        assert!(conn.txn.staged_commit().is_some());
+                        for _ in 0..2 {
+                            let waiting = crate::mem::guard::forbid_alloc(|| {
+                                conn.retry_parked(engine, 0, true).unwrap()
+                            });
+                            assert_eq!(waiting.after, After::Continue);
+                            assert!(conn.parked && conn.txn.staged_commit().is_some());
+                            assert!(!has_backend_message(
+                                conn.send.readable(),
+                                wire::MSG_ERROR_RESPONSE,
+                            ));
+                        }
+                        // The simulated remote store may allocate fixture objects.
+                        engine.commit_wal().unwrap();
+                        let pending = crate::mem::guard::forbid_alloc(|| {
+                            conn.retry_parked(engine, 0, true).unwrap()
+                        });
+                        assert_eq!(
+                            pending.after,
+                            After::Continue,
+                            "response {:?}, fatal {:?}",
+                            conn.send.readable(),
+                            engine.fatal_commit_failure()
+                        );
+                    }
+                    Step::Close => panic!(
+                        "connection closed: response {:?}, fatal {:?}",
+                        conn.send.readable(),
+                        engine.fatal_commit_failure()
+                    ),
+                }
+                if conn.recv.is_empty() {
+                    break;
+                }
+            }
+            assert!(conn.recv.is_empty() && !conn.parked);
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+            let response = conn.send.readable().to_vec();
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| conn.finish_response(
+                    PendingResponse {
+                        after: After::Continue,
+                        publication_mark: Some(0),
+                    },
+                    None,
+                )),
+                After::Continue
+            );
+            assert!(!conn.is_terminating());
+            response
+        }
+        fn extended(sql: &str, binary: bool) -> Vec<u8> {
+            let mut parse = vec![0];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            let mut input = frontend(wire::FMSG_PARSE, &parse);
+            input.extend_from_slice(&frontend(
+                wire::FMSG_BIND,
+                if binary {
+                    b"\0\0\0\0\0\0\0\x01\0\x01"
+                } else {
+                    b"\0\0\0\0\0\0\0\0"
+                },
+            ));
+            if binary {
+                input.extend_from_slice(&frontend(wire::FMSG_DESCRIBE, b"P\0"));
+            }
+            input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+            input.extend_from_slice(&frontend(wire::FMSG_SYNC, &[]));
+            input
+        }
+        for commit in [false, true] {
+            let name = format!("prepared-protocol-{commit}-{}", std::process::id());
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 8;
+            config.table_rows = 64;
+            config.max_connections = 4;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 64;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            server.set_nonblocking(true).unwrap();
+            conn.open(server, 72);
+            conn.phase = Phase::Ready;
+            let role = engine.role_login("postgres").unwrap().slot;
+            engine
+                .register_backend(
+                    72,
+                    crate::storage::DatabaseOid::POSTGRES,
+                    role,
+                    "",
+                    None,
+                    -1,
+                    conn.backend_start,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            conn.recv.append(&frontend(
+                wire::FMSG_QUERY,
+                b"CREATE TABLE prepared_protocol(id integer PRIMARY KEY, value text); \
+                  INSERT INTO prepared_protocol VALUES(1, 'before')\0",
+            ));
+            assert!(matches!(conn.process_message(&mut engine), Step::Continue));
+            engine.commit_wal().unwrap();
+            engine.enable_async_durability();
+            request(&mut conn, &mut engine, &extended("BEGIN", false));
+            request(
+                &mut conn,
+                &mut engine,
+                &extended(
+                    "UPDATE prepared_protocol SET value = 'after' WHERE id = 1",
+                    false,
+                ),
+            );
+            request(
+                &mut conn,
+                &mut engine,
+                &extended("PREPARE TRANSACTION 'protocol-held'", false),
+            );
+            request(
+                &mut conn,
+                &mut engine,
+                &extended("SELECT transaction FROM pg_prepared_xacts", true),
+            );
+            let hidden = request(
+                &mut conn,
+                &mut engine,
+                &frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT value FROM prepared_protocol WHERE id = 1\0",
+                ),
+            );
+            assert!(
+                hidden
+                    .windows(17)
+                    .any(|bytes| bytes == b"D\0\0\0\x10\0\x01\0\0\0\x06before")
+            );
+            let resolution = request(
+                &mut conn,
+                &mut engine,
+                &extended(
+                    if commit {
+                        "COMMIT PREPARED 'protocol-held'"
+                    } else {
+                        "ROLLBACK PREPARED 'protocol-held'"
+                    },
+                    false,
+                ),
+            );
+            let tag: &[u8] = if commit {
+                b"COMMIT PREPARED\0"
+            } else {
+                b"ROLLBACK PREPARED\0"
+            };
+            assert!(resolution.windows(tag.len()).any(|bytes| bytes == tag));
+            let visible = request(
+                &mut conn,
+                &mut engine,
+                &frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT value FROM prepared_protocol WHERE id = 1\0",
+                ),
+            );
+            let row: &[u8] = if commit {
+                b"D\0\0\0\x0f\0\x01\0\0\0\x05after"
+            } else {
+                b"D\0\0\0\x10\0\x01\0\0\0\x06before"
+            };
+            assert!(visible.windows(row.len()).any(|bytes| bytes == row));
+            assert!(engine.fatal_commit_failure().is_none());
+            assert!(engine.take_backend_signal().is_none());
+            engine.drop_connection(72);
+            drop(conn);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
     fn copy_transition_values_survive_chunks_and_release_after_errors_and_rollback() {
         fn message(
             conn: &mut Conn,
@@ -6700,6 +7343,94 @@ mod tests {
                 .readable()
                 .contains(&wire::MSG_READY_FOR_QUERY)
         );
+    }
+
+    #[test]
+    fn parallel_commit_unknown_outcome_flushes_fatal_before_closing_a_full_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    core::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let config = Config::default_dev();
+        let mut budget = Budget::new(256 << 20);
+        let mut connection = Conn::new(&config, &mut budget).unwrap();
+        connection.open(server, 72);
+        let padding = [0u8; 4096];
+        let mut prefix = 0usize;
+        let mut stream = connection.stream();
+        loop {
+            match stream.write(&padding) {
+                Ok(length) => {
+                    assert!(length > 0 && prefix < (8 << 20));
+                    prefix += length;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        connection.txn.stage_commit(
+            1,
+            crate::sql::txn::CommitTarget::Ordinary,
+            crate::sql::txn::CommitBarrier::Journal,
+        );
+        connection.park(true, 0);
+        client.write_all(b"Q\0\0\0\x0dSELECT 1\0").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let error = crate::sql_err!(sqlstate::IO_ERROR, "publication response lost");
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| connection.finish_response(
+                PendingResponse {
+                    after: After::Continue,
+                    publication_mark: Some(0)
+                },
+                Some(&error)
+            )),
+            After::Continue
+        );
+        assert!(connection.is_terminating());
+        if !connection.transport_output_empty() {
+            assert!(!connection.wants_read());
+        }
+        let mut scratch = [0u8; 4096];
+        while prefix != 0 {
+            let length = prefix.min(scratch.len());
+            client.read_exact(&mut scratch[..length]).unwrap();
+            assert!(scratch[..length].iter().all(|byte| *byte == 0));
+            prefix -= length;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !connection.transport_output_empty() {
+            assert!(Instant::now() < deadline, "terminal response did not flush");
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| connection.on_writable()),
+                After::Continue
+            );
+            std::thread::yield_now();
+        }
+        assert!(connection.wants_read());
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
+        assert!(response.windows(5).any(|bytes| bytes == b"08007"));
+        assert!(connection.txn.staged_commit().is_some());
+        assert_eq!(connection.drain_termination_input(), After::Continue);
+        assert_eq!(connection.drain_termination_input(), After::Close);
     }
 
     #[test]

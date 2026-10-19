@@ -19,8 +19,18 @@ pub enum LogFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionMode {
+    Mvcc,
+    Locking,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Required file setting: retain committed versions or wait on relation locks.
+    pub transaction_mode: TransactionMode,
+    /// Transactions whose object-store commit owns detached execution state.
+    pub commit_queue_slots: usize,
     /// Address the PostgreSQL wire listener binds to.
     pub listen_addr: String,
     /// Address for the optional unauthenticated operational HTTP listener.
@@ -283,6 +293,8 @@ pub struct Config {
     pub checkpoint_delete_objects_per_beat: usize,
     /// Physical row-version entries retained while one SST pair is merged.
     pub checkpoint_merge_entries: usize,
+    /// Committed versions scheduled by one retained table checkpoint writer.
+    pub checkpoint_write_entries: usize,
     /// S3-compatible data-plane authority (`host:port`).
     pub object_store_endpoint: String,
     /// Bucket containing this database's durable objects.
@@ -308,6 +320,11 @@ pub struct Config {
     /// Independently connected durable-block GET slots. Each reserves its
     /// request and response buffers at startup; exhaustion parks the caller.
     pub object_store_get_slots: usize,
+    /// Independently connected upload slots. Each owns up to
+    /// wal_upload_buffer_bytes of immutable request data until completion.
+    pub object_store_put_slots: usize,
+    /// Physical-block upload clients, independent of journal publication.
+    pub object_store_block_put_slots: usize,
     /// Deadline after which a pending durable-block GET may use one spare
     /// fixed slot for a duplicate request. Zero disables hedging.
     pub object_store_hedge_after_ms: u64,
@@ -317,9 +334,8 @@ pub struct Config {
     /// Extra PEM root certificates for object-store TLS (self-signed test
     /// endpoints); empty = the compiled-in Mozilla roots alone.
     pub object_store_tls_ca_file: String,
-    /// Byte budget for the isolated TLS component's allocations (the object
-    /// client; every configured outbound subscription worker; and, when
-    /// `tls_on`, every server-side session).
+    /// Base byte ceiling for object-store TLS. Startup adds headroom for
+    /// every subscription transport and, when enabled, server-side session.
     pub tls_pool_bytes: usize,
     /// Server-side TLS: answer the SSLRequest probe with `S` and negotiate TLS
     /// for the client connection. Requires `tls_cert_file` and `tls_key_file`.
@@ -355,9 +371,11 @@ impl Drop for TestDataDirCleanup {
 }
 
 impl Config {
-    /// Development defaults, used when no config file is given.
+    /// Explicit development fixture; the server requires a configuration file.
     pub fn default_dev() -> Self {
         Self {
+            transaction_mode: TransactionMode::Mvcc,
+            commit_queue_slots: 4,
             listen_addr: "127.0.0.1:5433".to_string(),
             operations_listen_addr: String::new(),
             operations_max_connections: 4,
@@ -467,6 +485,7 @@ impl Config {
             checkpoint_garbage_batch_objects: 4096,
             checkpoint_delete_objects_per_beat: 16,
             checkpoint_merge_entries: 512 * 1024,
+            checkpoint_write_entries: 64 * 1024,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),
             object_store_prefix: String::new(),
@@ -479,6 +498,8 @@ impl Config {
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
             object_store_get_slots: 4,
+            object_store_put_slots: 4,
+            object_store_block_put_slots: 4,
             object_store_hedge_after_ms: 0,
             object_store_tls: false,
             object_store_tls_ca_file: String::new(),
@@ -576,6 +597,23 @@ impl Config {
             }
             seen.push(canonical_key.to_string());
             match canonical_key {
+                "commit_queue_slots" => {
+                    config.commit_queue_slots = parse_count(value)
+                        .map_err(|message| ConfigError::at(line_no, message))?
+                        as usize;
+                }
+                "transaction_mode" => {
+                    config.transaction_mode = match value {
+                        "mvcc" => TransactionMode::Mvcc,
+                        "locking" => TransactionMode::Locking,
+                        _ => {
+                            return Err(ConfigError::at(
+                                line_no,
+                                "transaction_mode must be mvcc or locking".to_string(),
+                            ));
+                        }
+                    };
+                }
                 "listen_addr" => config.listen_addr = value.to_string(),
                 "operations_listen_addr" => config.operations_listen_addr = value.to_string(),
                 "operations_max_connections" => {
@@ -1017,6 +1055,10 @@ impl Config {
                     config.checkpoint_delete_objects_per_beat =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "checkpoint_write_entries" => {
+                    config.checkpoint_write_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
                 "checkpoint_merge_entries" => {
                     config.checkpoint_merge_entries =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1068,6 +1110,14 @@ impl Config {
                 "object_store_response_bytes" => {
                     config.object_store_response_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "object_store_put_slots" => {
+                    config.object_store_put_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
+                "object_store_block_put_slots" => {
+                    config.object_store_block_put_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
                 }
                 "object_store_get_slots" => {
                     config.object_store_get_slots =
@@ -1163,10 +1213,51 @@ impl Config {
             }
         }
 
+        if !seen.iter().any(|name| name == "transaction_mode") {
+            return Err(ConfigError::at(
+                0,
+                "transaction_mode must be set explicitly to mvcc or locking".to_string(),
+            ));
+        }
+
         // With object storage enabled it is the durable authority, not an
         // asynchronous backup of local disk. Every acknowledged WAL batch
         // must therefore be present there; RAM and disk remain caches.
         if config.object_store_on {
+            for (name, size) in [
+                ("object_store_head_bytes", config.object_store_head_bytes),
+                (
+                    "object_store_response_bytes",
+                    config.object_store_response_bytes,
+                ),
+                ("wal_upload_buffer_bytes", config.wal_upload_buffer_bytes),
+            ] {
+                if size == 0 {
+                    return Err(ConfigError::at(
+                        0,
+                        format!("{name} must be greater than zero"),
+                    ));
+                }
+            }
+
+            if config.commit_queue_slots == 0 {
+                return Err(ConfigError::at(
+                    0,
+                    "commit_queue_slots must be greater than zero".to_string(),
+                ));
+            }
+            if config.object_store_put_slots < 2 {
+                return Err(ConfigError::at(
+                    0,
+                    "object_store_put_slots must be at least 2".to_string(),
+                ));
+            }
+            if config.object_store_block_put_slots == 0 {
+                return Err(ConfigError::at(
+                    0,
+                    "object_store_block_put_slots must be at least 1".to_string(),
+                ));
+            }
             if config.object_store_get_slots == 0 {
                 return Err(ConfigError::at(
                     0,
@@ -1184,6 +1275,12 @@ impl Config {
                     0,
                     "object_store requires wal_upload = on and wal_upload_sync = on; local disk is a cache, not a durable fallback"
                         .to_string(),
+                ));
+            }
+            if config.wal_upload_buffer_bytes < config.wal_buffer_bytes {
+                return Err(ConfigError::at(
+                    0,
+                    "wal_upload_buffer_bytes must be at least wal_buffer_bytes".to_string(),
                 ));
             }
             if !config.object_store_sim {
@@ -1311,6 +1408,7 @@ impl Config {
                 config.checkpoint_delete_objects_per_beat,
             ),
             ("checkpoint_merge_entries", config.checkpoint_merge_entries),
+            ("checkpoint_write_entries", config.checkpoint_write_entries),
         ] {
             if value == 0 {
                 return Err(ConfigError::at(
@@ -1809,17 +1907,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_when_empty() {
-        assert_eq!(Config::parse("").unwrap(), Config::default_dev());
+    fn transaction_mode_requires_an_explicit_supported_selection() {
+        for text in [
+            "",
+            "# comment\n",
+            "transaction_mode = automatic\n",
+            "transaction_mode = mvcc\ntransaction_mode = locking\n",
+        ] {
+            assert!(Config::parse(text).is_err());
+        }
         assert_eq!(
-            Config::parse("# just a comment\n\n").unwrap(),
+            Config::parse("transaction_mode = mvcc\n")
+                .unwrap()
+                .transaction_mode,
+            TransactionMode::Mvcc
+        );
+        assert_eq!(
+            Config::parse("transaction_mode = locking\n")
+                .unwrap()
+                .transaction_mode,
+            TransactionMode::Locking
+        );
+    }
+
+    #[test]
+    fn explicit_mode_keeps_other_development_settings() {
+        assert_eq!(
+            Config::parse("\ntransaction_mode = mvcc\n").unwrap(),
+            Config::default_dev()
+        );
+        assert_eq!(
+            Config::parse("# just a comment\n\n\ntransaction_mode = mvcc\n").unwrap(),
             Config::default_dev()
         );
     }
 
     #[test]
     fn transaction_capacities_are_validated_and_exactly_budgeted() {
-        let config = Config::parse(
+        let config = Config::parse(concat!(
             "max_catalog_versions_per_object = 33\n\
              max_row_versions_per_row = 34\n\
              max_spill_generations_per_table = 35\n\
@@ -1827,7 +1952,8 @@ mod tests {
              max_deferred_constraints_per_transaction = 1024\n\
              deferred_trigger_bytes = 1MiB\n\
              max_analyze_per_transaction = 260\n",
-        )
+            "\ntransaction_mode = mvcc\n"
+        ))
         .unwrap();
         assert_eq!(config.max_catalog_versions_per_object, 33);
         assert_eq!(config.max_row_versions_per_row, 34);
@@ -1850,26 +1976,39 @@ mod tests {
             "deferred_trigger_bytes",
             "max_analyze_per_transaction",
         ] {
-            assert!(Config::parse(&format!("{key} = 0\n")).is_err());
-            assert!(Config::parse(&format!("{key} = 4294967296\n")).is_err());
-            assert!(Config::parse(&format!("{key} = 1\n{key} = 2\n")).is_err());
+            assert!(Config::parse(&format!("{key} = 0\n\ntransaction_mode = mvcc\n")).is_err());
+            assert!(
+                Config::parse(&format!("{key} = 4294967296\n\ntransaction_mode = mvcc\n")).is_err()
+            );
+            assert!(
+                Config::parse(&format!(
+                    "{key} = 1\n{key} = 2\n\ntransaction_mode = mvcc\n"
+                ))
+                .is_err()
+            );
         }
         for value in ["0", "1", "4294967296"] {
             assert!(
-                Config::parse(&format!("max_spill_generations_per_table = {value}\n")).is_err()
+                Config::parse(&format!(
+                    "max_spill_generations_per_table = {value}\n\ntransaction_mode = mvcc\n"
+                ))
+                .is_err()
             );
         }
         assert!(
-            Config::parse(
-                "max_spill_generations_per_table = 2\nmax_spill_generations_per_table = 3\n"
-            )
+            Config::parse("max_spill_generations_per_table = 2\nmax_spill_generations_per_table = 3\n\ntransaction_mode = mvcc\n")
             .is_err()
         );
         let guc_bytes = crate::sql::guc::GucState::extra_savepoint_budget_bytes(257)
             + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences);
         let mut budget = crate::mem::budget::Budget::new(guc_bytes);
-        crate::sql::guc::GucState::new_with_capacities(&mut budget, config.max_sequences, 257)
-            .unwrap();
+        crate::sql::guc::GucState::new_with_capacities(
+            &mut budget,
+            config.max_sequences,
+            257,
+            config.transaction_mode,
+        )
+        .unwrap();
         assert_eq!(budget.remaining(), 0);
     }
 
@@ -1943,9 +2082,10 @@ checkpoint_live_blocks = 8000
 checkpoint_garbage_batch_objects = 3
 checkpoint_delete_objects_per_beat = 2
 checkpoint_merge_entries = 9000
+checkpoint_write_entries = 9001
 sql_arena_bytes = 4096
 ";
-        let c = Config::parse(text).unwrap();
+        let c = Config::parse(&format!("{text}\ntransaction_mode = mvcc\n")).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.query_workspace_slots, 7);
@@ -1984,6 +2124,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.checkpoint_garbage_batch_objects, 3);
         assert_eq!(c.checkpoint_delete_objects_per_beat, 2);
         assert_eq!(c.checkpoint_merge_entries, 9000);
+        assert_eq!(c.checkpoint_write_entries, 9001);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
         assert_eq!(c.block_cache_bytes, Config::default_dev().block_cache_bytes);
@@ -1991,10 +2132,11 @@ sql_arena_bytes = 4096
 
     #[test]
     fn temporary_spill_must_hold_at_least_one_block() {
-        let error = Config::parse("temporary_spill_bytes = 1KiB\n").unwrap_err();
+        let error =
+            Config::parse("temporary_spill_bytes = 1KiB\n\ntransaction_mode = mvcc\n").unwrap_err();
         assert!(error.to_string().contains("must be at least 262144 bytes"));
         assert_eq!(
-            Config::parse("temporary_spill_bytes = 0\n")
+            Config::parse("temporary_spill_bytes = 0\n\ntransaction_mode = mvcc\n")
                 .unwrap()
                 .temporary_spill_bytes,
             0
@@ -2003,7 +2145,8 @@ sql_arena_bytes = 4096
 
     #[test]
     fn checkpoint_manifest_capacity_must_be_nonzero() {
-        let error = Config::parse("checkpoint_manifest_bytes = 0\n").unwrap_err();
+        let error = Config::parse("checkpoint_manifest_bytes = 0\n\ntransaction_mode = mvcc\n")
+            .unwrap_err();
         assert_eq!(error.line, 0);
         assert_eq!(
             error.message,
@@ -2013,19 +2156,15 @@ sql_arena_bytes = 4096
 
     #[test]
     fn operational_listener_and_log_format_are_strict() {
-        let config = Config::parse(
-            "operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 7\nlog_format = json\n",
-        )
+        let config = Config::parse(concat!("operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 7\nlog_format = json\n", "\ntransaction_mode = mvcc\n"))
         .unwrap();
         assert_eq!(config.operations_listen_addr, "127.0.0.1:9187");
         assert_eq!(config.operations_max_connections, 7);
         assert_eq!(config.log_format, LogFormat::Json);
 
-        assert!(Config::parse("log_format = yaml\n").is_err());
+        assert!(Config::parse("log_format = yaml\n\ntransaction_mode = mvcc\n").is_err());
         assert!(
-            Config::parse(
-                "operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 0\n"
-            )
+            Config::parse("operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 0\n\ntransaction_mode = mvcc\n")
             .is_err()
         );
     }
@@ -2033,7 +2172,7 @@ sql_arena_bytes = 4096
     #[test]
     fn query_workspace_slots_are_bounded_by_connection_capacity() {
         assert_eq!(
-            Config::parse("query_workspace_slots = 4\n")
+            Config::parse("query_workspace_slots = 4\n\ntransaction_mode = mvcc\n")
                 .unwrap()
                 .query_workspace_slots,
             4
@@ -2042,7 +2181,7 @@ sql_arena_bytes = 4096
             "query_workspace_slots = 0\n",
             "max_connections = 2\nquery_workspace_slots = 3\n",
         ] {
-            let error = Config::parse(text).unwrap_err();
+            let error = Config::parse(&format!("{text}\ntransaction_mode = mvcc\n")).unwrap_err();
             assert_eq!(
                 error.message,
                 "query_workspace_slots must be between 1 and max_connections"
@@ -2052,17 +2191,13 @@ sql_arena_bytes = 4096
 
     #[test]
     fn credential_file_excludes_inline_object_store_secrets() {
-        let file = Config::parse(
-            "object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\n",
-        )
+        let file = Config::parse(concat!("object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\n", "\ntransaction_mode = mvcc\n"))
         .unwrap();
         assert_eq!(
             file.object_store_credentials_file,
             "/run/credentials/pos3ql"
         );
-        let mixed = Config::parse(
-            "object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\nobject_store_access_key = access\n",
-        )
+        let mixed = Config::parse(concat!("object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\nobject_store_access_key = access\n", "\ntransaction_mode = mvcc\n"))
         .unwrap_err();
         assert!(mixed.message.contains("cannot be combined"));
     }
@@ -2076,14 +2211,17 @@ sql_arena_bytes = 4096
             "checkpoint_garbage_batch_objects",
             "checkpoint_delete_objects_per_beat",
             "checkpoint_merge_entries",
+            "checkpoint_write_entries",
         ] {
-            let error = Config::parse(&format!("{name} = 0\n")).unwrap_err();
+            let error =
+                Config::parse(&format!("{name} = 0\n\ntransaction_mode = mvcc\n")).unwrap_err();
             assert_eq!(error.line, 0);
             assert_eq!(error.message, format!("{name} must be greater than zero"));
         }
-        let error = Config::parse(
+        let error = Config::parse(concat!(
             "checkpoint_garbage_batch_objects = 2\ncheckpoint_delete_objects_per_beat = 3\n",
-        )
+            "\ntransaction_mode = mvcc\n"
+        ))
         .unwrap_err();
         assert_eq!(
             error.message,
@@ -2093,7 +2231,8 @@ sql_arena_bytes = 4096
 
     #[test]
     fn advisory_lock_capacity_must_be_nonzero() {
-        let error = Config::parse("max_locks_per_transaction = 0\n").unwrap_err();
+        let error = Config::parse("max_locks_per_transaction = 0\n\ntransaction_mode = mvcc\n")
+            .unwrap_err();
         assert_eq!(error.line, 0);
         assert_eq!(
             error.message,
@@ -2103,7 +2242,8 @@ sql_arena_bytes = 4096
 
     #[test]
     fn unknown_key_is_an_error_with_line_number() {
-        let err = Config::parse("listen_addr = x\nmax_conections = 4\n").unwrap_err();
+        let err = Config::parse("listen_addr = x\nmax_conections = 4\n\ntransaction_mode = mvcc\n")
+            .unwrap_err();
         assert_eq!(err.line, 2);
         assert!(
             err.message.contains("unknown key 'max_conections'"),
@@ -2114,14 +2254,18 @@ sql_arena_bytes = 4096
     #[test]
     fn inactive_cluster_settings_are_rejected_instead_of_ignored() {
         for setting in ["replica_id = 1", "cluster = one:7000,two:7000"] {
-            let error = Config::parse(setting).unwrap_err();
+            let error =
+                Config::parse(&format!("{setting}\ntransaction_mode = mvcc\n")).unwrap_err();
             assert!(error.message.contains("unknown key"), "{error}");
         }
     }
 
     #[test]
     fn duplicate_key_is_an_error() {
-        let err = Config::parse("memtable_bytes = 1MiB\nmemtable_bytes = 2MiB\n").unwrap_err();
+        let err = Config::parse(
+            "memtable_bytes = 1MiB\nmemtable_bytes = 2MiB\n\ntransaction_mode = mvcc\n",
+        )
+        .unwrap_err();
         assert_eq!(err.line, 2);
         assert!(err.message.contains("duplicate"), "{err}");
     }
@@ -2133,88 +2277,156 @@ sql_arena_bytes = 4096
                       object_store_region = local\n\
                       object_store_access_key = access\n\
                       object_store_secret_key = secret\n";
-        let c = Config::parse(direct).unwrap();
+        let c = Config::parse(&format!("{direct}\ntransaction_mode = mvcc\n")).unwrap();
         assert!(
             c.wal_upload && c.wal_upload_sync,
             "the plan-of-record default"
         );
-        assert!(Config::parse("object_store = on\n").is_err());
-        assert!(Config::parse(&format!("{direct}wal_upload = off\n")).is_err());
-        assert!(Config::parse(&format!("{direct}wal_upload_sync = off\n")).is_err());
+        assert!(Config::parse("object_store = on\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse(&format!(
+                "{direct}wal_upload = off\n\ntransaction_mode = mvcc\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::parse(&format!(
+                "{direct}wal_upload_sync = off\n\ntransaction_mode = mvcc\n"
+            ))
+            .is_err()
+        );
         // Without object storage nothing is implied.
-        let c = Config::parse("").unwrap();
+        let c = Config::parse("\ntransaction_mode = mvcc\n").unwrap();
         assert!(!c.object_store_on && !c.wal_upload && !c.wal_upload_sync);
         // The simulator mode is object storage too.
-        let c = Config::parse("object_store = sim\n").unwrap();
+        let c = Config::parse("object_store = sim\n\ntransaction_mode = mvcc\n").unwrap();
         assert!(c.object_store_sim && c.wal_upload && c.wal_upload_sync);
     }
 
     #[test]
+    fn parallel_physical_upload_slots_are_explicit_and_nonzero() {
+        let config = Config::parse(
+            "transaction_mode = mvcc\nobject_store = sim\nobject_store_block_put_slots = 3\n",
+        )
+        .unwrap();
+        assert_eq!(config.object_store_block_put_slots, 3);
+        let error = Config::parse(
+            "transaction_mode = locking\nobject_store = sim\nobject_store_block_put_slots = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("object_store_block_put_slots must be at least 1")
+        );
+    }
+
+    #[test]
     fn object_store_get_slots_are_fixed_and_nonzero() {
-        let c = Config::parse("object_store = sim\nobject_store_get_slots = 7\n").unwrap();
+        let c = Config::parse(
+            "object_store = sim\nobject_store_get_slots = 7\n\ntransaction_mode = mvcc\n",
+        )
+        .unwrap();
         assert_eq!(c.object_store_get_slots, 7);
-        let err = Config::parse("object_store = sim\nobject_store_get_slots = 0\n").unwrap_err();
+        let err = Config::parse(
+            "object_store = sim\nobject_store_get_slots = 0\n\ntransaction_mode = mvcc\n",
+        )
+        .unwrap_err();
         assert!(err.message.contains("at least 1"), "{err}");
     }
 
     #[test]
     fn object_store_hedge_deadline_is_configured() {
-        let c = Config::parse("object_store = sim\nobject_store_hedge_after_ms = 175\n").unwrap();
+        let c = Config::parse(
+            "object_store = sim\nobject_store_hedge_after_ms = 175\n\ntransaction_mode = mvcc\n",
+        )
+        .unwrap();
         assert_eq!(c.object_store_hedge_after_ms, 175);
-        assert_eq!(Config::parse("").unwrap().object_store_hedge_after_ms, 0);
+        assert_eq!(
+            Config::parse("\ntransaction_mode = mvcc\n")
+                .unwrap()
+                .object_store_hedge_after_ms,
+            0
+        );
     }
 
     #[test]
     fn s3_addressing_is_a_closed_protocol_state() {
         assert_eq!(
-            Config::parse("object_store_addressing = virtual_hosted\n")
+            Config::parse("object_store_addressing = virtual_hosted\n\ntransaction_mode = mvcc\n")
                 .unwrap()
                 .object_store_addressing,
             ObjectStoreAddressing::VirtualHosted
         );
-        let error = Config::parse("object_store_addressing = automatic\n").unwrap_err();
+        let error =
+            Config::parse("object_store_addressing = automatic\n\ntransaction_mode = mvcc\n")
+                .unwrap_err();
         assert!(error.message.contains("path or virtual_hosted"), "{error}");
     }
 
     #[test]
     fn malformed_values_are_errors() {
         assert!(
-            Config::parse("memtable_bytes = 16MB\n").is_err(),
+            Config::parse("memtable_bytes = 16MB\n\ntransaction_mode = mvcc\n").is_err(),
             "MB is not MiB"
         );
-        assert!(Config::parse("memtable_bytes = lots\n").is_err());
-        assert!(Config::parse("max_connections = -1\n").is_err());
-        assert!(Config::parse("max_ddl_per_transaction = 0\n").is_err());
+        assert!(Config::parse("memtable_bytes = lots\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_connections = -1\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_ddl_per_transaction = 0\n\ntransaction_mode = mvcc\n").is_err());
         assert_eq!(
-            Config::parse("max_ddl_per_transaction = 257\n")
+            Config::parse("max_ddl_per_transaction = 257\n\ntransaction_mode = mvcc\n")
                 .unwrap()
                 .max_ddl_per_transaction,
             257
         );
-        assert!(Config::parse("max_rules = 0\n").is_err());
-        assert!(Config::parse("max_stored_query_dependencies_per_object = 0\n").is_err());
-        assert!(Config::parse("max_stored_query_dependencies_per_object = 256\n").is_err());
-        assert!(Config::parse("max_tables = 0\n").is_err());
-        assert!(Config::parse("max_databases = 2\n").is_err());
-        assert!(Config::parse("max_schemas = 2\n").is_err());
-        assert!(Config::parse("max_sequences = 0\n").is_err());
-        assert!(Config::parse("max_domains = 0\n").is_err());
-        assert!(Config::parse("max_enums = 0\n").is_err());
-        assert!(Config::parse("max_enum_labels_per_type = 0\n").is_err());
-        assert!(Config::parse("max_composites = 0\n").is_err());
-        assert!(Config::parse("max_roles = 0\n").is_err());
-        assert!(Config::parse("max_role_memberships = 0\n").is_err());
-        assert!(Config::parse("max_role_settings = 0\n").is_err());
-        assert!(Config::parse("max_acl_entries = 0\n").is_err());
-        assert!(Config::parse("max_acl_entries = 2\n").is_err());
-        assert!(Config::parse("max_column_acl_entries = 0\n").is_err());
-        assert!(Config::parse("max_default_acl_entries = 0\n").is_err());
-        assert!(Config::parse("max_parameter_acl_entries = 0\n").is_err());
-        assert!(Config::parse("max_indexes = 0\n").is_err());
-        assert!(Config::parse("max_extended_statistics = 0\n").is_err());
-        assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 0\n").is_err());
-        assert!(Config::parse("max_foreign_sessions = 0\n").is_err());
-        assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 256\n").is_err());
+        assert!(Config::parse("max_rules = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse(
+                "max_stored_query_dependencies_per_object = 0\n\ntransaction_mode = mvcc\n"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse(
+                "max_stored_query_dependencies_per_object = 256\n\ntransaction_mode = mvcc\n"
+            )
+            .is_err()
+        );
+        assert!(Config::parse("max_tables = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_databases = 2\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_schemas = 2\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_sequences = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_domains = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_enums = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse("max_enum_labels_per_type = 0\n\ntransaction_mode = mvcc\n").is_err()
+        );
+        assert!(Config::parse("max_composites = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_roles = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_role_memberships = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_role_settings = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_acl_entries = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_acl_entries = 2\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_column_acl_entries = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_default_acl_entries = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse("max_parameter_acl_entries = 0\n\ntransaction_mode = mvcc\n").is_err()
+        );
+        assert!(Config::parse("max_indexes = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_extended_statistics = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse(
+                "max_brin_unsummarized_ranges_per_index = 0\n\ntransaction_mode = mvcc\n"
+            )
+            .is_err()
+        );
+        assert!(Config::parse("max_foreign_sessions = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse(
+                "max_brin_unsummarized_ranges_per_index = 256\n\ntransaction_mode = mvcc\n"
+            )
+            .is_err()
+        );
         for name in [
             "max_views",
             "max_materialized_views",
@@ -2232,18 +2444,30 @@ sql_arena_bytes = 4096
             "max_event_triggers",
             "max_comments",
         ] {
-            assert!(Config::parse(&format!("{name} = 0\n")).is_err(), "{name}");
+            assert!(
+                Config::parse(&format!("{name} = 0\n\ntransaction_mode = mvcc\n")).is_err(),
+                "{name}"
+            );
         }
-        assert!(Config::parse("just some words\n").is_err());
-        assert!(Config::parse("max_tablespaces = 1\n").is_err());
-        assert!(Config::parse("max_text_search_objects = 20\n").is_err());
-        assert!(Config::parse("database_collation_locale = \n").is_err());
-        assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
-        assert!(Config::parse("auth = unknown\n").is_err());
-        assert_eq!(Config::parse("auth = md5\n").unwrap().auth, "md5");
+        assert!(Config::parse("just some words\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("max_tablespaces = 1\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(
+            Config::parse("max_text_search_objects = 20\n\ntransaction_mode = mvcc\n").is_err()
+        );
+        assert!(
+            Config::parse("database_collation_locale = \n\ntransaction_mode = mvcc\n").is_err()
+        );
+        assert!(Config::parse("collation_scratch_bytes = 0\n\ntransaction_mode = mvcc\n").is_err());
+        assert!(Config::parse("auth = unknown\n\ntransaction_mode = mvcc\n").is_err());
+        assert_eq!(
+            Config::parse("auth = md5\n\ntransaction_mode = mvcc\n")
+                .unwrap()
+                .auth,
+            "md5"
+        );
         assert!(
             Config::parse(&format!(
-                "password = {}\n",
+                "password = {}\n\ntransaction_mode = mvcc\n",
                 "x".repeat(crate::storage::ROLE_PASSWORD_MAX + 1)
             ))
             .is_err()
@@ -2270,22 +2494,27 @@ sql_arena_bytes = 4096
             "max_foreign_servers",
             "max_user_mappings",
         ] {
-            let error = Config::parse(&format!("{name} = 65536\n")).unwrap_err();
+            let error =
+                Config::parse(&format!("{name} = 65536\n\ntransaction_mode = mvcc\n")).unwrap_err();
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
-            Config::parse(&format!("{name} = 65535\n")).unwrap();
+            Config::parse(&format!("{name} = 65535\n\ntransaction_mode = mvcc\n")).unwrap();
         }
         for (name, maximum) in [
             ("max_tables", crate::storage::MAX_TABLE_TYPE_OID_SLOTS),
             ("max_views", crate::storage::MAX_VIEW_TYPE_OID_SLOTS),
         ] {
-            let error = Config::parse(&format!("{name} = {}\n", maximum + 1)).unwrap_err();
+            let error = Config::parse(&format!(
+                "{name} = {}\n\ntransaction_mode = mvcc\n",
+                maximum + 1
+            ))
+            .unwrap_err();
             assert!(
                 error
                     .message
                     .contains(&format!("{maximum}-slot row-type OID range")),
                 "{name}: {error}"
             );
-            Config::parse(&format!("{name} = {maximum}\n")).unwrap();
+            Config::parse(&format!("{name} = {maximum}\n\ntransaction_mode = mvcc\n")).unwrap();
         }
         for name in [
             "max_schemas",
@@ -2293,16 +2522,18 @@ sql_arena_bytes = 4096
             "max_conversions",
             "max_event_triggers",
         ] {
-            let error = Config::parse(&format!("{name} = 256\n")).unwrap_err();
+            let error =
+                Config::parse(&format!("{name} = 256\n\ntransaction_mode = mvcc\n")).unwrap_err();
             assert!(error.message.contains("255-slot"), "{name}: {error}");
-            Config::parse(&format!("{name} = 255\n")).unwrap();
+            Config::parse(&format!("{name} = 255\n\ntransaction_mode = mvcc\n")).unwrap();
         }
-        let error = Config::parse("max_tablespaces = 65535\n").unwrap_err();
+        let error =
+            Config::parse("max_tablespaces = 65535\n\ntransaction_mode = mvcc\n").unwrap_err();
         assert!(error.message.contains("65534-slot"), "{error}");
-        Config::parse("max_tablespaces = 65534\n").unwrap();
-        let error = Config::parse("max_sequences = 5001\n").unwrap_err();
+        Config::parse("max_tablespaces = 65534\n\ntransaction_mode = mvcc\n").unwrap();
+        let error = Config::parse("max_sequences = 5001\n\ntransaction_mode = mvcc\n").unwrap_err();
         assert!(error.message.contains("5000-slot sequence OID range"));
-        Config::parse("max_sequences = 5000\n").unwrap();
+        Config::parse("max_sequences = 5000\n\ntransaction_mode = mvcc\n").unwrap();
         for (name, maximum) in [
             ("max_domains", crate::storage::MAX_DOMAIN_CATALOG_SLOTS),
             ("max_enums", crate::storage::MAX_ENUM_CATALOG_SLOTS),
@@ -2311,14 +2542,18 @@ sql_arena_bytes = 4096
                 crate::storage::MAX_COMPOSITE_CATALOG_SLOTS,
             ),
         ] {
-            let error = Config::parse(&format!("{name} = {}\n", maximum + 1)).unwrap_err();
+            let error = Config::parse(&format!(
+                "{name} = {}\n\ntransaction_mode = mvcc\n",
+                maximum + 1
+            ))
+            .unwrap_err();
             assert!(
                 error
                     .message
                     .contains(&format!("{maximum}-slot type OID range")),
                 "{name}: {error}"
             );
-            Config::parse(&format!("{name} = {maximum}\n")).unwrap();
+            Config::parse(&format!("{name} = {maximum}\n\ntransaction_mode = mvcc\n")).unwrap();
         }
         for name in [
             "max_roles",
@@ -2329,15 +2564,16 @@ sql_arena_bytes = 4096
             "max_default_acl_entries",
             "max_parameter_acl_entries",
         ] {
-            let error = Config::parse(&format!("{name} = 65536\n")).unwrap_err();
+            let error =
+                Config::parse(&format!("{name} = 65536\n\ntransaction_mode = mvcc\n")).unwrap_err();
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
-            Config::parse(&format!("{name} = 65535\n")).unwrap();
+            Config::parse(&format!("{name} = 65535\n\ntransaction_mode = mvcc\n")).unwrap();
         }
     }
 
     #[test]
     fn table_derived_catalog_capacities_are_independent_with_compatible_defaulting() {
-        let inherited = Config::parse("max_tables = 7\n").unwrap();
+        let inherited = Config::parse("max_tables = 7\n\ntransaction_mode = mvcc\n").unwrap();
         assert_eq!(inherited.max_tables, 7);
         assert_eq!(inherited.max_extended_statistics, 56);
         assert_eq!(
@@ -2356,7 +2592,7 @@ sql_arena_bytes = 4096
             [7; 10]
         );
 
-        let independent = Config::parse(
+        let independent = Config::parse(concat!(
             "max_tables = 7\n\
              max_indexes = 11\n\
              max_extended_statistics = 21\n\
@@ -2369,7 +2605,8 @@ sql_arena_bytes = 4096
              max_operator_classes = 18\n\
              max_triggers = 19\n\
              max_publications = 20\n",
-        )
+            "\ntransaction_mode = mvcc\n"
+        ))
         .unwrap();
         assert_eq!(independent.max_tables, 7);
         assert_eq!(independent.max_extended_statistics, 21);
@@ -2392,9 +2629,8 @@ sql_arena_bytes = 4096
 
     #[test]
     fn collation_runtime_configuration_is_explicit() {
-        let config =
-            Config::parse("database_collation_locale = C.UTF-8\ncollation_scratch_bytes = 8KiB\n")
-                .unwrap();
+        let config = Config::parse("database_collation_locale = C.UTF-8\ncollation_scratch_bytes = 8KiB\n\ntransaction_mode = mvcc\n")
+        .unwrap();
         assert_eq!(config.database_collation_locale, "C.UTF-8");
         assert_eq!(config.collation_scratch_bytes, 8 * KIB);
     }
@@ -2402,7 +2638,7 @@ sql_arena_bytes = 4096
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn cursor_bytes_fit_wire_offsets() {
-        let error = Config::parse("cursor_bytes = 4GiB\n").unwrap_err();
+        let error = Config::parse("cursor_bytes = 4GiB\n\ntransaction_mode = mvcc\n").unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2412,7 +2648,7 @@ sql_arena_bytes = 4096
 
     #[test]
     fn policy_catalog_capacity_budgets_policy_and_dependency_pools() {
-        let defaults = Config::parse("max_tables = 7\n").unwrap();
+        let defaults = Config::parse("max_tables = 7\n\ntransaction_mode = mvcc\n").unwrap();
         assert_eq!(defaults.max_policies, 256);
         let mut larger = defaults.clone();
         larger.max_policies += 41;
@@ -2426,10 +2662,15 @@ sql_arena_bytes = 4096
                 - crate::storage::policy_role_budget_bytes(&defaults)
         );
         assert_eq!(
-            Config::parse("max_policies = 1025\n").unwrap().max_policies,
+            Config::parse("max_policies = 1025\n\ntransaction_mode = mvcc\n")
+                .unwrap()
+                .max_policies,
             1025
         );
-        assert!(Config::parse("max_policies = 256\nmax_policies = 257\n").is_err());
+        assert!(
+            Config::parse("max_policies = 256\nmax_policies = 257\n\ntransaction_mode = mvcc\n")
+                .is_err()
+        );
     }
 
     #[test]

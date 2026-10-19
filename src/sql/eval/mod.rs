@@ -184,6 +184,7 @@ pub mod sqlstate {
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
     pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
+    pub const TRANSACTION_RESOLUTION_UNKNOWN: &str = "08007";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const UNDEFINED_FUNCTION: &str = "42883";
@@ -771,16 +772,6 @@ pub trait SequenceAccess {
     fn currval(&self, name: &str) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError>;
-    fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
-    fn dry_lastval(&self) -> Result<i64, SqlError>;
-    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    /// Captures and restores the logical position when a bounded physical
-    /// executor pass repeats the same expression stream.
-    fn statement_cursor(&self) -> Option<usize> {
-        None
-    }
-    fn restore_statement_cursor(&self, _cursor: usize) {}
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -1155,10 +1146,6 @@ pub trait CatalogAccess {
     fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
         None
     }
-    fn routine_invocation_cursor(&self) -> Option<usize> {
-        None
-    }
-    fn restore_routine_invocation_cursor(&self, _cursor: usize) {}
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.
@@ -4350,6 +4337,10 @@ fn call<'a>(
         args
     };
     let name = regex_srf_name.unwrap_or(written_name);
+    let effect_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if super::ast::is_volatile_function(effect_name) {
+        super::query::protect_statement_effects();
+    }
     if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
         if args.len() != 2 || star || variadic {
             return Err(undefined_function(name, args, row));

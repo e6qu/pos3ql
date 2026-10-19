@@ -63,6 +63,7 @@ PASS=0
 FAIL=0
 SERVER_CREDENTIALS_FILE="$WORK/object-store-credentials"
 POS3QL_CREDENTIALS_FILE="$WORK/pos3ql-credentials"
+WRITER_PROBE_GATE_FILE="$WORK/writer-probe.gate"
 
 write_credentials() { # <path> <access key> <secret key> [session token]
   local path=$1 access=$2 secret=$3 token=${4:-}
@@ -196,6 +197,7 @@ python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PO
   --bucket "$S3_TEST_BUCKET" --region "$S3_TEST_REGION" \
   --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" \
   --credentials-file "$SERVER_CREDENTIALS_FILE" --page-size 7 \
+  --writer-probe-gate-file "$WRITER_PROBE_GATE_FILE" \
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do
@@ -219,6 +221,7 @@ write_main_config() { # <object prefix> [data directory name]
   local object_prefix=$1
   local data_name=${2:-data}
   cat > "$WORK/server.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:${PG_PORT}
 operations_listen_addr = 127.0.0.1:${OPERATIONS_PORT}
 operations_max_connections = 4
@@ -265,6 +268,7 @@ ok "server up (pid $SERVER_PID)"
 step "operational health, readiness, metrics and capacity"
 if POS3QL_PORT=$PG_PORT POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
     POS3QL_EXPECTED_QUERY_WORKSPACES=2 \
+    POS3QL_WRITER_PROBE_GATE_FILE="$WRITER_PROBE_GATE_FILE" \
     python3 "$EXT/operations_probe.py" \
     > "$WORK/operations.out" 2>&1; then
   ok "operational HTTP endpoints"
@@ -274,6 +278,13 @@ else
 fi
 
 step "atomic object-store credential rotation"
+rotation_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
+rotation_successes=$(awk '$1 == "pos3ql_object_store_credential_reload_successes_total" { print $2 }' <<< "$rotation_metrics")
+rotation_failures=$(awk '$1 == "pos3ql_object_store_credential_reload_failures_total" { print $2 }' <<< "$rotation_metrics")
+[[ "$rotation_successes" =~ ^[0-9]+$ && "$rotation_failures" =~ ^[0-9]+$ ]] || {
+  bad "credential rotation counters are missing or invalid"
+  exit 1
+}
 ROTATED_ACCESS=pos3ql-rotated-access
 ROTATED_SECRET=pos3ql-rotated-secret
 write_credentials "$POS3QL_CREDENTIALS_FILE" "$ROTATED_ACCESS" "$ROTATED_SECRET"
@@ -285,7 +296,7 @@ for _ in {1..50}; do
   sleep 0.05
 done
 failed_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-if [[ "$failed_metrics" == *"pos3ql_object_store_credential_reload_failures_total 1"* ]]; then
+if [[ $'\n'"$failed_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_failures_total $((rotation_failures + 1))"$'\n'* ]]; then
   ok "invalid candidate retained old credentials and made readiness explicit"
 else
   bad "credential candidate failure was not observable"
@@ -300,7 +311,7 @@ for _ in {1..50}; do
   sleep 0.05
 done
 rotated_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-if [[ "$rotated_metrics" == *"pos3ql_object_store_credential_reload_successes_total 1"* ]] \
+if [[ $'\n'"$rotated_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 1))"$'\n'* ]] \
   && "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
        -c "CREATE TABLE credential_rotation (id int); INSERT INTO credential_rotation VALUES (1); CHECKPOINT"; then
   ok "new credentials validated, installed and used for durable work"
@@ -315,11 +326,11 @@ kill -HUP "$SERVER_PID"
 for _ in {1..50}; do
   restored_metrics=$(curl --fail --silent \
     "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-  [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]] \
+  [[ $'\n'"$restored_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 2))"$'\n'* ]] \
     && break
   sleep 0.05
 done
-if [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]]; then
+if [[ $'\n'"$restored_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 2))"$'\n'* ]]; then
   ok "SIGHUP reloaded the restored credentials"
 else
   bad "SIGHUP credential reload was not observable"
@@ -372,7 +383,9 @@ restart_main_server wire
 if POS3QL_PORT=$PG_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else
-  bad "wire probes"; cat "$WORK/wire.out"
+  bad "wire probes"
+  cat "$WORK/wire.out"
+  tail -120 "$WORK/server-wire.log"
 fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"
@@ -571,6 +584,7 @@ step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold star
 # posture: the commit batch is published before acknowledgement, so the
 # kill needs no drain pause and the wiped-disk recovery needs no checkpoint.
 cat > "$WORK/rpo0.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
 object_store = on
@@ -656,6 +670,7 @@ step "row count beyond table_rows: the map is an overlay, the bucket is the tabl
 # set, and reads, counts, updates, deletes and the cold start below all
 # reach entry-less rows through the spill list.
 cat > "$WORK/overlay.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:$((PG_PORT + 3))
 data_dir = ${WORK}/overlay-data
 memtable_bytes = 512KiB
@@ -1087,6 +1102,7 @@ fi
 
 step "logical subscription apply from a pos3ql publisher"
 cat > "$WORK/subscription-pos3ql.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:${SUB_POS3QL_PORT}
 data_dir = ${WORK}/subscription-pos3ql-data
 max_connections = 6
@@ -1425,6 +1441,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "$WORK/server-tls/key.pem" \
   -out "$WORK/server-tls/cert.pem" -days 30 -nodes -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
 cat > "$WORK/server-tls.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data
 object_store = off

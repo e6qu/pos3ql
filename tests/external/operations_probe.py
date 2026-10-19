@@ -3,6 +3,9 @@
 
 import json
 import os
+import pathlib
+import select
+import struct
 import socket
 import time
 
@@ -14,20 +17,13 @@ QUERY_WORKSPACES = int(os.environ.get("POS3QL_EXPECTED_QUERY_WORKSPACES", "1"))
 OBJECT_STORE = os.environ.get("POS3QL_EXPECTED_OBJECT_STORE", "on") == "on"
 
 
-def request(method: str, path: str, fragmented: bool = False):
-    wire = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
-    with socket.create_connection(("127.0.0.1", PORT), timeout=5) as stream:
-        if fragmented:
-            stream.sendall(wire[:7])
-            stream.sendall(wire[7:])
-        else:
-            stream.sendall(wire)
-        chunks = []
-        while True:
-            chunk = stream.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
+def read_response(stream):
+    chunks = []
+    while True:
+        chunk = stream.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
     head, body = b"".join(chunks).split(b"\r\n\r\n", 1)
     status = int(head.split(b" ", 2)[1])
     headers = {}
@@ -37,6 +33,119 @@ def request(method: str, path: str, fragmented: bool = False):
     assert int(headers[b"content-length"]) == len(body)
     assert headers[b"cache-control"] == b"no-store"
     return status, body
+
+
+def request(method: str, path: str, fragmented: bool = False):
+    wire = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode()
+    with socket.create_connection(("127.0.0.1", PORT), timeout=5) as stream:
+        if fragmented:
+            stream.sendall(wire[:7])
+            stream.sendall(wire[7:])
+        else:
+            stream.sendall(wire)
+        return read_response(stream)
+
+
+def sql_while_control_waits(text, expected_values):
+    with socket.create_connection(("127.0.0.1", DATABASE_PORT), timeout=2) as stream:
+        stream.settimeout(2)
+        source = stream.makefile("rb")
+
+        def frame():
+            head = source.read(5)
+            assert len(head) == 5, "SQL connection closed during a delayed health check"
+            length = struct.unpack("!I", head[1:])[0]
+            assert length >= 4
+            body = source.read(length - 4)
+            assert len(body) == length - 4
+            assert head[:1] != b"E", body
+            return head[:1], body
+
+        startup = struct.pack("!I", 3 << 16) + b"user\0postgres\0database\0postgres\0\0"
+        stream.sendall(struct.pack("!I", len(startup) + 4) + startup)
+        while frame()[0] != b"Z":
+            pass
+        query = text.encode() + b"\0"
+        stream.sendall(b"Q" + struct.pack("!I", len(query) + 4) + query)
+        rows = []
+        while True:
+            kind, body = frame()
+            if kind == b"D":
+                assert body[:2] == struct.pack("!H", 1)
+                length = struct.unpack("!I", body[2:6])[0]
+                assert len(body) == 6 + length
+                rows.append(body[6:].decode())
+            if kind == b"Z":
+                break
+        assert rows == expected_values
+        source.close()
+
+
+def delayed_writer_probe():
+    gate = pathlib.Path(os.environ["POS3QL_WRITER_PROBE_GATE_FILE"])
+    observed = gate.with_suffix(".observed")
+    assert not gate.exists() and not observed.exists(), "probe gate must start clean"
+    with socket.create_connection(("127.0.0.1", PORT), timeout=5) as held, \
+            socket.create_connection(("127.0.0.1", PORT), timeout=5) as metrics:
+        gate.write_text("GET", encoding="ascii")
+        try:
+            try:
+                held.sendall(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                held.shutdown(socket.SHUT_WR)
+                deadline = time.monotonic() + 2
+                while not observed.exists():
+                    assert time.monotonic() < deadline, "readiness did not start its writer probe"
+                    time.sleep(0.005)
+                metrics.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                assert not select.select([held], [], [], 0)[0], "pending probe reported readiness early"
+                sql_while_control_waits("SELECT 42", ["42"])
+                assert request("GET", "/livez")[0] == 200
+                assert request("GET", "/capacity")[0] == 200
+                assert observed.read_text(encoding="ascii") == "1", "waiting checks must share the probe"
+            finally:
+                gate.unlink(missing_ok=True)
+            status, body = read_response(held)
+            assert status == 200 and json.loads(body) == {"status": "ready"}
+            status, body = read_response(metrics)
+            assert status == 200 and "pos3ql_ready 1" in body.decode()
+            assert request("GET", "/readyz")[0] == 200
+        finally:
+            gate.unlink(missing_ok=True)
+            observed.unlink(missing_ok=True)
+
+
+def delayed_credential_validation():
+    gate = pathlib.Path(os.environ["POS3QL_WRITER_PROBE_GATE_FILE"])
+    observed = gate.with_suffix(".observed")
+    assert not gate.exists() and not observed.exists()
+
+    def successes():
+        status, body = request("GET", "/metrics")
+        assert status == 200
+        samples = [line for line in body.decode().splitlines()
+                   if line.startswith("pos3ql_object_store_credential_reload_successes_total ")]
+        assert len(samples) == 1
+        return int(samples[0].split()[1])
+
+    before = successes()
+    gate.write_text("PUT", encoding="ascii")
+    try:
+        sql_while_control_waits("SELECT pg_reload_conf()", ["t"])
+        deadline = time.monotonic() + 2
+        while not observed.exists():
+            assert time.monotonic() < deadline, "reload did not start conditional validation"
+            time.sleep(0.005)
+        sql_while_control_waits("SELECT 42", ["42"])
+        assert request("GET", "/livez")[0] == 200
+        assert request("GET", "/capacity")[0] == 200
+    finally:
+        gate.unlink(missing_ok=True)
+        observed.unlink(missing_ok=True)
+    deadline = time.monotonic() + 2
+    while successes() == before:
+        assert time.monotonic() < deadline, "validated credentials were not installed"
+        time.sleep(0.005)
+    assert request("GET", "/readyz")[0] == 200
 
 
 status, body = request("GET", "/livez", fragmented=True)
@@ -79,6 +188,10 @@ assert capacity["memory"]["tls_budget_bytes"] > 0
 
 assert request("GET", "/missing")[0] == 404
 assert request("POST", "/readyz")[0] == 405
+
+if OBJECT_STORE:
+    delayed_writer_probe()
+    delayed_credential_validation()
 
 # Operational slots remain usable when every PostgreSQL slot is occupied by a
 # client that has connected but not sent its startup packet.

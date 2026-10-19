@@ -19,6 +19,101 @@ An endpoint is supported only after tests prove the operations below behave
 correctly. Bucket creation, account administration, and credentials are set up
 outside pos3ql; an “S3-compatible” label alone is not enough.
 
+## Concurrent requests and durable commits
+
+**User example:** two customers save orders in different tables. Both can wait
+on the same log publication. Reading a cached invoice can continue while that
+upload waits; success for either order waits for its own durable log position.
+
+`object_store_get_slots` reserves independent read clients. A selected-column
+scan starts a bounded batch of missing columns before waiting, retaining
+completed extents across resumption. Atomic operations use a separate block
+client and can still wait synchronously; SQL CPU execution remains serial.
+A SELECT uses that client from its first routine or state-changing expression
+until the statement finishes, including reads after a routine returns. For
+example, a function can prepare a query and then read an uncached invoice
+without preparing the same query twice. Pure reads keep their concurrent path.
+
+`object_store_put_slots` reserves upload clients and immutable request bodies.
+A log batch has two independent objects: transaction bytes and a descriptor.
+Those uploads can complete out of order. The commit-head update starts only
+after both succeed. Clients retain their transaction outcome until publication
+and ordered in-memory completion finish, including when the client disconnects.
+
+`object_store_block_put_slots` reserves separate clients for immutable row and
+index output. Table slices, paced merges and secondary indexes retain one operation's bytes while
+its uploads overlap; the new file handle stays private until every upload
+finishes. Table slices retain their selected bytes while later changes append
+another generation. Replacing a table or rewriting its row encodings discards
+the old capture. Index sort runs and final index handles remain private until
+their uploads finish; changed index inputs cancel abandoned uploads without
+waiting for socket readiness. Merge source failures restart the same immutable
+pair with cleared output and checksum state.
+A separate startup-reserved client and metadata buffer upload the manifest,
+the metadata naming the saved files. Its exact bytes survive retries, including a lost response.
+Completion installs matching table and index identities and preserves newer
+changes. Cleanup keeps every file named by that saved manifest, even when a
+later table rewrite has stopped using its indexes.
+
+An explicit SQL CHECKPOINT waits for its requested save while other connections
+continue working. Later writes do not extend an earlier command indefinitely;
+failures reach the commands waiting for that save. Remaining qualification is in
+[the plan](../PLAN.md).
+
+Table output schedules at most the configured number of committed versions,
+processes at most 64 per CPU turn, and stops to drain each emitted batch.
+Deleting or truncating rows during capture retains deletion markers until the
+complete saved-file list installs. For example, deleting an order during its
+first checkpoint cannot make the order reappear after that checkpoint.
+Cleanup removes only deletion markers covered by the saved file list. Finishing
+an older checkpoint must also preserve newer ANALYZE results and the journal
+work of an analysis another transaction has not committed.
+Metadata capture and other atomic maintenance reads can still wait
+synchronously. Rows larger than one block use bounded overflow chains in the
+same generation; reading such a row requires its complete chain.
+
+
+| Setting | Reservation or rejection |
+|---|---|
+| `object_store_get_slots` | Fixed read clients; at least 1 in object-store mode. |
+| `object_store_put_slots` | Fixed journal upload clients; at least 2 in object-store mode. |
+| `object_store_block_put_slots` | Fixed physical-block upload clients; at least 1 in object-store mode. Each reserves one 256 KiB body. |
+| `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
+| Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
+| Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
+| `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
+| `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
+| `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
+
+The development fixture selects 4 read slots, 4 journal upload slots, 4 physical
+upload slots and 4 commit queue slots. Size their startup memory reservations explicitly for a deployment.
+An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
+`commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
+
+TLS has a separate startup ceiling. `tls_pool_bytes` supplies the object-store
+base; startup adds 128 KiB for each of the two transports per subscription
+worker, plus 128 KiB per server connection when server TLS is enabled. Choose
+the base for the configured object-store request concurrency. These reservations
+are fixed before the server accepts connections.
+
+Nonblocking reads have a 30-second deadline. Each upload attempt has a
+30-second deadline, with at most three attempts for retryable failures and
+200 ms then 400 ms backoff. A failed conditional create compares the entire
+stored object, including its length, before accepting an uncertain prior
+success. A different mutable root remains a writer conflict.
+
+A procedure's internal `COMMIT`, login hooks and standalone catalog commands
+retain explicit synchronous completion boundaries. They cannot replay their
+call stack after a commit. The concurrent path for ordinary client commits and
+streaming subscription apply uses the fixed commit queue.
+
+Saved query results are collected in one scan within the fixed statement arena.
+They do not run expressions a second time to discover the result size. For
+example, a saved query that calls a function to prepare a statement must prepare
+it once, even when another part of the query reads uncached data. Sorting by
+that query's output label or position reuses the saved value, following
+[PostgreSQL's ORDER BY rules](https://www.postgresql.org/docs/18/sql-select.html#SQL-ORDERBY).
+
 ## Required S3-compatible subset
 
 | S3 operation | Required behavior |
@@ -54,6 +149,13 @@ replacement updates its root and is preserved, or fails because the generation
 has changed. Uploaded objects without a successful root update cannot become
 confirmed commits. [Durable formats](durable-format.md#format-details-for-implementers)
 specifies empty roots, writer identities, conflict handling, and upgrade rules.
+
+After an ownership check detects a replacement, new SQL work is rejected with
+SQLSTATE `40001` before another commit enters the journal; rollback remains
+available. An operation already awaiting publication has a different outcome:
+if durability cannot be confirmed, the server sends a terminal `08007` error,
+flushes it before closing the connection, and retains the transaction for
+recovery. Reconnect and check the order before trying to save it again.
 
 Profile v1 accepts S3's 1,024-byte object-key limit, opaque continuation tokens
 up to 1,024 bytes, and strong quoted ETags up to 80 bytes. Exceeding a fixed

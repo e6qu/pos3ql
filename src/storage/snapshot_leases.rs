@@ -65,6 +65,9 @@ pub(super) fn snapshot_owner_bytes() -> usize {
 
 impl SnapshotState {
     pub(super) fn oldest(&self) -> Option<u64> {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return None;
+        }
         self.active
             .iter()
             .map(|(_, lsn)| *lsn)
@@ -74,6 +77,9 @@ impl SnapshotState {
     }
 
     pub(super) fn retains_for(&self, transaction: u32) -> bool {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return false;
+        }
         !self.active.is_empty()
             || !self.exported.is_empty()
             || self
@@ -142,6 +148,7 @@ impl Storage {
         connection: i32,
         lsn: u64,
     ) -> Result<(), SqlError> {
+        self.validate_transaction_isolation(crate::sql::ast::TransactionIsolation::RepeatableRead)?;
         if connection <= 0 {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -205,6 +212,7 @@ impl Storage {
         transaction: u32,
         accept: impl FnOnce(u64) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
+        self.validate_transaction_isolation(crate::sql::ast::TransactionIsolation::RepeatableRead)?;
         let mut snapshots = self.snapshot_state();
         let Some(exported) = snapshots
             .exported

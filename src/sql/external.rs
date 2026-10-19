@@ -529,6 +529,12 @@ fn run_error(error: SstError) -> SqlError {
         SstError::Store(crate::store::StoreError::NotReady) => {
             sql_err!(sqlstate::INTERNAL_IO_WAIT, "durable block read in progress")
         }
+        SstError::Store(crate::store::StoreError::ReadOwnersExhausted) => {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "object read consumers exceed max_connections and max_subscriptions"
+            )
+        }
         other => sql_err!(sqlstate::IO_ERROR, "external query run failed: {:?}", other),
     }
 }

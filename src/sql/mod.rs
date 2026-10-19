@@ -7,6 +7,7 @@ pub mod ast;
 mod brin_catalog;
 pub mod catalog;
 mod catalog_metadata;
+pub(crate) mod commit;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -71,7 +72,9 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, ColumnSet, RowHome, SqlName, Storage};
+use crate::storage::{
+    ColumnMeta, ColumnSet, HeapRelocationMode, HeapRelocationStep, RowHome, SqlName, Storage,
+};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 std::thread_local! {
@@ -109,6 +112,10 @@ pub(crate) struct ExecutionIdentity {
 }
 
 impl ExecutionIdentity {
+    pub(crate) const fn read_owner(self) -> crate::store::ReadOwner {
+        crate::store::ReadOwner((1u128 << 96) | self.connection_id as u32 as u128)
+    }
+
     pub(crate) const fn new(connection_id: i32, database_oid: crate::storage::DatabaseOid) -> Self {
         Self {
             connection_id,
@@ -198,6 +205,7 @@ pub(crate) struct SubscriptionCleanupRuntime {
 
 #[derive(Debug)]
 pub enum EngineSetupError {
+    Configuration(&'static str),
     Budget(BudgetError),
     Wal(WalSetupError),
     Checkpoint(CheckpointSetupError),
@@ -216,6 +224,7 @@ impl From<SqlError> for EngineSetupError {
 impl std::fmt::Display for EngineSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Configuration(message) => f.write_str(message),
             Self::Budget(e) => write!(f, "{e}"),
             Self::Wal(e) => write!(f, "{e}"),
             Self::Checkpoint(e) => write!(f, "{e}"),
@@ -433,6 +442,24 @@ impl CheckpointBeat {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitProgressMode {
+    Inline,
+    Reactor,
+}
+
+struct InflightPublication {
+    batch: crate::wal::CommittedBatch,
+    through_lsn: u64,
+    retry_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CopyFinishMode {
+    Statement,
+    ImplicitTransaction,
+}
+
 struct CommandSnapshot {
     lease: Option<crate::storage::StatementSnapshotLease>,
     _files: Option<crate::storage::StatementFileScope>,
@@ -445,15 +472,24 @@ pub struct Engine {
     wal: Wal,
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
-    /// A published manifest whose local bookkeeping still needs to finish.
-    /// Keeping this state makes publication and its cleanup one retriable
-    /// completion protocol instead of reporting success after the manifest.
+    /// A durable, installed manifest whose heap and journal cleanup remains.
+    /// Cleanup retries preserve the publication's captured log boundary.
     post_publish_cleanup: Option<PostPublishCleanup>,
+    checkpoint_failure: Option<(u64, SqlError)>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
     pending_copy: Option<exec::CopySetup>,
     wal_upload: bool,
+    commit_progress: CommitProgressMode,
+    inflight_publication: Option<InflightPublication>,
+    publication_failed: bool,
+    durable_lsn: u64,
+    unpromoted_commits: usize,
+    fatal_commit_failure: Option<SqlError>,
+    commit_queue: Option<commit::Queue>,
+    read_owner: Option<crate::store::ReadOwner>,
+    visible_lsn: u64,
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
@@ -908,9 +944,14 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
 }
 
 fn apply_current_transaction_setting(
+    storage: &Storage,
     txn: &mut TxnState,
     characteristics: ast::TransactionCharacteristics,
 ) -> Result<(), SqlError> {
+    if let Some(isolation) = characteristics.isolation {
+        storage.validate_transaction_isolation(isolation)?;
+    }
+
     txn.apply_characteristics(characteristics)
 }
 
@@ -2411,6 +2452,7 @@ impl Engine {
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
         self.wal.select_database(self.work.database_oid());
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
     }
 
     pub(crate) fn execution_identity(&self) -> ExecutionIdentity {
@@ -2420,6 +2462,34 @@ impl Engine {
     pub(crate) fn restore_execution_identity(&mut self, identity: ExecutionIdentity) {
         publish_execution_identity(identity);
         self.wal.select_database(identity.database_oid);
+        let _ = self.replace_read_owner(Some(identity.read_owner()));
+    }
+
+    pub(crate) fn bind_query_connection(&mut self, connection_id: i32) {
+        self.work.bind_connection(connection_id);
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
+    }
+
+    pub(crate) fn replace_read_owner(
+        &mut self,
+        owner: Option<crate::store::ReadOwner>,
+    ) -> Option<crate::store::ReadOwner> {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.set_read_owner(owner);
+        }
+        core::mem::replace(&mut self.read_owner, owner)
+    }
+
+    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.cancel_read_owner(owner);
+        }
+    }
+
+    pub(crate) fn read_capacity_generation(&self) -> u64 {
+        self.ckpt
+            .as_ref()
+            .map_or(0, Checkpointer::read_capacity_generation)
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
@@ -2432,6 +2502,37 @@ impl Engine {
             foreign_sessions_used: self.storage.foreign_sessions_used(),
             block_io: self.storage.block_io_stats(),
             checkpoint_pending: self.checkpoint_work_pending(),
+        }
+    }
+
+    /// Standalone catalog commands have no resumable transaction owner.
+    /// Complete their explicit publication boundary before applying catalog
+    /// changes; an uncertain outcome requires recovery rather than rollback.
+    fn finish_atomic_journal<T>(
+        &mut self,
+        apply: impl FnOnce(&mut Storage) -> Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        self.check_writer_fence()?;
+        self.wal.commit();
+        if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            let result = self.commit_wal().and_then(|()| apply(&mut self.storage));
+            if let Err(error) = &result {
+                crate::logging::error_args(
+                    "atomic_commit_requires_recovery",
+                    format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                );
+                self.fatal_commit_failure = Some(SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                });
+                return Err(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "commit outcome requires recovery"
+                ));
+            }
+            result
+        } else {
+            apply(&mut self.storage)
         }
     }
 
@@ -2478,11 +2579,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage
-            .complete_subscription_cleanup(slot, created_at)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.complete_subscription_cleanup(slot, created_at)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn fail_subscription(
@@ -2516,10 +2617,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.fail_subscription(stream, failure)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.fail_subscription(stream, failure)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn subscription_runtime(&self, slot: usize) -> Option<SubscriptionRuntime> {
@@ -2764,6 +2866,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        self.check_writer_fence()?;
         // Apply workers have transaction identities but no frontend/backend
         // process identity. Publish their durable database before opening the
         // local transaction instead of inheriting a reactor thread's context.
@@ -3414,7 +3517,7 @@ impl Engine {
                     .saturating_add(size_of::<QueryWorkspace>()),
             )
             + config.wal_buffer_bytes
-            + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
+            + config.wal_upload_buffer_bytes
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_roles * size_of::<u16>()
             + config.max_databases * size_of::<u16>()
@@ -3432,6 +3535,11 @@ impl Engine {
                     .saturating_add(size_of::<u32>()),
             )
             + two_phase::PreparedTransactions::budget_bytes(config)
+            + if config.object_store_on && config.wal_upload {
+                commit::Queue::budget_bytes(config)
+            } else {
+                0
+            }
             + config.max_foreign_sessions.saturating_mul(
                 crate::pg::replication_client::ReplicationClient::budget_bytes(
                     1,
@@ -3467,6 +3575,15 @@ impl Engine {
     /// Builds storage, loads the latest checkpoint from object storage
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
+        if config.object_store_on
+            && config.wal_upload
+            && config.wal_upload_buffer_bytes < config.wal_buffer_bytes
+        {
+            return Err(EngineSetupError::Configuration(
+                "wal_upload_buffer_bytes must be at least wal_buffer_bytes",
+            ));
+        }
+
         crate::sql::tzif::init_catalog();
         budget.draw(
             exec::record_shape_pool_bytes(config.max_composites),
@@ -3614,6 +3731,7 @@ impl Engine {
             c.publish_commit_batch(first, &segment)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
+        let recovered_durable_lsn = storage.lsn();
         if clean_shutdown_lsn != Some(storage.lsn()) && storage.has_unlogged_relations() {
             let transaction_id = storage.reserve_transaction_identity()?;
             let provisional_lsn = storage.lsn().checked_add(1).ok_or_else(|| {
@@ -3660,7 +3778,7 @@ impl Engine {
             storage.install_foreign_client(foreign_client);
         }
         // The upload buffer must hold at least one full WAL batch.
-        let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
+        let upload_buf = config.wal_upload_buffer_bytes;
         let mut database_connections =
             FixedVec::new(budget, "database_connections", config.max_databases)?;
         for _ in 0..config.max_databases {
@@ -3693,8 +3811,22 @@ impl Engine {
             ckpt,
             temporary_spiller,
             post_publish_cleanup: None,
+            checkpoint_failure: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
+            commit_progress: CommitProgressMode::Inline,
+            inflight_publication: None,
+            publication_failed: false,
+            durable_lsn: recovered_durable_lsn,
+            unpromoted_commits: 0,
+            fatal_commit_failure: None,
+            commit_queue: if config.object_store_on && config.wal_upload {
+                Some(commit::Queue::new(config, budget)?)
+            } else {
+                None
+            },
+            read_owner: None,
+            visible_lsn: recovered_durable_lsn,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: DmlWorkspaces::new(config, budget)?,
@@ -3760,12 +3892,17 @@ impl Engine {
         let parent = self
             .clean_shutdown_path
             .parent()
-            .ok_or_else(|| std::io::Error::other("clean shutdown marker has no parent"))?;
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         std::fs::File::open(parent)?.sync_all()
     }
 
     pub(crate) fn replication_identity(&self) -> (u64, u64) {
-        (self.replication_system_id, self.wal.last_lsn())
+        let lsn = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            self.visible_lsn.min(self.durable_lsn)
+        } else {
+            self.wal.last_lsn()
+        };
+        (self.replication_system_id, lsn)
     }
 
     pub(crate) fn export_replication_snapshot(
@@ -3840,11 +3977,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage
-            .create_replication_slot(name, restart_lsn, behavior)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(restart_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.create_replication_slot(name, restart_lsn, behavior)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(restart_lsn)
+        })
     }
 
     /// Writes one user logical-decoding message. A transactional message joins
@@ -4006,15 +4143,16 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.restore_replication_slot(
-            destination_name,
-            source.restart_lsn,
-            source.confirmed_flush_lsn,
-            source.behavior,
-        )?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(source.confirmed_flush_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.restore_replication_slot(
+                destination_name,
+                source.restart_lsn,
+                source.confirmed_flush_lsn,
+                source.behavior,
+            )?;
+            storage.observe_lsn(commit_lsn);
+            Ok(source.confirmed_flush_lsn)
+        })
     }
 
     pub(crate) fn drop_replication_slot(
@@ -4060,10 +4198,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.drop_replication_slot(name.as_str())?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.drop_replication_slot(name.as_str())?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn alter_replication_slot(
@@ -4111,10 +4250,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.alter_replication_slot(name, behavior)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.alter_replication_slot(name, behavior)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn activate_replication_slot(
@@ -4236,7 +4376,8 @@ impl Engine {
         name: &str,
         confirmed_flush_lsn: u64,
     ) -> Result<u64, SqlError> {
-        let confirmed_flush_lsn = confirmed_flush_lsn.min(self.storage.lsn());
+        let (_, frontier) = self.replication_identity();
+        let confirmed_flush_lsn = confirmed_flush_lsn.min(frontier);
         let advance = self
             .storage
             .prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
@@ -4267,10 +4408,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.apply_replication_slot_advance(advance);
-        self.storage.observe_lsn(commit_lsn);
-        Ok(confirmed_flush_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.apply_replication_slot_advance(advance);
+            storage.observe_lsn(commit_lsn);
+            Ok(confirmed_flush_lsn)
+        })
     }
 
     /// Emits the next complete committed transaction selected by one logical
@@ -4315,6 +4457,14 @@ impl Engine {
             protocol: proto_version,
         } = emission;
         self.validate_replication_publications(publication_names)?;
+        let ceiling = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            self.visible_lsn.min(self.durable_lsn)
+        } else {
+            u64::MAX
+        };
+        if floor >= ceiling {
+            return Ok(None);
+        }
         self.work.reset();
         let storage = &self.storage;
         let filter_arena = &self.work;
@@ -4702,7 +4852,9 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            logical_messages.as_mut_slice(),
+                            logical_messages
+                                .as_mut_slice()
+                                .map_err(|_| eval::arena_full())?,
                             responder,
                         )?;
                         emit_pending_truncates(
@@ -4895,7 +5047,9 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            logical_messages.as_mut_slice(),
+                            logical_messages
+                                .as_mut_slice()
+                                .map_err(|_| eval::arena_full())?,
                             responder,
                         )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
@@ -5015,7 +5169,9 @@ impl Engine {
                 messages,
                 end_lsn,
                 u32::MAX,
-                logical_messages.as_mut_slice(),
+                logical_messages
+                    .as_mut_slice()
+                    .map_err(|_| eval::arena_full())?,
                 responder,
             )?;
             if !has_nontransactional_message {
@@ -5033,14 +5189,14 @@ impl Engine {
             // The checkpointer owns the object client; its serving cursor is
             // read-only and uses its startup-reserved segment-list scratch.
             if let Some(lsn) =
-                checkpointer.next_committed_wal_transaction(floor, scratch, &mut encode)?
+                checkpointer.next_committed_wal_transaction(floor, ceiling, scratch, &mut encode)?
             {
                 return Ok(Some((lsn, emitted)));
             }
         }
         Ok(self
             .wal
-            .next_committed_after(floor, scratch, encode)?
+            .next_committed_after(floor, ceiling, scratch, encode)?
             .map(|lsn| (lsn, emitted)))
     }
 
@@ -5058,12 +5214,13 @@ impl Engine {
             }
             return Ok(());
         }
+        let (isolation, read_only, deferrable) = guc.transaction_defaults();
+        self.storage.validate_transaction_isolation(isolation)?;
         txn.txid = self.storage.start_transaction_identity()?;
         txn.mode = mode;
         datetime::begin_transaction();
         txn.activate_transaction_clock();
         guc.begin_transaction();
-        let (isolation, read_only, deferrable) = guc.transaction_defaults();
         txn.set_characteristics(isolation, read_only, deferrable);
         txn.failed = false;
         Ok(())
@@ -5081,38 +5238,43 @@ impl Engine {
         retain_snapshot: bool,
         resume_statement: bool,
     ) -> Result<CommandSnapshot, SqlError> {
+        self.storage.validate_transaction_isolation(txn.isolation)?;
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
+        let visible = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            self.visible_lsn
+        } else {
+            self.storage.lsn()
+        };
         let resumed = if resume_statement {
-            txn.resume_statement_snapshot()
+            txn.resume_statement()
         } else {
             None
         };
-        if let Some(lease) = &resumed {
+        if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
         }
         if advance_command && resumed.is_none() {
             txn.begin_command()?;
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
-        let lease = if resumed.is_some() {
-            resumed
+        let retained_lease = resumed.and_then(|state| state.lease);
+        let lease = if retained_lease.is_some() {
+            retained_lease
         } else if takes_snapshot && retain_snapshot {
-            Some(
-                self.storage
-                    .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
-            )
+            Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| {
+                txn.statement_snapshot(lsn.min(visible))
+            })?)
         } else {
             None
         };
         let snapshot = if takes_snapshot {
-            let snapshot = lease.as_ref().map_or_else(
-                || txn.statement_snapshot(self.storage.lsn()),
-                |lease| lease.snapshot(),
-            );
+            let snapshot = lease
+                .as_ref()
+                .map_or_else(|| txn.statement_snapshot(visible), |lease| lease.snapshot());
             if matches!(
                 txn.isolation,
                 TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -5139,7 +5301,7 @@ impl Engine {
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
-        self.finish_txn(txn, guc, None)
+        self.finish_txn(txn, guc, txn::CommitTarget::Ordinary)
     }
 
     /// Journals every final transaction image and either commits it or leaves
@@ -5149,8 +5311,21 @@ impl Engine {
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
-        prepared_slot: Option<usize>,
+        target: txn::CommitTarget,
     ) -> Result<(), SqlError> {
+        if let Some(staged) = txn.staged_commit() {
+            if staged.target != target {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "staged commit target changed"
+                ));
+            }
+            return self.complete_staged_commit(txn, guc);
+        }
+        let prepared_slot = match target {
+            txn::CommitTarget::Prepare { slot, .. } => Some(slot),
+            _ => None,
+        };
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if !txn.is_active() {
@@ -6026,6 +6201,14 @@ impl Engine {
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
         let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        // ROLLBACK leaves an empty protocol transaction. Only a durable
+        // change needs writer ownership at this final commit boundary.
+        if (staged_bytes != 0 || target != txn::CommitTarget::Ordinary)
+            && let Err(error) = self.check_writer_fence()
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let boundary_bytes =
             prepared_slot.map_or_else(crate::wal::Wal::commit_boundary_bytes, |slot| {
                 crate::wal::Wal::prepare_boundary_bytes(
@@ -6037,15 +6220,48 @@ impl Engine {
             .pending_batch_bytes()
             .saturating_add(staged_bytes)
             .saturating_add(boundary_bytes as u64);
-        if next_batch_bytes > self.wal_seg_buf.capacity() as u64
-            && let Err(error) = self.commit_wal()
-        {
-            self.rollback_txn(txn, guc);
-            return Err(error);
+        if self.wal_upload && next_batch_bytes > self.wal_seg_buf.capacity() as u64 {
+            if self.commit_progress == CommitProgressMode::Reactor {
+                self.rollback_txn(txn, guc);
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "wal_upload_buffer_bytes exhausted while commit publication is pending"
+                ));
+            }
+            if let Err(error) = self.commit_wal() {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
         }
+        let queued = if self.wal_upload
+            && self.commit_progress == CommitProgressMode::Reactor
+            && (prepared_slot.is_some() || staged_bytes != 0)
+        {
+            let identity = self.execution_identity();
+            match self
+                .commit_queue
+                .as_mut()
+                .expect("object commit queue")
+                .reserve(guc, identity)
+            {
+                Ok(ticket) => Some(ticket),
+                Err(error) => {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if prepared_slot.is_none()
             && let Err(error) = foreign::commit_session(&self.storage, txn.txid)
         {
+            if let Some(ticket) = queued {
+                self.commit_queue
+                    .as_mut()
+                    .expect("reserved commit queue")
+                    .cancel_reservation(ticket);
+            }
             self.rollback_txn(txn, guc);
             return Err(error);
         }
@@ -6067,6 +6283,12 @@ impl Engine {
         let commit_lsn = match finish_result {
             Ok(lsn) => lsn,
             Err(error) => {
+                if let Some(ticket) = queued {
+                    self.commit_queue
+                        .as_mut()
+                        .expect("reserved commit queue")
+                        .cancel_reservation(ticket);
+                }
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
@@ -6075,14 +6297,6 @@ impl Engine {
         // transaction state and locks live until every staged image and the
         // commit boundary are complete, so the statement retry can resume the
         // same transaction instead of observing cleared undo buffers.
-        if prepared_slot.is_none() {
-            self.storage
-                .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
-            self.storage.release_serializable(txn.txid);
-            self.storage.release_table_locks(txn.txid);
-            self.storage.release_row_locks(txn.txid);
-            self.storage.release_advisory_transaction_locks(txn.txid);
-        }
         if let Some(origin_lsn) = subscription_origin_lsn {
             debug_assert_eq!(
                 origin_lsn, commit_lsn,
@@ -6114,16 +6328,218 @@ impl Engine {
             }
         }
         statistics_receipts.acknowledge();
-        // The local journal makes the batch crash-recoverable while it waits
-        // for the protocol publication barrier.  The connection releases no
-        // successful response until that barrier has published the immutable
-        // batch to object storage.
         self.wal.commit();
-        if prepared_slot.is_some() {
-            guc.commit_transaction();
+        if let txn::CommitTarget::CommitPrepared { slot, .. }
+        | txn::CommitTarget::RollbackPrepared { slot, .. } = target
+        {
+            self.prepared_transactions.claim_resolution(slot, txn.txid);
+        }
+        let journal = prepared_slot.is_some() || staged_bytes != 0;
+        let publication_lsn =
+            if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+                // Position zero denotes an absent deletion marker. Temporary data
+                // needs a real position even before the first durable transaction.
+                if self.visible_lsn == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
+                    self.storage.observe_lsn(1);
+                    self.visible_lsn = 1;
+                }
+                self.visible_lsn
+            } else {
+                commit_lsn
+            };
+        txn.stage_commit(
+            publication_lsn,
+            target,
+            if journal {
+                txn::CommitBarrier::Journal
+            } else {
+                txn::CommitBarrier::NoJournal
+            },
+        );
+        if let Some(ticket) = queued {
+            self.commit_queue
+                .as_mut()
+                .expect("reserved commit queue")
+                .stage(ticket, txn);
+        }
+        self.unpromoted_commits = self
+            .unpromoted_commits
+            .checked_add(1)
+            .expect("staged commits are bounded by the startup transaction registry");
+        self.complete_staged_commit(txn, guc)
+    }
+
+    pub(crate) fn finish_staged_transaction(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        if txn.staged_commit().is_none() {
             return Ok(());
         }
-        self.promote_transaction_state(txn, commit_lsn, Some(guc))
+        let _atomic_reads = self.atomic_block_read_scope();
+        let _published = eval::funcs::system::retain_session_evaluation();
+        let _evaluation = guc::enter_eval_scope(guc, txn);
+        let role = guc.current_role();
+        let session = guc.session_user();
+        eval::funcs::system::set_current_user(role.as_str());
+        eval::funcs::system::set_session_user(session.as_str());
+        let path = self
+            .storage
+            .compute_path(guc.search_path().as_str(), role.as_str(), txn.txid);
+        let prior = self.storage.swap_path(path);
+        timezone::set_session(guc.timezone());
+        if let Some(database) = self
+            .storage
+            .database_slot_by_oid(self.storage.current_database_oid(), txn.txid)
+        {
+            let name = self.storage.database_definition(database, txn.txid).name;
+            eval::funcs::system::set_current_database(name.as_str());
+        }
+        let result = self.complete_staged_commit(txn, guc);
+        self.storage.swap_path(prior);
+        result
+    }
+
+    fn complete_staged_commit(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        let staged = txn
+            .staged_commit()
+            .expect("completion owns a staged commit");
+        if let Some(ticket) = staged.queue {
+            self.promote_ready_commits()?;
+            if self
+                .commit_queue
+                .as_mut()
+                .expect("queued commit receipt")
+                .receipt(ticket, txn, guc)?
+            {
+                return Ok(());
+            }
+            query::arm_timeout(0);
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "commit is waiting for object storage"
+            ));
+        }
+        if self.wal_upload
+            && self.commit_progress == CommitProgressMode::Reactor
+            && staged.barrier == txn::CommitBarrier::Journal
+            && staged.lsn > self.durable_lsn
+        {
+            query::arm_timeout(0);
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "commit is waiting for object storage"
+            ));
+        }
+        txn.take_staged_commit();
+        let result = match staged.target {
+            txn::CommitTarget::Prepare { slot, .. } => {
+                guc.commit_transaction();
+                let prepared_transaction = txn.txid;
+                self.storage.prepare_transaction_locks(txn.txid);
+                let first_lsn = self
+                    .prepared_transactions
+                    .slot(slot)
+                    .first_lsn()
+                    .expect("prepared transaction owns its database-scope WAL record");
+                self.prepared_transactions
+                    .set_lsn_range(slot, first_lsn, staged.lsn);
+                core::mem::swap(
+                    txn,
+                    &mut self.prepared_transactions.slot_mut(slot).transaction,
+                );
+                txn.clear();
+                self.storage.wake_transaction_waiters(prepared_transaction);
+                Ok(())
+            }
+            target => {
+                self.storage
+                    .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
+                self.storage.release_serializable(txn.txid);
+                self.storage.release_table_locks(txn.txid);
+                self.storage.release_row_locks(txn.txid);
+                self.storage.release_advisory_transaction_locks(txn.txid);
+                let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
+                match target {
+                    txn::CommitTarget::Ordinary => own,
+                    txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
+                        self.complete_prepared_resolution(slot, true, txn, staged.lsn)
+                    }),
+                    txn::CommitTarget::RollbackPrepared { slot, .. } => own.and_then(|()| {
+                        self.complete_prepared_resolution(slot, false, txn, staged.lsn)
+                    }),
+                    txn::CommitTarget::Prepare { .. } => unreachable!("prepare handled separately"),
+                }
+            }
+        };
+        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
+            self.visible_lsn = self.visible_lsn.max(staged.lsn);
+        }
+        self.unpromoted_commits -= 1;
+        if self.commit_progress == CommitProgressMode::Reactor
+            && let Err(error) = &result
+            && self.fatal_commit_failure.is_none()
+        {
+            crate::logging::error_args(
+                "committed_state_publication_failed",
+                format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+            );
+            self.fatal_commit_failure = Some(SqlError {
+                sqlstate: error.sqlstate,
+                message: error.message,
+            });
+        }
+        result
+    }
+
+    fn promote_ready_commits(&mut self) -> Result<(), SqlError> {
+        while let Some(ticket) = self
+            .commit_queue
+            .as_ref()
+            .and_then(|queue| queue.next_ready(self.durable_lsn))
+        {
+            let mut work = self
+                .commit_queue
+                .as_mut()
+                .expect("ready commit queue")
+                .take_work(ticket);
+            let prior = self.execution_identity();
+            let read_owner = self.read_owner;
+            self.restore_execution_identity(work.identity);
+            let result = self.finish_staged_transaction(&mut work.transaction, &work.guc);
+            self.restore_execution_identity(prior);
+            let _ = self.replace_read_owner(read_owner);
+            self.commit_queue
+                .as_mut()
+                .expect("working commit queue")
+                .finish_work(ticket, work, result);
+            if self.fatal_commit_failure.is_some() {
+                return Err(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "commit completion requires recovery"
+                ));
+            }
+        }
+        let frontier = self
+            .commit_queue
+            .as_ref()
+            .and_then(commit::Queue::first_staged_lsn)
+            .map_or(self.durable_lsn, |lsn| self.durable_lsn.min(lsn - 1));
+        self.visible_lsn = self.visible_lsn.max(frontier);
+        Ok(())
+    }
+
+    pub(crate) fn fatal_commit_failure(&self) -> Option<&SqlError> {
+        self.fatal_commit_failure.as_ref()
+    }
+
+    pub(crate) fn staged_commits_pending(&self) -> bool {
+        self.unpromoted_commits != 0
     }
 
     /// Promotes an already-durable transaction's live overlays. Ordinary
@@ -6790,6 +7206,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        if txn.staged_commit().is_some() {
+            return self.complete_staged_commit(txn, guc);
+        }
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
@@ -6801,6 +7220,27 @@ impl Engine {
             return Err(error);
         }
         self.commit_txn(txn, guc)
+    }
+
+    fn commit_partition_detach_phase(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let result = if txn.staged_commit().is_some() {
+            self.finish_staged_transaction(txn, guc)
+        } else {
+            self.commit_txn_with_triggers(txn, guc, arena, responder)
+        };
+        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+            && txn.staged_commit().is_some()
+        {
+            // Consume this phase's receipt before executing its continuation.
+            txn.begin_concurrent_partition_detach();
+        }
+        result
     }
 
     fn refresh_prepared_transaction_catalog(&self) -> Result<(), SqlError> {
@@ -6830,6 +7270,26 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        if let Some(staged) = txn.staged_commit() {
+            let txn::CommitTarget::Prepare {
+                gid: staged_gid, ..
+            } = staged.target
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed staged commit target"
+                ));
+            };
+            if staged_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed staged transaction identity"
+                ));
+            }
+            self.complete_staged_commit(txn, guc)?;
+            cursors.on_rollback();
+            return Ok(());
+        }
         let _atomic_reads = self.atomic_block_read_scope();
         let fail =
             |engine: &mut Self, txn: &mut TxnState, cursors: &mut cursor::CursorPool, error| {
@@ -6971,24 +7431,12 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
-        if let Err(error) = self.finish_txn(txn, guc, Some(slot)) {
-            self.prepared_transactions.release(slot);
+        if let Err(error) = self.finish_txn(txn, guc, txn::CommitTarget::Prepare { slot, gid }) {
+            if txn.staged_commit().is_none() {
+                self.prepared_transactions.release(slot);
+            }
             return Err(error);
         }
-        self.storage.prepare_transaction_locks(txn.txid);
-        let prepared_lsn = self.storage.lsn();
-        let first_lsn = self
-            .prepared_transactions
-            .slot(slot)
-            .first_lsn()
-            .expect("a prepared transaction has a database-scope WAL record");
-        self.prepared_transactions
-            .set_lsn_range(slot, first_lsn, prepared_lsn);
-        core::mem::swap(
-            txn,
-            &mut self.prepared_transactions.slot_mut(slot).transaction,
-        );
-        txn.clear();
         cursors.on_rollback();
         Ok(())
     }
@@ -7000,6 +7448,25 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        if let Some(staged) = txn.staged_commit() {
+            let staged_gid = match staged.target {
+                txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
+                txn::CommitTarget::RollbackPrepared { gid, .. } if !commit => gid,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "prepared resolution changed staged outcome"
+                    ));
+                }
+            };
+            if staged_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared resolution changed identity"
+                ));
+            }
+            return self.complete_staged_commit(txn, guc);
+        }
         let _atomic_reads = self.atomic_block_read_scope();
         let Some(slot) = self.prepared_transactions.find(gid) else {
             return Err(sql_err!(
@@ -7009,7 +7476,6 @@ impl Engine {
             ));
         };
         let metadata = self.prepared_transactions.slot(slot).metadata();
-        let recovered = self.prepared_transactions.slot(slot).recovered;
         if metadata.database != self.storage.current_database_oid() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -7034,6 +7500,16 @@ impl Engine {
             ));
         }
 
+        if let Some(blocker) = self
+            .prepared_transactions
+            .resolution_blocker(slot, txn.txid)
+        {
+            self.storage.wait_for_transaction(txn.txid, blocker)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for prepared transaction publication"
+            ));
+        }
         let lsn = self.storage.bump_lsn();
         let operation = if commit {
             WalOp::CommitPrepared { gid: gid.as_str() }
@@ -7041,9 +7517,25 @@ impl Engine {
             WalOp::RollbackPrepared { gid: gid.as_str() }
         };
         self.wal.stage_reserved(txn.txid, lsn, &operation)?;
-        self.commit_txn(txn, guc)?;
-        let resolution_lsn = self.storage.lsn();
+        self.finish_txn(
+            txn,
+            guc,
+            if commit {
+                txn::CommitTarget::CommitPrepared { slot, gid }
+            } else {
+                txn::CommitTarget::RollbackPrepared { slot, gid }
+            },
+        )
+    }
 
+    fn complete_prepared_resolution(
+        &mut self,
+        slot: usize,
+        commit: bool,
+        txn: &mut TxnState,
+        resolution_lsn: u64,
+    ) -> Result<(), SqlError> {
+        let recovered = self.prepared_transactions.slot(slot).recovered;
         // The resolution record is durable before the detached transaction is
         // released. Recovery therefore reaches the same outcome if the process
         // stops anywhere in the in-memory promotion below.
@@ -7135,6 +7627,17 @@ impl Engine {
     }
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
+        if txn.staged_commit().is_some() {
+            crate::logging::error_args(
+                "rollback_after_commit_boundary",
+                format_args!("transaction {} requires recovery", txn.txid),
+            );
+            self.fatal_commit_failure = Some(sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "rollback requested after irreversible commit boundary"
+            ));
+            return;
+        }
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if txn.txid == 0 {
@@ -7260,14 +7763,181 @@ impl Engine {
     /// Publishes every committed journal record accumulated since the prior
     /// protocol flush.  This is the object-store acknowledgement barrier.
     pub fn commit_wal(&mut self) -> Result<(), SqlError> {
-        self.wal.commit();
-        self.upload_wal_batch()
+        // Manual completion explicitly retries now. Reactor turns preserve
+        // their backoff deadline and never busy-wait on it.
+        if let Some(pending) = &mut self.inflight_publication {
+            pending.retry_at = None;
+        }
+        loop {
+            if self.advance_wal_publication(std::time::Instant::now())? {
+                return Ok(());
+            }
+            if let Some(checkpointer) = self.ckpt.as_mut() {
+                checkpointer.wait_commit_publication()?;
+            }
+        }
+    }
+
+    pub(crate) fn enable_async_durability(&mut self) {
+        assert!(self.inflight_publication.is_none());
+        self.commit_progress = CommitProgressMode::Reactor;
     }
 
     pub(crate) fn durable_retry_pending(&self) -> bool {
-        self.wal_upload && self.wal.pending_batch_bytes() != 0
+        self.wal_upload
+            && (self.inflight_publication.is_some() || self.wal.pending_batch_bytes() != 0)
     }
 
+    pub(crate) fn publication_failed(&self) -> bool {
+        self.publication_failed
+    }
+
+    pub(crate) fn journal_lsn(&self) -> u64 {
+        self.wal.last_lsn()
+    }
+
+    pub(crate) fn durable_lsn(&self) -> u64 {
+        self.durable_lsn
+    }
+
+    /// A captured journal range has a distinct owner from records appended
+    /// during its upload. Errors retain that exact range for publication retry.
+    pub(crate) fn advance_wal_publication(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<bool, SqlError> {
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            checkpointer.advance_background_uploads(now);
+        }
+        if self.fatal_commit_failure.is_some() {
+            return Err(sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "commit completion requires recovery"
+            ));
+        }
+        self.wal.commit();
+        if !self.wal_upload {
+            self.durable_lsn = self.wal.last_lsn();
+            return Ok(true);
+        }
+        if let Some(pending) = &mut self.inflight_publication {
+            if pending.retry_at.is_some_and(|deadline| deadline > now) {
+                return Ok(false);
+            }
+            pending.retry_at = None;
+        } else {
+            if self
+                .ckpt
+                .as_ref()
+                .is_some_and(Checkpointer::credential_install_pending)
+            {
+                return Ok(false);
+            }
+            let Some(batch) = self.wal.last_committed_batch() else {
+                return Ok(true);
+            };
+            if batch.byte_len() == 0 {
+                self.wal.clear_batch_marker();
+                return Ok(true);
+            }
+            self.inflight_publication = Some(InflightPublication {
+                batch,
+                through_lsn: self.wal.last_lsn(),
+                retry_at: None,
+            });
+            self.wal.clear_batch_marker();
+        }
+        let result = (|| {
+            let pending = self
+                .inflight_publication
+                .as_ref()
+                .expect("captured committed range");
+            let checkpointer = self
+                .ckpt
+                .as_mut()
+                .expect("object durability has a checkpointer");
+            if !checkpointer.commit_publication_busy() {
+                if pending.batch.byte_len() > self.wal_seg_buf.capacity() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "committed upload exceeds wal_upload_buffer_bytes"
+                    ));
+                }
+                self.wal_seg_buf.resize(pending.batch.byte_len(), 0);
+                self.wal
+                    .read_range(pending.batch.start(), &mut self.wal_seg_buf)
+                    .map_err(|_| {
+                        sql_err!(sqlstate::IO_ERROR, "cannot read WAL batch for upload")
+                    })?;
+                checkpointer
+                    .begin_commit_publication(pending.batch.first_lsn(), &self.wal_seg_buf)?;
+            }
+            checkpointer.advance_commit_publication(now)
+        })();
+        match result {
+            Ok(true) => {
+                self.publication_failed = false;
+                let published = self
+                    .inflight_publication
+                    .take()
+                    .expect("completed publication owns range");
+                self.durable_lsn = self.durable_lsn.max(published.through_lsn);
+                self.promote_ready_commits()?;
+                Ok(self.wal.pending_batch_bytes() == 0)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => {
+                self.publication_failed = true;
+                self.inflight_publication
+                    .as_mut()
+                    .expect("failed publication retains range")
+                    .retry_at = Some(now + std::time::Duration::from_secs(1));
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn upload_slots(&self) -> usize {
+        self.ckpt.as_ref().map_or(0, Checkpointer::upload_slots)
+    }
+
+    pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.ckpt
+            .as_ref()
+            .and_then(|checkpointer| checkpointer.pending_upload_fd(slot))
+    }
+
+    pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
+        self.ckpt
+            .as_ref()
+            .is_some_and(|checkpointer| checkpointer.pending_upload_wants_write(slot))
+    }
+
+    pub(crate) fn next_publication_deadline(&self) -> Option<std::time::Instant> {
+        let journal = self
+            .inflight_publication
+            .as_ref()
+            .and_then(|pending| pending.retry_at)
+            .or_else(|| {
+                (self.inflight_publication.is_none() && self.wal.pending_batch_bytes() != 0)
+                    .then(std::time::Instant::now)
+            });
+        [
+            journal,
+            self.ckpt
+                .as_ref()
+                .and_then(Checkpointer::next_upload_deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(crate) fn writer_probe(&mut self) -> Option<&mut crate::checkpoint::WriterProbe> {
+        self.ckpt.as_mut().and_then(Checkpointer::writer_probe)
+    }
+
+    #[cfg(test)]
     pub(crate) fn verify_writer_ownership(&mut self) -> Result<(), SqlError> {
         match self.ckpt.as_mut() {
             Some(checkpointer) => checkpointer.verify_writer(),
@@ -7275,14 +7945,40 @@ impl Engine {
         }
     }
 
-    pub(crate) fn rotate_object_store_credentials(
+    fn check_writer_fence(&self) -> Result<(), SqlError> {
+        if self
+            .ckpt
+            .as_ref()
+            .is_some_and(Checkpointer::writer_was_fenced)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "writer was fenced by a newer process"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_object_store_credential_reload(
         &mut self,
         credentials: crate::object_store::Credentials,
     ) -> Result<(), SqlError> {
-        match self.ckpt.as_mut() {
-            Some(checkpointer) => checkpointer.rotate_credentials(credentials),
-            None => Ok(()),
-        }
+        let checkpointer = self.ckpt.as_mut().ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "credential reload requires object_store = on"
+            )
+        })?;
+        checkpointer.begin_credential_reload(credentials)
+    }
+
+    pub(crate) fn advance_object_store_credential_reload(
+        &mut self,
+    ) -> Result<crate::checkpoint::CredentialReloadStep, SqlError> {
+        self.ckpt
+            .as_mut()
+            .expect("credential reload requires a durable target")
+            .advance_credential_reload()
     }
 
     /// Whether success responses must remain buffered until commit-batch
@@ -7291,49 +7987,19 @@ impl Engine {
         self.wal_upload
     }
 
-    /// Publishes the accumulated immutable commit batch to the bucket.
-    fn upload_wal_batch(&mut self) -> Result<(), SqlError> {
-        if !self.wal_upload {
-            return Ok(());
-        }
-        let Some(batch) = self.wal.last_committed_batch() else {
-            return Ok(());
-        };
-        if batch.byte_len() == 0 {
-            self.wal.clear_batch_marker();
-            return Ok(());
-        }
-        self.wal_seg_buf.resize(batch.byte_len(), 0);
-        if self
-            .wal
-            .read_range(batch.start(), &mut self.wal_seg_buf)
-            .is_err()
-        {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::IO_ERROR),
-                message: stack_format!(192, "cannot read WAL batch for upload"),
-            });
-        }
-        if let Some(c) = self.ckpt.as_mut() {
-            c.publish_commit_batch(batch.first_lsn(), &self.wal_seg_buf)?;
-        }
-        self.wal.clear_batch_marker();
-        Ok(())
-    }
-
     /// Makes a previously failed committed batch object-store durable before a
     /// later statement can observe it.
     fn retry_pending_wal_upload(&mut self) -> Result<(), SqlError> {
-        if !self.wal_upload || self.wal.pending_batch_bytes() == 0 {
+        if self.commit_progress == CommitProgressMode::Reactor || !self.durable_retry_pending() {
             return Ok(());
         }
-        self.upload_wal_batch()
+        self.commit_wal()
     }
 
     /// Snapshots to object storage, then truncates the journal and compacts
-    /// the heap. The atomic form — drives the sliced checkpoint's beats to
-    /// completion in one call, for the explicit `CHECKPOINT` statement and
-    /// shutdown. `Ok(false)` = nothing to do.
+    /// the heap. The atomic form drives checkpoint beats to completion for
+    /// embedders and shutdown. Reactor SQL commands retain a request instead.
+    /// `Ok(false)` = nothing to do.
     pub fn checkpoint_enabled(&self) -> bool {
         self.ckpt.is_some()
     }
@@ -7344,9 +8010,10 @@ impl Engine {
             .map(Checkpointer::atomic_block_read_scope)
     }
 
-    /// Enables reactor-driven reads only for the durable block stack. Manifest
-    /// and WAL clients retain their synchronous, statement-atomic contracts.
+    /// Enables reactor-driven reads for durable blocks. Root and journal
+    /// uploads use their separately reserved clients and completion state.
     pub(crate) fn enable_async_block_reads(&mut self) {
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.enable_async_block_reads();
         }
@@ -7364,14 +8031,21 @@ impl Engine {
             .and_then(|checkpointer| checkpointer.pending_block_read_fd(slot))
     }
 
+    pub(crate) fn pending_block_read_wants_write(&self, slot: usize) -> bool {
+        self.ckpt
+            .as_ref()
+            .is_some_and(|checkpointer| checkpointer.pending_block_read_wants_write(slot))
+    }
+
     fn block_reads_pending(&self) -> bool {
         self.ckpt
             .as_ref()
             .is_some_and(crate::checkpoint::Checkpointer::block_reads_busy)
     }
 
-    pub(crate) fn object_store_reads_busy(&self) -> bool {
-        self.block_reads_pending()
+    #[cfg(test)]
+    pub(crate) fn object_store_io_busy(&self) -> bool {
+        self.ckpt.as_ref().is_some_and(Checkpointer::object_io_busy)
     }
 
     /// Advances a pending block read. A completed read or a terminal failure
@@ -7387,16 +8061,16 @@ impl Engine {
         checkpointer.advance_pending_block_read(slot)
     }
 
-    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next_block_read_deadline(&self) -> Option<std::time::Instant> {
         self.ckpt
             .as_ref()
-            .and_then(crate::checkpoint::Checkpointer::next_block_read_hedge_deadline)
+            .and_then(crate::checkpoint::Checkpointer::next_block_read_deadline)
     }
 
-    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
-        if let Some(checkpointer) = self.ckpt.as_mut() {
-            checkpointer.issue_due_block_read_hedges(now);
-        }
+    pub(crate) fn advance_block_read_deadlines(&mut self, now: std::time::Instant) -> bool {
+        self.ckpt
+            .as_mut()
+            .is_some_and(|checkpointer| checkpointer.advance_block_read_deadlines(now))
     }
 
     fn validate_maintenance_targets(
@@ -7592,8 +8266,41 @@ impl Engine {
 
     pub(crate) fn execute_checkpoint_statement(
         &mut self,
+        txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if self.commit_progress == CommitProgressMode::Reactor
+            && let Some(checkpointer) = self.ckpt.as_mut()
+        {
+            let request = match txn.checkpoint_request {
+                Some(request) => request,
+                None => match checkpointer.request_checkpoint() {
+                    Ok(request) => {
+                        txn.checkpoint_request = Some(request);
+                        request
+                    }
+                    Err(error) => return Ok(Err(error)),
+                },
+            };
+            if !checkpointer.checkpoint_request_satisfied(request) {
+                if let Some((epoch, error)) = &self.checkpoint_failure
+                    && *epoch >= request.epoch()
+                {
+                    txn.checkpoint_request = None;
+                    return Ok(Err(SqlError {
+                        sqlstate: error.sqlstate,
+                        message: error.message,
+                    }));
+                }
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_IO_WAIT,
+                    "checkpoint publication is pending"
+                )));
+            }
+            txn.checkpoint_request = None;
+            responder.command_complete("CHECKPOINT")?;
+            return Ok(Ok(()));
+        }
         match self.checkpoint() {
             Ok(_) => {
                 responder.command_complete("CHECKPOINT")?;
@@ -7778,7 +8485,9 @@ impl Engine {
                     Ok(characteristics) => characteristics,
                     Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                if let Err(error) =
+                    apply_current_transaction_setting(&self.storage, txn, characteristics)
+                {
                     return Ok(Err(error));
                 }
             } else if let Err(error) = guc.set_from_current(name, local) {
@@ -7793,7 +8502,9 @@ impl Engine {
                 Ok(characteristics) => characteristics,
                 Err(error) => return Ok(Err(error)),
             };
-            if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+            if let Err(error) =
+                apply_current_transaction_setting(&self.storage, txn, characteristics)
+            {
                 return Ok(Err(error));
             }
             responder.command_complete("SET")?;
@@ -8266,6 +8977,12 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        if self.unpromoted_commits != 0 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "checkpoint waits for committed transaction publication"
+            ));
+        }
         self.retry_pending_wal_upload()?;
         if self.post_publish_cleanup.is_some() {
             self.finish_post_publish_cleanup()?;
@@ -8290,7 +9007,7 @@ impl Engine {
         // state machine cannot be rewound as a client statement can.
         let checkpoint = {
             let _atomic_reads = ckpt.atomic_block_read_scope();
-            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
+            ckpt.checkpoint(&mut self.storage)
         };
         match checkpoint? {
             Some(lsn) => {
@@ -8386,18 +9103,21 @@ impl Engine {
 
     fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
         while self.post_publish_cleanup.is_some() {
-            self.post_publish_cleanup_step(true)?;
+            self.post_publish_cleanup_step(HeapRelocationMode::Finish)?;
         }
         Ok(())
     }
 
-    fn post_publish_cleanup_step(&mut self, exclusive: bool) -> Result<bool, SqlError> {
+    fn post_publish_cleanup_step(
+        &mut self,
+        mode: HeapRelocationMode,
+    ) -> Result<HeapRelocationStep, SqlError> {
         let cleanup = self
             .post_publish_cleanup
             .expect("post-publication cleanup has its published LSN");
         #[cfg(feature = "checkpoint-profile")]
         let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
-        let result = self.advance_post_publish_cleanup(cleanup, exclusive);
+        let result = self.advance_post_publish_cleanup(cleanup, mode);
         #[cfg(feature = "checkpoint-profile")]
         if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
             ckpt.profile_phase("local_cleanup", cleanup.lsn, started, before);
@@ -8408,21 +9128,22 @@ impl Engine {
     fn advance_post_publish_cleanup(
         &mut self,
         cleanup: PostPublishCleanup,
-        exclusive: bool,
-    ) -> Result<bool, SqlError> {
+        mode: HeapRelocationMode,
+    ) -> Result<HeapRelocationStep, SqlError> {
         let next = match cleanup.phase {
             PostPublishPhase::Prepare => {
                 self.prepare_post_publish_cleanup(cleanup.lsn);
                 PostPublishPhase::Compact
             }
             PostPublishPhase::Compact | PostPublishPhase::CompactAfterEviction => {
-                let finished = self.compact_scratch.compact_step(
+                match self.compact_scratch.compact_step(
                     &mut self.storage,
+                    core::num::NonZeroUsize::new(64).unwrap(),
                     core::num::NonZeroUsize::new(64 << 10).unwrap(),
-                    exclusive,
-                )?;
-                if !finished {
-                    return Ok(false);
+                    mode,
+                )? {
+                    HeapRelocationStep::Complete => {}
+                    pending => return Ok(pending),
                 }
                 match cleanup.phase {
                     PostPublishPhase::Compact => PostPublishPhase::Evict,
@@ -8443,14 +9164,14 @@ impl Engine {
             PostPublishPhase::Finish => {
                 self.storage.evict_entries();
                 self.post_publish_cleanup = None;
-                return Ok(true);
+                return Ok(HeapRelocationStep::Complete);
             }
         };
         self.post_publish_cleanup = Some(PostPublishCleanup {
             lsn: cleanup.lsn,
             phase: next,
         });
-        Ok(false)
+        Ok(HeapRelocationStep::Advanced)
     }
 
     fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
@@ -8458,7 +9179,7 @@ impl Engine {
             if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()?;
             } else {
-                self.post_publish_cleanup_step(false)?;
+                self.post_publish_cleanup_step(HeapRelocationMode::Background)?;
             }
         }
         Ok(())
@@ -8562,6 +9283,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
@@ -8598,6 +9320,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
@@ -8689,8 +9412,19 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
+        finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        if txn.staged_commit().is_some() {
+            return self.complete_staged_commit(txn, guc);
+        }
+        let transaction_boundary =
+            txn.mode == TxnMode::Implicit && matches!(finish, CopyFinishMode::ImplicitTransaction);
+        let boundary = if transaction_boundary {
+            exec::TriggerQueueBoundary::Transaction
+        } else {
+            exec::TriggerQueueBoundary::Statement
+        };
         self.work.reset();
         let result = Self::copy_finish_with_scratch(
             &mut self.storage,
@@ -8701,13 +9435,14 @@ impl Engine {
             responder,
             &mut self.dml_scratch,
             inserted,
+            boundary,
         );
         setup.release_snapshot();
         if let Err(error) = result {
             self.copy_abort(txn, guc);
             return Err(error);
         }
-        if txn.mode == TxnMode::Implicit {
+        if transaction_boundary {
             return self.commit_txn(txn, guc);
         }
         Ok(())
@@ -8723,6 +9458,11 @@ impl Engine {
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
         workspace.arena.reset();
+        let boundary = if txn.mode == TxnMode::Implicit {
+            exec::TriggerQueueBoundary::Transaction
+        } else {
+            exec::TriggerQueueBoundary::Statement
+        };
         Self::copy_finish_with_scratch(
             &mut self.storage,
             workspace.arena,
@@ -8732,6 +9472,7 @@ impl Engine {
             responder,
             workspace.dml_scratch,
             workspace.transition_rows,
+            boundary,
         )?;
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
@@ -8752,6 +9493,7 @@ impl Engine {
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
         inserted: &exec::CopyTransitionRows,
+        boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
         let _files = setup.restore_snapshot(storage)?;
         exec::copy_statement_end(
@@ -8765,11 +9507,6 @@ impl Engine {
             inserted,
         )?;
         exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
-        let boundary = if txn.mode == TxnMode::Implicit {
-            exec::TriggerQueueBoundary::Transaction
-        } else {
-            exec::TriggerQueueBoundary::Statement
-        };
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -8809,9 +9546,43 @@ impl Engine {
     /// Heap and history cleanup use no object client. Publication and merge
     /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
+        if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.manifest_publication_pending()
+        {
+            return checkpointer.manifest_publication_ready(std::time::Instant::now())
+                || self.storage.history_cleanup_pending();
+        }
+        if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.credential_install_pending()
+        {
+            return self.post_publish_cleanup.is_some()
+                || self.storage.history_cleanup_pending()
+                || (checkpointer.physical_output_pending()
+                    && (checkpointer.physical_output_ready(std::time::Instant::now())
+                        || checkpointer.physical_output_stale(&self.storage)));
+        }
+        let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
+            checkpointer.physical_output_ready(std::time::Instant::now())
+                || checkpointer.physical_output_stale(&self.storage)
+        });
         self.post_publish_cleanup.is_some()
             || self.storage.history_cleanup_pending()
-            || !self.block_reads_pending()
+            || (self
+                .ckpt
+                .as_ref()
+                .is_some_and(|checkpointer| checkpointer.physical_output_pending())
+                && output_ready)
+            || (output_ready
+                && !self.block_reads_pending()
+                && self
+                    .ckpt
+                    .as_ref()
+                    .is_some_and(Checkpointer::retained_output_ready))
+            || (output_ready
+                && !self.block_reads_pending()
+                && self.unpromoted_commits == 0
+                && !(self.commit_progress == CommitProgressMode::Reactor
+                    && self.durable_retry_pending()))
     }
 
     /// Advances one maintenance turn; false requests retry backoff.
@@ -8820,10 +9591,118 @@ impl Engine {
     }
 
     /// Snapshot cleanup visits at most 64 stable slots alongside a heap step.
-    /// Critical pressure, heap capture/remapping and other maintenance still
+    /// Critical pressure, heap remapping and other maintenance still
     /// have whole turns. Publication and merge wait for owned reads to finish.
+    fn remember_checkpoint_failure(&mut self, error: &SqlError) {
+        if let Some(checkpointer) = self.ckpt.as_ref() {
+            self.checkpoint_failure = Some((
+                checkpointer.requested_checkpoint_epoch(),
+                SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                },
+            ));
+        }
+    }
+
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
-        let reads_pending = self.block_reads_pending();
+        if let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.manifest_publication_pending()
+        {
+            if !checkpointer.manifest_publication_ready(std::time::Instant::now()) {
+                return match self
+                    .storage
+                    .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap())
+                {
+                    crate::storage::HistoryReclamation::Idle => CheckpointBeat::WaitingForReads,
+                    crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
+                    crate::storage::HistoryReclamation::WaitingForOwner => {
+                        CheckpointBeat::WaitingForOwner
+                    }
+                };
+            }
+            return match checkpointer.advance_manifest_publication(&mut self.storage) {
+                Ok(CheckpointStep::Published { lsn }) => {
+                    self.begin_post_publish_cleanup(lsn);
+                    CheckpointBeat::Durable
+                }
+                Ok(CheckpointStep::Working) => CheckpointBeat::Advanced,
+                Ok(CheckpointStep::Idle) => unreachable!("retained manifest publication"),
+                Err(error) => {
+                    crate::logging::error_args(
+                        "checkpoint_manifest_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    let durable = checkpointer.manifest_installing();
+                    self.remember_checkpoint_failure(&error);
+                    if durable {
+                        CheckpointBeat::DurableWithLocalFailure
+                    } else {
+                        CheckpointBeat::StorageFailure
+                    }
+                }
+            };
+        }
+        if let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.physical_output_pending()
+            && (checkpointer.physical_output_ready(std::time::Instant::now())
+                || checkpointer.physical_output_stale(&self.storage))
+        {
+            return match checkpointer.advance_physical_output(&self.storage) {
+                Ok(_) => CheckpointBeat::Advanced,
+                Err(error) => {
+                    self.remember_checkpoint_failure(&error);
+                    crate::logging::error_args(
+                        "checkpoint_upload_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    CheckpointBeat::StorageFailure
+                }
+            };
+        }
+        let credential_draining = self
+            .ckpt
+            .as_ref()
+            .is_some_and(Checkpointer::credential_install_pending);
+        let journal_pending = self.unpromoted_commits != 0
+            || (self.commit_progress == CommitProgressMode::Reactor
+                && self.durable_retry_pending());
+        if journal_pending
+            && !credential_draining
+            && self.post_publish_cleanup.is_none()
+            && !self.block_reads_pending()
+            && let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.retained_output_ready()
+        {
+            if self.storage.history_cleanup_pending() {
+                let _ = self
+                    .storage
+                    .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap());
+            }
+            let atomic_reads = checkpointer.atomic_block_read_scope();
+            let result = checkpointer.advance_retained_output(&self.storage);
+            drop(atomic_reads);
+            return match result {
+                Ok(()) => CheckpointBeat::Advanced,
+                Err(error) => {
+                    self.remember_checkpoint_failure(&error);
+                    crate::logging::error_args(
+                        "checkpoint_output_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    CheckpointBeat::StorageFailure
+                }
+            };
+        }
+        let reads_pending = credential_draining
+            || self.block_reads_pending()
+            || self
+                .ckpt
+                .as_ref()
+                .is_some_and(Checkpointer::physical_output_pending)
+            || self.unpromoted_commits != 0
+            || (self.commit_progress == CommitProgressMode::Reactor
+                && self.durable_retry_pending());
         let history_pending = self.storage.history_cleanup_pending();
         if reads_pending && self.post_publish_cleanup.is_none() && !history_pending {
             return CheckpointBeat::WaitingForReads;
@@ -8832,6 +9711,7 @@ impl Engine {
         // With an owned GET, only already-published local cleanup may advance.
         let retried_upload = !reads_pending && self.durable_retry_pending();
         if !reads_pending && let Err(error) = self.retry_pending_wal_upload() {
+            self.remember_checkpoint_failure(&error);
             let message = stack_format!(
                 512,
                 "auto-checkpoint failed ({}): {}\n",
@@ -8850,10 +9730,14 @@ impl Engine {
         if self.post_publish_cleanup.is_some() {
             let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()
+                    .map(|()| HeapRelocationStep::Complete)
             } else {
-                self.post_publish_cleanup_step(false).map(|_| ())
+                self.post_publish_cleanup_step(HeapRelocationMode::Background)
             };
             return match cleanup {
+                Ok(HeapRelocationStep::WaitingForOwner) if !retried_upload => {
+                    CheckpointBeat::WaitingForOwner
+                }
                 Ok(_) => {
                     if retried_upload {
                         CheckpointBeat::Durable
@@ -8862,6 +9746,7 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    self.remember_checkpoint_failure(&e);
                     let message = stack_format!(
                         512,
                         "post-checkpoint bookkeeping failed ({}): {}\n",
@@ -8905,6 +9790,7 @@ impl Engine {
             && let Some(slot) = match spiller.spill_step(&mut self.storage, &mut self.scratch) {
                 Ok(slot) => slot,
                 Err(error) => {
+                    self.remember_checkpoint_failure(&error);
                     let message = stack_format!(
                         512,
                         "temporary spill failed ({}): {}\n",
@@ -8969,14 +9855,13 @@ impl Engine {
         let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = if critical {
-            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
-                .map(|published| {
-                    published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
-                        lsn,
-                    })
+            ckpt.checkpoint(&mut self.storage).map(|published| {
+                published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
+                    lsn,
                 })
+            })
         } else {
-            ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
+            ckpt.checkpoint_step(&mut self.storage)
         };
         drop(atomic_reads);
         let remote_maintenance_finished =
@@ -8987,9 +9872,11 @@ impl Engine {
                 let cleanup = if critical {
                     self.finish_post_publish_cleanup()
                 } else {
-                    self.post_publish_cleanup_step(false).map(|_| ())
+                    self.post_publish_cleanup_step(HeapRelocationMode::Background)
+                        .map(|_| ())
                 };
                 if let Err(e) = cleanup {
+                    self.remember_checkpoint_failure(&e);
                     let message = stack_format!(
                         512,
                         "post-checkpoint bookkeeping failed ({}): {}\n",
@@ -9016,6 +9903,7 @@ impl Engine {
                 }
             }
             Err(e) => {
+                self.remember_checkpoint_failure(&e);
                 let message = stack_format!(
                     512,
                     "auto-checkpoint failed ({}): {}\n",
@@ -9107,7 +9995,21 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
+        if txn.concurrent_partition_detach_pending()
+            && txn.staged_commit().is_some()
+            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+        {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExecutionStatus::Blocked {
+                    completed_statements: resume_statement,
+                    output_mark: responder.buffer.mark(),
+                    io_wait: true,
+                });
+            }
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9177,7 +10079,7 @@ impl Engine {
         } else {
             exec::PlpgsqlTransactionContext::Atomic
         };
-        let mut executed_any = resume_statement > 0;
+        let mut executed_any = resume_statement > 0 || txn.staged_commit().is_some();
         for (statement_index, statement) in statements[..statement_count]
             .iter()
             .enumerate()
@@ -9207,6 +10109,13 @@ impl Engine {
                 && txn.mode == TxnMode::Implicit
                 && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
             {
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                    return Ok(ExecutionStatus::Blocked {
+                        completed_statements: statement_index,
+                        output_mark: responder.buffer.mark(),
+                        io_wait: true,
+                    });
+                }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
@@ -9248,9 +10157,23 @@ impl Engine {
                 })
                 .and_then(|()| query::check_timeout());
             if let Err(mut e) = outcome {
+                if self.fatal_commit_failure.is_some() {
+                    responder.error(
+                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                        "commit completion requires recovery; connection must close",
+                    )?;
+                    return Ok(ExecutionStatus::Complete);
+                }
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
+                    if txn.staged_commit().is_some() {
+                        return Ok(ExecutionStatus::Blocked {
+                            completed_statements: statement_index,
+                            output_mark,
+                            io_wait: true,
+                        });
+                    }
                     if txn.owns_statement_mark(statement_mark) {
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
@@ -9288,7 +10211,15 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
             if txn.take_concurrent_partition_detach() {
-                if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                if let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder) {
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some()
+                    {
+                        return Ok(ExecutionStatus::Blocked {
+                            completed_statements: statement_index,
+                            output_mark,
+                            io_wait: true,
+                        });
+                    }
                     responder.error(error.sqlstate, error.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
@@ -9309,6 +10240,13 @@ impl Engine {
             && self.pending_copy.is_none()
             && let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
+            if e.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExecutionStatus::Blocked {
+                    completed_statements: statement_count,
+                    output_mark: responder.buffer.mark(),
+                    io_wait: true,
+                });
+            }
             responder.error(e.sqlstate, e.message.as_str())?;
         }
         Ok(ExecutionStatus::Complete)
@@ -9369,7 +10307,17 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
+        if txn.concurrent_partition_detach_pending()
+            && txn.staged_commit().is_some()
+            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+        {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+            }
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9475,7 +10423,14 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.take_concurrent_partition_detach() {
-                    if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                    if let Err(error) =
+                        self.commit_partition_detach_phase(txn, guc, arena, responder)
+                    {
+                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            && txn.staged_commit().is_some()
+                        {
+                            return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                        }
                         responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
@@ -9485,9 +10440,20 @@ impl Engine {
                 Ok(ExtendedExecutionStatus::Complete(true))
             }
             Err(mut e) => {
+                if self.fatal_commit_failure.is_some() {
+                    responder.error(
+                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                        "commit completion requires recovery; connection must close",
+                    )?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
+
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
+                    if txn.staged_commit().is_some() {
+                        return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                    }
                     if txn.owns_statement_mark(statement_mark) {
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
@@ -9542,14 +10508,17 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
-    ) -> Result<bool, WireFull> {
+    ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _atomic_reads = self.atomic_block_read_scope();
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
-        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+        if let Err(error) = self
+            .check_writer_fence()
+            .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
+        {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
-            return Ok(false);
+            return Ok(ExtendedExecutionStatus::Complete(false));
         }
         if txn.failed {
             responder.error(
@@ -9557,7 +10526,7 @@ impl Engine {
                 "current transaction is aborted, commands ignored until end of transaction block",
             )?;
             responder.ready_for_query(txn.status_byte())?;
-            return Ok(false);
+            return Ok(ExtendedExecutionStatus::Complete(false));
         }
         let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
             Ok(lease) => lease,
@@ -9569,7 +10538,7 @@ impl Engine {
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
-                return Ok(false);
+                return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
@@ -9594,20 +10563,25 @@ impl Engine {
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
-                return Ok(false);
+                return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
         txn.compact_completed_constraints();
+        let response_mark = responder.buffer.mark();
+        responder.function_call_response(&value, binary_result)?;
         if txn.mode == TxnMode::Implicit
             && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+            }
+            responder.buffer.truncate_to(response_mark);
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
-            return Ok(false);
+            return Ok(ExtendedExecutionStatus::Complete(false));
         }
-        responder.function_call_response(&value, binary_result)?;
         responder.ready_for_query(txn.status_byte())?;
-        Ok(true)
+        Ok(ExtendedExecutionStatus::Complete(true))
     }
 
     /// Infers each `$n` parameter's type OID from how it is used, as
@@ -11465,6 +12439,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        query::protect_statement_effects();
         if let Some(oid) = pending.intrinsic_oid {
             let arguments = match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
                 Ok(arguments) => arguments,
@@ -13228,10 +14203,16 @@ impl Engine {
                     responder,
                 },
             )?;
-            self.commit_txn_with_triggers(txn, guc, arena, responder)?;
-            self.commit_wal()
+            match self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                Err(error)
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        && txn.staged_commit().is_some() => {}
+                result => result?,
+            }
+            self.commit_wal()?;
+            self.finish_staged_transaction(txn, guc)
         })();
-        if result.is_err() && txn.is_active() {
+        if result.is_err() && txn.is_active() && txn.staged_commit().is_none() {
             self.rollback_txn(txn, guc);
         }
         result
@@ -13350,6 +14331,9 @@ impl Engine {
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let routine_transaction_context = txn
+            .suspended_statement_context()
+            .unwrap_or(routine_transaction_context);
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
@@ -13367,10 +14351,17 @@ impl Engine {
             None,
         );
         txn.leave_ddl_origin(prior_origin);
-        if !matches!(&result, Ok(Err(error)) if
+        if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
+            txn.suspend_statement(
+                None,
+                datetime::statement_clock(),
+                query::statement_deadline(),
+                routine_transaction_context,
+            );
+        } else {
             txn.release_suspended_statement();
         }
         result
@@ -13588,6 +14579,12 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && txn.staged_commit().is_none()
+            && let Err(error) = self.check_writer_fence()
+        {
+            return Ok(Err(error));
+        }
         let _atomic_reads = if statement_writes(statement) {
             self.ckpt
                 .as_ref()
@@ -13595,6 +14592,14 @@ impl Engine {
         } else {
             None
         };
+        let effect_reads = if reset_workspace {
+            self.ckpt
+                .as_ref()
+                .map(Checkpointer::deferred_atomic_block_read_scope)
+        } else {
+            None
+        };
+        let _read_effects = query::enter_statement_read_effect_scope(effect_reads.as_ref());
         let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         // Reclaim the shared execution arena from the previous top-level
@@ -13640,7 +14645,9 @@ impl Engine {
         if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
             return Ok(Err(error));
         }
-        if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
+        if txn.staged_commit().is_some() {
+            query::arm_timeout(0);
+        } else if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
             query::restore_statement_deadline(deadline);
         } else {
             query::arm_timeout(guc.statement_timeout_ms());
@@ -13758,7 +14765,12 @@ impl Engine {
         {
             // Transfer ownership before returning to the reactor. The next
             // attempt resumes this command and view; it is not a new statement.
-            txn.suspend_statement_snapshot(lease, statement_clock, statement_deadline);
+            txn.suspend_statement(
+                Some(lease),
+                statement_clock,
+                statement_deadline,
+                routine_transaction_context,
+            );
         }
         result
     }
@@ -15668,6 +16680,11 @@ impl Engine {
                 if let Err(error) = self.ensure_txn(txn, TxnMode::Explicit, guc) {
                     return Ok(Err(error));
                 }
+                if let Some(isolation) = characteristics.isolation
+                    && let Err(error) = self.storage.validate_transaction_isolation(isolation)
+                {
+                    return Ok(Err(error));
+                }
                 txn.apply_begin_characteristics(*characteristics);
                 responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
@@ -15873,7 +16890,9 @@ impl Engine {
                     responder.command_complete("SET")?;
                     return Ok(Ok(()));
                 }
-                if let Err(error) = apply_current_transaction_setting(txn, *characteristics) {
+                if let Err(error) =
+                    apply_current_transaction_setting(&self.storage, txn, *characteristics)
+                {
                     return Ok(Err(error));
                 }
                 responder.command_complete("SET")?;
@@ -15960,7 +16979,7 @@ impl Engine {
                     Ok(Ok(()))
                 }
             }
-            Stmt::Checkpoint => self.execute_checkpoint_statement(responder),
+            Stmt::Checkpoint => self.execute_checkpoint_statement(txn, responder),
             // VACUUM reclaims space; in this LSM that is a checkpoint (flush +
             // compaction, pruning superseded versions and tombstones). The
             // options and per-table targets are parsed; a checkpoint compacts
@@ -21922,7 +22941,22 @@ pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
             + Storage::retained_row_metadata_budget_bytes(config)
             + Storage::row_heap_relocation_budget_bytes(config)
             + if config.object_store_on {
-                Checkpointer::workspace_budget_bytes(config) + crate::store::BLOCK_SIZE
+                Checkpointer::workspace_budget_bytes(config)
+                    + Checkpointer::physical_output_budget_bytes(config)
+                    + Checkpointer::manifest_output_budget_bytes(config)
+                    + Checkpointer::writer_probe_budget_bytes(config)
+                    + Checkpointer::credential_output_budget_bytes(config)
+                    + crate::store::BLOCK_SIZE
+                    + crate::object_store::upload::Uploads::budget_bytes(
+                        config,
+                        config.object_store_put_slots,
+                        config.wal_upload_buffer_bytes,
+                    )
+                    + if config.wal_upload {
+                        commit::Queue::budget_bytes(config)
+                    } else {
+                        0
+                    }
             } else {
                 0
             },

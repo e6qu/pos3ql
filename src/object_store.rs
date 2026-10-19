@@ -183,6 +183,7 @@ pub mod http;
 pub(crate) mod signature_v4;
 pub(crate) mod sim;
 pub(crate) mod tls;
+pub(crate) mod upload;
 
 /// A strong object generation token returned by the provider.
 ///
@@ -274,6 +275,12 @@ pub struct GetResult {
     pub etag: EntityTag,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestAdmission {
+    Open,
+    Draining,
+}
+
 /// A provider-neutral operation failure.
 #[derive(Debug)]
 #[allow(
@@ -299,6 +306,8 @@ pub enum Error {
         content_length: usize,
         capacity: usize,
     },
+    /// An object changed while validating a successful conditional write.
+    ConditionMismatch,
     /// The client received a malformed response.
     Protocol(&'static str),
     /// A non-blocking read is not yet ready (WouldBlock).
@@ -345,6 +354,9 @@ impl std::fmt::Display for Error {
                 formatter,
                 "object store response of {content_length} bytes exceeds buffer of {capacity}"
             ),
+            Self::ConditionMismatch => {
+                formatter.write_str("object changed during conditional write verification")
+            }
             Self::Protocol(what) => write!(formatter, "object store protocol error: {what}"),
             Self::WouldBlock => write!(formatter, "object store i/o not ready"),
         }
@@ -369,7 +381,7 @@ impl Error {
             Self::Status {
                 code: 412 | 409,
                 ..
-            }
+            } | Self::ConditionMismatch
         )
     }
 
@@ -383,7 +395,10 @@ impl Error {
                     | std::io::ErrorKind::PermissionDenied
                     | std::io::ErrorKind::Unsupported
             ),
-            Self::ResponseTooLarge { .. } | Self::Protocol(_) | Self::WouldBlock => false,
+            Self::ConditionMismatch
+            | Self::ResponseTooLarge { .. }
+            | Self::Protocol(_)
+            | Self::WouldBlock => false,
         }
     }
 }
@@ -391,6 +406,7 @@ impl Error {
 /// Startup failed before the provider-neutral client became usable.
 #[derive(Debug)]
 pub(crate) enum SetupError {
+    Capacity(&'static str),
     Budget(BudgetError),
     S3(http::S3SetupError),
 }
@@ -398,6 +414,7 @@ pub(crate) enum SetupError {
 impl std::fmt::Display for SetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Capacity(message) => formatter.write_str(message),
             Self::Budget(error) => write!(formatter, "{error}"),
             Self::S3(error) => write!(formatter, "{error}"),
         }
@@ -424,7 +441,7 @@ impl From<http::S3SetupError> for SetupError {
 /// implements the internal semantic contract for deterministic tests.
 #[allow(
     clippy::large_enum_variant,
-    reason = "two long-lived instances per process; boxing buys nothing"
+    reason = "fixed startup client slots retain inline network state"
 )]
 pub(crate) enum Client {
     S3(S3Client),
@@ -437,6 +454,11 @@ impl Client {
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, SetupError> {
+        if config.object_store_response_bytes == 0 {
+            return Err(SetupError::Capacity(
+                "object_store_response_bytes must be greater than zero",
+            ));
+        }
         if config.object_store_sim {
             Ok(Self::Simulator(sim::SimClient::new(config, budget)?))
         } else {
@@ -520,10 +542,36 @@ impl Client {
         }
     }
 
-    pub(crate) fn pending_get_fd(&self) -> Option<std::os::fd::RawFd> {
+    pub(crate) fn pending_fd(&self) -> Option<std::os::fd::RawFd> {
         match self {
             Self::S3(client) => client.pending_fd(),
             Self::Simulator(_) => None,
+        }
+    }
+
+    pub(crate) fn pending_wants_write(&self) -> bool {
+        match self {
+            Self::S3(client) => client.pending_wants_write(),
+            Self::Simulator(_) => false,
+        }
+    }
+
+    pub(crate) fn begin_put(
+        &mut self,
+        key: &str,
+        body: &[u8],
+        precondition: Precondition<'_>,
+    ) -> Result<EntityTag, Error> {
+        match self {
+            Self::S3(client) => client.begin_put(key, body, precondition),
+            Self::Simulator(client) => client.put(key, body, precondition),
+        }
+    }
+
+    pub(crate) fn advance_put(&mut self, body: &[u8]) -> Result<EntityTag, Error> {
+        match self {
+            Self::S3(client) => client.advance_put(body),
+            Self::Simulator(_) => Err(Error::Protocol("simulator PUTs complete inline")),
         }
     }
 
@@ -536,15 +584,15 @@ impl Client {
     /// Advances a pending non-blocking GET. Returns `Ok(())` when the GET
     /// completed (body is in [`Self::body_bytes`]), or `Err(WouldBlock)` when
     /// more data is needed.
-    pub(crate) fn advance_get(&mut self) -> Result<(), Error> {
+    pub(crate) fn advance_get(&mut self) -> Result<GetResult, Error> {
         match self {
-            Self::S3(client) => client.advance_pending().map(|_| ()),
-            Self::Simulator(_) => Ok(()),
+            Self::S3(client) => client.advance_pending(),
+            Self::Simulator(_) => Err(Error::Protocol("simulator GETs complete inline")),
         }
     }
 
     /// Discards an incomplete response after a terminal read error.
-    pub(crate) fn clear_pending_get(&mut self) {
+    pub(crate) fn cancel_request(&mut self) {
         match self {
             Self::S3(client) => client.clear_pending(),
             Self::Simulator(_) => {}

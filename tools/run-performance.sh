@@ -44,6 +44,11 @@ cleanup() {
   fi
   release_test_ports
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    mkdir -p "$OUTPUT/server-logs"
+    for server_log in "$WORK"/*.log; do
+      [ -f "$server_log" ] || continue
+      cp -- "$server_log" "$OUTPUT/server-logs/"
+    done
     rm -rf -- "$WORK"
   fi
 }
@@ -256,6 +261,7 @@ write_config() {
     object_prefix="${OBJECT_STORE_PREFIX_ROOT%/}/$prefix"
   fi
   cat >"$config" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:$port
 data_dir = $data
 auth = trust

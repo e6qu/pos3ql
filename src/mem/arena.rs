@@ -370,14 +370,15 @@ impl<T> Drop for OwnedArenaSlice<'_, T> {
 }
 
 /// A geometrically growing list whose backing storage comes from one arena.
-/// Growth leaves the old prefix in the bump arena, so all abandoned storage
-/// is bounded by the final capacity and reclaimed with the arena.
+/// Growth and edits preserve published slices. All backing buffers stay
+/// within the fixed arena and are reclaimed when it resets.
 pub(crate) struct ArenaList<'a, T: Copy> {
     arena: &'a Arena,
     entries: *mut T,
     len: usize,
     capacity: usize,
     persistent: bool,
+    exposed: Cell<bool>,
 }
 
 impl<'a, T: Copy + 'a> ArenaList<'a, T> {
@@ -388,6 +389,7 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
             len: 0,
             capacity: 0,
             persistent: false,
+            exposed: Cell::new(false),
         }
     }
 
@@ -400,6 +402,7 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
             len: 0,
             capacity: 0,
             persistent: true,
+            exposed: Cell::new(false),
         }
     }
 
@@ -419,6 +422,7 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
             }
             self.entries = entries.as_mut_ptr();
             self.capacity = capacity;
+            self.exposed.set(false);
         }
         unsafe {
             self.entries.add(self.len).write(value);
@@ -436,6 +440,10 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
     /// current length.
     pub(crate) fn truncate(&mut self, len: usize) {
         assert!(len <= self.len);
+        if len < self.len && self.exposed.get() {
+            // Appending must not overwrite an already published suffix.
+            self.capacity = len;
+        }
         self.len = len;
     }
 
@@ -447,15 +455,63 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
         if self.is_empty() {
             &[]
         } else {
+            self.exposed.set(true);
+            // Published slices remain immutable for the arena lifetime.
             unsafe { core::slice::from_raw_parts(self.entries, self.len) }
         }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+    /// A short borrow for inspection before further edits to this list.
+    pub(crate) fn borrowed_slice(&self) -> &[T] {
         if self.is_empty() {
-            &mut []
+            &[]
         } else {
-            unsafe { core::slice::from_raw_parts_mut(self.entries, self.len) }
+            unsafe { core::slice::from_raw_parts(self.entries, self.len) }
+        }
+    }
+
+    fn make_unique(&mut self) -> Result<(), ArenaFull> {
+        if !self.exposed.get() {
+            return Ok(());
+        }
+        if self.is_empty() {
+            self.entries = core::ptr::null_mut();
+            self.capacity = 0;
+        } else {
+            // Existing arena-lifetime slices must retain their old values.
+            let first = unsafe { *self.entries };
+            let entries = if self.persistent {
+                self.arena
+                    .alloc_persistent_slice_with(self.capacity, |_| first)?
+            } else {
+                self.arena.alloc_slice_with(self.capacity, |_| first)?
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.entries, entries.as_mut_ptr(), self.len);
+            }
+            self.entries = entries.as_mut_ptr();
+        }
+        self.exposed.set(false);
+        Ok(())
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> Result<&mut [T], ArenaFull> {
+        self.make_unique()?;
+        if self.is_empty() {
+            Ok(&mut [])
+        } else {
+            Ok(unsafe { core::slice::from_raw_parts_mut(self.entries, self.len) })
+        }
+    }
+
+    pub(crate) fn into_mut_slice(mut self) -> Result<&'a mut [T], ArenaFull> {
+        self.make_unique()?;
+        if self.is_empty() {
+            Ok(&mut [])
+        } else {
+            // The consumed list cannot edit this storage again, and any
+            // previously published immutable slices were detached above.
+            Ok(unsafe { core::slice::from_raw_parts_mut(self.entries, self.len) })
         }
     }
 }
@@ -540,6 +596,74 @@ mod tests {
     impl Drop for Counted<'_> {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn arena_owned_list_published_slices_survive_edits_and_consumption() {
+        let mut budget = Budget::new(2048);
+        let mut arena = Arena::new(&mut budget, "list ownership", 2048).unwrap();
+        for persistent in [false, true] {
+            crate::mem::guard::forbid_alloc(|| {
+                let mut list = if persistent {
+                    ArenaList::new_persistent(&arena)
+                } else {
+                    ArenaList::new(&arena)
+                };
+                for value in [1u64, 2, 3] {
+                    list.push(value).unwrap();
+                }
+                let original = list.as_slice();
+                assert_eq!(list.borrowed_slice(), original);
+                list.as_mut_slice().unwrap()[0] = 4;
+                assert_eq!(original, [1, 2, 3]);
+                let edited = list.as_slice();
+                list.truncate(1);
+                list.push(5).unwrap();
+                assert_eq!(edited, [4, 2, 3]);
+                let truncated = list.as_slice();
+                let consumed = list.into_mut_slice().unwrap();
+                consumed[0] = 6;
+                assert_eq!(truncated, [4, 5]);
+                assert_eq!(original, [1, 2, 3]);
+                assert_eq!(consumed, [6, 5]);
+            });
+            arena.reset();
+        }
+    }
+
+    #[test]
+    fn arena_owned_list_consumption_reuses_unique_storage_and_reports_exhaustion() {
+        let mut budget = Budget::new(64);
+        let mut arena = Arena::new(&mut budget, "bounded list", 64).unwrap();
+        for persistent in [false, true] {
+            crate::mem::guard::forbid_alloc(|| {
+                let mut list = if persistent {
+                    ArenaList::new_persistent(&arena)
+                } else {
+                    ArenaList::new(&arena)
+                };
+                list.push(7u64).unwrap();
+                let used = arena.used();
+                let values = list.into_mut_slice().unwrap();
+                assert_eq!(arena.used(), used);
+                values[0] = 8;
+                assert_eq!(values, [8]);
+
+                let mut list = if persistent {
+                    ArenaList::new_persistent(&arena)
+                } else {
+                    ArenaList::new(&arena)
+                };
+                list.push(9u64).unwrap();
+                let published = list.as_slice();
+                assert_eq!(arena.used(), 64);
+                assert!(list.as_mut_slice().is_err());
+                assert_eq!(published, [9]);
+                assert!(list.into_mut_slice().is_err());
+                assert_eq!(published, [9]);
+            });
+            arena.reset();
         }
     }
 

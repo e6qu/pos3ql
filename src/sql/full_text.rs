@@ -352,6 +352,7 @@ fn parse_vector_with_limit<'a>(
     vector
         .lexemes
         .as_mut_slice()
+        .map_err(|_| arena_full("tsvector"))?
         .sort_unstable_by(|left, right| left.text.as_bytes().cmp(right.text.as_bytes()));
     Ok(vector)
 }
@@ -1338,7 +1339,11 @@ fn complete_decoded_query_node<'a>(
     root: &mut Option<u32>,
 ) -> Result<(), SqlError> {
     loop {
-        let Some(frame) = frames.as_mut_slice().last_mut() else {
+        let Some(frame) = frames
+            .as_mut_slice()
+            .map_err(|_| arena_full("tsquery binary"))?
+            .last_mut()
+        else {
             if root.replace(node).is_some() {
                 return Err(syntax("tsquery binary", ""));
             }
@@ -3321,7 +3326,10 @@ pub(crate) fn headline_with<'a>(
                 .saturating_add(1)
                 .saturating_sub(options.max_words)
                 .min(begin);
-            if let Some(previous) = fragments.as_mut_slice().last_mut()
+            if let Some(previous) = fragments
+                .as_mut_slice()
+                .map_err(|_| arena_full("ts_headline"))?
+                .last_mut()
                 && begin <= previous.1
             {
                 previous.1 = previous.1.max(end);
@@ -3358,7 +3366,10 @@ pub(crate) fn headline_with<'a>(
             .saturating_add(1),
         "ts_headline",
     )?;
-    for (begin, end) in fragments.as_mut_slice() {
+    for (begin, end) in fragments
+        .as_mut_slice()
+        .map_err(|_| arena_full("ts_headline"))?
+    {
         while *end > *begin
             && *end + 1 - *begin > options.min_words
             && !words.as_slice()[*end].hit
@@ -3661,6 +3672,7 @@ pub fn rank_with_options(
     }
     operands
         .as_mut_slice()
+        .map_err(|_| arena_full("ts_rank"))?
         .sort_unstable_by(|left, right| left.text.cmp(right.text));
     let root = query.nodes()[query.root().expect("checked root") as usize];
     let conjunction = matches!(root, QueryNode::And(_, _) | QueryNode::Phrase { .. });
@@ -3953,6 +3965,7 @@ fn rank_cover_density(
     }
     document
         .as_mut_slice()
+        .map_err(|_| arena_full("ts_rank_cd"))?
         .sort_unstable_by_key(|entry| (entry.position.number, entry.position.weight, entry.lexeme));
     if document.is_empty() {
         return Ok(0.0);

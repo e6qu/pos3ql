@@ -139,7 +139,7 @@ pub(super) fn groups_for_mask<'a>(
     group_collations: &[Collation],
     row_count: usize,
     agg_ptrs: &'a [*const Expr<'a>],
-    order_exprs: &[Option<&'a Expr<'a>>],
+    order_exprs: &[Option<super::ResolvedSortKey<'a>>],
     width: usize,
     n_order: usize,
     pax_demand: super::PaxReadDemand,
@@ -407,10 +407,9 @@ pub(super) fn groups_for_mask<'a>(
         }) || statement
             .having
             .is_some_and(|h| expr_contains_node(h, node as *const Expr))
-            || order_exprs
-                .iter()
-                .take(n_order)
-                .any(|oe| oe.is_some_and(|o| expr_contains_node(o, node as *const Expr)));
+            || order_exprs.iter().take(n_order).any(|oe| {
+                oe.is_some_and(|o| expr_contains_node(o.expression, node as *const Expr))
+            });
         if in_group_clauses {
             group_correlated_list.push(node).map_err(|_| arena_full())?;
         }
@@ -661,13 +660,12 @@ pub(super) fn groups_for_mask<'a>(
                 full[n] = eval_full(expression, arena, params, &schema, &project_hooks)?;
             }
             for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
-                full[width + k] = eval_full(
-                    oe.expect("resolved"),
-                    arena,
-                    params,
-                    &schema,
-                    &project_hooks,
+                let value = oe.expect("resolved").value(
+                    &full[..width],
+                    &full[width..width + k],
+                    |expression| eval_full(expression, arena, params, &schema, &project_hooks),
                 )?;
+                full[width + k] = value;
             }
             *output = crate::sql::exec::encode_projected_pub(&full[..width + n_order], arena)?;
         }
@@ -826,14 +824,22 @@ pub(super) fn grouped_rows<'a>(
         .map_err(|_| arena_full())?;
     // ORDER BY over groups: ordinals resolve to select items; keys evaluate
     // under the group hooks (so aggregates work). Resolved once.
-    let order_arr: &mut [Option<&Expr>] = arena
+    let order_arr: &mut [Option<super::ResolvedSortKey<'a>>] = arena
         .alloc_slice_with(statement.order_by.len(), |_| None)
         .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
-        let target = resolve_order_target(ob.expression, statement.items, scope, arena)?;
+        let target = super::resolve_sort_key(
+            ob.expression,
+            statement.items,
+            scope,
+            arena,
+            &order_arr[..k],
+        )?;
         // The sort key evaluates against the group, so it faces the same
         // grouping rule as a select item (42803, not a missing-column error).
-        if let Some(column) = ungrouped_column(target, statement.group_by, scope, storage, txid) {
+        if let Some(column) =
+            ungrouped_column(target.expression, statement.group_by, scope, storage, txid)
+        {
             return Err(ungrouped_error(column, scope));
         }
         order_arr[k] = Some(target);
@@ -931,7 +937,7 @@ pub(super) fn grouped_rows<'a>(
         // DISTINCT over the grouped output. ORDER BY keys must be select-list
         // members (as in PostgreSQL); then dedupe on the visible prefix.
         for oe in order_exprs.iter() {
-            let target = oe.expect("resolved");
+            let target = oe.expect("resolved").expression;
             let in_list = statement.items.iter().any(|item| {
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
@@ -949,7 +955,8 @@ pub(super) fn grouped_rows<'a>(
     if n_order > 0 {
         let mut order_collations = [Collation::None; MAX_PROJ];
         for (index, expression) in order_exprs.iter().enumerate().take(n_order) {
-            order_collations[index] = scope.expression_collation(expression.expect("resolved"))?;
+            order_collations[index] =
+                scope.expression_collation(expression.expect("resolved").expression)?;
         }
         for row in out_rows.iter() {
             for (index, &collation) in order_collations.iter().enumerate().take(n_order) {

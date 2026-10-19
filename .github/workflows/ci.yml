@@ -12,6 +12,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  reactor-ownership:
+    name: macOS readiness ownership
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macOS-reactor-dependencies-${{ hashFiles('Cargo.lock') }}
+
+      - name: Socket readiness, cancellation and descriptor reuse
+        run: >-
+          cargo test --lib --locked io:: -- --test-threads=1
+
   heap-aliasing:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -25,6 +44,8 @@ jobs:
         run: cargo miri test --lib --locked shared_heap_append -- --test-threads=1
       - name: Scoped arena ownership and destruction
         run: cargo miri test --lib --locked owned_write_inputs_scoped_arena -- --test-threads=1
+      - name: Arena list snapshots and bounded mutation
+        run: cargo miri test --lib --locked arena_owned_list_ -- --test-threads=1
       - name: Private heap copy ownership and publication
         run: cargo miri test --lib --locked shared_heap_relocation_heap_ -- --test-threads=1
       - name: Heap row-map ownership and lock release

@@ -254,6 +254,7 @@ normalize() {
 }
 
 run_corpus() { # port name file
+  printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
@@ -264,7 +265,12 @@ run_corpus() { # port name file
   fi | normalize > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
+    printf '%s\n' 'Last client transcript:'
+    tail -40 "$WORK/$2"
+    printf '%s\n' 'Server log:'
     tail -80 "$WORK/p3.log"
+    wait "$P3_PID"
+    printf 'pos3ql exit status: %s\n' "$?"
     exit 1
   fi
 }

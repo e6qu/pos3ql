@@ -13,6 +13,7 @@ pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
 mod enum_publication;
 pub(crate) use enum_publication::{EnumAlterUndo, EnumMemberPublication};
+pub(crate) use statistics::CheckpointStatistics;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -31,7 +32,7 @@ mod heap_relocation;
 mod row_heap;
 #[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
-pub(crate) use heap_relocation::HeapRelocationWorkspace;
+pub(crate) use heap_relocation::{HeapRelocationMode, HeapRelocationStep, HeapRelocationWorkspace};
 mod row_cleanup;
 mod row_identities;
 mod row_images;
@@ -2550,9 +2551,16 @@ impl TableSerialState {
     }
 }
 
+pub(crate) enum ValueIndexInstallation {
+    Recovery,
+    Checkpoint { dirty_lsn: u64 },
+}
+
 struct TablePublication {
     dirty: bool,
     generation: u64,
+    /// Last committed replacement of row encodings, independent of row updates.
+    rewrite_generation: u64,
     /// A complete candidate list and its count publish together.
     enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     n_enforcers: usize,
@@ -2565,6 +2573,8 @@ pub struct Table {
     pub rows: RowMap,
     /// Changed since the last checkpoint (drives delta checkpoints).
     publication: std::sync::Mutex<TablePublication>,
+    /// Captured unpublished rows need deletion markers until their roots install.
+    checkpoint_deletions: std::sync::Arc<()>,
     /// Planner estimates, transaction-private column versions, and save markers.
     statistics: TableStatisticsOwner,
     /// Per-column sequence state for serial/identity columns: the last value
@@ -3780,6 +3790,9 @@ pub(crate) fn pending_row_version_capacity(config: &Config) -> usize {
 }
 
 pub(crate) fn committed_row_version_capacity(config: &Config) -> usize {
+    if config.transaction_mode == crate::config::TransactionMode::Locking {
+        return 0;
+    }
     config
         .max_tables
         .saturating_mul(config.table_rows)
@@ -3890,6 +3903,10 @@ impl Table {
     pub(crate) fn generation(&self) -> u64 {
         self.publication().generation
     }
+    pub(crate) fn rewrite_generation(&self) -> u64 {
+        self.publication().rewrite_generation
+    }
+
     pub(crate) fn dirty(&self) -> bool {
         self.publication().dirty
     }
@@ -13157,6 +13174,7 @@ pub(crate) enum SchemaLockBlocker {
 }
 
 struct SnapshotState {
+    transaction_mode: crate::config::TransactionMode,
     exported: FixedVec<ExportedSnapshot>,
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
@@ -13703,6 +13721,7 @@ impl Iterator for MatviewIter<'_> {
 }
 
 pub struct Storage {
+    transaction_mode: crate::config::TransactionMode,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     /// Serializes table-name checks and empty-slot initialization, never row I/O.
@@ -17862,6 +17881,7 @@ impl Storage {
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config) * size_of::<Table>()
+            + table_slot_capacity(config) * 2 * size_of::<usize>()
             + config.max_tables * RowMap::budget_bytes(config.table_rows)
             + RowMap::budget_bytes(config.large_object_pages)
             + table_slot_capacity(config).saturating_mul(
@@ -18009,6 +18029,10 @@ impl Storage {
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
         let pending_table_statistics = StatisticsVersions::new(config, budget)?;
+        budget.draw(
+            table_capacity * 2 * size_of::<usize>(),
+            "checkpoint deletion guard owners",
+        )?;
         for slot in 0..table_capacity {
             tables
                 .push(Table {
@@ -18031,9 +18055,11 @@ impl Storage {
                     publication: std::sync::Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
+                        rewrite_generation: 0,
                         enforcers: [const { None }; MAX_VALUE_ENFORCERS],
                         n_enforcers: 0,
                     }),
+                    checkpoint_deletions: std::sync::Arc::new(()),
                     statistics: TableStatisticsOwner::new(budget)?,
                     serial: std::sync::Mutex::new(TableSerialState::EMPTY),
                     spill_generations: SpillGenerationRoster::new(
@@ -18884,7 +18910,9 @@ impl Storage {
             }),
             comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
+            transaction_mode: config.transaction_mode,
             snapshots: std::sync::Arc::new(std::sync::Mutex::new(SnapshotState {
+                transaction_mode: config.transaction_mode,
                 exported: exported_snapshots,
                 active: active_snapshots,
                 serializable: serializable_snapshots,
@@ -20359,13 +20387,10 @@ impl Storage {
                     .spill_generations
                     .write()
                     .copy_from(&self.tables[source_slot].spill_generations())?;
-                let row_count = self.tables[source_slot].rows.len();
-                for position in 0..row_count {
-                    let (rowid, mut state) = self.tables[source_slot]
-                        .rows
-                        .iter()
-                        .nth(position)
-                        .expect("row position remains stable while cloning another table");
+                let source_rows = self.tables[source_slot].rows.read();
+                let mut target_rows = self.tables[target_slot].rows.write();
+                for (&rowid, state) in source_rows.iter() {
+                    let mut state = *state;
                     if state.pending.len() != 0 {
                         return Err(sql_err!(
                             sqlstate::OBJECT_IN_USE,
@@ -20377,15 +20402,18 @@ impl Storage {
                     // committed image. Snapshot-retention chains belong only
                     // to transactions reading the source database.
                     state.history = CommittedHistory::empty();
-                    self.tables[target_slot]
-                        .rows
-                        .insert(rowid, state)
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "template relation exceeds cloned row-map capacity"
-                            )
-                        })?;
+                    if let Some(RowHome::Heap(location)) = state.committed {
+                        let image = self.heap.get(location)?;
+                        state.committed = Some(RowHome::Heap(
+                            self.heap.retain_for_publication(&image)?.location(),
+                        ));
+                    }
+                    target_rows.insert(rowid, state).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "template relation exceeds cloned row-map capacity"
+                        )
+                    })?;
                 }
             }
 
@@ -29543,6 +29571,7 @@ impl Storage {
                             .max()
                             .unwrap_or(0);
                         let mut loaded_container = None;
+                        let mut pending_columns = false;
                         for column in 0..layout.columns() {
                             if decoded_columns.is_some_and(|columns| !columns[column])
                                 || pax_value_extents[column].is_some()
@@ -29555,55 +29584,72 @@ impl Storage {
                             let blocks = block_guard.get_or_insert_with(|| {
                                 spill.relation_blocks_for(relation.persistence)
                             });
-                            let (len, block_type) = match reference {
-                                crate::store::DataBlockRef::Packed {
-                                    container,
-                                    offset,
-                                    length,
-                                    id,
-                                } if coalesce_packed => {
-                                    let container_len = if let Some((loaded, len)) =
-                                        loaded_container
-                                        && loaded == container
-                                    {
-                                        len
-                                    } else {
-                                        let (len, block_type) = blocks
-                                            .get(&container, pax_column_buf)
-                                            .map_err(|error| {
+                            // Start every missing selected column before yielding.
+                            // Completed extents remain attached to this immutable
+                            // descriptor, including when another request waits.
+                            let read: Result<_, SqlError> = (|| {
+                                Ok(match reference {
+                                    crate::store::DataBlockRef::Packed {
+                                        container,
+                                        offset,
+                                        length,
+                                        id,
+                                    } if coalesce_packed => {
+                                        let container_len = if let Some((loaded, len)) =
+                                            loaded_container
+                                            && loaded == container
+                                        {
+                                            len
+                                        } else {
+                                            let (len, block_type) = blocks
+                                                .get(&container, pax_column_buf)
+                                                .map_err(|error| {
+                                                    spill_read_error(crate::store::SstError::Store(
+                                                        error,
+                                                    ))
+                                                })?;
+                                            if block_type
+                                                != crate::store::BlockType::SstPackedContainerV1
+                                            {
+                                                return Err(sql_err!(
+                                                    sqlstate::INTERNAL_ERROR,
+                                                    "PAX column container has the wrong block type"
+                                                ));
+                                            }
+                                            loaded_container = Some((container, len));
+                                            len
+                                        };
+                                        crate::store::decode_packed_extent(
+                                            &pax_column_buf[..container_len],
+                                            offset as usize,
+                                            length as usize,
+                                            &id,
+                                            pax_extent_buf,
+                                        )
+                                        .map_err(
+                                            |error| {
                                                 spill_read_error(crate::store::SstError::Store(
                                                     error,
                                                 ))
-                                            })?;
-                                        if block_type
-                                            != crate::store::BlockType::SstPackedContainerV1
-                                        {
-                                            return Err(sql_err!(
-                                                sqlstate::INTERNAL_ERROR,
-                                                "PAX column container has the wrong block type"
-                                            ));
-                                        }
-                                        loaded_container = Some((container, len));
-                                        len
-                                    };
-                                    crate::store::decode_packed_extent(
-                                        &pax_column_buf[..container_len],
-                                        offset as usize,
-                                        length as usize,
-                                        &id,
+                                            },
+                                        )?
+                                    }
+                                    _ => crate::store::read_data_block_raw_ref(
+                                        &mut **blocks,
+                                        reference,
                                         pax_extent_buf,
+                                        pax_column_buf,
                                     )
-                                    .map_err(|error| {
-                                        spill_read_error(crate::store::SstError::Store(error))
-                                    })?
+                                    .map_err(spill_read_error)?,
+                                })
+                            })();
+                            let (len, block_type) = match read {
+                                Ok(result) => result,
+                                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                                    pending_columns = true;
+                                    continue;
                                 }
-                                _ => crate::store::read_data_block_raw_ref(
-                                    &mut **blocks,
-                                    reference,
-                                    pax_extent_buf,
-                                    pax_column_buf,
-                                )
-                                .map_err(spill_read_error)?,
+                                Err(error) => return Err(error),
                             };
                             if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
                                 return Err(sql_err!(
@@ -29623,6 +29669,12 @@ impl Storage {
                             member_blocks[slot][at..end].copy_from_slice(&pax_extent_buf[..len]);
                             pax_value_extents[column] = Some((at, end));
                             at = end;
+                        }
+                        if pending_columns {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_IO_WAIT,
+                                "selected column reads in progress"
+                            ));
                         }
                         let _ = (member_raw_blocks, pax_row_buf);
                     }
@@ -30637,6 +30689,10 @@ impl Storage {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<VisibleRowHome>, SqlError> {
+        let commit_snapshot = match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => commit_snapshot,
+            crate::config::TransactionMode::Locking => u64::MAX,
+        };
         if let Some(source) = state.spilled_source() {
             source.validate_request(table_slot, rowid)?;
             let selected = source.visible_at(commit_snapshot)?;
@@ -31739,21 +31795,6 @@ impl Storage {
         Ok(None)
     }
 
-    /// Clears only table images captured by a published checkpoint.
-    pub fn clear_dirty_through(&mut self, generations: &[u64]) {
-        for (slot, t) in self.tables.iter_mut().enumerate() {
-            let mut publication = t.publication();
-            if generations.get(slot).copied() == Some(publication.generation) {
-                publication.dirty = false;
-                for (_, state) in t.rows.write().iter_mut() {
-                    state.checkpoint_change_lsn = 0;
-                }
-            }
-            drop(publication);
-            t.statistics.clear_dirty();
-        }
-    }
-
     /// Compares canonical physical column payloads without allocating or
     /// decoding variable-width values. The comparison happens on the
     /// fallible, pre-commit write path: commit itself must never discover that
@@ -31841,7 +31882,9 @@ impl Storage {
         rowid: u64,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables[table_index].spill_generations().is_empty() {
+        if self.tables[table_index].spill_generations().is_empty()
+            && std::sync::Arc::strong_count(&self.tables[table_index].checkpoint_deletions) == 1
+        {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
@@ -32062,7 +32105,11 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
-        if state.committed.is_none() && generations.is_empty() && state.history.is_empty() {
+        if state.committed.is_none()
+            && generations.is_empty()
+            && state.history.is_empty()
+            && std::sync::Arc::strong_count(&table.checkpoint_deletions) == 1
+        {
             rows.remove(&rowid);
         }
         publication.generation = generation;
@@ -33641,6 +33688,7 @@ impl Storage {
         index_created_at: Option<u64>,
         include_mask: ColumnSet,
         handle: Option<crate::store::ValueIndexHandle>,
+        installation: ValueIndexInstallation,
     ) -> Result<(), SqlError> {
         let n_enforcers = self.tables[table_index].enforcer_count();
         let mut publication = self.tables[table_index].publication();
@@ -33659,8 +33707,16 @@ impl Storage {
             ));
         };
         enforcer.durable = handle;
-        enforcer.durable_dirty = false;
-        enforcer.durable_rebuild = false;
+        let captured_current = match installation {
+            ValueIndexInstallation::Recovery => true,
+            ValueIndexInstallation::Checkpoint { dirty_lsn } => {
+                enforcer.durable_dirty_lsn == dirty_lsn
+            }
+        };
+        if captured_current {
+            enforcer.durable_dirty = false;
+            enforcer.durable_rebuild = false;
+        }
         Ok(())
     }
 
@@ -34628,6 +34684,13 @@ impl Storage {
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
         if rewrote_rows {
             self.set_spill_list(index, &[]);
+            let mut publication = self.tables[index].publication();
+            publication.generation = publication
+                .generation
+                .checked_add(1)
+                .expect("table publication generation exhausted");
+            publication.rewrite_generation = publication.generation;
+            publication.dirty = true;
         }
     }
 
@@ -47062,7 +47125,17 @@ impl Storage {
     }
 
     pub fn commit_snapshot(&self) -> u64 {
-        execution_visibility().commit_snapshot
+        match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => execution_visibility().commit_snapshot,
+            crate::config::TransactionMode::Locking => u64::MAX,
+        }
+    }
+
+    pub(crate) fn validate_transaction_isolation(
+        &self,
+        isolation: crate::sql::ast::TransactionIsolation,
+    ) -> Result<(), SqlError> {
+        crate::sql::txn::validate_isolation_mode(self.transaction_mode, isolation)
     }
 
     pub(crate) fn analyze_snapshot(&self) -> ReadSnapshotScope {
@@ -47398,6 +47471,7 @@ impl Storage {
     }
 
     pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
+        self.validate_transaction_isolation(crate::sql::ast::TransactionIsolation::RepeatableRead)?;
         let mut snapshots = self.snapshot_state();
         if let Some((_, existing)) = snapshots
             .active
@@ -47694,12 +47768,20 @@ impl Storage {
 
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
-        let requested = mode_bit(mode);
+        let protection = match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => mode,
+            crate::config::TransactionMode::Locking => match mode {
+                TableLockMode::AccessShare | TableLockMode::Share => TableLockMode::Share,
+                TableLockMode::AccessExclusive => TableLockMode::AccessExclusive,
+                _ => TableLockMode::Exclusive,
+            },
+        };
+        let requested = mode_bit(mode) | mode_bit(protection);
         let own_index = locks
             .table
             .iter()
             .position(|lock| lock.owner == txid && lock.relation == relation);
-        if own_index.is_some_and(|index| locks.table[index].mask() & requested != 0) {
+        if own_index.is_some_and(|index| locks.table[index].mask() & requested == requested) {
             return Ok(());
         }
         let combined = own_index
@@ -47732,10 +47814,12 @@ impl Storage {
         let sequence = locks.next_sequence();
         if let Some(index) = own_index {
             locks.table[index].modes[mode as usize] = sequence;
+            locks.table[index].modes[protection as usize] = sequence;
             return Ok(());
         }
         let mut modes = [0; 8];
         modes[mode as usize] = sequence;
+        modes[protection as usize] = sequence;
         locks
             .table
             .push(TableLock {
@@ -48196,6 +48280,11 @@ impl Storage {
             }
         };
         self.lock_state().row.wait_for(waiter, blocker)
+    }
+
+    pub(crate) fn wake_transaction_waiters(&self, transaction: u32) {
+        let owner = self.transaction_wait_owner(transaction);
+        self.lock_state().row.resource_released(owner);
     }
 
     pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {
@@ -59911,7 +60000,7 @@ mod tests {
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
-        storage.clear_dirty_through(&[captured]);
+        storage.clear_table_dirty_through(slot, captured);
         assert!(storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
@@ -59922,7 +60011,7 @@ mod tests {
             42
         );
         let current = storage.table(slot).generation();
-        storage.clear_dirty_through(&[current]);
+        storage.clear_table_dirty_through(slot, current);
         assert!(!storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]

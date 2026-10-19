@@ -9,6 +9,17 @@ use pos3ql::server::Server;
 /// inheriting an OS- and build-mode-dependent main-thread limit.
 const SERVER_STARTUP_STACK_BYTES: usize = pos3ql::sql::exec::QUERY_STACK_BYTES;
 
+enum ProcessError {
+    Startup(String),
+    EventLoop(std::io::Error),
+}
+
+impl From<String> for ProcessError {
+    fn from(message: String) -> Self {
+        Self::Startup(message)
+    }
+}
+
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()
         .name("pos3ql-server".to_string())
@@ -17,8 +28,22 @@ fn main() -> ExitCode {
     match worker {
         Ok(worker) => match worker.join() {
             Ok(Ok(())) => ExitCode::SUCCESS,
-            Ok(Err(message)) => {
-                pos3ql::logging::error("process", &message);
+            Ok(Err(error)) => {
+                match error {
+                    ProcessError::Startup(message) => {
+                        pos3ql::logging::error("process", &message);
+                    }
+                    ProcessError::EventLoop(error) => {
+                        pos3ql::logging::error_args(
+                            "process",
+                            format_args!(
+                                "event loop failed: kind={:?} os_error={:?}",
+                                error.kind(),
+                                error.raw_os_error()
+                            ),
+                        );
+                    }
+                }
                 ExitCode::FAILURE
             }
             Err(_) => {
@@ -36,7 +61,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), ProcessError> {
     let (mut config, operation) = load_config()?;
     config.resolve_object_store_credentials()?;
     pos3ql::logging::configure(config.log_format);
@@ -76,7 +101,7 @@ fn run() -> Result<(), String> {
             if pos3ql::operations::delete_backup(&config, &name)? {
                 println!("backup {name} deleted");
             } else {
-                return Err(format!("backup '{name}' does not exist"));
+                return Err(format!("backup '{name}' does not exist").into());
             }
             return Ok(());
         }
@@ -126,7 +151,8 @@ fn run() -> Result<(), String> {
         return Err(
             "object_store = sim is the in-process simulator's mode (it allocates freely); \
              the server refuses it — use object_store = on with a real endpoint"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
@@ -169,13 +195,8 @@ fn run() -> Result<(), String> {
             FmtBytes(budget.total()),
         );
     }
-    server.run().map_err(|e| {
-        format!(
-            "event loop failed: kind={:?} os_error={:?}",
-            e.kind(),
-            e.raw_os_error()
-        )
-    })
+    // Runtime errors cross the frozen allocator boundary without a String.
+    server.run().map_err(ProcessError::EventLoop)
 }
 
 enum Operation {
@@ -259,7 +280,7 @@ fn load_config() -> Result<(Config, Operation), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> [--recovery-target-lsn <pg_lsn> | --recovery-target-time <timestamptz>] | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
+                    "usage: pos3ql --config <path> [--backup <name> | --restore <name> [--recovery-target-lsn <pg_lsn> | --recovery-target-time <timestamptz>] | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
                 );
                 std::process::exit(0);
             }
@@ -307,13 +328,7 @@ fn load_config() -> Result<(Config, Operation), String> {
     };
     let config = match config_path {
         Some(path) => load_config_file(&path),
-        None => {
-            pos3ql::logging::warn(
-                "configuration",
-                "no --config given, using development defaults",
-            );
-            Ok(Config::default_dev())
-        }
+        None => Err("--config is required; choose transaction_mode explicitly".to_string()),
     }?;
     Ok((config, operation))
 }

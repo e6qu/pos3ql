@@ -8,7 +8,7 @@
 //! order a result; an expensive select-list expression can also be postponed
 //! past the sort, so it is evaluated only for the rows that survive a LIMIT.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryValues, eval_full, sqlstate};
@@ -110,9 +110,8 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 }
 
-/// Runs the per-source-row part shared by materialization's sizing and
-/// encoding passes. Both passes must evaluate predicates, correlated
-/// subqueries, SRFs, projection, and sort keys in exactly the same order.
+/// Projects each source row before deriving its sort keys. Keys that name
+/// output columns reuse their saved values, including volatile expressions.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 fn for_each_materialized_projection<'a>(
     storage: &'a Storage,
@@ -126,7 +125,7 @@ fn for_each_materialized_projection<'a>(
     correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     where_correlated: &[&'a Expr<'a>],
-    order_exprs: &[Option<&'a Expr<'a>>; MAX_PROJ],
+    order_exprs: &[Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
     n_keys: usize,
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
@@ -221,13 +220,12 @@ fn for_each_materialized_projection<'a>(
         let mut keys = [Datum::Null; MAX_PROJ];
         let chained_row = Chained { inner: row, outer };
         for (key, expression) in order_exprs.iter().take(n_keys).enumerate() {
-            keys[key] = eval_full(
-                expression.expect("resolved"),
-                arena,
-                params,
-                &chained_row,
-                use_hooks,
+            let value = expression.expect("resolved").value(
+                &projected[..width],
+                &keys[..key],
+                |expression| eval_full(expression, arena, params, &chained_row, use_hooks),
             )?;
+            keys[key] = value;
         }
         consume(row, &projected[..width], &keys[..n_keys])?;
     }
@@ -401,7 +399,7 @@ struct MaterializationPlan<'a> {
     n_identities: usize,
     where_correlated: &'a [&'a Expr<'a>],
     where_in_scan: Option<&'a Expr<'a>>,
-    order_exprs: [Option<&'a Expr<'a>>; MAX_PROJ],
+    order_exprs: [Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
     key_collations: [Collation; MAX_PROJ],
     postponed: [bool; MAX_PROJ],
     any_postponed: bool,
@@ -517,29 +515,43 @@ fn prepare_materialization<'a>(
     if n_order + n_on > MAX_PROJ {
         return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
     }
-    let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut order_exprs: [Option<super::ResolvedSortKey<'a>>; MAX_PROJ] = [None; MAX_PROJ];
     let mut key_collations = [Collation::None; MAX_PROJ];
     for (key, order) in statement.order_by.iter().enumerate() {
-        let resolved = resolve_order_target(order.expression, statement.items, scope, arena)?;
-        key_collations[key] = scope.expression_collation(resolved)?;
+        let resolved = super::resolve_sort_key(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+            &order_exprs[..key],
+        )?;
+        key_collations[key] = scope.expression_collation(resolved.expression)?;
         order_exprs[key] = Some(resolved);
     }
     for (index, on) in statement.distinct_on.iter().enumerate() {
-        let resolved = resolve_order_target(on, statement.items, scope, arena)?;
-        if n_order > 0 && (index >= n_order || *order_exprs[index].expect("resolved") != *resolved)
+        let resolved = super::resolve_sort_key(
+            on,
+            statement.items,
+            scope,
+            arena,
+            &order_exprs[..n_order + index],
+        )?;
+        if n_order > 0
+            && (index >= n_order
+                || *order_exprs[index].expect("resolved").expression != *resolved.expression)
         {
             return Err(sql_err!(
                 sqlstate::INVALID_COLUMN_REFERENCE,
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ));
         }
-        key_collations[n_order + index] = scope.expression_collation(resolved)?;
+        key_collations[n_order + index] = scope.expression_collation(resolved.expression)?;
         order_exprs[n_order + index] = Some(resolved);
     }
     let n_keys = n_order + n_on;
     if statement.distinct && n_on == 0 {
         for expression in order_exprs.iter().take(n_order) {
-            let target = expression.expect("resolved");
+            let target = expression.expect("resolved").expression;
             let in_list = statement.items.iter().any(|item| {
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
@@ -578,7 +590,7 @@ fn prepare_materialization<'a>(
             };
             let ordered_by = order_exprs[..n_order]
                 .iter()
-                .any(|order| order.is_some_and(|target| *target == **expression));
+                .any(|order| order.is_some_and(|target| *target.expression == **expression));
             if !ordered_by && postpone_cost(expression, scope, arena) > 20 {
                 postponed[index] = true;
                 any_postponed = true;
@@ -655,7 +667,7 @@ fn materialization_pax_columns<'a>(
         count += 1;
     }
     for expression in plan.order_exprs.iter().take(plan.n_keys) {
-        expressions[count] = expression.expect("resolved");
+        expressions[count] = expression.expect("resolved").expression;
         count += 1;
     }
     pax_column_demand(scope, from, &expressions[..count])
@@ -700,8 +712,8 @@ pub(crate) fn materialized_rows<'a>(
         any_postponed,
         has_srf,
     } = plan;
-    // Per-row correlated-subquery scratch, allocated once and reused across
-    // both passes: per-row merges must not grow the statement arena. The
+    // Per-row correlated-subquery scratch, allocated once and reused for
+    // every row: per-row merges must not grow the statement arena. The
     // WHERE gate and the row merge share the pair, so it is sized for the
     // wider of the two.
     let (n_where_scalars, n_where_lists) =
@@ -755,24 +767,11 @@ pub(crate) fn materialized_rows<'a>(
         None
     };
 
-    let routine_cursor = hooks
-        .catalog
-        .and_then(crate::sql::eval::CatalogAccess::routine_invocation_cursor);
-    let sequence_cursor = hooks
-        .sequences
-        .and_then(crate::sql::eval::SequenceAccess::statement_cursor);
     let stored_width = width + n_keys + n_raw + n_identities;
-    // Pass 1: count and measure — and evaluate the projection and ORDER BY keys per row
-    // (discarding the values). PostgreSQL scans, filters, and projects in a
-    // single per-row pass below the Sort, so an early row's projection error
-    // surfaces before a later row's WHERE error. We materialize in two passes
-    // for a fixed-size allocation, so the count pass must reproduce that error
-    // timing rather than evaluate every WHERE before any projection. Postponed
-    // items are exactly the ones PostgreSQL does not evaluate below the Sort,
-    // so they are skipped here too.
-    let mut count = 0usize;
-    let mut encoded_bytes = 0usize;
-    let mut measure = |row: &JoinRow<'_, 'a, '_>| {
+    let mut rows = ArenaList::new_persistent(arena);
+    // Evaluate each projection once, in scan order. Encoded rows and their
+    // references survive the scan's per-row scratch rewinds in the arena tail.
+    let mut encode = |row: &JoinRow<'_, 'a, '_>| {
         for_each_materialized_projection(
             storage,
             scope,
@@ -809,10 +808,26 @@ pub(crate) fn materialized_rows<'a>(
                         index,
                     )
                 })?;
-                encoded_bytes = encoded_bytes
-                    .checked_add(row_bytes)
-                    .ok_or_else(arena_full)?;
-                count += 1;
+                let output = arena
+                    .alloc_persistent_slice_with(row_bytes, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                let len = crate::sql::exec::encode_projected_by_into(
+                    stored_width,
+                    |index| {
+                        materialized_value_at(
+                            scope,
+                            row,
+                            projected,
+                            keys,
+                            width,
+                            n_keys,
+                            identities_at,
+                            index,
+                        )
+                    },
+                    output,
+                )?;
+                rows.push(&output[..len]).map_err(|_| arena_full())?;
                 Ok(())
             },
         )?;
@@ -831,7 +846,7 @@ pub(crate) fn materialized_rows<'a>(
             outer,
             pax_columns,
             indexed,
-            &mut measure,
+            &mut encode,
         )?;
     } else {
         scan_source_recycling_with_pax_columns(
@@ -845,127 +860,10 @@ pub(crate) fn materialized_rows<'a>(
             hooks,
             outer,
             pax_columns,
-            &mut measure,
+            &mut encode,
         )?;
     }
-    let empty: &[u8] = &[];
-    let rows: &mut [&[u8]] = arena
-        .alloc_slice_with(count, |_| empty)
-        .map_err(|_| arena_full())?;
-    let encoded_rows = arena
-        .alloc_slice_with(encoded_bytes, |_| 0_u8)
-        .map_err(|_| arena_full())?;
-    let encoded_rows_ptr = encoded_rows.as_mut_ptr();
-    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
-        catalog.restore_routine_invocation_cursor(cursor);
-    }
-    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
-        sequences.restore_statement_cursor(cursor);
-    }
-    // Pass 2: project + keys, encode into the persistent block measured above.
-    // The recycling scan can then release catalog rows and correlated-subquery
-    // scratch after each source row without releasing a materialized result.
-    {
-        let mut at = 0usize;
-        let mut encoded_at = 0usize;
-        let mut encode = |row: &JoinRow<'_, 'a, '_>| {
-            for_each_materialized_projection(
-                storage,
-                scope,
-                statement,
-                row,
-                txid,
-                arena,
-                params,
-                hooks,
-                correlated,
-                base,
-                where_correlated,
-                &order_exprs,
-                n_keys,
-                if any_postponed {
-                    Some(&postponed)
-                } else {
-                    None
-                },
-                has_srf,
-                outer,
-                &mut *merge_scalars,
-                &mut *merge_lists,
-                &mut |row, projected, keys| {
-                    debug_assert_eq!(projected.len(), width);
-                    let remaining = encoded_bytes
-                        .checked_sub(encoded_at)
-                        .ok_or_else(arena_full)?;
-                    // SAFETY: pass 1 measured this persistent block exactly.
-                    // Each callback receives the still-unwritten suffix, so
-                    // its mutable slice is disjoint from every stored row.
-                    let output = unsafe {
-                        core::slice::from_raw_parts_mut(encoded_rows_ptr.add(encoded_at), remaining)
-                    };
-                    let len = crate::sql::exec::encode_projected_by_into(
-                        stored_width,
-                        |index| {
-                            materialized_value_at(
-                                scope,
-                                row,
-                                projected,
-                                keys,
-                                width,
-                                n_keys,
-                                identities_at,
-                                index,
-                            )
-                        },
-                        output,
-                    )?;
-                    // SAFETY: encoding initialized this prefix of the
-                    // current disjoint suffix, and the arena owns the block
-                    // for 'a. Later callbacks only write after this slice.
-                    let encoded_row: &'a [u8] = unsafe {
-                        core::slice::from_raw_parts(encoded_rows_ptr.add(encoded_at), len)
-                    };
-                    rows[at] = encoded_row;
-                    encoded_at += len;
-                    at += 1;
-                    Ok(())
-                },
-            )?;
-            Ok(true)
-        };
-        if let Some(indexed) = ordered_candidates.as_ref() {
-            scan_source_recycling_with_indexed_candidates(
-                storage,
-                scope,
-                from,
-                txid,
-                where_in_scan,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
-                indexed,
-                &mut encode,
-            )?;
-        } else {
-            scan_source_recycling_with_pax_columns(
-                storage,
-                scope,
-                from,
-                txid,
-                where_in_scan,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
-                &mut encode,
-            )?;
-        }
-        debug_assert_eq!(at, count);
-        debug_assert_eq!(encoded_at, encoded_bytes);
-    }
+    let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
 
     // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.
     // DISTINCT ON dedups on its keys *after* the sort (below), so the first

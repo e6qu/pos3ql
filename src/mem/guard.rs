@@ -190,17 +190,32 @@ fn credit(size: usize) {
 unsafe impl GlobalAlloc for GuardedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         check(layout.size());
-        unsafe { System.alloc(layout) }
+        let allocation = unsafe { System.alloc(layout) };
+        if allocation.is_null() {
+            credit(layout.size());
+        }
+        allocation
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         check(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        let allocation = unsafe { System.alloc_zeroed(layout) };
+        if allocation.is_null() {
+            credit(layout.size());
+        }
+        allocation
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        check(new_size.saturating_sub(layout.size()));
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let growth = new_size.saturating_sub(layout.size());
+        check(growth);
+        let allocation = unsafe { System.realloc(ptr, layout, new_size) };
+        if allocation.is_null() {
+            credit(growth);
+        } else if new_size < layout.size() {
+            credit(layout.size() - new_size);
+        }
+        allocation
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -213,9 +228,8 @@ unsafe impl GlobalAlloc for GuardedAllocator {
 mod tests {
     use super::*;
 
-    // A single test covers all guard behavior: COUNT_ONLY is process-global,
-    // and splitting this across #[test] functions would let the parallel
-    // test harness interleave with it.
+    // Counting violations is local to this thread, so other tests retain
+    // ordinary allocation enforcement while this fixture probes the guard.
     #[test]
     fn forbid_alloc_detects_allocation() {
         set_count_only(true);

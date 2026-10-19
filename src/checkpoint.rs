@@ -2,6 +2,9 @@
 
 use core::cmp::Ordering;
 
+mod probe;
+pub(crate) use probe::{Ticket as WriterProbeTicket, WriterProbe};
+
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -22,10 +25,10 @@ use crate::storage::{
     SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
 };
 use crate::store::{
-    BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
-    SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan, StoreError,
-    TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter,
-    block_keys_at, copy_block_entry_at,
+    BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
+    RowSstFormat, SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan,
+    StoreError, TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep,
+    ValueIndexWriter, block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -167,7 +170,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v15";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v16";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -355,20 +358,20 @@ fn profile_checkpoint_phase(
 
 /// A published roster proves these immutable blocks already reached the
 /// durable tier. Their content identity lets a rebuild reuse unchanged blocks.
-struct PublishedValueBlockStore<'a> {
-    inner: &'a mut dyn BlockStore,
+struct PublishedValueBlockWriter<'a> {
+    inner: &'a mut dyn BlockWriter,
     known_blocks: &'a [(BlockId, Option<BlockType>)],
 }
 
-impl BlockStore for PublishedValueBlockStore<'_> {
-    fn put(
+impl BlockWriter for PublishedValueBlockWriter<'_> {
+    fn write_block(
         &mut self,
         payload: &[u8],
         block_type: BlockType,
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
         if lsn == 0 {
-            let id = BlockId::of(payload);
+            let id = BlockId::for_block(block_type, payload);
             if self
                 .known_blocks
                 .binary_search(&(id, Some(block_type)))
@@ -377,11 +380,7 @@ impl BlockStore for PublishedValueBlockStore<'_> {
                 return Ok(id);
             }
         }
-        self.inner.put(payload, block_type, lsn)
-    }
-
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        self.inner.get(id, into)
+        self.inner.write_block(payload, block_type, lsn)
     }
 }
 
@@ -476,14 +475,18 @@ enum SlotInstall {
 /// earlier immutable delta only when every generation uses the same decoder.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SliceLayout {
-    column_types: [u8; MAX_COLUMNS],
+    created_at: u64,
+    rewrite_generation: u64,
+    column_types: [ColType; MAX_COLUMNS],
     n_columns: u16,
     fillfactor: u8,
 }
 
 impl SliceLayout {
     const EMPTY: Self = Self {
-        column_types: [0; MAX_COLUMNS],
+        created_at: 0,
+        rewrite_generation: 0,
+        column_types: [ColType::Bool; MAX_COLUMNS],
         n_columns: 0,
         fillfactor: 0,
     };
@@ -491,10 +494,12 @@ impl SliceLayout {
     fn from_storage(storage: &Storage, slot: usize) -> Self {
         let definition = &*storage.table(slot).definition();
         let mut layout = Self::EMPTY;
+        layout.created_at = storage.table(slot).created_at();
+        layout.rewrite_generation = storage.table(slot).rewrite_generation();
         layout.n_columns = definition.n_columns as u16;
         layout.fillfactor = definition.storage_options.fillfactor.unwrap_or(0);
         for (target, column) in layout.column_types.iter_mut().zip(definition.columns()) {
-            *target = column.ctype.code();
+            *target = column.ctype;
         }
         layout
     }
@@ -568,6 +573,10 @@ enum ValueSchedulePhase {
         accumulator: Option<ExternalRun>,
         level: usize,
     },
+    CompleteRun {
+        run: ExternalRun,
+        destination: ValueMergeDestination,
+    },
 }
 
 struct ValueScheduleJob {
@@ -592,7 +601,20 @@ struct ValueScheduleJob {
     levels: [Option<ExternalRun>; 64],
 }
 
+#[derive(Clone, Copy)]
+enum ValueIndexPhase {
+    Write,
+    Finish(Option<ValueIndexHandle>),
+}
+
+#[derive(Clone, Copy)]
+enum IndexOutputOwner {
+    Schedule,
+    Index,
+}
+
 struct ValueIndexJob {
+    phase: ValueIndexPhase,
     slot: usize,
     table_created_at: u64,
     binding: usize,
@@ -622,6 +644,35 @@ type LoadedValueIndex = (
     crate::storage::ColumnSet,
     ValueIndexHandle,
 );
+
+#[derive(Clone, Copy)]
+struct CheckpointVersion {
+    key: SstKey,
+    home: Option<RowHome>,
+}
+
+enum TableSlicePhase {
+    Clean,
+    Write {
+        source: crate::storage::TableRowSnapshot<'static>,
+        position: usize,
+    },
+    Finish(Option<SstHandle>),
+}
+
+struct TableSliceJob {
+    slot: usize,
+    layout: SliceLayout,
+    generation: u64,
+    through_lsn: u64,
+    reuse_slice: bool,
+    delta: bool,
+    count: u64,
+    crc: Crc32c,
+    installs: [Option<SlotInstall>; 2],
+    install_count: usize,
+    phase: TableSlicePhase,
+}
 
 /// A prior checkpoint's SST reference for one table slot.
 #[derive(Clone, Copy)]
@@ -697,6 +748,8 @@ enum MergePhase {
     Schedule { rank: u8, resume_lo: SstKey },
     /// Streaming scheduled entries into the merged SST from `cursor`.
     Write { cursor: usize },
+    /// The handle is private until its last output emission is durable.
+    Finish { merged: Option<PrevSst> },
 }
 
 /// A merge in flight across beats: which pair of which table's list, and
@@ -757,7 +810,7 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
 fn garbage_sst_root_capacity(config: &Config) -> usize {
     crate::storage::Storage::retained_spill_root_capacity(config)
         + crate::storage::table_slot_capacity(config)
-            .saturating_mul(config.max_spill_generations_per_table)
+            .saturating_mul(config.max_spill_generations_per_table.saturating_add(1))
 }
 
 fn garbage_index_root_capacity(config: &Config) -> usize {
@@ -942,7 +995,7 @@ impl TemporarySpiller {
             }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
-        storage.clear_tombstones(slot);
+        storage.clear_tombstones(slot, storage.lsn());
         storage.clear_table_dirty_through(slot, generation);
         self.reclaim(storage)?;
         Ok(Some(slot))
@@ -1029,22 +1082,116 @@ enum CommitPruneProgress {
 #[must_use]
 pub(crate) struct AtomicBlockReadScope {
     blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
-    restartable: bool,
+    active: core::cell::Cell<bool>,
 }
 
-impl Drop for AtomicBlockReadScope {
-    fn drop(&mut self) {
-        let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-        if self.restartable {
-            blocks.enable_async_gets();
-        } else {
-            blocks.disable_async_gets();
+impl AtomicBlockReadScope {
+    pub(crate) fn activate(&self) {
+        if !self.active.replace(true) {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .enter_atomic_reads();
         }
     }
 }
 
+impl Drop for AtomicBlockReadScope {
+    fn drop(&mut self) {
+        if self.active.get() {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .leave_atomic_reads();
+        }
+    }
+}
+
+enum CommitPublication {
+    Objects {
+        batch: CommitBatchId,
+        data: Option<crate::object_store::upload::Ticket>,
+        descriptor: Option<crate::object_store::upload::Ticket>,
+    },
+    Root {
+        batch: CommitBatchId,
+        ticket: crate::object_store::upload::Ticket,
+    },
+}
+
+pub(crate) const MANIFEST_UPLOAD_SLOTS: usize = 1;
+pub(crate) const CREDENTIAL_UPLOAD_SLOTS: usize = 1;
+const CREDENTIAL_UPLOAD_BYTES: usize = 128;
+
+pub(crate) enum CredentialReloadStep {
+    Pending,
+    Installed,
+}
+
+enum CredentialRenewalPhase {
+    Uploading(crate::object_store::upload::Ticket),
+    Installing(EntityTag),
+}
+
+struct CredentialRenewal {
+    credentials: crate::object_store::Credentials,
+    phase: CredentialRenewalPhase,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CheckpointRequest(core::num::NonZeroU64);
+
+impl CheckpointRequest {
+    pub(crate) fn epoch(self) -> u64 {
+        self.0.get()
+    }
+}
+
+enum ManifestPublication {
+    Uploading {
+        lsn: u64,
+        ticket: crate::object_store::upload::Ticket,
+    },
+    Retry {
+        lsn: u64,
+        at: std::time::Instant,
+    },
+    Installing {
+        lsn: u64,
+        row_position: usize,
+        value_position: usize,
+        cleanup_position: usize,
+    },
+}
+
+// One append may flush a prior group and a maximum chained row; finish may
+// flush column frames, index levels, filter and roster. Index navigation adds
+// its fixed-depth frontier. This reserves one operation, independent of rows.
+const PHYSICAL_EMISSION_BYTES: usize = crate::store::MAX_ASSEMBLED
+    + 8 * crate::store::BLOCK_SIZE
+    + MAX_COLUMNS * (crate::store::HEADER_LEN + 8 + 7)
+    + ValueIndexWriter::budget_bytes();
+const PHYSICAL_EMISSION_OBJECTS: usize = MAX_COLUMNS + 32;
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
+    uploads: crate::object_store::upload::Uploads,
+    block_uploads: crate::object_store::upload::Uploads,
+    manifest_uploads: crate::object_store::upload::Uploads,
+    writer_probe: Option<WriterProbe>,
+    credential_uploads: Option<crate::object_store::upload::Uploads>,
+    credential_renewal: Option<CredentialRenewal>,
+    manifest_publication: Option<ManifestPublication>,
+    requested_checkpoint_epoch: u64,
+    captured_checkpoint_epoch: u64,
+    published_checkpoint_epoch: u64,
+    block_output: crate::store::BlockWriteBatch,
+    index_output_owner: Option<IndexOutputOwner>,
+    table_output: FixedVec<CheckpointVersion>,
+    table_job: Option<TableSliceJob>,
+    commit_publication: Option<CommitPublication>,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
@@ -1069,6 +1216,7 @@ pub(crate) struct Checkpointer {
     garbage_index_roots: Vec<BlockId>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
+    manifest_output: FixedBuf,
     prepared_transaction_snapshot: FixedVec<crate::storage::PreparedTransactionCatalogEntry>,
     manifest_etag: Option<EntityTag>,
     manifest_present: bool,
@@ -1116,6 +1264,8 @@ pub(crate) struct Checkpointer {
     sliced_lsn: Vec<u64>,
     sliced_layout: Vec<SliceLayout>,
     sliced_this_sweep: Vec<bool>,
+    checkpoint_deletions: Vec<Option<std::sync::Arc<()>>>,
+    checkpoint_statistics: Vec<Option<crate::storage::CheckpointStatistics>>,
     /// The slice writer (reset per table) and the merge writer, which holds
     /// a half-written SST across beats — the reason the writer owns its
     /// state instead of borrowing an arena.
@@ -1162,6 +1312,7 @@ pub(crate) struct Checkpointer {
     /// for a displaced process's write.
     writer_token: WriterToken,
     writer_fence_etag: Option<EntityTag>,
+    writer_fenced: bool,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -1195,11 +1346,9 @@ const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 pub(crate) const MERGE_SOURCE_SCRATCH_BYTES: usize = 5 * crate::store::MAX_PAYLOAD + MAX_ASSEMBLED;
-const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
 const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
 const VALUE_INDEX_SCHEDULE_BEAT_ROWS: usize = 1024;
-const VALUE_INDEX_SCHEDULE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_SCHEDULE_BEAT_READS: u64 = 8;
 const VALUE_SORT_ROWS_PER_CHUNK: usize = 8192;
 
@@ -1244,6 +1393,8 @@ impl Checkpointer {
                 + 2 * core::mem::size_of::<u64>()
                 + core::mem::size_of::<SliceLayout>()
                 + core::mem::size_of::<bool>()
+                + core::mem::size_of::<Option<std::sync::Arc<()>>>()
+                + core::mem::size_of::<Option<crate::storage::CheckpointStatistics>>()
                 + core::mem::size_of::<Option<CompletedMerge>>()
                 + core::mem::size_of::<Option<(BlockId, BlockId)>>())
             + table_capacity
@@ -1263,11 +1414,61 @@ impl Checkpointer {
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
+    pub(crate) fn credential_output_budget_bytes(config: &Config) -> usize {
+        if config.object_store_credentials_file.is_empty() {
+            0
+        } else {
+            crate::object_store::upload::Uploads::budget_bytes(
+                config,
+                CREDENTIAL_UPLOAD_SLOTS,
+                CREDENTIAL_UPLOAD_BYTES,
+            )
+        }
+    }
+
+    pub(crate) fn writer_probe_budget_bytes(config: &Config) -> usize {
+        if config.operations_listen_addr.is_empty() {
+            0
+        } else {
+            WriterProbe::budget_bytes(config)
+        }
+    }
+
+    pub(crate) fn manifest_output_budget_bytes(config: &Config) -> usize {
+        crate::object_store::upload::Uploads::budget_bytes(
+            config,
+            MANIFEST_UPLOAD_SLOTS,
+            config.checkpoint_manifest_bytes,
+        ) + config.checkpoint_manifest_bytes
+    }
+
+    pub(crate) fn physical_output_budget_bytes(config: &Config) -> usize {
+        crate::object_store::upload::Uploads::budget_bytes(
+            config,
+            config.object_store_block_put_slots,
+            crate::store::BLOCK_SIZE,
+        ) + crate::store::BlockWriteBatch::budget_bytes(
+            PHYSICAL_EMISSION_BYTES,
+            PHYSICAL_EMISSION_OBJECTS,
+        ) + config
+            .checkpoint_write_entries
+            .saturating_mul(core::mem::size_of::<CheckpointVersion>())
+    }
+
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
         // The metadata client is separate from the block write client, fixed
         // read pool and scratch. Cache tiers draw their own startup budget.
         ObjectStore::budget_bytes(config)
+            + crate::object_store::upload::Uploads::budget_bytes(
+                config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+            )
+            + Self::physical_output_budget_bytes(config)
+            + Self::manifest_output_budget_bytes(config)
+            + Self::writer_probe_budget_bytes(config)
+            + Self::credential_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -1294,6 +1495,19 @@ impl Checkpointer {
             + MERGE_SOURCE_SCRATCH_BYTES
     }
 
+    fn reset_merge_writer(&mut self, storage: &Storage, slot: usize) -> Result<(), SqlError> {
+        self.merge_writer.reset();
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let definition = storage.table(slot).definition();
+        let columns = definition.schema(&mut schema);
+        self.merge_writer
+            .set_pax_schema(&schema[..columns])
+            .map_err(sst_to_sql)?;
+        self.merge_writer
+            .set_packed_fillfactor(definition.storage_options.fillfactor)
+            .map_err(sst_to_sql)
+    }
+
     /// One bounded step of the paced merge — the compaction work a beat may
     /// do between statements. Starting a job, advancing its schedule scan a
     /// few blocks, streaming a few output blocks, or finishing: each is one
@@ -1308,21 +1522,7 @@ impl Checkpointer {
         let Some(mut job) = self.merge_job.take() else {
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
-                self.merge_writer.reset();
-                let mut schema = [ColType::Bool; MAX_COLUMNS];
-                let columns = storage.table(job.slot).definition().schema(&mut schema);
-                self.merge_writer
-                    .set_pax_schema(&schema[..columns])
-                    .map_err(sst_to_sql)?;
-                self.merge_writer
-                    .set_packed_fillfactor(
-                        storage
-                            .table(job.slot)
-                            .definition()
-                            .storage_options
-                            .fillfactor,
-                    )
-                    .map_err(sst_to_sql)?;
+                self.reset_merge_writer(storage, job.slot)?;
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
@@ -1338,6 +1538,10 @@ impl Checkpointer {
             .get(job.slot)
             .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
         if !valid {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.merge_writer.reset();
             return Ok(());
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -1345,6 +1549,7 @@ impl Checkpointer {
             match &job.phase {
                 MergePhase::Schedule { .. } => "row_merge_schedule",
                 MergePhase::Write { .. } => "row_merge_write",
+                MergePhase::Finish { .. } => "row_merge_finish",
             },
             checkpoint_profile_start(),
             self.blocks
@@ -1354,9 +1559,36 @@ impl Checkpointer {
         );
         let outcome = match job.phase {
             MergePhase::Schedule { rank, resume_lo } => {
-                self.merge_schedule_beat(&mut job, rank, resume_lo)?
+                self.merge_schedule_beat(&mut job, rank, resume_lo)
             }
-            MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor)?,
+            MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor),
+            MergePhase::Finish { merged } => Ok(MergeBeatOutcome::Finished(merged)),
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A read can fail after cursors, checksum or writer state changed.
+                // Retry the same immutable pair with one coherent empty output.
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
+                let reset = self.reset_merge_writer(storage, job.slot);
+                self.merge_scratch.clear();
+                self.merge_source_cursors = [
+                    Some(SstVersionCursor::new(job.old0.handle)),
+                    Some(SstVersionCursor::new(job.old1.handle)),
+                ];
+                job.phase = MergePhase::Schedule {
+                    rank: 0,
+                    resume_lo: SstKey::MIN,
+                };
+                job.schedule_len = 0;
+                job.count = 0;
+                job.crc = Crc32c::new();
+                self.merge_job = Some(job);
+                reset?;
+                return Err(error);
+            }
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -1589,6 +1821,7 @@ impl Checkpointer {
     ) -> Result<MergeBeatOutcome, SqlError> {
         let blocks = &self.blocks;
         let writer = &mut self.merge_writer;
+        let output = &mut self.block_output;
         let scratch = &self.merge_scratch;
         let start_blocks = writer.roster_so_far().len();
         let start_reads = blocks
@@ -1599,7 +1832,8 @@ impl Checkpointer {
         let mut cursor = cursor;
         let mut processed = 0usize;
         while cursor < job.schedule_len {
-            if processed >= MERGE_BEAT_ENTRIES
+            if !output.is_empty()
+                || processed >= MERGE_BEAT_ENTRIES
                 || writer.roster_so_far().len() - start_blocks >= MERGE_WRITE_BEAT_BLOCKS
                 || (processed > 0
                     && blocks
@@ -1663,7 +1897,7 @@ impl Checkpointer {
                 if reusable && at == group.data_len() && entries > 0 {
                     let reused = writer
                         .append_reused_pax_group(
-                            &mut *blocks.lock().expect("block store lock poisoned"),
+                            output,
                             group.reference(),
                             &self.merge_source_raw[..group.raw_len()],
                         )
@@ -1726,10 +1960,7 @@ impl Checkpointer {
                     header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
                     job.crc.update(&header);
                     writer
-                        .append_tombstone_version(
-                            &mut *blocks.lock().expect("block store lock poisoned"),
-                            key,
-                        )
+                        .append_tombstone_version(output, key)
                         .map_err(sst_to_sql)?;
                     job.count += 1;
                 }
@@ -1764,26 +1995,29 @@ impl Checkpointer {
             job.crc.update(&header);
             job.crc.update(&self.merge_row[..len]);
             writer
-                .append_version(
-                    &mut *blocks.lock().expect("block store lock poisoned"),
-                    key,
-                    &self.merge_row[..len],
-                )
+                .append_version(output, key, &self.merge_row[..len])
                 .map_err(sst_to_sql)?;
             job.count += 1;
+        }
+        if !output.is_empty() {
+            job.phase = MergePhase::Write { cursor };
+            return Ok(MergeBeatOutcome::Continue);
         }
         if job.count == 0 {
             return Ok(MergeBeatOutcome::Finished(None));
         }
         let handle = writer
-            .finish(&mut *blocks.lock().expect("block store lock poisoned"))
+            .finish(output)
             .map_err(sst_to_sql)?
             .ok_or_else(|| sql_err!(SQLSTATE_IO, "merge wrote rows but produced no SST"))?;
-        Ok(MergeBeatOutcome::Finished(Some(PrevSst {
-            handle,
-            count: job.count,
-            crc: job.crc.finish(),
-        })))
+        job.phase = MergePhase::Finish {
+            merged: Some(PrevSst {
+                handle,
+                count: job.count,
+                crc: job.crc.finish(),
+            }),
+        };
+        Ok(MergeBeatOutcome::Continue)
     }
 
     /// Builds both clients and every fixed cache/checkpoint buffer at startup.
@@ -1882,9 +2116,71 @@ impl Checkpointer {
                 "garbage collection retained index roots",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        let writer_token = new_writer_token().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
+        })?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            uploads: crate::object_store::upload::Uploads::new(
+                config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            block_uploads: crate::object_store::upload::Uploads::new(
+                config,
+                config.object_store_block_put_slots,
+                crate::store::BLOCK_SIZE,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            manifest_uploads: crate::object_store::upload::Uploads::new(
+                config,
+                MANIFEST_UPLOAD_SLOTS,
+                config.checkpoint_manifest_bytes,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            writer_probe: if config.operations_listen_addr.is_empty() {
+                None
+            } else {
+                Some(WriterProbe::new(config, budget, writer_token)?)
+            },
+            credential_uploads: if config.object_store_credentials_file.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::object_store::upload::Uploads::new(
+                        config,
+                        CREDENTIAL_UPLOAD_SLOTS,
+                        CREDENTIAL_UPLOAD_BYTES,
+                        budget,
+                    )
+                    .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+                )
+            },
+            credential_renewal: None,
+            manifest_publication: None,
+            requested_checkpoint_epoch: 0,
+            captured_checkpoint_epoch: 0,
+            published_checkpoint_epoch: 0,
+            block_output: crate::store::BlockWriteBatch::new(
+                budget,
+                PHYSICAL_EMISSION_BYTES,
+                PHYSICAL_EMISSION_OBJECTS,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
+            table_output: FixedVec::new(
+                budget,
+                "checkpoint write entries",
+                config.checkpoint_write_entries,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
+            index_output_owner: None,
+            table_job: None,
+            commit_publication: None,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -1906,6 +2202,8 @@ impl Checkpointer {
             garbage_index_roots: Vec::with_capacity(garbage_index_root_capacity(config)),
             doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
+                .map_err(CheckpointSetupError::Budget)?,
+            manifest_output: FixedBuf::new(budget, "retained manifest", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
             prepared_transaction_snapshot: FixedVec::new(
                 budget,
@@ -1942,6 +2240,8 @@ impl Checkpointer {
             sliced_lsn: vec![0; table_capacity],
             sliced_layout: vec![SliceLayout::EMPTY; table_capacity],
             sliced_this_sweep: vec![false; table_capacity],
+            checkpoint_deletions: (0..table_capacity).map(|_| None).collect(),
+            checkpoint_statistics: (0..table_capacity).map(|_| None).collect(),
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
@@ -1969,10 +2269,9 @@ impl Checkpointer {
             merge_done: vec![None; table_capacity],
             merge_turn: false,
             merge_overflow: vec![None; table_capacity],
-            writer_token: new_writer_token().map_err(|error| {
-                CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
-            })?,
+            writer_token,
             writer_fence_etag: None,
+            writer_fenced: false,
         })
     }
 
@@ -2003,20 +2302,24 @@ impl Checkpointer {
     }
 
     #[cfg(test)]
+    pub(crate) fn merge_source_read_ready(&self) -> bool {
+        self.block_output.is_empty()
+            && self
+                .merge_job
+                .as_ref()
+                .is_some_and(|job| matches!(job.phase, MergePhase::Write { .. }))
+    }
+
+    #[cfg(test)]
     pub(crate) fn value_index_job_active(&self) -> bool {
         self.value_schedule_job.is_some() || self.value_job.is_some()
     }
 
     #[cfg(test)]
-    pub(crate) fn value_index_schedule_io_active(&self) -> bool {
-        self.value_schedule_job.as_ref().is_some_and(|job| {
-            matches!(
-                job.phase,
-                ValueSchedulePhase::WriteChunk { .. }
-                    | ValueSchedulePhase::StartMerge { .. }
-                    | ValueSchedulePhase::Merge { .. }
-            )
-        })
+    pub(crate) fn value_index_schedule_merge_ready(&self) -> bool {
+        self.value_schedule_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.phase, ValueSchedulePhase::StartMerge { .. }))
     }
 
     #[cfg(test)]
@@ -2039,16 +2342,15 @@ impl Checkpointer {
     }
 
     pub(crate) fn atomic_block_read_scope(&self) -> AtomicBlockReadScope {
-        let blocks = std::sync::Arc::clone(&self.blocks);
-        let restartable = {
-            let mut blocks = blocks.lock().expect("block store lock poisoned");
-            let restartable = blocks.async_gets_enabled();
-            blocks.disable_async_gets();
-            restartable
-        };
+        let scope = self.deferred_atomic_block_read_scope();
+        scope.activate();
+        scope
+    }
+
+    pub(crate) fn deferred_atomic_block_read_scope(&self) -> AtomicBlockReadScope {
         AtomicBlockReadScope {
-            blocks,
-            restartable,
+            blocks: std::sync::Arc::clone(&self.blocks),
+            active: core::cell::Cell::new(false),
         }
     }
 
@@ -2067,6 +2369,27 @@ impl Checkpointer {
             .disable_async_gets();
     }
 
+    pub(crate) fn set_read_owner(&mut self, owner: Option<crate::store::ReadOwner>) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .set_read_owner(owner);
+    }
+
+    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .cancel_read_owner(owner);
+    }
+
+    pub(crate) fn read_capacity_generation(&self) -> u64 {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .read_capacity_generation()
+    }
+
     pub(crate) fn block_read_slots(&self) -> usize {
         self.blocks
             .lock()
@@ -2081,11 +2404,31 @@ impl Checkpointer {
             .async_reads_busy()
     }
 
+    pub(crate) fn object_io_busy(&self) -> bool {
+        self.block_reads_busy()
+            || self.uploads.busy()
+            || self.block_uploads.busy()
+            || self.manifest_uploads.busy()
+            || self.writer_probe.as_ref().is_some_and(WriterProbe::busy)
+            || self
+                .credential_uploads
+                .as_ref()
+                .is_some_and(|uploads| uploads.busy())
+            || self.commit_publication.is_some()
+    }
+
     pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
             .pending_read_fd(slot)
+    }
+
+    pub(crate) fn pending_block_read_wants_write(&self, slot: usize) -> bool {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .pending_read_wants_write(slot)
     }
 
     pub(crate) fn advance_pending_block_read(
@@ -2098,18 +2441,18 @@ impl Checkpointer {
             .advance_pending_read(slot)
     }
 
-    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next_block_read_deadline(&self) -> Option<std::time::Instant> {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
-            .next_hedge_deadline()
+            .next_read_deadline()
     }
 
-    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
+    pub(crate) fn advance_block_read_deadlines(&mut self, now: std::time::Instant) -> bool {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
-            .issue_due_hedges(now);
+            .advance_read_deadlines(now)
     }
 
     fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {
@@ -2123,49 +2466,33 @@ impl Checkpointer {
         Ok(())
     }
 
-    fn assert_writer(&mut self) -> Result<(), SqlError> {
-        let etag = self.writer_fence_etag.as_ref().ok_or_else(|| {
-            sql_err!(
-                SQLSTATE_CAS,
-                "writer ownership was not acquired during startup"
-            )
-        })?;
-        let active = writer_fence_record("active", self.writer_token);
-        match self.client.put(
-            WRITER_FENCE_KEY,
-            active.as_str().as_bytes(),
-            Precondition::IfMatch(etag),
-        ) {
-            Ok(etag) => {
-                self.writer_fence_etag = Some(etag);
-                Ok(())
-            }
-            Err(error) => {
-                let refreshed = self.client.get(WRITER_FENCE_KEY, None);
-                if let Ok(result) = refreshed
-                    && self.client.body_bytes() == active.as_str().as_bytes()
-                {
-                    self.writer_fence_etag = Some(result.etag);
-                    return Ok(());
-                }
-                if error.is_precondition_failed() {
-                    Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "writer was fenced by a newer process"
-                    ))
-                } else {
-                    Err(sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))
-                }
-            }
-        }
+    pub(crate) fn writer_was_fenced(&self) -> bool {
+        self.writer_fenced || self.writer_probe.as_ref().is_some_and(WriterProbe::fenced)
     }
 
+    pub(crate) fn writer_probe(&mut self) -> Option<&mut WriterProbe> {
+        if self.writer_fenced
+            && let Some(probe) = self.writer_probe.as_mut()
+        {
+            probe.fence();
+        }
+        self.writer_probe.as_mut()
+    }
+
+    #[cfg(test)]
     pub(crate) fn verify_writer(&mut self) -> Result<(), SqlError> {
+        if self.writer_was_fenced() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
         let active = writer_fence_record("active", self.writer_token);
         self.client
             .get(WRITER_FENCE_KEY, None)
             .map_err(|error| sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))?;
         if self.client.body_bytes() != active.as_str().as_bytes() {
+            self.writer_fenced = true;
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"
@@ -2174,38 +2501,150 @@ impl Checkpointer {
         Ok(())
     }
 
-    pub(crate) fn rotate_credentials(
-        &mut self,
-        credentials: crate::object_store::Credentials,
-    ) -> Result<(), SqlError> {
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .async_reads_busy()
-        {
-            return Err(sql_err!(
-                SQLSTATE_IO,
-                "object-store credential rotation is waiting for active reads"
-            ));
-        }
-        let previous = self.client.credentials().ok_or_else(|| {
-            sql_err!(
-                SQLSTATE_IO,
-                "object-store credential rotation is unavailable for the simulator"
-            )
-        })?;
-        self.client.replace_credentials(credentials);
-        if let Err(error) = self.assert_writer() {
-            self.client.replace_credentials(previous);
-            return Err(error);
-        }
+    pub(crate) fn credential_install_pending(&self) -> bool {
+        matches!(
+            self.credential_renewal
+                .as_ref()
+                .map(|renewal| &renewal.phase),
+            Some(CredentialRenewalPhase::Installing(_))
+        )
+    }
+
+    fn set_credential_admission(&mut self, admission: crate::object_store::RequestAdmission) {
+        self.block_uploads.set_admission(admission);
         self.blocks
             .lock()
             .expect("block store lock poisoned")
             .base_mut()
-            .replace_credentials(credentials);
+            .set_admission(admission);
+        if let Some(probe) = self.writer_probe.as_mut() {
+            probe.set_admission(admission);
+        }
+    }
+
+    pub(crate) fn begin_credential_reload(
+        &mut self,
+        credentials: crate::object_store::Credentials,
+    ) -> Result<(), SqlError> {
+        if self.credential_renewal.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "credential renewal already pending"
+            ));
+        }
+        if self.writer_was_fenced() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        if self.client.credentials().is_none() {
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "object-store credential rotation is unavailable for the simulator"
+            ));
+        }
+        let etag = self.writer_fence_etag.ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_CAS,
+                "writer ownership was not acquired during startup"
+            )
+        })?;
+        let uploads = self.credential_uploads.as_mut().ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_IO,
+                "credential renewal requires object_store_credentials_file"
+            )
+        })?;
+        uploads.replace_credentials(credentials);
+        let record = writer_fence_record("active", self.writer_token);
+        let ticket = uploads
+            .enqueue(
+                WRITER_FENCE_KEY,
+                record.as_str().as_bytes(),
+                crate::object_store::upload::Condition::PublishMatchVerified(etag),
+            )
+            .map_err(upload_to_sql)?;
+        self.credential_renewal = Some(CredentialRenewal {
+            credentials,
+            phase: CredentialRenewalPhase::Uploading(ticket),
+        });
         Ok(())
+    }
+
+    pub(crate) fn advance_credential_reload(&mut self) -> Result<CredentialReloadStep, SqlError> {
+        let mut renewal = self.credential_renewal.take().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "credential renewal has not been requested"
+            )
+        })?;
+        if self.writer_was_fenced() {
+            self.set_credential_admission(crate::object_store::RequestAdmission::Open);
+            if let CredentialRenewalPhase::Uploading(ticket) = renewal.phase {
+                self.credential_uploads
+                    .as_mut()
+                    .expect("reserved credential client")
+                    .cancel(ticket)
+                    .map_err(upload_to_sql)?;
+            }
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        match renewal.phase {
+            CredentialRenewalPhase::Uploading(ticket) => {
+                match self
+                    .credential_uploads
+                    .as_mut()
+                    .expect("reserved credential client")
+                    .take(ticket)
+                {
+                    Ok(Some(etag)) => {
+                        renewal.phase = CredentialRenewalPhase::Installing(etag);
+                        self.set_credential_admission(
+                            crate::object_store::RequestAdmission::Draining,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if matches!(&error, crate::object_store::upload::UploadError::Request(error)
+                            if error.is_precondition_failed())
+                        {
+                            self.writer_fenced = true;
+                        }
+                        return Err(upload_to_sql(error));
+                    }
+                }
+                self.credential_renewal = Some(renewal);
+                Ok(CredentialReloadStep::Pending)
+            }
+            CredentialRenewalPhase::Installing(etag) => {
+                // Every transport retains its signed request until completion.
+                // Install validated credentials only between those owners.
+                if self.object_io_busy() {
+                    self.credential_renewal = Some(renewal);
+                    return Ok(CredentialReloadStep::Pending);
+                }
+                self.client.replace_credentials(renewal.credentials);
+                self.uploads.replace_credentials(renewal.credentials);
+                self.block_uploads.replace_credentials(renewal.credentials);
+                self.manifest_uploads
+                    .replace_credentials(renewal.credentials);
+                if let Some(probe) = self.writer_probe.as_mut() {
+                    probe.replace_credentials(renewal.credentials);
+                }
+                self.blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .base_mut()
+                    .replace_credentials(renewal.credentials);
+                self.writer_fence_etag = Some(etag);
+                self.set_credential_admission(crate::object_store::RequestAdmission::Open);
+                Ok(CredentialReloadStep::Installed)
+            }
+        }
     }
 
     /// Publishes one immutable committed journal batch, keyed by its first
@@ -2216,6 +2655,27 @@ impl Checkpointer {
         first_lsn: u64,
         bytes: &[u8],
     ) -> Result<(), SqlError> {
+        self.begin_commit_publication(first_lsn, bytes)?;
+        while !self.advance_commit_publication(std::time::Instant::now())? {
+            if let Err(error) = self.uploads.wait_ready() {
+                self.cancel_commit_publication()?;
+                return Err(object_store_to_sql(error));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_commit_publication(
+        &mut self,
+        first_lsn: u64,
+        bytes: &[u8],
+    ) -> Result<(), SqlError> {
+        if self.commit_publication.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "commit publication already in progress"
+            ));
+        }
         let batch = CommitBatchId::from_bytes(first_lsn, bytes);
         let key = stack_format!(
             72,
@@ -2223,7 +2683,6 @@ impl Checkpointer {
             batch.first_lsn,
             batch.digest
         );
-        self.put_immutable(key.as_str(), bytes)?;
         let descriptor_key = stack_format!(
             72,
             "commits/{:020}-{:08x}.head",
@@ -2239,70 +2698,334 @@ impl Checkpointer {
             COMMIT_HEAD_HEADER, batch.first_lsn, batch.digest, previous.first_lsn, previous.digest
         )
         .expect("commit descriptor fits its fixed buffer");
-        self.put_immutable(descriptor_key.as_str(), descriptor.as_str().as_bytes())?;
-
-        let mut head = StackStr::<128>::new();
-        write!(
-            head,
-            "{}\nwriter {:032x}\nfirst {}\ndigest {:08x}\nend\n",
-            COMMIT_HEAD_HEADER, self.writer_token.0, batch.first_lsn, batch.digest
-        )
-        .expect("commit head fits its fixed buffer");
-        let precondition = match &self.commit_head_etag {
-            Some(etag) => Precondition::IfMatch(etag),
-            None => Precondition::IfNoneMatchAny,
-        };
-        let etag = match self
-            .client
-            .put(COMMIT_HEAD_KEY, head.as_str().as_bytes(), precondition)
-        {
-            Ok(etag) => etag,
-            Err(error) if error.is_precondition_failed() => {
-                self.assert_writer()?;
-                let refreshed = self
-                    .client
-                    .get(COMMIT_HEAD_KEY, None)
-                    .map_err(object_store_to_sql)?;
-                let (writer, published) = parse_commit_head(self.client.body_bytes())
-                    .map_err(|message| sql_err!(SQLSTATE_CAS, "{message}"))?;
-                if writer != self.writer_token || published != batch {
-                    return Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "commit-head compare-and-swap failed after writer fencing"
-                    ));
-                }
-                self.client
-                    .put(
-                        COMMIT_HEAD_KEY,
-                        head.as_str().as_bytes(),
-                        Precondition::IfMatch(&refreshed.etag),
-                    )
-                    .map_err(object_store_to_sql)?
+        use crate::object_store::upload::Condition;
+        let data_ticket = self
+            .uploads
+            .enqueue(key.as_str(), bytes, Condition::ImmutableCreate)
+            .map_err(upload_to_sql)?;
+        let descriptor_ticket = match self.uploads.enqueue(
+            descriptor_key.as_str(),
+            descriptor.as_str().as_bytes(),
+            Condition::ImmutableCreate,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.uploads.cancel(data_ticket).map_err(upload_to_sql)?;
+                return Err(upload_to_sql(error));
             }
-            Err(error) => return Err(object_store_to_sql(error)),
         };
-        self.commit_head_etag = Some(etag);
-        self.commit_head = Some(batch);
+        self.commit_publication = Some(CommitPublication::Objects {
+            batch,
+            data: Some(data_ticket),
+            descriptor: Some(descriptor_ticket),
+        });
         Ok(())
     }
 
-    fn put_immutable(&mut self, key: &str, bytes: &[u8]) -> Result<(), SqlError> {
-        match self.client.put(key, bytes, Precondition::IfNoneMatchAny) {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_precondition_failed() => {
-                self.client.get(key, None).map_err(object_store_to_sql)?;
-                if self.client.body_bytes() == bytes {
-                    Ok(())
+    /// Independent objects may complete out of order. Only the sequenced root
+    /// transition makes their transaction records recoverable.
+    pub(crate) fn advance_commit_publication(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<bool, SqlError> {
+        use crate::object_store::upload::Condition;
+        self.uploads.advance(now);
+        let Some(publication) = self.commit_publication.take() else {
+            return Ok(true);
+        };
+        match publication {
+            CommitPublication::Objects {
+                batch,
+                mut data,
+                mut descriptor,
+            } => {
+                if let Some(ticket) = data {
+                    match self.uploads.take(ticket) {
+                        Ok(Some(_)) => data = None,
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(ticket) = descriptor {
+                                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                            }
+                            return Err(upload_to_sql(error));
+                        }
+                    }
+                }
+                if let Some(ticket) = descriptor {
+                    match self.uploads.take(ticket) {
+                        Ok(Some(_)) => descriptor = None,
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(ticket) = data {
+                                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                            }
+                            return Err(upload_to_sql(error));
+                        }
+                    }
+                }
+                if data.is_none() && descriptor.is_none() {
+                    let head = format_commit_head(self.writer_token, batch);
+                    let condition = match self.commit_head_etag {
+                        Some(etag) => Condition::PublishMatch(etag),
+                        None => Condition::PublishAbsent,
+                    };
+                    let ticket = self
+                        .uploads
+                        .enqueue(COMMIT_HEAD_KEY, head.as_str().as_bytes(), condition)
+                        .map_err(upload_to_sql)?;
+                    self.commit_publication = Some(CommitPublication::Root { batch, ticket });
                 } else {
-                    Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "immutable object collision at {}",
-                        key
-                    ))
+                    self.commit_publication = Some(CommitPublication::Objects {
+                        batch,
+                        data,
+                        descriptor,
+                    });
+                }
+                Ok(false)
+            }
+            CommitPublication::Root { batch, ticket } => {
+                let outcome = self.uploads.take(ticket).map_err(|error| match error {
+                    crate::object_store::upload::UploadError::Request(error)
+                        if error.is_precondition_failed() =>
+                    {
+                        sql_err!(SQLSTATE_CAS, "commit root changed; writer was fenced")
+                    }
+                    other => upload_to_sql(other),
+                })?;
+                match outcome {
+                    Some(etag) => {
+                        self.commit_head_etag = Some(etag);
+                        self.commit_head = Some(batch);
+                        Ok(true)
+                    }
+                    None => {
+                        self.commit_publication = Some(CommitPublication::Root { batch, ticket });
+                        Ok(false)
+                    }
                 }
             }
-            Err(error) => Err(object_store_to_sql(error)),
         }
+    }
+
+    pub(crate) fn wait_commit_publication(&mut self) -> Result<(), SqlError> {
+        if self.commit_publication.is_none() {
+            return Ok(());
+        }
+        self.uploads.wait_ready().map_err(object_store_to_sql)
+    }
+
+    fn cancel_commit_publication(&mut self) -> Result<(), SqlError> {
+        match self.commit_publication.take() {
+            Some(CommitPublication::Objects {
+                data, descriptor, ..
+            }) => {
+                for ticket in [data, descriptor].into_iter().flatten() {
+                    self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                }
+            }
+            Some(CommitPublication::Root { ticket, .. }) => {
+                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_publication_busy(&self) -> bool {
+        self.commit_publication.is_some()
+    }
+
+    pub(crate) fn upload_slots(&self) -> usize {
+        self.uploads.slots()
+            + self.block_uploads.slots()
+            + self.manifest_uploads.slots()
+            + self
+                .credential_uploads
+                .as_ref()
+                .map_or(0, |uploads| uploads.slots())
+    }
+
+    pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        if slot < self.uploads.slots() {
+            self.uploads.fd(slot)
+        } else if slot < self.uploads.slots() + self.block_uploads.slots() {
+            self.block_uploads.fd(slot - self.uploads.slots())
+        } else if slot
+            < self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
+        {
+            self.manifest_uploads
+                .fd(slot - self.uploads.slots() - self.block_uploads.slots())
+        } else {
+            self.credential_uploads
+                .as_ref()
+                .expect("reserved credential upload slot")
+                .fd(slot
+                    - self.uploads.slots()
+                    - self.block_uploads.slots()
+                    - self.manifest_uploads.slots())
+        }
+    }
+
+    pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
+        if slot < self.uploads.slots() {
+            self.uploads.wants_write(slot)
+        } else if slot < self.uploads.slots() + self.block_uploads.slots() {
+            self.block_uploads.wants_write(slot - self.uploads.slots())
+        } else if slot
+            < self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
+        {
+            self.manifest_uploads
+                .wants_write(slot - self.uploads.slots() - self.block_uploads.slots())
+        } else {
+            self.credential_uploads
+                .as_ref()
+                .expect("reserved credential upload slot")
+                .wants_write(
+                    slot - self.uploads.slots()
+                        - self.block_uploads.slots()
+                        - self.manifest_uploads.slots(),
+                )
+        }
+    }
+
+    pub(crate) fn next_upload_deadline(&self) -> Option<std::time::Instant> {
+        [
+            self.uploads.next_deadline(),
+            self.block_output.deadline(&self.block_uploads),
+            self.manifest_uploads.next_deadline(),
+            self.credential_uploads
+                .as_ref()
+                .and_then(|uploads| uploads.next_deadline()),
+            match self
+                .credential_renewal
+                .as_ref()
+                .map(|renewal| &renewal.phase)
+            {
+                Some(CredentialRenewalPhase::Installing(_)) if !self.object_io_busy() => {
+                    Some(std::time::Instant::now())
+                }
+                _ => None,
+            },
+            match self.manifest_publication {
+                Some(ManifestPublication::Retry { at, .. }) => Some(at),
+                Some(ManifestPublication::Installing { .. }) => Some(std::time::Instant::now()),
+                _ => None,
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(crate) fn advance_background_uploads(&mut self, now: std::time::Instant) {
+        self.block_uploads.advance(now);
+        self.manifest_uploads.advance(now);
+        if let Some(uploads) = self.credential_uploads.as_mut() {
+            uploads.advance(now);
+        }
+    }
+
+    pub(crate) fn physical_output_ready(&self, now: std::time::Instant) -> bool {
+        self.block_output.ready(&self.block_uploads, now)
+    }
+
+    pub(crate) fn physical_output_pending(&self) -> bool {
+        !self.block_output.is_empty()
+    }
+
+    pub(crate) fn physical_output_stale(&self, storage: &Storage) -> bool {
+        !self.block_output.is_empty()
+            && match self.index_output_owner {
+                Some(IndexOutputOwner::Schedule) => self
+                    .value_schedule_job
+                    .as_ref()
+                    .is_none_or(|job| !Self::value_schedule_job_is_current(storage, job)),
+                Some(IndexOutputOwner::Index) => self
+                    .value_job
+                    .as_ref()
+                    .is_none_or(|job| !Self::value_job_is_current(storage, job)),
+                None => false,
+            }
+    }
+
+    pub(crate) fn advance_physical_output(&mut self, storage: &Storage) -> Result<bool, SqlError> {
+        if self.physical_output_stale(storage) {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.index_output_owner = None;
+            return Ok(true);
+        }
+        self.drain_block_output()
+    }
+
+    pub(crate) fn retained_output_pending(&self) -> bool {
+        self.table_job.is_some() || self.merge_job.is_some()
+    }
+
+    pub(crate) fn retained_output_ready(&self) -> bool {
+        self.block_output.is_empty() && self.retained_output_pending()
+    }
+
+    /// Already-captured inputs can progress behind later journal uploads.
+    /// This path never starts a sweep or publishes a manifest.
+    pub(crate) fn advance_retained_output(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        assert!(
+            self.retained_output_ready(),
+            "retained producer must wait for its previous emission"
+        );
+        if self.table_job.is_some() && !(self.merge_turn && self.merge_job.is_some()) {
+            self.merge_turn = true;
+            self.advance_table_slice(storage)
+        } else {
+            self.merge_turn = false;
+            self.merge_beat(storage)
+        }
+    }
+
+    fn drain_block_output(&mut self) -> Result<bool, SqlError> {
+        if self.block_output.is_empty() {
+            self.index_output_owner = None;
+            return Ok(true);
+        }
+        let before = self.block_output.object_puts();
+        let result = self
+            .block_output
+            .drain(&mut self.block_uploads, std::time::Instant::now());
+        let requests = self.block_output.object_puts().saturating_sub(before);
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .record_puts(requests);
+        let complete = result.map_err(upload_to_sql)?;
+        if complete {
+            self.block_output.consume();
+            self.index_output_owner = None;
+        }
+        Ok(complete)
+    }
+
+    fn finish_immutable_upload(
+        &mut self,
+        ticket: crate::object_store::upload::Ticket,
+    ) -> Result<(), SqlError> {
+        self.uploads
+            .finish(ticket)
+            .map(|_| ())
+            .map_err(upload_to_sql)
+    }
+
+    fn put_immutable(&mut self, key: &str, bytes: &[u8]) -> Result<(), SqlError> {
+        let ticket = self
+            .uploads
+            .enqueue(
+                key,
+                bytes,
+                crate::object_store::upload::Condition::ImmutableCreate,
+            )
+            .map_err(upload_to_sql)?;
+        self.finish_immutable_upload(ticket)
     }
 
     /// Creates one immutable, named recovery point from the roots published by
@@ -2543,13 +3266,14 @@ impl Checkpointer {
     pub(crate) fn next_committed_wal_transaction(
         &mut self,
         floor: u64,
+        ceiling: u64,
         scratch: &mut FixedBuf,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<Option<u64>, SqlError> {
         scratch.clear();
         let mut complete_lsn = None;
         self.replay_commit_batches(floor, |lsn, record| {
-            if complete_lsn.is_some() {
+            if complete_lsn.is_some() || lsn > ceiling {
                 return Ok(());
             }
             append_uploaded_wal_record(scratch, lsn, record)?;
@@ -7744,6 +8468,7 @@ impl Checkpointer {
                     index_created_at,
                     include_mask,
                     Some(handle),
+                    crate::storage::ValueIndexInstallation::Recovery,
                 )
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!(
@@ -7916,15 +8641,25 @@ impl Checkpointer {
     /// heap, and overlay transition before another statement runs. Remote
     /// garbage maintenance remains pending and is either paced by later beats
     /// or drained explicitly by [`Self::finish_maintenance`].
-    pub(crate) fn checkpoint(
-        &mut self,
-        storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
-    ) -> Result<Option<u64>, SqlError> {
+    pub(crate) fn checkpoint(&mut self, storage: &mut Storage) -> Result<Option<u64>, SqlError> {
+        if self.credential_install_pending() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "checkpoint waits for validated credential installation"
+            ));
+        }
         loop {
-            match self.checkpoint_step(storage, sort_scratch)? {
+            match self.checkpoint_step(storage)? {
                 CheckpointStep::Idle => return Ok(None),
-                CheckpointStep::Working => continue,
+                CheckpointStep::Working => {
+                    if self.manifest_publication_pending() {
+                        self.wait_manifest_publication()?;
+                    } else if !self.block_output.is_empty() {
+                        self.block_output
+                            .wait_ready(&mut self.block_uploads)
+                            .map_err(upload_to_sql)?;
+                    }
+                }
                 CheckpointStep::Published { lsn } => return Ok(Some(lsn)),
             }
         }
@@ -7933,7 +8668,7 @@ impl Checkpointer {
     /// Whether a sweep is mid-flight — once true, every beat advances it
     /// until the manifest publishes, trigger conditions or not.
     pub(crate) fn sweep_active(&self) -> bool {
-        self.sweeping
+        self.sweeping || self.requested_checkpoint_epoch > self.published_checkpoint_epoch
     }
 
     fn observe_retained_root_release(&mut self, storage: &Storage) {
@@ -7975,8 +8710,8 @@ impl Checkpointer {
     /// checkpoint no longer stalls every connection for its whole duration;
     /// consistency holds because a table that changes after its slice
     /// ([`Table::mark_dirty`] bumps its generation) is re-sliced before the
-    /// publish, and the publish itself runs only in a beat where no table has
-    /// an outdated slice.
+    /// publish. Root serialization captures only current slices; its upload
+    /// and local installation retain that captured identity across later beats.
     ///
     /// A failed beat (an object-store error) leaves the sweep state where it
     /// stands; the next beat retries the same work — block writes are
@@ -7986,9 +8721,26 @@ impl Checkpointer {
     pub(crate) fn checkpoint_step(
         &mut self,
         storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
+        if self.manifest_publication_pending() {
+            return self.advance_manifest_publication(storage);
+        }
+        if !self.advance_physical_output(storage)? {
+            return Ok(CheckpointStep::Working);
+        }
+        if self.table_job.is_some() {
+            self.advance_retained_output(storage)?;
+            return Ok(CheckpointStep::Working);
+        }
         self.observe_retained_root_release(storage);
+        if self
+            .merge_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.phase, MergePhase::Finish { .. }))
+        {
+            self.merge_beat(storage)?;
+            return Ok(CheckpointStep::Working);
+        }
         if self.published_lsn_pending_maintenance.is_some() {
             if let Some(up_to_lsn) = self.commit_prune_through {
                 if self.prune_commit_batch(up_to_lsn)? {
@@ -8036,7 +8788,7 @@ impl Checkpointer {
         // sweep due even at an unchanged lsn: its install needs a publish.
         let merge_due = self.merge_job.is_some() || self.merge_candidate(storage).is_some();
         let value_index_due = self.value_index_schedule_pending(storage);
-        let sweep_due = self.sweeping
+        let sweep_due = self.sweep_active()
             || storage.lsn() != self.manifest_lsn
             || !self.manifest_present
             || self.merge_done.iter().any(Option::is_some)
@@ -8059,6 +8811,9 @@ impl Checkpointer {
                 .iter_mut()
                 .for_each(|layout| *layout = SliceLayout::EMPTY);
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
+            self.checkpoint_deletions
+                .iter_mut()
+                .for_each(|guard| *guard = None);
             self.pending_installs.clear();
             self.pending_value_installs.clear();
             self.value_schedule_job = None;
@@ -8091,12 +8846,9 @@ impl Checkpointer {
             if !self.needs_slice(storage, slot) {
                 continue;
             }
-            let generation = storage.table(slot).generation();
-            self.build_table_list(storage, sort_scratch, slot)?;
-            self.sliced_generation[slot] = generation;
-            self.sliced_lsn[slot] = storage.lsn();
-            self.sliced_layout[slot] = SliceLayout::from_storage(storage, slot);
-            self.sliced_this_sweep[slot] = true;
+            if !self.begin_table_slice(storage, slot)? {
+                return Ok(CheckpointStep::Working);
+            }
             wrote_slice = true;
             break;
         }
@@ -8121,7 +8873,7 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
-        let published = self.publish(storage, lsn);
+        let published = self.prepare_manifest(storage, lsn);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "manifest",
@@ -8136,9 +8888,8 @@ impl Checkpointer {
             0,
         );
         published?;
-        storage.clear_dirty_through(&self.sliced_generation);
-        self.sweeping = false;
-        Ok(CheckpointStep::Published { lsn })
+        self.queue_manifest_upload(lsn)?;
+        Ok(CheckpointStep::Working)
     }
 
     /// For a live relation, storage's installed handles and `prev_ssts` name
@@ -8209,16 +8960,26 @@ impl Checkpointer {
     }
 
     /// Assembles and publishes the manifest from the sweep's recorded
-    /// per-table lists, then installs the new spill state and sweeps
-    /// garbage. Runs only when no table has an outdated slice.
-    fn publish(&mut self, storage: &mut Storage, lsn: u64) -> Result<(), SqlError> {
+    /// per-table lists. The retained bytes stay unchanged until publication
+    /// resolves. Runs only when no table has an outdated slice.
+    fn prepare_manifest(&mut self, storage: &Storage, lsn: u64) -> Result<(), SqlError> {
+        if self.writer_was_fenced() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
         // Delta bookkeeping collects the new per-slot references into
         // pre-reserved scratch so this post-freeze path never allocates.
-        self.manifest_buf.clear();
-        write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
-        write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
+        for (slot, receipt) in self.checkpoint_statistics.iter_mut().enumerate() {
+            *receipt = Some(storage.capture_checkpoint_statistics(slot));
+            self.sliced_layout[slot] = SliceLayout::from_storage(storage, slot);
+        }
+        self.manifest_output.clear();
+        write_manifest(&mut self.manifest_output, MANIFEST_HEADER)?;
+        write_manifest(&mut self.manifest_output, format_args!("lsn {lsn}"))?;
         write_manifest(
-            &mut self.manifest_buf,
+            &mut self.manifest_output,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
         let mut identity_result = Ok(());
@@ -8228,14 +8989,14 @@ impl Checkpointer {
             }
             identity_result = match record {
                 TransactionIdentityRecord::Latest(transaction_id) => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("latest_transaction_id {transaction_id}"),
                 ),
                 TransactionIdentityRecord::Recent {
                     transaction_id,
                     committed,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "transaction_status {} {}",
                         transaction_id,
@@ -8247,13 +9008,13 @@ impl Checkpointer {
         identity_result?;
         match storage.next_large_object_oid() {
             Some(oid) => write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("next_lo_oid {}", oid.get()),
             )?,
-            None => write_manifest(&mut self.manifest_buf, "next_lo_oid -")?,
+            None => write_manifest(&mut self.manifest_output, "next_lo_oid -")?,
         }
         write_manifest(
-            &mut self.manifest_buf,
+            &mut self.manifest_output,
             format_args!("writer {:032x}", self.writer_token.0),
         )?;
         let mut database_context = None;
@@ -8323,7 +9084,7 @@ impl Checkpointer {
                 | (u16::from(attributes.password.is_some()) << 7)
                 | (u16::from(attributes.valid_until.is_some()) << 8);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rol {} {} {} {} {} {} {} {} {}",
                     name.as_str(),
@@ -8371,7 +9132,7 @@ impl Checkpointer {
                 | (u8::from(membership.options.inherit) << 1)
                 | (u8::from(membership.options.set) << 2);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rmem {} {} {} {}",
                     role.as_str(),
@@ -8405,7 +9166,7 @@ impl Checkpointer {
             let flags =
                 u8::from(definition.allow_connections) | (u8::from(definition.is_template) << 1);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "db {} {} {} {} {} {} {} {} {} {} {} {}",
                     database.oid.get(),
@@ -8464,7 +9225,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rset {} {} {} {} {}",
                     scope,
@@ -8493,7 +9254,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("sset {} {}", name.as_str(), value.as_str()),
             )?;
         }
@@ -8517,7 +9278,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "ptx {} {} {} {} {} {} {}",
                     prepared.transaction_id,
@@ -8545,7 +9306,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 schema.database,
             )?;
@@ -8554,16 +9315,19 @@ impl Checkpointer {
             for b in schema.name.as_str().as_bytes() {
                 let _ = write!(hex, "{b:02x}");
             }
-            write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!("nsp {}", hex.as_str()),
+            )?;
         }
         for (_, object) in storage.checkpoint_large_objects() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 object.database,
             )?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("lob {} {}", object.oid.get(), object.created_at),
             )?;
         }
@@ -8574,7 +9338,7 @@ impl Checkpointer {
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
         for (_, d) in storage.checkpoint_domains() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, d.database)?;
+            write_database_context(&mut self.manifest_output, &mut database_context, d.database)?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
             let hex = |line: &mut StackStr<10_240>, s: &str| {
@@ -8641,7 +9405,7 @@ impl Checkpointer {
                 hex(&mut line, c.expression.as_str());
                 let _ = write!(line, " {}", c.validation.code());
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            write_manifest(&mut self.manifest_output, format_args!("{}", line.as_str()))?;
         }
         // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
         // <sort-bits>]...`. Written before tables so an enum-typed column
@@ -8649,7 +9413,7 @@ impl Checkpointer {
         // key is emitted as its exact f64 bit pattern.
         for (slot, e) in storage.checkpoint_enums() {
             let definition = storage.enum_for(slot, 0);
-            write_database_context(&mut self.manifest_buf, &mut database_context, e.database)?;
+            write_database_context(&mut self.manifest_output, &mut database_context, e.database)?;
             use core::fmt::Write;
             let hex = |output: &mut FixedBuf, s: &str| -> core::fmt::Result {
                 if s.is_empty() {
@@ -8661,32 +9425,31 @@ impl Checkpointer {
                 }
                 Ok(())
             };
-            write!(&mut self.manifest_buf, "enm ").map_err(|_| manifest_full())?;
-            hex(&mut self.manifest_buf, e.schema.as_str()).map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
-            hex(&mut self.manifest_buf, e.name.as_str()).map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_buf, " {}", definition.members().len())
+            write!(&mut self.manifest_output, "enm ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_output, e.schema.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_output, e.name.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_output, " {}", definition.members().len())
                 .map_err(|_| manifest_full())?;
             for m in definition.members() {
-                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
-                hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
-                write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
+                write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
+                hex(&mut self.manifest_output, m.label.as_str()).map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_output, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
-                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
                 match m.legacy_label {
-                    Some(label) => {
-                        hex(&mut self.manifest_buf, label.as_str()).map_err(|_| manifest_full())?
-                    }
-                    None => write!(&mut self.manifest_buf, "-").map_err(|_| manifest_full())?,
+                    Some(label) => hex(&mut self.manifest_output, label.as_str())
+                        .map_err(|_| manifest_full())?,
+                    None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
+            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         // Named composites precede tables because composite columns rebind by
         // catalog identity while the table definitions are restored.
         for (_, definition) in storage.checkpoint_composites() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 definition.database,
             )?;
@@ -8698,7 +9461,7 @@ impl Checkpointer {
                 )
             };
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "cmp {} {} {}",
                 ManifestZeroName(definition.schema.as_str()),
                 ManifestZeroName(definition.name.as_str()),
@@ -8707,7 +9470,7 @@ impl Checkpointer {
             .map_err(|_| manifest_full())?;
             for field in definition.fields() {
                 write!(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     " {} {} {} {} {} {} {} {} {}",
                     ManifestZeroName(field.name.as_str()),
                     field.attribute_number,
@@ -8733,11 +9496,11 @@ impl Checkpointer {
                 )
                 .map_err(|_| manifest_full())?;
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
+            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         for (_, method) in storage.checkpoint_access_methods() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 method.database,
             )?;
@@ -8747,7 +9510,7 @@ impl Checkpointer {
                 let _ = write!(name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "am {} {} {}",
                     method.created_at,
@@ -8785,7 +9548,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 identity.database,
             )?;
@@ -8850,9 +9613,9 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            write_manifest(&mut self.manifest_buf, table_line.as_str())?;
+            write_manifest(&mut self.manifest_output, table_line.as_str())?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
             if definition.schema.as_str() != "public" {
@@ -8862,13 +9625,13 @@ impl Checkpointer {
                     let _ = write!(hex, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("tsch {}", hex.as_str()),
                 )?;
             }
-            write_partition_manifest(&mut self.manifest_buf, definition.partition)?;
+            write_partition_manifest(&mut self.manifest_output, definition.partition)?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rls {} {} {}",
                     u8::from(definition.row_level_security.enabled),
@@ -8926,7 +9689,7 @@ impl Checkpointer {
                     }
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
@@ -8952,7 +9715,7 @@ impl Checkpointer {
             let table_statistics = table.committed_statistics();
             if table_statistics.valid {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "stats {slot} {} {} {}",
                         table_statistics.rows,
@@ -8968,7 +9731,7 @@ impl Checkpointer {
                         continue;
                     }
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "cstat {slot} {column} {} {} {} {}",
                             statistics.null_fraction_ppm,
@@ -8983,7 +9746,7 @@ impl Checkpointer {
             for (ci, c) in definition.columns().iter().enumerate() {
                 if c.auto_increment {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!("seq {ci} {}", serial_values[ci]),
                     )?;
                 }
@@ -9001,7 +9764,7 @@ impl Checkpointer {
                     let _ = write!(hex_name, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "ukey {} {} {} {}{}",
                         u8::from(uk.is_primary),
@@ -9024,7 +9787,7 @@ impl Checkpointer {
                     let _ = write!(hexpr, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "chk {} {} {}",
                         check.validation.code(),
@@ -9057,7 +9820,7 @@ impl Checkpointer {
                     let _ = write!(hparent_schema, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "fkey {} {}{} {}{} {} {} {} {} {} {}",
                         fk.n_cols,
@@ -9105,7 +9868,7 @@ impl Checkpointer {
                     ));
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "excl {} {} {}{} {}",
                         exclusion.timing.code(),
@@ -9156,7 +9919,7 @@ impl Checkpointer {
                 h.filter.write_key(&mut fh);
                 h.roster.write_key(&mut rh);
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "dsst {slot} {idx} {} {} {} {} {} {}",
                         p.count,
@@ -9172,7 +9935,7 @@ impl Checkpointer {
                 // An empty table still records its (zero-row) state so the
                 // loader creates it.
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("dsst {slot} 0 0 0 - - -"),
                 )?;
             }
@@ -9202,7 +9965,7 @@ impl Checkpointer {
                 let mut roster = [0u8; 64];
                 handle.roster.write_key(&mut roster);
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
                         column_text.as_str(),
@@ -9219,7 +9982,7 @@ impl Checkpointer {
         }
         for (statistics_slot, statistics) in storage.checkpoint_extended_statistics() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 statistics.database,
             )?;
@@ -9268,14 +10031,14 @@ impl Checkpointer {
                     "extended-statistics manifest line exceeds its fixed buffer"
                 ));
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            write_manifest(&mut self.manifest_output, format_args!("{}", line.as_str()))?;
 
             let data = storage.extended_statistics_data(statistics_slot, 0);
             if !data.valid {
                 continue;
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "estatdata {} {} {} {} {} {}",
                     statistics.created_at,
@@ -9289,7 +10052,7 @@ impl Checkpointer {
             for (index, strength) in data.dependencies_ppm.iter().copied().enumerate() {
                 if strength != 0 {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!("estatdep {} {index} {strength}", statistics.created_at),
                     )?;
                 }
@@ -9297,7 +10060,7 @@ impl Checkpointer {
             for (key, column) in data.expression_statistics.iter().copied().enumerate() {
                 if column.valid {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "estatexpr {} {key} {} {} {} {}",
                             statistics.created_at,
@@ -9316,7 +10079,7 @@ impl Checkpointer {
                     let _ = write!(value_hex, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "estatmcv {} {} {} {}",
                         statistics.created_at,
@@ -9327,7 +10090,7 @@ impl Checkpointer {
                 )?;
                 if entry.base_frequency_bits != 0 {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "estatmcvbase {} {} {}",
                             statistics.created_at, entry.hash, entry.base_frequency_bits,
@@ -9338,7 +10101,7 @@ impl Checkpointer {
         }
         for (slot, entry) in storage.checkpoint_foreign_wrappers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9373,11 +10136,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_servers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9408,11 +10171,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_user_mappings() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9447,11 +10210,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_tables() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9492,11 +10255,15 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         // View SQL and names are hex because the manifest is space-separated.
         for (view_slot, view) in storage.checkpoint_views() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, view.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                view.database,
+            )?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in storage.view_sql(view_slot).as_str().as_bytes() {
@@ -9515,7 +10282,7 @@ impl Checkpointer {
                 let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "vw12 {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
@@ -9540,7 +10307,7 @@ impl Checkpointer {
         // Publications: database-scoped names plus explicit table slots.
         for (_, publication) in storage.checkpoint_publications() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 publication.database,
             )?;
@@ -9561,7 +10328,7 @@ impl Checkpointer {
                     crate::storage::PublishGeneratedColumns::Stored
                 )) << 6);
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "pub {} {} {} {} {}",
                 name.as_str(),
                 publication.ownership.owner,
@@ -9584,7 +10351,7 @@ impl Checkpointer {
             {
                 let filter = publication.table_filters.get(index);
                 write!(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     " {table} {mask} {} ",
                     u8::from(*descendants)
                 )
@@ -9595,7 +10362,7 @@ impl Checkpointer {
                     )
                 })?;
                 if filter.is_empty() {
-                    write!(&mut self.manifest_buf, "-").map_err(|_| {
+                    write!(&mut self.manifest_output, "-").map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -9603,7 +10370,7 @@ impl Checkpointer {
                     })?;
                 } else {
                     for byte in filter.as_bytes() {
-                        write!(&mut self.manifest_buf, "{byte:02x}").map_err(|_| {
+                        write!(&mut self.manifest_output, "{byte:02x}").map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                                 "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -9613,14 +10380,14 @@ impl Checkpointer {
                 }
             }
             for schema in &publication.schemas[..publication.schema_count] {
-                write!(&mut self.manifest_buf, " {schema}").map_err(|_| {
+                write!(&mut self.manifest_output, " {schema}").map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                     )
                 })?;
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| {
+            writeln!(&mut self.manifest_output).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -9630,14 +10397,18 @@ impl Checkpointer {
         // A replication slot's active flag is process-local; only its resume
         // positions survive a checkpoint and restart.
         for (_, slot) in storage.checkpoint_replication_slots() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, slot.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                slot.database,
+            )?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             for byte in slot.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rslot {} {} {} {}",
                     name.as_str(),
@@ -9651,7 +10422,7 @@ impl Checkpointer {
         // fields preserve conninfo whitespace in the line-oriented manifest.
         for (_, subscription) in storage.checkpoint_subscriptions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 subscription.database,
             )?;
@@ -9705,7 +10476,7 @@ impl Checkpointer {
                 let _ = write!(failure_message, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
@@ -9752,7 +10523,7 @@ impl Checkpointer {
                     let _ = write!(table_name, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "subrel {} {} {} {} {} {}",
                         subscription.created_at,
@@ -9768,7 +10539,11 @@ impl Checkpointer {
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
         for (matview_slot, mv) in storage.checkpoint_matviews() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, mv.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                mv.database,
+            )?;
             let backing = storage.table_def(storage.matview_table(matview_slot), 0);
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
@@ -9788,7 +10563,7 @@ impl Checkpointer {
                 let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "mv5 {} {} {} {} {} {}",
                     hex.as_str(),
@@ -9805,7 +10580,11 @@ impl Checkpointer {
         // this line is its whole durable form.
         for (_, seq, last_value, is_called, log_count) in storage.checkpoint_sequences_with_slots()
         {
-            write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                seq.database,
+            )?;
             use core::fmt::Write;
             let mut hschema = StackStr::<130>::new();
             for b in seq.schema.as_str().as_bytes() {
@@ -9852,7 +10631,7 @@ impl Checkpointer {
                 let _ = write!(generator_column, "0");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "sq6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     hschema.as_str(),
@@ -9883,7 +10662,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 routine.database,
             )?;
@@ -9945,7 +10724,7 @@ impl Checkpointer {
                 let _ = write!(result_name, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
                     routine.created_at,
@@ -9990,7 +10769,7 @@ impl Checkpointer {
         }
         for (slot, event_trigger) in storage.checkpoint_event_triggers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 event_trigger.database,
             )?;
@@ -10004,7 +10783,7 @@ impl Checkpointer {
                 let _ = write!(tags, " {}", ManifestName(tag.as_str()));
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "evt {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10020,7 +10799,11 @@ impl Checkpointer {
             )?;
         }
         for (slot, rule) in storage.checkpoint_rules() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, rule.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                rule.database,
+            )?;
             use core::fmt::Write as _;
             let definition = rule.definition;
             let (target, schema, relation) = match definition.target {
@@ -10045,7 +10828,7 @@ impl Checkpointer {
                 let _ = write!(spans, " {} {}", action.start, action.len);
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rul {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10068,13 +10851,17 @@ impl Checkpointer {
             )?;
         }
         for (_, cast) in storage.checkpoint_casts() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, cast.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                cast.database,
+            )?;
             let function = match cast.method {
                 crate::storage::CastMethod::Function(oid) => oid,
                 crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => 0,
             };
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cst {} {} {} {} {} {}",
                     cast.created_at,
@@ -10088,13 +10875,13 @@ impl Checkpointer {
         }
         for (slot, collation) in storage.checkpoint_collations() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 collation.database,
             )?;
             let definition = collation.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "coll {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10119,7 +10906,7 @@ impl Checkpointer {
         }
         for (slot, object) in storage.checkpoint_text_search_objects() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 object.database,
             )?;
@@ -10135,7 +10922,7 @@ impl Checkpointer {
                     headline,
                     lextypes,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} p {} {} {} {} {} {} {} {}",
                         slot,
@@ -10158,7 +10945,7 @@ impl Checkpointer {
                     lexize,
                     behavior,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} t {} {} {} {} {} {}",
                         slot,
@@ -10180,7 +10967,7 @@ impl Checkpointer {
                     options,
                     behavior,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} d {} {} {} {} {} {} {}",
                         slot,
@@ -10202,7 +10989,7 @@ impl Checkpointer {
                     parser,
                     mappings,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} c {} {} {} {} {}{}",
                         slot,
@@ -10219,13 +11006,13 @@ impl Checkpointer {
         }
         for (slot, conversion) in storage.checkpoint_conversions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 conversion.database,
             )?;
             let definition = conversion.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "conv {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10242,7 +11029,7 @@ impl Checkpointer {
         }
         for (_, operator) in storage.checkpoint_operators() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 operator.database,
             )?;
@@ -10261,7 +11048,7 @@ impl Checkpointer {
                 .right
                 .unwrap_or(crate::storage::RoutineResult::TEXT);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opr {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     operator.created_at,
@@ -10287,13 +11074,13 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 operator.database,
             )?;
             let linked_oid = |oid: Option<i32>| oid.unwrap_or(0);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "oprl {} {} {}",
                     operator.oid(),
@@ -10304,13 +11091,13 @@ impl Checkpointer {
         }
         for (_, family) in storage.checkpoint_operator_families() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 family.database,
             )?;
             let definition = family.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opf {} {} {} {}",
                     family.created_at,
@@ -10321,7 +11108,7 @@ impl Checkpointer {
             )?;
             for member in definition.operators.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opfo {} {} {} {} {}",
                         family.oid(),
@@ -10334,7 +11121,7 @@ impl Checkpointer {
             }
             for member in definition.functions.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opff {} {} {} {}",
                         family.oid(),
@@ -10347,13 +11134,13 @@ impl Checkpointer {
         }
         for (_, class) in storage.checkpoint_operator_classes() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 class.database,
             )?;
             let definition = class.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opc {} {} {} {} {} {} {} {}",
                     class.created_at,
@@ -10368,7 +11155,7 @@ impl Checkpointer {
             )?;
             for member in definition.operators.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opco {} {} {} {} {}",
                         class.oid(),
@@ -10381,7 +11168,7 @@ impl Checkpointer {
             }
             for member in definition.functions.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opcf {} {} {} {}",
                         class.oid(),
@@ -10394,7 +11181,7 @@ impl Checkpointer {
         }
         for (_, trigger) in storage.checkpoint_triggers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 trigger.database,
             )?;
@@ -10473,7 +11260,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
@@ -10526,7 +11313,7 @@ impl Checkpointer {
             use core::fmt::Write;
             let trigger = storage.trigger(trigger_slot);
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 trigger.database,
             )?;
@@ -10540,7 +11327,7 @@ impl Checkpointer {
                 let _ = write!(table_name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "trgs {} {} {} {}",
                     trigger.created_at,
@@ -10552,7 +11339,7 @@ impl Checkpointer {
         }
         for (slot, policy) in storage.checkpoint_policies() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 policy.database,
             )?;
@@ -10588,7 +11375,7 @@ impl Checkpointer {
             // images are mutex guarded, and dependency lookup consults the
             // policy definition to select its committed image.
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "pol {} {} {} {} {} {} {}{}",
                 policy.created_at,
                 policy.command.code(),
@@ -10605,7 +11392,7 @@ impl Checkpointer {
             .map_err(|_| manifest_full())?;
             drop(roles);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     " {} {} {}",
                     if definition.using.is_some() {
@@ -10624,7 +11411,7 @@ impl Checkpointer {
         }
         for (_, extension) in storage.checkpoint_extensions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 extension.database,
             )?;
@@ -10643,7 +11430,7 @@ impl Checkpointer {
                 let _ = write!(version, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "ext {} {} {} {} {} {}",
                     extension.created_at,
@@ -10668,7 +11455,7 @@ impl Checkpointer {
             );
             self.put_immutable(metadata_key.as_str(), metadata.as_str().as_bytes())?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("xpk {} {}", package_slot, metadata_key.as_str()),
             )?;
             for (_, script) in storage.extension_scripts_for(package_slot) {
@@ -10702,7 +11489,7 @@ impl Checkpointer {
                     let _ = write!(to, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "xsc {} {} {} {} {} {}",
                         package_slot,
@@ -10724,7 +11511,7 @@ impl Checkpointer {
                 continue;
             }
             if let Some(database) = comment.database {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             use core::fmt::Write;
             let Some(text) = comment.live else { continue };
@@ -10744,7 +11531,7 @@ impl Checkpointer {
                 let _ = write!(htext, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cmt {} {} {} {} {}",
                     comment.class.to_u8(),
@@ -10770,7 +11557,7 @@ impl Checkpointer {
             }
             let options = tablespace.options;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "tsp {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10792,7 +11579,7 @@ impl Checkpointer {
         // Index definitions are complete catalog state, not a cache rebuild hint.
         for (index_slot, index) in storage.checkpoint_indexes() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 index.database,
             )?;
@@ -11001,7 +11788,7 @@ impl Checkpointer {
                 |value| StackStr::<16>::from_str(stack_format!(16, "{value}").as_str()),
             );
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
                     index.created_at,
@@ -11044,7 +11831,7 @@ impl Checkpointer {
         }
         for (_, dependency) in storage.checkpoint_extension_dependencies() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(dependency.object)
@@ -11069,7 +11856,7 @@ impl Checkpointer {
                 let _ = write!(name_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "exd {} {} {} {} {} {}",
                     extension_hex.as_str(),
@@ -11093,7 +11880,7 @@ impl Checkpointer {
         }
         for (_, config) in storage.checkpoint_extension_configs() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(config.relation.access_object())
@@ -11123,7 +11910,7 @@ impl Checkpointer {
                 let _ = write!(condition_hex, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "exc {} {} {} {} {} {}",
                     extension_hex.as_str(),
@@ -11143,7 +11930,7 @@ impl Checkpointer {
                 return Ok(());
             }
             if let Some(database) = storage.access_object_database(object) {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             let (schema, name) = storage.access_object_name(object);
             let owner = storage.role(storage.object_owner(object, 0)).name;
@@ -11164,7 +11951,7 @@ impl Checkpointer {
             }
             if object.class == crate::storage::AccessClass::Routine {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {} {}",
                         object.class as u8,
@@ -11176,7 +11963,7 @@ impl Checkpointer {
                 )
             } else {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {}",
                         object.class as u8,
@@ -11268,7 +12055,7 @@ impl Checkpointer {
                 continue;
             }
             if let Some(database) = storage.access_object_database(acl.object) {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             use core::fmt::Write;
             let (schema, name) = storage.access_object_name(acl.object);
@@ -11296,7 +12083,7 @@ impl Checkpointer {
             }
             if acl.object.class == crate::storage::AccessClass::Routine {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
@@ -11311,7 +12098,7 @@ impl Checkpointer {
                 )?;
             } else {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {}",
                         acl.object.class as u8,
@@ -11333,7 +12120,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(acl.target.relation())
@@ -11365,7 +12152,7 @@ impl Checkpointer {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cacl {} {} {} {} {} {} {} {}",
                     relation.class as u8,
@@ -11380,7 +12167,11 @@ impl Checkpointer {
             )?;
         }
         for (_, acl) in storage.checkpoint_default_acls() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, acl.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                acl.database,
+            )?;
             use core::fmt::Write;
             let owner = storage.role(acl.owner as usize).name;
             let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
@@ -11406,7 +12197,7 @@ impl Checkpointer {
                 let _ = write!(grantee_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "dacl {} {} {} {} {} {}",
                     owner_hex.as_str(),
@@ -11439,7 +12230,7 @@ impl Checkpointer {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "pacl {} {} {} {} {}",
                     parameter_hex.as_str(),
@@ -11450,127 +12241,260 @@ impl Checkpointer {
                 ),
             )?;
         }
-        write_manifest(&mut self.manifest_buf, "end")?;
+        write_manifest(&mut self.manifest_output, "end")?;
+        self.captured_checkpoint_epoch = self.requested_checkpoint_epoch;
 
-        // Promotion bumps both root ETags before activating the successor.
-        // A conflict is retried only after the process proves it still owns
-        // the writer fence.
-        let precondition = match &self.manifest_etag {
-            Some(etag) => Precondition::IfMatch(etag),
-            None => Precondition::IfNoneMatchAny,
+        Ok(())
+    }
+
+    pub(crate) fn request_checkpoint(&mut self) -> Result<CheckpointRequest, SqlError> {
+        let epoch = self
+            .requested_checkpoint_epoch
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint request identities exhausted"
+                )
+            })?;
+        self.requested_checkpoint_epoch = epoch.get();
+        Ok(CheckpointRequest(epoch))
+    }
+
+    pub(crate) fn requested_checkpoint_epoch(&self) -> u64 {
+        self.requested_checkpoint_epoch
+    }
+
+    pub(crate) fn checkpoint_request_satisfied(&self, request: CheckpointRequest) -> bool {
+        self.published_checkpoint_epoch >= request.epoch()
+    }
+
+    pub(crate) fn manifest_installing(&self) -> bool {
+        matches!(
+            self.manifest_publication,
+            Some(ManifestPublication::Installing { .. })
+        )
+    }
+
+    pub(crate) fn manifest_publication_pending(&self) -> bool {
+        self.manifest_publication.is_some()
+    }
+
+    pub(crate) fn manifest_publication_ready(&self, now: std::time::Instant) -> bool {
+        match self.manifest_publication {
+            Some(ManifestPublication::Uploading { .. }) => self.manifest_uploads.has_completion(),
+            Some(ManifestPublication::Retry { at, .. }) => at <= now,
+            Some(ManifestPublication::Installing { .. }) => true,
+            None => false,
+        }
+    }
+
+    fn queue_manifest_upload(&mut self, lsn: u64) -> Result<(), SqlError> {
+        if self.writer_was_fenced() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        self.manifest_publication = Some(ManifestPublication::Retry {
+            lsn,
+            at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        let condition = match self.manifest_etag {
+            Some(etag) => crate::object_store::upload::Condition::PublishMatch(etag),
+            None => crate::object_store::upload::Condition::PublishAbsent,
         };
-        let etag = match self
-            .client
-            .put(MANIFEST_KEY, self.manifest_buf.readable(), precondition)
-        {
-            Ok(etag) => etag,
-            Err(e) if e.is_precondition_failed() => {
-                // A previous attempt's PUT may have landed with its response
-                // lost (the ambiguous failure): the bucket then holds a
-                // manifest of ours under an etag this process never learned
-                // — possibly an *older* one of ours, if state advanced since
-                // that attempt, so byte comparison cannot recognize it. The
-                // writer line can: our identity means our own write — adopt
-                // its etag and republish the current state over it. Any
-                // other identity is a genuine second writer, which stays a
-                // loud error rather than a clobber.
-                self.assert_writer()?;
-                let refreshed = self
-                    .client
-                    .get(MANIFEST_KEY, None)
-                    .map_err(object_store_to_sql)?;
-                let ours = {
-                    let body = self.client.body_bytes();
-                    let expect = crate::stack_format!(48, "writer {:032x}", self.writer_token.0);
-                    core::str::from_utf8(body)
-                        .ok()
-                        .is_some_and(|text| text.lines().any(|l| l == expect.as_str()))
-                };
-                if !ours {
-                    return Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "manifest compare-and-swap failed after writer fencing"
-                    ));
-                }
-                self.client
-                    .put(
-                        MANIFEST_KEY,
-                        self.manifest_buf.readable(),
-                        Precondition::IfMatch(&refreshed.etag),
-                    )
-                    .map_err(object_store_to_sql)?
-            }
-            Err(e) => return Err(object_store_to_sql(e)),
-        };
-        self.manifest_etag = Some(etag);
-        self.manifest_present = true;
-        self.manifest_lsn = lsn;
-        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
-        // The manifest is durable: install the new spill lists (a collapse
-        // remaps the table's spilled entries to slot 0) and forget the
-        // flushed tombstones. A failed CAS above reaches none of this, so a
-        // retry recomputes against unchanged state and the orphaned blocks
-        // are swept as garbage.
-        for &(slot, install) in &self.pending_installs {
-            match install {
-                SlotInstall::Append {
-                    handle,
-                    through_lsn,
-                } => {
-                    storage.append_spill_through(slot, handle, through_lsn)?;
-                }
-                SlotInstall::Replace {
-                    handle,
-                    through_lsn,
-                } => {
-                    if let Some(handle) = handle {
-                        storage.collapse_spill_through(slot, handle, through_lsn)?;
-                    } else {
-                        storage.set_spill_list(slot, &[]);
+        let ticket = self
+            .manifest_uploads
+            .enqueue(MANIFEST_KEY, self.manifest_output.readable(), condition)
+            .map_err(upload_to_sql)?;
+        self.manifest_publication = Some(ManifestPublication::Uploading { lsn, ticket });
+        Ok(())
+    }
+
+    fn wait_manifest_publication(&mut self) -> Result<(), SqlError> {
+        if self.manifest_publication_ready(std::time::Instant::now()) {
+            return Ok(());
+        }
+        match self.manifest_publication {
+            Some(ManifestPublication::Uploading { .. }) => self
+                .manifest_uploads
+                .wait_ready()
+                .map_err(object_store_to_sql),
+            Some(ManifestPublication::Retry { at, .. }) => self
+                .manifest_uploads
+                .wait_until(at)
+                .map_err(object_store_to_sql),
+            Some(ManifestPublication::Installing { .. }) | None => Ok(()),
+        }
+    }
+
+    fn captured_table_current(&self, storage: &Storage, slot: usize) -> bool {
+        slot < storage.physical_table_count()
+            && storage.table(slot).live()
+            && self.sliced_layout[slot] == SliceLayout::from_storage(storage, slot)
+    }
+
+    /// Once the conditional root is durable, each local installation advances
+    /// exactly once. Errors retain the next uninstalled item, never the old CAS.
+    pub(crate) fn advance_manifest_publication(
+        &mut self,
+        storage: &mut Storage,
+    ) -> Result<CheckpointStep, SqlError> {
+        let publication = self
+            .manifest_publication
+            .take()
+            .expect("retained manifest publication");
+        match publication {
+            ManifestPublication::Uploading { lsn, ticket } => {
+                self.manifest_uploads.advance(std::time::Instant::now());
+                match self.manifest_uploads.take(ticket) {
+                    Ok(Some(etag)) => {
+                        self.manifest_etag = Some(etag);
+                        self.manifest_present = true;
+                        self.manifest_lsn = lsn;
+                        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
+                        self.manifest_publication = Some(ManifestPublication::Installing {
+                            lsn,
+                            row_position: 0,
+                            value_position: 0,
+                            cleanup_position: 0,
+                        });
+                    }
+                    Ok(None) => {
+                        self.manifest_publication =
+                            Some(ManifestPublication::Uploading { lsn, ticket });
+                    }
+                    Err(crate::object_store::upload::UploadError::Request(error))
+                        if error.is_precondition_failed() =>
+                    {
+                        self.writer_fenced = true;
+                        return Err(sql_err!(
+                            SQLSTATE_CAS,
+                            "manifest root changed; writer was fenced"
+                        ));
+                    }
+                    Err(error) => {
+                        self.manifest_publication = Some(ManifestPublication::Retry {
+                            lsn,
+                            at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        });
+                        return Err(upload_to_sql(error));
                     }
                 }
-                SlotInstall::MergePair { at, handle } => storage.merge_spill_pair(slot, at, handle),
+            }
+            ManifestPublication::Retry { lsn, at } => {
+                if at > std::time::Instant::now() {
+                    self.manifest_publication = Some(ManifestPublication::Retry { lsn, at });
+                } else {
+                    self.queue_manifest_upload(lsn)?;
+                }
+            }
+            ManifestPublication::Installing {
+                lsn,
+                row_position,
+                value_position,
+                cleanup_position,
+            } => {
+                self.manifest_publication = Some(ManifestPublication::Installing {
+                    lsn,
+                    row_position,
+                    value_position,
+                    cleanup_position,
+                });
+                if row_position < self.pending_installs.len() {
+                    let (slot, install) = self.pending_installs[row_position];
+                    if self.captured_table_current(storage, slot) {
+                        match install {
+                            SlotInstall::Append {
+                                handle,
+                                through_lsn,
+                            } => storage.append_spill_through(slot, handle, through_lsn)?,
+                            SlotInstall::Replace {
+                                handle: Some(handle),
+                                through_lsn,
+                            } => storage.collapse_spill_through(slot, handle, through_lsn)?,
+                            SlotInstall::Replace { handle: None, .. } => {
+                                storage.set_spill_list(slot, &[])
+                            }
+                            SlotInstall::MergePair { at, handle } => {
+                                storage.merge_spill_pair(slot, at, handle)
+                            }
+                        }
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position: row_position + 1,
+                        value_position,
+                        cleanup_position,
+                    });
+                } else if value_position < self.pending_value_installs.len() {
+                    let install = self.pending_value_installs[value_position];
+                    if self.captured_table_current(storage, install.slot)
+                        && (0..storage.value_binding_count(install.slot)).any(|binding| {
+                            Self::value_install_matches_binding(
+                                storage,
+                                &install,
+                                install.slot,
+                                binding,
+                            )
+                        })
+                    {
+                        storage.install_value_binding(
+                            install.slot,
+                            &install.columns[..install.n_columns],
+                            install.index_created_at,
+                            install.include_mask,
+                            install.handle,
+                            crate::storage::ValueIndexInstallation::Checkpoint {
+                                dirty_lsn: install.dirty_lsn,
+                            },
+                        )?;
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position,
+                        value_position: value_position + 1,
+                        cleanup_position,
+                    });
+                } else if cleanup_position < self.checkpoint_deletions.len() {
+                    let end = (cleanup_position + 64).min(self.checkpoint_deletions.len());
+                    for slot in cleanup_position..end {
+                        if self.captured_table_current(storage, slot) {
+                            if self.sliced_this_sweep[slot] {
+                                storage.clear_tombstones(slot, self.sliced_lsn[slot]);
+                            }
+                            storage.clear_table_dirty_through(slot, self.sliced_generation[slot]);
+                            if let Some(receipt) = self.checkpoint_statistics[slot].take() {
+                                receipt.acknowledge(storage);
+                            }
+                        } else {
+                            self.checkpoint_statistics[slot] = None;
+                        }
+                        self.checkpoint_deletions[slot] = None;
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position,
+                        value_position,
+                        cleanup_position: end,
+                    });
+                } else {
+                    self.pending_installs.clear();
+                    self.pending_value_installs.clear();
+                    self.merge_done.fill(None);
+                    self.sweeping = false;
+                    self.published_checkpoint_epoch = self.captured_checkpoint_epoch;
+                    self.manifest_publication = None;
+                    self.published_lsn_pending_maintenance = Some(lsn);
+                    self.legacy_garbage_pending = true;
+                    self.block_garbage_pending = true;
+                    return Ok(CheckpointStep::Published { lsn });
+                }
             }
         }
-        // A resliced table may install several ordered deltas. Deletion
-        // markers must shadow every earlier member until the complete list is
-        // installed, then the published SSTs make them redundant.
-        for slot in 0..storage.physical_table_count() {
-            if self.sliced_this_sweep.get(slot).copied().unwrap_or(false) {
-                storage.clear_tombstones(slot);
-            }
-        }
-        self.pending_installs.clear();
-        for install in &self.pending_value_installs {
-            storage.install_value_binding(
-                install.slot,
-                &install.columns[..install.n_columns],
-                install.index_created_at,
-                install.include_mask,
-                install.handle,
-            )?;
-        }
-        self.pending_value_installs.clear();
-        // Completed merges are consumed with the installs — whether each one
-        // composed in or a collapse superseded it, this publish settled its
-        // fate either way.
-        self.merge_done.fill(None);
-        // The sweep is complete the instant the installs land: everything
-        // after the CAS is cleanup of the superseded generation. Marking it
-        // here (not in the caller) is load-bearing — a failure below must
-        // not leave the sweep active, because the swap above repurposed
-        // `prev_scratch`, and a retried publish reading it would CAS a
-        // manifest whose lsn claims state its lists do not carry, silently
-        // shadowing every local WAL record the lsn covers.
-        self.sweeping = false;
-
-        // A successful checkpoint includes both publication and maintenance.
-        // Keep the LSN until bounded sweeps finish so the next beat resumes
-        // cleanup instead of falsely reporting completion.
-        self.published_lsn_pending_maintenance = Some(lsn);
-        self.legacy_garbage_pending = true;
-        self.block_garbage_pending = true;
-        Ok(())
+        Ok(CheckpointStep::Working)
     }
 
     /// One beat's work for one table: computes its new SST list — carrying,
@@ -11581,12 +12505,7 @@ impl Checkpointer {
     /// the earlier immutable delta and appends only versions committed after
     /// its captured LSN. Relation replacements rebuild without a reusable
     /// published base; filled generation rosters are merged before this beat.
-    fn build_table_list(
-        &mut self,
-        storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
-        slot: usize,
-    ) -> Result<(), SqlError> {
+    fn begin_table_slice(&mut self, storage: &Storage, slot: usize) -> Result<bool, SqlError> {
         let layout = SliceLayout::from_storage(storage, slot);
         let reuse_slice = self.sliced_this_sweep[slot]
             && self.sliced_layout[slot] == layout
@@ -11597,9 +12516,6 @@ impl Checkpointer {
         } else {
             self.slice_scratch.copy_from(&self.prev_ssts[slot]);
         }
-        // A completed paced merge is part of this publish's base before a
-        // dirty table decides whether its new versions fit as a delta. A
-        // retained slice already incorporated this merge.
         let completed = (!reuse_slice).then(|| {
             self.merge_done[slot].as_ref().and_then(|done| {
                 (pair_at(&self.slice_scratch, done.at)
@@ -11607,34 +12523,26 @@ impl Checkpointer {
                 .then_some((done.at, done.merged))
             })
         });
-        let mut staged_installs = [None; 2];
-        let mut staged_install_count = 0usize;
+        let mut installs = [None; 2];
+        let mut install_count = 0;
         if let Some((at, merged)) = completed.flatten() {
             self.slice_scratch.replace_pair(at, merged);
-            staged_installs[staged_install_count] = Some(SlotInstall::MergePair {
+            installs[install_count] = Some(SlotInstall::MergePair {
                 at,
                 handle: merged.map(|prior| prior.handle),
             });
-            staged_install_count += 1;
+            install_count += 1;
         }
-        // A clean table carries its whole SST list forward untouched.
         let clean = !storage.table(slot).dirty() && self.slice_scratch.n > 0;
-        // A dirty table with spilled SSTs and room flushes a *delta* from the
-        // committed row identities retained in the overlay since the last
-        // checkpoint. Otherwise it rewrites fully. The overlay is already
-        // startup-sized by `table_rows`, so there is no second row-id limit.
         let delta = !clean
             && storage.table(slot).dirty()
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
-        let changed_row_after_lsn = delta.then_some(if reuse_slice {
+        let changed_after = delta.then_some(if reuse_slice {
             self.sliced_lsn[slot]
         } else {
             self.manifest_lsn
         });
-
-        // A logical full scan does not enumerate historical object versions.
-        // Filled rosters must use the version-preserving paced merge first.
         if storage.has_active_snapshots()
             && !clean
             && !storage.table(slot).spill_generations().is_empty()
@@ -11646,231 +12554,315 @@ impl Checkpointer {
                 storage.table(slot).definition().name.as_str()
             ));
         }
-
+        let mut job = TableSliceJob {
+            slot,
+            layout,
+            generation: storage.table(slot).generation(),
+            through_lsn: storage.lsn(),
+            reuse_slice,
+            delta,
+            count: 0,
+            crc: Crc32c::new(),
+            installs,
+            install_count,
+            phase: TableSlicePhase::Clean,
+        };
+        if clean {
+            self.complete_table_slice(storage, job)?;
+            return Ok(true);
+        }
         #[cfg(feature = "checkpoint-profile")]
-        let row_started = checkpoint_profile_start();
-        #[cfg(feature = "checkpoint-profile")]
-        let row_before = self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats();
-        if !clean {
-            // Collect rowids; each rowid expands to its current image plus
-            // every snapshot-retained committed version. The scratch remains
-            // one entry per row even when object capacity holds a long chain.
-            sort_scratch.clear();
-            let mut collect = |rowid, state: crate::storage::RowRead<'_>| {
-                use core::ops::ControlFlow;
-                let has_version = state.committed.is_some()
-                    || state.committed_lsn != 0
-                    || !state.history.is_empty();
-                if !has_version {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                if changed_row_after_lsn.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                let marker = state
-                    .committed
-                    .or_else(|| {
-                        (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
-                    })
-                    .unwrap_or(RowHome::Heap(crate::storage::RowLoc::EMPTY));
-                sort_scratch.push((rowid, marker)).map_err(|e| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "checkpoint scratch: {}",
-                        e
-                    )
-                })?;
-                Ok(ControlFlow::Continue(()))
-            };
-            // Unpublished row identities remain in the fixed-capacity overlay
-            // even when their bytes spill. Delta discovery therefore avoids a
-            // complete walk of the immutable table; full rewrites still need
-            // that complete logical stream.
-            if delta {
-                let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
-            } else {
-                storage.for_each_row_state(slot, &mut collect)?;
+        let profile = (
+            checkpoint_profile_start(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+        );
+        let deletion_guard = storage.retain_checkpoint_deletions(slot);
+        let source = storage.table_row_snapshot(slot, None)?;
+        if !source.matches_table(slot, layout.created_at) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table identity changed during checkpoint capture"
+            ));
+        }
+        self.table_output.clear();
+        let entries = &mut self.table_output;
+        let mut collect = |rowid, state: crate::storage::RowRead<'_>| {
+            use core::ops::ControlFlow;
+            if changed_after.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
+                return Ok(ControlFlow::Continue(()));
             }
-            sort_scratch
-                .as_mut_slice()
-                .sort_unstable_by_key(|(rowid, _)| *rowid);
-
-            // Versions are already grouped in `(rowid, commit_lsn DESC)`
-            // order. Write and checksum the same logical stream in one pass,
-            // avoiding a second round of provider-neutral reads for spilled
-            // images during a full rewrite.
-            self.sst_arena.reset();
-            self.slice_writer.reset();
-            let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let columns = storage.table(slot).definition().schema(&mut schema);
-            if delta {
-                self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
-            } else {
-                self.slice_writer
-                    .set_pax_schema(&schema[..columns])
-                    .map_err(sst_to_sql)?;
-            }
-            self.slice_writer
-                .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
-                .map_err(sst_to_sql)?;
-            let writer = &mut self.slice_writer;
-            let blocks = &self.blocks;
-            let mut count = 0u64;
-            let mut crc = Crc32c::new();
-            for &(rowid, _) in sort_scratch.iter() {
-                let Some(state) = storage.row_state(slot, rowid)? else {
-                    continue;
-                };
-                let mut append_version = |commit_lsn: u64,
-                                          home: Option<RowHome>,
-                                          current: bool|
-                 -> Result<(), SqlError> {
-                    // Ordinary deltas repeat resident Heap and tombstone
-                    // history so pair-merge pruning can retain a pinned
-                    // snapshot. Spilled history is already in the base.
-                    // A reslice appends only work newer than its prior
-                    // immutable slice.
-                    if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                        || (delta
-                            && !current
-                            && home.is_some_and(|location| {
-                                matches!(location, RowHome::Spilled { .. })
-                            }))
+            let mut version =
+                |lsn: u64, home: Option<RowHome>, current: bool| -> Result<(), SqlError> {
+                    if slice_after_lsn.is_some_and(|floor| lsn <= floor)
+                        || (delta && !current && matches!(home, Some(RowHome::Spilled { .. })))
                     {
                         return Ok(());
                     }
-                    let key = SstKey::at(rowid, commit_lsn);
-                    let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
-                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                    header[8..16].copy_from_slice(&commit_lsn.to_le_bytes());
-                    header[16..20].copy_from_slice(
-                        &home
-                            .map_or(u32::MAX, |location| match location {
-                                RowHome::Heap(row) => row.len,
-                                RowHome::Spilled { len, .. } => len,
-                            })
-                            .to_le_bytes(),
-                    );
-                    crc.update(&header);
-                    if let Some(location) = home {
-                        storage.with_row_bytes(slot, rowid, location, |row| {
-                            crc.update(row);
-                            writer
-                                .append_version(
-                                    &mut *blocks.lock().expect("block store lock poisoned"),
-                                    key,
-                                    row,
-                                )
-                                .map_err(sst_to_sql)
-                        })?
-                    } else {
-                        writer
-                            .append_tombstone_version(
-                                &mut *blocks.lock().expect("block store lock poisoned"),
-                                key,
+                    entries
+                        .push(CheckpointVersion {
+                            key: SstKey::at(rowid, lsn),
+                            home,
+                        })
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "checkpoint_write_entries exhausted ({})",
+                                entries.capacity()
                             )
-                            .map_err(sst_to_sql)?
-                    }
-                    count += 1;
-                    Ok(())
+                        })
                 };
-                if state.committed.is_some() || state.committed_lsn != 0 {
-                    append_version(state.committed_lsn, state.committed, true)?;
-                }
-                for index in 0..state.history.len() {
-                    if let Some(version) = state.history_get(index) {
-                        append_version(version.lsn, version.home, false)?;
-                    }
+            if state.committed.is_some() || state.committed_lsn != 0 {
+                version(state.committed_lsn, state.committed, true)?;
+            }
+            for index in 0..state.history.len() {
+                if let Some(prior) = state.history_get(index) {
+                    version(prior.lsn, prior.home, false)?;
                 }
             }
-            let crc = crc.finish();
-            let handle = writer
-                .finish(&mut *blocks.lock().expect("block store lock poisoned"))
+            Ok(ControlFlow::Continue(()))
+        };
+        if delta {
+            let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
+        } else {
+            storage.for_each_row_state(slot, &mut collect)?;
+        }
+        self.table_output
+            .as_mut_slice()
+            .sort_unstable_by_key(|entry| entry.key);
+        self.slice_writer.reset();
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let columns = storage.table(slot).definition().schema(&mut schema);
+        if delta {
+            self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
+        } else {
+            self.slice_writer
+                .set_pax_schema(&schema[..columns])
                 .map_err(sst_to_sql)?;
+        }
+        self.slice_writer
+            .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
+            .map_err(sst_to_sql)?;
+        job.phase = TableSlicePhase::Write {
+            source,
+            position: 0,
+        };
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            if job.delta {
+                "row_sst_delta"
+            } else {
+                "row_sst_full"
+            },
+            job.through_lsn,
+            Some(job.slot),
+            profile.0,
+            profile.1,
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+            0,
+        );
+        self.checkpoint_deletions[slot].get_or_insert(deletion_guard);
+        self.table_job = Some(job);
+        Ok(false)
+    }
 
-            // Storage is not touched yet: the list installs (and the
-            // entry remap a collapse implies) apply only after the
-            // manifest CAS lands, so a failed publish leaves memory
-            // consistent with the still-current manifest.
-            match (delta, handle) {
-                (true, Some(h)) => {
-                    if !self.slice_scratch.push(PrevSst {
-                        handle: h,
-                        count,
-                        crc,
-                    }) {
-                        return Err(sql_err!(SQLSTATE_IO, "delta flush into a full spill list"));
-                    }
-                    staged_installs[staged_install_count] = Some(SlotInstall::Append {
-                        handle: h,
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                }
-                (true, None) => {
-                    // Dirty but nothing new to flush (e.g. the change was
-                    // rolled back): the list stands.
-                }
-                (false, Some(h)) => {
-                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
-                        handle: Some(h),
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                    self.slice_scratch.clear();
-                    push_slot_list(
-                        &mut self.slice_scratch,
-                        PrevSst {
-                            handle: h,
-                            count,
-                            crc,
-                        },
-                    )?;
-                }
-                (false, None) => {
-                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
-                        handle: None,
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                    self.slice_scratch.clear();
-                }
-            }
+    fn table_slice_matches(storage: &Storage, job: &TableSliceJob) -> bool {
+        job.slot < storage.physical_table_count()
+            && storage.table(job.slot).live()
+            && SliceLayout::from_storage(storage, job.slot) == job.layout
+    }
+
+    fn advance_table_slice(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let mut job = self.table_job.take().expect("scheduled table output");
+        if !Self::table_slice_matches(storage, &job) {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.table_output.clear();
+            self.slice_writer.reset();
+            return Ok(());
+        }
+        if matches!(
+            job.phase,
+            TableSlicePhase::Finish(_) | TableSlicePhase::Clean
+        ) {
+            return self.complete_table_slice(storage, job);
         }
         #[cfg(feature = "checkpoint-profile")]
-        if !clean {
-            profile_checkpoint_phase(
-                if delta {
-                    "row_sst_delta"
+        let profile = (
+            if job.delta {
+                "row_sst_delta"
+            } else {
+                "row_sst_full"
+            },
+            job.through_lsn,
+            job.slot,
+            checkpoint_profile_start(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+        );
+        let mut writer_failed = false;
+        let result = (|| -> Result<(), SqlError> {
+            let TableSlicePhase::Write { source, position } = &mut job.phase else {
+                unreachable!("checked table output phase");
+            };
+            let mut processed = 0;
+            while *position < self.table_output.len()
+                && processed < 64
+                && self.block_output.is_empty()
+            {
+                let entry = self.table_output[*position];
+                let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
+                header[..8].copy_from_slice(&entry.key.rowid.to_le_bytes());
+                header[8..16].copy_from_slice(&entry.key.commit_lsn.to_le_bytes());
+                header[16..20].copy_from_slice(
+                    &entry
+                        .home
+                        .map_or(u32::MAX, |home| match home {
+                            RowHome::Heap(location) => location.len,
+                            RowHome::Spilled { len, .. } => len,
+                        })
+                        .to_le_bytes(),
+                );
+                let appended = if let Some(home) = entry.home {
+                    source.with_physical_row_bytes(entry.key.rowid, home, |row| {
+                        let appended = self.slice_writer.append_version(
+                            &mut self.block_output,
+                            entry.key,
+                            row,
+                        );
+                        if appended.is_ok() {
+                            job.crc.update(&header);
+                            job.crc.update(row);
+                        }
+                        Ok(appended)
+                    })?
                 } else {
-                    "row_sst_full"
-                },
-                storage.lsn(),
-                Some(slot),
-                row_started,
-                row_before,
-                self.blocks
-                    .lock()
-                    .expect("block store lock poisoned")
-                    .io_stats(),
-                0,
-            );
+                    let appended = self
+                        .slice_writer
+                        .append_tombstone_version(&mut self.block_output, entry.key);
+                    if appended.is_ok() {
+                        job.crc.update(&header);
+                    }
+                    appended
+                };
+                if let Err(error) = appended {
+                    writer_failed = true;
+                    return Err(sst_to_sql(error));
+                }
+                job.count += 1;
+                *position += 1;
+                processed += 1;
+            }
+            if *position == self.table_output.len() && self.block_output.is_empty() {
+                match self.slice_writer.finish(&mut self.block_output) {
+                    Ok(handle) => job.phase = TableSlicePhase::Finish(handle),
+                    Err(error) => {
+                        writer_failed = true;
+                        return Err(sst_to_sql(error));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            profile.0,
+            profile.1,
+            Some(profile.2),
+            profile.3,
+            profile.4,
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+            0,
+        );
+        if writer_failed {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.table_output.clear();
+            self.slice_writer.reset();
+        } else {
+            self.table_job = Some(job);
         }
-        if !reuse_slice {
-            self.pending_installs.retain(|(s, _)| *s != slot);
+        result
+    }
+
+    fn complete_table_slice(
+        &mut self,
+        storage: &Storage,
+        mut job: TableSliceJob,
+    ) -> Result<(), SqlError> {
+        if !Self::table_slice_matches(storage, &job) {
+            self.table_output.clear();
+            return Ok(());
         }
-        for install in staged_installs[..staged_install_count]
-            .iter()
-            .copied()
-            .flatten()
-        {
-            self.pending_installs.push((slot, install));
+        match job.phase {
+            TableSlicePhase::Finish(handle) => {
+                let crc = job.crc.finish();
+                match (job.delta, handle) {
+                    (true, Some(handle)) => {
+                        push_slot_list(
+                            &mut self.slice_scratch,
+                            PrevSst {
+                                handle,
+                                count: job.count,
+                                crc,
+                            },
+                        )?;
+                        job.installs[job.install_count] = Some(SlotInstall::Append {
+                            handle,
+                            through_lsn: job.through_lsn,
+                        });
+                        job.install_count += 1;
+                    }
+                    (true, None) => {}
+                    (false, handle) => {
+                        job.installs[job.install_count] = Some(SlotInstall::Replace {
+                            handle,
+                            through_lsn: job.through_lsn,
+                        });
+                        job.install_count += 1;
+                        self.slice_scratch.clear();
+                        if let Some(handle) = handle {
+                            push_slot_list(
+                                &mut self.slice_scratch,
+                                PrevSst {
+                                    handle,
+                                    count: job.count,
+                                    crc,
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+            TableSlicePhase::Clean => {}
+            TableSlicePhase::Write { .. } => {
+                unreachable!("table output must finish before installation")
+            }
         }
-        self.prev_scratch[slot].copy_from(&self.slice_scratch);
+        if !job.reuse_slice {
+            self.pending_installs.retain(|(slot, _)| *slot != job.slot);
+        }
+        for install in job.installs[..job.install_count].iter().copied().flatten() {
+            self.pending_installs.push((job.slot, install));
+        }
+        self.prev_scratch[job.slot].copy_from(&self.slice_scratch);
+        self.sliced_generation[job.slot] = job.generation;
+        self.sliced_lsn[job.slot] = job.through_lsn;
+        self.sliced_layout[job.slot] = job.layout;
+        self.sliced_this_sweep[job.slot] = true;
+        self.table_output.clear();
         Ok(())
     }
 
@@ -11972,7 +12964,7 @@ impl Checkpointer {
         self.roster_scratch.clear();
         self.value_changed_rowids.clear();
         let result = (|| {
-            if let Some(previous) = storage.value_binding_handle(slot, binding) {
+            if let Some(previous) = base {
                 let known = &mut self.roster_scratch;
                 let complete = crate::store::walk_value_roster(
                     &mut *self.blocks.lock().expect("block store lock poisoned"),
@@ -12410,7 +13402,6 @@ impl Checkpointer {
         &mut self,
         job: &mut ValueScheduleJob,
         mut position: usize,
-        before: crate::store::BlockIoStats,
     ) -> Result<(), SqlError> {
         if position == 0 {
             self.slice_writer.reset();
@@ -12422,41 +13413,25 @@ impl Checkpointer {
             let end = begin + row.length as usize;
             self.slice_writer
                 .append(
-                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    &mut self.block_output,
                     position as u64 + 1,
                     &self.value_source[begin..end],
                 )
                 .map_err(sst_to_sql)?;
             position += 1;
-            let io = self
-                .blocks
-                .lock()
-                .expect("block store lock poisoned")
-                .io_stats()
-                .saturating_sub(before);
-            if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
-            {
+            if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES || !self.block_output.is_empty() {
                 job.phase = ValueSchedulePhase::WriteChunk { position };
                 return Ok(());
             }
         }
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats()
-            .saturating_sub(before)
-            .object_puts
-            != 0
-        {
+        if !self.block_output.is_empty() {
             job.phase = ValueSchedulePhase::WriteChunk { position };
             return Ok(());
         }
         let rows = job.row_count as u64;
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
+            .finish(&mut self.block_output)
             .map_err(sst_to_sql)?
             .expect("non-empty value-index run");
         if let Some(pending) = job.pending {
@@ -12467,11 +13442,11 @@ impl Checkpointer {
         }
         job.chunk_len = 0;
         job.row_count = 0;
-        Self::install_value_run(
-            job,
-            ExternalRun::from_checkpoint(handle, rows),
-            ValueMergeDestination::Carry(0),
-        )
+        job.phase = ValueSchedulePhase::CompleteRun {
+            run: ExternalRun::from_checkpoint(handle, rows),
+            destination: ValueMergeDestination::Carry(0),
+        };
+        Ok(())
     }
 
     fn start_value_merge(
@@ -12575,18 +13550,14 @@ impl Checkpointer {
                     .prefixed_row()
                     .expect("chosen left row");
                 self.slice_writer
-                    .append(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
-                        output,
-                        row,
-                    )
+                    .append(&mut self.block_output, output, row)
                     .map_err(sst_to_sql)?;
                 self.value_sort_reader
                     .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
             } else {
                 self.slice_writer
                     .append(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
+                        &mut self.block_output,
                         output,
                         &self.value_entry[..right_len],
                     )
@@ -12611,7 +13582,7 @@ impl Checkpointer {
                 .io_stats()
                 .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
+                || !self.block_output.is_empty()
                 || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
             {
                 right_cursor.detach_buffer();
@@ -12625,13 +13596,15 @@ impl Checkpointer {
                 return Ok(());
             }
         }
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats()
-            .saturating_sub(before)
-            != Default::default()
+        if !self.block_output.is_empty()
+            || self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats()
+                .saturating_sub(before)
+                .object_gets
+                != 0
         {
             right_cursor.detach_buffer();
             job.phase = ValueSchedulePhase::Merge {
@@ -12645,10 +13618,14 @@ impl Checkpointer {
         }
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
+            .finish(&mut self.block_output)
             .map_err(sst_to_sql)?
             .expect("merged value-index run is non-empty");
-        Self::install_value_run(job, ExternalRun::from_checkpoint(handle, rows), destination)
+        job.phase = ValueSchedulePhase::CompleteRun {
+            run: ExternalRun::from_checkpoint(handle, rows),
+            destination,
+        };
+        Ok(())
     }
 
     fn value_finish_beat(
@@ -12702,6 +13679,7 @@ impl Checkpointer {
             self.value_base_stream.reset(base, job.navigation.is_some());
         }
         self.value_job = Some(ValueIndexJob {
+            phase: ValueIndexPhase::Write,
             slot: job.slot,
             table_created_at: job.table_created_at,
             binding: job.binding,
@@ -12732,6 +13710,7 @@ impl Checkpointer {
             self.value_changed_rowids.clear();
             return Ok(());
         }
+        self.index_output_owner = Some(IndexOutputOwner::Schedule);
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         let before = self
@@ -12743,7 +13722,7 @@ impl Checkpointer {
         let result = match phase {
             ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
             ValueSchedulePhase::WriteChunk { position } => self
-                .value_write_chunk_beat(&mut job, position, before)
+                .value_write_chunk_beat(&mut job, position)
                 .map(|()| None),
             ValueSchedulePhase::StartMerge {
                 left,
@@ -12773,6 +13752,9 @@ impl Checkpointer {
             ValueSchedulePhase::Finish { accumulator, level } => {
                 Ok(self.value_finish_beat(&mut job, accumulator, level))
             }
+            ValueSchedulePhase::CompleteRun { run, destination } => {
+                Self::install_value_run(&mut job, run, destination).map(|()| None)
+            }
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -12791,6 +13773,9 @@ impl Checkpointer {
             Ok(Some(source)) => self.finish_value_schedule(job, source),
             Ok(None) => self.value_schedule_job = Some(job),
             Err(error) => {
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
                 self.slice_writer.reset();
                 self.value_source_cursor.reset();
                 self.value_changed_rowids.clear();
@@ -12836,6 +13821,7 @@ impl Checkpointer {
         } else {
             self.value_writer.reset();
         }
+        job.phase = ValueIndexPhase::Write;
         job.previous_posting = None;
         match &mut job.source {
             ValueIndexSource::InMemory { position, .. } => *position = 0,
@@ -12866,6 +13852,7 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
+        self.index_output_owner = Some(IndexOutputOwner::Index);
         let result = self.write_value_index_entries(storage, &mut job, before);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -12909,6 +13896,9 @@ impl Checkpointer {
                 Ok(())
             }
             Err(error) => {
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
                 self.reset_value_index_output(&mut job);
                 self.value_job = Some(job);
                 Err(error)
@@ -12922,6 +13912,9 @@ impl Checkpointer {
         job: &mut ValueIndexJob,
         before: crate::store::BlockIoStats,
     ) -> Result<Option<Option<ValueIndexHandle>>, SqlError> {
+        if let ValueIndexPhase::Finish(handle) = job.phase {
+            return Ok(Some(handle));
+        }
         if let ValueIndexSource::External { run, started } = &mut job.source
             && !*started
         {
@@ -12986,16 +13979,16 @@ impl Checkpointer {
             }
             if delta_len == 0 && job.base_len == 0 {
                 let handle = {
-                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-                    let mut published = PublishedValueBlockStore {
-                        inner: &mut *blocks,
+                    let mut published = PublishedValueBlockWriter {
+                        inner: &mut self.block_output,
                         known_blocks: &self.roster_scratch,
                     };
                     self.value_writer
                         .finish(&mut published, job.through_lsn)
                         .map_err(value_index_to_sql)?
                 };
-                return Ok(Some(handle));
+                job.phase = ValueIndexPhase::Finish(handle);
+                return Ok(None);
             }
 
             let take_base = match (job.base_len, delta_len) {
@@ -13076,9 +14069,8 @@ impl Checkpointer {
                     None
                 };
                 let write = {
-                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-                    let mut published = PublishedValueBlockStore {
-                        inner: &mut *blocks,
+                    let mut published = PublishedValueBlockWriter {
+                        inner: &mut self.block_output,
                         known_blocks: &self.roster_scratch,
                     };
                     if let Some(spec) = job.navigation {
@@ -13135,7 +14127,7 @@ impl Checkpointer {
                 .io_stats()
                 .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_WRITE_BEAT_BLOCKS
+                || !self.block_output.is_empty()
                 || io.object_gets >= VALUE_INDEX_WRITE_BEAT_READS
             {
                 return Ok(None);
@@ -13181,7 +14173,25 @@ impl Checkpointer {
                     }
                 }
                 storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
-                for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
+                // A completed merge can finish after another manifest was
+                // captured. It still owns its graph until a later publication
+                // installs it or its source pair is replaced.
+                let completed = self
+                    .merge_done
+                    .iter()
+                    .filter_map(|done| done.as_ref()?.merged);
+                let finishing = self.merge_job.as_ref().and_then(|job| match job.phase {
+                    MergePhase::Finish { merged } => merged,
+                    _ => None,
+                });
+                for prev in self
+                    .prev_ssts
+                    .iter()
+                    .flat_map(SlotList::iter)
+                    .copied()
+                    .chain(completed)
+                    .chain(finishing)
+                {
                     if self.garbage_sst_roots.len() == self.garbage_sst_roots.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -13201,7 +14211,9 @@ impl Checkpointer {
                         .expect("block store lock poisoned")
                         .get(&h.roster, scratch)
                         .map(|(n, _)| n)
-                        .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
+                        .map_err(|e| {
+                            sql_err!(SQLSTATE_IO, "gc roster {:?} read: {:?}", h.roster, e)
+                        })?;
                     for id_bytes in scratch[..n].chunks(32) {
                         if id_bytes.len() != 32 {
                             return Err(sql_err!(
@@ -13256,6 +14268,24 @@ impl Checkpointer {
                             keep.capacity()
                         ));
                     }
+                }
+                // A delayed publication can name an index no longer installed
+                // in a rewritten or dropped live table. Recovery still needs
+                // every graph in the durable root before replaying its suffix.
+                if self.manifest_present {
+                    self.client
+                        .get(MANIFEST_KEY, None)
+                        .map_err(object_store_to_sql)?;
+                    self.manifest_buf.clear();
+                    if !self.manifest_buf.append(self.client.body_bytes()) {
+                        return Err(manifest_full());
+                    }
+                    retain_manifest_blocks(
+                        &self.blocks,
+                        &mut keep,
+                        scratch,
+                        self.manifest_buf.readable(),
+                    )?;
                 }
                 for index in 0..self.backup_scratch.len() {
                     let name = self.backup_scratch[index];
@@ -13654,46 +14684,44 @@ fn retain_manifest_blocks(
     bytes: &[u8],
 ) -> Result<(), SqlError> {
     let text = core::str::from_utf8(bytes)
-        .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest is not UTF-8"))?;
+        .map_err(|_| sql_err!(SQLSTATE_IO, "saved manifest is not UTF-8"))?;
     parse_manifest_metadata(text)
-        .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
+        .map_err(|message| sql_err!(SQLSTATE_IO, "saved manifest: {message}"))?;
     for line in text.lines().skip(1) {
         let mut words = line.split(' ');
         match words.next() {
             Some("dsst") => {
                 for _ in 0..4 {
                     words.next().ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst")
                     })?;
                 }
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 let roster = words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 if roster == "-" {
                     continue;
                 }
                 let roster = parse_block_id(roster)
-                    .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has a bad dsst roster"))?;
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "saved manifest has a bad dsst roster"))?;
                 retain_block(keep, roster)?;
                 let n = blocks
                     .lock()
                     .expect("block store lock poisoned")
                     .get(&roster, scratch)
                     .map(|(n, _)| n)
-                    .map_err(|error| {
-                        sql_err!(SQLSTATE_IO, "backup row roster read: {:?}", error)
-                    })?;
+                    .map_err(|error| sql_err!(SQLSTATE_IO, "saved row roster read: {:?}", error))?;
                 for id_bytes in scratch[..n].chunks(32) {
                     if id_bytes.len() != 32 {
                         return Err(sql_err!(
                             SQLSTATE_IO,
-                            "backup row roster is not a multiple of 32 bytes"
+                            "saved row roster is not a multiple of 32 bytes"
                         ));
                     }
                     let mut id = [0; 32];
@@ -13704,31 +14732,31 @@ fn retain_manifest_blocks(
             Some("vix") => {
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 let column_count: usize = words
                     .next()
                     .and_then(|word| word.parse().ok())
                     .filter(|count| *count != 0 && *count <= crate::storage::MAX_INDEX_COLS)
                     .ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a bad vix column count")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a bad vix column count")
                     })?;
                 for _ in 0..column_count {
                     words.next().ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix")
                     })?;
                 }
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 let roster = words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))
                     .and_then(|word| {
                         parse_block_id(word).map_err(|_| {
-                            sql_err!(SQLSTATE_IO, "backup manifest has a bad vix roster")
+                            sql_err!(SQLSTATE_IO, "saved manifest has a bad vix roster")
                         })
                     })?;
                 let complete = crate::store::walk_value_roster(
@@ -13737,7 +14765,7 @@ fn retain_manifest_blocks(
                     scratch,
                     |id, _| retain_block(keep, id).is_ok(),
                 )
-                .map_err(|error| sql_err!(SQLSTATE_IO, "backup value-index roster: {:?}", error))?;
+                .map_err(|error| sql_err!(SQLSTATE_IO, "saved value-index roster: {:?}", error))?;
                 if !complete {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -13758,6 +14786,19 @@ fn sst_to_sql(e: crate::store::SstError) -> SqlError {
             sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_IO_WAIT,
                 "block fetch in progress"
+            )
+        }
+        crate::store::SstError::Store(
+            crate::store::StoreError::WriteBatchBytesExhausted
+            | crate::store::StoreError::WriteBatchObjectsExhausted,
+        ) => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "physical output emission exceeds its startup reservation"
+        ),
+        crate::store::SstError::Store(crate::store::StoreError::ReadOwnersExhausted) => {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "object read consumers exceed max_connections and max_subscriptions"
             )
         }
         other => sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", other),
@@ -13814,6 +14855,41 @@ fn write_database_context(
         *current = Some(database);
     }
     Ok(())
+}
+
+fn upload_to_sql(error: crate::object_store::upload::UploadError) -> SqlError {
+    use crate::object_store::upload::UploadError;
+    match error {
+        UploadError::Request(error) => object_store_to_sql(error),
+        UploadError::AdmissionPaused => sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "object requests are draining for credential installation"
+        ),
+        UploadError::SlotsExhausted => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object_store_put_slots exhausted"
+        ),
+        UploadError::BodyTooLarge {
+            requested,
+            capacity,
+        } => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "upload needs {} bytes but wal_upload_buffer_bytes is {}",
+            requested,
+            capacity
+        ),
+        UploadError::KeyTooLarge => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object key exceeds S3 key limit"
+        ),
+        UploadError::GenerationExhausted => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "upload ticket generation exhausted"
+        ),
+        UploadError::InvalidTicket => {
+            sql_err!(sqlstate::INTERNAL_ERROR, "invalid object upload ticket")
+        }
+    }
 }
 
 fn object_store_to_sql(e: ObjectError) -> SqlError {
@@ -17499,6 +18575,260 @@ mod stored_dependency_tests {
         (checkpointer, storage, table, config)
     }
 
+    #[test]
+    fn parallel_physical_manifest_retry_preserves_bytes_while_backup_uses_scratch() {
+        use std::time::{Duration, Instant};
+        let (mut checkpoint, mut storage, _table, config) =
+            index_gc_fixture("manifest-backup-retry", 16);
+        assert!(checkpoint.checkpoint(&mut storage).unwrap().is_some());
+        checkpoint.finish_maintenance(&storage).unwrap();
+        storage.set_lsn(7);
+        for _ in 0..64 {
+            if checkpoint.manifest_publication_pending() {
+                break;
+            }
+            assert!(matches!(
+                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                super::CheckpointStep::Working
+            ));
+        }
+        assert!(checkpoint.manifest_publication_pending());
+        let captured = checkpoint.manifest_output.readable().to_vec();
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 274);
+        namespace.borrow_mut().faults.transient_per_mille = 1000;
+        let now = Instant::now();
+        for turn in 0..16 {
+            checkpoint
+                .manifest_uploads
+                .advance(now + Duration::from_millis(turn * 250));
+            if checkpoint.manifest_uploads.has_completion() {
+                break;
+            }
+        }
+        let error = checkpoint
+            .advance_manifest_publication(&mut storage)
+            .err()
+            .expect("exhausted request attempts must retain a root retry");
+        assert_eq!(error.sqlstate, "58030");
+        assert!(matches!(
+            checkpoint.manifest_publication,
+            Some(super::ManifestPublication::Retry { lsn: 7, .. })
+        ));
+        namespace.borrow_mut().faults.transient_per_mille = 0;
+        assert_eq!(checkpoint.create_backup("during-retry").unwrap(), 0);
+        assert_ne!(checkpoint.manifest_buf.readable(), captured);
+        assert_eq!(checkpoint.manifest_output.readable(), captured);
+        checkpoint.manifest_publication = Some(super::ManifestPublication::Retry {
+            lsn: 7,
+            at: Instant::now(),
+        });
+        assert_eq!(checkpoint.checkpoint(&mut storage).unwrap(), Some(7));
+        let key = format!("{}manifest", config.object_store_prefix);
+        assert_eq!(namespace.borrow().object_bytes(&key).unwrap(), captured);
+        assert!(namespace.borrow().blind_overwrites.is_empty());
+        drop(storage);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn parallel_credentials_renewal_requires_read_and_write_before_installing() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let end = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(at) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = core::str::from_utf8(&bytes[..end]).unwrap().to_owned();
+            assert!(head.contains("authorization: AWS4-HMAC-SHA256 "));
+            assert!(head.contains("Credential=candidate/"));
+            let length = if head.starts_with("PUT ") {
+                head.lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            } else {
+                assert!(head.starts_with("GET "));
+                0
+            };
+            while bytes.len() < end + length {
+                let n = stream.read(&mut part).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&part[..n]);
+            }
+            (head, bytes[end..].to_vec())
+        }
+
+        fn reply(stream: &mut TcpStream, status: &str, body: &[u8]) {
+            write!(stream,
+                "HTTP/1.1 {status}\r\nETag: \"candidate\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+
+        for case in [
+            "read-only",
+            "write-only",
+            "both",
+            "replaced",
+            "ambiguous",
+            "conditional-denied",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut config =
+                crate::object_store::upload::tests::config(listener.local_addr().unwrap().port());
+            config.object_store_bucket = "credential-renewal".to_owned();
+            config.object_store_credentials_file = "configured-credential-file".to_owned();
+            config.data_dir = std::env::temp_dir()
+                .join(format!("credential-renewal-{case}-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned();
+            config.max_tables = 2;
+            config.max_connections = 2;
+            config.table_rows = 16;
+            config.max_value_indexes = 2;
+            config.block_cache_bytes = 0;
+            config.disk_cache_bytes = 0;
+            let (finished, done) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut put, _) = listener.accept().unwrap();
+                let (head, body) = request(&mut put);
+                assert!(head.starts_with("PUT "));
+                assert!(head.contains("if-match: \"current\"\r\n"));
+                assert_eq!(
+                    body,
+                    writer_fence_record("active", WriterToken(1))
+                        .as_str()
+                        .as_bytes()
+                );
+                if case == "read-only" {
+                    reply(&mut put, "403 Forbidden", b"");
+                    listener.set_nonblocking(true).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut reads = 0;
+                    loop {
+                        assert!(
+                            Instant::now() < deadline,
+                            "credential request did not finish"
+                        );
+                        match listener.accept() {
+                            Ok((mut get, _)) => {
+                                assert!(request(&mut get).0.starts_with("GET "));
+                                let record = writer_fence_record("active", WriterToken(1));
+                                reply(&mut get, "200 OK", record.as_str().as_bytes());
+                                reads += 1;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => panic!("accept verification: {error}"),
+                        }
+                        match done.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return reads,
+                            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                        }
+                    }
+                }
+                reply(
+                    &mut put,
+                    if matches!(case, "ambiguous" | "conditional-denied") {
+                        "412 Precondition Failed"
+                    } else {
+                        "200 OK"
+                    },
+                    b"",
+                );
+                let (mut get, _) = listener.accept().unwrap();
+                assert!(request(&mut get).0.starts_with("GET "));
+                if case == "write-only" {
+                    reply(&mut get, "403 Forbidden", b"");
+                } else {
+                    let record = writer_fence_record(
+                        "active",
+                        WriterToken(if case == "replaced" { 2 } else { 1 }),
+                    );
+                    reply(&mut get, "200 OK", record.as_str().as_bytes());
+                }
+                if matches!(case, "ambiguous" | "conditional-denied") {
+                    let (mut retry, _) = listener.accept().unwrap();
+                    let (head, retried_body) = request(&mut retry);
+                    assert!(head.starts_with("PUT "));
+                    assert!(head.contains("if-match: \"candidate\"\r\n"));
+                    assert_eq!(retried_body, body);
+                    if case == "conditional-denied" {
+                        reply(&mut retry, "403 Forbidden", b"");
+                        return 1;
+                    }
+                    reply(&mut retry, "200 OK", b"");
+                    let (mut verified, _) = listener.accept().unwrap();
+                    assert!(request(&mut verified).0.starts_with("GET "));
+                    reply(&mut verified, "200 OK", &body);
+                    return 2;
+                }
+                1
+            });
+            let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+            let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+            checkpoint.writer_token = WriterToken(1);
+            checkpoint.writer_fence_etag = Some(EntityTag::parse("\"current\"").unwrap());
+            let installed = checkpoint.client.credentials().unwrap();
+            let candidate =
+                crate::object_store::Credentials::new("candidate", "candidate-secret", "").unwrap();
+            let result = crate::mem::guard::forbid_alloc(|| {
+                checkpoint.begin_credential_reload(candidate).unwrap();
+                assert!(checkpoint.client.credentials() == Some(installed));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "credential validation did not finish"
+                    );
+                    checkpoint.advance_background_uploads(Instant::now());
+                    match checkpoint.advance_credential_reload() {
+                        Ok(CredentialReloadStep::Pending) => {
+                            assert!(
+                                checkpoint.client.credentials() == Some(installed),
+                                "candidate remains private until read and write validation finish"
+                            );
+                        }
+                        result => break result,
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let _ = finished.send(());
+            let reads = server.join().unwrap();
+            let accepted = matches!(result, Ok(CredentialReloadStep::Installed));
+            assert_eq!(accepted, matches!(case, "both" | "ambiguous"), "{case}");
+            assert_eq!(
+                reads,
+                usize::from(case != "read-only") + usize::from(case == "ambiguous"),
+                "a rejected write cannot become successful through a read fallback"
+            );
+            assert_eq!(checkpoint.writer_was_fenced(), case == "replaced");
+            assert!(
+                checkpoint.client.credentials()
+                    == Some(if accepted { candidate } else { installed })
+            );
+            assert!(checkpoint.credential_renewal.is_none());
+            assert!(checkpoint.block_uploads.admits_requests());
+            drop(checkpoint);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
+    }
+
     fn write_gc_index(checkpointer: &Checkpointer, payload: &[u8]) -> ValueIndexHandle {
         let mut writer = ValueIndexWriter::new();
         let mut blocks = checkpointer.blocks.lock().unwrap();
@@ -17521,6 +18851,126 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn parallel_physical_completed_merge_survives_cleanup_before_its_publication() {
+        for finish_before_cleanup in [false, true] {
+            let label = if finish_before_cleanup {
+                "merge-completed-gc"
+            } else {
+                "merge-finishing-gc"
+            };
+            let (mut checkpoint, mut storage, table, config) = index_gc_fixture(label, 32);
+            let mut saved = [None; 4];
+            for (index, value) in [b"first".as_slice(), b"second", b"merged", b"orphan"]
+                .into_iter()
+                .enumerate()
+            {
+                checkpoint.slice_writer.reset();
+                let mut blocks = checkpoint.blocks.lock().unwrap();
+                checkpoint
+                    .slice_writer
+                    .append(&mut *blocks, 1, value)
+                    .unwrap();
+                saved[index] = Some(PrevSst {
+                    handle: checkpoint
+                        .slice_writer
+                        .finish(&mut *blocks)
+                        .unwrap()
+                        .unwrap(),
+                    count: 1,
+                    crc: 0,
+                });
+            }
+            let [Some(old0), Some(old1), Some(merged), Some(orphan)] = saved else {
+                unreachable!()
+            };
+            assert!(checkpoint.prev_ssts[table].push(old0));
+            assert!(checkpoint.prev_ssts[table].push(old1));
+            checkpoint.merge_job = Some(MergeJob {
+                slot: table,
+                at: 0,
+                old0,
+                old1,
+                drop_tombstones: true,
+                oldest_snapshot: None,
+                phase: MergePhase::Finish {
+                    merged: Some(merged),
+                },
+                schedule_len: 0,
+                count: 1,
+                crc: Crc32c::new(),
+            });
+            checkpoint.published_lsn_pending_maintenance = Some(0);
+            checkpoint.block_garbage_pending = true;
+            if finish_before_cleanup {
+                assert!(matches!(
+                    checkpoint.checkpoint_step(&mut storage).unwrap(),
+                    CheckpointStep::Working
+                ));
+            }
+            for _ in 0..16 {
+                if !checkpoint.block_garbage_pending {
+                    break;
+                }
+                checkpoint.block_garbage_pending = !crate::mem::guard::forbid_alloc(|| {
+                    checkpoint.collect_block_garbage_batch(&storage)
+                })
+                .unwrap();
+            }
+            assert!(!checkpoint.block_garbage_pending, "cleanup must drain");
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+            let merged_key = format!(
+                "{}blocks/{}",
+                config.object_store_prefix,
+                index_gc_hex(merged.handle.roster)
+            );
+            let orphan_key = format!(
+                "{}blocks/{}",
+                config.object_store_prefix,
+                index_gc_hex(orphan.handle.roster)
+            );
+            assert!(namespace.borrow().object_bytes(&merged_key).is_some());
+            assert!(namespace.borrow().object_bytes(&orphan_key).is_none());
+            if !finish_before_cleanup {
+                checkpoint.merge_beat(&storage).unwrap();
+            }
+            assert!(checkpoint.merge_job.is_none());
+            assert!(checkpoint.merge_done[table].is_some());
+            // Publish the merged identity after the earlier sweep. Its graph
+            // must still be readable with both caches disabled.
+            checkpoint.prev_ssts[table].replace_pair(0, Some(merged));
+            checkpoint.merge_done[table] = None;
+            assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+            let mut scratch = [0u8; crate::store::MAX_PAYLOAD];
+            let (len, _) = checkpoint
+                .blocks
+                .lock()
+                .unwrap()
+                .get(&merged.handle.roster, &mut scratch)
+                .unwrap();
+            for bytes in scratch[..len].chunks_exact(32) {
+                let id = BlockId(bytes.try_into().unwrap());
+                assert!(
+                    namespace
+                        .borrow()
+                        .object_bytes(&format!(
+                            "{}blocks/{}",
+                            config.object_store_prefix,
+                            index_gc_hex(id)
+                        ))
+                        .is_some()
+                );
+            }
+            checkpoint.prev_ssts[table].clear();
+            assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+            assert!(namespace.borrow().object_bytes(&merged_key).is_none());
+            drop(storage);
+            drop(checkpoint);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
     fn index_file_owners_garbage_collection_retains_old_graph_until_last_owner_and_backup() {
         let (mut checkpoint, mut storage, table, config) =
             index_gc_fixture("index-gc-retention", 4);
@@ -17533,6 +18983,7 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(old),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let first = storage.retain_statement_snapshot(71, |_| 7).unwrap();
@@ -17555,10 +19006,11 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(new),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v15\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\nend\n",
+            "pos3ql-manifest-v16\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -17613,6 +19065,7 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(live),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
@@ -17644,6 +19097,7 @@ mod stored_dependency_tests {
                     roster: corrupt,
                     ..live
                 }),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let error = checkpoint
@@ -17696,6 +19150,47 @@ mod stored_dependency_tests {
             assert_eq!(fail(), Err(()));
             assert!(!blocks.lock().unwrap().async_gets_enabled());
             drop(outer);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn atomic_block_reads_deferred_effect_outlives_an_inner_atomic_operation() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-deferred");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        crate::mem::guard::forbid_alloc(|| {
+            let statement = checkpointer.deferred_atomic_block_read_scope();
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+            let inner = checkpointer.atomic_block_read_scope();
+            statement.activate();
+            statement.activate();
+            drop(inner);
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            checkpointer.enable_async_block_reads();
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(statement);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn atomic_block_reads_inactive_statement_keeps_async_and_owners_can_drop_out_of_order() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-order");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        crate::mem::guard::forbid_alloc(|| {
+            drop(checkpointer.deferred_atomic_block_read_scope());
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+            let first = checkpointer.atomic_block_read_scope();
+            let second = checkpointer.atomic_block_read_scope();
+            drop(first);
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(second);
             assert!(blocks.lock().unwrap().async_gets_enabled());
         });
         drop(checkpointer);
@@ -17919,7 +19414,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\n");
+                    let mut manifest = String::from("pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -17945,7 +19440,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
+                        "pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -17954,7 +19449,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
+                    let manifest = format!("pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -18036,6 +19531,21 @@ mod stored_dependency_tests {
         delete_pacing.checkpoint_delete_objects_per_beat += 1;
         assert_eq!(Checkpointer::budget_bytes(&delete_pacing), base_bytes);
 
+        let mut writes = base.clone();
+        writes.checkpoint_write_entries += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&writes) - base_bytes,
+            core::mem::size_of::<CheckpointVersion>()
+        );
+
+        let mut manifest = base.clone();
+        manifest.checkpoint_manifest_bytes += 64;
+        assert_eq!(
+            Checkpointer::budget_bytes(&manifest) - base_bytes,
+            3 * 64,
+            "metadata read scratch, retained output and immutable request body"
+        );
+
         let mut merge = base;
         merge.checkpoint_merge_entries += 1;
         assert_eq!(
@@ -18100,8 +19610,9 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v12",
                 "pos3ql-manifest-v13",
                 "pos3ql-manifest-v14",
-                "pos3ql-manifest-v16",
-                "pos3ql-manifest-v15 trailing",
+                "pos3ql-manifest-v15",
+                "pos3ql-manifest-v17",
+                "pos3ql-manifest-v16 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -18178,11 +19689,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v15\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
+        let manifest = b"pos3ql-manifest-v16\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v15\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\nend\n";
+        let slot_only = b"pos3ql-manifest-v16\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -18395,7 +19906,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v15\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
+                b"pos3ql-manifest-v16\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();
@@ -18407,7 +19918,8 @@ mod stored_dependency_tests {
         for header in [
             "pos3ql-manifest-v13",
             "pos3ql-manifest-v14",
-            "pos3ql-manifest-v16",
+            "pos3ql-manifest-v15",
+            "pos3ql-manifest-v17",
         ] {
             let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());
@@ -18479,4 +19991,105 @@ mod stored_dependency_tests {
             (42, Some(820_497_600_123_456), 0x00aa_bbcc, 0x0011_2233)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
+    let mut config = Config::default_dev();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = "127.0.0.1:1".to_string();
+    config.object_store_access_key = "access".to_string();
+    config.object_store_secret_key = "secret".to_string();
+    config.object_store_bucket = format!("physical-emission-bound-{}", std::process::id());
+    let total = SstWriter::budget_bytes()
+        + crate::store::BlockWriteBatch::budget_bytes(
+            PHYSICAL_EMISSION_BYTES,
+            PHYSICAL_EMISSION_OBJECTS,
+        )
+        + crate::object_store::upload::Uploads::budget_bytes(&config, 1, crate::store::BLOCK_SIZE);
+    let mut budget = Budget::new(total);
+    budget
+        .draw(SstWriter::budget_bytes(), "physical emission test writer")
+        .unwrap();
+    let mut writer = SstWriter::new();
+    let mut output = crate::store::BlockWriteBatch::new(
+        &mut budget,
+        PHYSICAL_EMISSION_BYTES,
+        PHYSICAL_EMISSION_OBJECTS,
+    )
+    .unwrap();
+    let mut uploads = crate::object_store::upload::Uploads::new(
+        &config,
+        1,
+        crate::store::BLOCK_SIZE,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(budget.used(), total);
+    let mut row = vec![0u8; crate::store::MAX_ASSEMBLED];
+    let mut random = 0x6a09e667f3bcc909u64;
+    for byte in &mut row {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        *byte = random as u8;
+    }
+    crate::mem::guard::forbid_alloc(|| {
+        writer.append(&mut output, 0, b"prior group").unwrap();
+        writer.append(&mut output, 1, &row).unwrap();
+        assert!(!output.is_empty());
+        output.discard(&mut uploads).unwrap();
+        assert!(writer.finish(&mut output).unwrap().is_some());
+        assert!(!output.is_empty());
+        output.discard(&mut uploads).unwrap();
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_physical_credential_rotation_waits_for_requests_not_retained_bytes() {
+    use crate::store::BlockWriter;
+    let mut config = Config::default_dev();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = "127.0.0.1:1".to_string();
+    config.object_store_access_key = "access".to_string();
+    config.object_store_secret_key = "secret".to_string();
+    config.object_store_bucket = format!("physical-credential-owner-{}", std::process::id());
+    config.data_dir = std::env::temp_dir()
+        .join(&config.object_store_bucket)
+        .to_string_lossy()
+        .into_owned();
+    config.max_tables = 2;
+    config.table_rows = 4;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+    let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+    assert_eq!(budget.used(), Checkpointer::budget_bytes(&config));
+    crate::mem::guard::forbid_alloc(|| {
+        checkpoint
+            .block_output
+            .write_block(b"retained", crate::store::BlockType::SstData, 0)
+            .unwrap();
+        assert!(!checkpoint.block_output.is_empty());
+        assert!(
+            !checkpoint.object_io_busy(),
+            "retained output must allow credential reload between attempts"
+        );
+        assert!(!checkpoint.drain_block_output().unwrap());
+        assert!(
+            checkpoint.object_io_busy(),
+            "queued PUT owns its current request credentials"
+        );
+        checkpoint
+            .block_output
+            .discard(&mut checkpoint.block_uploads)
+            .unwrap();
+        assert!(!checkpoint.object_io_busy());
+    });
+    drop(checkpoint);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

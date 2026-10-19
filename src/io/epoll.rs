@@ -84,17 +84,36 @@ impl Reactor {
 
     pub fn register_read(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
         let (index, existing) = self.interest_index(fd)?;
-        self.interests[index].token = token;
-        self.interests[index].read = true;
-        let interest = self.interests[index];
-        self.ctl(
-            if existing {
-                libc::EPOLL_CTL_MOD
-            } else {
-                libc::EPOLL_CTL_ADD
-            },
-            interest,
-        )
+        let previous = self.interests[index];
+        let interest = Interest {
+            fd,
+            token,
+            read: true,
+            write: existing && previous.token == token && previous.write,
+        };
+        let operation = if existing {
+            libc::EPOLL_CTL_MOD
+        } else {
+            libc::EPOLL_CTL_ADD
+        };
+        let result = match self.ctl(operation, interest) {
+            // close/dup2 removes the kernel registration while the fixed slot
+            // still remembers the descriptor. Register its current owner anew.
+            Err(error) if existing && error.raw_os_error() == Some(libc::ENOENT) => {
+                self.ctl(libc::EPOLL_CTL_ADD, interest)
+            }
+            result => result,
+        };
+        match result {
+            Ok(()) => {
+                self.interests[index] = interest;
+                Ok(())
+            }
+            Err(error) => {
+                self.interests[index] = if existing { previous } else { EMPTY_INTEREST };
+                Err(error)
+            }
+        }
     }
 
     pub fn register_read_oneshot(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
@@ -124,6 +143,18 @@ impl Reactor {
         self.interests[index].token = token;
         self.interests[index].write = enabled;
         self.ctl(libc::EPOLL_CTL_MOD, self.interests[index])
+    }
+
+    /// A closed request may retain an integer already reused by another owner.
+    pub fn deregister_owned(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {
+        if self
+            .interests
+            .iter()
+            .any(|interest| interest.fd == fd && interest.token == token)
+        {
+            self.deregister(fd)?;
+        }
+        Ok(())
     }
 
     pub fn deregister(&mut self, fd: RawFd) -> std::io::Result<()> {

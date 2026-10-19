@@ -513,11 +513,15 @@ impl<'a> P<'a> {
         // Stable-sort by key, then drop earlier duplicates (last value wins).
         // jsonb orders object keys by length first, then bytewise — the same
         // order PostgreSQL stores and prints them in.
-        crate::mem::arena::stable_sort_via(self.arena, members.as_mut_slice(), |a, b| {
-            a.0.len()
-                .cmp(&b.0.len())
-                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-        })
+        crate::mem::arena::stable_sort_via(
+            self.arena,
+            members.as_mut_slice().map_err(|_| full())?,
+            |a, b| {
+                a.0.len()
+                    .cmp(&b.0.len())
+                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            },
+        )
         .map_err(|_| full())?;
         let ms = members.as_slice();
         let mut out = ArenaList::new(self.arena);

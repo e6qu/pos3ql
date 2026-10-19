@@ -39,6 +39,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     metrics_lock = threading.Lock()
     metrics_file = None
     latency_seconds = 0.0
+    writer_probe_gate_file = None
+    writer_probe_gate_lock = threading.Lock()
     metrics = {
         "schema_version": 1,
         "requests": {"put": 0, "get": 0, "range_get": 0, "list": 0, "delete": 0},
@@ -74,6 +76,28 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     def delay(cls):
         if cls.latency_seconds:
             time.sleep(cls.latency_seconds)
+
+    def hold_control_request(self, key):
+        gate = self.writer_probe_gate_file
+        if gate is None or key.rsplit("/", 1)[-1] != "writer-fence" or not gate.exists():
+            return True
+        method = gate.read_text(encoding="ascii")
+        if method not in ("GET", "PUT"):
+            self.error(500, "InvalidRequest", "invalid control request test gate")
+            return False
+        if self.command != method:
+            return True
+        observed = gate.with_suffix(".observed")
+        with self.writer_probe_gate_lock:
+            count = int(observed.read_text()) if observed.exists() else 0
+            observed.write_text(str(count + 1), encoding="ascii")
+        deadline = time.monotonic() + 5
+        while gate.exists():
+            if time.monotonic() >= deadline:
+                self.error(503, "SlowDown", "writer probe test gate was not released")
+                return False
+            time.sleep(0.005)
+        return True
 
     def error(self, status, code, message):
         body = (
@@ -216,6 +240,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         try:
             body, _, key = self.begin()
             self.delay()
+            if not self.hold_control_request(key):
+                return
             path = self.object_path(key)
             with self.mutation_lock:
                 exists = path.exists()
@@ -249,6 +275,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         try:
             _, parsed, key = self.begin()
             self.delay()
+            if not self.hold_control_request(key):
+                return
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
             if not key and query.get("list-type") == ["2"]:
                 return self.list_objects(query)
@@ -362,6 +390,7 @@ def main():
     parser.add_argument("--page-size", type=int, default=1000)
     parser.add_argument("--metrics-file")
     parser.add_argument("--latency-ms", type=float, default=0.0)
+    parser.add_argument("--writer-probe-gate-file")
     args = parser.parse_args()
     S3TestServer.root = pathlib.Path(args.root).resolve()
     S3TestServer.bucket = args.bucket
@@ -373,6 +402,8 @@ def main():
         S3TestServer.credentials_file = pathlib.Path(args.credentials_file).resolve()
     S3TestServer.page_size = args.page_size
     S3TestServer.latency_seconds = args.latency_ms / 1000.0
+    if args.writer_probe_gate_file:
+        S3TestServer.writer_probe_gate_file = pathlib.Path(args.writer_probe_gate_file).resolve()
     if args.metrics_file:
         S3TestServer.metrics_file = pathlib.Path(args.metrics_file).resolve()
         S3TestServer.metrics_file.parent.mkdir(parents=True, exist_ok=True)

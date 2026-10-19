@@ -74769,15 +74769,27 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
         &mut budget,
         "CREATE TABLE retry_batch (id int)",
     );
+    assert!(engine.wal.pending_batch_bytes() > 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(engine.commit_wal().is_err());
-    assert!(engine.wal.pending_batch_bytes() > 0);
-    assert!(engine.checkpoint().is_err());
-    assert!(engine.wal.pending_batch_bytes() > 0);
+    // Every successful PUT loses its response. Conditional retries must verify
+    // the durable bytes and adopt the same batch and root without duplication.
+    engine.commit_wal().unwrap();
+    assert_eq!(engine.wal.pending_batch_bytes(), 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
     assert!(engine.checkpoint().unwrap());
-    assert_eq!(engine.wal.pending_batch_bytes(), 0);
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovery_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovery_budget,
+            "SELECT count(*) FROM retry_batch"
+        )),
+        ["0"]
+    );
+    drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -86757,6 +86769,7 @@ fn explicit_locking_mode_waits_on_readers_and_preserves_unrelated_writes() {
         )),
         ["10"]
     );
+    engine.bind_query_connection(33);
     let waiter = engine.storage.start_transaction_identity().unwrap();
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
@@ -86863,4 +86876,168 @@ fn explicit_locking_mode_rejects_isolation_it_cannot_preserve() {
         )),
         ["7"]
     );
+}
+
+#[test]
+fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
+    fn publish(engine: &mut Engine) {
+        for _ in 0..16 {
+            // The simulator allocates its remote object fixtures; production
+            // upload ownership is covered separately under the allocation guard.
+            if engine
+                .advance_wal_publication(std::time::Instant::now())
+                .unwrap()
+            {
+                return;
+            }
+        }
+        panic!("simulated publication did not complete in bounded progress turns");
+    }
+
+    for commit in [false, true] {
+        let mut config = test_config(&format!("prepared-receipt-reuse-{commit}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.max_ddl_per_transaction = 4;
+        config.max_prepared_transactions = 1;
+        config.txn_rows = 8;
+        config.object_store_bucket = format!("prepared-receipts-{}-{commit}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 512 << 20);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut preparing =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut resolving =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut replacement =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+        preparing.success(
+            &mut engine,
+            "CREATE TABLE receipt_orders(id integer); BEGIN; INSERT INTO receipt_orders VALUES (1)",
+            false,
+        );
+        engine.commit_wal().unwrap();
+        engine.enable_async_durability();
+        let gid = ast::PreparedTransactionId::parse("receipt-original").unwrap();
+        engine.bind_query_connection(preparing.connection_id);
+        let error = crate::mem::guard::forbid_alloc(|| {
+            engine.prepare_transaction(
+                gid,
+                &mut preparing.transaction,
+                &preparing.guc,
+                &mut preparing.cursors,
+                &preparing.arena,
+                &mut Responder::new(&mut preparing.send),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+        publish(&mut engine);
+        assert!(preparing.transaction.staged_commit().is_some());
+
+        resolving.success(&mut engine, "BEGIN", true);
+        let error = crate::mem::guard::forbid_alloc(|| {
+            engine.resolve_prepared_transaction(
+                gid,
+                commit,
+                &mut resolving.transaction,
+                &resolving.guc,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+        publish(&mut engine);
+        assert!(engine.prepared_transactions.find(gid).is_none());
+
+        // Another connection can reuse the only prepared slot before either
+        // older connection receives its completion response.
+        replacement.success(
+            &mut engine,
+            "BEGIN; INSERT INTO receipt_orders VALUES (2)",
+            true,
+        );
+        let next_gid = ast::PreparedTransactionId::parse("receipt-replacement").unwrap();
+        let error = crate::mem::guard::forbid_alloc(|| {
+            engine.prepare_transaction(
+                next_gid,
+                &mut replacement.transaction,
+                &replacement.guc,
+                &mut replacement.cursors,
+                &replacement.arena,
+                &mut Responder::new(&mut replacement.send),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+        publish(&mut engine);
+        assert_eq!(engine.prepared_transactions.find(next_gid), Some(0));
+
+        engine.bind_query_connection(preparing.connection_id);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.prepare_transaction(
+                gid,
+                &mut preparing.transaction,
+                &preparing.guc,
+                &mut preparing.cursors,
+                &preparing.arena,
+                &mut Responder::new(&mut preparing.send),
+            )
+        })
+        .unwrap();
+        engine.bind_query_connection(resolving.connection_id);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.resolve_prepared_transaction(
+                gid,
+                commit,
+                &mut resolving.transaction,
+                &resolving.guc,
+            )
+        })
+        .unwrap();
+        assert!(!preparing.transaction.is_active());
+        assert!(!resolving.transaction.is_active());
+        assert_eq!(engine.prepared_transactions.find(next_gid), Some(0));
+
+        engine.bind_query_connection(replacement.connection_id);
+        engine
+            .prepare_transaction(
+                next_gid,
+                &mut replacement.transaction,
+                &replacement.guc,
+                &mut replacement.cursors,
+                &replacement.arena,
+                &mut Responder::new(&mut replacement.send),
+            )
+            .unwrap();
+        preparing.success(&mut engine, "BEGIN", true);
+        assert_eq!(
+            engine
+                .resolve_prepared_transaction(
+                    next_gid,
+                    false,
+                    &mut preparing.transaction,
+                    &preparing.guc
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
+        publish(&mut engine);
+        engine
+            .resolve_prepared_transaction(
+                next_gid,
+                false,
+                &mut preparing.transaction,
+                &preparing.guc,
+            )
+            .unwrap();
+        assert!(engine.prepared_transactions.find(next_gid).is_none());
+        let expected = if commit { "1" } else { "0" };
+        assert_eq!(
+            data_rows(&preparing.success(&mut engine, "SELECT count(*) FROM receipt_orders", true)),
+            [expected]
+        );
+    }
 }

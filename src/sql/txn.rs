@@ -208,9 +208,18 @@ pub(crate) fn validate_isolation_mode(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitTarget {
     Ordinary,
-    Prepare { slot: usize },
-    CommitPrepared { slot: usize },
-    RollbackPrepared { slot: usize },
+    Prepare {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
+    CommitPrepared {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
+    RollbackPrepared {
+        slot: usize,
+        gid: super::ast::PreparedTransactionId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

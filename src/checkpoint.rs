@@ -2085,6 +2085,27 @@ impl Checkpointer {
             .disable_async_gets();
     }
 
+    pub(crate) fn set_read_owner(&mut self, owner: Option<crate::store::ReadOwner>) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .set_read_owner(owner);
+    }
+
+    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .cancel_read_owner(owner);
+    }
+
+    pub(crate) fn read_capacity_generation(&self) -> u64 {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .read_capacity_generation()
+    }
+
     pub(crate) fn block_read_slots(&self) -> usize {
         self.blocks
             .lock()
@@ -2370,7 +2391,15 @@ impl Checkpointer {
                 Ok(false)
             }
             CommitPublication::Root { batch, ticket } => {
-                match self.uploads.take(ticket).map_err(upload_to_sql)? {
+                let outcome = self.uploads.take(ticket).map_err(|error| match error {
+                    crate::object_store::upload::UploadError::Request(error)
+                        if error.is_precondition_failed() =>
+                    {
+                        sql_err!(SQLSTATE_CAS, "commit root changed; writer was fenced")
+                    }
+                    other => upload_to_sql(other),
+                })?;
+                match outcome {
                     Some(etag) => {
                         self.commit_head_etag = Some(etag);
                         self.commit_head = Some(batch);
@@ -13905,6 +13934,12 @@ fn sst_to_sql(e: crate::store::SstError) -> SqlError {
             sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_IO_WAIT,
                 "block fetch in progress"
+            )
+        }
+        crate::store::SstError::Store(crate::store::StoreError::ReadOwnersExhausted) => {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "object read consumers exceed max_connections and max_subscriptions"
             )
         }
         other => sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", other),

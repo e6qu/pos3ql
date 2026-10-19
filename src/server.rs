@@ -126,6 +126,7 @@ pub struct Server {
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
     upload_fds: FixedVec<Option<i32>>,
+    read_capacity_generation: u64,
     subscriptions: FixedVec<SubscriptionWorker>,
     operations_listener: Option<TcpListener>,
     operations_slots: FixedVec<OperationsSlot>,
@@ -1122,6 +1123,7 @@ impl Server {
             shutdown_read: pipe_fds[0],
             block_read_fds,
             upload_fds,
+            read_capacity_generation: 0,
             subscriptions,
             operations_listener,
             operations_slots,
@@ -1213,6 +1215,8 @@ impl Server {
                 self.next_termination_timeout(),
                 read_timeout,
                 self.buffered_subscription_work().then_some(Duration::ZERO),
+                (self.engine.read_capacity_generation() != self.read_capacity_generation)
+                    .then_some(Duration::ZERO),
                 self.engine
                     .next_publication_deadline()
                     .map(|deadline| deadline.saturating_duration_since(Instant::now())),
@@ -1229,7 +1233,9 @@ impl Server {
             }
             self.durability_ready = !self.engine.publication_failed();
             let publication_ready = self.durability_ready;
-            let mut completed_block_read = false;
+            let capacity = self.engine.read_capacity_generation();
+            let mut completed_block_read = capacity != self.read_capacity_generation;
+            self.read_capacity_generation = capacity;
             for i in 0..n {
                 let event = self.reactor.event(i);
                 if event.token == SHUTDOWN_TOKEN {
@@ -1562,6 +1568,8 @@ impl Server {
             assert!(self.slots[dispatch.owner].conn.is_open());
             assert!(self.slots[dispatch.owner].query_dispatch_pending);
             self.engine.select_query_workspace(dispatch.workspace);
+            self.engine
+                .bind_query_connection(self.slots[dispatch.owner].conn.id());
             let before_lsn = self.engine.journal_lsn();
             let response = match dispatch.kind {
                 QueryDispatchKind::Readable => Some(self.slots[dispatch.owner].conn.on_readable(
@@ -1717,6 +1725,10 @@ impl Server {
     }
 
     fn complete_dispatch(&mut self, index: usize, after: After) {
+        if !self.slots[index].conn.owns_pending_object_reads() {
+            self.engine
+                .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
+        }
         match after {
             After::Close => self.release(index),
             After::Continue => {
@@ -2840,6 +2852,7 @@ impl Server {
         // unblocked connection is considered in the same reactor turn.
         for _ in 0..=self.slots.len() {
             let generation = self.engine.lock_generation();
+            let read_generation = self.engine.read_capacity_generation();
             for index in 0..self.slots.len() {
                 if !self.slots[index].conn.is_open() || self.slots[index].pending_response.is_some()
                 {
@@ -2867,7 +2880,9 @@ impl Server {
                 });
             }
             self.drain_query_dispatches();
-            if self.engine.lock_generation() == generation {
+            if self.engine.lock_generation() == generation
+                && self.engine.read_capacity_generation() == read_generation
+            {
                 break;
             }
         }
@@ -2944,6 +2959,8 @@ impl Server {
     }
 
     fn release(&mut self, index: usize) {
+        self.engine
+            .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
         if self.slots[index].conn.txn.staged_commit().is_some() {
             assert!(!self.slots[index].query_dispatch_pending);
             let handoff = self.query_workspaces.cancel(index);

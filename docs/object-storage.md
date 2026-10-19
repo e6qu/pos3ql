@@ -19,6 +19,46 @@ An endpoint is supported only after tests prove the operations below behave
 correctly. Bucket creation, account administration, and credentials are set up
 outside pos3ql; an “S3-compatible” label alone is not enough.
 
+## Concurrent requests and durable commits
+
+**User example:** two customers save orders in different tables. Both can wait
+on the same log publication. Reading a cached invoice can continue while that
+upload waits; success for either order waits for its own durable log position.
+
+`object_store_get_slots` reserves independent read clients. A selected-column
+scan starts a bounded batch of missing columns before waiting, retaining
+completed extents across resumption. Atomic operations use a separate block
+client and can still wait synchronously; SQL CPU execution remains serial.
+
+`object_store_put_slots` reserves upload clients and immutable request bodies.
+A log batch has two independent objects: transaction bytes and a descriptor.
+Those uploads can complete out of order. The commit-head update starts only
+after both succeed. Clients retain their transaction outcome until publication
+and ordered in-memory completion finish, including when the client disconnects.
+
+| Setting | Reservation or rejection |
+|---|---|
+| `object_store_get_slots` | Fixed read clients; at least 1 in object-store mode. |
+| `object_store_put_slots` | Fixed upload clients; at least 2 in object-store mode. |
+| `wal_upload_buffer_bytes` | Immutable body bytes per upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
+| `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
+
+The development fixture selects 4 read slots, 4 upload slots and 4 commit queue
+slots. Size their startup memory reservations explicitly for a deployment.
+An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
+`commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
+
+Nonblocking reads have a 30-second deadline. Each upload attempt has a
+30-second deadline, with at most three attempts for retryable failures and
+200 ms then 400 ms backoff. A failed conditional create compares the entire
+stored object, including its length, before accepting an uncertain prior
+success. A different mutable root remains a writer conflict.
+
+A procedure's internal `COMMIT`, login hooks and standalone catalog commands
+retain explicit synchronous completion boundaries. They cannot replay their
+call stack after a commit. The concurrent path for ordinary client commits and
+streaming subscription apply uses the fixed commit queue.
+
 ## Required S3-compatible subset
 
 | S3 operation | Required behavior |

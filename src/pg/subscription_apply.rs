@@ -366,7 +366,17 @@ impl SubscriptionApply {
         // this private callback, including bootstrap and failure cleanup.
         let _evaluation = crate::sql::guc::enter_eval_scope(&self.guc, &mut self.txn);
         let prior_path = engine.enter_subscription_session(self.stream, &self.guc, &self.txn)?;
+        let owner = crate::store::ReadOwner(
+            (2u128 << 96)
+                | ((self.stream.database_oid().get() as u32 as u128) << 64)
+                | self.stream.slot() as u128,
+        );
+        let prior_owner = engine.replace_read_owner(Some(owner));
         let result = operation(self, engine);
+        if result.is_err() || !self.txn.is_active() || self.txn.staged_commit().is_some() {
+            engine.cancel_read_owner(owner);
+        }
+        let _ = engine.replace_read_owner(prior_owner);
         engine.restore_subscription_path(prior_path);
         result
     }
@@ -696,6 +706,11 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
+        engine.cancel_read_owner(crate::store::ReadOwner(
+            (2u128 << 96)
+                | ((self.stream.database_oid().get() as u32 as u128) << 64)
+                | self.stream.slot() as u128,
+        ));
         if self.txn.staged_commit().is_some() {
             // The commit boundary is irreversible. Its startup queue owner
             // survives a disconnected publisher until publication resolves.

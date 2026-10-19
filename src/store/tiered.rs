@@ -177,6 +177,34 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
+    fn set_read_owner(&mut self, owner: Option<super::ReadOwner>) {
+        match self {
+            Layer::Base(store) => store.set_read_owner(owner),
+            Layer::Disk(cache) => cache.set_read_owner(owner),
+        }
+    }
+
+    fn cancel_read_owner(&mut self, owner: super::ReadOwner) {
+        match self {
+            Layer::Base(store) => store.cancel_read_owner(owner),
+            Layer::Disk(cache) => cache.cancel_read_owner(owner),
+        }
+    }
+
+    fn release_read(&mut self, id: &BlockId) {
+        match self {
+            Layer::Base(store) => store.release_read(id),
+            Layer::Disk(cache) => cache.release_read(id),
+        }
+    }
+
+    fn read_capacity_generation(&self) -> u64 {
+        match self {
+            Layer::Base(store) => store.read_capacity_generation(),
+            Layer::Disk(cache) => cache.read_capacity_generation(),
+        }
+    }
+
     fn enable_async_gets(&mut self) {
         match self {
             Layer::Base(store) => store.enable_async_gets(),
@@ -338,6 +366,34 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         match self {
             TieredStore::WithRam(cache) => cache.contains(id),
             TieredStore::WithoutRam(layer) => layer.contains(id),
+        }
+    }
+
+    fn set_read_owner(&mut self, owner: Option<super::ReadOwner>) {
+        match self {
+            TieredStore::WithRam(cache) => cache.set_read_owner(owner),
+            TieredStore::WithoutRam(layer) => layer.set_read_owner(owner),
+        }
+    }
+
+    fn cancel_read_owner(&mut self, owner: super::ReadOwner) {
+        match self {
+            TieredStore::WithRam(cache) => cache.cancel_read_owner(owner),
+            TieredStore::WithoutRam(layer) => layer.cancel_read_owner(owner),
+        }
+    }
+
+    fn release_read(&mut self, id: &BlockId) {
+        match self {
+            TieredStore::WithRam(cache) => cache.release_read(id),
+            TieredStore::WithoutRam(layer) => layer.release_read(id),
+        }
+    }
+
+    fn read_capacity_generation(&self) -> u64 {
+        match self {
+            TieredStore::WithRam(cache) => cache.read_capacity_generation(),
+            TieredStore::WithoutRam(layer) => layer.read_capacity_generation(),
         }
     }
 

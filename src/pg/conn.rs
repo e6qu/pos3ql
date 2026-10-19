@@ -607,6 +607,10 @@ impl Conn {
             || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
+    pub(crate) fn owns_pending_object_reads(&self) -> bool {
+        self.parked && self.parked_for_io && self.txn.staged_commit().is_none()
+    }
+
     pub(crate) fn wants_read(&self) -> bool {
         matches!(self.termination, TerminationState::Draining { .. })
             || (!self.parked && matches!(self.termination, TerminationState::Open))

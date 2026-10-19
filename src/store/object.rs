@@ -18,8 +18,8 @@ use crate::object_store::{ByteRange, Client as ObjectStore, Error as ObjectError
 use std::time::{Duration, Instant};
 
 use super::{
-    BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, PrefetchState, StoreError, decode,
-    decode_packed_block, encode,
+    BlockId, BlockIoStats, BlockStore, BlockType, HEADER_LEN, PrefetchState, ReadOwner, StoreError,
+    decode, decode_packed_block, encode,
 };
 
 /// `<prefix><64 hex chars>`, written into a caller-provided buffer so that
@@ -170,6 +170,8 @@ pub(crate) struct OwnedObjectStore {
     stats: BlockIoStats,
     read_mode: ObjectReadMode,
     hedge_after: Option<Duration>,
+    read_owner: Option<ReadOwner>,
+    read_capacity_generation: u64,
 }
 
 struct ObjectReadSlot {
@@ -182,6 +184,7 @@ struct ObjectReadSlot {
     pending_error: Option<StoreError>,
     started_at: Option<Instant>,
     hedge_issued: bool,
+    owners: FixedVec<ReadOwner>,
 }
 
 impl OwnedObjectStore {
@@ -190,12 +193,17 @@ impl OwnedObjectStore {
             .object_store_get_slots
             .saturating_add(1)
             .saturating_mul(ObjectStore::budget_bytes(config))
-            .saturating_add(
-                config
-                    .object_store_get_slots
-                    .saturating_mul(core::mem::size_of::<ObjectReadSlot>()),
-            )
+            .saturating_add(config.object_store_get_slots.saturating_mul(
+                core::mem::size_of::<ObjectReadSlot>()
+                    + Self::owner_capacity(config) * core::mem::size_of::<ReadOwner>(),
+            ))
             .saturating_add(super::BLOCK_SIZE)
+    }
+
+    fn owner_capacity(config: &crate::config::Config) -> usize {
+        (config.max_connections as usize)
+            .saturating_add(config.max_subscriptions)
+            .saturating_add(1)
     }
 
     /// Startup-only: the scratch Vec is reserved once, before the allocator
@@ -232,6 +240,12 @@ impl OwnedObjectStore {
                     pending_error: None,
                     started_at: None,
                     hedge_issued: false,
+                    owners: FixedVec::new(
+                        budget,
+                        "object read consumers",
+                        Self::owner_capacity(config),
+                    )
+                    .map_err(crate::object_store::SetupError::Budget)?,
                 })
                 .expect("object read slots sized from configuration");
         }
@@ -245,6 +259,8 @@ impl OwnedObjectStore {
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
             read_mode: ObjectReadMode::Atomic,
+            read_owner: None,
+            read_capacity_generation: 0,
             hedge_after: (config.object_store_hedge_after_ms != 0)
                 .then(|| Duration::from_millis(config.object_store_hedge_after_ms)),
         })
@@ -347,18 +363,51 @@ impl OwnedObjectStore {
             && slot.ready_id.is_none()
             && slot.error_id.is_none()
             && slot.pending_error.is_none()
+            && slot.owners.is_empty()
     }
 
-    fn demand_slot(&mut self) -> Option<&mut ObjectReadSlot> {
-        let index = self.slots.iter().position(Self::slot_is_free).or_else(|| {
-            self.slots.iter().position(|slot| {
-                slot.pending_id.is_none() && (slot.ready_id.is_some() || slot.error_id.is_some())
-            })
-        });
-        let index = index?;
-        let slot = &mut self.slots[index];
-        // Immutable completed responses can be retried if their caller still
-        // needs them. Reclaim one when all fixed slots are occupied.
+    fn request_owner(&self) -> Result<Option<ReadOwner>, StoreError> {
+        if self.read_mode == ObjectReadMode::Atomic {
+            Ok(None)
+        } else {
+            self.read_owner
+                .map(Some)
+                .ok_or(StoreError::ReadOwnerRequired)
+        }
+    }
+
+    fn join_owner(slot: &mut ObjectReadSlot, owner: Option<ReadOwner>) -> Result<(), StoreError> {
+        if let Some(owner) = owner
+            && !slot.owners.iter().any(|existing| *existing == owner)
+        {
+            slot.owners
+                .push(owner)
+                .map_err(|_| StoreError::ReadOwnersExhausted)?;
+        }
+        Ok(())
+    }
+
+    fn join_request(
+        &mut self,
+        id: BlockId,
+        packed: bool,
+        owner: Option<ReadOwner>,
+    ) -> Result<(), StoreError> {
+        for slot in self.slots.as_mut_slice() {
+            if slot.packed == packed
+                && (slot.pending_id == Some(id)
+                    || slot.ready_id == Some(id)
+                    || slot.error_id == Some(id))
+            {
+                Self::join_owner(slot, owner)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_slot(slot: &mut ObjectReadSlot) {
+        slot.client.cancel_request();
+        slot.pending_id = None;
         slot.ready_id = None;
         slot.error_id = None;
         slot.pending_error = None;
@@ -366,30 +415,65 @@ impl OwnedObjectStore {
         slot.hedge_issued = false;
         slot.speculative = false;
         slot.packed = false;
-        Some(slot)
+        slot.owners.clear();
     }
 
-    fn release_siblings(&mut self, id: BlockId, winner: usize) {
-        for (index, slot) in self.slots.as_mut_slice().iter_mut().enumerate() {
+    fn consume(&mut self, index: usize, owner: Option<ReadOwner>) {
+        let slot = &mut self.slots[index];
+        let owner = owner.or(self.read_owner);
+        if let Some(owner) = owner {
+            if let Some(index) = slot.owners.iter().position(|existing| *existing == owner) {
+                slot.owners.swap_remove(index);
+            }
+        }
+        if slot.owners.is_empty() {
+            Self::clear_slot(slot);
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+        }
+    }
+
+    fn demand_slot(&mut self, owner: Option<ReadOwner>) -> Option<&mut ObjectReadSlot> {
+        let free = self.slots.iter().position(Self::slot_is_free);
+        let index = free.or_else(|| {
+            // A caller may abandon its own lookahead to make a demand read.
+            // Never discard a result another suspended consumer still owns.
+            self.slots.iter().position(|slot| {
+                slot.speculative && slot.owners.len() == 1 && Some(slot.owners[0]) == owner
+            })
+        })?;
+        if !Self::slot_is_free(&self.slots[index]) {
+            Self::clear_slot(&mut self.slots[index]);
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+        }
+        Some(&mut self.slots[index])
+    }
+
+    fn release_siblings(&mut self, id: BlockId, winner: usize) -> Result<(), StoreError> {
+        for index in 0..self.slots.len() {
             if index == winner
-                || (slot.pending_id != Some(id)
-                    && slot.ready_id != Some(id)
-                    && slot.error_id != Some(id))
+                || self.slots[index].packed != self.slots[winner].packed
+                || (self.slots[index].pending_id != Some(id)
+                    && self.slots[index].ready_id != Some(id)
+                    && self.slots[index].error_id != Some(id))
             {
                 continue;
             }
-            if slot.pending_id.is_some() {
-                slot.client.cancel_request();
+            let (source, destination) = if index < winner {
+                let (before, after) = self.slots.as_mut_slice().split_at_mut(winner);
+                (&mut before[index], &mut after[0])
+            } else {
+                let (before, after) = self.slots.as_mut_slice().split_at_mut(index);
+                (&mut after[0], &mut before[winner])
+            };
+            // The winning body inherits every waiter before a duplicate socket
+            // or completion is released. Cancellation removes only its caller.
+            for owner in source.owners.iter() {
+                Self::join_owner(destination, Some(*owner))?;
             }
-            slot.pending_id = None;
-            slot.ready_id = None;
-            slot.error_id = None;
-            slot.pending_error = None;
-            slot.started_at = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
+            Self::clear_slot(source);
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
         }
+        Ok(())
     }
 
     fn next_read_deadline(&self) -> Option<Instant> {
@@ -451,6 +535,11 @@ impl OwnedObjectStore {
             .pending_id
             .expect("selected pending hedge source");
         self.slots[source_index].hedge_issued = true;
+        for index in 0..self.slots[source_index].owners.len() {
+            let owner = self.slots[source_index].owners[index];
+            Self::join_owner(&mut self.slots[destination_index], Some(owner))
+                .expect("hedge slots share the same startup consumer capacity");
+        }
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, &id, &mut key_buffer);
         let hedge_bytes = {
@@ -504,26 +593,30 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
+        let owner = self.request_owner()?;
         if let Some(winner) = self
             .slots
             .iter()
             .position(|slot| slot.ready_id == Some(*id) && !slot.packed)
         {
-            self.release_siblings(*id, winner);
-            let slot = &mut self.slots[winner];
-            slot.ready_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            return decode_block_body(slot.client.body_bytes(), id, into);
+            self.release_siblings(*id, winner)?;
+            Self::join_owner(&mut self.slots[winner], owner)?;
+            let result = decode_block_body(self.slots[winner].client.body_bytes(), id, into);
+            self.consume(winner, owner);
+            return result;
         }
         if self.read_mode == ObjectReadMode::Restartable
-            && let Some(slot) = self
+            && self
                 .slots
-                .iter_mut()
-                .find(|slot| slot.pending_id == Some(*id) && !slot.packed)
+                .iter()
+                .any(|slot| slot.pending_id == Some(*id) && !slot.packed)
         {
-            slot.speculative = false;
+            self.join_request(*id, false, owner)?;
+            for slot in self.slots.as_mut_slice() {
+                if slot.pending_id == Some(*id) && !slot.packed {
+                    slot.speculative = false;
+                }
+            }
             return Err(StoreError::NotReady);
         }
         if let Some(winner) = self
@@ -531,27 +624,30 @@ impl BlockStore for OwnedObjectStore {
             .iter()
             .position(|slot| slot.error_id == Some(*id) && !slot.packed)
         {
-            self.release_siblings(*id, winner);
-            let slot = &mut self.slots[winner];
-            slot.error_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            return Err(slot.pending_error.take().expect("checked above"));
+            self.release_siblings(*id, winner)?;
+            Self::join_owner(&mut self.slots[winner], owner)?;
+            let error = self.slots[winner]
+                .pending_error
+                .expect("retained read failure");
+            self.consume(winner, owner);
+            return Err(error);
         }
         let started = Instant::now();
         let prefix = self.prefix;
         let read = if self.read_mode == ObjectReadMode::Atomic {
             get_block(&mut self.atomic_client, prefix, id, into)
         } else {
-            let Some(slot) = self.demand_slot() else {
+            let Some(slot) = self.demand_slot(owner) else {
                 return Err(StoreError::NotReady);
             };
+            Self::join_owner(slot, owner)?;
             let read = get_block(&mut slot.client, prefix, id, into);
             if matches!(&read, ObjectBlockRead::Pending) {
                 slot.pending_id = Some(*id);
                 slot.started_at = Some(started);
                 slot.packed = false;
+            } else {
+                Self::clear_slot(slot);
             }
             read
         };
@@ -568,20 +664,20 @@ impl BlockStore for OwnedObjectStore {
         _scratch: &mut [u8],
     ) -> Result<(usize, BlockType), StoreError> {
         let range = PackedBlockRange::new(offset, length)?;
+        let owner = self.request_owner()?;
         if let Some(winner) = self
             .slots
             .iter()
             .position(|slot| slot.ready_id == Some(*expected) && slot.packed)
         {
-            let slot = &mut self.slots[winner];
-            slot.ready_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            if slot.client.body_bytes().len() != length {
-                return Err(StoreError::Corrupt(super::BlockError::Truncated));
-            }
-            return decode_packed_block(slot.client.body_bytes(), expected, into);
+            Self::join_owner(&mut self.slots[winner], owner)?;
+            let result = if self.slots[winner].client.body_bytes().len() != length {
+                Err(StoreError::Corrupt(super::BlockError::Truncated))
+            } else {
+                decode_packed_block(self.slots[winner].client.body_bytes(), expected, into)
+            };
+            self.consume(winner, owner);
+            return result;
         }
         if self.read_mode == ObjectReadMode::Restartable
             && self
@@ -589,6 +685,7 @@ impl BlockStore for OwnedObjectStore {
                 .iter()
                 .any(|slot| slot.pending_id == Some(*expected) && slot.packed)
         {
+            self.join_request(*expected, true, owner)?;
             return Err(StoreError::NotReady);
         }
         if let Some(winner) = self
@@ -596,12 +693,12 @@ impl BlockStore for OwnedObjectStore {
             .iter()
             .position(|slot| slot.error_id == Some(*expected) && slot.packed)
         {
-            let slot = &mut self.slots[winner];
-            slot.error_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            return Err(slot.pending_error.take().expect("checked above"));
+            Self::join_owner(&mut self.slots[winner], owner)?;
+            let error = self.slots[winner]
+                .pending_error
+                .expect("retained packed read failure");
+            self.consume(winner, owner);
+            return Err(error);
         }
         let started = Instant::now();
         let prefix = self.prefix;
@@ -615,14 +712,17 @@ impl BlockStore for OwnedObjectStore {
                 into,
             )
         } else {
-            let Some(slot) = self.demand_slot() else {
+            let Some(slot) = self.demand_slot(owner) else {
                 return Err(StoreError::NotReady);
             };
+            Self::join_owner(slot, owner)?;
             let read = get_packed_block(&mut slot.client, prefix, container, range, expected, into);
             if matches!(&read, ObjectBlockRead::Pending) {
                 slot.pending_id = Some(*expected);
                 slot.started_at = Some(started);
                 slot.packed = true;
+            } else {
+                Self::clear_slot(slot);
             }
             read
         };
@@ -630,15 +730,19 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
-        for slot in self.slots.as_mut_slice() {
-            if slot.pending_id == Some(*id)
-                || slot.ready_id == Some(*id)
-                || slot.error_id == Some(*id)
-            {
-                self.stats.object_prefetch_reused =
-                    self.stats.object_prefetch_reused.saturating_add(1);
-                return Ok(PrefetchState::Reused);
-            }
+        let owner = self.request_owner()?;
+        if owner.is_none() {
+            return Ok(PrefetchState::Unavailable);
+        }
+        if self.slots.iter().any(|slot| {
+            !slot.packed
+                && (slot.pending_id == Some(*id)
+                    || slot.ready_id == Some(*id)
+                    || slot.error_id == Some(*id))
+        }) {
+            self.join_request(*id, false, owner)?;
+            self.stats.object_prefetch_reused = self.stats.object_prefetch_reused.saturating_add(1);
+            return Ok(PrefetchState::Reused);
         }
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
@@ -649,6 +753,7 @@ impl BlockStore for OwnedObjectStore {
                     self.stats.object_prefetch_saturated.saturating_add(1);
                 return Ok(PrefetchState::Saturated);
             };
+            Self::join_owner(slot, owner)?;
             match slot.client.get(key, None) {
                 Ok(result) => {
                     slot.ready_id = Some(*id);
@@ -662,7 +767,10 @@ impl BlockStore for OwnedObjectStore {
                     slot.packed = false;
                     None
                 }
-                Err(error) => return Err(store_error(error)),
+                Err(error) => {
+                    Self::clear_slot(slot);
+                    return Err(store_error(error));
+                }
             }
         };
         if let Some(bytes) = completed {
@@ -679,44 +787,48 @@ impl BlockStore for OwnedObjectStore {
         id: &BlockId,
         into: &mut [u8],
     ) -> Result<Option<(usize, BlockType)>, StoreError> {
-        if let Some(winner) = self
-            .slots
-            .iter()
-            .position(|slot| slot.ready_id == Some(*id) && !slot.packed)
-        {
-            self.release_siblings(*id, winner);
-            let slot = &mut self.slots[winner];
-            slot.ready_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
-        }
-        if self
-            .slots
-            .iter()
-            .any(|slot| slot.pending_id == Some(*id) && !slot.packed)
-        {
-            return Ok(None);
-        }
-        if let Some(winner) = self
-            .slots
-            .iter()
-            .position(|slot| slot.error_id == Some(*id) && !slot.packed)
-        {
-            self.release_siblings(*id, winner);
-            let slot = &mut self.slots[winner];
-            slot.error_id = None;
-            slot.hedge_issued = false;
-            slot.speculative = false;
-            slot.packed = false;
-            return Err(slot.pending_error.take().expect("checked above"));
-        }
         match self.get(id, into) {
             Ok(result) => Ok(Some(result)),
             Err(StoreError::NotReady) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn set_read_owner(&mut self, owner: Option<ReadOwner>) {
+        self.read_owner = owner;
+    }
+
+    fn cancel_read_owner(&mut self, owner: ReadOwner) {
+        for slot in self.slots.as_mut_slice() {
+            let before = slot.owners.len();
+            if let Some(index) = slot.owners.iter().position(|existing| *existing == owner) {
+                slot.owners.swap_remove(index);
+            }
+            if before != slot.owners.len() && slot.owners.is_empty() {
+                Self::clear_slot(slot);
+                self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+            }
+        }
+    }
+
+    fn release_read(&mut self, id: &BlockId) {
+        let Some(owner) = self.read_owner else {
+            return;
+        };
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            if (slot.pending_id == Some(*id)
+                || slot.ready_id == Some(*id)
+                || slot.error_id == Some(*id))
+                && slot.owners.iter().any(|existing| *existing == owner)
+            {
+                self.consume(index, Some(owner));
+            }
+        }
+    }
+
+    fn read_capacity_generation(&self) -> u64 {
+        self.read_capacity_generation
     }
 
     fn io_stats(&self) -> BlockIoStats {
@@ -812,6 +924,209 @@ mod tests {
     }
 
     #[test]
+    fn parallel_reads_shared_results_survive_other_demand_until_every_consumer_finishes() {
+        for packed in [false, true] {
+            for missing in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut config = network_config(
+                    listener.local_addr().unwrap().port(),
+                    "shared-read-consumers",
+                );
+                config.object_store_get_slots = 1;
+                let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+                let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+                store.enable_async_gets();
+                let payload = b"one immutable response for two suspended queries";
+                let (id, frame) = atomic_read_frame(payload);
+                let container = BlockId::of(b"shared packed container");
+                let mut output = [0u8; 128];
+                let get = |store: &mut OwnedObjectStore, output: &mut [u8]| {
+                    if packed {
+                        store.get_packed(&container, 0, frame.len(), &id, output, &mut [])
+                    } else {
+                        store.get(&id, output)
+                    }
+                };
+                crate::mem::guard::forbid_alloc(|| {
+                    for owner in [ReadOwner(1), ReadOwner(2)] {
+                        store.set_read_owner(Some(owner));
+                        assert_eq!(get(&mut store, &mut output), Err(StoreError::NotReady));
+                    }
+                    assert_eq!(store.io_stats().object_gets, 1);
+                });
+                finish_request_sends(&mut store);
+                let (mut stream, _) = atomic_read_request(&listener);
+                atomic_read_response(&mut stream, &frame, packed, missing);
+                drop(stream);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !crate::mem::guard::forbid_alloc(|| store.advance_pending_read(0)).unwrap() {
+                    assert!(Instant::now() < deadline, "shared response did not arrive");
+                    std::thread::yield_now();
+                }
+                let expected = if missing {
+                    Err(StoreError::NotFound)
+                } else {
+                    Ok((payload.len(), BlockType::SstData))
+                };
+                crate::mem::guard::forbid_alloc(|| {
+                    store.set_read_owner(Some(ReadOwner(1)));
+                    assert_eq!(get(&mut store, &mut output), expected);
+                    if !missing {
+                        assert_eq!(&output[..payload.len()], payload);
+                    }
+                    assert!(!OwnedObjectStore::slot_is_free(&store.slots[0]));
+                    store.set_read_owner(Some(ReadOwner(3)));
+                    assert_eq!(
+                        store.get(&BlockId::of(b"unrelated demand"), &mut output),
+                        Err(StoreError::NotReady)
+                    );
+                    assert_eq!(store.io_stats().object_gets, 1);
+                    store.set_read_owner(Some(ReadOwner(2)));
+                    assert_eq!(get(&mut store, &mut output), expected);
+                    if !missing {
+                        assert_eq!(&output[..payload.len()], payload);
+                    }
+                    assert!(OwnedObjectStore::slot_is_free(&store.slots[0]));
+                    assert_eq!(store.read_capacity_generation(), 1);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_reads_cancel_only_their_consumer_and_release_hedged_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config =
+            network_config(listener.local_addr().unwrap().port(), "cancel-shared-hedge");
+        config.object_store_get_slots = 2;
+        config.object_store_hedge_after_ms = 1;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+        let id = BlockId::of(b"held shared and hedged response");
+        let mut output = [0u8; 64];
+        crate::mem::guard::forbid_alloc(|| {
+            for owner in [ReadOwner(1), ReadOwner(2)] {
+                store.set_read_owner(Some(owner));
+                assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));
+            }
+            let started = store.slots[0].started_at.unwrap();
+            assert!(!store.advance_read_deadlines(started + Duration::from_millis(1)));
+            for slot in store.slots.iter() {
+                assert_eq!(slot.pending_id, Some(id));
+                assert_eq!(slot.owners.len(), 2);
+            }
+            store.cancel_read_owner(ReadOwner(1));
+            for slot in store.slots.iter() {
+                assert_eq!(slot.owners.as_slice(), &[ReadOwner(2)]);
+                assert!(slot.client.pending_fd().is_some());
+            }
+            assert_eq!(store.read_capacity_generation(), 0);
+            store.cancel_read_owner(ReadOwner(2));
+            for slot in store.slots.iter() {
+                assert!(OwnedObjectStore::slot_is_free(slot));
+                assert!(slot.client.pending_fd().is_none());
+            }
+            assert_eq!(store.read_capacity_generation(), 2);
+            assert!(store.next_read_deadline().is_none());
+        });
+    }
+
+    #[test]
+    fn parallel_reads_require_owners_and_reject_consumer_exhaustion_without_losing_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = network_config(
+            listener.local_addr().unwrap().port(),
+            "read-consumer-capacity",
+        );
+        config.object_store_get_slots = 1;
+        config.max_connections = 0;
+        config.max_subscriptions = 0;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+        let id = BlockId::of(b"one reserved consumer");
+        let mut output = [0u8; 64];
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                store.get(&id, &mut output),
+                Err(StoreError::ReadOwnerRequired)
+            );
+            assert_eq!(store.io_stats().object_gets, 0);
+            store.set_read_owner(Some(ReadOwner(1)));
+            assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));
+            let fd = store.pending_read_fd(0).unwrap();
+            store.set_read_owner(Some(ReadOwner(2)));
+            assert_eq!(
+                store.get(&id, &mut output),
+                Err(StoreError::ReadOwnersExhausted)
+            );
+            assert_eq!(store.pending_read_fd(0), Some(fd));
+            assert_eq!(store.slots[0].owners.as_slice(), &[ReadOwner(1)]);
+            assert_eq!(store.io_stats().object_gets, 1);
+            store.cancel_read_owner(ReadOwner(1));
+            assert!(OwnedObjectStore::slot_is_free(&store.slots[0]));
+        });
+    }
+
+    #[test]
+    fn parallel_reads_cache_hits_release_shared_responses_before_further_demand() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = network_config(
+            listener.local_addr().unwrap().port(),
+            "shared-cache-consumers",
+        );
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config) + (1 << 20));
+        let store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let mut cache =
+            super::super::BlockCache::new(&mut budget, "shared response cache", store, 1).unwrap();
+        cache.enable_async_gets();
+        let payload = b"the second query can use the first query's cached response";
+        let (id, frame) = atomic_read_frame(payload);
+        let mut output = [0u8; 128];
+        crate::mem::guard::forbid_alloc(|| {
+            for owner in [ReadOwner(1), ReadOwner(2)] {
+                cache.set_read_owner(Some(owner));
+                assert_eq!(cache.get(&id, &mut output), Err(StoreError::NotReady));
+            }
+        });
+        finish_request_sends(cache.inner_mut());
+        let (mut stream, _) = atomic_read_request(&listener);
+        atomic_read_response(&mut stream, &frame, false, false);
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !crate::mem::guard::forbid_alloc(|| cache.advance_pending_read(0)).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "shared cache response did not arrive"
+            );
+            std::thread::yield_now();
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            for owner in [ReadOwner(1), ReadOwner(2)] {
+                cache.set_read_owner(Some(owner));
+                assert_eq!(
+                    cache.get(&id, &mut output).unwrap(),
+                    (payload.len(), BlockType::SstData)
+                );
+                assert_eq!(&output[..payload.len()], payload);
+            }
+            assert_eq!(cache.io_stats().ram_hits, 1);
+            assert_eq!(cache.io_stats().object_gets, 1);
+            assert!(OwnedObjectStore::slot_is_free(&cache.inner_mut().slots[0]));
+            assert_eq!(cache.read_capacity_generation(), 1);
+            assert_eq!(
+                cache.get(&BlockId::of(b"next uncached block"), &mut output),
+                Err(StoreError::NotReady)
+            );
+            assert_eq!(cache.io_stats().object_gets, 2);
+            cache.cancel_read_owner(ReadOwner(2));
+            assert!(OwnedObjectStore::slot_is_free(&cache.inner_mut().slots[0]));
+        });
+    }
+
+    #[test]
     fn parallel_reads_timeout_whole_and_packed_requests_without_waiting_for_socket_events() {
         use std::net::TcpListener;
         for packed in [false, true] {
@@ -820,6 +1135,7 @@ mod tests {
             let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
             let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
             store.enable_async_gets();
+            store.set_read_owner(Some(ReadOwner(1)));
             let id = BlockId::of(b"held read");
             let container = BlockId::of(b"held packed read");
             let mut output = [0u8; 128];
@@ -1026,6 +1342,7 @@ mod tests {
         let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
         let pending_container = BlockId::of(b"pending packed container");
         let packed_container = BlockId::of(b"atomic packed container");
         let mut output = [0u8; 128];
@@ -1090,6 +1407,7 @@ mod tests {
             assert_eq!(store.pending_read_fd(0), Some(fd));
             assert!(store.async_reads_busy());
             store.enable_async_gets();
+            store.set_read_owner(Some(ReadOwner(1)));
         });
         release.send(()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -1134,6 +1452,7 @@ mod tests {
                 + if missing_pending { 0 } else { pending_length };
             assert_eq!(store.io_stats().object_read_bytes, expected_bytes as u64);
             store.enable_async_gets();
+            store.set_read_owner(Some(ReadOwner(1)));
             let mut result = store.get(&atomic_id, &mut output);
             while result == Err(StoreError::NotReady) {
                 assert!(
@@ -1204,6 +1523,7 @@ mod tests {
         let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
         let id = BlockId::of(b"owned pending request");
         let mut output = [0u8; 32];
         assert_eq!(
@@ -1217,6 +1537,7 @@ mod tests {
             for restartable in [true, false] {
                 if restartable {
                     store.enable_async_gets();
+                    store.set_read_owner(Some(ReadOwner(1)));
                 } else {
                     store.disable_async_gets();
                 }
@@ -1256,6 +1577,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
 
         let first = BlockId::of(b"first");
         let second = BlockId::of(b"second");
@@ -1323,6 +1645,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
         assert_eq!(store.prefetch(&id).unwrap(), PrefetchState::Scheduled);
         let mut complete = false;
         for _ in 0..10_000 {
@@ -1364,6 +1687,7 @@ mod tests {
         let first = store.put(b"first", BlockType::SstData, 0).unwrap();
         let second = store.put(b"second", BlockType::SstData, 0).unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
 
         assert_eq!(store.prefetch(&first).unwrap(), PrefetchState::Scheduled);
         assert!(!store.async_reads_busy());
@@ -1381,16 +1705,17 @@ mod tests {
 
         assert_eq!(store.prefetch(&second).unwrap(), PrefetchState::Scheduled);
         store.slots[0].speculative = false;
-        assert_eq!(
-            store.get(&first, &mut output).unwrap(),
-            (5, BlockType::SstData)
-        );
-        assert_eq!(&output[..5], b"first");
+        assert_eq!(store.get(&first, &mut output), Err(StoreError::NotReady));
         assert_eq!(
             store.take_prefetch(&second, &mut output).unwrap(),
             Some((6, BlockType::SstData))
         );
         assert_eq!(&output[..6], b"second");
+        assert_eq!(
+            store.get(&first, &mut output).unwrap(),
+            (5, BlockType::SstData)
+        );
+        assert_eq!(&output[..5], b"first");
 
         assert_eq!(store.prefetch(&second).unwrap(), PrefetchState::Scheduled);
         assert!(!store.async_reads_busy());
@@ -1437,6 +1762,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
 
         let container = BlockId::of(b"packed container");
         let mut output = [0u8; 64];
@@ -1594,6 +1920,7 @@ mod tests {
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         store.enable_async_gets();
+        store.set_read_owner(Some(ReadOwner(1)));
 
         let mut output = [0u8; 64];
         assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));

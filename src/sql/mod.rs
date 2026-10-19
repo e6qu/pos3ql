@@ -112,6 +112,10 @@ pub(crate) struct ExecutionIdentity {
 }
 
 impl ExecutionIdentity {
+    pub(crate) const fn read_owner(self) -> crate::store::ReadOwner {
+        crate::store::ReadOwner((1u128 << 96) | self.connection_id as u32 as u128)
+    }
+
     pub(crate) const fn new(connection_id: i32, database_oid: crate::storage::DatabaseOid) -> Self {
         Self {
             connection_id,
@@ -484,6 +488,7 @@ pub struct Engine {
     unpromoted_commits: usize,
     fatal_commit_failure: Option<SqlError>,
     commit_queue: Option<commit::Queue>,
+    read_owner: Option<crate::store::ReadOwner>,
     visible_lsn: u64,
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
@@ -2447,6 +2452,7 @@ impl Engine {
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
         self.wal.select_database(self.work.database_oid());
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
     }
 
     pub(crate) fn execution_identity(&self) -> ExecutionIdentity {
@@ -2456,6 +2462,34 @@ impl Engine {
     pub(crate) fn restore_execution_identity(&mut self, identity: ExecutionIdentity) {
         publish_execution_identity(identity);
         self.wal.select_database(identity.database_oid);
+        let _ = self.replace_read_owner(Some(identity.read_owner()));
+    }
+
+    pub(crate) fn bind_query_connection(&mut self, connection_id: i32) {
+        self.work.bind_connection(connection_id);
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
+    }
+
+    pub(crate) fn replace_read_owner(
+        &mut self,
+        owner: Option<crate::store::ReadOwner>,
+    ) -> Option<crate::store::ReadOwner> {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.set_read_owner(owner);
+        }
+        core::mem::replace(&mut self.read_owner, owner)
+    }
+
+    pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
+        if let Some(checkpointer) = &mut self.ckpt {
+            checkpointer.cancel_read_owner(owner);
+        }
+    }
+
+    pub(crate) fn read_capacity_generation(&self) -> u64 {
+        self.ckpt
+            .as_ref()
+            .map_or(0, Checkpointer::read_capacity_generation)
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
@@ -3785,6 +3819,7 @@ impl Engine {
             } else {
                 None
             },
+            read_owner: None,
             visible_lsn: recovered_durable_lsn,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
@@ -5275,7 +5310,7 @@ impl Engine {
             return self.complete_staged_commit(txn, guc);
         }
         let prepared_slot = match target {
-            txn::CommitTarget::Prepare { slot } => Some(slot),
+            txn::CommitTarget::Prepare { slot, .. } => Some(slot),
             _ => None,
         };
         // The next statement starts a fresh transaction clock.
@@ -6273,8 +6308,8 @@ impl Engine {
         }
         statistics_receipts.acknowledge();
         self.wal.commit();
-        if let txn::CommitTarget::CommitPrepared { slot }
-        | txn::CommitTarget::RollbackPrepared { slot } = target
+        if let txn::CommitTarget::CommitPrepared { slot, .. }
+        | txn::CommitTarget::RollbackPrepared { slot, .. } = target
         {
             self.prepared_transactions.claim_resolution(slot, txn.txid);
         }
@@ -6321,6 +6356,7 @@ impl Engine {
         if txn.staged_commit().is_none() {
             return Ok(());
         }
+        let _atomic_reads = self.atomic_block_read_scope();
         let _published = eval::funcs::system::retain_session_evaluation();
         let _evaluation = guc::enter_eval_scope(guc, txn);
         let role = guc.current_role();
@@ -6381,7 +6417,7 @@ impl Engine {
         }
         txn.take_staged_commit();
         let result = match staged.target {
-            txn::CommitTarget::Prepare { slot } => {
+            txn::CommitTarget::Prepare { slot, .. } => {
                 guc.commit_transaction();
                 let prepared_transaction = txn.txid;
                 self.storage.prepare_transaction_locks(txn.txid);
@@ -6410,10 +6446,10 @@ impl Engine {
                 let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
                 match target {
                     txn::CommitTarget::Ordinary => own,
-                    txn::CommitTarget::CommitPrepared { slot } => own.and_then(|()| {
+                    txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
                         self.complete_prepared_resolution(slot, true, txn, staged.lsn)
                     }),
-                    txn::CommitTarget::RollbackPrepared { slot } => own.and_then(|()| {
+                    txn::CommitTarget::RollbackPrepared { slot, .. } => own.and_then(|()| {
                         self.complete_prepared_resolution(slot, false, txn, staged.lsn)
                     }),
                     txn::CommitTarget::Prepare { .. } => unreachable!("prepare handled separately"),
@@ -6455,9 +6491,11 @@ impl Engine {
                 .expect("ready commit queue")
                 .take_work(ticket);
             let prior = self.execution_identity();
+            let read_owner = self.read_owner;
             self.restore_execution_identity(work.identity);
             let result = self.finish_staged_transaction(&mut work.transaction, &work.guc);
             self.restore_execution_identity(prior);
+            let _ = self.replace_read_owner(read_owner);
             self.commit_queue
                 .as_mut()
                 .expect("working commit queue")
@@ -7191,13 +7229,16 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         if let Some(staged) = txn.staged_commit() {
-            let txn::CommitTarget::Prepare { slot } = staged.target else {
+            let txn::CommitTarget::Prepare {
+                gid: staged_gid, ..
+            } = staged.target
+            else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "PREPARE changed staged commit target"
                 ));
             };
-            if self.prepared_transactions.slot(slot).metadata().gid != gid {
+            if staged_gid != gid {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "PREPARE changed staged transaction identity"
@@ -7348,7 +7389,7 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
-        if let Err(error) = self.finish_txn(txn, guc, txn::CommitTarget::Prepare { slot }) {
+        if let Err(error) = self.finish_txn(txn, guc, txn::CommitTarget::Prepare { slot, gid }) {
             if txn.staged_commit().is_none() {
                 self.prepared_transactions.release(slot);
             }
@@ -7366,9 +7407,9 @@ impl Engine {
         guc: &GucState,
     ) -> Result<(), SqlError> {
         if let Some(staged) = txn.staged_commit() {
-            let slot = match staged.target {
-                txn::CommitTarget::CommitPrepared { slot } if commit => slot,
-                txn::CommitTarget::RollbackPrepared { slot } if !commit => slot,
+            let staged_gid = match staged.target {
+                txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
+                txn::CommitTarget::RollbackPrepared { gid, .. } if !commit => gid,
                 _ => {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -7376,7 +7417,7 @@ impl Engine {
                     ));
                 }
             };
-            if self.prepared_transactions.slot(slot).metadata().gid != gid {
+            if staged_gid != gid {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "prepared resolution changed identity"
@@ -7438,9 +7479,9 @@ impl Engine {
             txn,
             guc,
             if commit {
-                txn::CommitTarget::CommitPrepared { slot }
+                txn::CommitTarget::CommitPrepared { slot, gid }
             } else {
-                txn::CommitTarget::RollbackPrepared { slot }
+                txn::CommitTarget::RollbackPrepared { slot, gid }
             },
         )
     }
@@ -7882,6 +7923,7 @@ impl Engine {
     /// Enables reactor-driven reads only for the durable block stack. Manifest
     /// and WAL clients retain their synchronous, statement-atomic contracts.
     pub(crate) fn enable_async_block_reads(&mut self) {
+        let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.enable_async_block_reads();
         }
@@ -9687,7 +9729,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9970,7 +10012,7 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -10156,7 +10198,7 @@ impl Engine {
         conn_id: i32,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _atomic_reads = self.atomic_block_read_scope();
-        self.work.bind_connection(conn_id);
+        self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             responder.error(error.sqlstate, error.message.as_str())?;

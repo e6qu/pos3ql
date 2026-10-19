@@ -20,6 +20,22 @@
 
 macro_rules! delegate_async_block_reads {
     () => {
+        fn set_read_owner(&mut self, owner: Option<super::ReadOwner>) {
+            self.inner.set_read_owner(owner);
+        }
+
+        fn cancel_read_owner(&mut self, owner: super::ReadOwner) {
+            self.inner.cancel_read_owner(owner);
+        }
+
+        fn release_read(&mut self, id: &super::BlockId) {
+            self.inner.release_read(id);
+        }
+
+        fn read_capacity_generation(&self) -> u64 {
+            self.inner.read_capacity_generation()
+        }
+
         fn enable_async_gets(&mut self) {
             self.inner.enable_async_gets();
         }
@@ -303,6 +319,10 @@ pub(crate) fn decode(bytes: &[u8], verify_identity: bool) -> Result<Block<'_>, B
     })
 }
 
+/// Opaque identity of a consumer whose suspended operation owns read results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadOwner(pub(crate) u128);
+
 /// Where blocks live. The seam the tiered cache, the local grid and the bucket
 /// all sit behind, so the layers above never learn which one answered.
 ///
@@ -350,6 +370,20 @@ pub(crate) trait BlockStore {
             return Err(StoreError::Corrupt(BlockError::Truncated));
         }
         decode_packed_extent(&scratch[..container_len], offset, length, expected, into)
+    }
+
+    /// Selects the explicit owner for subsequent asynchronous demand/prefetch reads.
+    fn set_read_owner(&mut self, _owner: Option<ReadOwner>) {}
+
+    /// Releases one consumer without discarding other consumers of shared reads.
+    fn cancel_read_owner(&mut self, _owner: ReadOwner) {}
+
+    /// Releases the current consumer when another tier has supplied the block.
+    fn release_read(&mut self, _id: &BlockId) {}
+
+    /// Changes when a consumed or canceled response frees request capacity.
+    fn read_capacity_generation(&self) -> u64 {
+        0
     }
 
     /// Enables non-blocking object reads for this stack. The server owns the
@@ -563,6 +597,10 @@ pub(crate) enum StoreError {
     Unavailable,
     /// An object read exceeded its 30-second request deadline.
     ReadTimedOut,
+    /// Asynchronous reads require a caller identity.
+    ReadOwnerRequired,
+    /// Consumer slots reserved from max_connections and max_subscriptions filled.
+    ReadOwnersExhausted,
     /// A non-blocking fetch is in progress; retry later.
     NotReady,
 }

@@ -190,6 +190,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
             into[..len].copy_from_slice(&self.slot(frame)[..len]);
             self.frames[frame].referenced = true;
             self.stats.hits += 1;
+            self.inner.release_read(id);
             return Ok((len, self.frames[frame].block_type));
         }
         self.stats.misses += 1;
@@ -224,6 +225,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         if self.index.get(id).is_none() {
             return self.inner.prefetch(id);
         }
+        self.inner.release_read(id);
         Ok(super::PrefetchState::Reused)
     }
 
@@ -232,6 +234,9 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
         id: &BlockId,
         into: &mut [u8],
     ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        if self.index.get(id).is_some() {
+            return self.get(id, into).map(Some);
+        }
         let Some((len, block_type)) = self.inner.take_prefetch(id, into)? else {
             return Ok(None);
         };

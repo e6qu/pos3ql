@@ -47,6 +47,22 @@ impl<Store: BlockStore + ?Sized> BlockStore for SharedBlockStore<'_, Store> {
             .get_packed(container, offset, length, expected, into, scratch)
     }
 
+    fn set_read_owner(&mut self, owner: Option<super::ReadOwner>) {
+        self.lock().set_read_owner(owner);
+    }
+
+    fn cancel_read_owner(&mut self, owner: super::ReadOwner) {
+        self.lock().cancel_read_owner(owner);
+    }
+
+    fn release_read(&mut self, id: &BlockId) {
+        self.lock().release_read(id);
+    }
+
+    fn read_capacity_generation(&self) -> u64 {
+        self.lock().read_capacity_generation()
+    }
+
     fn enable_async_gets(&mut self) {
         self.lock().enable_async_gets();
     }

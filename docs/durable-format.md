@@ -20,7 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v15` | yes | yes | Current enum member identities and legacy label bindings. |
+| Checkpoint manifest | `pos3ql-manifest-v16` | yes | yes | Requires typed block identities; retains current enum member identities and legacy label bindings. |
+| Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
 | Empty commit root | `pos3ql-empty-commit-head-v1` | yes | yes | Fences an as-yet unpublished commit root. |
@@ -32,6 +33,11 @@ they never select a guessed decoder.
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
 | Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
 | Published row SST | `v4` | yes | yes | Current packed format: PAX full slices and row-packed deltas. |
+
+A column container and a row index can contain identical bytes and still be
+different blocks. Their type is part of the object name, so writing one cannot
+replace the other. Headers without the current identity version are rejected.
+Manifest v15 and older manifests are rejected before their references are used.
 
 ## Why the storage layout matters
 

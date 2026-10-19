@@ -413,7 +413,7 @@ mod tests {
             if c.put(&[i; 256], BlockType::SstData, i as u64).is_ok() {
                 stored += 1;
             } else {
-                let id = BlockId::of(&[i; 256]);
+                let id = BlockId::for_block(BlockType::SstData, &[i; 256]);
                 assert!(
                     !c.contains(&id).unwrap(),
                     "cached a block the store refused"

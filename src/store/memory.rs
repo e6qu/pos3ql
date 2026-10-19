@@ -189,7 +189,7 @@ mod tests {
         assert!(n > 0, "nothing fitted at all");
         // Everything written before the store filled is still readable.
         for i in 0..n {
-            let id = BlockId::of(&[i as u8; 512]);
+            let id = BlockId::for_block(BlockType::SstData, &[i as u8; 512]);
             assert!(s.contains(&id).unwrap(), "block {i} was dropped");
         }
     }

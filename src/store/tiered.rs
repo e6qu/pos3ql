@@ -191,7 +191,7 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
-    fn release_read(&mut self, id: &BlockId) {
+    fn release_read(&mut self, id: &super::BlockId) {
         match self {
             Layer::Base(store) => store.release_read(id),
             Layer::Disk(cache) => cache.release_read(id),
@@ -383,7 +383,7 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
-    fn release_read(&mut self, id: &BlockId) {
+    fn release_read(&mut self, id: &super::BlockId) {
         match self {
             TieredStore::WithRam(cache) => cache.release_read(id),
             TieredStore::WithoutRam(layer) => layer.release_read(id),

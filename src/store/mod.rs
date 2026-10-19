@@ -1,9 +1,9 @@
 //! The block grid: the one unit every persisted byte travels in.
 //!
 //! A block is fixed-size, self-describing and checksummed, and it is
-//! *content-addressed* — its identity is the SHA-256 of its payload, the way a
-//! Loki chunk is keyed by its content. That single choice buys three things the
-//! layers above would otherwise each have to arrange for themselves. Writing a
+//! *content-addressed* — its identity hashes the block type and payload with
+//! SHA-256. The layers above need no separate identity or duplicate-write
+//! tracking. Writing a
 //! block twice is writing it once, so a retry after an ambiguous failure is
 //! free rather than a duplicate. Nothing has to be overwritten, so only the
 //! root of the tree needs compare-and-swap. And a block that reads back with
@@ -130,7 +130,7 @@ use crate::wal::crc32c::crc32c;
 /// cache miss costs.
 pub(crate) const BLOCK_SIZE: usize = 256 * 1024;
 
-/// `checksum` u32 | `block_type` u8 | `reserved` [u8; 3] | `lsn` u64 |
+/// `checksum` u32 | `block_type` u8 | `format` u8 | `reserved` [u8; 2] | `lsn` u64 |
 /// `len` u32 | `block_id` [u8; 32].
 pub(crate) const HEADER_LEN: usize = 4 + 1 + 3 + 8 + 4 + 32;
 
@@ -201,13 +201,22 @@ impl BlockType {
     }
 }
 
-/// A block's name: the SHA-256 of its payload. Two blocks with the same
-/// contents have the same identity by construction, which is what makes a write
-/// idempotent and a retry harmless.
+/// A block's name: a domain-separated SHA-256 of its type and payload.
+/// Blocks with the same type and contents share an identity, making writes
+/// idempotent and retries harmless.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct BlockId(pub(crate) [u8; 32]);
 
 impl BlockId {
+    pub(crate) fn for_block(block_type: BlockType, payload: &[u8]) -> Self {
+        let mut hash = crate::crypto::sha256::Sha256::new();
+        hash.update(b"pos3ql:block:v1\0");
+        hash.update(&[block_type as u8]);
+        hash.update(payload);
+        Self(hash.finish())
+    }
+
+    #[cfg(test)]
     pub(crate) fn of(payload: &[u8]) -> Self {
         BlockId(crate::crypto::sha256::sha256(payload))
     }
@@ -235,6 +244,8 @@ pub(crate) enum BlockError {
     /// The payload does not hash to the identity in the header, so this is not
     /// the block that was asked for even if it is a valid block.
     IdentityMismatch,
+    /// The block header does not use the current typed identity format.
+    UnsupportedVersion,
     /// A payload longer than a block can hold.
     TooLarge,
     /// A `block_type` this build does not know.
@@ -260,10 +271,10 @@ pub(crate) fn encode(
     if out.len() < total {
         return Err(BlockError::Truncated);
     }
-    let id = BlockId::of(payload);
+    let id = BlockId::for_block(block_type, payload);
     // The checksum covers everything after itself, so it is written last.
     out[4] = block_type as u8;
-    out[5..8].fill(0);
+    out[5..8].copy_from_slice(&[1, 0, 0]);
     out[8..16].copy_from_slice(&lsn.to_le_bytes());
     out[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     out[20..HEADER_LEN].copy_from_slice(&id.0);
@@ -299,13 +310,16 @@ pub(crate) fn decode(bytes: &[u8], verify_identity: bool) -> Result<Block<'_>, B
     if crc32c(&bytes[4..total]) != stored {
         return Err(BlockError::ChecksumMismatch);
     }
+    if bytes[5..8] != [1, 0, 0] {
+        return Err(BlockError::UnsupportedVersion);
+    }
     let Some(block_type) = BlockType::from_code(bytes[4]) else {
         return Err(BlockError::UnknownType);
     };
     let mut id = [0u8; 32];
     id.copy_from_slice(&bytes[20..HEADER_LEN]);
     let payload = &bytes[HEADER_LEN..total];
-    if verify_identity && BlockId::of(payload).0 != id {
+    if verify_identity && BlockId::for_block(block_type, payload).0 != id {
         return Err(BlockError::IdentityMismatch);
     }
     Ok(Block {
@@ -661,6 +675,65 @@ mod tests {
     }
 
     #[test]
+    fn typed_block_identity_preserves_equal_payloads_with_distinct_types() {
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "typed block identities", 32 << 10, 64).unwrap();
+        let mut ids = [None; 256];
+        let mut output = [0u8; 32];
+        crate::mem::guard::forbid_alloc(|| {
+            for code in 0..=u8::MAX {
+                let Some(block_type) = BlockType::from_code(code) else {
+                    continue;
+                };
+                let id = store.put(b"identical bytes", block_type, 0).unwrap();
+                for prior in ids.iter().flatten() {
+                    assert_ne!(*prior, id);
+                }
+                ids[code as usize] = Some(id);
+                assert_eq!(store.put(b"identical bytes", block_type, 0).unwrap(), id);
+            }
+            for (code, id) in ids.iter().enumerate() {
+                if let Some(id) = id {
+                    let (length, block_type) = store.get(id, &mut output).unwrap();
+                    assert_eq!(block_type as usize, code);
+                    assert_eq!(&output[..length], b"identical bytes");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn typed_block_identity_rejects_a_rechecksummed_type_substitution() {
+        let mut frame = [0u8; BLOCK_SIZE];
+        let (_, length) = encode(b"same payload", BlockType::SstData, 0, &mut frame).unwrap();
+        frame[4] = BlockType::SstFilter as u8;
+        let checksum = crc32c(&frame[4..length]);
+        frame[..4].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(
+            decode(&frame[..length], true).err(),
+            Some(BlockError::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn typed_block_identity_refuses_old_and_unknown_header_formats() {
+        for version in [[0, 0, 0], [2, 0, 0], [1, 1, 0], [1, 0, 1]] {
+            let mut frame = [0u8; BLOCK_SIZE];
+            let (_, length) = encode(b"format probe", BlockType::SstData, 0, &mut frame).unwrap();
+            frame[5..8].copy_from_slice(&version);
+            let checksum = crc32c(&frame[4..length]);
+            frame[..4].copy_from_slice(&checksum.to_le_bytes());
+            for verify in [false, true] {
+                assert_eq!(
+                    decode(&frame[..length], verify).err(),
+                    Some(BlockError::UnsupportedVersion)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn identity_is_the_content() {
         // The same bytes are the same block however they were produced, which
         // is what makes a repeated write idempotent.
@@ -670,7 +743,10 @@ mod tests {
         let mut b = [0u8; BLOCK_SIZE];
         let (id_a, _) = encode(b"payload", BlockType::SstData, 1, &mut a).unwrap();
         let (id_b, _) = encode(b"payload", BlockType::SstData, 99, &mut b).unwrap();
-        assert_eq!(id_a, id_b, "identity is the payload, not the metadata");
+        assert_eq!(
+            id_a, id_b,
+            "LSN is provenance; caches retain type and payload"
+        );
     }
 
     #[test]

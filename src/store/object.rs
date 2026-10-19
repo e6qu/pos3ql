@@ -1807,7 +1807,7 @@ mod tests {
         config.object_store_get_slots = 1;
         let mut budget = Budget::new(16 << 20);
         let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
-        let id = BlockId::of(b"inline completion");
+        let id = BlockId::for_block(BlockType::SstData, b"inline completion");
 
         store.slots[0].ready_id = Some(id);
         assert!(store.advance_pending_read(0).unwrap());

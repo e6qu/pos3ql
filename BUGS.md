@@ -9,7 +9,8 @@ complete concurrent and batched storage reads and writes, physical layout,
 and an explicit MVCC or locking mode before merging. Passing checks on its
 earlier capture-only head do not qualify that expanded scope. Qualification
 must cover the complete implementation on the final PR head, including delayed
-prepared-transaction responses after their slots have been released and reused.
+prepared-transaction responses after their slots have been released and reused,
+and equal block payloads stored under different types.
 
 For an entry, include a reproducer, affected boundary, observed behavior and
 the specific blocker. Remove repaired entries; preserve provenance in their

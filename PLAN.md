@@ -68,6 +68,8 @@ updating one order appends a small change instead of rewriting the full table.
 
 - Use immutable packed objects and column groups, with small logged row changes.
   Reuse existing groups when their data has not changed.
+- Include block type in immutable content identities, so equal payloads in
+  different formats cannot overwrite one another. Verify rejection of old headers.
 - Keep column boundaries and offsets explicit and checked. Choose alignment for
   decoding and useful byte-range requests, not an assumed object-store sector.
 - Measure requests, downloaded bytes and rewritten bytes. Demonstrate batching

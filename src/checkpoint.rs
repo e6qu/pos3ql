@@ -852,9 +852,6 @@ impl TemporarySpiller {
                 "temporary spill retained root roster",
             )
             .map_err(CheckpointSetupError::Budget)?;
-        let writer_token = new_writer_token().map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
-        })?;
         Ok(Self {
             blocks: std::sync::Arc::new(std::sync::Mutex::new(blocks)),
             handles: Vec::with_capacity(garbage_sst_root_capacity(config)),
@@ -2074,6 +2071,9 @@ impl Checkpointer {
                 "garbage collection retained index roots",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        let writer_token = new_writer_token().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
+        })?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,

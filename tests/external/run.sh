@@ -63,6 +63,7 @@ PASS=0
 FAIL=0
 SERVER_CREDENTIALS_FILE="$WORK/object-store-credentials"
 POS3QL_CREDENTIALS_FILE="$WORK/pos3ql-credentials"
+WRITER_PROBE_GATE_FILE="$WORK/writer-probe.gate"
 
 write_credentials() { # <path> <access key> <secret key> [session token]
   local path=$1 access=$2 secret=$3 token=${4:-}
@@ -196,6 +197,7 @@ python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PO
   --bucket "$S3_TEST_BUCKET" --region "$S3_TEST_REGION" \
   --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" \
   --credentials-file "$SERVER_CREDENTIALS_FILE" --page-size 7 \
+  --writer-probe-gate-file "$WRITER_PROBE_GATE_FILE" \
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do
@@ -266,6 +268,7 @@ ok "server up (pid $SERVER_PID)"
 step "operational health, readiness, metrics and capacity"
 if POS3QL_PORT=$PG_PORT POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
     POS3QL_EXPECTED_QUERY_WORKSPACES=2 \
+    POS3QL_WRITER_PROBE_GATE_FILE="$WRITER_PROBE_GATE_FILE" \
     python3 "$EXT/operations_probe.py" \
     > "$WORK/operations.out" 2>&1; then
   ok "operational HTTP endpoints"

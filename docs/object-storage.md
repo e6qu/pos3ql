@@ -75,6 +75,8 @@ same generation; reading such a row requires its complete chain.
 | `object_store_put_slots` | Fixed journal upload clients; at least 2 in object-store mode. |
 | `object_store_block_put_slots` | Fixed physical-block upload clients; at least 1 in object-store mode. Each reserves one 256 KiB body. |
 | `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
+| Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
+| `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

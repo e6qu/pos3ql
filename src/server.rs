@@ -24,6 +24,7 @@ const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
 /// bounded subscription count is checked against this disjoint range at setup.
 const SUBSCRIPTION_TOKEN_BASE: u64 = u64::MAX - 1_000_000;
 const OPERATIONS_LISTENER_TOKEN: u64 = u64::MAX - 2_000_000;
+const WRITER_PROBE_TOKEN: u64 = u64::MAX - 3_000_000;
 const OPERATIONS_TOKEN_BASE: u64 = 1 << 63;
 const OPERATIONS_REQUEST_BYTES: usize = 2048;
 const OPERATIONS_RESPONSE_BYTES: usize = 16 * 1024;
@@ -126,6 +127,7 @@ pub struct Server {
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
     upload_fds: FixedVec<Option<i32>>,
+    writer_probe_fd: Option<i32>,
     read_capacity_generation: u64,
     subscriptions: FixedVec<SubscriptionWorker>,
     operations_listener: Option<TcpListener>,
@@ -359,6 +361,13 @@ struct OperationsSlot {
     stream: Option<TcpStream>,
     request: crate::mem::buffer::FixedBuf,
     response: crate::mem::buffer::FixedBuf,
+    writer_probe: Option<OperationsProbe>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationsProbe {
+    endpoint: OperationsEndpoint,
+    ticket: Option<crate::checkpoint::WriterProbeTicket>,
 }
 
 #[derive(Default)]
@@ -752,6 +761,10 @@ impl Server {
         }
     }
 
+    fn writer_probe_slots(config: &Config) -> usize {
+        usize::from(config.object_store_on && !config.operations_listen_addr.is_empty())
+    }
+
     fn upload_slots(config: &Config) -> usize {
         if config.object_store_on {
             config
@@ -781,7 +794,8 @@ impl Server {
                 + uploads
                 + 2 * config.max_subscriptions
                 + usize::from(operations_connections != 0)
-                + operations_connections,
+                + operations_connections
+                + Self::writer_probe_slots(config),
         ) + 128
             + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
             + QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections)
@@ -865,7 +879,8 @@ impl Server {
                 + upload_slots
                 + 2 * config.max_subscriptions
                 + usize::from(operations_listener.is_some())
-                + operations_connections,
+                + operations_connections
+                + Self::writer_probe_slots(config),
         )
         .map_err(|e| match e {
             crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
@@ -1002,6 +1017,7 @@ impl Server {
                         "operations_response",
                         OPERATIONS_RESPONSE_BYTES,
                     )?,
+                    writer_probe: None,
                 })
                 .expect("sized to operations_max_connections");
             operations_free
@@ -1126,6 +1142,7 @@ impl Server {
             shutdown_read: pipe_fds[0],
             block_read_fds,
             upload_fds,
+            writer_probe_fd: None,
             read_capacity_generation: 0,
             subscriptions,
             operations_listener,
@@ -1217,6 +1234,10 @@ impl Server {
                 self.next_replication_keepalive_timeout(),
                 self.next_termination_timeout(),
                 read_timeout,
+                self.engine
+                    .writer_probe()
+                    .and_then(|probe| probe.deadline())
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                 self.buffered_subscription_work().then_some(Duration::ZERO),
                 (self.engine.read_capacity_generation() != self.read_capacity_generation)
                     .then_some(Duration::ZERO),
@@ -1254,6 +1275,8 @@ impl Server {
                     self.accept_operations_pending();
                 } else if let Some(slot) = self.block_slot(event.token) {
                     completed_block_read |= self.advance_block_io(slot)?;
+                } else if event.token == WRITER_PROBE_TOKEN {
+                    // The owned control GET advances once after this event batch.
                 } else if self.upload_slot(event.token).is_some() {
                     // All upload slots advance together below, including slots
                     // whose connect or request send just became writable.
@@ -1277,6 +1300,13 @@ impl Server {
                     );
                 }
             }
+            if let Some(probe) = self.engine.writer_probe() {
+                probe.advance(Instant::now());
+            }
+            // Reconcile a cancelled control descriptor before other clients
+            // can open sockets and reuse its integer descriptor.
+            self.sync_writer_probe_interest()?;
+            self.advance_operations_probes();
             self.drain_query_dispatches();
             if publication_ready {
                 if completed_block_read {
@@ -1340,6 +1370,7 @@ impl Server {
             // interest before this loop can block again.
             self.sync_block_read_interest()?;
             self.sync_upload_interest()?;
+            self.sync_writer_probe_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -1974,6 +2005,34 @@ impl Server {
                     self.engine.pending_upload_wants_write(slot),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn sync_writer_probe_interest(&mut self) -> std::io::Result<()> {
+        let wanted = self.engine.writer_probe().and_then(|probe| probe.fd());
+        match (self.writer_probe_fd, wanted) {
+            (Some(old), Some(fd)) if old == fd => {
+                self.reactor.register_read(fd, WRITER_PROBE_TOKEN)?;
+            }
+            (registered, wanted) => {
+                if let Some(fd) = registered {
+                    self.reactor.deregister(fd)?;
+                }
+                if let Some(fd) = wanted {
+                    self.reactor.register_read(fd, WRITER_PROBE_TOKEN)?;
+                }
+                self.writer_probe_fd = wanted;
+            }
+        }
+        if let Some(fd) = wanted {
+            let writable = self
+                .engine
+                .writer_probe()
+                .expect("reserved probe")
+                .wants_write();
+            self.reactor
+                .set_write_interest(fd, WRITER_PROBE_TOKEN, writable)?;
         }
         Ok(())
     }
@@ -3120,7 +3179,40 @@ impl Server {
             return;
         }
         if readable && self.operations_slots[index].response.is_empty() {
-            self.read_operations(index);
+            if self.operations_slots[index].writer_probe.is_some() {
+                let mut extra = [0u8; 1];
+                let read = self.operations_slots[index]
+                    .stream
+                    .as_mut()
+                    .expect("open operational slot")
+                    .read(&mut extra);
+                match read {
+                    Ok(0) => {
+                        // A complete HTTP request may half-close its send side.
+                        let fd = self.operations_slots[index]
+                            .stream
+                            .as_ref()
+                            .unwrap()
+                            .as_raw_fd();
+                        if self
+                            .reactor
+                            .set_read_interest(fd, Self::operations_token(index), false)
+                            .is_err()
+                        {
+                            self.release_operations(index);
+                        }
+                    }
+                    Ok(_) => self.queue_operations_error(index, 400, "unexpected request data\n"),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => self.release_operations(index),
+                }
+            } else {
+                self.read_operations(index);
+            }
         }
         if writable
             && index < self.operations_slots.len()
@@ -3181,6 +3273,22 @@ impl Server {
     fn answer_operations(&mut self, index: usize, endpoint: OperationsEndpoint) {
         self.operations_metrics.http_requests =
             self.operations_metrics.http_requests.saturating_add(1);
+        if matches!(
+            endpoint,
+            OperationsEndpoint::Ready | OperationsEndpoint::Metrics
+        ) && self.engine.checkpoint_enabled()
+        {
+            self.operations_slots[index].writer_probe = Some(OperationsProbe {
+                endpoint,
+                ticket: None,
+            });
+            self.advance_operations_probes();
+            return;
+        }
+        self.answer_operations_after_probe(index, endpoint);
+    }
+
+    fn answer_operations_after_probe(&mut self, index: usize, endpoint: OperationsEndpoint) {
         match endpoint {
             OperationsEndpoint::Live => {
                 self.queue_operations_response(
@@ -3191,7 +3299,6 @@ impl Server {
                 );
             }
             OperationsEndpoint::Ready => {
-                self.refresh_writer_readiness();
                 if self.ready() {
                     self.queue_operations_response(
                         index,
@@ -3211,7 +3318,6 @@ impl Server {
                 }
             }
             OperationsEndpoint::Metrics => {
-                self.refresh_writer_readiness();
                 let mut body = crate::util::StackStr::<12000>::new();
                 self.render_metrics(&mut body);
                 if body.is_truncated() {
@@ -3296,8 +3402,73 @@ impl Server {
         }
     }
 
-    fn refresh_writer_readiness(&mut self) {
-        self.ownership_ready = self.engine.verify_writer_ownership().is_ok();
+    fn advance_operations_probes(&mut self) {
+        for index in 0..self.operations_slots.len() {
+            let Some(OperationsProbe {
+                endpoint,
+                ticket: Some(ticket),
+            }) = self.operations_slots[index].writer_probe
+            else {
+                continue;
+            };
+            if let Some(result) = self
+                .engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .take(ticket)
+            {
+                self.operations_slots[index].writer_probe = None;
+                self.ownership_ready = result.is_ok();
+                if let Err(error) = result {
+                    crate::logging::error_args(
+                        "writer_probe_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                }
+                self.answer_operations_after_probe(index, endpoint);
+            }
+        }
+        for index in 0..self.operations_slots.len() {
+            let Some(waiting) = self.operations_slots[index].writer_probe else {
+                continue;
+            };
+            if waiting.ticket.is_some() {
+                continue;
+            }
+            match self
+                .engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .request(index)
+            {
+                Ok(ticket) => {
+                    self.operations_slots[index].writer_probe =
+                        Some(OperationsProbe { ticket, ..waiting });
+                }
+                Err(error) => {
+                    self.operations_slots[index].writer_probe = None;
+                    self.ownership_ready = false;
+                    crate::logging::error_args(
+                        "writer_probe_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    self.answer_operations_after_probe(index, waiting.endpoint);
+                }
+            }
+        }
+    }
+
+    fn cancel_operations_probe(&mut self, index: usize) {
+        if let Some(OperationsProbe {
+            ticket: Some(ticket),
+            ..
+        }) = self.operations_slots[index].writer_probe.take()
+        {
+            self.engine
+                .writer_probe()
+                .expect("reserved writer probe")
+                .cancel(ticket);
+        }
     }
 
     fn render_metrics(&self, out: &mut crate::util::StackStr<12000>) {
@@ -3466,6 +3637,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         body: &str,
     ) {
         use core::fmt::Write as _;
+        self.cancel_operations_probe(index);
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
@@ -3528,6 +3700,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
     }
 
     fn release_operations(&mut self, index: usize) {
+        self.cancel_operations_probe(index);
         let slot = &mut self.operations_slots[index];
         if let Some(stream) = slot.stream.take() {
             let _ = self.reactor.deregister(stream.as_raw_fd());

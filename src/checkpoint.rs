@@ -2,6 +2,9 @@
 
 use core::cmp::Ordering;
 
+mod probe;
+pub(crate) use probe::{Ticket as WriterProbeTicket, WriterProbe};
+
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -849,6 +852,9 @@ impl TemporarySpiller {
                 "temporary spill retained root roster",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        let writer_token = new_writer_token().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
+        })?;
         Ok(Self {
             blocks: std::sync::Arc::new(std::sync::Mutex::new(blocks)),
             handles: Vec::with_capacity(garbage_sst_root_capacity(config)),
@@ -1147,6 +1153,7 @@ pub(crate) struct Checkpointer {
     uploads: crate::object_store::upload::Uploads,
     block_uploads: crate::object_store::upload::Uploads,
     manifest_uploads: crate::object_store::upload::Uploads,
+    writer_probe: Option<WriterProbe>,
     manifest_publication: Option<ManifestPublication>,
     requested_checkpoint_epoch: u64,
     captured_checkpoint_epoch: u64,
@@ -1378,6 +1385,14 @@ impl Checkpointer {
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
+    pub(crate) fn writer_probe_budget_bytes(config: &Config) -> usize {
+        if config.operations_listen_addr.is_empty() {
+            0
+        } else {
+            WriterProbe::budget_bytes(config)
+        }
+    }
+
     pub(crate) fn manifest_output_budget_bytes(config: &Config) -> usize {
         crate::object_store::upload::Uploads::budget_bytes(
             config,
@@ -1411,6 +1426,7 @@ impl Checkpointer {
             )
             + Self::physical_output_budget_bytes(config)
             + Self::manifest_output_budget_bytes(config)
+            + Self::writer_probe_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -2082,6 +2098,11 @@ impl Checkpointer {
                 budget,
             )
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            writer_probe: if config.operations_listen_addr.is_empty() {
+                None
+            } else {
+                Some(WriterProbe::new(config, budget, writer_token)?)
+            },
             manifest_publication: None,
             requested_checkpoint_epoch: 0,
             captured_checkpoint_epoch: 0,
@@ -2189,9 +2210,7 @@ impl Checkpointer {
             merge_done: vec![None; table_capacity],
             merge_turn: false,
             merge_overflow: vec![None; table_capacity],
-            writer_token: new_writer_token().map_err(|error| {
-                CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
-            })?,
+            writer_token,
             writer_fence_etag: None,
             writer_fenced: false,
         })
@@ -2332,6 +2351,7 @@ impl Checkpointer {
             || self.uploads.busy()
             || self.block_uploads.busy()
             || self.manifest_uploads.busy()
+            || self.writer_probe.as_ref().is_some_and(WriterProbe::busy)
             || self.commit_publication.is_some()
     }
 
@@ -2385,7 +2405,7 @@ impl Checkpointer {
     }
 
     fn assert_writer(&mut self) -> Result<(), SqlError> {
-        if self.writer_fenced {
+        if self.writer_was_fenced() {
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"
@@ -2432,11 +2452,21 @@ impl Checkpointer {
     }
 
     pub(crate) fn writer_was_fenced(&self) -> bool {
-        self.writer_fenced
+        self.writer_fenced || self.writer_probe.as_ref().is_some_and(WriterProbe::fenced)
     }
 
+    pub(crate) fn writer_probe(&mut self) -> Option<&mut WriterProbe> {
+        if self.writer_fenced
+            && let Some(probe) = self.writer_probe.as_mut()
+        {
+            probe.fence();
+        }
+        self.writer_probe.as_mut()
+    }
+
+    #[cfg(test)]
     pub(crate) fn verify_writer(&mut self) -> Result<(), SqlError> {
-        if self.writer_fenced {
+        if self.writer_was_fenced() {
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"
@@ -2480,6 +2510,9 @@ impl Checkpointer {
         self.uploads.replace_credentials(credentials);
         self.block_uploads.replace_credentials(credentials);
         self.manifest_uploads.replace_credentials(credentials);
+        if let Some(probe) = self.writer_probe.as_mut() {
+            probe.replace_credentials(credentials);
+        }
         self.blocks
             .lock()
             .expect("block store lock poisoned")
@@ -8755,7 +8788,7 @@ impl Checkpointer {
     /// per-table lists. The retained bytes stay unchanged until publication
     /// resolves. Runs only when no table has an outdated slice.
     fn prepare_manifest(&mut self, storage: &Storage, lsn: u64) -> Result<(), SqlError> {
-        if self.writer_fenced {
+        if self.writer_was_fenced() {
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"
@@ -12083,7 +12116,7 @@ impl Checkpointer {
     }
 
     fn queue_manifest_upload(&mut self, lsn: u64) -> Result<(), SqlError> {
-        if self.writer_fenced {
+        if self.writer_was_fenced() {
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"
@@ -18945,6 +18978,14 @@ mod stored_dependency_tests {
         assert_eq!(
             Checkpointer::budget_bytes(&writes) - base_bytes,
             core::mem::size_of::<CheckpointVersion>()
+        );
+
+        let mut manifest = base.clone();
+        manifest.checkpoint_manifest_bytes += 64;
+        assert_eq!(
+            Checkpointer::budget_bytes(&manifest) - base_bytes,
+            3 * 64,
+            "metadata read scratch, retained output and immutable request body"
         );
 
         let mut merge = base;

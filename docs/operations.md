@@ -52,10 +52,14 @@ fail explicitly. Responses disable caching and close the connection.
 
 In durable mode, `/readyz` and `/metrics` read and validate the writer fence.
 This detects a displaced idle process before it can continue serving routed
-reads. The request uses the existing fixed object client and allocates no
-runtime memory, but it can wait on object-store latency. `/livez` remains a
-local event-loop probe for separating process failure from durable-tier
-failure. Readiness also turns false when commit publication or remote checkpoint work
+reads. One separate client and each waiting request's receipt are reserved at
+startup. Concurrent checks can share an unfinished read; each keeps its result,
+and a new check never consumes cached readiness. Slow storage delays those
+responses while cached SQL queries, `/livez` and `/capacity` continue.
+For example, a report can return while a monitor waits to verify ownership.
+Transport failures retry within the existing three-attempt, 30-second request
+limits; a displaced writer stays fenced. No runtime memory grows.
+`/livez` separates process failure from durable-tier failure. Readiness also turns false when commit publication or remote checkpoint work
 fails and returns true after a successful durable publication or completion of
 its pending remote cleanup. A skipped
 maintenance turn, local heap cleanup, or temporary-file spill cannot clear a

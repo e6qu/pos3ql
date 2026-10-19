@@ -44,8 +44,11 @@ including indexes retired by a later table rewrite. Explicit index repair rebuil
 reading the retired index. Explicit CHECKPOINT requests also retain their own completion receipts while
 network work yields; later requests require a later metadata capture. These
 changes still require runner qualification.
-Remaining read progress, fairness and complete failure/recovery evidence remain
-acceptance work in this same PR.
+Readiness and metrics now use a separately reserved asynchronous ownership
+check. Shared checks retain each request's result, and a delayed response lets
+cached SQL and local health requests proceed. This path still needs runner
+qualification. Remaining read progress, fairness and complete failure/recovery
+evidence remain acceptance work in this same PR.
 
 ### Concurrent and batched reads
 

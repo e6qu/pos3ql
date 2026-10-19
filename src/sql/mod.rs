@@ -7911,6 +7911,11 @@ impl Engine {
         .min()
     }
 
+    pub(crate) fn writer_probe(&mut self) -> Option<&mut crate::checkpoint::WriterProbe> {
+        self.ckpt.as_mut().and_then(Checkpointer::writer_probe)
+    }
+
+    #[cfg(test)]
     pub(crate) fn verify_writer_ownership(&mut self) -> Result<(), SqlError> {
         match self.ckpt.as_mut() {
             Some(checkpointer) => checkpointer.verify_writer(),
@@ -22877,6 +22882,7 @@ pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
                 Checkpointer::workspace_budget_bytes(config)
                     + Checkpointer::physical_output_budget_bytes(config)
                     + Checkpointer::manifest_output_budget_bytes(config)
+                    + Checkpointer::writer_probe_budget_bytes(config)
                     + crate::store::BLOCK_SIZE
                     + crate::object_store::upload::Uploads::budget_bytes(
                         config,

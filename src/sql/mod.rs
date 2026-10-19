@@ -5240,19 +5240,20 @@ impl Engine {
             self.storage.lsn()
         };
         let resumed = if resume_statement {
-            txn.resume_statement_snapshot()
+            txn.resume_statement()
         } else {
             None
         };
-        if let Some(lease) = &resumed {
+        if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
         }
         if advance_command && resumed.is_none() {
             txn.begin_command()?;
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
-        let lease = if resumed.is_some() {
-            resumed
+        let retained_lease = resumed.and_then(|state| state.lease);
+        let lease = if retained_lease.is_some() {
+            retained_lease
         } else if takes_snapshot && retain_snapshot {
             Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| {
                 txn.statement_snapshot(lsn.min(visible))
@@ -14105,6 +14106,9 @@ impl Engine {
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let routine_transaction_context = txn
+            .suspended_statement_context()
+            .unwrap_or(routine_transaction_context);
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
@@ -14122,10 +14126,17 @@ impl Engine {
             None,
         );
         txn.leave_ddl_origin(prior_origin);
-        if !matches!(&result, Ok(Err(error)) if
+        if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
+            txn.suspend_statement(
+                None,
+                datetime::statement_clock(),
+                query::statement_deadline(),
+                routine_transaction_context,
+            );
+        } else {
             txn.release_suspended_statement();
         }
         result
@@ -14521,7 +14532,12 @@ impl Engine {
         {
             // Transfer ownership before returning to the reactor. The next
             // attempt resumes this command and view; it is not a new statement.
-            txn.suspend_statement_snapshot(lease, statement_clock, statement_deadline);
+            txn.suspend_statement(
+                Some(lease),
+                statement_clock,
+                statement_deadline,
+                routine_transaction_context,
+            );
         }
         result
     }

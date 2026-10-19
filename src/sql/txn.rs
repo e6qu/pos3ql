@@ -179,11 +179,13 @@ impl Drop for TriggerSqlScope<'_> {
     }
 }
 
-struct SuspendedStatementSnapshot {
-    lease: crate::storage::StatementSnapshotLease,
+// Utility commands retain their invocation context even without a row snapshot.
+pub(super) struct SuspendedStatement {
+    pub(super) lease: Option<crate::storage::StatementSnapshotLease>,
     command: u32,
     clock: super::datetime::StatementClock,
     deadline: i64,
+    context: super::exec::PlpgsqlTransactionContext,
 }
 
 pub(crate) fn validate_isolation_mode(
@@ -273,7 +275,7 @@ pub struct TxnState {
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
     transaction_start: Option<i64>,
-    suspended_statement: Option<SuspendedStatementSnapshot>,
+    suspended_statement: Option<SuspendedStatement>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
@@ -1269,26 +1271,40 @@ impl TxnState {
             .map(|suspended| suspended.deadline)
     }
 
-    pub(crate) fn suspend_statement_snapshot(
+    pub(super) fn suspended_statement_context(
+        &self,
+    ) -> Option<super::exec::PlpgsqlTransactionContext> {
+        self.suspended_statement.as_ref().map(|state| state.context)
+    }
+
+    pub(super) fn suspend_statement(
         &mut self,
-        lease: crate::storage::StatementSnapshotLease,
+        lease: Option<crate::storage::StatementSnapshotLease>,
         clock: super::datetime::StatementClock,
         deadline: i64,
+        context: super::exec::PlpgsqlTransactionContext,
     ) {
-        self.suspended_statement = Some(SuspendedStatementSnapshot {
+        if let Some(suspended) = &self.suspended_statement {
+            assert!(lease.is_none(), "one retained statement snapshot");
+            assert!(
+                suspended.context == context,
+                "one command invocation context"
+            );
+            return;
+        }
+        self.suspended_statement = Some(SuspendedStatement {
             lease,
             command: self.command_id,
             clock,
             deadline,
+            context,
         });
     }
 
-    pub(crate) fn resume_statement_snapshot(
-        &mut self,
-    ) -> Option<crate::storage::StatementSnapshotLease> {
+    pub(super) fn resume_statement(&mut self) -> Option<SuspendedStatement> {
         let suspended = self.suspended_statement.take()?;
         self.command_id = suspended.command;
-        Some(suspended.lease)
+        Some(suspended)
     }
 
     pub(crate) fn release_suspended_statement(&mut self) {

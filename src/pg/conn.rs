@@ -5746,6 +5746,17 @@ mod tests {
                     Step::NeedMoreData => break,
                     Step::Parked => {
                         assert!(conn.txn.staged_commit().is_some());
+                        for _ in 0..2 {
+                            let waiting = crate::mem::guard::forbid_alloc(|| {
+                                conn.retry_parked(engine, 0, true).unwrap()
+                            });
+                            assert_eq!(waiting.after, After::Continue);
+                            assert!(conn.parked && conn.txn.staged_commit().is_some());
+                            assert!(!has_backend_message(
+                                conn.send.readable(),
+                                wire::MSG_ERROR_RESPONSE,
+                            ));
+                        }
                         // The simulated remote store may allocate fixture objects.
                         engine.commit_wal().unwrap();
                         let pending = crate::mem::guard::forbid_alloc(|| {

@@ -68,7 +68,9 @@ customer receives success before their change is recoverable.
   example, `INSERT ...; BEGIN; ...; ROLLBACK` commits the first insert once;
   concurrent partition detach finishes publishing each phase before continuing.
 - Preserve a usable connection after prepared-transaction commit or rollback,
-  including binary catalog queries and pipelined extended-protocol messages.
+  including binary catalog queries and pipelined extended-protocol messages. Retain
+  whether each waiting command started inside a transaction block; retries must
+  keep the original restrictions, statement identity, clock and deadline.
 - Keep reads, durable commits and maintenance from starving one another.
 
 ### Physical layout

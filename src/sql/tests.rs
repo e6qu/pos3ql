@@ -85672,9 +85672,12 @@ fn atomic_block_reads_suspended_snapshot_keeps_its_view_command_and_clocks() {
             .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
             .unwrap();
         let lease = snapshot.lease.take().unwrap();
-        reader
-            .transaction
-            .suspend_statement_snapshot(lease, clock, 0);
+        reader.transaction.suspend_statement(
+            Some(lease),
+            clock,
+            0,
+            exec::PlpgsqlTransactionContext::Atomic,
+        );
     });
     let command = reader.transaction.command_id();
     let write = atomic_snapshot_execute(
@@ -85695,7 +85698,7 @@ fn atomic_block_reads_suspended_snapshot_keeps_its_view_command_and_clocks() {
     assert_eq!(reader.transaction.command_id(), command);
     assert_eq!(datetime::statement_micros(), statement_start);
     assert_eq!(datetime::transaction_micros(), transaction_start);
-    assert!(reader.transaction.resume_statement_snapshot().is_none());
+    assert!(reader.transaction.resume_statement().is_none());
     let next = atomic_snapshot_execute(
         &mut reader,
         &mut engine,
@@ -85724,7 +85727,12 @@ fn atomic_block_reads_suspended_snapshot_releases_on_cancel_rollback_and_retirem
                 .begin_command_snapshot(&mut transaction, true, true, true, false)
                 .unwrap();
             let lease = snapshot.lease.take().unwrap();
-            transaction.suspend_statement_snapshot(lease, datetime::statement_clock(), 0);
+            transaction.suspend_statement(
+                Some(lease),
+                datetime::statement_clock(),
+                0,
+                exec::PlpgsqlTransactionContext::Atomic,
+            );
         });
         assert!(engine.storage.has_active_snapshots());
         if exit == 2 {
@@ -85740,7 +85748,7 @@ fn atomic_block_reads_suspended_snapshot_releases_on_cancel_rollback_and_retirem
             });
             assert!(!engine.storage.has_active_snapshots());
         }
-        assert!(transaction.resume_statement_snapshot().is_none());
+        assert!(transaction.resume_statement().is_none());
     }
 }
 
@@ -85757,9 +85765,12 @@ fn atomic_block_reads_resuming_keeps_the_original_expired_timeout() {
             .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
             .unwrap();
         let lease = snapshot.lease.take().unwrap();
-        reader
-            .transaction
-            .suspend_statement_snapshot(lease, datetime::statement_clock(), 1);
+        reader.transaction.suspend_statement(
+            Some(lease),
+            datetime::statement_clock(),
+            1,
+            exec::PlpgsqlTransactionContext::Atomic,
+        );
     });
     assert!(
         error_sqlstates(&atomic_snapshot_execute(
@@ -85772,7 +85783,7 @@ fn atomic_block_reads_resuming_keeps_the_original_expired_timeout() {
     );
     let expired = atomic_snapshot_execute(&mut reader, &mut engine, 11, "SELECT 1");
     assert_eq!(error_sqlstates(&expired), ["57014"]);
-    assert!(reader.transaction.resume_statement_snapshot().is_none());
+    assert!(reader.transaction.resume_statement().is_none());
     assert!(!engine.storage.has_active_snapshots());
     atomic_snapshot_execute(&mut reader, &mut engine, 11, "ROLLBACK");
     assert_eq!(reader.transaction.mode, TxnMode::Idle);
@@ -85820,10 +85831,11 @@ fn statement_files_suspended_sql_releases_on_completion_error_cancel_and_rollbac
                 .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
                 .unwrap();
             drop(engine.storage.row_scan(table).unwrap());
-            reader.transaction.suspend_statement_snapshot(
-                snapshot.lease.take().unwrap(),
+            reader.transaction.suspend_statement(
+                snapshot.lease.take(),
                 datetime::statement_clock(),
                 if exit == 4 { 1 } else { 0 },
+                exec::PlpgsqlTransactionContext::Atomic,
             );
         });
         crate::mem::guard::forbid_alloc(|| {
@@ -85864,7 +85876,7 @@ fn statement_files_suspended_sql_releases_on_completion_error_cancel_and_rollbac
                 .copy_retained_spill_roots(true, &mut retained)
                 .unwrap();
             assert!(retained.is_empty());
-            assert!(reader.transaction.resume_statement_snapshot().is_none());
+            assert!(reader.transaction.resume_statement().is_none());
         });
         drop(reader);
         drop(engine);

@@ -61,7 +61,9 @@ jobs:
             writer_promotion_fences_old_and_delayed_publications \
             ambiguous_commit_batch_put_is_idempotently_adopted \
             one_protocol_flush_publishes_many_commits_as_one_immutable_batch \
-            atomic_block_reads_
+            atomic_block_reads_ \
+            prepared_transactions_commit_rollback_catalog_and_lock_contracts \
+            statement_files_suspended_sql_releases_on_completion_error_cancel_and_rollback
           do
             cargo test --lib --release --locked "$filter" -- --test-threads=1
           done

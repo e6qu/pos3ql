@@ -1080,7 +1080,8 @@ mod tests {
         let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config) + (1 << 20));
         let store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
         let mut cache =
-            super::super::BlockCache::new(&mut budget, "shared response cache", store, 1).unwrap();
+            super::super::cache::BlockCache::new(&mut budget, "shared response cache", store, 1)
+                .unwrap();
         cache.enable_async_gets();
         let payload = b"the second query can use the first query's cached response";
         let (id, frame) = atomic_read_frame(payload);

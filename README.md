@@ -21,7 +21,7 @@ machines still need qualification.
 For example, a cached invoice can be read while another connection waits for
 storage. A successful order commit must survive loss of both local caches.
 The [plan](PLAN.md) lists the remaining implementation and evidence required
-before the expanded storage work is complete.
+for final qualification and the later execution and deployment work.
 
 See [what works today](docs/implemented-baseline.md) and the
 [remaining plan](PLAN.md) for the details and the evidence still needed.

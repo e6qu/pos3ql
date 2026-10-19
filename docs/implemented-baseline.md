@@ -705,7 +705,8 @@ SQL errors, cancellation, rollback and timeout release it; an executing scope
 keeps its files even if its snapshot or Storage instance is retired first.
 Streamed COPY restores that owner for each data message and keeps files selected
 by its triggers until completion or abort, including while it waits for input.
-Checkpoint publication and merges still wait for pending downloads.
+Checkpoint uploads retain separate request owners. Source reads within atomic
+maintenance can still wait synchronously without discarding a paused report.
 
 File owners use the same 1,024 slots per query workspace as statement snapshots,
 independent of connection count and the separate 64-slot point-source pool.
@@ -846,9 +847,9 @@ tables. Temporary eviction still requires the exact captured table generation.
 Removing redundant saved-row metadata and already published deletion markers
 evaluates each map entry once, including collision chains that wrap around.
 Pending changes and retained history stay resident. Ordinary eviction also keeps
-heap rows, deletion markers and unpublished saved rows; deletion-marker cleanup
-still requires exclusive storage during publication. These walks complete within
-one server turn.
+heap rows, deletion markers and unpublished saved rows. Checkpoint installation
+removes only deletion markers covered by its captured log position, in turns of
+at most 64 row-map slots; later deletions remain for a later save.
 
 **User example:** cleanup can release an order's old metadata while a report
 keeps its already selected total of 10, another transaction saves a total of 20,
@@ -863,9 +864,10 @@ instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
 prefix; writes after it keep their journal suffix for recovery. Final heap
 remapping, eviction and other maintenance still finish as whole operations
-within server turns. Checkpoint publication, merges, and temporary spilling still wait for
-pending durable-block downloads. Fixed execution workers and independent storage
-publication remain unfinished.
+within server turns. Checkpoint metadata uploads and immutable table, index and
+merge output now retain their own bytes while network requests overlap.
+Metadata capture and other atomic maintenance reads can still wait
+synchronously. Fixed SQL execution workers remain unfinished.
 
 For example, while one connection downloads an uncached invoice, another can
 update a cached order and receive its durable commit acknowledgement. INSERT,
@@ -881,8 +883,8 @@ transaction controls and retains an existing fixed snapshot slot. Cancellation,
 rollback, completion and errors release it. A write that needs an uncached block
 still waits synchronously; it can
 issue another GET even if a reader is already downloading that block. SQL
-execution remains serial, and this does not enable independent checkpoint
-publication or worker threads.
+execution remains serial. Checkpoint uploads can progress independently;
+SQL worker threads remain separate roadmap work.
 
 Row lookups retain the verified sparse-index page already in their own buffer,
 including the row and version bounds where it is valid. A resumed report can
@@ -932,8 +934,9 @@ turn. Deletion count and staging memory keep their configured limits; listing
 the namespace can still span many pages. Retries
 retain their cursor after errors, and later commits can extend the chain.
 Pending journal uploads retain their bytes through local cleanup, including
-when the snapshot already covers them. With no pending block download, the
-publication retry runs before local cleanup continues.
+when the snapshot already covers them. Journal publication uses its own upload
+clients and can finish while a reader waits for an unrelated block. Captured
+physical output and metadata retain separate bytes and completion state.
 
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that

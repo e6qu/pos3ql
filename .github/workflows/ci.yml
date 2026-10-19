@@ -12,6 +12,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  reactor-ownership:
+    name: macOS readiness ownership
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macOS-reactor-dependencies-${{ hashFiles('Cargo.lock') }}
+
+      - name: Socket readiness, cancellation and descriptor reuse
+        run: cargo test --lib --locked io:: -- --test-threads=1
+
   heap-aliasing:
     runs-on: ubuntu-latest
     timeout-minutes: 15

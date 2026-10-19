@@ -15,44 +15,31 @@ workers is separate from overlapping network requests.
 
 Current SQL execution is serial. There are already multiple download slots,
 read lookahead, immutable journal batches, packed row groups, and independently
-readable column groups. These pieces do not yet provide the complete concurrent
-read and write path below. Same-host MinIO and SeaweedFS tests establish
-portability; they do not establish production performance.
+readable column groups. The integrated storage path must meet the acceptance
+criteria below. Same-host MinIO and SeaweedFS tests establish portability;
+they do not establish production performance.
 
-## Current PR: finish object-store reads and writes together
+## Current PR: qualify concurrent object-store reads and writes
 
-Keep implementation, regressions, recovery, capacity accounting and documentation
-in one PR. Do not merge a partial implementation.
+The integrated implementation provides shared download ownership, selected-column
+read batches, independent journal and physical upload clients, ordered durable
+commit completion, aligned column groups and explicit transaction modes.
+Table capture and merges retain their selected bytes across turns. File handles
+stay private until every upload succeeds; metadata publication preserves later
+updates, deletions and analysis. SQL CHECKPOINT, readiness checks and credential
+validation yield while network requests wait.
 
-The current branch connects concurrent upload clients, ordered durable commit
-completion, selected-column read batches and explicit transaction modes. This
-implementation is still being validated. Shared read ownership and cancellation
-now retain results for each waiting query. Table slices and paced merges now
-emit owned batches through separate physical upload clients. Selected table
-bytes survive later updates; replaced layouts cancel their captured output.
-Retained writers wait for every upload before continuing or exposing table files.
-Captured rows retain later deletion markers until the complete file list installs,
-so DELETE and TRUNCATE cannot resurrect rows during capture.
-Secondary-index data, navigation blocks and external sort runs now use the same
-owned output path. Source read failures retain the merge pair for a coherent retry.
-Checkpoint cleanup acknowledges only captured deletions and statistics; later
-analysis and transaction-private statistics keep their pending work.
-Manifest upload now retains its exact metadata bytes and conditional request while
-other work runs. Its completion installs only matching table and index identities;
-later writes stay dirty. Cleanup retains every file named by the saved metadata,
-including indexes retired by a later table rewrite. Explicit index repair rebuilds from table data without
-reading the retired index. Explicit CHECKPOINT requests also retain their own completion receipts while
-network work yields; later requests require a later metadata capture. These
-changes still require runner qualification.
-Readiness and metrics now use a separately reserved asynchronous ownership
-check. Shared checks retain each request's result, and a delayed response lets
-cached SQL and local health requests proceed. This path still needs runner
-qualification. Credential reload also retains a separate validation request,
-requires read and write access, and drains existing owners before installation
-so continuous traffic cannot postpone the handoff. Its permission, fairness and reused-socket ownership regressions still need
-runner qualification.
-Remaining read progress, fairness and complete failure/recovery
-evidence remain acceptance work in this same PR.
+**Scope limit:** data-changing execution uses a separate synchronous read client
+where restarting could repeat effects. Metadata capture and some maintenance
+reads also remain synchronous. SQL still executes on one CPU worker. The current
+PR must not imply that every database operation is nonblocking or that CPU work
+already runs on several workers.
+
+The checks below define acceptance. Require CI, Differential, Drivers and coverage
+to pass on the final PR version, including PostgreSQL 18 comparisons, Miri and
+actual MinIO and SeaweedFS qualification. Focused runner passes are development
+evidence, not merge qualification. Remove the temporary focused workflow before
+final qualification. Do not increase timeouts to obtain a pass.
 
 ### Concurrent and batched reads
 

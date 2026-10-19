@@ -5320,10 +5320,6 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
-        if let Err(error) = self.check_writer_fence() {
-            self.rollback_txn(txn, guc);
-            return Err(error);
-        }
         if txn.has_deferred_triggers() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -6194,6 +6190,14 @@ impl Engine {
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
         let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        // ROLLBACK leaves an empty protocol transaction. Only a durable
+        // change needs writer ownership at this final commit boundary.
+        if (staged_bytes != 0 || target != txn::CommitTarget::Ordinary)
+            && let Err(error) = self.check_writer_fence()
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let boundary_bytes =
             prepared_slot.map_or_else(crate::wal::Wal::commit_boundary_bytes, |slot| {
                 crate::wal::Wal::prepare_boundary_bytes(

@@ -265,7 +265,12 @@ run_corpus() { # port name file
   fi | normalize > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
+    printf '%s\n' 'Last client transcript:'
+    tail -40 "$WORK/$2"
+    printf '%s\n' 'Server log:'
     tail -80 "$WORK/p3.log"
+    wait "$P3_PID"
+    printf 'pos3ql exit status: %s\n' "$?"
     exit 1
   fi
 }

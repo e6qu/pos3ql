@@ -9,7 +9,8 @@ the PR that finds them. The [current plan](PLAN.md) identifies the remaining
 storage implementation and qualification work. Passing focused tests does not
 qualify an unfinished implementation for merging. Qualification includes compiled
 regressions, delayed-publication recovery, control-request fairness, credential permissions, descriptor reuse, merge retry
-layouts, retained read-completion wakeups, one-time function and sequence effects
+layouts, completed merge retention through earlier cleanup, retained read-completion
+wakeups, one-time function and sequence effects
 across cold reads, saved query results and sorting, immutable arena-list snapshots,
 accurate build identities, and complete
 workflows on the final head.

@@ -810,7 +810,7 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
 fn garbage_sst_root_capacity(config: &Config) -> usize {
     crate::storage::Storage::retained_spill_root_capacity(config)
         + crate::storage::table_slot_capacity(config)
-            .saturating_mul(config.max_spill_generations_per_table)
+            .saturating_mul(config.max_spill_generations_per_table.saturating_add(1))
 }
 
 fn garbage_index_root_capacity(config: &Config) -> usize {
@@ -14173,7 +14173,25 @@ impl Checkpointer {
                     }
                 }
                 storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
-                for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
+                // A completed merge can finish after another manifest was
+                // captured. It still owns its graph until a later publication
+                // installs it or its source pair is replaced.
+                let completed = self
+                    .merge_done
+                    .iter()
+                    .filter_map(|done| done.as_ref()?.merged);
+                let finishing = self.merge_job.as_ref().and_then(|job| match job.phase {
+                    MergePhase::Finish { merged } => merged,
+                    _ => None,
+                });
+                for prev in self
+                    .prev_ssts
+                    .iter()
+                    .flat_map(SlotList::iter)
+                    .copied()
+                    .chain(completed)
+                    .chain(finishing)
+                {
                     if self.garbage_sst_roots.len() == self.garbage_sst_roots.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -14193,7 +14211,9 @@ impl Checkpointer {
                         .expect("block store lock poisoned")
                         .get(&h.roster, scratch)
                         .map(|(n, _)| n)
-                        .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
+                        .map_err(|e| {
+                            sql_err!(SQLSTATE_IO, "gc roster {:?} read: {:?}", h.roster, e)
+                        })?;
                     for id_bytes in scratch[..n].chunks(32) {
                         if id_bytes.len() != 32 {
                             return Err(sql_err!(
@@ -18828,6 +18848,126 @@ mod stored_dependency_tests {
         let mut key = [0; 64];
         id.write_key(&mut key);
         core::str::from_utf8(&key).unwrap().to_owned()
+    }
+
+    #[test]
+    fn parallel_physical_completed_merge_survives_cleanup_before_its_publication() {
+        for finish_before_cleanup in [false, true] {
+            let label = if finish_before_cleanup {
+                "merge-completed-gc"
+            } else {
+                "merge-finishing-gc"
+            };
+            let (mut checkpoint, mut storage, table, config) = index_gc_fixture(label, 32);
+            let mut saved = [None; 4];
+            for (index, value) in [b"first".as_slice(), b"second", b"merged", b"orphan"]
+                .into_iter()
+                .enumerate()
+            {
+                checkpoint.slice_writer.reset();
+                let mut blocks = checkpoint.blocks.lock().unwrap();
+                checkpoint
+                    .slice_writer
+                    .append(&mut *blocks, 1, value)
+                    .unwrap();
+                saved[index] = Some(PrevSst {
+                    handle: checkpoint
+                        .slice_writer
+                        .finish(&mut *blocks)
+                        .unwrap()
+                        .unwrap(),
+                    count: 1,
+                    crc: 0,
+                });
+            }
+            let [Some(old0), Some(old1), Some(merged), Some(orphan)] = saved else {
+                unreachable!()
+            };
+            assert!(checkpoint.prev_ssts[table].push(old0));
+            assert!(checkpoint.prev_ssts[table].push(old1));
+            checkpoint.merge_job = Some(MergeJob {
+                slot: table,
+                at: 0,
+                old0,
+                old1,
+                drop_tombstones: true,
+                oldest_snapshot: None,
+                phase: MergePhase::Finish {
+                    merged: Some(merged),
+                },
+                schedule_len: 0,
+                count: 1,
+                crc: Crc32c::new(),
+            });
+            checkpoint.published_lsn_pending_maintenance = Some(0);
+            checkpoint.block_garbage_pending = true;
+            if finish_before_cleanup {
+                assert!(matches!(
+                    checkpoint.checkpoint_step(&mut storage).unwrap(),
+                    CheckpointStep::Working
+                ));
+            }
+            for _ in 0..16 {
+                if !checkpoint.block_garbage_pending {
+                    break;
+                }
+                checkpoint.block_garbage_pending = !crate::mem::guard::forbid_alloc(|| {
+                    checkpoint.collect_block_garbage_batch(&storage)
+                })
+                .unwrap();
+            }
+            assert!(!checkpoint.block_garbage_pending, "cleanup must drain");
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+            let merged_key = format!(
+                "{}blocks/{}",
+                config.object_store_prefix,
+                index_gc_hex(merged.handle.roster)
+            );
+            let orphan_key = format!(
+                "{}blocks/{}",
+                config.object_store_prefix,
+                index_gc_hex(orphan.handle.roster)
+            );
+            assert!(namespace.borrow().object_bytes(&merged_key).is_some());
+            assert!(namespace.borrow().object_bytes(&orphan_key).is_none());
+            if !finish_before_cleanup {
+                checkpoint.merge_beat(&storage).unwrap();
+            }
+            assert!(checkpoint.merge_job.is_none());
+            assert!(checkpoint.merge_done[table].is_some());
+            // Publish the merged identity after the earlier sweep. Its graph
+            // must still be readable with both caches disabled.
+            checkpoint.prev_ssts[table].replace_pair(0, Some(merged));
+            checkpoint.merge_done[table] = None;
+            assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+            let mut scratch = [0u8; crate::store::MAX_PAYLOAD];
+            let (len, _) = checkpoint
+                .blocks
+                .lock()
+                .unwrap()
+                .get(&merged.handle.roster, &mut scratch)
+                .unwrap();
+            for bytes in scratch[..len].chunks_exact(32) {
+                let id = BlockId(bytes.try_into().unwrap());
+                assert!(
+                    namespace
+                        .borrow()
+                        .object_bytes(&format!(
+                            "{}blocks/{}",
+                            config.object_store_prefix,
+                            index_gc_hex(id)
+                        ))
+                        .is_some()
+                );
+            }
+            checkpoint.prev_ssts[table].clear();
+            assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+            assert!(namespace.borrow().object_bytes(&merged_key).is_none());
+            drop(storage);
+            drop(checkpoint);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
     }
 
     #[test]

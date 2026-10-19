@@ -76,6 +76,9 @@ customer receives success before their change is recoverable.
   at startup. Slots and batch sizes are explicit settings.
 - Allow independent uploads to complete out of order; publish references and
   commit outcomes in the required order. A root must never name incomplete data.
+- Keep a finished merge alive through cleanup for an earlier checkpoint, until
+  its own publication installs it or a replacement discards it. Cleanup must
+  retain the file's roster as well as the blocks that roster lists.
 - Batch committed journal records and physical output. While storage waits,
   continue unrelated queries, cancellation and bounded maintenance.
 - Reject work after an ownership probe detects a replaced writer, before a new

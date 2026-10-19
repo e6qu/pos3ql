@@ -1168,6 +1168,7 @@ pub(crate) struct Checkpointer {
     garbage_index_roots: Vec<BlockId>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
+    manifest_output: FixedBuf,
     prepared_transaction_snapshot: FixedVec<crate::storage::PreparedTransactionCatalogEntry>,
     manifest_etag: Option<EntityTag>,
     manifest_present: bool,
@@ -1370,7 +1371,7 @@ impl Checkpointer {
             config,
             MANIFEST_UPLOAD_SLOTS,
             config.checkpoint_manifest_bytes,
-        )
+        ) + config.checkpoint_manifest_bytes
     }
 
     pub(crate) fn physical_output_budget_bytes(config: &Config) -> usize {
@@ -2106,6 +2107,8 @@ impl Checkpointer {
             garbage_index_roots: Vec::with_capacity(garbage_index_root_capacity(config)),
             doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
+                .map_err(CheckpointSetupError::Budget)?,
+            manifest_output: FixedBuf::new(budget, "retained manifest", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
             prepared_transaction_snapshot: FixedVec::new(
                 budget,
@@ -8749,11 +8752,11 @@ impl Checkpointer {
             *receipt = Some(storage.capture_checkpoint_statistics(slot));
             self.sliced_layout[slot] = SliceLayout::from_storage(storage, slot);
         }
-        self.manifest_buf.clear();
-        write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
-        write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
+        self.manifest_output.clear();
+        write_manifest(&mut self.manifest_output, MANIFEST_HEADER)?;
+        write_manifest(&mut self.manifest_output, format_args!("lsn {lsn}"))?;
         write_manifest(
-            &mut self.manifest_buf,
+            &mut self.manifest_output,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
         let mut identity_result = Ok(());
@@ -8763,14 +8766,14 @@ impl Checkpointer {
             }
             identity_result = match record {
                 TransactionIdentityRecord::Latest(transaction_id) => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("latest_transaction_id {transaction_id}"),
                 ),
                 TransactionIdentityRecord::Recent {
                     transaction_id,
                     committed,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "transaction_status {} {}",
                         transaction_id,
@@ -8782,13 +8785,13 @@ impl Checkpointer {
         identity_result?;
         match storage.next_large_object_oid() {
             Some(oid) => write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("next_lo_oid {}", oid.get()),
             )?,
-            None => write_manifest(&mut self.manifest_buf, "next_lo_oid -")?,
+            None => write_manifest(&mut self.manifest_output, "next_lo_oid -")?,
         }
         write_manifest(
-            &mut self.manifest_buf,
+            &mut self.manifest_output,
             format_args!("writer {:032x}", self.writer_token.0),
         )?;
         let mut database_context = None;
@@ -8858,7 +8861,7 @@ impl Checkpointer {
                 | (u16::from(attributes.password.is_some()) << 7)
                 | (u16::from(attributes.valid_until.is_some()) << 8);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rol {} {} {} {} {} {} {} {} {}",
                     name.as_str(),
@@ -8906,7 +8909,7 @@ impl Checkpointer {
                 | (u8::from(membership.options.inherit) << 1)
                 | (u8::from(membership.options.set) << 2);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rmem {} {} {} {}",
                     role.as_str(),
@@ -8940,7 +8943,7 @@ impl Checkpointer {
             let flags =
                 u8::from(definition.allow_connections) | (u8::from(definition.is_template) << 1);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "db {} {} {} {} {} {} {} {} {} {} {} {}",
                     database.oid.get(),
@@ -8999,7 +9002,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rset {} {} {} {} {}",
                     scope,
@@ -9028,7 +9031,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("sset {} {}", name.as_str(), value.as_str()),
             )?;
         }
@@ -9052,7 +9055,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "ptx {} {} {} {} {} {} {}",
                     prepared.transaction_id,
@@ -9080,7 +9083,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 schema.database,
             )?;
@@ -9089,16 +9092,19 @@ impl Checkpointer {
             for b in schema.name.as_str().as_bytes() {
                 let _ = write!(hex, "{b:02x}");
             }
-            write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!("nsp {}", hex.as_str()),
+            )?;
         }
         for (_, object) in storage.checkpoint_large_objects() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 object.database,
             )?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("lob {} {}", object.oid.get(), object.created_at),
             )?;
         }
@@ -9109,7 +9115,7 @@ impl Checkpointer {
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
         for (_, d) in storage.checkpoint_domains() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, d.database)?;
+            write_database_context(&mut self.manifest_output, &mut database_context, d.database)?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
             let hex = |line: &mut StackStr<10_240>, s: &str| {
@@ -9176,7 +9182,7 @@ impl Checkpointer {
                 hex(&mut line, c.expression.as_str());
                 let _ = write!(line, " {}", c.validation.code());
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            write_manifest(&mut self.manifest_output, format_args!("{}", line.as_str()))?;
         }
         // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
         // <sort-bits>]...`. Written before tables so an enum-typed column
@@ -9184,7 +9190,7 @@ impl Checkpointer {
         // key is emitted as its exact f64 bit pattern.
         for (slot, e) in storage.checkpoint_enums() {
             let definition = storage.enum_for(slot, 0);
-            write_database_context(&mut self.manifest_buf, &mut database_context, e.database)?;
+            write_database_context(&mut self.manifest_output, &mut database_context, e.database)?;
             use core::fmt::Write;
             let hex = |output: &mut FixedBuf, s: &str| -> core::fmt::Result {
                 if s.is_empty() {
@@ -9196,32 +9202,31 @@ impl Checkpointer {
                 }
                 Ok(())
             };
-            write!(&mut self.manifest_buf, "enm ").map_err(|_| manifest_full())?;
-            hex(&mut self.manifest_buf, e.schema.as_str()).map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
-            hex(&mut self.manifest_buf, e.name.as_str()).map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_buf, " {}", definition.members().len())
+            write!(&mut self.manifest_output, "enm ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_output, e.schema.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_output, e.name.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_output, " {}", definition.members().len())
                 .map_err(|_| manifest_full())?;
             for m in definition.members() {
-                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
-                hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
-                write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
+                write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
+                hex(&mut self.manifest_output, m.label.as_str()).map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_output, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
-                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
                 match m.legacy_label {
-                    Some(label) => {
-                        hex(&mut self.manifest_buf, label.as_str()).map_err(|_| manifest_full())?
-                    }
-                    None => write!(&mut self.manifest_buf, "-").map_err(|_| manifest_full())?,
+                    Some(label) => hex(&mut self.manifest_output, label.as_str())
+                        .map_err(|_| manifest_full())?,
+                    None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
+            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         // Named composites precede tables because composite columns rebind by
         // catalog identity while the table definitions are restored.
         for (_, definition) in storage.checkpoint_composites() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 definition.database,
             )?;
@@ -9233,7 +9238,7 @@ impl Checkpointer {
                 )
             };
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "cmp {} {} {}",
                 ManifestZeroName(definition.schema.as_str()),
                 ManifestZeroName(definition.name.as_str()),
@@ -9242,7 +9247,7 @@ impl Checkpointer {
             .map_err(|_| manifest_full())?;
             for field in definition.fields() {
                 write!(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     " {} {} {} {} {} {} {} {} {}",
                     ManifestZeroName(field.name.as_str()),
                     field.attribute_number,
@@ -9268,11 +9273,11 @@ impl Checkpointer {
                 )
                 .map_err(|_| manifest_full())?;
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
+            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         for (_, method) in storage.checkpoint_access_methods() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 method.database,
             )?;
@@ -9282,7 +9287,7 @@ impl Checkpointer {
                 let _ = write!(name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "am {} {} {}",
                     method.created_at,
@@ -9320,7 +9325,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 identity.database,
             )?;
@@ -9385,9 +9390,9 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            write_manifest(&mut self.manifest_buf, table_line.as_str())?;
+            write_manifest(&mut self.manifest_output, table_line.as_str())?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
             if definition.schema.as_str() != "public" {
@@ -9397,13 +9402,13 @@ impl Checkpointer {
                     let _ = write!(hex, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("tsch {}", hex.as_str()),
                 )?;
             }
-            write_partition_manifest(&mut self.manifest_buf, definition.partition)?;
+            write_partition_manifest(&mut self.manifest_output, definition.partition)?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rls {} {} {}",
                     u8::from(definition.row_level_security.enabled),
@@ -9461,7 +9466,7 @@ impl Checkpointer {
                     }
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
@@ -9487,7 +9492,7 @@ impl Checkpointer {
             let table_statistics = table.committed_statistics();
             if table_statistics.valid {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "stats {slot} {} {} {}",
                         table_statistics.rows,
@@ -9503,7 +9508,7 @@ impl Checkpointer {
                         continue;
                     }
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "cstat {slot} {column} {} {} {} {}",
                             statistics.null_fraction_ppm,
@@ -9518,7 +9523,7 @@ impl Checkpointer {
             for (ci, c) in definition.columns().iter().enumerate() {
                 if c.auto_increment {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!("seq {ci} {}", serial_values[ci]),
                     )?;
                 }
@@ -9536,7 +9541,7 @@ impl Checkpointer {
                     let _ = write!(hex_name, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "ukey {} {} {} {}{}",
                         u8::from(uk.is_primary),
@@ -9559,7 +9564,7 @@ impl Checkpointer {
                     let _ = write!(hexpr, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "chk {} {} {}",
                         check.validation.code(),
@@ -9592,7 +9597,7 @@ impl Checkpointer {
                     let _ = write!(hparent_schema, "{b:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "fkey {} {}{} {}{} {} {} {} {} {} {}",
                         fk.n_cols,
@@ -9640,7 +9645,7 @@ impl Checkpointer {
                     ));
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "excl {} {} {}{} {}",
                         exclusion.timing.code(),
@@ -9691,7 +9696,7 @@ impl Checkpointer {
                 h.filter.write_key(&mut fh);
                 h.roster.write_key(&mut rh);
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "dsst {slot} {idx} {} {} {} {} {} {}",
                         p.count,
@@ -9707,7 +9712,7 @@ impl Checkpointer {
                 // An empty table still records its (zero-row) state so the
                 // loader creates it.
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!("dsst {slot} 0 0 0 - - -"),
                 )?;
             }
@@ -9737,7 +9742,7 @@ impl Checkpointer {
                 let mut roster = [0u8; 64];
                 handle.roster.write_key(&mut roster);
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
                         column_text.as_str(),
@@ -9754,7 +9759,7 @@ impl Checkpointer {
         }
         for (statistics_slot, statistics) in storage.checkpoint_extended_statistics() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 statistics.database,
             )?;
@@ -9803,14 +9808,14 @@ impl Checkpointer {
                     "extended-statistics manifest line exceeds its fixed buffer"
                 ));
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            write_manifest(&mut self.manifest_output, format_args!("{}", line.as_str()))?;
 
             let data = storage.extended_statistics_data(statistics_slot, 0);
             if !data.valid {
                 continue;
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "estatdata {} {} {} {} {} {}",
                     statistics.created_at,
@@ -9824,7 +9829,7 @@ impl Checkpointer {
             for (index, strength) in data.dependencies_ppm.iter().copied().enumerate() {
                 if strength != 0 {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!("estatdep {} {index} {strength}", statistics.created_at),
                     )?;
                 }
@@ -9832,7 +9837,7 @@ impl Checkpointer {
             for (key, column) in data.expression_statistics.iter().copied().enumerate() {
                 if column.valid {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "estatexpr {} {key} {} {} {} {}",
                             statistics.created_at,
@@ -9851,7 +9856,7 @@ impl Checkpointer {
                     let _ = write!(value_hex, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "estatmcv {} {} {} {}",
                         statistics.created_at,
@@ -9862,7 +9867,7 @@ impl Checkpointer {
                 )?;
                 if entry.base_frequency_bits != 0 {
                     write_manifest(
-                        &mut self.manifest_buf,
+                        &mut self.manifest_output,
                         format_args!(
                             "estatmcvbase {} {} {}",
                             statistics.created_at, entry.hash, entry.base_frequency_bits,
@@ -9873,7 +9878,7 @@ impl Checkpointer {
         }
         for (slot, entry) in storage.checkpoint_foreign_wrappers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9908,11 +9913,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_servers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9943,11 +9948,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_user_mappings() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -9982,11 +9987,11 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         for (slot, entry) in storage.checkpoint_foreign_tables() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 entry.database,
             )?;
@@ -10027,11 +10032,15 @@ impl Checkpointer {
                     ),
                 );
             }
-            write_manifest(&mut self.manifest_buf, line.as_str())?;
+            write_manifest(&mut self.manifest_output, line.as_str())?;
         }
         // View SQL and names are hex because the manifest is space-separated.
         for (view_slot, view) in storage.checkpoint_views() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, view.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                view.database,
+            )?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in storage.view_sql(view_slot).as_str().as_bytes() {
@@ -10050,7 +10059,7 @@ impl Checkpointer {
                 let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "vw12 {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
@@ -10075,7 +10084,7 @@ impl Checkpointer {
         // Publications: database-scoped names plus explicit table slots.
         for (_, publication) in storage.checkpoint_publications() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 publication.database,
             )?;
@@ -10096,7 +10105,7 @@ impl Checkpointer {
                     crate::storage::PublishGeneratedColumns::Stored
                 )) << 6);
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "pub {} {} {} {} {}",
                 name.as_str(),
                 publication.ownership.owner,
@@ -10119,7 +10128,7 @@ impl Checkpointer {
             {
                 let filter = publication.table_filters.get(index);
                 write!(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     " {table} {mask} {} ",
                     u8::from(*descendants)
                 )
@@ -10130,7 +10139,7 @@ impl Checkpointer {
                     )
                 })?;
                 if filter.is_empty() {
-                    write!(&mut self.manifest_buf, "-").map_err(|_| {
+                    write!(&mut self.manifest_output, "-").map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -10138,7 +10147,7 @@ impl Checkpointer {
                     })?;
                 } else {
                     for byte in filter.as_bytes() {
-                        write!(&mut self.manifest_buf, "{byte:02x}").map_err(|_| {
+                        write!(&mut self.manifest_output, "{byte:02x}").map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                                 "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -10148,14 +10157,14 @@ impl Checkpointer {
                 }
             }
             for schema in &publication.schemas[..publication.schema_count] {
-                write!(&mut self.manifest_buf, " {schema}").map_err(|_| {
+                write!(&mut self.manifest_output, " {schema}").map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                     )
                 })?;
             }
-            writeln!(&mut self.manifest_buf).map_err(|_| {
+            writeln!(&mut self.manifest_output).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "checkpoint manifest is full; raise checkpoint_manifest_bytes"
@@ -10165,14 +10174,18 @@ impl Checkpointer {
         // A replication slot's active flag is process-local; only its resume
         // positions survive a checkpoint and restart.
         for (_, slot) in storage.checkpoint_replication_slots() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, slot.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                slot.database,
+            )?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             for byte in slot.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rslot {} {} {} {}",
                     name.as_str(),
@@ -10186,7 +10199,7 @@ impl Checkpointer {
         // fields preserve conninfo whitespace in the line-oriented manifest.
         for (_, subscription) in storage.checkpoint_subscriptions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 subscription.database,
             )?;
@@ -10240,7 +10253,7 @@ impl Checkpointer {
                 let _ = write!(failure_message, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
@@ -10287,7 +10300,7 @@ impl Checkpointer {
                     let _ = write!(table_name, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "subrel {} {} {} {} {} {}",
                         subscription.created_at,
@@ -10303,7 +10316,11 @@ impl Checkpointer {
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
         for (matview_slot, mv) in storage.checkpoint_matviews() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, mv.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                mv.database,
+            )?;
             let backing = storage.table_def(storage.matview_table(matview_slot), 0);
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
@@ -10323,7 +10340,7 @@ impl Checkpointer {
                 let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "mv5 {} {} {} {} {} {}",
                     hex.as_str(),
@@ -10340,7 +10357,11 @@ impl Checkpointer {
         // this line is its whole durable form.
         for (_, seq, last_value, is_called, log_count) in storage.checkpoint_sequences_with_slots()
         {
-            write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                seq.database,
+            )?;
             use core::fmt::Write;
             let mut hschema = StackStr::<130>::new();
             for b in seq.schema.as_str().as_bytes() {
@@ -10387,7 +10408,7 @@ impl Checkpointer {
                 let _ = write!(generator_column, "0");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "sq6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     hschema.as_str(),
@@ -10418,7 +10439,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 routine.database,
             )?;
@@ -10480,7 +10501,7 @@ impl Checkpointer {
                 let _ = write!(result_name, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
                     routine.created_at,
@@ -10525,7 +10546,7 @@ impl Checkpointer {
         }
         for (slot, event_trigger) in storage.checkpoint_event_triggers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 event_trigger.database,
             )?;
@@ -10539,7 +10560,7 @@ impl Checkpointer {
                 let _ = write!(tags, " {}", ManifestName(tag.as_str()));
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "evt {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10555,7 +10576,11 @@ impl Checkpointer {
             )?;
         }
         for (slot, rule) in storage.checkpoint_rules() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, rule.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                rule.database,
+            )?;
             use core::fmt::Write as _;
             let definition = rule.definition;
             let (target, schema, relation) = match definition.target {
@@ -10580,7 +10605,7 @@ impl Checkpointer {
                 let _ = write!(spans, " {} {}", action.start, action.len);
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "rul {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10603,13 +10628,17 @@ impl Checkpointer {
             )?;
         }
         for (_, cast) in storage.checkpoint_casts() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, cast.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                cast.database,
+            )?;
             let function = match cast.method {
                 crate::storage::CastMethod::Function(oid) => oid,
                 crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => 0,
             };
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cst {} {} {} {} {} {}",
                     cast.created_at,
@@ -10623,13 +10652,13 @@ impl Checkpointer {
         }
         for (slot, collation) in storage.checkpoint_collations() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 collation.database,
             )?;
             let definition = collation.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "coll {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10654,7 +10683,7 @@ impl Checkpointer {
         }
         for (slot, object) in storage.checkpoint_text_search_objects() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 object.database,
             )?;
@@ -10670,7 +10699,7 @@ impl Checkpointer {
                     headline,
                     lextypes,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} p {} {} {} {} {} {} {} {}",
                         slot,
@@ -10693,7 +10722,7 @@ impl Checkpointer {
                     lexize,
                     behavior,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} t {} {} {} {} {} {}",
                         slot,
@@ -10715,7 +10744,7 @@ impl Checkpointer {
                     options,
                     behavior,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} d {} {} {} {} {} {} {}",
                         slot,
@@ -10737,7 +10766,7 @@ impl Checkpointer {
                     parser,
                     mappings,
                 } => write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "tsobj {} {} c {} {} {} {} {}{}",
                         slot,
@@ -10754,13 +10783,13 @@ impl Checkpointer {
         }
         for (slot, conversion) in storage.checkpoint_conversions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 conversion.database,
             )?;
             let definition = conversion.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "conv {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -10777,7 +10806,7 @@ impl Checkpointer {
         }
         for (_, operator) in storage.checkpoint_operators() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 operator.database,
             )?;
@@ -10796,7 +10825,7 @@ impl Checkpointer {
                 .right
                 .unwrap_or(crate::storage::RoutineResult::TEXT);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opr {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     operator.created_at,
@@ -10822,13 +10851,13 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 operator.database,
             )?;
             let linked_oid = |oid: Option<i32>| oid.unwrap_or(0);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "oprl {} {} {}",
                     operator.oid(),
@@ -10839,13 +10868,13 @@ impl Checkpointer {
         }
         for (_, family) in storage.checkpoint_operator_families() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 family.database,
             )?;
             let definition = family.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opf {} {} {} {}",
                     family.created_at,
@@ -10856,7 +10885,7 @@ impl Checkpointer {
             )?;
             for member in definition.operators.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opfo {} {} {} {} {}",
                         family.oid(),
@@ -10869,7 +10898,7 @@ impl Checkpointer {
             }
             for member in definition.functions.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opff {} {} {} {}",
                         family.oid(),
@@ -10882,13 +10911,13 @@ impl Checkpointer {
         }
         for (_, class) in storage.checkpoint_operator_classes() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 class.database,
             )?;
             let definition = class.definition;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "opc {} {} {} {} {} {} {} {}",
                     class.created_at,
@@ -10903,7 +10932,7 @@ impl Checkpointer {
             )?;
             for member in definition.operators.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opco {} {} {} {} {}",
                         class.oid(),
@@ -10916,7 +10945,7 @@ impl Checkpointer {
             }
             for member in definition.functions.iter().filter(|member| member.used) {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "opcf {} {} {} {}",
                         class.oid(),
@@ -10929,7 +10958,7 @@ impl Checkpointer {
         }
         for (_, trigger) in storage.checkpoint_triggers() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 trigger.database,
             )?;
@@ -11008,7 +11037,7 @@ impl Checkpointer {
                 }
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
@@ -11061,7 +11090,7 @@ impl Checkpointer {
             use core::fmt::Write;
             let trigger = storage.trigger(trigger_slot);
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 trigger.database,
             )?;
@@ -11075,7 +11104,7 @@ impl Checkpointer {
                 let _ = write!(table_name, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "trgs {} {} {} {}",
                     trigger.created_at,
@@ -11087,7 +11116,7 @@ impl Checkpointer {
         }
         for (slot, policy) in storage.checkpoint_policies() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 policy.database,
             )?;
@@ -11123,7 +11152,7 @@ impl Checkpointer {
             // images are mutex guarded, and dependency lookup consults the
             // policy definition to select its committed image.
             write!(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 "pol {} {} {} {} {} {} {}{}",
                 policy.created_at,
                 policy.command.code(),
@@ -11140,7 +11169,7 @@ impl Checkpointer {
             .map_err(|_| manifest_full())?;
             drop(roles);
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     " {} {} {}",
                     if definition.using.is_some() {
@@ -11159,7 +11188,7 @@ impl Checkpointer {
         }
         for (_, extension) in storage.checkpoint_extensions() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 extension.database,
             )?;
@@ -11178,7 +11207,7 @@ impl Checkpointer {
                 let _ = write!(version, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "ext {} {} {} {} {} {}",
                     extension.created_at,
@@ -11203,7 +11232,7 @@ impl Checkpointer {
             );
             self.put_immutable(metadata_key.as_str(), metadata.as_str().as_bytes())?;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!("xpk {} {}", package_slot, metadata_key.as_str()),
             )?;
             for (_, script) in storage.extension_scripts_for(package_slot) {
@@ -11237,7 +11266,7 @@ impl Checkpointer {
                     let _ = write!(to, "{byte:02x}");
                 }
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "xsc {} {} {} {} {} {}",
                         package_slot,
@@ -11259,7 +11288,7 @@ impl Checkpointer {
                 continue;
             }
             if let Some(database) = comment.database {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             use core::fmt::Write;
             let Some(text) = comment.live else { continue };
@@ -11279,7 +11308,7 @@ impl Checkpointer {
                 let _ = write!(htext, "{b:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cmt {} {} {} {} {}",
                     comment.class.to_u8(),
@@ -11305,7 +11334,7 @@ impl Checkpointer {
             }
             let options = tablespace.options;
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "tsp {} {} {} {} {} {} {} {} {}",
                     slot,
@@ -11327,7 +11356,7 @@ impl Checkpointer {
         // Index definitions are complete catalog state, not a cache rebuild hint.
         for (index_slot, index) in storage.checkpoint_indexes() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 index.database,
             )?;
@@ -11536,7 +11565,7 @@ impl Checkpointer {
                 |value| StackStr::<16>::from_str(stack_format!(16, "{value}").as_str()),
             );
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
                     index.created_at,
@@ -11579,7 +11608,7 @@ impl Checkpointer {
         }
         for (_, dependency) in storage.checkpoint_extension_dependencies() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(dependency.object)
@@ -11604,7 +11633,7 @@ impl Checkpointer {
                 let _ = write!(name_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "exd {} {} {} {} {} {}",
                     extension_hex.as_str(),
@@ -11628,7 +11657,7 @@ impl Checkpointer {
         }
         for (_, config) in storage.checkpoint_extension_configs() {
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(config.relation.access_object())
@@ -11658,7 +11687,7 @@ impl Checkpointer {
                 let _ = write!(condition_hex, "-");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "exc {} {} {} {} {} {}",
                     extension_hex.as_str(),
@@ -11678,7 +11707,7 @@ impl Checkpointer {
                 return Ok(());
             }
             if let Some(database) = storage.access_object_database(object) {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             let (schema, name) = storage.access_object_name(object);
             let owner = storage.role(storage.object_owner(object, 0)).name;
@@ -11699,7 +11728,7 @@ impl Checkpointer {
             }
             if object.class == crate::storage::AccessClass::Routine {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {} {}",
                         object.class as u8,
@@ -11711,7 +11740,7 @@ impl Checkpointer {
                 )
             } else {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {}",
                         object.class as u8,
@@ -11803,7 +11832,7 @@ impl Checkpointer {
                 continue;
             }
             if let Some(database) = storage.access_object_database(acl.object) {
-                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+                write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             }
             use core::fmt::Write;
             let (schema, name) = storage.access_object_name(acl.object);
@@ -11831,7 +11860,7 @@ impl Checkpointer {
             }
             if acl.object.class == crate::storage::AccessClass::Routine {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
@@ -11846,7 +11875,7 @@ impl Checkpointer {
                 )?;
             } else {
                 write_manifest(
-                    &mut self.manifest_buf,
+                    &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {}",
                         acl.object.class as u8,
@@ -11868,7 +11897,7 @@ impl Checkpointer {
                 continue;
             }
             write_database_context(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 &mut database_context,
                 storage
                     .access_object_database(acl.target.relation())
@@ -11900,7 +11929,7 @@ impl Checkpointer {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "cacl {} {} {} {} {} {} {} {}",
                     relation.class as u8,
@@ -11915,7 +11944,11 @@ impl Checkpointer {
             )?;
         }
         for (_, acl) in storage.checkpoint_default_acls() {
-            write_database_context(&mut self.manifest_buf, &mut database_context, acl.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                acl.database,
+            )?;
             use core::fmt::Write;
             let owner = storage.role(acl.owner as usize).name;
             let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
@@ -11941,7 +11974,7 @@ impl Checkpointer {
                 let _ = write!(grantee_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "dacl {} {} {} {} {} {}",
                     owner_hex.as_str(),
@@ -11974,7 +12007,7 @@ impl Checkpointer {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
             write_manifest(
-                &mut self.manifest_buf,
+                &mut self.manifest_output,
                 format_args!(
                     "pacl {} {} {} {} {}",
                     parameter_hex.as_str(),
@@ -11985,7 +12018,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        write_manifest(&mut self.manifest_buf, "end")?;
+        write_manifest(&mut self.manifest_output, "end")?;
 
         Ok(())
     }
@@ -12027,7 +12060,7 @@ impl Checkpointer {
         };
         let ticket = self
             .manifest_uploads
-            .enqueue(MANIFEST_KEY, self.manifest_buf.readable(), condition)
+            .enqueue(MANIFEST_KEY, self.manifest_output.readable(), condition)
             .map_err(upload_to_sql)?;
         self.manifest_publication = Some(ManifestPublication::Uploading { lsn, ticket });
         Ok(())
@@ -13968,6 +14001,24 @@ impl Checkpointer {
                         ));
                     }
                 }
+                // A delayed publication can name an index no longer installed
+                // in a rewritten or dropped live table. Recovery still needs
+                // every graph in the durable root before replaying its suffix.
+                if self.manifest_present {
+                    self.client
+                        .get(MANIFEST_KEY, None)
+                        .map_err(object_store_to_sql)?;
+                    self.manifest_buf.clear();
+                    if !self.manifest_buf.append(self.client.body_bytes()) {
+                        return Err(manifest_full());
+                    }
+                    retain_manifest_blocks(
+                        &self.blocks,
+                        &mut keep,
+                        scratch,
+                        self.manifest_buf.readable(),
+                    )?;
+                }
                 for index in 0..self.backup_scratch.len() {
                     let name = self.backup_scratch[index];
                     let key = stack_format!(128, "backups/{}/manifest", name.as_str());
@@ -14365,46 +14416,44 @@ fn retain_manifest_blocks(
     bytes: &[u8],
 ) -> Result<(), SqlError> {
     let text = core::str::from_utf8(bytes)
-        .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest is not UTF-8"))?;
+        .map_err(|_| sql_err!(SQLSTATE_IO, "saved manifest is not UTF-8"))?;
     parse_manifest_metadata(text)
-        .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
+        .map_err(|message| sql_err!(SQLSTATE_IO, "saved manifest: {message}"))?;
     for line in text.lines().skip(1) {
         let mut words = line.split(' ');
         match words.next() {
             Some("dsst") => {
                 for _ in 0..4 {
                     words.next().ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst")
                     })?;
                 }
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 let roster = words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed dsst"))?;
                 if roster == "-" {
                     continue;
                 }
                 let roster = parse_block_id(roster)
-                    .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has a bad dsst roster"))?;
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "saved manifest has a bad dsst roster"))?;
                 retain_block(keep, roster)?;
                 let n = blocks
                     .lock()
                     .expect("block store lock poisoned")
                     .get(&roster, scratch)
                     .map(|(n, _)| n)
-                    .map_err(|error| {
-                        sql_err!(SQLSTATE_IO, "backup row roster read: {:?}", error)
-                    })?;
+                    .map_err(|error| sql_err!(SQLSTATE_IO, "saved row roster read: {:?}", error))?;
                 for id_bytes in scratch[..n].chunks(32) {
                     if id_bytes.len() != 32 {
                         return Err(sql_err!(
                             SQLSTATE_IO,
-                            "backup row roster is not a multiple of 32 bytes"
+                            "saved row roster is not a multiple of 32 bytes"
                         ));
                     }
                     let mut id = [0; 32];
@@ -14415,31 +14464,31 @@ fn retain_manifest_blocks(
             Some("vix") => {
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 let column_count: usize = words
                     .next()
                     .and_then(|word| word.parse().ok())
                     .filter(|count| *count != 0 && *count <= crate::storage::MAX_INDEX_COLS)
                     .ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a bad vix column count")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a bad vix column count")
                     })?;
                 for _ in 0..column_count {
                     words.next().ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix")
+                        sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix")
                     })?;
                 }
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))?;
                 let roster = words
                     .next()
-                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "saved manifest has a malformed vix"))
                     .and_then(|word| {
                         parse_block_id(word).map_err(|_| {
-                            sql_err!(SQLSTATE_IO, "backup manifest has a bad vix roster")
+                            sql_err!(SQLSTATE_IO, "saved manifest has a bad vix roster")
                         })
                     })?;
                 let complete = crate::store::walk_value_roster(
@@ -14448,7 +14497,7 @@ fn retain_manifest_blocks(
                     scratch,
                     |id, _| retain_block(keep, id).is_ok(),
                 )
-                .map_err(|error| sql_err!(SQLSTATE_IO, "backup value-index roster: {:?}", error))?;
+                .map_err(|error| sql_err!(SQLSTATE_IO, "saved value-index roster: {:?}", error))?;
                 if !complete {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18252,6 +18301,62 @@ mod stored_dependency_tests {
         };
         let table = storage.create_table(definition).unwrap();
         (checkpointer, storage, table, config)
+    }
+
+    #[test]
+    fn parallel_physical_manifest_retry_preserves_bytes_while_backup_uses_scratch() {
+        use std::time::{Duration, Instant};
+        let (mut checkpoint, mut storage, _table, config) =
+            index_gc_fixture("manifest-backup-retry", 16);
+        assert!(checkpoint.checkpoint(&mut storage).unwrap().is_some());
+        checkpoint.finish_maintenance(&storage).unwrap();
+        storage.set_lsn(7);
+        for _ in 0..64 {
+            if checkpoint.manifest_publication_pending() {
+                break;
+            }
+            assert!(matches!(
+                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                super::CheckpointStep::Working
+            ));
+        }
+        assert!(checkpoint.manifest_publication_pending());
+        let captured = checkpoint.manifest_output.readable().to_vec();
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 274);
+        namespace.borrow_mut().faults.transient_per_mille = 1000;
+        let now = Instant::now();
+        for turn in 0..16 {
+            checkpoint
+                .manifest_uploads
+                .advance(now + Duration::from_millis(turn * 250));
+            if checkpoint.manifest_uploads.has_completion() {
+                break;
+            }
+        }
+        let error = checkpoint
+            .advance_manifest_publication(&mut storage)
+            .err()
+            .expect("exhausted request attempts must retain a root retry");
+        assert_eq!(error.sqlstate, "58030");
+        assert!(matches!(
+            checkpoint.manifest_publication,
+            Some(super::ManifestPublication::Retry { lsn: 7, .. })
+        ));
+        namespace.borrow_mut().faults.transient_per_mille = 0;
+        assert_eq!(checkpoint.create_backup("during-retry").unwrap(), 0);
+        assert_ne!(checkpoint.manifest_buf.readable(), captured);
+        assert_eq!(checkpoint.manifest_output.readable(), captured);
+        checkpoint.manifest_publication = Some(super::ManifestPublication::Retry {
+            lsn: 7,
+            at: Instant::now(),
+        });
+        assert_eq!(checkpoint.checkpoint(&mut storage).unwrap(), Some(7));
+        let key = format!("{}manifest", config.object_store_prefix);
+        assert_eq!(namespace.borrow().object_bytes(&key).unwrap(), captured);
+        assert!(namespace.borrow().blind_overwrites.is_empty());
+        drop(storage);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 
     fn write_gc_index(checkpointer: &Checkpointer, payload: &[u8]) -> ValueIndexHandle {

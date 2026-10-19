@@ -87696,7 +87696,11 @@ fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
         }
         match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
             crate::checkpoint::CheckpointStep::Working => {
-                assert_eq!(checkpointer.published_spill_generation_count(table), 0);
+                assert_eq!(
+                    checkpointer.published_spill_generation_count(table),
+                    usize::from(checkpointer.manifest_installing()),
+                    "a durable root may precede local installation; unfinished uploads cannot"
+                );
             }
             crate::checkpoint::CheckpointStep::Published { lsn } => {
                 published = Some(lsn);
@@ -88188,6 +88192,7 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
         }
         assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
         let saved_lsn = engine.storage.lsn();
+        namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
         assert!(
             error_sqlstates(&run_with(
                 &mut engine,
@@ -88198,7 +88203,6 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
             ))
             .is_empty()
         );
-        namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
         let mut completed = false;
         for _ in 0..128 {
             engine
@@ -88349,10 +88353,13 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut recovered_budget = test_engine_budget(&config, 1 << 29);
         let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
-        assert_eq!(
-            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
-            ["11|one!", "12|two!"]
+        let recovered_rows = run_with(&mut recovered, &mut recovered_budget, query);
+        assert!(
+            error_sqlstates(&recovered_rows).is_empty(),
+            "replacement={replacement}: {}",
+            String::from_utf8_lossy(&recovered_rows)
         );
+        assert_eq!(data_rows(&recovered_rows), ["11|one!", "12|two!"]);
         assert!(recovered.checkpoint().unwrap());
         drop(recovered);
         std::fs::remove_dir_all(&config.data_dir).unwrap();

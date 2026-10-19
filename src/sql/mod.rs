@@ -7967,8 +7967,8 @@ impl Engine {
             .map(Checkpointer::atomic_block_read_scope)
     }
 
-    /// Enables reactor-driven reads only for the durable block stack. Manifest
-    /// and WAL clients retain their synchronous, statement-atomic contracts.
+    /// Enables reactor-driven reads for durable blocks. Root and journal
+    /// uploads use their separately reserved clients and completion state.
     pub(crate) fn enable_async_block_reads(&mut self) {
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
         if let Some(checkpointer) = self.ckpt.as_mut() {

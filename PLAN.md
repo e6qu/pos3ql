@@ -39,7 +39,8 @@ Checkpoint cleanup acknowledges only captured deletions and statistics; later
 analysis and transaction-private statistics keep their pending work.
 Manifest upload now retains its exact metadata bytes and conditional request while
 other work runs. Its completion installs only matching table and index identities;
-later writes stay dirty. Explicit index repair rebuilds from table data without
+later writes stay dirty. Cleanup retains every file named by the saved metadata,
+including indexes retired by a later table rewrite. Explicit index repair rebuilds from table data without
 reading the retired index. These changes still require runner qualification.
 Remaining read progress, fairness and complete failure/recovery evidence remain
 acceptance work in this same PR.

@@ -88995,10 +88995,17 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                 }
             }
         });
-        let checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+        let mut io_budget = Budget::new(
+            Checkpointer::budget_bytes(&config)
+                + crate::storage::SpillReader::budget_bytes(
+                    true,
+                    config.max_spill_generations_per_table,
+                ),
+        );
+        let checkpoint = Checkpointer::new(&config, &mut io_budget).unwrap();
         let blocks = checkpoint.block_stack();
         let reader = crate::storage::SpillReader::new(
-            &mut budget,
+            &mut io_budget,
             config.max_spill_generations_per_table,
             Some(Arc::clone(&blocks)),
             engine

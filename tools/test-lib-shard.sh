@@ -22,7 +22,16 @@ list=$(mktemp)
 trap 'rm -f "$list"' EXIT
 cargo test --locked --lib -- --list > "$list"
 
+# Validate cold-read effects before the rest of worker zero. Execute this
+# case once overall even if future test names move its ordinal to another worker.
+priority_test=sql::tests::atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
+grep -Fx "$priority_test: test" "$list" >/dev/null
+if [ "$index" -eq 0 ]; then
+    python3 tools/test_command.py cargo test --locked --lib -- --exact "$priority_test"
+fi
+
 set -- --exact \
+    --skip "$priority_test" \
     --skip sim::storage::storage_vopr \
     --skip sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery \
     --skip sql::tests::external_cold_order_and_distinct_runs_use_object_storage \

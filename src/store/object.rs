@@ -226,6 +226,12 @@ impl OwnedObjectStore {
                 "object_store_get_slots must be at least 1",
             ));
         }
+        budget
+            .draw(
+                core::mem::size_of::<AtomicReadScopes>(),
+                "atomic read owners",
+            )
+            .map_err(crate::object_store::SetupError::Budget)?;
         // A completed async read retains its response until its consumer
         // verifies it. Atomic reads and writes use another client so they
         // cannot replace a response still owned by a suspended reader.
@@ -259,12 +265,6 @@ impl OwnedObjectStore {
         }
         budget
             .draw(super::BLOCK_SIZE, "object_store_block_scratch")
-            .map_err(crate::object_store::SetupError::Budget)?;
-        budget
-            .draw(
-                core::mem::size_of::<AtomicReadScopes>(),
-                "atomic read owners",
-            )
             .map_err(crate::object_store::SetupError::Budget)?;
         Ok(Self {
             atomic_client,

@@ -2512,6 +2512,7 @@ impl Engine {
         &mut self,
         apply: impl FnOnce(&mut Storage) -> Result<T, SqlError>,
     ) -> Result<T, SqlError> {
+        self.check_writer_fence()?;
         self.wal.commit();
         if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
             let result = self.commit_wal().and_then(|()| apply(&mut self.storage));
@@ -2862,6 +2863,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        self.check_writer_fence()?;
         // Apply workers have transaction identities but no frontend/backend
         // process identity. Publish their durable database before opening the
         // local transaction instead of inheriting a reactor thread's context.
@@ -5318,6 +5320,10 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
+        if let Err(error) = self.check_writer_fence() {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         if txn.has_deferred_triggers() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -6477,14 +6483,11 @@ impl Engine {
     }
 
     fn promote_ready_commits(&mut self) -> Result<(), SqlError> {
-        loop {
-            let Some(ticket) = self
-                .commit_queue
-                .as_ref()
-                .and_then(|queue| queue.next_ready(self.durable_lsn))
-            else {
-                break;
-            };
+        while let Some(ticket) = self
+            .commit_queue
+            .as_ref()
+            .and_then(|queue| queue.next_ready(self.durable_lsn))
+        {
             let mut work = self
                 .commit_queue
                 .as_mut()
@@ -7881,6 +7884,17 @@ impl Engine {
         }
     }
 
+    fn check_writer_fence(&self) -> Result<(), SqlError> {
+        if self
+            .ckpt
+            .as_ref()
+            .is_some_and(Checkpointer::writer_was_fenced)
+        {
+            return Err(sql_err!("40001", "writer was fenced by a newer process"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn rotate_object_store_credentials(
         &mut self,
         credentials: crate::object_store::Credentials,
@@ -9159,6 +9173,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
@@ -9195,6 +9210,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
@@ -10200,7 +10216,10 @@ impl Engine {
         let _atomic_reads = self.atomic_block_read_scope();
         self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
-        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+        if let Err(error) = self
+            .check_writer_fence()
+            .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
+        {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
@@ -14253,6 +14272,12 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+            && txn.staged_commit().is_none()
+            && let Err(error) = self.check_writer_fence()
+        {
+            return Ok(Err(error));
+        }
         let _atomic_reads = if statement_writes(statement) {
             self.ckpt
                 .as_ref()

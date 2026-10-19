@@ -38,6 +38,10 @@ impl Condition {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Object-store errors stay inline because runtime heap allocation is forbidden"
+)]
 #[derive(Debug)]
 pub(crate) enum UploadError {
     SlotsExhausted,
@@ -48,6 +52,10 @@ pub(crate) enum UploadError {
     Request(Error),
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Each startup-reserved upload slot owns its complete result without heap indirection"
+)]
 enum State {
     Free,
     Queued {

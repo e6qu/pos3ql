@@ -378,7 +378,7 @@ impl OwnedObjectStore {
 
     fn join_owner(slot: &mut ObjectReadSlot, owner: Option<ReadOwner>) -> Result<(), StoreError> {
         if let Some(owner) = owner
-            && !slot.owners.iter().any(|existing| *existing == owner)
+            && !slot.owners.contains(&owner)
         {
             slot.owners
                 .push(owner)
@@ -421,10 +421,10 @@ impl OwnedObjectStore {
     fn consume(&mut self, index: usize, owner: Option<ReadOwner>) {
         let slot = &mut self.slots[index];
         let owner = owner.or(self.read_owner);
-        if let Some(owner) = owner {
-            if let Some(index) = slot.owners.iter().position(|existing| *existing == owner) {
-                slot.owners.swap_remove(index);
-            }
+        if let Some(owner) = owner
+            && let Some(index) = slot.owners.iter().position(|existing| *existing == owner)
+        {
+            slot.owners.swap_remove(index);
         }
         if slot.owners.is_empty() {
             Self::clear_slot(slot);
@@ -820,7 +820,7 @@ impl BlockStore for OwnedObjectStore {
             if (slot.pending_id == Some(*id)
                 || slot.ready_id == Some(*id)
                 || slot.error_id == Some(*id))
-                && slot.owners.iter().any(|existing| *existing == owner)
+                && slot.owners.contains(&owner)
             {
                 self.consume(index, Some(owner));
             }

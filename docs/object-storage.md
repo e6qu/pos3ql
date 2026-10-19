@@ -95,6 +95,13 @@ has changed. Uploaded objects without a successful root update cannot become
 confirmed commits. [Durable formats](durable-format.md#format-details-for-implementers)
 specifies empty roots, writer identities, conflict handling, and upgrade rules.
 
+After an ownership check detects a replacement, new SQL work is rejected with
+SQLSTATE `40001` before another commit enters the journal; rollback remains
+available. An operation already awaiting publication has a different outcome:
+if durability cannot be confirmed, the server sends a terminal `08007` error,
+flushes it before closing the connection, and retains the transaction for
+recovery. Reconnect and check the order before trying to save it again.
+
 Profile v1 accepts S3's 1,024-byte object-key limit, opaque continuation tokens
 up to 1,024 bytes, and strong quoted ETags up to 80 bytes. Exceeding a fixed
 profile bound fails before I/O or while decoding; it never truncates a key,

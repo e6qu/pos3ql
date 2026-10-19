@@ -76163,12 +76163,31 @@ fn writer_promotion_fences_old_and_delayed_publications_body() {
     assert!(first.checkpoint().unwrap());
     let (stale_manifest, stale_head) = first.ckpt.as_ref().unwrap().root_etags_for_test();
 
+    let namespace = crate::object_store::sim::open_namespace(&first_config.object_store_bucket, 17);
+    namespace.borrow_mut().faults.fail_from_op = Some(0);
+    assert!(first.verify_writer_ownership().is_err());
+    assert_eq!(
+        data_rows(&run_with(&mut first, &mut first_budget, "SELECT 1")),
+        ["1"]
+    );
+    namespace.borrow_mut().faults.fail_from_op = None;
+    first.verify_writer_ownership().unwrap();
+
+    let mut pending =
+        ConfiguredTransactionSession::new(&first_config, &mut first_budget).with_connection_id(2);
+    pending.success(
+        &mut first,
+        "BEGIN; INSERT INTO fenced_values VALUES (77)",
+        false,
+    );
     let mut second_config = first_config.clone();
     second_config.data_dir = format!("{}-successor", first_config.data_dir);
     let mut second_budget = test_engine_budget(&second_config, test_engine_budget_bytes(1 << 28));
     let mut second = Engine::new(&second_config, &mut second_budget).unwrap();
     assert!(first.verify_writer_ownership().is_err());
     assert!(second.verify_writer_ownership().is_ok());
+    pending.success(&mut first, "ROLLBACK", false);
+    assert!(!pending.transaction.is_active());
 
     let old_client = &mut first.ckpt.as_mut().unwrap().client;
     assert!(
@@ -76191,6 +76210,7 @@ fn writer_promotion_fences_old_and_delayed_publications_body() {
             .unwrap_err()
             .is_precondition_failed()
     );
+    let fenced_lsn = first.journal_lsn();
     let displaced = run_with(
         &mut first,
         &mut first_budget,
@@ -76198,6 +76218,11 @@ fn writer_promotion_fences_old_and_delayed_publications_body() {
     );
     assert_eq!(message_types(&displaced).last(), Some(&b'E'));
     assert!(String::from_utf8_lossy(&displaced).contains("40001"));
+    assert_eq!(
+        first.journal_lsn(),
+        fenced_lsn,
+        "known fencing must reject before WAL commit"
+    );
 
     let successor = run_with(
         &mut second,
@@ -86904,9 +86929,11 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
         config.max_ddl_per_transaction = 4;
         config.max_prepared_transactions = 1;
         config.txn_rows = 8;
+        config.table_rows = 8;
+        config.work_arena_bytes = 4 << 20;
         config.object_store_bucket = format!("prepared-receipts-{}-{commit}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-        let mut budget = test_engine_budget(&config, 512 << 20);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(128 << 20));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut preparing =
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);

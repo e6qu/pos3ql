@@ -1176,6 +1176,7 @@ pub(crate) struct Checkpointer {
     /// for a displaced process's write.
     writer_token: WriterToken,
     writer_fence_etag: Option<EntityTag>,
+    writer_fenced: bool,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -1991,6 +1992,7 @@ impl Checkpointer {
                 CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
             })?,
             writer_fence_etag: None,
+            writer_fenced: false,
         })
     }
 
@@ -2174,6 +2176,12 @@ impl Checkpointer {
     }
 
     fn assert_writer(&mut self) -> Result<(), SqlError> {
+        if self.writer_fenced {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
         let etag = self.writer_fence_etag.as_ref().ok_or_else(|| {
             sql_err!(
                 SQLSTATE_CAS,
@@ -2192,11 +2200,15 @@ impl Checkpointer {
             }
             Err(error) => {
                 let refreshed = self.client.get(WRITER_FENCE_KEY, None);
+                let refreshed_ok = refreshed.is_ok();
                 if let Ok(result) = refreshed
                     && self.client.body_bytes() == active.as_str().as_bytes()
                 {
                     self.writer_fence_etag = Some(result.etag);
                     return Ok(());
+                }
+                if refreshed_ok {
+                    self.writer_fenced = true;
                 }
                 if error.is_precondition_failed() {
                     Err(sql_err!(
@@ -2210,12 +2222,23 @@ impl Checkpointer {
         }
     }
 
+    pub(crate) fn writer_was_fenced(&self) -> bool {
+        self.writer_fenced
+    }
+
     pub(crate) fn verify_writer(&mut self) -> Result<(), SqlError> {
+        if self.writer_fenced {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
         let active = writer_fence_record("active", self.writer_token);
         self.client
             .get(WRITER_FENCE_KEY, None)
             .map_err(|error| sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))?;
         if self.client.body_bytes() != active.as_str().as_bytes() {
+            self.writer_fenced = true;
             return Err(sql_err!(
                 SQLSTATE_CAS,
                 "writer was fenced by a newer process"

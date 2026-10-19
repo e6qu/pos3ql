@@ -884,11 +884,17 @@ impl Conn {
             // boundary.  The journal remains available for a later retry,
             // but this client receives an explicit unknown-outcome error.
             self.send.truncate_to(output_mark);
-            let mut responder = Responder::new(&mut self.send);
             let staged = self.txn.staged_commit().is_some();
+            if staged {
+                self.recv.clear();
+                self.finish_lock_wait();
+                self.replication_completion_pending = false;
+                self.start_termination();
+                pending.after = After::Continue;
+            }
+            let mut responder = Responder::new(&mut self.send);
             let sent = if staged {
-                pending.after = After::Close;
-                responder.error(
+                responder.fatal(
                     "08007",
                     "commit outcome is unknown; reconnect before checking it",
                 )
@@ -6763,6 +6769,94 @@ mod tests {
                 .readable()
                 .contains(&wire::MSG_READY_FOR_QUERY)
         );
+    }
+
+    #[test]
+    fn parallel_commit_unknown_outcome_flushes_fatal_before_closing_a_full_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    core::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let config = Config::default_dev();
+        let mut budget = Budget::new(256 << 20);
+        let mut connection = Conn::new(&config, &mut budget).unwrap();
+        connection.open(server, 72);
+        let padding = [0u8; 4096];
+        let mut prefix = 0usize;
+        let mut stream = connection.stream();
+        loop {
+            match stream.write(&padding) {
+                Ok(length) => {
+                    assert!(length > 0 && prefix < (8 << 20));
+                    prefix += length;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+        connection.txn.stage_commit(
+            1,
+            crate::sql::txn::CommitTarget::Ordinary,
+            crate::sql::txn::CommitBarrier::Journal,
+        );
+        connection.park(true, 0);
+        client.write_all(b"Q\0\0\0\x0dSELECT 1\0").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let error = crate::sql_err!(sqlstate::IO_ERROR, "publication response lost");
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| connection.finish_response(
+                PendingResponse {
+                    after: After::Continue,
+                    publication_mark: Some(0)
+                },
+                Some(&error)
+            )),
+            After::Continue
+        );
+        assert!(connection.is_terminating());
+        if !connection.transport_output_empty() {
+            assert!(!connection.wants_read());
+        }
+        let mut scratch = [0u8; 4096];
+        while prefix != 0 {
+            let length = prefix.min(scratch.len());
+            client.read_exact(&mut scratch[..length]).unwrap();
+            assert!(scratch[..length].iter().all(|byte| *byte == 0));
+            prefix -= length;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !connection.transport_output_empty() {
+            assert!(Instant::now() < deadline, "terminal response did not flush");
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| connection.on_writable()),
+                After::Continue
+            );
+            std::thread::yield_now();
+        }
+        assert!(connection.wants_read());
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
+        assert!(response.windows(5).any(|bytes| bytes == b"08007"));
+        assert!(connection.txn.staged_commit().is_some());
+        assert_eq!(connection.drain_termination_input(), After::Continue);
+        assert_eq!(connection.drain_termination_input(), After::Close);
     }
 
     #[test]

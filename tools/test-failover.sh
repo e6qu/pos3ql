@@ -39,6 +39,15 @@ stop_process() {
   fi
 }
 cleanup() {
+  local status=$?
+  if [[ "$status" != 0 ]]; then
+    for log in primary candidate monitor old-client store; do
+      if [[ -f "$WORK/$log.log" ]]; then
+        printf '%s\n' "failover diagnostics: $log" >&2
+        tail -n 100 "$WORK/$log.log" >&2
+      fi
+    done
+  fi
   stop_process "$MONITOR_PID"
   stop_process "$OLD_CLIENT_PID"
   if [[ -z "$CANDIDATE_PID" && -s "$WORK/candidate.pid" ]]; then

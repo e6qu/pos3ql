@@ -2326,12 +2326,11 @@ impl Server {
                     flushed_lsn,
                     reply_requested,
                 }) => {
-                    if self.subscriptions[slot].detached_commit {
-                        self.unbind_subscription(slot);
-                    } else if self.subscriptions[slot]
-                        .client
-                        .acknowledge(flushed_lsn, reply_requested)
-                        .is_err()
+                    if self.subscriptions[slot].detached_commit
+                        || self.subscriptions[slot]
+                            .client
+                            .acknowledge(flushed_lsn, reply_requested)
+                            .is_err()
                     {
                         self.unbind_subscription(slot);
                     } else {

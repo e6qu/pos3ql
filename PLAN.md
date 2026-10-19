@@ -57,6 +57,9 @@ customer receives success before their change is recoverable.
   commit outcomes in the required order. A root must never name incomplete data.
 - Batch committed journal records and physical output. While storage waits,
   continue unrelated queries, cancellation and bounded maintenance.
+- Reject work after an ownership probe detects a replaced writer, before a new
+  commit enters the journal. Flush an uncertain commit's terminal error before
+  closing its connection.
 - Preserve writer fencing, retries, savepoints, prepared transactions and cold
   recovery. Never turn an uncertain commit into a claim that it rolled back.
 - Keep reads, durable commits and maintenance from starving one another.

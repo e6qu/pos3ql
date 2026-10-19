@@ -4633,6 +4633,89 @@ pub(super) fn resolve_order_target<'a>(
     resolve_position_target(expression, items, Some(scope), arena, "ORDER BY")
 }
 
+#[derive(Clone, Copy)]
+enum SortKeySource {
+    Projection(usize),
+    EarlierKey(usize),
+    Expression,
+}
+
+/// A sort key retains the output slot selected by an alias or position.
+/// Equal expressions in two output slots can have different volatile values.
+#[derive(Clone, Copy)]
+pub(super) struct ResolvedSortKey<'a> {
+    expression: &'a Expr<'a>,
+    source: SortKeySource,
+}
+
+impl<'a> ResolvedSortKey<'a> {
+    pub(super) fn value(
+        self,
+        projected: &[Datum<'a>],
+        earlier: &[Datum<'a>],
+        evaluate: impl FnOnce(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+    ) -> Result<Datum<'a>, SqlError> {
+        match self.source {
+            SortKeySource::Projection(index) => Ok(projected[index]),
+            SortKeySource::EarlierKey(index) => Ok(earlier[index]),
+            SortKeySource::Expression => evaluate(self.expression),
+        }
+    }
+}
+
+pub(super) fn resolve_sort_key<'a>(
+    original: &'a Expr<'a>,
+    items: &'a [SelectItem<'a>],
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    earlier: &[Option<ResolvedSortKey<'a>>],
+) -> Result<ResolvedSortKey<'a>, SqlError> {
+    let expression = resolve_order_target(original, items, scope, arena)?;
+    let source = if let Expr::Int(position) = original {
+        // Resolution above checked this against the expanded output width.
+        SortKeySource::Projection(*position as usize - 1)
+    } else {
+        let mut index = 0;
+        let mut equal_output = None;
+        let mut named_output = None;
+        for item in items {
+            match item {
+                SelectItem::Expr {
+                    expression: output,
+                    alias,
+                } => {
+                    if matches!(original, Expr::Column { qualifier: None, name }
+                        if *name == alias.unwrap_or(super::exec::derived_name(output)))
+                    {
+                        named_output = Some(index);
+                        break;
+                    }
+                    if equal_output.is_none() && **output == *expression {
+                        equal_output = Some(index);
+                    }
+                    index += 1;
+                }
+                SelectItem::Wildcard => index += scope.star_columns(),
+                SelectItem::TableWildcard(qualifier) => {
+                    index += scope.qualified_star_columns(qualifier)?;
+                }
+                SelectItem::RecordStar(base) => index += record_star_width(base, scope),
+            }
+        }
+        if let Some(index) = named_output.or(equal_output) {
+            SortKeySource::Projection(index)
+        } else if let Some(index) = earlier
+            .iter()
+            .position(|key| key.is_some_and(|key| *key.expression == *expression))
+        {
+            SortKeySource::EarlierKey(index)
+        } else {
+            SortKeySource::Expression
+        }
+    };
+    Ok(ResolvedSortKey { expression, source })
+}
+
 /// An `ORDER BY` / `GROUP BY` target: a bare integer is a 1-based position in
 /// the select list (a star item expanding to its columns), anything else is the
 /// expression itself, matched against the select list's aliases.

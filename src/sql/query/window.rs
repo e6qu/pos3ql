@@ -25,9 +25,9 @@ use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
-    merge_correlated, pax_column_demand, project_row, record_star_width, resolve_order_target,
-    rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok, window_row,
+    merge_correlated, pax_column_demand, project_row, record_star_width, rewrite_grouped_expr,
+    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
+    window_row,
 };
 
 fn window_scan_where<'a>(
@@ -1552,15 +1552,16 @@ pub(crate) fn project_window_rows<'a>(
 
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
-    let order_exprs: &mut [Option<&Expr>] = arena
+    let order_exprs: &mut [Option<super::ResolvedSortKey<'a>>] = arena
         .alloc_slice_with(n_order, |_| None)
         .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(resolve_order_target(
+        order_exprs[k] = Some(super::resolve_sort_key(
             ob.expression,
             statement.items,
             scope,
             arena,
+            &order_exprs[..k],
         )?);
     }
 
@@ -1627,13 +1628,18 @@ pub(crate) fn project_window_rows<'a>(
             .alloc_slice_with(n_order, |_| Datum::Null)
             .map_err(|_| arena_full())?;
         for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
-            keys[k] = eval_full(
-                oe.expect("set"),
-                arena,
-                params,
-                &super::Chained { inner: &jr, outer },
-                &win_hooks,
-            )?;
+            let value = oe
+                .expect("set")
+                .value(&projected[..np], &keys[..k], |expression| {
+                    eval_full(
+                        expression,
+                        arena,
+                        params,
+                        &super::Chained { inner: &jr, outer },
+                        &win_hooks,
+                    )
+                })?;
+            keys[k] = value;
         }
         sort_keys[i] = &*arena
             .alloc_slice_copy(&keys[..n_order])
@@ -1765,15 +1771,16 @@ pub(crate) fn external_window_into<'a>(
     }
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
-    let order_exprs: &mut [Option<&Expr>] = arena
+    let order_exprs: &mut [Option<super::ResolvedSortKey<'a>>] = arena
         .alloc_slice_with(n_order, |_| None)
         .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(resolve_order_target(
+        order_exprs[k] = Some(super::resolve_sort_key(
             ob.expression,
             statement.items,
             scope,
             arena,
+            &order_exprs[..k],
         )?);
     }
     let win_ptrs: &[*const Expr] = arena
@@ -2052,9 +2059,9 @@ pub(crate) fn external_window_into<'a>(
     let statement_order_collations: &mut [Collation] = arena
         .alloc_slice_with(statement.order_by.len(), |_| Collation::None)
         .map_err(|_| arena_full())?;
-    for (index, order) in statement.order_by.iter().enumerate() {
-        let expression = resolve_order_target(order.expression, statement.items, scope, arena)?;
-        statement_order_collations[index] = scope.expression_collation(expression)?;
+    for (index, key) in order_exprs.iter().enumerate() {
+        statement_order_collations[index] =
+            scope.expression_collation(key.expect("set").expression)?;
     }
     let mut out_sorter = storage.external_sorter()?;
     out_sorter.reset();
@@ -2190,13 +2197,18 @@ pub(crate) fn external_window_into<'a>(
             )?;
             debug_assert_eq!(np, width);
             for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
-                keys[k] = eval_full(
-                    oe.expect("set"),
-                    arena,
-                    params,
-                    &super::Chained { inner: row, outer },
-                    &win_hooks,
-                )?;
+                let value = oe
+                    .expect("set")
+                    .value(&projected[..np], &keys[..k], |expression| {
+                        eval_full(
+                            expression,
+                            arena,
+                            params,
+                            &super::Chained { inner: row, outer },
+                            &win_hooks,
+                        )
+                    })?;
+                keys[k] = value;
             }
             storage
                 .with_block_store(|blocks| {

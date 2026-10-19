@@ -60,6 +60,8 @@ fetching the large notes column it did not request.
 - Save CTE, sorted, subquery and INSERT SELECT results in one scan; do not
   evaluate expressions once to count rows and again to save them. For example,
   saving a query that prepares a statement must prepare it exactly once.
+  Sorting by an output label or position must reuse that output value, including
+  in grouped and windowed queries.
 - Release shared cache and storage owners before waiting on network I/O.
 - Retain read-completion wakeups until queued responses have been released;
   a ready result must not leave a customer waiting for another socket event.

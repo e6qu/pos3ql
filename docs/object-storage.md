@@ -110,7 +110,9 @@ streaming subscription apply uses the fixed commit queue.
 Saved query results are collected in one scan within the fixed statement arena.
 They do not run expressions a second time to discover the result size. For
 example, a saved query that calls a function to prepare a statement must prepare
-it once, even when another part of the query reads uncached data.
+it once, even when another part of the query reads uncached data. Sorting by
+that query's output label or position reuses the saved value, following
+[PostgreSQL's ORDER BY rules](https://www.postgresql.org/docs/18/sql-select.html#SQL-ORDERBY).
 
 ## Required S3-compatible subset
 

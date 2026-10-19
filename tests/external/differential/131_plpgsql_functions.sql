@@ -700,3 +700,49 @@ SELECT 'px' IN (
 );
 SELECT current_setting('application_name');
 RESET application_name;
+
+
+-- A sort key reuses its selected output slot in every projection route.
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) GROUP BY i ORDER BY label;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label,
+       row_number() OVER (ORDER BY i) AS ordinal
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT g.*, set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY 2;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT (ROW(i, i + 10)).*,
+       set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY 3;
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT i FROM generate_series(1, 3) AS g(i)
+ORDER BY set_config('application_name', current_setting('application_name') || 'x', false),
+         set_config('application_name', current_setting('application_name') || 'x', false);
+SELECT current_setting('application_name');
+SET application_name = 's';
+SELECT DISTINCT ON (set_config('application_name', current_setting('application_name') || 'x', false))
+       set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+RESET application_name;
+
+CREATE SEQUENCE sort_identity;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY b, a;
+SELECT currval('sort_identity');
+ALTER SEQUENCE sort_identity RESTART WITH 1;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY 2, 1;
+SELECT currval('sort_identity');
+ALTER SEQUENCE sort_identity RESTART WITH 1;
+SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+FROM generate_series(1, 3) AS g(i) ORDER BY nextval('sort_identity') % 3, b;
+SELECT currval('sort_identity');
+DROP SEQUENCE sort_identity;

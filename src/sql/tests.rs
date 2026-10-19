@@ -88892,7 +88892,6 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         config.max_tables = 4;
         config.table_rows = 16;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -88937,13 +88936,23 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         config.object_store_access_key = "test-access".to_string();
         config.object_store_secret_key = "test-secret".to_string();
         let prefix = format!("/{}/", config.object_store_bucket);
+        let mut fixture_config = config.clone();
+        fixture_config.object_store_sim = true;
+        // HTTP paths already contain the configured object prefix.
+        fixture_config.object_store_prefix.clear();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let uploads = Arc::new(AtomicUsize::new(0));
         let hold_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
+        let server_uploads = Arc::clone(&uploads);
         let server_hold_response = Arc::clone(&hold_response);
         let server = std::thread::spawn(move || {
+            let mut fixture_budget =
+                Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
+            let mut backing =
+                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
             while !server_stop.load(Ordering::Acquire) {
                 let mut stream = match listener.accept() {
                     Ok((stream, _)) => stream,
@@ -88961,42 +88970,110 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                     .unwrap();
                 let mut request = [0u8; 8192];
                 let mut received = 0;
-                while !request[..received]
-                    .windows(4)
-                    .any(|bytes| bytes == b"\r\n\r\n")
-                {
+                let header_end = loop {
+                    if let Some(at) = request[..received]
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        break at + 4;
+                    }
+                    assert!(
+                        received < request.len(),
+                        "fixture request headers are too large"
+                    );
                     let n = stream.read(&mut request[received..]).unwrap();
-                    assert!(n != 0 && received + n < request.len());
+                    assert_ne!(n, 0, "request ended before its headers");
                     received += n;
-                }
-                let request = std::str::from_utf8(&request[..received]).unwrap();
-                let mut words = request.split_whitespace();
-                assert_eq!(words.next(), Some("GET"));
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let mut words = headers.lines().next().unwrap().split_whitespace();
+                let method = words.next().unwrap();
                 let key = words.next().unwrap().strip_prefix(&prefix).unwrap();
-                let body = namespace
-                    .borrow()
-                    .object_bytes(key)
-                    .expect("fixture block exists")
-                    .to_vec();
-                server_requests.fetch_add(1, Ordering::Relaxed);
-                while server_hold_response.load(Ordering::Acquire)
-                    && !server_stop.load(Ordering::Acquire)
-                {
-                    std::thread::sleep(Duration::from_millis(1));
+                let mut content_length = None;
+                let mut range = None;
+                let mut if_none_match = None;
+                let mut if_match = None;
+                for line in headers.lines().skip(1).filter(|line| !line.is_empty()) {
+                    let (name, value) = line.split_once(':').expect("HTTP header field");
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("Content-Length") {
+                        content_length = Some(value.parse::<usize>().unwrap());
+                    } else if name.eq_ignore_ascii_case("Range") {
+                        range = Some(value);
+                    } else if name.eq_ignore_ascii_case("If-None-Match") {
+                        if_none_match = Some(value);
+                    } else if name.eq_ignore_ascii_case("If-Match") {
+                        if_match = Some(crate::object_store::EntityTag::parse(value).unwrap());
+                    }
                 }
-                if let Some(range) = request.lines().find_map(|line| {
-                    line.strip_prefix("Range: bytes=")
-                        .or_else(|| line.strip_prefix("range: bytes="))
-                }) {
-                    let (first, last) = range.split_once('-').unwrap();
-                    let first: usize = first.parse().unwrap();
-                    let last: usize = last.parse().unwrap();
-                    let selected = &body[first..=last];
-                    write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: \"effect-read\"\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", selected.len(), body.len()).unwrap();
-                    stream.write_all(selected).unwrap();
-                } else {
-                    write!(stream, "HTTP/1.1 200 OK\r\nETag: \"effect-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                    stream.write_all(&body).unwrap();
+                let length = match content_length {
+                    Some(length) => length,
+                    None => {
+                        assert_ne!(method, "PUT", "PUT requires Content-Length");
+                        0
+                    }
+                };
+                assert!(
+                    length <= backing.response_capacity(),
+                    "fixture request body is too large"
+                );
+                let mut body = vec![0u8; length];
+                let buffered = received - header_end;
+                assert!(
+                    buffered <= length,
+                    "unexpected bytes after the request body"
+                );
+                body[..buffered].copy_from_slice(&request[header_end..received]);
+                stream.read_exact(&mut body[buffered..]).unwrap();
+                match method {
+                    "PUT" => {
+                        let condition = match (if_none_match, if_match.as_ref()) {
+                            (Some("*"), None) => crate::object_store::Precondition::IfNoneMatchAny,
+                            (None, Some(tag)) => crate::object_store::Precondition::IfMatch(tag),
+                            (None, None) => crate::object_store::Precondition::None,
+                            _ => panic!("unsupported conditional request"),
+                        };
+                        match backing.put(key, &body, condition) {
+                            Ok(tag) => {
+                                server_uploads.fetch_add(1, Ordering::Relaxed);
+                                write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
+                            }
+                            Err(crate::object_store::Error::Status { code: 412, .. }) => {
+                                stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                            }
+                            Err(error) => panic!("fixture object upload failed: {error}"),
+                        }
+                    }
+                    "DELETE" => {
+                        backing.delete(key).unwrap();
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
+                    "GET" => {
+                        let metadata = backing.get(key, None).unwrap();
+                        let data = backing.body_bytes();
+                        server_requests.fetch_add(1, Ordering::Relaxed);
+                        while server_hold_response.load(Ordering::Acquire)
+                            && !server_stop.load(Ordering::Acquire)
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        if let Some(range) = range {
+                            let (first, last) = range
+                                .strip_prefix("bytes=")
+                                .unwrap()
+                                .split_once('-')
+                                .unwrap();
+                            let first: usize = first.parse().unwrap();
+                            let last: usize = last.parse().unwrap();
+                            let selected = &data[first..=last];
+                            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: {}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), selected.len(), data.len()).unwrap();
+                            stream.write_all(selected).unwrap();
+                        } else {
+                            write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), data.len()).unwrap();
+                            stream.write_all(data).unwrap();
+                        }
+                    }
+                    _ => panic!("unsupported fixture method: {method}"),
                 }
             }
         });
@@ -89132,6 +89209,10 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
             )),
             ["sx", "sxx", "sxxx"]
         );
+        assert!(
+            uploads.load(Ordering::Relaxed) > 0,
+            "sort must upload a temporary run"
+        );
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
@@ -89210,4 +89291,109 @@ fn version_reports_the_compiled_architecture_and_operating_system_without_alloca
         std::env::consts::OS
     };
     assert!(target.contains(os));
+}
+
+#[test]
+fn sort_keys_reuse_projected_values_without_repeating_effects() {
+    let (mut engine, budget) = test_engine();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            r#"SET application_name = 's';
+               SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) ORDER BY label;
+               SELECT current_setting('application_name');"#,
+            &["sx", "sxx", "sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) ORDER BY 1;
+               SELECT current_setting('application_name');"#,
+            &["sx", "sxx", "sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i)
+               ORDER BY set_config('application_name', current_setting('application_name') || 'x', false);
+               SELECT current_setting('application_name');"#,
+            &["sx", "sxx", "sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) GROUP BY i ORDER BY label;
+               SELECT current_setting('application_name');"#,
+            &["sx", "sxx", "sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label,
+                      row_number() OVER (ORDER BY i) AS ordinal
+               FROM generate_series(1, 3) AS g(i) ORDER BY label;
+               SELECT current_setting('application_name');"#,
+            &["sx|1", "sxx|2", "sxxx|3", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT g.*, set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) ORDER BY 2;
+               SELECT current_setting('application_name');"#,
+            &["1|sx", "2|sxx", "3|sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT (ROW(i, i + 10)).*,
+                      set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) ORDER BY 3;
+               SELECT current_setting('application_name');"#,
+            &["1|11|sx", "2|12|sxx", "3|13|sxxx", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT i FROM generate_series(1, 3) AS g(i)
+               ORDER BY set_config('application_name', current_setting('application_name') || 'x', false),
+                        set_config('application_name', current_setting('application_name') || 'x', false);
+               SELECT current_setting('application_name');"#,
+            &["1", "2", "3", "sxxx"],
+        ),
+        (
+            r#"SET application_name = 's';
+               SELECT DISTINCT ON (set_config('application_name', current_setting('application_name') || 'x', false))
+                      set_config('application_name', current_setting('application_name') || 'x', false) AS label
+               FROM generate_series(1, 3) AS g(i) ORDER BY label;
+               SELECT current_setting('application_name');"#,
+            &["sx", "sxx", "sxxx", "sxxx"],
+        ),
+    ];
+    for &(sql, expected) in cases {
+        let output = run_with_fixed_memory(&mut engine, &budget, sql, 1 << 20);
+        let errors = error_sqlstates(&output);
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        assert_eq!(data_rows(&output), expected, "{sql}");
+    }
+
+    // Identical volatile expressions in distinct output slots stay distinct.
+    // Both outputs participate in sorting, so both must be computed before
+    // the sort. Names and positions retain their own slot identities.
+    for (order, expected) in [
+        ("b, a", &["2|0", "0|1", "1|2", "6"][..]),
+        ("2, 1", &["2|0", "0|1", "1|2", "6"][..]),
+        (
+            "nextval('sort_identity') % 3, b",
+            &["0|1", "1|2", "2|0", "6"][..],
+        ),
+    ] {
+        let sql = format!(
+            "CREATE SEQUENCE sort_identity;
+             SELECT nextval('sort_identity') % 3 AS a, nextval('sort_identity') % 3 AS b
+             FROM generate_series(1, 3) AS g(i) ORDER BY {order};
+             SELECT currval('sort_identity');
+             DROP SEQUENCE sort_identity;"
+        );
+        let output = run_with_fixed_memory(&mut engine, &budget, &sql, 1 << 20);
+        let errors = error_sqlstates(&output);
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        assert_eq!(data_rows(&output), expected, "{sql}");
+    }
 }

@@ -9471,6 +9471,7 @@ impl Engine {
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
         let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
             checkpointer.physical_output_ready(std::time::Instant::now())
+                || checkpointer.physical_output_stale(&self.storage)
         });
         self.post_publish_cleanup.is_some()
             || self.storage.history_cleanup_pending()
@@ -9503,9 +9504,10 @@ impl Engine {
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
         if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.physical_output_pending()
-            && checkpointer.physical_output_ready(std::time::Instant::now())
+            && (checkpointer.physical_output_ready(std::time::Instant::now())
+                || checkpointer.physical_output_stale(&self.storage))
         {
-            return match checkpointer.advance_physical_output() {
+            return match checkpointer.advance_physical_output(&self.storage) {
                 Ok(_) => CheckpointBeat::Advanced,
                 Err(error) => {
                     crate::logging::error_args(

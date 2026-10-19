@@ -37,11 +37,13 @@ after both succeed. Clients retain their transaction outcome until publication
 and ordered in-memory completion finish, including when the client disconnects.
 
 `object_store_block_put_slots` reserves separate clients for immutable row and
-index output. Table slices and paced merges retain one operation's bytes while
+index output. Table slices, paced merges and secondary indexes retain one operation's bytes while
 its uploads overlap; the new file handle stays private until every upload
 finishes. Table slices retain their selected bytes while later changes append
 another generation. Replacing a table or rewriting its row encodings discards
-the old capture. Secondary-index producers, manifest publication and remaining
+the old capture. Index sort runs and final index handles remain private until
+their uploads finish; changed index inputs cancel abandoned uploads.
+Manifest publication and remaining
 qualification are in [the plan](../PLAN.md).
 
 Table output schedules at most the configured number of committed versions,

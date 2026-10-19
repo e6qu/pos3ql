@@ -22,10 +22,10 @@ use crate::storage::{
     SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
 };
 use crate::store::{
-    BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
-    SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan, StoreError,
-    TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter,
-    block_keys_at, copy_block_entry_at,
+    BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
+    RowSstFormat, SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan,
+    StoreError, TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep,
+    ValueIndexWriter, block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -355,13 +355,13 @@ fn profile_checkpoint_phase(
 
 /// A published roster proves these immutable blocks already reached the
 /// durable tier. Their content identity lets a rebuild reuse unchanged blocks.
-struct PublishedValueBlockStore<'a> {
-    inner: &'a mut dyn BlockStore,
+struct PublishedValueBlockWriter<'a> {
+    inner: &'a mut dyn BlockWriter,
     known_blocks: &'a [(BlockId, Option<BlockType>)],
 }
 
-impl BlockStore for PublishedValueBlockStore<'_> {
-    fn put(
+impl BlockWriter for PublishedValueBlockWriter<'_> {
+    fn write_block(
         &mut self,
         payload: &[u8],
         block_type: BlockType,
@@ -377,11 +377,7 @@ impl BlockStore for PublishedValueBlockStore<'_> {
                 return Ok(id);
             }
         }
-        self.inner.put(payload, block_type, lsn)
-    }
-
-    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        self.inner.get(id, into)
+        self.inner.write_block(payload, block_type, lsn)
     }
 }
 
@@ -574,6 +570,10 @@ enum ValueSchedulePhase {
         accumulator: Option<ExternalRun>,
         level: usize,
     },
+    CompleteRun {
+        run: ExternalRun,
+        destination: ValueMergeDestination,
+    },
 }
 
 struct ValueScheduleJob {
@@ -598,7 +598,20 @@ struct ValueScheduleJob {
     levels: [Option<ExternalRun>; 64],
 }
 
+#[derive(Clone, Copy)]
+enum ValueIndexPhase {
+    Write,
+    Finish(Option<ValueIndexHandle>),
+}
+
+#[derive(Clone, Copy)]
+enum IndexOutputOwner {
+    Schedule,
+    Index,
+}
+
 struct ValueIndexJob {
+    phase: ValueIndexPhase,
     slot: usize,
     table_created_at: u64,
     binding: usize,
@@ -1106,6 +1119,7 @@ pub(crate) struct Checkpointer {
     uploads: crate::object_store::upload::Uploads,
     block_uploads: crate::object_store::upload::Uploads,
     block_output: crate::store::BlockWriteBatch,
+    index_output_owner: Option<IndexOutputOwner>,
     table_output: FixedVec<CheckpointVersion>,
     table_job: Option<TableSliceJob>,
     commit_publication: Option<CommitPublication>,
@@ -1261,11 +1275,9 @@ const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 pub(crate) const MERGE_SOURCE_SCRATCH_BYTES: usize = 5 * crate::store::MAX_PAYLOAD + MAX_ASSEMBLED;
-const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
 const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
 const VALUE_INDEX_SCHEDULE_BEAT_ROWS: usize = 1024;
-const VALUE_INDEX_SCHEDULE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_SCHEDULE_BEAT_READS: u64 = 8;
 const VALUE_SORT_ROWS_PER_CHUNK: usize = 8192;
 
@@ -2005,6 +2017,7 @@ impl Checkpointer {
                 config.checkpoint_write_entries,
             )
             .map_err(CheckpointSetupError::Budget)?,
+            index_output_owner: None,
             table_job: None,
             commit_publication: None,
             blocks,
@@ -2132,15 +2145,10 @@ impl Checkpointer {
     }
 
     #[cfg(test)]
-    pub(crate) fn value_index_schedule_io_active(&self) -> bool {
-        self.value_schedule_job.as_ref().is_some_and(|job| {
-            matches!(
-                job.phase,
-                ValueSchedulePhase::WriteChunk { .. }
-                    | ValueSchedulePhase::StartMerge { .. }
-                    | ValueSchedulePhase::Merge { .. }
-            )
-        })
+    pub(crate) fn value_index_schedule_merge_ready(&self) -> bool {
+        self.value_schedule_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.phase, ValueSchedulePhase::StartMerge { .. }))
     }
 
     #[cfg(test)]
@@ -2615,7 +2623,29 @@ impl Checkpointer {
         !self.block_output.is_empty()
     }
 
-    pub(crate) fn advance_physical_output(&mut self) -> Result<bool, SqlError> {
+    pub(crate) fn physical_output_stale(&self, storage: &Storage) -> bool {
+        !self.block_output.is_empty()
+            && match self.index_output_owner {
+                Some(IndexOutputOwner::Schedule) => self
+                    .value_schedule_job
+                    .as_ref()
+                    .is_none_or(|job| !Self::value_schedule_job_is_current(storage, job)),
+                Some(IndexOutputOwner::Index) => self
+                    .value_job
+                    .as_ref()
+                    .is_none_or(|job| !Self::value_job_is_current(storage, job)),
+                None => false,
+            }
+    }
+
+    pub(crate) fn advance_physical_output(&mut self, storage: &Storage) -> Result<bool, SqlError> {
+        if self.physical_output_stale(storage) {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.index_output_owner = None;
+            return Ok(true);
+        }
         self.drain_block_output()
     }
 
@@ -2645,6 +2675,7 @@ impl Checkpointer {
 
     fn drain_block_output(&mut self) -> Result<bool, SqlError> {
         if self.block_output.is_empty() {
+            self.index_output_owner = None;
             return Ok(true);
         }
         let before = self.block_output.object_puts();
@@ -2660,6 +2691,7 @@ impl Checkpointer {
         let complete = result.map_err(upload_to_sql)?;
         if complete {
             self.block_output.consume();
+            self.index_output_owner = None;
         }
         Ok(complete)
     }
@@ -8371,7 +8403,7 @@ impl Checkpointer {
         &mut self,
         storage: &mut Storage,
     ) -> Result<CheckpointStep, SqlError> {
-        if !self.drain_block_output()? {
+        if !self.advance_physical_output(storage)? {
             return Ok(CheckpointStep::Working);
         }
         if self.table_job.is_some() {
@@ -12879,7 +12911,6 @@ impl Checkpointer {
         &mut self,
         job: &mut ValueScheduleJob,
         mut position: usize,
-        before: crate::store::BlockIoStats,
     ) -> Result<(), SqlError> {
         if position == 0 {
             self.slice_writer.reset();
@@ -12891,41 +12922,25 @@ impl Checkpointer {
             let end = begin + row.length as usize;
             self.slice_writer
                 .append(
-                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    &mut self.block_output,
                     position as u64 + 1,
                     &self.value_source[begin..end],
                 )
                 .map_err(sst_to_sql)?;
             position += 1;
-            let io = self
-                .blocks
-                .lock()
-                .expect("block store lock poisoned")
-                .io_stats()
-                .saturating_sub(before);
-            if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
-            {
+            if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES || !self.block_output.is_empty() {
                 job.phase = ValueSchedulePhase::WriteChunk { position };
                 return Ok(());
             }
         }
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats()
-            .saturating_sub(before)
-            .object_puts
-            != 0
-        {
+        if !self.block_output.is_empty() {
             job.phase = ValueSchedulePhase::WriteChunk { position };
             return Ok(());
         }
         let rows = job.row_count as u64;
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
+            .finish(&mut self.block_output)
             .map_err(sst_to_sql)?
             .expect("non-empty value-index run");
         if let Some(pending) = job.pending {
@@ -12936,11 +12951,11 @@ impl Checkpointer {
         }
         job.chunk_len = 0;
         job.row_count = 0;
-        Self::install_value_run(
-            job,
-            ExternalRun::from_checkpoint(handle, rows),
-            ValueMergeDestination::Carry(0),
-        )
+        job.phase = ValueSchedulePhase::CompleteRun {
+            run: ExternalRun::from_checkpoint(handle, rows),
+            destination: ValueMergeDestination::Carry(0),
+        };
+        Ok(())
     }
 
     fn start_value_merge(
@@ -13044,18 +13059,14 @@ impl Checkpointer {
                     .prefixed_row()
                     .expect("chosen left row");
                 self.slice_writer
-                    .append(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
-                        output,
-                        row,
-                    )
+                    .append(&mut self.block_output, output, row)
                     .map_err(sst_to_sql)?;
                 self.value_sort_reader
                     .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
             } else {
                 self.slice_writer
                     .append(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
+                        &mut self.block_output,
                         output,
                         &self.value_entry[..right_len],
                     )
@@ -13080,7 +13091,7 @@ impl Checkpointer {
                 .io_stats()
                 .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
+                || !self.block_output.is_empty()
                 || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
             {
                 right_cursor.detach_buffer();
@@ -13094,13 +13105,15 @@ impl Checkpointer {
                 return Ok(());
             }
         }
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats()
-            .saturating_sub(before)
-            != Default::default()
+        if !self.block_output.is_empty()
+            || self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats()
+                .saturating_sub(before)
+                .object_gets
+                != 0
         {
             right_cursor.detach_buffer();
             job.phase = ValueSchedulePhase::Merge {
@@ -13114,10 +13127,14 @@ impl Checkpointer {
         }
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
+            .finish(&mut self.block_output)
             .map_err(sst_to_sql)?
             .expect("merged value-index run is non-empty");
-        Self::install_value_run(job, ExternalRun::from_checkpoint(handle, rows), destination)
+        job.phase = ValueSchedulePhase::CompleteRun {
+            run: ExternalRun::from_checkpoint(handle, rows),
+            destination,
+        };
+        Ok(())
     }
 
     fn value_finish_beat(
@@ -13171,6 +13188,7 @@ impl Checkpointer {
             self.value_base_stream.reset(base, job.navigation.is_some());
         }
         self.value_job = Some(ValueIndexJob {
+            phase: ValueIndexPhase::Write,
             slot: job.slot,
             table_created_at: job.table_created_at,
             binding: job.binding,
@@ -13201,6 +13219,7 @@ impl Checkpointer {
             self.value_changed_rowids.clear();
             return Ok(());
         }
+        self.index_output_owner = Some(IndexOutputOwner::Schedule);
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         let before = self
@@ -13212,7 +13231,7 @@ impl Checkpointer {
         let result = match phase {
             ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
             ValueSchedulePhase::WriteChunk { position } => self
-                .value_write_chunk_beat(&mut job, position, before)
+                .value_write_chunk_beat(&mut job, position)
                 .map(|()| None),
             ValueSchedulePhase::StartMerge {
                 left,
@@ -13242,6 +13261,9 @@ impl Checkpointer {
             ValueSchedulePhase::Finish { accumulator, level } => {
                 Ok(self.value_finish_beat(&mut job, accumulator, level))
             }
+            ValueSchedulePhase::CompleteRun { run, destination } => {
+                Self::install_value_run(&mut job, run, destination).map(|()| None)
+            }
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -13260,6 +13282,9 @@ impl Checkpointer {
             Ok(Some(source)) => self.finish_value_schedule(job, source),
             Ok(None) => self.value_schedule_job = Some(job),
             Err(error) => {
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
                 self.slice_writer.reset();
                 self.value_source_cursor.reset();
                 self.value_changed_rowids.clear();
@@ -13305,6 +13330,7 @@ impl Checkpointer {
         } else {
             self.value_writer.reset();
         }
+        job.phase = ValueIndexPhase::Write;
         job.previous_posting = None;
         match &mut job.source {
             ValueIndexSource::InMemory { position, .. } => *position = 0,
@@ -13335,6 +13361,7 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
+        self.index_output_owner = Some(IndexOutputOwner::Index);
         let result = self.write_value_index_entries(storage, &mut job, before);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -13378,6 +13405,9 @@ impl Checkpointer {
                 Ok(())
             }
             Err(error) => {
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
                 self.reset_value_index_output(&mut job);
                 self.value_job = Some(job);
                 Err(error)
@@ -13391,6 +13421,9 @@ impl Checkpointer {
         job: &mut ValueIndexJob,
         before: crate::store::BlockIoStats,
     ) -> Result<Option<Option<ValueIndexHandle>>, SqlError> {
+        if let ValueIndexPhase::Finish(handle) = job.phase {
+            return Ok(Some(handle));
+        }
         if let ValueIndexSource::External { run, started } = &mut job.source
             && !*started
         {
@@ -13455,16 +13488,16 @@ impl Checkpointer {
             }
             if delta_len == 0 && job.base_len == 0 {
                 let handle = {
-                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-                    let mut published = PublishedValueBlockStore {
-                        inner: &mut *blocks,
+                    let mut published = PublishedValueBlockWriter {
+                        inner: &mut self.block_output,
                         known_blocks: &self.roster_scratch,
                     };
                     self.value_writer
                         .finish(&mut published, job.through_lsn)
                         .map_err(value_index_to_sql)?
                 };
-                return Ok(Some(handle));
+                job.phase = ValueIndexPhase::Finish(handle);
+                return Ok(None);
             }
 
             let take_base = match (job.base_len, delta_len) {
@@ -13545,9 +13578,8 @@ impl Checkpointer {
                     None
                 };
                 let write = {
-                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-                    let mut published = PublishedValueBlockStore {
-                        inner: &mut *blocks,
+                    let mut published = PublishedValueBlockWriter {
+                        inner: &mut self.block_output,
                         known_blocks: &self.roster_scratch,
                     };
                     if let Some(spec) = job.navigation {
@@ -13604,7 +13636,7 @@ impl Checkpointer {
                 .io_stats()
                 .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || io.object_puts >= VALUE_INDEX_WRITE_BEAT_BLOCKS
+                || !self.block_output.is_empty()
                 || io.object_gets >= VALUE_INDEX_WRITE_BEAT_READS
             {
                 return Ok(None);

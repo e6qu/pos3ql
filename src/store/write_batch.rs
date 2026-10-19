@@ -354,4 +354,76 @@ mod tests {
         assert!(output.is_empty() && !uploads.busy());
         server.join().unwrap();
     }
+
+    #[test]
+    fn parallel_physical_output_retains_original_bytes_across_failed_attempts() {
+        let mut config = config(1);
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("physical-output-retry-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 222);
+        let bytes = 2 * (HEADER_LEN + 4);
+        let mut budget = Budget::new(
+            BlockWriteBatch::budget_bytes(bytes, 2)
+                + Uploads::budget_bytes(&config, 2, super::super::BLOCK_SIZE),
+        );
+        let mut output = BlockWriteBatch::new(&mut budget, bytes, 2).unwrap();
+        let mut uploads = Uploads::new(&config, 2, super::super::BLOCK_SIZE, &mut budget).unwrap();
+        let first = output.write_block(b"keep", BlockType::SstData, 0).unwrap();
+        let second = output.write_block(b"also", BlockType::SstData, 0).unwrap();
+        namespace.borrow_mut().faults.transient_per_mille = 1000;
+        let start = Instant::now();
+        let mut failed_at = None;
+        for turn in 0..16 {
+            let now = start + Duration::from_millis(turn * 250);
+            match output.drain(&mut uploads, now) {
+                Ok(false) => {}
+                Ok(true) => panic!("failed uploads cannot complete the batch"),
+                Err(_) => {
+                    failed_at = Some(now);
+                    break;
+                }
+            }
+        }
+        let failed_at = failed_at.expect("request attempts must surface their terminal failure");
+        assert_eq!(output.blocks.len(), 2);
+        assert_eq!(output.bytes.len(), bytes);
+        assert_eq!(output.blocks[0].id, first);
+        assert_eq!(output.blocks[1].id, second);
+        for (index, expected) in [b"keep", b"also"].into_iter().enumerate() {
+            let block = &output.blocks[index];
+            assert_eq!(
+                super::super::decode(
+                    &output.bytes.readable()[block.offset..block.offset + block.length],
+                    true
+                )
+                .unwrap()
+                .payload,
+                expected
+            );
+        }
+        namespace.borrow_mut().faults.transient_per_mille = 0;
+        let mut completed = false;
+        for turn in 0..16 {
+            if output
+                .drain(
+                    &mut uploads,
+                    failed_at + Duration::from_secs(2) + Duration::from_millis(turn * 250),
+                )
+                .unwrap()
+            {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "retained bytes must complete after storage recovers"
+        );
+        assert_eq!(namespace.borrow().object_count(), 2);
+        assert!(namespace.borrow().blind_overwrites.is_empty());
+        output.consume();
+        assert!(output.is_empty());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 }

@@ -72031,7 +72031,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         .ckpt
         .as_ref()
         .unwrap()
-        .value_index_schedule_io_active()
+        .value_index_schedule_merge_ready()
     {
         assert!(matches!(
             engine
@@ -72044,6 +72044,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         ));
     }
 
+    // Fail the next saved-run read; staged uploads have already completed.
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     let before_failure = engine.storage.block_io_stats();
     assert!(
@@ -87816,6 +87817,119 @@ fn parallel_physical_table_capture_releases_deletion_owners_on_failure_and_drop(
             ["0"]
         );
         drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
+    for slots in [1, 4] {
+        let mut config = test_config(&format!("physical-index-batches-{slots}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("physical-index-batches-{slots}-{}", std::process::id());
+        config.object_store_block_put_slots = slots;
+        config.max_tables = 4;
+        config.table_rows = 512;
+        config.txn_rows = 512;
+        config.value_index_rows = 512;
+        config.memtable_bytes = 8 << 20;
+        config.wal_bytes = 8 << 20;
+        config.wal_buffer_bytes = 2 << 20;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE batch_index(id integer PRIMARY KEY, code text, tags integer[], payload text); \
+             INSERT INTO batch_index SELECT i,'code-'||i::text,ARRAY[i],repeat('x',1024) \
+             FROM generate_series(1,320) AS source(i); \
+             CREATE INDEX batch_index_cover ON batch_index(code) INCLUDE(payload); \
+             CREATE INDEX batch_index_tags ON batch_index USING gin(tags)",
+        );
+        assert!(
+            error_sqlstates(&setup).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let table = engine.storage.find_table("public", "batch_index").unwrap();
+        let mut pending_index = false;
+        let mut published = None;
+        for _ in 0..4096 {
+            let checkpointer = engine.ckpt.as_mut().unwrap();
+            if checkpointer.value_index_job_active() && checkpointer.physical_output_pending() {
+                pending_index = true;
+            }
+            let before = engine.storage.block_io_stats();
+            match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
+                crate::checkpoint::CheckpointStep::Working => {
+                    for binding in 0..engine.storage.value_binding_count(table) {
+                        assert!(
+                            engine
+                                .storage
+                                .value_binding_handle(table, binding)
+                                .is_none(),
+                            "a pending checkpoint cannot install any index root"
+                        );
+                    }
+                }
+                crate::checkpoint::CheckpointStep::Published { lsn } => {
+                    published = Some(lsn);
+                    break;
+                }
+                crate::checkpoint::CheckpointStep::Idle => panic!("dirty index became idle"),
+            }
+            let io = engine.storage.block_io_stats().saturating_sub(before);
+            assert!(
+                io.object_puts <= slots as u64,
+                "upload slots bound one turn: {io:?}"
+            );
+        }
+        assert!(pending_index, "index output must wait across upload turns");
+        let lsn = published.expect("batched index checkpoint must converge");
+        for binding in 0..engine.storage.value_binding_count(table) {
+            assert!(
+                engine
+                    .storage
+                    .value_binding_handle(table, binding)
+                    .is_some()
+            );
+        }
+        engine.begin_post_publish_cleanup(lsn);
+        engine.finish_post_publish_cleanup().unwrap();
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .finish_maintenance(&engine.storage)
+            .unwrap();
+        let query = "SELECT id,length(payload) FROM batch_index WHERE code='code-17'; \
+                     SELECT id FROM batch_index WHERE tags @> ARRAY[43]; \
+                     SELECT count(*),sum(id) FROM batch_index";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["17|1024", "43", "320|51360"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["17|1024", "43", "320|51360"]
+        );
+        let duplicate = run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "INSERT INTO batch_index VALUES(17,'duplicate',ARRAY[999],'duplicate')",
+        );
+        assert_eq!(error_sqlstates(&duplicate), [sqlstate::UNIQUE_VIOLATION]);
+        drop(recovered);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }

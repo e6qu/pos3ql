@@ -5618,12 +5618,10 @@ mod tests {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
                 conn.phase = Phase::Ready;
-                assert!(matches!(
-                    message(
-                        &mut conn,
-                        &mut engine,
-                        wire::FMSG_QUERY,
-                        b"CREATE TABLE copy_pending(id integer PRIMARY KEY); \
+                // Initial publication populates the simulator's remote fixtures.
+                assert!(conn.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"CREATE TABLE copy_pending(id integer PRIMARY KEY); \
                           CREATE TABLE copy_pending_audit(n bigint); \
                           CREATE FUNCTION copy_pending_row() RETURNS trigger LANGUAGE plpgsql AS \
                             'BEGIN NEW.id := NEW.id + 10; RETURN NEW; END'; \
@@ -5633,10 +5631,9 @@ mod tests {
                             FOR EACH ROW EXECUTE FUNCTION copy_pending_row(); \
                           CREATE TRIGGER copy_pending_statement AFTER INSERT ON copy_pending \
                             REFERENCING NEW TABLE AS inserted_rows \
-                            FOR EACH STATEMENT EXECUTE FUNCTION copy_pending_statement()\0",
-                    ),
-                    Step::Continue
-                ));
+                            FOR EACH STATEMENT EXECUTE FUNCTION copy_pending_statement()\0"
+                )));
+                assert!(matches!(conn.process_message(&mut engine), Step::Continue));
                 assert!(!has_backend_message(
                     conn.send.readable(),
                     wire::MSG_ERROR_RESPONSE

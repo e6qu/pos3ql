@@ -87657,3 +87657,84 @@ fn parallel_physical_columnar_generations_preserve_overflow_rows_on_cold_recover
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
+    let mut config = test_config("physical-table-pending-output");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("physical-table-pending-output-{}", std::process::id());
+    config.object_store_block_put_slots = 1;
+    config.max_tables = 4;
+    config.table_rows = 8;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pending_output(id integer, qty integer); \
+         INSERT INTO pending_output VALUES(1,10),(2,20)",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let table = engine
+        .storage
+        .find_table("public", "pending_output")
+        .unwrap();
+    let mut pending_seen = false;
+    let mut published = None;
+    for _ in 0..64 {
+        let checkpointer = engine.ckpt.as_mut().unwrap();
+        if checkpointer.physical_output_pending() {
+            pending_seen = true;
+            assert!(checkpointer.retained_output_pending());
+            assert!(!checkpointer.retained_output_ready());
+            assert_eq!(checkpointer.published_spill_generation_count(table), 0);
+        }
+        match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
+            crate::checkpoint::CheckpointStep::Working => {
+                assert_eq!(checkpointer.published_spill_generation_count(table), 0);
+            }
+            crate::checkpoint::CheckpointStep::Published { lsn } => {
+                published = Some(lsn);
+                break;
+            }
+            crate::checkpoint::CheckpointStep::Idle => panic!("dirty table became idle"),
+        }
+    }
+    assert!(pending_seen, "fixture must queue physical uploads");
+    let lsn = published.expect("checkpoint must finish after uploads complete");
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        1
+    );
+    engine.begin_post_publish_cleanup(lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), sum(qty) FROM pending_output"
+        )),
+        ["2|30"]
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

@@ -9484,7 +9484,7 @@ impl Engine {
                 && self
                     .ckpt
                     .as_ref()
-                    .is_some_and(Checkpointer::retained_output_pending))
+                    .is_some_and(Checkpointer::retained_output_ready))
             || (output_ready
                 && !self.block_reads_pending()
                 && self.unpromoted_commits == 0
@@ -9523,7 +9523,7 @@ impl Engine {
             && self.post_publish_cleanup.is_none()
             && !self.block_reads_pending()
             && let Some(checkpointer) = self.ckpt.as_mut()
-            && checkpointer.retained_output_pending()
+            && checkpointer.retained_output_ready()
         {
             if self.storage.history_cleanup_pending() {
                 let _ = self

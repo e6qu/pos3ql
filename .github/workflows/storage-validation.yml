@@ -74,7 +74,7 @@ jobs:
 
       - name: Lint production code
         if: ${{ !cancelled() && steps.static.outcome == 'success' }}
-        run: cargo clippy --lib --bins -- -D warnings
+        run: cargo clippy --lib --bins --features checkpoint-profile -- -D warnings
 
       - name: Build release executable
         if: ${{ !cancelled() && steps.static.outcome == 'success' }}

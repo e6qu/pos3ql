@@ -2624,14 +2624,17 @@ impl Checkpointer {
         self.table_job.is_some() || self.merge_job.is_some()
     }
 
+    pub(crate) fn retained_output_ready(&self) -> bool {
+        self.block_output.is_empty() && self.retained_output_pending()
+    }
+
     /// Already-captured inputs can progress behind later journal uploads.
     /// This path never starts a sweep or publishes a manifest.
     pub(crate) fn advance_retained_output(&mut self, storage: &Storage) -> Result<(), SqlError> {
         assert!(
-            self.block_output.is_empty(),
-            "previous emission must be durable"
+            self.retained_output_ready(),
+            "retained producer must wait for its previous emission"
         );
-        assert!(self.retained_output_pending(), "retained physical producer");
         if self.table_job.is_some() && !(self.merge_turn && self.merge_job.is_some()) {
             self.merge_turn = true;
             self.advance_table_slice(storage)
@@ -12062,25 +12065,26 @@ impl Checkpointer {
             if changed_after.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
                 return Ok(ControlFlow::Continue(()));
             }
-            let mut version = |lsn, home, current| -> Result<(), SqlError> {
-                if slice_after_lsn.is_some_and(|floor| lsn <= floor)
-                    || (delta && !current && matches!(home, Some(RowHome::Spilled { .. })))
-                {
-                    return Ok(());
-                }
-                entries
-                    .push(CheckpointVersion {
-                        key: SstKey::at(rowid, lsn),
-                        home,
-                    })
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "checkpoint_write_entries exhausted ({})",
-                            entries.capacity()
-                        )
-                    })
-            };
+            let mut version =
+                |lsn: u64, home: Option<RowHome>, current: bool| -> Result<(), SqlError> {
+                    if slice_after_lsn.is_some_and(|floor| lsn <= floor)
+                        || (delta && !current && matches!(home, Some(RowHome::Spilled { .. })))
+                    {
+                        return Ok(());
+                    }
+                    entries
+                        .push(CheckpointVersion {
+                            key: SstKey::at(rowid, lsn),
+                            home,
+                        })
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "checkpoint_write_entries exhausted ({})",
+                                entries.capacity()
+                            )
+                        })
+                };
             if state.committed.is_some() || state.committed_lsn != 0 {
                 version(state.committed_lsn, state.committed, true)?;
             }

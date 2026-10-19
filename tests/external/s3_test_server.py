@@ -77,9 +77,15 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         if cls.latency_seconds:
             time.sleep(cls.latency_seconds)
 
-    def hold_writer_probe(self, key):
+    def hold_control_request(self, key):
         gate = self.writer_probe_gate_file
         if gate is None or key.rsplit("/", 1)[-1] != "writer-fence" or not gate.exists():
+            return True
+        method = gate.read_text(encoding="ascii")
+        if method not in ("GET", "PUT"):
+            self.error(500, "InvalidRequest", "invalid control request test gate")
+            return False
+        if self.command != method:
             return True
         observed = gate.with_suffix(".observed")
         with self.writer_probe_gate_lock:
@@ -234,6 +240,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         try:
             body, _, key = self.begin()
             self.delay()
+            if not self.hold_control_request(key):
+                return
             path = self.object_path(key)
             with self.mutation_lock:
                 exists = path.exists()
@@ -267,7 +275,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         try:
             _, parsed, key = self.begin()
             self.delay()
-            if not self.hold_writer_probe(key):
+            if not self.hold_control_request(key):
                 return
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
             if not key and query.get("list-type") == ["2"]:

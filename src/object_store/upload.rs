@@ -28,6 +28,7 @@ pub(crate) enum Condition {
     ImmutableCreate,
     PublishAbsent,
     PublishMatch(EntityTag),
+    PublishMatchVerified(EntityTag),
 }
 
 impl Condition {
@@ -35,7 +36,9 @@ impl Condition {
         match self {
             Self::ContentAddressed => Precondition::None,
             Self::ImmutableCreate | Self::PublishAbsent => Precondition::IfNoneMatchAny,
-            Self::PublishMatch(etag) => Precondition::IfMatch(etag),
+            Self::PublishMatch(etag) | Self::PublishMatchVerified(etag) => {
+                Precondition::IfMatch(etag)
+            }
         }
     }
 }
@@ -47,6 +50,7 @@ impl Condition {
 #[derive(Debug)]
 pub(crate) enum UploadError {
     SlotsExhausted,
+    AdmissionPaused,
     BodyTooLarge { requested: usize, capacity: usize },
     KeyTooLarge,
     GenerationExhausted,
@@ -92,6 +96,7 @@ struct Slot {
 pub(crate) struct Uploads {
     slots: FixedVec<Slot>,
     pollfds: FixedVec<libc::pollfd>,
+    admission: super::RequestAdmission,
 }
 
 impl Uploads {
@@ -142,6 +147,7 @@ impl Uploads {
         }
         Ok(Self {
             slots,
+            admission: super::RequestAdmission::Open,
             pollfds: FixedVec::new(budget, "object upload poll descriptors", slot_count)?,
         })
     }
@@ -154,6 +160,9 @@ impl Uploads {
         body: &[u8],
         condition: Condition,
     ) -> Result<Ticket, UploadError> {
+        if !self.admits_requests() {
+            return Err(UploadError::AdmissionPaused);
+        }
         if key.len() > MAX_OBJECT_KEY_BYTES {
             return Err(UploadError::KeyTooLarge);
         }
@@ -244,6 +253,15 @@ impl Uploads {
                         _ => continue,
                     };
                     match result {
+                        Ok(etag)
+                            if matches!(slot.condition, Condition::PublishMatchVerified(_)) =>
+                        {
+                            slot.conditional_failure = None;
+                            slot.state = State::VerifyQueued {
+                                offset: 0,
+                                etag: Some(etag),
+                            };
+                        }
                         Ok(etag) => slot.state = State::Complete(Ok(etag)),
                         Err(Error::WouldBlock) => {}
                         Err(error)
@@ -289,6 +307,10 @@ impl Uploads {
             Condition::ImmutableCreate | Condition::ContentAddressed => {
                 Error::Protocol("immutable object collision")
             }
+            Condition::PublishMatchVerified(_) => match slot.conditional_failure.take() {
+                Some(error) => error,
+                None => Error::ConditionMismatch,
+            },
             Condition::PublishAbsent | Condition::PublishMatch(_) => slot
                 .conditional_failure
                 .take()
@@ -308,7 +330,11 @@ impl Uploads {
             Err(Error::Status { code: 416, .. })
                 if offset == slot.body.len() && prior_etag.is_some() =>
             {
-                slot.state = State::Complete(Ok(prior_etag.expect("checked verified generation")));
+                Self::verification_complete(
+                    slot,
+                    prior_etag.expect("checked verified generation"),
+                    now,
+                );
                 return;
             }
             Err(Error::Status { code: 416, .. }) => {
@@ -338,12 +364,34 @@ impl Uploads {
         // Whole GET checks the full length. A final short range asks for one
         // extra byte; an exact-capacity ending needs a separate 416 probe.
         if slot.body.len() <= capacity || (end == slot.body.len() && expected < capacity) {
-            slot.state = State::Complete(Ok(result.etag));
+            Self::verification_complete(slot, result.etag, now);
         } else {
             slot.state = State::VerifyQueued {
                 offset: end,
                 etag: Some(result.etag),
             };
+        }
+    }
+
+    fn verification_complete(slot: &mut Slot, etag: EntityTag, now: Instant) {
+        if matches!(slot.condition, Condition::PublishMatchVerified(_))
+            && slot.conditional_failure.is_some()
+        {
+            // Matching bytes after a 412 resolve ownership, but do not prove
+            // write permission. Require a successful write with the current tag.
+            if slot.attempts < ATTEMPTS {
+                slot.condition = Condition::PublishMatchVerified(etag);
+                slot.state = State::Queued {
+                    retry_at: now + Duration::from_millis(100 << slot.attempts),
+                };
+            } else {
+                slot.state = State::Complete(Err(slot
+                    .conditional_failure
+                    .take()
+                    .expect("conditional verification failure retained")));
+            }
+        } else {
+            slot.state = State::Complete(Ok(etag));
         }
     }
 
@@ -476,9 +524,11 @@ impl Uploads {
     }
 
     pub(crate) fn has_capacity(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| matches!(slot.state, State::Free))
+        self.admits_requests()
+            && self
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.state, State::Free))
     }
 
     pub(crate) fn has_completion(&self) -> bool {
@@ -491,6 +541,14 @@ impl Uploads {
         self.slots
             .iter()
             .any(|slot| !matches!(slot.state, State::Free))
+    }
+
+    pub(crate) fn set_admission(&mut self, admission: super::RequestAdmission) {
+        self.admission = admission;
+    }
+
+    pub(crate) fn admits_requests(&self) -> bool {
+        self.admission == super::RequestAdmission::Open
     }
 
     pub(crate) fn replace_credentials(&mut self, credentials: super::Credentials) {

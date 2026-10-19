@@ -65,6 +65,15 @@ impl BlockWriteBatch {
     }
 
     pub(crate) fn deadline(&self, uploads: &Uploads) -> Option<Instant> {
+        if !uploads.admits_requests() {
+            return if !self.is_empty()
+                && (self.blocks.iter().all(|block| block.durable) || uploads.has_completion())
+            {
+                Some(Instant::now())
+            } else {
+                uploads.next_deadline()
+            };
+        }
         self.retry_at.or_else(|| {
             if self.ready(uploads, Instant::now()) && !self.is_empty() {
                 Some(Instant::now())
@@ -226,6 +235,53 @@ mod tests {
     use crate::object_store::upload::tests::{config, reply, request};
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn parallel_credentials_draining_keeps_unstarted_physical_bytes_until_resume() {
+        let mut config = config(1);
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("credential-write-drain-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 292);
+        let bytes = 2 * (HEADER_LEN + 4);
+        let mut budget = Budget::new(
+            BlockWriteBatch::budget_bytes(bytes, 2)
+                + Uploads::budget_bytes(&config, 1, super::super::BLOCK_SIZE),
+        );
+        let mut output = BlockWriteBatch::new(&mut budget, bytes, 2).unwrap();
+        let mut uploads = Uploads::new(&config, 1, super::super::BLOCK_SIZE, &mut budget).unwrap();
+        let first = output.write_block(b"keep", BlockType::SstData, 0).unwrap();
+        let second = output.write_block(b"also", BlockType::SstData, 0).unwrap();
+        assert!(!output.drain(&mut uploads, Instant::now()).unwrap());
+        uploads.set_admission(crate::object_store::RequestAdmission::Draining);
+        assert!(!output.drain(&mut uploads, Instant::now()).unwrap());
+        assert!(!uploads.busy());
+        assert!(output.blocks[0].durable && !output.blocks[1].durable);
+        assert!(!output.ready(&uploads, Instant::now()));
+        assert!(
+            output.deadline(&uploads).is_none(),
+            "paused output must not busy-poll"
+        );
+        assert_eq!(output.bytes.len(), bytes);
+        assert_eq!(output.blocks[0].id, first);
+        assert_eq!(output.blocks[1].id, second);
+        assert_eq!(namespace.borrow().object_count(), 1);
+        uploads.set_admission(crate::object_store::RequestAdmission::Open);
+        assert!(output.ready(&uploads, Instant::now()));
+        let mut completed = false;
+        for _ in 0..8 {
+            if output.drain(&mut uploads, Instant::now()).unwrap() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(namespace.borrow().object_count(), 2);
+        assert!(namespace.borrow().blind_overwrites.is_empty());
+        output.consume();
+        assert!(output.is_empty());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 
     #[test]
     fn parallel_physical_output_reserves_exact_capacity_and_deduplicates_typed_blocks() {

@@ -275,6 +275,12 @@ pub struct GetResult {
     pub etag: EntityTag,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestAdmission {
+    Open,
+    Draining,
+}
+
 /// A provider-neutral operation failure.
 #[derive(Debug)]
 #[allow(
@@ -300,6 +306,8 @@ pub enum Error {
         content_length: usize,
         capacity: usize,
     },
+    /// An object changed while validating a successful conditional write.
+    ConditionMismatch,
     /// The client received a malformed response.
     Protocol(&'static str),
     /// A non-blocking read is not yet ready (WouldBlock).
@@ -346,6 +354,9 @@ impl std::fmt::Display for Error {
                 formatter,
                 "object store response of {content_length} bytes exceeds buffer of {capacity}"
             ),
+            Self::ConditionMismatch => {
+                formatter.write_str("object changed during conditional write verification")
+            }
             Self::Protocol(what) => write!(formatter, "object store protocol error: {what}"),
             Self::WouldBlock => write!(formatter, "object store i/o not ready"),
         }
@@ -370,7 +381,7 @@ impl Error {
             Self::Status {
                 code: 412 | 409,
                 ..
-            }
+            } | Self::ConditionMismatch
         )
     }
 
@@ -384,7 +395,10 @@ impl Error {
                     | std::io::ErrorKind::PermissionDenied
                     | std::io::ErrorKind::Unsupported
             ),
-            Self::ResponseTooLarge { .. } | Self::Protocol(_) | Self::WouldBlock => false,
+            Self::ConditionMismatch
+            | Self::ResponseTooLarge { .. }
+            | Self::Protocol(_)
+            | Self::WouldBlock => false,
         }
     }
 }

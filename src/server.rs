@@ -139,6 +139,7 @@ pub struct Server {
     durability_ready: bool,
     ownership_ready: bool,
     credentials_ready: bool,
+    credential_reload_pending: bool,
     credentials_file: crate::util::StackStr<{ crate::object_store::CREDENTIAL_FILE_BYTES }>,
 }
 
@@ -771,6 +772,11 @@ impl Server {
                 .object_store_put_slots
                 .saturating_add(config.object_store_block_put_slots)
                 .saturating_add(crate::checkpoint::MANIFEST_UPLOAD_SLOTS)
+                .saturating_add(if config.object_store_credentials_file.is_empty() {
+                    0
+                } else {
+                    crate::checkpoint::CREDENTIAL_UPLOAD_SLOTS
+                })
         } else {
             0
         }
@@ -863,14 +869,10 @@ impl Server {
                 "object request slots",
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, the manifest client and max_subscriptions exceed reactor token capacity",
+                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest and credential clients and max_subscriptions exceed reactor token capacity",
                 ),
             ));
         }
-        #[allow(
-            unused_mut,
-            reason = "the Linux epoll backend records fixed read/write interest"
-        )]
         let mut reactor = Reactor::new(
             budget,
             max_conns
@@ -1179,6 +1181,7 @@ impl Server {
             durability_ready: true,
             ownership_ready: true,
             credentials_ready: true,
+            credential_reload_pending: false,
             credentials_file: crate::util::StackStr::from_str(
                 &config.object_store_credentials_file,
             ),
@@ -1357,6 +1360,7 @@ impl Server {
             {
                 self.reload_object_store_credentials();
             }
+            self.advance_object_store_credential_reload();
             self.close_expired_terminations();
             if self.engine.advance_block_read_deadlines(Instant::now()) && self.durability_ready {
                 self.wake_io_waiters();
@@ -1959,7 +1963,8 @@ impl Server {
                 }
                 (registered, wanted) => {
                     if let Some(fd) = registered {
-                        self.reactor.deregister(fd)?;
+                        self.reactor
+                            .deregister_owned(fd, BLOCK_IO_TOKEN - slot as u64)?;
                     }
                     if let Some(fd) = wanted {
                         self.reactor
@@ -1990,7 +1995,7 @@ impl Server {
                 }
                 (registered, wanted) => {
                     if let Some(fd) = registered {
-                        self.reactor.deregister(fd)?;
+                        self.reactor.deregister_owned(fd, token)?;
                     }
                     if let Some(fd) = wanted {
                         self.reactor.register_read(fd, token)?;
@@ -2017,7 +2022,7 @@ impl Server {
             }
             (registered, wanted) => {
                 if let Some(fd) = registered {
-                    self.reactor.deregister(fd)?;
+                    self.reactor.deregister_owned(fd, WRITER_PROBE_TOKEN)?;
                 }
                 if let Some(fd) = wanted {
                     self.reactor.register_read(fd, WRITER_PROBE_TOKEN)?;
@@ -2063,10 +2068,14 @@ impl Server {
     fn unbind_subscription(&mut self, slot: usize) {
         let worker = &mut self.subscriptions[slot];
         if let Some(fd) = worker.registered_fd.take() {
-            let _ = self.reactor.deregister(fd);
+            let _ = self
+                .reactor
+                .deregister_owned(fd, Self::subscription_token(slot, false));
         }
         if let Some(fd) = worker.registered_sql_fd.take() {
-            let _ = self.reactor.deregister(fd);
+            let _ = self
+                .reactor
+                .deregister_owned(fd, Self::subscription_token(slot, true));
         }
         worker.apply.stop(&mut self.engine);
         worker.client.unbind();
@@ -2353,7 +2362,9 @@ impl Server {
         let binding = worker.definition.ok_or(())?;
         if binding.drop_bootstrap_slot {
             if let Some(fd) = worker.registered_fd.take() {
-                let _ = self.reactor.deregister(fd);
+                let _ = self
+                    .reactor
+                    .deregister_owned(fd, Self::subscription_token(slot, false));
             }
             worker.client.unbind();
             worker
@@ -3355,7 +3366,7 @@ impl Server {
         if self.credentials_file.is_empty() {
             return;
         }
-        if self.engine.object_store_io_busy() {
+        if self.credential_reload_pending {
             RELOAD_REQUESTED.store(true, Ordering::SeqCst);
             return;
         }
@@ -3375,8 +3386,23 @@ impl Server {
                     return;
                 }
             };
-        match self.engine.rotate_object_store_credentials(credentials) {
-            Ok(()) => {
+        match self
+            .engine
+            .begin_object_store_credential_reload(credentials)
+        {
+            Ok(()) => self.credential_reload_pending = true,
+            Err(_) => self.record_credential_reload_failure(),
+        }
+    }
+
+    fn advance_object_store_credential_reload(&mut self) {
+        if !self.credential_reload_pending {
+            return;
+        }
+        match self.engine.advance_object_store_credential_reload() {
+            Ok(crate::checkpoint::CredentialReloadStep::Pending) => {}
+            Ok(crate::checkpoint::CredentialReloadStep::Installed) => {
+                self.credential_reload_pending = false;
                 self.credentials_ready = true;
                 self.ownership_ready = true;
                 self.operations_metrics.credential_reload_successes = self
@@ -3387,19 +3413,25 @@ impl Server {
                     "object_store_credentials_reloaded",
                     "object-store credentials validated and installed",
                 );
+                self.advance_operations_probes();
             }
             Err(_) => {
-                self.credentials_ready = false;
-                self.operations_metrics.credential_reload_failures = self
-                    .operations_metrics
-                    .credential_reload_failures
-                    .saturating_add(1);
-                crate::logging::error(
-                    "object_store_credentials_reload_failed",
-                    "candidate failed writer-fence validation; installed credentials retained",
-                );
+                self.credential_reload_pending = false;
+                self.record_credential_reload_failure();
             }
         }
+    }
+
+    fn record_credential_reload_failure(&mut self) {
+        self.credentials_ready = false;
+        self.operations_metrics.credential_reload_failures = self
+            .operations_metrics
+            .credential_reload_failures
+            .saturating_add(1);
+        crate::logging::error(
+            "object_store_credentials_reload_failed",
+            "candidate failed writer-fence validation; installed credentials retained",
+        );
     }
 
     fn advance_operations_probes(&mut self) {

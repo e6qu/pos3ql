@@ -125,11 +125,22 @@ Rotate without interrupting durable work:
 5. Revoke the prior credential and confirm durable writes and checkpoints
    continue.
 
-The candidate is parsed without runtime allocation and tested by a conditional
-writer-fence renewal before any client adopts it. Invalid permissions, syntax,
-authentication, connectivity, or lost writer ownership retain the installed
-credential, make readiness return 503, increment the failure counter, and emit
-an error without credential values. Correct the file and reload again.
+The candidate is parsed without runtime allocation. A separate reserved client
+conditionally renews the writer fence, then reads back the exact result. Both
+read and write access must succeed before any ordinary client adopts it.
+For example, an account allowed to read orders but forbidden to save them is
+rejected.
+
+Validation yields while cached queries and other object requests continue.
+After validation, new asynchronous requests briefly wait while existing signed
+requests finish; their retained data is preserved. The new credentials then
+install and waiting requests resume. Continuous traffic cannot keep adding work
+ahead of this handoff.
+
+Invalid permissions, syntax, authentication, connectivity, or lost writer
+ownership retain the installed credential, make readiness return 503, increment
+the failure counter, and emit an error without credential values. Correct the
+file and reload again.
 
 ## Release archive
 

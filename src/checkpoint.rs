@@ -1109,6 +1109,23 @@ enum CommitPublication {
 }
 
 pub(crate) const MANIFEST_UPLOAD_SLOTS: usize = 1;
+pub(crate) const CREDENTIAL_UPLOAD_SLOTS: usize = 1;
+const CREDENTIAL_UPLOAD_BYTES: usize = 128;
+
+pub(crate) enum CredentialReloadStep {
+    Pending,
+    Installed,
+}
+
+enum CredentialRenewalPhase {
+    Uploading(crate::object_store::upload::Ticket),
+    Installing(EntityTag),
+}
+
+struct CredentialRenewal {
+    credentials: crate::object_store::Credentials,
+    phase: CredentialRenewalPhase,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct CheckpointRequest(core::num::NonZeroU64);
@@ -1151,6 +1168,8 @@ pub(crate) struct Checkpointer {
     block_uploads: crate::object_store::upload::Uploads,
     manifest_uploads: crate::object_store::upload::Uploads,
     writer_probe: Option<WriterProbe>,
+    credential_uploads: Option<crate::object_store::upload::Uploads>,
+    credential_renewal: Option<CredentialRenewal>,
     manifest_publication: Option<ManifestPublication>,
     requested_checkpoint_epoch: u64,
     captured_checkpoint_epoch: u64,
@@ -1382,6 +1401,18 @@ impl Checkpointer {
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
+    pub(crate) fn credential_output_budget_bytes(config: &Config) -> usize {
+        if config.object_store_credentials_file.is_empty() {
+            0
+        } else {
+            crate::object_store::upload::Uploads::budget_bytes(
+                config,
+                CREDENTIAL_UPLOAD_SLOTS,
+                CREDENTIAL_UPLOAD_BYTES,
+            )
+        }
+    }
+
     pub(crate) fn writer_probe_budget_bytes(config: &Config) -> usize {
         if config.operations_listen_addr.is_empty() {
             0
@@ -1424,6 +1455,7 @@ impl Checkpointer {
             + Self::physical_output_budget_bytes(config)
             + Self::manifest_output_budget_bytes(config)
             + Self::writer_probe_budget_bytes(config)
+            + Self::credential_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -2103,6 +2135,20 @@ impl Checkpointer {
             } else {
                 Some(WriterProbe::new(config, budget, writer_token)?)
             },
+            credential_uploads: if config.object_store_credentials_file.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::object_store::upload::Uploads::new(
+                        config,
+                        CREDENTIAL_UPLOAD_SLOTS,
+                        CREDENTIAL_UPLOAD_BYTES,
+                        budget,
+                    )
+                    .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+                )
+            },
+            credential_renewal: None,
             manifest_publication: None,
             requested_checkpoint_epoch: 0,
             captured_checkpoint_epoch: 0,
@@ -2352,6 +2398,10 @@ impl Checkpointer {
             || self.block_uploads.busy()
             || self.manifest_uploads.busy()
             || self.writer_probe.as_ref().is_some_and(WriterProbe::busy)
+            || self
+                .credential_uploads
+                .as_ref()
+                .is_some_and(|uploads| uploads.busy())
             || self.commit_publication.is_some()
     }
 
@@ -2404,53 +2454,6 @@ impl Checkpointer {
         Ok(())
     }
 
-    fn assert_writer(&mut self) -> Result<(), SqlError> {
-        if self.writer_was_fenced() {
-            return Err(sql_err!(
-                SQLSTATE_CAS,
-                "writer was fenced by a newer process"
-            ));
-        }
-        let etag = self.writer_fence_etag.as_ref().ok_or_else(|| {
-            sql_err!(
-                SQLSTATE_CAS,
-                "writer ownership was not acquired during startup"
-            )
-        })?;
-        let active = writer_fence_record("active", self.writer_token);
-        match self.client.put(
-            WRITER_FENCE_KEY,
-            active.as_str().as_bytes(),
-            Precondition::IfMatch(etag),
-        ) {
-            Ok(etag) => {
-                self.writer_fence_etag = Some(etag);
-                Ok(())
-            }
-            Err(error) => {
-                let refreshed = self.client.get(WRITER_FENCE_KEY, None);
-                let refreshed_ok = refreshed.is_ok();
-                if let Ok(result) = refreshed
-                    && self.client.body_bytes() == active.as_str().as_bytes()
-                {
-                    self.writer_fence_etag = Some(result.etag);
-                    return Ok(());
-                }
-                if refreshed_ok {
-                    self.writer_fenced = true;
-                }
-                if error.is_precondition_failed() {
-                    Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "writer was fenced by a newer process"
-                    ))
-                } else {
-                    Err(sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))
-                }
-            }
-        }
-    }
-
     pub(crate) fn writer_was_fenced(&self) -> bool {
         self.writer_fenced || self.writer_probe.as_ref().is_some_and(WriterProbe::fenced)
     }
@@ -2486,39 +2489,150 @@ impl Checkpointer {
         Ok(())
     }
 
-    pub(crate) fn rotate_credentials(
-        &mut self,
-        credentials: crate::object_store::Credentials,
-    ) -> Result<(), SqlError> {
-        if self.object_io_busy() {
-            return Err(sql_err!(
-                SQLSTATE_IO,
-                "object-store credential rotation is waiting for active requests"
-            ));
-        }
-        let previous = self.client.credentials().ok_or_else(|| {
-            sql_err!(
-                SQLSTATE_IO,
-                "object-store credential rotation is unavailable for the simulator"
-            )
-        })?;
-        self.client.replace_credentials(credentials);
-        if let Err(error) = self.assert_writer() {
-            self.client.replace_credentials(previous);
-            return Err(error);
-        }
-        self.uploads.replace_credentials(credentials);
-        self.block_uploads.replace_credentials(credentials);
-        self.manifest_uploads.replace_credentials(credentials);
-        if let Some(probe) = self.writer_probe.as_mut() {
-            probe.replace_credentials(credentials);
-        }
+    pub(crate) fn credential_install_pending(&self) -> bool {
+        matches!(
+            self.credential_renewal
+                .as_ref()
+                .map(|renewal| &renewal.phase),
+            Some(CredentialRenewalPhase::Installing(_))
+        )
+    }
+
+    fn set_credential_admission(&mut self, admission: crate::object_store::RequestAdmission) {
+        self.block_uploads.set_admission(admission);
         self.blocks
             .lock()
             .expect("block store lock poisoned")
             .base_mut()
-            .replace_credentials(credentials);
+            .set_admission(admission);
+        if let Some(probe) = self.writer_probe.as_mut() {
+            probe.set_admission(admission);
+        }
+    }
+
+    pub(crate) fn begin_credential_reload(
+        &mut self,
+        credentials: crate::object_store::Credentials,
+    ) -> Result<(), SqlError> {
+        if self.credential_renewal.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "credential renewal already pending"
+            ));
+        }
+        if self.writer_was_fenced() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        if self.client.credentials().is_none() {
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "object-store credential rotation is unavailable for the simulator"
+            ));
+        }
+        let etag = self.writer_fence_etag.ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_CAS,
+                "writer ownership was not acquired during startup"
+            )
+        })?;
+        let uploads = self.credential_uploads.as_mut().ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_IO,
+                "credential renewal requires object_store_credentials_file"
+            )
+        })?;
+        uploads.replace_credentials(credentials);
+        let record = writer_fence_record("active", self.writer_token);
+        let ticket = uploads
+            .enqueue(
+                WRITER_FENCE_KEY,
+                record.as_str().as_bytes(),
+                crate::object_store::upload::Condition::PublishMatchVerified(etag),
+            )
+            .map_err(upload_to_sql)?;
+        self.credential_renewal = Some(CredentialRenewal {
+            credentials,
+            phase: CredentialRenewalPhase::Uploading(ticket),
+        });
         Ok(())
+    }
+
+    pub(crate) fn advance_credential_reload(&mut self) -> Result<CredentialReloadStep, SqlError> {
+        let mut renewal = self.credential_renewal.take().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "credential renewal has not been requested"
+            )
+        })?;
+        if self.writer_was_fenced() {
+            self.set_credential_admission(crate::object_store::RequestAdmission::Open);
+            if let CredentialRenewalPhase::Uploading(ticket) = renewal.phase {
+                self.credential_uploads
+                    .as_mut()
+                    .expect("reserved credential client")
+                    .cancel(ticket)
+                    .map_err(upload_to_sql)?;
+            }
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        match renewal.phase {
+            CredentialRenewalPhase::Uploading(ticket) => {
+                match self
+                    .credential_uploads
+                    .as_mut()
+                    .expect("reserved credential client")
+                    .take(ticket)
+                {
+                    Ok(Some(etag)) => {
+                        renewal.phase = CredentialRenewalPhase::Installing(etag);
+                        self.set_credential_admission(
+                            crate::object_store::RequestAdmission::Draining,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if matches!(&error, crate::object_store::upload::UploadError::Request(error)
+                            if error.is_precondition_failed())
+                        {
+                            self.writer_fenced = true;
+                        }
+                        return Err(upload_to_sql(error));
+                    }
+                }
+                self.credential_renewal = Some(renewal);
+                Ok(CredentialReloadStep::Pending)
+            }
+            CredentialRenewalPhase::Installing(etag) => {
+                // Every transport retains its signed request until completion.
+                // Install validated credentials only between those owners.
+                if self.object_io_busy() {
+                    self.credential_renewal = Some(renewal);
+                    return Ok(CredentialReloadStep::Pending);
+                }
+                self.client.replace_credentials(renewal.credentials);
+                self.uploads.replace_credentials(renewal.credentials);
+                self.block_uploads.replace_credentials(renewal.credentials);
+                self.manifest_uploads
+                    .replace_credentials(renewal.credentials);
+                if let Some(probe) = self.writer_probe.as_mut() {
+                    probe.replace_credentials(renewal.credentials);
+                }
+                self.blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .base_mut()
+                    .replace_credentials(renewal.credentials);
+                self.writer_fence_etag = Some(etag);
+                self.set_credential_admission(crate::object_store::RequestAdmission::Open);
+                Ok(CredentialReloadStep::Installed)
+            }
+        }
     }
 
     /// Publishes one immutable committed journal batch, keyed by its first
@@ -2710,7 +2824,13 @@ impl Checkpointer {
     }
 
     pub(crate) fn upload_slots(&self) -> usize {
-        self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
+        self.uploads.slots()
+            + self.block_uploads.slots()
+            + self.manifest_uploads.slots()
+            + self
+                .credential_uploads
+                .as_ref()
+                .map_or(0, |uploads| uploads.slots())
     }
 
     pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -2718,9 +2838,19 @@ impl Checkpointer {
             self.uploads.fd(slot)
         } else if slot < self.uploads.slots() + self.block_uploads.slots() {
             self.block_uploads.fd(slot - self.uploads.slots())
-        } else {
+        } else if slot
+            < self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
+        {
             self.manifest_uploads
                 .fd(slot - self.uploads.slots() - self.block_uploads.slots())
+        } else {
+            self.credential_uploads
+                .as_ref()
+                .expect("reserved credential upload slot")
+                .fd(slot
+                    - self.uploads.slots()
+                    - self.block_uploads.slots()
+                    - self.manifest_uploads.slots())
         }
     }
 
@@ -2729,9 +2859,20 @@ impl Checkpointer {
             self.uploads.wants_write(slot)
         } else if slot < self.uploads.slots() + self.block_uploads.slots() {
             self.block_uploads.wants_write(slot - self.uploads.slots())
-        } else {
+        } else if slot
+            < self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
+        {
             self.manifest_uploads
                 .wants_write(slot - self.uploads.slots() - self.block_uploads.slots())
+        } else {
+            self.credential_uploads
+                .as_ref()
+                .expect("reserved credential upload slot")
+                .wants_write(
+                    slot - self.uploads.slots()
+                        - self.block_uploads.slots()
+                        - self.manifest_uploads.slots(),
+                )
         }
     }
 
@@ -2740,6 +2881,19 @@ impl Checkpointer {
             self.uploads.next_deadline(),
             self.block_output.deadline(&self.block_uploads),
             self.manifest_uploads.next_deadline(),
+            self.credential_uploads
+                .as_ref()
+                .and_then(|uploads| uploads.next_deadline()),
+            match self
+                .credential_renewal
+                .as_ref()
+                .map(|renewal| &renewal.phase)
+            {
+                Some(CredentialRenewalPhase::Installing(_)) if !self.object_io_busy() => {
+                    Some(std::time::Instant::now())
+                }
+                _ => None,
+            },
             match self.manifest_publication {
                 Some(ManifestPublication::Retry { at, .. }) => Some(at),
                 Some(ManifestPublication::Installing { .. }) => Some(std::time::Instant::now()),
@@ -2754,6 +2908,9 @@ impl Checkpointer {
     pub(crate) fn advance_background_uploads(&mut self, now: std::time::Instant) {
         self.block_uploads.advance(now);
         self.manifest_uploads.advance(now);
+        if let Some(uploads) = self.credential_uploads.as_mut() {
+            uploads.advance(now);
+        }
     }
 
     pub(crate) fn physical_output_ready(&self, now: std::time::Instant) -> bool {
@@ -8473,6 +8630,12 @@ impl Checkpointer {
     /// garbage maintenance remains pending and is either paced by later beats
     /// or drained explicitly by [`Self::finish_maintenance`].
     pub(crate) fn checkpoint(&mut self, storage: &mut Storage) -> Result<Option<u64>, SqlError> {
+        if self.credential_install_pending() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "checkpoint waits for validated credential installation"
+            ));
+        }
         loop {
             match self.checkpoint_step(storage)? {
                 CheckpointStep::Idle => return Ok(None),
@@ -14666,6 +14829,10 @@ fn upload_to_sql(error: crate::object_store::upload::UploadError) -> SqlError {
     use crate::object_store::upload::UploadError;
     match error {
         UploadError::Request(error) => object_store_to_sql(error),
+        UploadError::AdmissionPaused => sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "object requests are draining for credential installation"
+        ),
         UploadError::SlotsExhausted => sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "object_store_put_slots exhausted"
@@ -18430,6 +18597,204 @@ mod stored_dependency_tests {
         drop(storage);
         drop(checkpoint);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn parallel_credentials_renewal_requires_read_and_write_before_installing() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let end = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(at) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = core::str::from_utf8(&bytes[..end]).unwrap().to_owned();
+            assert!(head.contains("authorization: AWS4-HMAC-SHA256 "));
+            assert!(head.contains("Credential=candidate/"));
+            let length = if head.starts_with("PUT ") {
+                head.lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            } else {
+                assert!(head.starts_with("GET "));
+                0
+            };
+            while bytes.len() < end + length {
+                let n = stream.read(&mut part).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&part[..n]);
+            }
+            (head, bytes[end..].to_vec())
+        }
+
+        fn reply(stream: &mut TcpStream, status: &str, body: &[u8]) {
+            write!(stream,
+                "HTTP/1.1 {status}\r\nETag: \"candidate\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+
+        for case in [
+            "read-only",
+            "write-only",
+            "both",
+            "replaced",
+            "ambiguous",
+            "conditional-denied",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut config =
+                crate::object_store::upload::tests::config(listener.local_addr().unwrap().port());
+            config.object_store_bucket = "credential-renewal".to_owned();
+            config.object_store_credentials_file = "configured-credential-file".to_owned();
+            config.data_dir = std::env::temp_dir()
+                .join(format!("credential-renewal-{case}-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned();
+            config.max_tables = 2;
+            config.max_connections = 2;
+            config.table_rows = 16;
+            config.max_value_indexes = 2;
+            config.block_cache_bytes = 0;
+            config.disk_cache_bytes = 0;
+            let (finished, done) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut put, _) = listener.accept().unwrap();
+                let (head, body) = request(&mut put);
+                assert!(head.starts_with("PUT "));
+                assert!(head.contains("if-match: \"current\"\r\n"));
+                assert_eq!(
+                    body,
+                    writer_fence_record("active", WriterToken(1))
+                        .as_str()
+                        .as_bytes()
+                );
+                if case == "read-only" {
+                    reply(&mut put, "403 Forbidden", b"");
+                    listener.set_nonblocking(true).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut reads = 0;
+                    loop {
+                        assert!(
+                            Instant::now() < deadline,
+                            "credential request did not finish"
+                        );
+                        match listener.accept() {
+                            Ok((mut get, _)) => {
+                                assert!(request(&mut get).0.starts_with("GET "));
+                                let record = writer_fence_record("active", WriterToken(1));
+                                reply(&mut get, "200 OK", record.as_str().as_bytes());
+                                reads += 1;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => panic!("accept verification: {error}"),
+                        }
+                        match done.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return reads,
+                            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                        }
+                    }
+                }
+                reply(
+                    &mut put,
+                    if matches!(case, "ambiguous" | "conditional-denied") {
+                        "412 Precondition Failed"
+                    } else {
+                        "200 OK"
+                    },
+                    b"",
+                );
+                let (mut get, _) = listener.accept().unwrap();
+                assert!(request(&mut get).0.starts_with("GET "));
+                if case == "write-only" {
+                    reply(&mut get, "403 Forbidden", b"");
+                } else {
+                    let record = writer_fence_record(
+                        "active",
+                        WriterToken(if case == "replaced" { 2 } else { 1 }),
+                    );
+                    reply(&mut get, "200 OK", record.as_str().as_bytes());
+                }
+                if matches!(case, "ambiguous" | "conditional-denied") {
+                    let (mut retry, _) = listener.accept().unwrap();
+                    let (head, retried_body) = request(&mut retry);
+                    assert!(head.starts_with("PUT "));
+                    assert!(head.contains("if-match: \"candidate\"\r\n"));
+                    assert_eq!(retried_body, body);
+                    if case == "conditional-denied" {
+                        reply(&mut retry, "403 Forbidden", b"");
+                        return 1;
+                    }
+                    reply(&mut retry, "200 OK", b"");
+                    let (mut verified, _) = listener.accept().unwrap();
+                    assert!(request(&mut verified).0.starts_with("GET "));
+                    reply(&mut verified, "200 OK", &body);
+                    return 2;
+                }
+                1
+            });
+            let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+            let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+            checkpoint.writer_token = WriterToken(1);
+            checkpoint.writer_fence_etag = Some(EntityTag::parse("\"current\"").unwrap());
+            let installed = checkpoint.client.credentials().unwrap();
+            let candidate =
+                crate::object_store::Credentials::new("candidate", "candidate-secret", "").unwrap();
+            let result = crate::mem::guard::forbid_alloc(|| {
+                checkpoint.begin_credential_reload(candidate).unwrap();
+                assert!(checkpoint.client.credentials() == Some(installed));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "credential validation did not finish"
+                    );
+                    checkpoint.advance_background_uploads(Instant::now());
+                    match checkpoint.advance_credential_reload() {
+                        Ok(CredentialReloadStep::Pending) => {
+                            assert!(
+                                checkpoint.client.credentials() == Some(installed),
+                                "candidate remains private until read and write validation finish"
+                            );
+                        }
+                        result => break result,
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let _ = finished.send(());
+            let reads = server.join().unwrap();
+            let accepted = matches!(result, Ok(CredentialReloadStep::Installed));
+            assert_eq!(accepted, matches!(case, "both" | "ambiguous"), "{case}");
+            assert_eq!(
+                reads,
+                usize::from(case != "read-only") + usize::from(case == "ambiguous"),
+                "a rejected write cannot become successful through a read fallback"
+            );
+            assert_eq!(checkpoint.writer_was_fenced(), case == "replaced");
+            assert!(
+                checkpoint.client.credentials()
+                    == Some(if accepted { candidate } else { installed })
+            );
+            assert!(checkpoint.credential_renewal.is_none());
+            assert!(checkpoint.block_uploads.admits_requests());
+            drop(checkpoint);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
     }
 
     fn write_gc_index(checkpointer: &Checkpointer, payload: &[u8]) -> ValueIndexHandle {

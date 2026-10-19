@@ -278,6 +278,13 @@ else
 fi
 
 step "atomic object-store credential rotation"
+rotation_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
+rotation_successes=$(awk '$1 == "pos3ql_object_store_credential_reload_successes_total" { print $2 }' <<< "$rotation_metrics")
+rotation_failures=$(awk '$1 == "pos3ql_object_store_credential_reload_failures_total" { print $2 }' <<< "$rotation_metrics")
+[[ "$rotation_successes" =~ ^[0-9]+$ && "$rotation_failures" =~ ^[0-9]+$ ]] || {
+  bad "credential rotation counters are missing or invalid"
+  exit 1
+}
 ROTATED_ACCESS=pos3ql-rotated-access
 ROTATED_SECRET=pos3ql-rotated-secret
 write_credentials "$POS3QL_CREDENTIALS_FILE" "$ROTATED_ACCESS" "$ROTATED_SECRET"
@@ -289,7 +296,7 @@ for _ in {1..50}; do
   sleep 0.05
 done
 failed_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-if [[ "$failed_metrics" == *"pos3ql_object_store_credential_reload_failures_total 1"* ]]; then
+if [[ $'\n'"$failed_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_failures_total $((rotation_failures + 1))"$'\n'* ]]; then
   ok "invalid candidate retained old credentials and made readiness explicit"
 else
   bad "credential candidate failure was not observable"
@@ -304,7 +311,7 @@ for _ in {1..50}; do
   sleep 0.05
 done
 rotated_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-if [[ "$rotated_metrics" == *"pos3ql_object_store_credential_reload_successes_total 1"* ]] \
+if [[ $'\n'"$rotated_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 1))"$'\n'* ]] \
   && "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
        -c "CREATE TABLE credential_rotation (id int); INSERT INTO credential_rotation VALUES (1); CHECKPOINT"; then
   ok "new credentials validated, installed and used for durable work"
@@ -319,11 +326,11 @@ kill -HUP "$SERVER_PID"
 for _ in {1..50}; do
   restored_metrics=$(curl --fail --silent \
     "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
-  [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]] \
+  [[ $'\n'"$restored_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 2))"$'\n'* ]] \
     && break
   sleep 0.05
 done
-if [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]]; then
+if [[ $'\n'"$restored_metrics"$'\n' == *$'\n'"pos3ql_object_store_credential_reload_successes_total $((rotation_successes + 2))"$'\n'* ]]; then
   ok "SIGHUP reloaded the restored credentials"
 else
   bad "SIGHUP credential reload was not observable"

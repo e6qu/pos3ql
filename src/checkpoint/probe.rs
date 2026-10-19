@@ -36,6 +36,7 @@ pub(crate) struct WriterProbe {
     consumers: usize,
     owners: FixedVec<bool>,
     fenced: bool,
+    admission: crate::object_store::RequestAdmission,
 }
 
 impl WriterProbe {
@@ -69,6 +70,7 @@ impl WriterProbe {
             consumers: 0,
             owners,
             fenced: false,
+            admission: crate::object_store::RequestAdmission::Open,
         })
     }
 
@@ -87,6 +89,9 @@ impl WriterProbe {
                 sqlstate::INTERNAL_ERROR,
                 "writer probe owner already retains a request"
             ));
+        }
+        if self.admission == crate::object_store::RequestAdmission::Draining {
+            return Ok(None);
         }
         if matches!(self.state, State::Complete(_) | State::Releasing) {
             return Ok(None);
@@ -260,6 +265,10 @@ impl WriterProbe {
 
     pub(crate) fn wants_write(&self) -> bool {
         self.client.pending_wants_write()
+    }
+
+    pub(super) fn set_admission(&mut self, admission: crate::object_store::RequestAdmission) {
+        self.admission = admission;
     }
 
     pub(super) fn replace_credentials(&mut self, credentials: Credentials) {

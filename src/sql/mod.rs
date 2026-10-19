@@ -7811,6 +7811,13 @@ impl Engine {
             }
             pending.retry_at = None;
         } else {
+            if self
+                .ckpt
+                .as_ref()
+                .is_some_and(Checkpointer::credential_install_pending)
+            {
+                return Ok(false);
+            }
             let Some(batch) = self.wal.last_committed_batch() else {
                 return Ok(true);
             };
@@ -7934,14 +7941,26 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn rotate_object_store_credentials(
+    pub(crate) fn begin_object_store_credential_reload(
         &mut self,
         credentials: crate::object_store::Credentials,
     ) -> Result<(), SqlError> {
-        match self.ckpt.as_mut() {
-            Some(checkpointer) => checkpointer.rotate_credentials(credentials),
-            None => Ok(()),
-        }
+        let checkpointer = self.ckpt.as_mut().ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "credential reload requires object_store = on"
+            )
+        })?;
+        checkpointer.begin_credential_reload(credentials)
+    }
+
+    pub(crate) fn advance_object_store_credential_reload(
+        &mut self,
+    ) -> Result<crate::checkpoint::CredentialReloadStep, SqlError> {
+        self.ckpt
+            .as_mut()
+            .expect("credential reload requires a durable target")
+            .advance_credential_reload()
     }
 
     /// Whether success responses must remain buffered until commit-batch
@@ -8006,6 +8025,7 @@ impl Engine {
             .is_some_and(crate::checkpoint::Checkpointer::block_reads_busy)
     }
 
+    #[cfg(test)]
     pub(crate) fn object_store_io_busy(&self) -> bool {
         self.ckpt.as_ref().is_some_and(Checkpointer::object_io_busy)
     }
@@ -9514,6 +9534,15 @@ impl Engine {
             return checkpointer.manifest_publication_ready(std::time::Instant::now())
                 || self.storage.history_cleanup_pending();
         }
+        if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.credential_install_pending()
+        {
+            return self.post_publish_cleanup.is_some()
+                || self.storage.history_cleanup_pending()
+                || (checkpointer.physical_output_pending()
+                    && (checkpointer.physical_output_ready(std::time::Instant::now())
+                        || checkpointer.physical_output_stale(&self.storage)));
+        }
         let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
             checkpointer.physical_output_ready(std::time::Instant::now())
                 || checkpointer.physical_output_stale(&self.storage)
@@ -9613,10 +9642,15 @@ impl Engine {
                 }
             };
         }
+        let credential_draining = self
+            .ckpt
+            .as_ref()
+            .is_some_and(Checkpointer::credential_install_pending);
         let journal_pending = self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
         if journal_pending
+            && !credential_draining
             && self.post_publish_cleanup.is_none()
             && !self.block_reads_pending()
             && let Some(checkpointer) = self.ckpt.as_mut()
@@ -9642,7 +9676,8 @@ impl Engine {
                 }
             };
         }
-        let reads_pending = self.block_reads_pending()
+        let reads_pending = credential_draining
+            || self.block_reads_pending()
             || self
                 .ckpt
                 .as_ref()
@@ -22883,6 +22918,7 @@ pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
                     + Checkpointer::physical_output_budget_bytes(config)
                     + Checkpointer::manifest_output_budget_bytes(config)
                     + Checkpointer::writer_probe_budget_bytes(config)
+                    + Checkpointer::credential_output_budget_bytes(config)
                     + crate::store::BLOCK_SIZE
                     + crate::object_store::upload::Uploads::budget_bytes(
                         config,

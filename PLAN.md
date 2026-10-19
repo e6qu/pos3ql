@@ -47,7 +47,11 @@ changes still require runner qualification.
 Readiness and metrics now use a separately reserved asynchronous ownership
 check. Shared checks retain each request's result, and a delayed response lets
 cached SQL and local health requests proceed. This path still needs runner
-qualification. Remaining read progress, fairness and complete failure/recovery
+qualification. Credential reload also retains a separate validation request,
+requires read and write access, and drains existing owners before installation
+so continuous traffic cannot postpone the handoff. Its permission, fairness and reused-socket ownership regressions still need
+runner qualification.
+Remaining read progress, fairness and complete failure/recovery
 evidence remain acceptance work in this same PR.
 
 ### Concurrent and batched reads

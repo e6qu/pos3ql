@@ -169,6 +169,7 @@ pub(crate) struct OwnedObjectStore {
     scratch: Vec<u8>,
     stats: BlockIoStats,
     read_mode: ObjectReadMode,
+    admission: crate::object_store::RequestAdmission,
     hedge_after: Option<Duration>,
     read_owner: Option<ReadOwner>,
     read_capacity_generation: u64,
@@ -259,11 +260,21 @@ impl OwnedObjectStore {
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
             read_mode: ObjectReadMode::Atomic,
+            admission: crate::object_store::RequestAdmission::Open,
             read_owner: None,
             read_capacity_generation: 0,
             hedge_after: (config.object_store_hedge_after_ms != 0)
                 .then(|| Duration::from_millis(config.object_store_hedge_after_ms)),
         })
+    }
+
+    pub(crate) fn set_admission(&mut self, admission: crate::object_store::RequestAdmission) {
+        if self.admission != admission {
+            self.admission = admission;
+            if admission == crate::object_store::RequestAdmission::Open {
+                self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+            }
+        }
     }
 
     pub(crate) fn replace_credentials(&mut self, credentials: crate::object_store::Credentials) {
@@ -477,7 +488,8 @@ impl OwnedObjectStore {
     }
 
     fn next_read_deadline(&self) -> Option<Instant> {
-        let hedge_slot_available = self.slots.iter().any(Self::slot_is_free);
+        let hedge_slot_available = self.admission == crate::object_store::RequestAdmission::Open
+            && self.slots.iter().any(Self::slot_is_free);
         self.slots
             .iter()
             .filter_map(|slot| {
@@ -507,6 +519,9 @@ impl OwnedObjectStore {
                 slot.started_at = None;
                 completed = true;
             }
+        }
+        if self.admission == crate::object_store::RequestAdmission::Draining {
+            return completed;
         }
         let Some(deadline) = self.next_read_deadline() else {
             return completed;
@@ -638,6 +653,11 @@ impl BlockStore for OwnedObjectStore {
             self.consume(winner, owner);
             return Err(error);
         }
+        if self.read_mode == ObjectReadMode::Restartable
+            && self.admission == crate::object_store::RequestAdmission::Draining
+        {
+            return Err(StoreError::NotReady);
+        }
         let started = Instant::now();
         let prefix = self.prefix;
         let read = if self.read_mode == ObjectReadMode::Atomic {
@@ -706,6 +726,11 @@ impl BlockStore for OwnedObjectStore {
             self.consume(winner, owner);
             return Err(error);
         }
+        if self.read_mode == ObjectReadMode::Restartable
+            && self.admission == crate::object_store::RequestAdmission::Draining
+        {
+            return Err(StoreError::NotReady);
+        }
         let started = Instant::now();
         let prefix = self.prefix;
         let read = if self.read_mode == ObjectReadMode::Atomic {
@@ -749,6 +774,9 @@ impl BlockStore for OwnedObjectStore {
             self.join_request(*id, false, owner)?;
             self.stats.object_prefetch_reused = self.stats.object_prefetch_reused.saturating_add(1);
             return Ok(PrefetchState::Reused);
+        }
+        if self.admission == crate::object_store::RequestAdmission::Draining {
+            return Err(StoreError::NotReady);
         }
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
@@ -892,6 +920,51 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn parallel_credentials_draining_preserves_completed_reads_and_wakes_paused_requests() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("credential-read-drain-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 291);
+        let mut budget = crate::mem::budget::Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let first = store.put(b"first", BlockType::SstData, 0).unwrap();
+        let second = store.put(b"second", BlockType::SstData, 0).unwrap();
+        store.enable_async_gets();
+        crate::mem::guard::forbid_alloc(|| {
+            store.set_read_owner(Some(ReadOwner(1)));
+            assert_eq!(store.prefetch(&first).unwrap(), PrefetchState::Scheduled);
+            store.set_read_owner(Some(ReadOwner(2)));
+            assert_eq!(store.prefetch(&first).unwrap(), PrefetchState::Reused);
+            store.set_admission(crate::object_store::RequestAdmission::Draining);
+            let mut row = [0u8; 16];
+            for owner in [ReadOwner(1), ReadOwner(2)] {
+                store.set_read_owner(Some(owner));
+                assert_eq!(store.get(&first, &mut row).unwrap().0, 5);
+                assert_eq!(&row[..5], b"first");
+            }
+            let operations = namespace.borrow().op_count;
+            assert_eq!(store.get(&second, &mut row), Err(StoreError::NotReady));
+            assert_eq!(store.prefetch(&second), Err(StoreError::NotReady));
+            assert_eq!(namespace.borrow().op_count, operations);
+            assert!(!store.async_reads_busy());
+            // Atomic data-changing execution must never park after its effects.
+            store.disable_async_gets();
+            assert_eq!(store.get(&second, &mut row).unwrap().0, 6);
+            assert_eq!(&row[..6], b"second");
+            store.enable_async_gets();
+            let generation = store.read_capacity_generation();
+            store.set_admission(crate::object_store::RequestAdmission::Open);
+            assert_eq!(store.read_capacity_generation(), generation.wrapping_add(1));
+            assert_eq!(store.get(&second, &mut row).unwrap().0, 6);
+            assert_eq!(&row[..6], b"second");
+        });
+        drop(store);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 
     fn network_config(port: u16, bucket: &str) -> crate::config::Config {
         let mut config = crate::config::Config::default_dev();

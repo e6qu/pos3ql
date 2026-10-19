@@ -186,7 +186,64 @@ struct SuspendedStatementSnapshot {
     deadline: i64,
 }
 
+pub(crate) fn validate_isolation_mode(
+    mode: crate::config::TransactionMode,
+    isolation: super::ast::TransactionIsolation,
+) -> Result<(), super::eval::SqlError> {
+    if mode == crate::config::TransactionMode::Locking
+        && matches!(
+            isolation,
+            super::ast::TransactionIsolation::RepeatableRead
+                | super::ast::TransactionIsolation::Serializable
+        )
+    {
+        return Err(crate::sql_err!(
+            super::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction_mode = locking supports READ COMMITTED and READ UNCOMMITTED only"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitTarget {
+    Ordinary,
+    Prepare { slot: usize },
+    CommitPrepared { slot: usize },
+    RollbackPrepared { slot: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitBarrier {
+    NoJournal,
+    Journal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagedCommit {
+    pub lsn: u64,
+    pub barrier: CommitBarrier,
+    pub queue: Option<super::commit::Ticket>,
+    pub target: CommitTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CommitControl {
+    mode: TxnMode,
+    txid: u32,
+    isolation: TransactionIsolation,
+    read_only: bool,
+    deferrable: bool,
+    replication_apply: bool,
+    snapshot_lsn: Option<u64>,
+    snapshot_taken: bool,
+    transaction_start: Option<i64>,
+    command_id: u32,
+    command_counter: u32,
+}
+
 pub struct TxnState {
+    staged_commit: Option<StagedCommit>,
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
@@ -893,6 +950,7 @@ impl TxnState {
                 .expect("sized to descriptor capacity");
         }
         Ok(Self {
+            staged_commit: None,
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
@@ -1138,6 +1196,62 @@ impl TxnState {
             .transaction_start
             .get_or_insert_with(super::datetime::statement_micros);
         super::datetime::restore_transaction_clock(start);
+    }
+
+    pub(super) fn commit_control(&self) -> CommitControl {
+        CommitControl {
+            mode: self.mode,
+            txid: self.txid,
+            isolation: self.isolation,
+            read_only: self.read_only,
+            deferrable: self.deferrable,
+            replication_apply: self.replication_apply,
+            snapshot_lsn: self.snapshot_lsn,
+            snapshot_taken: self.snapshot_taken,
+            transaction_start: self.transaction_start,
+            command_id: self.command_id,
+            command_counter: self.command_counter,
+        }
+    }
+
+    pub(super) fn install_commit_wait(&mut self, control: CommitControl, staged: StagedCommit) {
+        assert!(
+            !self.is_active() && self.staged_commit.is_none(),
+            "empty commit buffer"
+        );
+        self.mode = control.mode;
+        self.txid = control.txid;
+        self.isolation = control.isolation;
+        self.read_only = control.read_only;
+        self.deferrable = control.deferrable;
+        self.replication_apply = control.replication_apply;
+        self.snapshot_lsn = control.snapshot_lsn;
+        self.snapshot_taken = control.snapshot_taken;
+        self.transaction_start = control.transaction_start;
+        self.command_id = control.command_id;
+        self.command_counter = control.command_counter;
+        self.staged_commit = Some(staged);
+    }
+
+    pub(crate) fn staged_commit(&self) -> Option<StagedCommit> {
+        self.staged_commit
+    }
+
+    pub(crate) fn stage_commit(&mut self, lsn: u64, target: CommitTarget, barrier: CommitBarrier) {
+        assert!(
+            self.staged_commit.is_none(),
+            "commit staging is performed once"
+        );
+        self.staged_commit = Some(StagedCommit {
+            queue: None,
+            lsn,
+            target,
+            barrier,
+        });
+    }
+
+    pub(crate) fn take_staged_commit(&mut self) -> Option<StagedCommit> {
+        self.staged_commit.take()
     }
 
     pub(crate) fn suspended_statement_deadline(&self) -> Option<i64> {
@@ -2334,6 +2448,7 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.staged_commit = None;
         self.mode = TxnMode::Idle;
         self.command_id = 0;
         self.command_counter = 0;

@@ -44,6 +44,10 @@ macro_rules! delegate_async_block_reads {
             self.inner.pending_read_fd(slot)
         }
 
+        fn pending_read_wants_write(&self, slot: usize) -> bool {
+            self.inner.pending_read_wants_write(slot)
+        }
+
         fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
             self.inner.advance_pending_read(slot)
         }
@@ -393,6 +397,11 @@ pub(crate) trait BlockStore {
     /// The socket of an in-flight object read, if this store has one.
     fn pending_read_fd(&self, _slot: usize) -> Option<std::os::fd::RawFd> {
         None
+    }
+
+    /// Connect, request bytes and TLS may require write readiness before a response.
+    fn pending_read_wants_write(&self, _slot: usize) -> bool {
+        false
     }
 
     /// Advances an in-flight object read. `Ok(false)` means it remains

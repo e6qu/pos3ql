@@ -484,6 +484,7 @@ impl Conn {
                 budget,
                 config.max_sequences,
                 config.max_savepoints_per_transaction,
+                config.transaction_mode,
             )?,
             scram: ScramFlow::new(),
             role_scram: None,
@@ -680,7 +681,7 @@ impl Conn {
     }
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
-        if !self.parked {
+        if !self.parked || self.txn.staged_commit().is_some() {
             return false;
         }
         let extended = self.recv.readable().first() != Some(&wire::FMSG_QUERY);
@@ -880,11 +881,19 @@ impl Conn {
             // but this client receives an explicit unknown-outcome error.
             self.send.truncate_to(output_mark);
             let mut responder = Responder::new(&mut self.send);
-            if responder
-                .error(error.sqlstate, error.message.as_str())
-                .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
-                .is_err()
-            {
+            let staged = self.txn.staged_commit().is_some();
+            let sent = if staged {
+                pending.after = After::Close;
+                responder.error(
+                    "08007",
+                    "commit outcome is unknown; reconnect before checking it",
+                )
+            } else {
+                responder
+                    .error(error.sqlstate, error.message.as_str())
+                    .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+            };
+            if sent.is_err() {
                 pending.after = After::Close;
             }
         }
@@ -1767,6 +1776,14 @@ impl Conn {
                         &mut responder,
                     )
                 {
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        && self.txn.staged_commit().is_some()
+                    {
+                        let generation = engine.lock_generation();
+                        self.park(true, generation);
+                        engine.park_backend_statement(self.id, true);
+                        return Step::Parked;
+                    }
                     self.cursors.on_rollback();
                     if responder
                         .error(error.sqlstate, error.message.as_str())
@@ -1809,6 +1826,30 @@ impl Conn {
     }
 
     fn handle_function_call(&mut self, engine: &mut Engine, total: usize) -> Step {
+        if self.txn.staged_commit().is_some() {
+            match engine.finish_staged_transaction(&mut self.txn, &self.guc) {
+                Ok(()) => {
+                    return if Responder::new(&mut self.send)
+                        .ready_for_query(self.txn.status_byte())
+                        .is_ok()
+                    {
+                        self.finish_lock_wait();
+                        Step::Continue
+                    } else {
+                        Step::Close
+                    };
+                }
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                    self.park(true, engine.lock_generation());
+                    return Step::Parked;
+                }
+                Err(error) => {
+                    let _ = Responder::new(&mut self.send)
+                        .error(error.sqlstate, error.message.as_str());
+                    return Step::Close;
+                }
+            }
+        }
         const MAX_FAST_PATH_ARGUMENTS: usize = 3;
         self.arena.reset();
         let payload = &self.recv.readable()[5..total];
@@ -1928,7 +1969,12 @@ impl Conn {
             )
         };
         match result {
-            Ok(_) => Step::Continue,
+            Ok(crate::sql::ExtendedExecutionStatus::Complete(_)) => Step::Continue,
+            Ok(crate::sql::ExtendedExecutionStatus::Blocked { io_wait }) => {
+                self.park(io_wait, engine.lock_generation());
+                engine.park_backend_statement(self.id, io_wait);
+                Step::Parked
+            }
             Err(WireFull) => Step::Close,
         }
     }
@@ -2510,9 +2556,9 @@ impl Conn {
             }
             self.copy_buf.clear();
         }
-        let copy = self.copy.take().expect("in copy-in mode");
+        let mut copy = self.copy.take().expect("in copy-in mode");
         let extended = copy.extended;
-        let outcome = match copy.failed {
+        let outcome = match copy.failed.take() {
             Some(e) => {
                 engine.copy_abort(&mut self.txn, &self.guc);
                 Err(e)
@@ -2526,10 +2572,23 @@ impl Conn {
                         &self.guc,
                         &mut responder,
                         &self.copy_transition_scratch,
+                        if extended {
+                            crate::sql::CopyFinishMode::Statement
+                        } else {
+                            crate::sql::CopyFinishMode::ImplicitTransaction
+                        },
                     )
                     .map(|()| copy.count)
             }
         };
+        if matches!(&outcome, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+            && self.txn.staged_commit().is_some()
+        {
+            self.copy = Some(copy);
+            self.park(true, engine.lock_generation());
+            engine.park_backend_statement(self.id, true);
+            return Step::Parked;
+        }
         self.copy_transition_scratch.clear();
         let failed = outcome.is_err();
         engine.finish_backend_statement(&self.txn, self.id);

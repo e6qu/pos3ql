@@ -259,7 +259,7 @@ fn load_config() -> Result<(Config, Operation), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> [--recovery-target-lsn <pg_lsn> | --recovery-target-time <timestamptz>] | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
+                    "usage: pos3ql --config <path> [--backup <name> | --restore <name> [--recovery-target-lsn <pg_lsn> | --recovery-target-time <timestamptz>] | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
                 );
                 std::process::exit(0);
             }
@@ -307,13 +307,7 @@ fn load_config() -> Result<(Config, Operation), String> {
     };
     let config = match config_path {
         Some(path) => load_config_file(&path),
-        None => {
-            pos3ql::logging::warn(
-                "configuration",
-                "no --config given, using development defaults",
-            );
-            Ok(Config::default_dev())
-        }
+        None => Err("--config is required; choose transaction_mode explicitly".to_string()),
     }?;
     Ok((config, operation))
 }

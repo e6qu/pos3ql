@@ -213,6 +213,7 @@ SQL
 # --- start pos3ql (object storage off: this suite is pure SQL semantics) ----
 cargo build --release -q || { echo "build failed"; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = off

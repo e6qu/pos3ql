@@ -58,6 +58,17 @@ impl Transport {
         }
     }
 
+    pub(crate) fn connected(&self) -> std::io::Result<bool> {
+        match self {
+            Self::Plain(stream) => {
+                crate::io::tcp::connected(stream.as_ref().expect("live plain transport"))
+            }
+            Self::Tls(session) => {
+                crate::io::tcp::connected(&session.as_ref().expect("live session").sock)
+            }
+        }
+    }
+
     /// Whether a non-blocking caller must retain write readiness.  TLS can
     /// produce handshake or acknowledgement records while processing a read.
     pub(crate) fn wants_write(&self) -> bool {

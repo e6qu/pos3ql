@@ -3780,6 +3780,9 @@ pub(crate) fn pending_row_version_capacity(config: &Config) -> usize {
 }
 
 pub(crate) fn committed_row_version_capacity(config: &Config) -> usize {
+    if config.transaction_mode == crate::config::TransactionMode::Locking {
+        return 0;
+    }
     config
         .max_tables
         .saturating_mul(config.table_rows)
@@ -13157,6 +13160,7 @@ pub(crate) enum SchemaLockBlocker {
 }
 
 struct SnapshotState {
+    transaction_mode: crate::config::TransactionMode,
     exported: FixedVec<ExportedSnapshot>,
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
@@ -13703,6 +13707,7 @@ impl Iterator for MatviewIter<'_> {
 }
 
 pub struct Storage {
+    transaction_mode: crate::config::TransactionMode,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     /// Serializes table-name checks and empty-slot initialization, never row I/O.
@@ -18884,7 +18889,9 @@ impl Storage {
             }),
             comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
+            transaction_mode: config.transaction_mode,
             snapshots: std::sync::Arc::new(std::sync::Mutex::new(SnapshotState {
+                transaction_mode: config.transaction_mode,
                 exported: exported_snapshots,
                 active: active_snapshots,
                 serializable: serializable_snapshots,
@@ -29543,6 +29550,7 @@ impl Storage {
                             .max()
                             .unwrap_or(0);
                         let mut loaded_container = None;
+                        let mut pending_columns = false;
                         for column in 0..layout.columns() {
                             if decoded_columns.is_some_and(|columns| !columns[column])
                                 || pax_value_extents[column].is_some()
@@ -29555,55 +29563,72 @@ impl Storage {
                             let blocks = block_guard.get_or_insert_with(|| {
                                 spill.relation_blocks_for(relation.persistence)
                             });
-                            let (len, block_type) = match reference {
-                                crate::store::DataBlockRef::Packed {
-                                    container,
-                                    offset,
-                                    length,
-                                    id,
-                                } if coalesce_packed => {
-                                    let container_len = if let Some((loaded, len)) =
-                                        loaded_container
-                                        && loaded == container
-                                    {
-                                        len
-                                    } else {
-                                        let (len, block_type) = blocks
-                                            .get(&container, pax_column_buf)
-                                            .map_err(|error| {
+                            // Start every missing selected column before yielding.
+                            // Completed extents remain attached to this immutable
+                            // descriptor, including when another request waits.
+                            let read: Result<_, SqlError> = (|| {
+                                Ok(match reference {
+                                    crate::store::DataBlockRef::Packed {
+                                        container,
+                                        offset,
+                                        length,
+                                        id,
+                                    } if coalesce_packed => {
+                                        let container_len = if let Some((loaded, len)) =
+                                            loaded_container
+                                            && loaded == container
+                                        {
+                                            len
+                                        } else {
+                                            let (len, block_type) = blocks
+                                                .get(&container, pax_column_buf)
+                                                .map_err(|error| {
+                                                    spill_read_error(crate::store::SstError::Store(
+                                                        error,
+                                                    ))
+                                                })?;
+                                            if block_type
+                                                != crate::store::BlockType::SstPackedContainerV1
+                                            {
+                                                return Err(sql_err!(
+                                                    sqlstate::INTERNAL_ERROR,
+                                                    "PAX column container has the wrong block type"
+                                                ));
+                                            }
+                                            loaded_container = Some((container, len));
+                                            len
+                                        };
+                                        crate::store::decode_packed_extent(
+                                            &pax_column_buf[..container_len],
+                                            offset as usize,
+                                            length as usize,
+                                            &id,
+                                            pax_extent_buf,
+                                        )
+                                        .map_err(
+                                            |error| {
                                                 spill_read_error(crate::store::SstError::Store(
                                                     error,
                                                 ))
-                                            })?;
-                                        if block_type
-                                            != crate::store::BlockType::SstPackedContainerV1
-                                        {
-                                            return Err(sql_err!(
-                                                sqlstate::INTERNAL_ERROR,
-                                                "PAX column container has the wrong block type"
-                                            ));
-                                        }
-                                        loaded_container = Some((container, len));
-                                        len
-                                    };
-                                    crate::store::decode_packed_extent(
-                                        &pax_column_buf[..container_len],
-                                        offset as usize,
-                                        length as usize,
-                                        &id,
+                                            },
+                                        )?
+                                    }
+                                    _ => crate::store::read_data_block_raw_ref(
+                                        &mut **blocks,
+                                        reference,
                                         pax_extent_buf,
+                                        pax_column_buf,
                                     )
-                                    .map_err(|error| {
-                                        spill_read_error(crate::store::SstError::Store(error))
-                                    })?
+                                    .map_err(spill_read_error)?,
+                                })
+                            })();
+                            let (len, block_type) = match read {
+                                Ok(result) => result,
+                                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                                    pending_columns = true;
+                                    continue;
                                 }
-                                _ => crate::store::read_data_block_raw_ref(
-                                    &mut **blocks,
-                                    reference,
-                                    pax_extent_buf,
-                                    pax_column_buf,
-                                )
-                                .map_err(spill_read_error)?,
+                                Err(error) => return Err(error),
                             };
                             if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
                                 return Err(sql_err!(
@@ -29623,6 +29648,12 @@ impl Storage {
                             member_blocks[slot][at..end].copy_from_slice(&pax_extent_buf[..len]);
                             pax_value_extents[column] = Some((at, end));
                             at = end;
+                        }
+                        if pending_columns {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_IO_WAIT,
+                                "selected column reads in progress"
+                            ));
                         }
                         let _ = (member_raw_blocks, pax_row_buf);
                     }
@@ -30637,6 +30668,10 @@ impl Storage {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<VisibleRowHome>, SqlError> {
+        let commit_snapshot = match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => commit_snapshot,
+            crate::config::TransactionMode::Locking => u64::MAX,
+        };
         if let Some(source) = state.spilled_source() {
             source.validate_request(table_slot, rowid)?;
             let selected = source.visible_at(commit_snapshot)?;
@@ -47062,7 +47097,17 @@ impl Storage {
     }
 
     pub fn commit_snapshot(&self) -> u64 {
-        execution_visibility().commit_snapshot
+        match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => execution_visibility().commit_snapshot,
+            crate::config::TransactionMode::Locking => u64::MAX,
+        }
+    }
+
+    pub(crate) fn validate_transaction_isolation(
+        &self,
+        isolation: crate::sql::ast::TransactionIsolation,
+    ) -> Result<(), SqlError> {
+        crate::sql::txn::validate_isolation_mode(self.transaction_mode, isolation)
     }
 
     pub(crate) fn analyze_snapshot(&self) -> ReadSnapshotScope {
@@ -47398,6 +47443,7 @@ impl Storage {
     }
 
     pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
+        self.validate_transaction_isolation(crate::sql::ast::TransactionIsolation::RepeatableRead)?;
         let mut snapshots = self.snapshot_state();
         if let Some((_, existing)) = snapshots
             .active
@@ -47694,12 +47740,20 @@ impl Storage {
 
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
-        let requested = mode_bit(mode);
+        let protection = match self.transaction_mode {
+            crate::config::TransactionMode::Mvcc => mode,
+            crate::config::TransactionMode::Locking => match mode {
+                TableLockMode::AccessShare | TableLockMode::Share => TableLockMode::Share,
+                TableLockMode::AccessExclusive => TableLockMode::AccessExclusive,
+                _ => TableLockMode::Exclusive,
+            },
+        };
+        let requested = mode_bit(mode) | mode_bit(protection);
         let own_index = locks
             .table
             .iter()
             .position(|lock| lock.owner == txid && lock.relation == relation);
-        if own_index.is_some_and(|index| locks.table[index].mask() & requested != 0) {
+        if own_index.is_some_and(|index| locks.table[index].mask() & requested == requested) {
             return Ok(());
         }
         let combined = own_index
@@ -47732,10 +47786,12 @@ impl Storage {
         let sequence = locks.next_sequence();
         if let Some(index) = own_index {
             locks.table[index].modes[mode as usize] = sequence;
+            locks.table[index].modes[protection as usize] = sequence;
             return Ok(());
         }
         let mut modes = [0; 8];
         modes[mode as usize] = sequence;
+        modes[protection as usize] = sequence;
         locks
             .table
             .push(TableLock {
@@ -48196,6 +48252,11 @@ impl Storage {
             }
         };
         self.lock_state().row.wait_for(waiter, blocker)
+    }
+
+    pub(crate) fn wake_transaction_waiters(&self, transaction: u32) {
+        let owner = self.transaction_wait_owner(transaction);
+        self.lock_state().row.resource_released(owner);
     }
 
     pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {

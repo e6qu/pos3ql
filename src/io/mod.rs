@@ -21,3 +21,5 @@ pub use reactor::{Event, Reactor, ReactorSetupError};
 // references resolve regardless of platform.
 #[cfg(target_os = "linux")]
 pub use epoll as reactor;
+
+pub(crate) mod tcp;

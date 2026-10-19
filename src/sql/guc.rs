@@ -993,6 +993,7 @@ pub(crate) enum ConnectionDefaultSource {
 }
 
 pub struct GucState {
+    transaction_mode: crate::config::TransactionMode,
     store: RefCell<GucStore>,
     /// Immutable authenticated identity from the startup packet. PostgreSQL
     /// uses this identity—not a later SET ROLE or SET SESSION
@@ -1091,6 +1092,7 @@ impl GucState {
             budget,
             sequence_capacity,
             super::txn::DEFAULT_MAX_SAVEPOINTS,
+            crate::config::TransactionMode::Mvcc,
         )
     }
 
@@ -1102,15 +1104,105 @@ impl GucState {
         budget: &mut Budget,
         sequence_capacity: usize,
         savepoint_capacity: usize,
+        transaction_mode: crate::config::TransactionMode,
     ) -> Result<Self, BudgetError> {
         budget.draw_array(
             savepoint_capacity,
             core::mem::size_of::<Option<GucSavepoint>>(),
             "GUC savepoints",
         )?;
-        let mut state = Self::with_savepoints(vec![None; savepoint_capacity]);
+        let mut state = Self::with_savepoints(vec![None; savepoint_capacity], transaction_mode);
         state.seq_session = SeqSession::with_capacity(budget, sequence_capacity)?;
         Ok(state)
+    }
+
+    /// Copies only into buffers reserved by the destination at startup.
+    pub(crate) fn capture_commit_context(&self, target: &mut Self) -> Result<(), SqlError> {
+        let source = self.store.borrow();
+        let destination = target.store.get_mut();
+        if source.transaction.savepoint_count > destination.transaction.savepoints.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "commit context exceeds max_savepoints_per_transaction"
+            ));
+        }
+        destination.current = source.current;
+        destination.defaults = source.defaults;
+        destination.cluster_defaults = source.cluster_defaults;
+        destination.cluster_overrides = source.cluster_overrides;
+        destination.connection_overrides = source.connection_overrides;
+        destination.database_overrides = source.database_overrides;
+        destination.role_overrides = source.role_overrides;
+        destination.database_role_overrides = source.database_role_overrides;
+        destination.client_overrides = source.client_overrides;
+        destination.session_overrides = source.session_overrides;
+        destination.transaction.active = source.transaction.active;
+        destination.transaction.start = source.transaction.start;
+        destination.transaction.session = source.transaction.session;
+        destination.transaction.start_overrides = source.transaction.start_overrides;
+        destination.transaction.session_overrides = source.transaction.session_overrides;
+        destination.transaction.savepoints.fill(None);
+        let count = source.transaction.savepoint_count;
+        destination.transaction.savepoints[..count]
+            .clone_from_slice(&source.transaction.savepoints[..count]);
+        destination.transaction.savepoint_count = count;
+        target.transaction_mode = self.transaction_mode;
+        target.authenticated_user = self.authenticated_user;
+        target.random.set(self.random.get());
+        target.seq_session.discard();
+        for (source, destination) in self
+            .seq_session
+            .currvals
+            .iter()
+            .zip(&target.seq_session.currvals)
+        {
+            destination.set(source.get());
+        }
+        for (source, destination) in self
+            .seq_session
+            .caches
+            .iter()
+            .zip(&target.seq_session.caches)
+        {
+            destination.set(source.get());
+        }
+        target
+            .seq_session
+            .lastval
+            .set(self.seq_session.lastval.get());
+        if let Some(source) = &self.seq_session.overflow_currvals {
+            let destination = target
+                .seq_session
+                .overflow_currvals
+                .as_ref()
+                .filter(|destination| destination.len() >= source.len())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "commit context exceeds max_sequences"
+                    )
+                })?;
+            for (source, destination) in source.iter().zip(destination.iter()) {
+                destination.set(source.get());
+            }
+        }
+        if let Some(source) = &self.seq_session.overflow_caches {
+            let destination = target
+                .seq_session
+                .overflow_caches
+                .as_ref()
+                .filter(|destination| destination.len() >= source.len())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "commit context exceeds max_sequences"
+                    )
+                })?;
+            for (source, destination) in source.iter().zip(destination.iter()) {
+                destination.set(source.get());
+            }
+        }
+        Ok(())
     }
 
     /// Restores connection-local state without replacing startup allocations.
@@ -1119,7 +1211,7 @@ impl GucState {
         core::mem::swap(&mut sequences, &mut self.seq_session);
         let mut savepoints = core::mem::take(&mut self.store.get_mut().transaction.savepoints);
         savepoints.fill(None);
-        *self = Self::with_savepoints(savepoints);
+        *self = Self::with_savepoints(savepoints, self.transaction_mode);
         core::mem::swap(&mut sequences, &mut self.seq_session);
         self.seq_session.discard();
     }
@@ -1154,12 +1246,19 @@ impl GucState {
     }
 
     pub fn new() -> Self {
-        Self::with_savepoints(vec![None; super::txn::DEFAULT_MAX_SAVEPOINTS])
+        Self::with_savepoints(
+            vec![None; super::txn::DEFAULT_MAX_SAVEPOINTS],
+            crate::config::TransactionMode::Mvcc,
+        )
     }
 
-    fn with_savepoints(savepoints: Vec<Option<GucSavepoint>>) -> Self {
+    fn with_savepoints(
+        savepoints: Vec<Option<GucSavepoint>>,
+        transaction_mode: crate::config::TransactionMode,
+    ) -> Self {
         let values = GucValues::new();
         let mut g = Self {
+            transaction_mode,
             store: RefCell::new(GucStore {
                 current: values,
                 defaults: values,
@@ -1518,6 +1617,10 @@ impl GucState {
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
         change_setting(&mut values, &state.defaults, name, raw)?;
+        super::txn::validate_isolation_mode(
+            self.transaction_mode,
+            values.default_transaction_isolation,
+        )?;
         let bit = guc_bit(name);
         let resetting = unquote(raw).eq_ignore_ascii_case("default");
         finish_setting_change(&mut state, values, bit, local, resetting);

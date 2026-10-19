@@ -187,6 +187,7 @@ fi
 # every query also exercises the spill/checkpoint/read-back path.
 cargo build --release -q || { bad build; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
+transaction_mode = mvcc
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = ${POS3QL_DIFF_OBJECT_STORE:-off}

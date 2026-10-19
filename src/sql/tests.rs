@@ -12298,7 +12298,14 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
-    let result = engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send), inserted);
+    let result = engine.copy_finish(
+        setup,
+        txn,
+        guc,
+        &mut Responder::new(&mut send),
+        inserted,
+        CopyFinishMode::ImplicitTransaction,
+    );
     inserted.clear();
     result
 }
@@ -12383,6 +12390,7 @@ impl ConfiguredTransactionSession {
                 budget,
                 config.max_sequences,
                 config.max_savepoints_per_transaction,
+                config.transaction_mode,
             )
             .unwrap(),
             pool: SqlPreparedPool::new(config, budget).unwrap(),
@@ -18610,7 +18618,7 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -18713,7 +18721,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -31138,7 +31146,7 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -40188,7 +40196,7 @@ fn language_and_composite_privileges_survive_wal_checkpoint_and_cold_recovery() 
     config.object_store_bucket = format!("language-acl-recovery-{}-{sequence}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
@@ -40261,7 +40269,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
         format!("routine-acl-checkpoint-{}-{sequence}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
@@ -43556,7 +43564,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -58353,6 +58361,7 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
+    config.wal_upload_buffer_bytes = 16777216;
     config.wal_upload_sync = true;
     config.wal_buffer_bytes = 16 << 20;
     config.wal_bytes = 32 << 20;
@@ -66304,7 +66313,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
@@ -71011,7 +71020,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.value_index_rows = 1;
@@ -72209,6 +72218,7 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
     );
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
+    config.wal_upload_buffer_bytes = 33554432;
     config.wal_upload_sync = true;
     config.table_rows = 4096;
     config.txn_rows = 4096;
@@ -72876,7 +72886,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
@@ -75778,7 +75788,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 7);
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
@@ -76786,7 +76796,7 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
 
@@ -77126,7 +77136,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 1048576;
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 16;
@@ -84213,7 +84223,7 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
         config.object_store_response_bytes = 1 << 20;
         config.wal_upload = true;
         config.wal_upload_sync = true;
-        config.wal_upload_buffer_bytes = 256 << 10;
+        config.wal_upload_buffer_bytes = 1048576;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -84555,7 +84565,7 @@ fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.wal_upload_buffer_bytes = 256 << 10;
+    config.wal_upload_buffer_bytes = 1048576;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -85943,6 +85953,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &reader.guc,
                         &mut Responder::new(&mut send),
                         &transition,
+                        CopyFinishMode::ImplicitTransaction,
                     )
                     .unwrap();
             }
@@ -86717,5 +86728,139 @@ fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
             4 << 20
         )),
         ["1|original"]
+    );
+}
+
+#[test]
+fn explicit_locking_mode_waits_on_readers_and_preserves_unrelated_writes() {
+    let mut config = test_config("explicit-locking-waits");
+    config.transaction_mode = crate::config::TransactionMode::Locking;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE locking_orders(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE locking_other(id integer); INSERT INTO locking_orders VALUES (1,10)",
+        true,
+    );
+    let table = engine
+        .storage
+        .find_table("public", "locking_orders")
+        .unwrap();
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "BEGIN; SELECT amount FROM locking_orders WHERE id = 1",
+            true
+        )),
+        ["10"]
+    );
+    let waiter = engine.storage.start_transaction_identity().unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            engine
+                .storage
+                .lock_table(waiter, table, ast::TableLockMode::RowExclusive, false)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+    });
+    writer.success(&mut engine, "INSERT INTO locking_other VALUES (7)", true);
+    reader.success(&mut engine, "ROLLBACK", true);
+    crate::mem::guard::forbid_alloc(|| {
+        engine
+            .storage
+            .lock_table(waiter, table, ast::TableLockMode::RowExclusive, false)
+            .unwrap();
+        engine.storage.release_table_locks(waiter);
+        engine.storage.finish_transaction_identity(waiter, false);
+    });
+    writer.success(
+        &mut engine,
+        "UPDATE locking_orders SET amount = 20 WHERE id = 1",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT amount FROM locking_orders WHERE id = 1",
+            true
+        )),
+        ["20"]
+    );
+}
+
+#[test]
+fn explicit_locking_mode_keeps_savepoint_images_without_committed_history() {
+    let mut config = test_config("explicit-locking-savepoints");
+    config.transaction_mode = crate::config::TransactionMode::Locking;
+    assert_eq!(crate::storage::committed_row_version_capacity(&config), 0);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE locking_values(id integer PRIMARY KEY, amount integer); \
+         INSERT INTO locking_values VALUES (1,10); BEGIN; \
+         UPDATE locking_values SET amount = 20; SAVEPOINT saved; \
+         UPDATE locking_values SET amount = 30; ROLLBACK TO saved; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT amount FROM locking_values", true)),
+        ["20"]
+    );
+    for _ in 0..8 {
+        session.success(
+            &mut engine,
+            "UPDATE locking_values SET amount = amount + 1",
+            true,
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT amount FROM locking_values", true)),
+        ["28"]
+    );
+}
+
+#[test]
+fn explicit_locking_mode_rejects_isolation_it_cannot_preserve() {
+    let mut config = test_config("explicit-locking-isolation");
+    config.transaction_mode = crate::config::TransactionMode::Locking;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "SET default_transaction_isolation = 'repeatable read'",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    ] {
+        let result = session.execute(&mut engine, sql, true);
+        assert_eq!(error_sqlstates(&result), ["0A000"], "{sql}: {result:?}");
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    assert_eq!(
+        session.guc.transaction_defaults().0,
+        ast::TransactionIsolation::ReadCommitted
+    );
+    assert_eq!(
+        engine
+            .export_replication_snapshot(11, engine.storage.lsn())
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::FEATURE_NOT_SUPPORTED
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN ISOLATION LEVEL READ UNCOMMITTED; SELECT 7; COMMIT",
+            true
+        )),
+        ["7"]
     );
 }

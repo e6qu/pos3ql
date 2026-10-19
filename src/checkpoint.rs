@@ -1043,8 +1043,22 @@ impl Drop for AtomicBlockReadScope {
     }
 }
 
+enum CommitPublication {
+    Objects {
+        batch: CommitBatchId,
+        data: Option<crate::object_store::upload::Ticket>,
+        descriptor: Option<crate::object_store::upload::Ticket>,
+    },
+    Root {
+        batch: CommitBatchId,
+        ticket: crate::object_store::upload::Ticket,
+    },
+}
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
+    uploads: crate::object_store::upload::Uploads,
+    commit_publication: Option<CommitPublication>,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
@@ -1268,6 +1282,7 @@ impl Checkpointer {
         // The metadata client is separate from the block write client, fixed
         // read pool and scratch. Cache tiers draw their own startup budget.
         ObjectStore::budget_bytes(config)
+            + crate::object_store::upload::Uploads::budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -1885,6 +1900,9 @@ impl Checkpointer {
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            uploads: crate::object_store::upload::Uploads::new(config, budget)
+                .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            commit_publication: None,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -2081,11 +2099,22 @@ impl Checkpointer {
             .async_reads_busy()
     }
 
+    pub(crate) fn object_io_busy(&self) -> bool {
+        self.block_reads_busy() || self.uploads.busy() || self.commit_publication.is_some()
+    }
+
     pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
             .pending_read_fd(slot)
+    }
+
+    pub(crate) fn pending_block_read_wants_write(&self, slot: usize) -> bool {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .pending_read_wants_write(slot)
     }
 
     pub(crate) fn advance_pending_block_read(
@@ -2178,15 +2207,10 @@ impl Checkpointer {
         &mut self,
         credentials: crate::object_store::Credentials,
     ) -> Result<(), SqlError> {
-        if self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .async_reads_busy()
-        {
+        if self.object_io_busy() {
             return Err(sql_err!(
                 SQLSTATE_IO,
-                "object-store credential rotation is waiting for active reads"
+                "object-store credential rotation is waiting for active requests"
             ));
         }
         let previous = self.client.credentials().ok_or_else(|| {
@@ -2200,6 +2224,7 @@ impl Checkpointer {
             self.client.replace_credentials(previous);
             return Err(error);
         }
+        self.uploads.replace_credentials(credentials);
         self.blocks
             .lock()
             .expect("block store lock poisoned")
@@ -2216,6 +2241,27 @@ impl Checkpointer {
         first_lsn: u64,
         bytes: &[u8],
     ) -> Result<(), SqlError> {
+        self.begin_commit_publication(first_lsn, bytes)?;
+        while !self.advance_commit_publication(std::time::Instant::now())? {
+            if let Err(error) = self.uploads.wait_ready() {
+                self.cancel_commit_publication()?;
+                return Err(object_store_to_sql(error));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_commit_publication(
+        &mut self,
+        first_lsn: u64,
+        bytes: &[u8],
+    ) -> Result<(), SqlError> {
+        if self.commit_publication.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "commit publication already in progress"
+            ));
+        }
         let batch = CommitBatchId::from_bytes(first_lsn, bytes);
         let key = stack_format!(
             72,
@@ -2223,7 +2269,6 @@ impl Checkpointer {
             batch.first_lsn,
             batch.digest
         );
-        self.put_immutable(key.as_str(), bytes)?;
         let descriptor_key = stack_format!(
             72,
             "commits/{:020}-{:08x}.head",
@@ -2239,70 +2284,171 @@ impl Checkpointer {
             COMMIT_HEAD_HEADER, batch.first_lsn, batch.digest, previous.first_lsn, previous.digest
         )
         .expect("commit descriptor fits its fixed buffer");
-        self.put_immutable(descriptor_key.as_str(), descriptor.as_str().as_bytes())?;
-
-        let mut head = StackStr::<128>::new();
-        write!(
-            head,
-            "{}\nwriter {:032x}\nfirst {}\ndigest {:08x}\nend\n",
-            COMMIT_HEAD_HEADER, self.writer_token.0, batch.first_lsn, batch.digest
-        )
-        .expect("commit head fits its fixed buffer");
-        let precondition = match &self.commit_head_etag {
-            Some(etag) => Precondition::IfMatch(etag),
-            None => Precondition::IfNoneMatchAny,
-        };
-        let etag = match self
-            .client
-            .put(COMMIT_HEAD_KEY, head.as_str().as_bytes(), precondition)
-        {
-            Ok(etag) => etag,
-            Err(error) if error.is_precondition_failed() => {
-                self.assert_writer()?;
-                let refreshed = self
-                    .client
-                    .get(COMMIT_HEAD_KEY, None)
-                    .map_err(object_store_to_sql)?;
-                let (writer, published) = parse_commit_head(self.client.body_bytes())
-                    .map_err(|message| sql_err!(SQLSTATE_CAS, "{message}"))?;
-                if writer != self.writer_token || published != batch {
-                    return Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "commit-head compare-and-swap failed after writer fencing"
-                    ));
-                }
-                self.client
-                    .put(
-                        COMMIT_HEAD_KEY,
-                        head.as_str().as_bytes(),
-                        Precondition::IfMatch(&refreshed.etag),
-                    )
-                    .map_err(object_store_to_sql)?
+        use crate::object_store::upload::Condition;
+        let data_ticket = self
+            .uploads
+            .enqueue(key.as_str(), bytes, Condition::ImmutableCreate)
+            .map_err(upload_to_sql)?;
+        let descriptor_ticket = match self.uploads.enqueue(
+            descriptor_key.as_str(),
+            descriptor.as_str().as_bytes(),
+            Condition::ImmutableCreate,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.uploads.cancel(data_ticket).map_err(upload_to_sql)?;
+                return Err(upload_to_sql(error));
             }
-            Err(error) => return Err(object_store_to_sql(error)),
         };
-        self.commit_head_etag = Some(etag);
-        self.commit_head = Some(batch);
+        self.commit_publication = Some(CommitPublication::Objects {
+            batch,
+            data: Some(data_ticket),
+            descriptor: Some(descriptor_ticket),
+        });
         Ok(())
     }
 
-    fn put_immutable(&mut self, key: &str, bytes: &[u8]) -> Result<(), SqlError> {
-        match self.client.put(key, bytes, Precondition::IfNoneMatchAny) {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_precondition_failed() => {
-                self.client.get(key, None).map_err(object_store_to_sql)?;
-                if self.client.body_bytes() == bytes {
-                    Ok(())
+    /// Independent objects may complete out of order. Only the sequenced root
+    /// transition makes their transaction records recoverable.
+    pub(crate) fn advance_commit_publication(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<bool, SqlError> {
+        use crate::object_store::upload::Condition;
+        self.uploads.advance(now);
+        let Some(publication) = self.commit_publication.take() else {
+            return Ok(true);
+        };
+        match publication {
+            CommitPublication::Objects {
+                batch,
+                mut data,
+                mut descriptor,
+            } => {
+                if let Some(ticket) = data {
+                    match self.uploads.take(ticket) {
+                        Ok(Some(_)) => data = None,
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(ticket) = descriptor {
+                                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                            }
+                            return Err(upload_to_sql(error));
+                        }
+                    }
+                }
+                if let Some(ticket) = descriptor {
+                    match self.uploads.take(ticket) {
+                        Ok(Some(_)) => descriptor = None,
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(ticket) = data {
+                                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                            }
+                            return Err(upload_to_sql(error));
+                        }
+                    }
+                }
+                if data.is_none() && descriptor.is_none() {
+                    let head = format_commit_head(self.writer_token, batch);
+                    let condition = match self.commit_head_etag {
+                        Some(etag) => Condition::PublishMatch(etag),
+                        None => Condition::PublishAbsent,
+                    };
+                    let ticket = self
+                        .uploads
+                        .enqueue(COMMIT_HEAD_KEY, head.as_str().as_bytes(), condition)
+                        .map_err(upload_to_sql)?;
+                    self.commit_publication = Some(CommitPublication::Root { batch, ticket });
                 } else {
-                    Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "immutable object collision at {}",
-                        key
-                    ))
+                    self.commit_publication = Some(CommitPublication::Objects {
+                        batch,
+                        data,
+                        descriptor,
+                    });
+                }
+                Ok(false)
+            }
+            CommitPublication::Root { batch, ticket } => {
+                match self.uploads.take(ticket).map_err(upload_to_sql)? {
+                    Some(etag) => {
+                        self.commit_head_etag = Some(etag);
+                        self.commit_head = Some(batch);
+                        Ok(true)
+                    }
+                    None => {
+                        self.commit_publication = Some(CommitPublication::Root { batch, ticket });
+                        Ok(false)
+                    }
                 }
             }
-            Err(error) => Err(object_store_to_sql(error)),
         }
+    }
+
+    pub(crate) fn wait_commit_publication(&mut self) -> Result<(), SqlError> {
+        if self.commit_publication.is_none() {
+            return Ok(());
+        }
+        self.uploads.wait_ready().map_err(object_store_to_sql)
+    }
+
+    fn cancel_commit_publication(&mut self) -> Result<(), SqlError> {
+        match self.commit_publication.take() {
+            Some(CommitPublication::Objects {
+                data, descriptor, ..
+            }) => {
+                for ticket in [data, descriptor].into_iter().flatten() {
+                    self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+                }
+            }
+            Some(CommitPublication::Root { ticket, .. }) => {
+                self.uploads.cancel(ticket).map_err(upload_to_sql)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_publication_busy(&self) -> bool {
+        self.commit_publication.is_some()
+    }
+
+    pub(crate) fn upload_slots(&self) -> usize {
+        self.uploads.slots()
+    }
+
+    pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        self.uploads.fd(slot)
+    }
+
+    pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
+        self.uploads.wants_write(slot)
+    }
+
+    pub(crate) fn next_upload_deadline(&self) -> Option<std::time::Instant> {
+        self.uploads.next_deadline()
+    }
+
+    fn finish_immutable_upload(
+        &mut self,
+        ticket: crate::object_store::upload::Ticket,
+    ) -> Result<(), SqlError> {
+        self.uploads
+            .finish(ticket)
+            .map(|_| ())
+            .map_err(upload_to_sql)
+    }
+
+    fn put_immutable(&mut self, key: &str, bytes: &[u8]) -> Result<(), SqlError> {
+        let ticket = self
+            .uploads
+            .enqueue(
+                key,
+                bytes,
+                crate::object_store::upload::Condition::ImmutableCreate,
+            )
+            .map_err(upload_to_sql)?;
+        self.finish_immutable_upload(ticket)
     }
 
     /// Creates one immutable, named recovery point from the roots published by
@@ -2543,13 +2689,14 @@ impl Checkpointer {
     pub(crate) fn next_committed_wal_transaction(
         &mut self,
         floor: u64,
+        ceiling: u64,
         scratch: &mut FixedBuf,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<Option<u64>, SqlError> {
         scratch.clear();
         let mut complete_lsn = None;
         self.replay_commit_batches(floor, |lsn, record| {
-            if complete_lsn.is_some() {
+            if complete_lsn.is_some() || lsn > ceiling {
                 return Ok(());
             }
             append_uploaded_wal_record(scratch, lsn, record)?;
@@ -13814,6 +13961,37 @@ fn write_database_context(
         *current = Some(database);
     }
     Ok(())
+}
+
+fn upload_to_sql(error: crate::object_store::upload::UploadError) -> SqlError {
+    use crate::object_store::upload::UploadError;
+    match error {
+        UploadError::Request(error) => object_store_to_sql(error),
+        UploadError::SlotsExhausted => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object_store_put_slots exhausted"
+        ),
+        UploadError::BodyTooLarge {
+            requested,
+            capacity,
+        } => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "upload needs {} bytes but wal_upload_buffer_bytes is {}",
+            requested,
+            capacity
+        ),
+        UploadError::KeyTooLarge => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object key exceeds S3 key limit"
+        ),
+        UploadError::GenerationExhausted => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "upload ticket generation exhausted"
+        ),
+        UploadError::InvalidTicket => {
+            sql_err!(sqlstate::INTERNAL_ERROR, "invalid object upload ticket")
+        }
+    }
 }
 
 fn object_store_to_sql(e: ObjectError) -> SqlError {

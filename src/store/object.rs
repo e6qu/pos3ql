@@ -205,6 +205,11 @@ impl OwnedObjectStore {
         budget: &mut Budget,
         prefix: &'static str,
     ) -> Result<Self, crate::object_store::SetupError> {
+        if config.object_store_get_slots == 0 {
+            return Err(crate::object_store::SetupError::Capacity(
+                "object_store_get_slots must be at least 1",
+            ));
+        }
         // A completed async read retains its response until its consumer
         // verifies it. Atomic reads and writes use another client so they
         // cannot replace a response still owned by a suspended reader.
@@ -293,7 +298,7 @@ impl OwnedObjectStore {
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
-        self.slots.get(slot)?.client.pending_get_fd()
+        self.slots.get(slot)?.client.pending_fd()
     }
 
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
@@ -312,7 +317,7 @@ impl OwnedObjectStore {
                 return Ok(true);
             }
             match slot.client.advance_get() {
-                Ok(()) => {
+                Ok(_) => {
                     let started = slot
                         .started_at
                         .take()
@@ -323,7 +328,7 @@ impl OwnedObjectStore {
                 }
                 Err(ObjectError::WouldBlock) => (Ok(false), None),
                 Err(error) => {
-                    slot.client.clear_pending_get();
+                    slot.client.cancel_request();
                     slot.pending_error = Some(store_error(error));
                     slot.error_id = slot.pending_id.take();
                     slot.started_at = None;
@@ -374,7 +379,7 @@ impl OwnedObjectStore {
                 continue;
             }
             if slot.pending_id.is_some() {
-                slot.client.clear_pending_get();
+                slot.client.cancel_request();
             }
             slot.pending_id = None;
             slot.ready_id = None;
@@ -721,6 +726,12 @@ impl BlockStore for OwnedObjectStore {
         self.pending_read_fd(slot)
     }
 
+    fn pending_read_wants_write(&self, slot: usize) -> bool {
+        self.slots
+            .get(slot)
+            .is_some_and(|slot| slot.client.pending_wants_write())
+    }
+
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
         self.advance_pending_read(slot)
     }
@@ -751,6 +762,17 @@ mod tests {
         config.object_store_access_key = "test-access".to_string();
         config.object_store_secret_key = "test-secret".to_string();
         config
+    }
+
+    fn finish_request_sends(store: &mut OwnedObjectStore) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for slot in 0..store.async_read_slots() {
+            while store.pending_read_wants_write(slot) {
+                assert!(Instant::now() < deadline, "request send did not progress");
+                crate::mem::guard::forbid_alloc(|| store.advance_pending_read(slot)).unwrap();
+                std::thread::yield_now();
+            }
+        }
     }
 
     fn read_request(stream: &mut std::net::TcpStream) {
@@ -962,6 +984,7 @@ mod tests {
             }
         });
         assert_eq!(initial, Err(StoreError::NotReady));
+        finish_request_sends(&mut store);
         request_started
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
@@ -1127,6 +1150,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| store.get(&id, &mut output)),
             Err(StoreError::NotReady)
         );
+        finish_request_sends(&mut store);
         let (accepted, _) = atomic_read_request(&listener);
         let fd = store.pending_read_fd(0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -1182,6 +1206,7 @@ mod tests {
         let second_fd = store.pending_read_fd(1).expect("second slot pending");
         assert_ne!(first_fd, second_fd);
         assert!(store.async_reads_busy());
+        finish_request_sends(&mut store);
         drop(store);
         release.send(()).unwrap();
         server.join().unwrap();
@@ -1359,6 +1384,7 @@ mod tests {
             store.get_packed(&container, 0, framed_len, &expected, &mut output, &mut []),
             Err(StoreError::NotReady)
         );
+        finish_request_sends(&mut store);
         request_started_rx.recv().unwrap();
         assert!(store.async_reads_busy());
         assert!(store.next_hedge_deadline().is_none());
@@ -1517,6 +1543,7 @@ mod tests {
         // Exercise the timer's strictly-due branch, not equality at an
         // `Instant` boundary whose precision differs across CI runners.
         store.issue_due_hedges(deadline + std::time::Duration::from_nanos(1));
+        finish_request_sends(&mut store);
         hedge_ready.recv().unwrap();
         assert!(
             store.pending_read_fd(1).is_some(),

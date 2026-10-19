@@ -267,6 +267,7 @@ enum RemoteTransaction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyResult {
     None,
+    AwaitingDurability,
     Acknowledge {
         flushed_lsn: u64,
         reply_requested: bool,
@@ -287,6 +288,7 @@ pub struct SubscriptionApply {
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
+    pending_commit: Option<(u64, bool)>,
     behavior: crate::storage::SubscriptionBehavior,
 }
 
@@ -313,6 +315,7 @@ impl SubscriptionApply {
             budget,
             config.max_sequences,
             config.max_savepoints_per_transaction,
+            config.transaction_mode,
         )?;
         guc.set("search_path", "", false)
             .expect("empty worker search path is valid");
@@ -343,6 +346,7 @@ impl SubscriptionApply {
             )?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,
+            pending_commit: None,
             behavior,
         })
     }
@@ -377,6 +381,61 @@ impl SubscriptionApply {
         engine.commit_txn_with_triggers(&mut self.txn, &self.guc, &self.arena, &mut responder)
     }
 
+    pub(crate) fn awaiting_durability(&self) -> bool {
+        self.pending_commit.is_some()
+    }
+
+    fn finish_remote_commit(&mut self, end_lsn: u64, clear_skip: bool) -> ApplyResult {
+        if clear_skip {
+            self.behavior.skip_lsn = None;
+        }
+        self.confirmed_lsn = end_lsn;
+        self.remote = RemoteTransaction::Idle;
+        self.pending_commit = None;
+        self.arena.reset();
+        ApplyResult::Acknowledge {
+            flushed_lsn: end_lsn,
+            reply_requested: false,
+        }
+    }
+
+    fn commit_remote(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        end_lsn: u64,
+        clear_skip: bool,
+    ) -> Result<ApplyResult, SqlError> {
+        match self.commit(engine) {
+            Ok(()) => Ok(self.finish_remote_commit(end_lsn, clear_skip)),
+            Err(error)
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    && self.txn.staged_commit().is_some() =>
+            {
+                self.pending_commit = Some((end_lsn, clear_skip));
+                Ok(ApplyResult::AwaitingDurability)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn poll_commit(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+    ) -> Result<ApplyResult, SqlError> {
+        let Some((end_lsn, clear_skip)) = self.pending_commit else {
+            return Ok(ApplyResult::None);
+        };
+        self.with_context(engine, |worker, engine| {
+            match engine.finish_staged_transaction(&mut worker.txn, &worker.guc) {
+                Ok(()) => Ok(worker.finish_remote_commit(end_lsn, clear_skip)),
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                    Ok(ApplyResult::AwaitingDurability)
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     pub(crate) fn establish_frontier(
         &mut self,
         engine: &mut crate::sql::Engine,
@@ -396,9 +455,21 @@ impl SubscriptionApply {
                             "subscription bootstrap frontier did not advance",
                         ));
                     }
-                    worker.commit(engine)
+                    match worker.commit(engine) {
+                        Err(error)
+                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                && worker.txn.staged_commit().is_some() => {}
+                        result => result?,
+                    }
+                    if worker.txn.staged_commit().is_some() {
+                        worker.pending_commit = Some((confirmed_lsn, false));
+                    }
+                    engine.commit_wal()?;
+                    engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+                    worker.pending_commit = None;
+                    Ok(())
                 });
-            if result.is_err() && worker.txn.is_active() {
+            if result.is_err() && worker.txn.is_active() && worker.txn.staged_commit().is_none() {
                 engine.rollback_txn(&mut worker.txn, &worker.guc);
             }
             if result.is_ok() {
@@ -559,11 +630,20 @@ impl SubscriptionApply {
                     "subscription bootstrap frontier did not advance",
                 ));
             }
-            let result = worker.commit(engine);
-            if result.is_ok() {
-                worker.confirmed_lsn = confirmed_lsn;
+            match worker.commit(engine) {
+                Err(error)
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        && worker.txn.staged_commit().is_some() => {}
+                result => result?,
             }
-            result
+            if worker.txn.staged_commit().is_some() {
+                worker.pending_commit = Some((confirmed_lsn, false));
+            }
+            engine.commit_wal()?;
+            engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+            worker.pending_commit = None;
+            worker.confirmed_lsn = confirmed_lsn;
+            Ok(())
         })
     }
 
@@ -616,6 +696,11 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
+        if self.txn.staged_commit().is_some() {
+            // The commit boundary is irreversible. Its startup queue owner
+            // survives a disconnected publisher until publication resolves.
+            return;
+        }
         if self.txn.is_active() {
             engine.rollback_txn(&mut self.txn, &self.guc);
         }
@@ -714,14 +799,7 @@ impl SubscriptionApply {
                             "subscription received a non-monotonic commit after apply began",
                         ));
                     }
-                    self.commit(engine)?;
-                    self.confirmed_lsn = end_lsn;
-                    self.remote = RemoteTransaction::Idle;
-                    self.arena.reset();
-                    Ok(ApplyResult::Acknowledge {
-                        flushed_lsn: end_lsn,
-                        reply_requested: false,
-                    })
+                    self.commit_remote(engine, end_lsn, false)
                 }
                 RemoteTransaction::Skipping {
                     final_lsn,
@@ -744,15 +822,7 @@ impl SubscriptionApply {
                         final_lsn,
                         end_lsn,
                     )?;
-                    self.commit(engine)?;
-                    self.behavior.skip_lsn = None;
-                    self.confirmed_lsn = end_lsn;
-                    self.remote = RemoteTransaction::Idle;
-                    self.arena.reset();
-                    Ok(ApplyResult::Acknowledge {
-                        flushed_lsn: end_lsn,
-                        reply_requested: false,
-                    })
+                    self.commit_remote(engine, end_lsn, true)
                 }
                 _ => Err(sql_err!(
                     sqlstate::PROTOCOL_VIOLATION,
@@ -1084,14 +1154,7 @@ impl SubscriptionApply {
                         "subscription received a non-monotonic streamed commit",
                     ));
                 }
-                self.commit(engine)?;
-                self.confirmed_lsn = end_lsn;
-                self.remote = RemoteTransaction::Idle;
-                self.arena.reset();
-                Ok(ApplyResult::Acknowledge {
-                    flushed_lsn: end_lsn,
-                    reply_requested: false,
-                })
+                self.commit_remote(engine, end_lsn, false)
             }
             Message::StreamAbort { xid, subxid, .. } => {
                 let RemoteTransaction::Streaming { xid: active, .. } = self.remote else {
@@ -1128,6 +1191,11 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         frame: CopyData<'_>,
     ) -> Result<ApplyResult, SqlError> {
+        if self.awaiting_durability() {
+            return Err(Self::protocol_error(
+                "subscription read before pending commit completed",
+            ));
+        }
         self.with_context(engine, |worker, engine| {
             let result = match frame {
                 CopyData::XLogData {

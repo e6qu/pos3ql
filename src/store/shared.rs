@@ -83,6 +83,10 @@ impl<Store: BlockStore + ?Sized> BlockStore for SharedBlockStore<'_, Store> {
         self.lock().pending_read_fd(slot)
     }
 
+    fn pending_read_wants_write(&self, slot: usize) -> bool {
+        self.lock().pending_read_wants_write(slot)
+    }
+
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, StoreError> {
         self.lock().advance_pending_read(slot)
     }

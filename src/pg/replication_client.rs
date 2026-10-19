@@ -5,8 +5,8 @@
 //! states keep an incomplete network read from becoming an apply action or
 //! acknowledgement.
 
+use crate::io::tcp::connect as open_nonblocking;
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::os::fd::FromRawFd;
 use std::sync::Arc;
 
 use crate::mem::budget::{Budget, BudgetError};
@@ -1100,17 +1100,22 @@ impl ReplicationClient {
         Ok(())
     }
 
-    /// Reads every complete backend frame currently buffered.  `visit` sees a
+    /// Reads at most the explicit frame quota; later frames stay buffered.  `visit` sees a
     /// CopyData borrow only until it returns, before the receive buffer can be
     /// consumed or compacted.
     pub fn readable(
         &mut self,
+        max_frames: usize,
         mut visit: impl FnMut(ClientEvent<'_>) -> Result<(), ClientError>,
     ) -> Result<(), ClientError> {
+        if max_frames == 0 {
+            return Err(ClientError::Protocol(FrameError::Malformed));
+        }
+        let mut closed = false;
         loop {
             let writable = self.receive.writable();
             if writable.is_empty() {
-                return Err(ClientError::WireFull);
+                break;
             }
             match self
                 .stream
@@ -1118,7 +1123,10 @@ impl ReplicationClient {
                 .expect("bound replication worker")
                 .read_nonblocking(writable)
             {
-                Ok(0) => return Err(ClientError::Closed),
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
                 Ok(read) => self.receive.advance(read),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1161,6 +1169,7 @@ impl ReplicationClient {
             );
             self.queue_startup()?;
         }
+        let mut frames = 0;
         loop {
             let parsed = next_frame(self.receive.readable())?;
             let Some((used, frame)) = parsed else {
@@ -1204,8 +1213,25 @@ impl ReplicationClient {
                 visit(frame)?;
             }
             self.receive.consume(used);
+            frames += 1;
+            if frames == max_frames {
+                return Ok(());
+            }
+        }
+        if closed {
+            return Err(ClientError::Closed);
+        }
+        if self.receive.writable().is_empty() {
+            return Err(ClientError::WireFull);
         }
         Ok(())
+    }
+
+    pub fn has_buffered_frame(&self) -> bool {
+        match next_frame(self.receive.readable()) {
+            Ok(frame) => frame.is_some(),
+            Err(_) => true, // Wake the owner so readable reports the malformed frame.
+        }
     }
 
     pub fn acknowledge(
@@ -1594,78 +1620,6 @@ fn queue_sasl_response(send: &mut FixedBuf, final_message: &str) -> Result<(), C
     let mut message = MsgOut::begin(send, wire::FMSG_PASSWORD);
     message.bytes(final_message.as_bytes());
     message.finish().map_err(|_| ClientError::WireFull)
-}
-
-fn open_nonblocking(address: SocketAddr) -> std::io::Result<TcpStream> {
-    let fd = match address {
-        SocketAddr::V4(address) => {
-            let fd = make_nonblocking_socket(libc::AF_INET)?;
-            let mut raw = unsafe { core::mem::zeroed::<libc::sockaddr_in>() };
-            raw.sin_family = libc::AF_INET as libc::sa_family_t;
-            raw.sin_port = address.port().to_be();
-            raw.sin_addr = libc::in_addr {
-                s_addr: u32::from_ne_bytes(address.ip().octets()),
-            };
-            connect_nonblocking(
-                fd,
-                (&raw const raw).cast(),
-                core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )?;
-            fd
-        }
-        SocketAddr::V6(address) => {
-            let fd = make_nonblocking_socket(libc::AF_INET6)?;
-            let mut raw = unsafe { core::mem::zeroed::<libc::sockaddr_in6>() };
-            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            raw.sin6_port = address.port().to_be();
-            raw.sin6_addr = libc::in6_addr {
-                s6_addr: address.ip().octets(),
-            };
-            raw.sin6_scope_id = address.scope_id();
-            connect_nonblocking(
-                fd,
-                (&raw const raw).cast(),
-                core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )?;
-            fd
-        }
-    };
-    Ok(unsafe { TcpStream::from_raw_fd(fd) })
-}
-
-fn make_nonblocking_socket(domain: libc::c_int) -> std::io::Result<libc::c_int> {
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != 0 {
-            let error = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(error);
-        }
-    }
-    Ok(fd)
-}
-
-fn connect_nonblocking(
-    fd: libc::c_int,
-    raw: *const libc::sockaddr,
-    length: libc::socklen_t,
-) -> std::io::Result<()> {
-    let result = unsafe { libc::connect(fd, raw, length) };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(libc::EINPROGRESS) | Some(libc::EWOULDBLOCK)
-        ) {
-            unsafe { libc::close(fd) };
-            return Err(error);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2561,7 +2515,7 @@ mod tests {
         while (!client.is_streaming() || keepalive.is_none()) && Instant::now() < deadline {
             client.writable().unwrap();
             client
-                .readable(|event| match event {
+                .readable(usize::MAX, |event| match event {
                     ClientEvent::Replication(CopyData::PrimaryKeepalive {
                         end_lsn,
                         reply_requested,
@@ -2698,7 +2652,7 @@ mod tests {
             if client.wants_write() {
                 client.writable().unwrap();
             }
-            client.readable(|_| Ok(())).unwrap();
+            client.readable(usize::MAX, |_| Ok(())).unwrap();
             std::thread::yield_now();
         }
         assert!(

@@ -20709,9 +20709,18 @@ impl PlpgsqlExecHost<'_> {
         let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
-                engine.commit_txn_with_triggers(txn, guc, arena, responder)?;
-                cursors.on_commit();
+                // The procedure stack cannot be replayed after transaction
+                // control. Drain this explicit boundary, promoting all earlier
+                // commits in log order before continuing the same invocation.
+                match engine.commit_txn_with_triggers(txn, guc, arena, responder) {
+                    Err(error)
+                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            && txn.staged_commit().is_some() => {}
+                    result => result?,
+                }
                 engine.commit_wal()?;
+                engine.finish_staged_transaction(txn, guc)?;
+                cursors.on_commit();
                 next
             }
             PlpgsqlTransactionCommand::Rollback(next) => {

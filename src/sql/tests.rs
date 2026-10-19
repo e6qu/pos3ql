@@ -34062,10 +34062,15 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
         ["15"]
     );
 
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(engine.checkpoint().is_err());
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 1000;
     assert!(engine.checkpoint().unwrap());
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 0;
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
@@ -34314,10 +34319,15 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
         String::from_utf8_lossy(&rolled_back)
     );
 
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(engine.checkpoint().is_err());
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 1000;
     assert!(engine.checkpoint().unwrap());
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 0;
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
@@ -34354,10 +34364,15 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
         String::from_utf8_lossy(&cascaded)
     );
 
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(cold.checkpoint().is_err());
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 1000;
     assert!(cold.checkpoint().unwrap());
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 0;
     drop(cold);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
@@ -56602,10 +56617,15 @@ fn configured_statistics_and_brin_ranges_cross_old_per_object_bounds() {
     );
     assert!(String::from_utf8_lossy(&overflow).contains("54000"));
 
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(engine.checkpoint().is_err());
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 1000;
     assert!(engine.checkpoint().unwrap());
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 0;
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
@@ -60276,17 +60296,15 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
         "UPDATE checkpoint_reused_1024 SET value = 2048",
     );
     assert!(!message_types(&updated).contains(&b'E'));
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
-    assert!(
-        engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-            .is_err()
-    );
-    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 1000;
     assert!(engine.checkpoint().unwrap());
+    namespace
+        .borrow_mut()
+        .faults
+        .ambiguous_conditional_put_per_mille = 0;
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -85273,8 +85291,18 @@ fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_r
     engine.wal.commit();
     let mut published = false;
     for _ in 0..64 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
         match engine.checkpoint_beat() {
             CheckpointBeat::Advanced => {}
+            CheckpointBeat::WaitingForReads => {
+                let checkpointer = engine.ckpt.as_ref().unwrap();
+                assert!(
+                    checkpointer.physical_output_pending()
+                        || checkpointer.manifest_publication_pending()
+                );
+            }
             CheckpointBeat::Durable => {
                 published = true;
                 break;
@@ -85433,12 +85461,14 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         } else {
             Some(publish_cleanup_fixture(&mut engine))
         };
-        namespace.borrow_mut().faults.fail_from_op = Some(0);
-        let failed = run_with(
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
             &mut engine,
-            &mut budget,
-            "INSERT INTO cleanup_orders VALUES (81, 'retry')",
+            "BEGIN; INSERT INTO cleanup_orders VALUES (81, 'retry')",
+            false,
         );
+        namespace.borrow_mut().faults.fail_from_op = Some(0);
+        let failed = session.execute(&mut engine, "COMMIT", false);
         assert_eq!(error_sqlstates(&failed), ["58030"]);
         assert!(engine.durable_retry_pending());
         let published = if let Some(published) = before_write {
@@ -85475,6 +85505,7 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
             namespace.borrow().object_bytes(&head_key).unwrap(),
             before.as_slice()
         );
+        drop(session);
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut recovery_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

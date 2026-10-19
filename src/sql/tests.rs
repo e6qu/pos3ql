@@ -89068,9 +89068,9 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
 
         // A saved query must not invoke the routine once to count rows and
         // again to encode them. Its result then drives a cold correlated read.
-        let cte_sql = "WITH effect AS MATERIALIZED (SELECT effect_prepare_cte() AS n) \\
-             SELECT n, (SELECT sum(value) FROM effect_rows WHERE value >= effect.n) \\
-             FROM effect";
+        let cte_sql = r#"WITH effect AS MATERIALIZED (SELECT effect_prepare_cte() AS n)
+             SELECT n, (SELECT sum(value) FROM effect_rows WHERE value >= effect.n)
+             FROM effect"#;
         if extended {
             session.send.clear();
             session.arena.reset();
@@ -89114,9 +89114,9 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
-                "WITH effect AS MATERIALIZED (SELECT set_config('application_name', \\
-                 current_setting('application_name') || '-once', false) AS label) \\
-                 SELECT label, current_setting('application_name') FROM effect",
+                r#"WITH effect AS MATERIALIZED (SELECT set_config('application_name',
+                 current_setting('application_name') || '-once', false) AS label)
+                 SELECT label, current_setting('application_name') FROM effect"#,
                 true,
             )),
             ["seed-once|seed-once"]
@@ -89125,9 +89125,9 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
-                "SELECT set_config('application_name', \\
-                 current_setting('application_name') || 'x', false) AS label \\
-                 FROM generate_series(1, 3) AS g(i) ORDER BY label",
+                r#"SELECT set_config('application_name',
+                 current_setting('application_name') || 'x', false) AS label
+                 FROM generate_series(1, 3) AS g(i) ORDER BY label"#,
                 true,
             )),
             ["sx", "sxx", "sxxx"]
@@ -89145,9 +89145,9 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
-                "WITH effect AS MATERIALIZED (SELECT nextval('effect_sequence') AS n) \
-                 SELECT n + (SELECT sum(value) FROM effect_rows WHERE value >= effect.n) \
-                 FROM effect",
+                r#"WITH effect AS MATERIALIZED (SELECT nextval('effect_sequence') AS n)
+                 SELECT n + (SELECT sum(value) FROM effect_rows WHERE value >= effect.n)
+                 FROM effect"#,
                 true
             )),
             ["7"]

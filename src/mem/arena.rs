@@ -370,8 +370,8 @@ impl<T> Drop for OwnedArenaSlice<'_, T> {
 }
 
 /// A geometrically growing list whose backing storage comes from one arena.
-/// Growth leaves the old prefix in the bump arena, so all abandoned storage
-/// is bounded by the final capacity and reclaimed with the arena.
+/// Growth and edits preserve published slices. All backing buffers stay
+/// within the fixed arena and are reclaimed when it resets.
 pub(crate) struct ArenaList<'a, T: Copy> {
     arena: &'a Arena,
     entries: *mut T,

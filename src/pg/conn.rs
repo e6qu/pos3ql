@@ -5835,7 +5835,7 @@ mod tests {
             server.set_nonblocking(true).unwrap();
             conn.open(server, 72);
             conn.phase = Phase::Ready;
-            let role = engine.storage.find_role_visible("postgres", 0).unwrap() as u16;
+            let role = engine.role_login("postgres").unwrap().slot;
             engine
                 .register_backend(
                     72,

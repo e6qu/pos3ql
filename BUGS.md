@@ -13,7 +13,8 @@ prepared-transaction responses after their slots have been released and reused,
 equal block payloads stored under different types, and failover rejection with
 complete terminal error delivery. TLS error paths must also remain allocation-free
 outside their isolated component. Its budget must be returned after failed
-allocations, buffer shrinking and owned-error cleanup.
+allocations, buffer shrinking and owned-error cleanup. Release-build checks
+must retain the allocation calls rather than allowing optimization to remove them.
 
 For an entry, include a reproducer, affected boundary, observed behavior and
 the specific blocker. Remove repaired entries; preserve provenance in their

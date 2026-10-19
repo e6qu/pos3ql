@@ -97,7 +97,8 @@ waits on locks.
 Exercise actual overlapping HTTP GETs and PUTs, batched requests, duplicate
 requests, out-of-order completion, transport failures, cancellation, capacity
 pressure and fairness. Verify TLS setup and record failures remain inside
-the fixed memory contract. Verify durable acknowledgement and cold recovery against
+the fixed memory contract, including failed allocations and released TLS buffers
+in optimized builds. Verify durable acknowledgement and cold recovery against
 MinIO and SeaweedFS, and SQL results against vanilla PostgreSQL 18. Keep complete
 CI passing on the final PR head without increasing timeouts. These checks
 establish correctness and request costs; speed claims require the measurements

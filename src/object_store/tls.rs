@@ -286,7 +286,12 @@ mod tests {
                 let mut empty = Vec::<u8>::new();
                 assert!(empty.try_reserve_exact(impossible).is_err());
                 let layout = std::alloc::Layout::from_size_align(impossible, 8).unwrap();
-                assert!(unsafe { std::alloc::alloc_zeroed(layout) }.is_null());
+                // Keep the allocator call observable in optimized builds; an unused
+                // allocation may otherwise be elided, including its failure.
+                let allocation = std::hint::black_box(unsafe {
+                    std::alloc::alloc_zeroed(std::hint::black_box(layout))
+                });
+                assert!(allocation.is_null());
             });
             guard::set_tls_budget(256);
             for _ in 0..32 {

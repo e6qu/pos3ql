@@ -373,7 +373,9 @@ restart_main_server wire
 if POS3QL_PORT=$PG_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else
-  bad "wire probes"; cat "$WORK/wire.out"
+  bad "wire probes"
+  cat "$WORK/wire.out"
+  tail -120 "$WORK/server-wire.log"
 fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"

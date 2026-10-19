@@ -66,7 +66,9 @@ customer receives success before their change is recoverable.
   replaying row or statement triggers or consuming later client messages early.
 - Pause transaction boundaries instead of sending internal wait statuses. For
   example, `INSERT ...; BEGIN; ...; ROLLBACK` commits the first insert once;
-  concurrent partition detach consumes each phase's receipt before continuing.
+  concurrent partition detach finishes publishing each phase before continuing.
+- Preserve a usable connection after prepared-transaction commit or rollback,
+  including binary catalog queries and pipelined extended-protocol messages.
 - Keep reads, durable commits and maintenance from starving one another.
 
 ### Physical layout

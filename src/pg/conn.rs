@@ -5736,6 +5736,204 @@ mod tests {
     }
 
     #[test]
+    fn parallel_commit_prepared_protocol_keeps_the_connection_after_resolution() {
+        fn request(conn: &mut Conn, engine: &mut Engine, input: &[u8]) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(input));
+            for _ in 0..32 {
+                match crate::mem::guard::forbid_alloc(|| conn.process_message(engine)) {
+                    Step::Continue => {}
+                    Step::NeedMoreData => break,
+                    Step::Parked => {
+                        assert!(conn.txn.staged_commit().is_some());
+                        // The simulated remote store may allocate fixture objects.
+                        engine.commit_wal().unwrap();
+                        let pending = crate::mem::guard::forbid_alloc(|| {
+                            conn.retry_parked(engine, 0, true).unwrap()
+                        });
+                        assert_eq!(
+                            pending.after,
+                            After::Continue,
+                            "response {:?}, fatal {:?}",
+                            conn.send.readable(),
+                            engine.fatal_commit_failure()
+                        );
+                    }
+                    Step::Close => panic!(
+                        "connection closed: response {:?}, fatal {:?}",
+                        conn.send.readable(),
+                        engine.fatal_commit_failure()
+                    ),
+                }
+                if conn.recv.is_empty() {
+                    break;
+                }
+            }
+            assert!(conn.recv.is_empty() && !conn.parked);
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+            let response = conn.send.readable().to_vec();
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| conn.finish_response(
+                    PendingResponse {
+                        after: After::Continue,
+                        publication_mark: Some(0),
+                    },
+                    None,
+                )),
+                After::Continue
+            );
+            assert!(!conn.is_terminating());
+            response
+        }
+        fn extended(sql: &str, binary: bool) -> Vec<u8> {
+            let mut parse = vec![0];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            let mut input = frontend(wire::FMSG_PARSE, &parse);
+            input.extend_from_slice(&frontend(
+                wire::FMSG_BIND,
+                if binary {
+                    b"\0\0\0\0\0\0\0\x01\0\x01"
+                } else {
+                    b"\0\0\0\0\0\0\0\0"
+                },
+            ));
+            if binary {
+                input.extend_from_slice(&frontend(wire::FMSG_DESCRIBE, b"P\0"));
+            }
+            input.extend_from_slice(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+            input.extend_from_slice(&frontend(wire::FMSG_SYNC, &[]));
+            input
+        }
+        for commit in [false, true] {
+            let name = format!("prepared-protocol-{commit}-{}", std::process::id());
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 8;
+            config.table_rows = 64;
+            config.max_connections = 4;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            server.set_nonblocking(true).unwrap();
+            conn.open(server, 72);
+            conn.phase = Phase::Ready;
+            let role = engine.storage.find_role_visible("postgres", 0).unwrap() as u16;
+            engine
+                .register_backend(
+                    72,
+                    crate::storage::DatabaseOid::POSTGRES,
+                    role,
+                    "",
+                    None,
+                    -1,
+                    conn.backend_start,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            conn.recv.append(&frontend(
+                wire::FMSG_QUERY,
+                b"CREATE TABLE prepared_protocol(id integer PRIMARY KEY, value text); \
+                  INSERT INTO prepared_protocol VALUES(1, 'before')\0",
+            ));
+            assert!(matches!(conn.process_message(&mut engine), Step::Continue));
+            engine.commit_wal().unwrap();
+            engine.enable_async_durability();
+            request(&mut conn, &mut engine, &extended("BEGIN", false));
+            request(
+                &mut conn,
+                &mut engine,
+                &extended(
+                    "UPDATE prepared_protocol SET value = 'after' WHERE id = 1",
+                    false,
+                ),
+            );
+            request(
+                &mut conn,
+                &mut engine,
+                &extended("PREPARE TRANSACTION 'protocol-held'", false),
+            );
+            request(
+                &mut conn,
+                &mut engine,
+                &extended("SELECT transaction FROM pg_prepared_xacts", true),
+            );
+            let hidden = request(
+                &mut conn,
+                &mut engine,
+                &frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT value FROM prepared_protocol WHERE id = 1\0",
+                ),
+            );
+            assert!(
+                hidden
+                    .windows(17)
+                    .any(|bytes| bytes == b"D\0\0\0\x10\0\x01\0\0\0\x06before")
+            );
+            let resolution = request(
+                &mut conn,
+                &mut engine,
+                &extended(
+                    if commit {
+                        "COMMIT PREPARED 'protocol-held'"
+                    } else {
+                        "ROLLBACK PREPARED 'protocol-held'"
+                    },
+                    false,
+                ),
+            );
+            let tag: &[u8] = if commit {
+                b"COMMIT PREPARED\0"
+            } else {
+                b"ROLLBACK PREPARED\0"
+            };
+            assert!(resolution.windows(tag.len()).any(|bytes| bytes == tag));
+            let visible = request(
+                &mut conn,
+                &mut engine,
+                &frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT value FROM prepared_protocol WHERE id = 1\0",
+                ),
+            );
+            let row: &[u8] = if commit {
+                b"D\0\0\0\x0f\0\x01\0\0\0\x05after"
+            } else {
+                b"D\0\0\0\x10\0\x01\0\0\0\x06before"
+            };
+            assert!(visible.windows(row.len()).any(|bytes| bytes == row));
+            assert!(engine.fatal_commit_failure().is_none());
+            assert!(engine.take_backend_signal().is_none());
+            engine.drop_connection(72);
+            drop(conn);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
     fn copy_transition_values_survive_chunks_and_release_after_errors_and_rollback() {
         fn message(
             conn: &mut Conn,

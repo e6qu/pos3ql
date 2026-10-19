@@ -88,8 +88,12 @@ jobs:
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
-          COVERAGE_SHARD: runtest:proto,dur
-        run: sh tools/coverage.sh
+          POS3QL_BIN: ${{ github.workspace }}/target/release/pos3ql
+          POS3QL_RUN_GROUPS: proto,dur
+        run: |
+          set -o pipefail
+          bash tests/external/run.sh 2>&1 | tee "$RUNNER_TEMP/storage-protocol.log"
+          grep -q '^PASS:' "$RUNNER_TEMP/storage-protocol.log"
 
       - name: Release install and actual failover
         run: |

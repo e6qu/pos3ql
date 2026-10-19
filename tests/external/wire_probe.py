@@ -13,6 +13,7 @@ import socket
 import struct
 import sys
 import time
+import traceback
 
 HOST = os.environ.get("POS3QL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("POS3QL_PORT", "5433"))
@@ -78,8 +79,8 @@ def simple_query(s, text):
     while True:
         try:
             item = read_message(s)
-        except TimeoutError:
-            print(f"Timed out executing {text!r}; received frames: {out!r}", flush=True)
+        except (TimeoutError, ConnectionError):
+            print(f"Failed executing {text!r}; received frames: {out!r}", flush=True)
             raise
         out.append(item)
         if item[0] == b"Z":
@@ -5392,6 +5393,13 @@ def test_two_phase_transactions_extended_wire_contract():
     )
     hidden = simple_query(s, "SELECT value FROM wire_two_phase WHERE id = 1")
     committed = execute("COMMIT PREPARED 'wire-two-phase'")
+    check(
+        "two-phase wire: COMMIT PREPARED completes before the next query",
+        not any(kind == b"E" for kind, _ in committed)
+        and (b"C", b"COMMIT PREPARED\x00") in committed
+        and committed[-1] == (b"Z", b"I"),
+        committed,
+    )
     visible = simple_query(s, "SELECT value FROM wire_two_phase WHERE id = 1")
     check(
         "two-phase wire: extended COMMIT PREPARED publishes retained work",
@@ -6080,8 +6088,12 @@ def main():
         if unknown:
             raise SystemExit(f"unknown wire probe(s): {', '.join(sorted(unknown))}")
     for t in tests:
-        print(t.__name__)
-        t()
+        print(t.__name__, flush=True)
+        try:
+            t()
+        except Exception as error:
+            traceback.print_exc()
+            check(f"{t.__name__} raised {type(error).__name__}", False, str(error))
     if failures:
         print(f"\n{len(failures)} wire probe(s) FAILED: {failures}")
         sys.exit(1)

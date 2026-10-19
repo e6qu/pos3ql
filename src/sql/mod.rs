@@ -53,7 +53,7 @@ mod spgist_catalog;
 pub(crate) mod statistics;
 pub mod timezone;
 pub mod to_char;
-mod two_phase;
+pub(crate) mod two_phase;
 pub mod txn;
 pub mod types;
 pub mod tzif;
@@ -2471,6 +2471,33 @@ impl Engine {
         }
     }
 
+    /// Standalone catalog commands have no resumable transaction owner.
+    /// Complete their explicit publication boundary before applying catalog
+    /// changes; an uncertain outcome requires recovery rather than rollback.
+    fn finish_atomic_journal<T>(
+        &mut self,
+        apply: impl FnOnce(&mut Storage) -> Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        self.wal.commit();
+        if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            let result = self.commit_wal().and_then(|()| apply(&mut self.storage));
+            if let Err(error) = &result {
+                crate::logging::error_args(
+                    "atomic_commit_requires_recovery",
+                    format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                );
+                self.fatal_commit_failure = Some(SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                });
+                return Err(sql_err!("08007", "commit outcome requires recovery"));
+            }
+            result
+        } else {
+            apply(&mut self.storage)
+        }
+    }
+
     pub(crate) fn subscription_cleanup_runtime(
         &self,
         slot: usize,
@@ -2514,11 +2541,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage
-            .complete_subscription_cleanup(slot, created_at)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.complete_subscription_cleanup(slot, created_at)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn fail_subscription(
@@ -2552,10 +2579,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.fail_subscription(stream, failure)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.fail_subscription(stream, failure)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn subscription_runtime(&self, slot: usize) -> Option<SubscriptionRuntime> {
@@ -3823,12 +3851,17 @@ impl Engine {
         let parent = self
             .clean_shutdown_path
             .parent()
-            .ok_or_else(|| std::io::Error::other("clean shutdown marker has no parent"))?;
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         std::fs::File::open(parent)?.sync_all()
     }
 
     pub(crate) fn replication_identity(&self) -> (u64, u64) {
-        (self.replication_system_id, self.wal.last_lsn())
+        let lsn = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
+            self.visible_lsn.min(self.durable_lsn)
+        } else {
+            self.wal.last_lsn()
+        };
+        (self.replication_system_id, lsn)
     }
 
     pub(crate) fn export_replication_snapshot(
@@ -3903,11 +3936,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage
-            .create_replication_slot(name, restart_lsn, behavior)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(restart_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.create_replication_slot(name, restart_lsn, behavior)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(restart_lsn)
+        })
     }
 
     /// Writes one user logical-decoding message. A transactional message joins
@@ -4069,15 +4102,16 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.restore_replication_slot(
-            destination_name,
-            source.restart_lsn,
-            source.confirmed_flush_lsn,
-            source.behavior,
-        )?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(source.confirmed_flush_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.restore_replication_slot(
+                destination_name,
+                source.restart_lsn,
+                source.confirmed_flush_lsn,
+                source.behavior,
+            )?;
+            storage.observe_lsn(commit_lsn);
+            Ok(source.confirmed_flush_lsn)
+        })
     }
 
     pub(crate) fn drop_replication_slot(
@@ -4123,10 +4157,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.drop_replication_slot(name.as_str())?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.drop_replication_slot(name.as_str())?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn alter_replication_slot(
@@ -4174,10 +4209,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.alter_replication_slot(name, behavior)?;
-        self.storage.observe_lsn(commit_lsn);
-        Ok(())
+        self.finish_atomic_journal(|storage| {
+            storage.alter_replication_slot(name, behavior)?;
+            storage.observe_lsn(commit_lsn);
+            Ok(())
+        })
     }
 
     pub(crate) fn activate_replication_slot(
@@ -4299,7 +4335,8 @@ impl Engine {
         name: &str,
         confirmed_flush_lsn: u64,
     ) -> Result<u64, SqlError> {
-        let confirmed_flush_lsn = confirmed_flush_lsn.min(self.storage.lsn());
+        let (_, frontier) = self.replication_identity();
+        let confirmed_flush_lsn = confirmed_flush_lsn.min(frontier);
         let advance = self
             .storage
             .prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
@@ -4330,10 +4367,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.wal.commit();
-        self.storage.apply_replication_slot_advance(advance);
-        self.storage.observe_lsn(commit_lsn);
-        Ok(confirmed_flush_lsn)
+        self.finish_atomic_journal(|storage| {
+            storage.apply_replication_slot_advance(advance);
+            storage.observe_lsn(commit_lsn);
+            Ok(confirmed_flush_lsn)
+        })
     }
 
     /// Emits the next complete committed transaction selected by one logical
@@ -7506,6 +7544,17 @@ impl Engine {
     }
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
+        if txn.staged_commit().is_some() {
+            crate::logging::error_args(
+                "rollback_after_commit_boundary",
+                format_args!("transaction {} requires recovery", txn.txid),
+            );
+            self.fatal_commit_failure = Some(sql_err!(
+                "08007",
+                "rollback requested after irreversible commit boundary"
+            ));
+            return;
+        }
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if txn.txid == 0 {
@@ -7879,16 +7928,16 @@ impl Engine {
         checkpointer.advance_pending_block_read(slot)
     }
 
-    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next_block_read_deadline(&self) -> Option<std::time::Instant> {
         self.ckpt
             .as_ref()
-            .and_then(crate::checkpoint::Checkpointer::next_block_read_hedge_deadline)
+            .and_then(crate::checkpoint::Checkpointer::next_block_read_deadline)
     }
 
-    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
-        if let Some(checkpointer) = self.ckpt.as_mut() {
-            checkpointer.issue_due_block_read_hedges(now);
-        }
+    pub(crate) fn advance_block_read_deadlines(&mut self, now: std::time::Instant) -> bool {
+        self.ckpt
+            .as_mut()
+            .is_some_and(|checkpointer| checkpointer.advance_block_read_deadlines(now))
     }
 
     fn validate_maintenance_targets(

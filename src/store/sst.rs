@@ -195,6 +195,9 @@ pub(crate) const MAX_ASSEMBLED: usize =
 const MAX_CHAIN: usize = 16;
 const PAX_V2_MAGIC: u32 = 0x3258_4150;
 const PAX_COLUMN_MAGIC: u32 = 0x3143_4150;
+// Two framing headers plus the column header are multiples of eight. Padding
+// packed offsets therefore aligns the first column value in the stored object.
+const PAX_COLUMN_ALIGNMENT: usize = 8;
 const PAX_ROW_HEADER: usize = 8 + 8 + 4;
 const PAX_V2_ROW_HEADER: usize = PAX_ROW_HEADER + 4;
 const PACKED_DATA_REF_BYTES: usize = 32 + 4 + 4 + 32;
@@ -852,13 +855,25 @@ impl SstWriter {
                 &mut self.compress_buf,
             )
             .map_err(|_| SstError::Encoding)?;
-            if self.packed_len + framed_len > self.packed.len() {
+            if framed_len > self.packed.len() {
+                let direct = store.put(
+                    &self.encoding_buf[..column_len],
+                    BlockType::SstDataPaxColumnV1,
+                    0,
+                )?;
+                self.record(direct)?;
+                self.pax_refs[column] = DataBlockRef::direct(direct);
+                continue;
+            }
+            let aligned = self.packed_len.next_multiple_of(PAX_COLUMN_ALIGNMENT);
+            if aligned + framed_len > self.packed.len() {
                 self.flush_pax_columns(store)?;
             }
-            let offset = self.packed_len;
+            let offset = self.packed_len.next_multiple_of(PAX_COLUMN_ALIGNMENT);
+            self.packed[self.packed_len..offset].fill(0);
             self.packed[offset..offset + framed_len]
                 .copy_from_slice(&self.compress_buf[..framed_len]);
-            self.packed_len += framed_len;
+            self.packed_len = offset + framed_len;
             self.pax_refs[column] = DataBlockRef::Packed {
                 container: BlockId([0; 32]),
                 offset: u32::try_from(offset).map_err(|_| SstError::Encoding)?,
@@ -4080,6 +4095,121 @@ mod tests {
         };
         assert_eq!(first_container, second_container);
         assert_ne!(first_offset, second_offset);
+    }
+
+    #[test]
+    fn aligned_column_groups_pad_checked_offsets_without_fetching_other_columns() {
+        let (_budget, mut store) = store();
+        let schema = [ColType::Text, ColType::Text, ColType::Int8];
+        let values = [
+            Datum::Text("abc"),
+            Datum::Text("notes that need not be read"),
+            Datum::Int8(42),
+        ];
+        let mut encoded = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut encoded);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 1), &encoded)
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = vec![0; MAX_PAYLOAD];
+        let first = locate_data_block_ref(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap();
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut range = vec![0; MAX_PAYLOAD];
+        let (length, _) = read_data_block_raw_ref(&mut store, first, &mut raw, &mut range).unwrap();
+        let layout = pax_layout(&raw[..length]).unwrap();
+        let mut previous_end = 0usize;
+        let mut padding = 0usize;
+        let mut container_bytes = vec![0; MAX_PAYLOAD];
+        for column in 0..schema.len() {
+            let DataBlockRef::Packed {
+                container,
+                offset,
+                length: extent_len,
+                ..
+            } = layout.column_ref(&raw[..length], column).unwrap()
+            else {
+                panic!("small columns must share a packed container");
+            };
+            let offset = offset as usize;
+            assert_eq!((2 * crate::store::HEADER_LEN + 8 + offset) % 8, 0);
+            let (bytes, kind) = store.get(&container, &mut container_bytes).unwrap();
+            assert_eq!(kind, BlockType::SstPackedContainerV1);
+            assert!(offset + extent_len as usize <= bytes);
+            assert!(
+                container_bytes[previous_end..offset]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+            padding += offset - previous_end;
+            previous_end = offset + extent_len as usize;
+        }
+        assert!(padding > 0 && padding < schema.len() * PAX_COLUMN_ALIGNMENT);
+        let mut scratch = vec![0; MAX_PAYLOAD];
+        let mut output = vec![0; MAX_PAYLOAD];
+        let mut demanded = [false; MAX_COLUMNS];
+        demanded[2] = true;
+        let copied = copy_pax_v2_row_demand(
+            &mut store,
+            &layout,
+            &raw[..length],
+            0,
+            Some(&demanded),
+            &mut PaxReadScratch {
+                column: &mut scratch,
+                range: &mut range,
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert!(copied < encoded.len());
+    }
+
+    #[test]
+    fn aligned_column_groups_keep_maximum_column_frames_outside_small_containers() {
+        let (_budget, mut store) = store();
+        let payload = "x".repeat(MAX_PAYLOAD - VERSIONED_ENTRY_HEADER - 7);
+        let values = [Datum::Text(&payload)];
+        let mut encoded = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut encoded);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&[ColType::Text]).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 1), &encoded)
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = vec![0; MAX_PAYLOAD];
+        let first = locate_data_block_ref(&mut store, &handle, &mut index, 0)
+            .unwrap()
+            .unwrap();
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut range = vec![0; MAX_PAYLOAD];
+        let (length, _) = read_data_block_raw_ref(&mut store, first, &mut raw, &mut range).unwrap();
+        let layout = pax_layout(&raw[..length]).unwrap();
+        assert!(matches!(
+            layout.column_ref(&raw[..length], 0).unwrap(),
+            DataBlockRef::Direct(_)
+        ));
+        let mut scratch = vec![0; MAX_PAYLOAD];
+        let mut output = vec![0; MAX_PAYLOAD];
+        let copied = copy_pax_v2_row_demand(
+            &mut store,
+            &layout,
+            &raw[..length],
+            0,
+            None,
+            &mut PaxReadScratch {
+                column: &mut scratch,
+                range: &mut range,
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(&output[..copied], encoded.as_slice());
     }
 
     #[test]

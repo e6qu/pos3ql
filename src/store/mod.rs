@@ -52,12 +52,12 @@ macro_rules! delegate_async_block_reads {
             self.inner.advance_pending_read(slot)
         }
 
-        fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
-            self.inner.next_hedge_deadline()
+        fn next_read_deadline(&self) -> Option<std::time::Instant> {
+            self.inner.next_read_deadline()
         }
 
-        fn issue_due_hedges(&mut self, now: std::time::Instant) {
-            self.inner.issue_due_hedges(now);
+        fn advance_read_deadlines(&mut self, now: std::time::Instant) -> bool {
+            self.inner.advance_read_deadlines(now)
         }
     };
 }
@@ -410,15 +410,16 @@ pub(crate) trait BlockStore {
         Ok(false)
     }
 
-    /// The next configured p95 hedge deadline for a pending object read.
-    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+    /// Earliest pending read timeout or optional hedge deadline.
+    fn next_read_deadline(&self) -> Option<std::time::Instant> {
         None
     }
 
-    /// Starts every due duplicate GET that fits in the startup-bounded slot
-    /// pool. A hedge is best-effort scheduling; its winner still transfers
-    /// through the ordinary demand read.
-    fn issue_due_hedges(&mut self, _now: std::time::Instant) {}
+    /// Expires stalled reads and starts a due hedge if a fixed slot is free.
+    /// Returns whether a completion or failure can wake a waiting consumer.
+    fn advance_read_deadlines(&mut self, _now: std::time::Instant) -> bool {
+        false
+    }
 
     /// Cumulative provider-neutral I/O counters for this store stack.
     ///
@@ -560,6 +561,8 @@ pub(crate) enum StoreError {
     BufferTooSmall,
     /// The backing store could not be reached or refused the operation.
     Unavailable,
+    /// An object read exceeded its 30-second request deadline.
+    ReadTimedOut,
     /// A non-blocking fetch is in progress; retry later.
     NotReady,
 }

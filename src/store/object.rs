@@ -392,24 +392,43 @@ impl OwnedObjectStore {
         }
     }
 
-    fn next_hedge_deadline(&self) -> Option<Instant> {
-        let hedge_after = self.hedge_after?;
+    fn next_read_deadline(&self) -> Option<Instant> {
+        let hedge_slot_available = self.slots.iter().any(Self::slot_is_free);
         self.slots
             .iter()
-            .filter(|slot| slot.pending_id.is_some() && !slot.hedge_issued && !slot.packed)
             .filter_map(|slot| {
-                slot.started_at
-                    .and_then(|started| started.checked_add(hedge_after))
+                slot.pending_id?;
+                let started = slot.started_at?;
+                let timeout = started + Duration::from_secs(30);
+                let hedge = self
+                    .hedge_after
+                    .filter(|_| hedge_slot_available && !slot.hedge_issued && !slot.packed)
+                    .map(|after| started + after);
+                Some(hedge.map_or(timeout, |deadline| timeout.min(deadline)))
             })
             .min()
     }
 
-    fn issue_due_hedges(&mut self, now: Instant) {
-        let Some(deadline) = self.next_hedge_deadline() else {
-            return;
+    fn advance_read_deadlines(&mut self, now: Instant) -> bool {
+        let mut completed = false;
+        for slot in self.slots.as_mut_slice() {
+            if slot.pending_id.is_some()
+                && slot
+                    .started_at
+                    .is_some_and(|started| now >= started + Duration::from_secs(30))
+            {
+                slot.client.cancel_request();
+                slot.error_id = slot.pending_id.take();
+                slot.pending_error = Some(StoreError::ReadTimedOut);
+                slot.started_at = None;
+                completed = true;
+            }
+        }
+        let Some(deadline) = self.next_read_deadline() else {
+            return completed;
         };
         if deadline > now {
-            return;
+            return completed;
         }
         let Some(source_index) = self.slots.iter().position(|slot| {
             slot.pending_id.is_some()
@@ -423,10 +442,10 @@ impl OwnedObjectStore {
                     })
                     .is_some_and(|due| due <= now)
         }) else {
-            return;
+            return completed;
         };
         let Some(destination_index) = self.slots.iter().position(Self::slot_is_free) else {
-            return;
+            return completed;
         };
         let id = self.slots[source_index]
             .pending_id
@@ -434,7 +453,7 @@ impl OwnedObjectStore {
         self.slots[source_index].hedge_issued = true;
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, &id, &mut key_buffer);
-        let completed = {
+        let hedge_bytes = {
             let destination = &mut self.slots[destination_index];
             match destination.client.get(key, None) {
                 Ok(result) => {
@@ -456,10 +475,12 @@ impl OwnedObjectStore {
                 }
             }
         };
-        if let Some(bytes) = completed {
+        if let Some(bytes) = hedge_bytes {
+            completed = true;
             self.record_completed_read(now, bytes);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
+        completed || self.slots[destination_index].error_id.is_some()
     }
 }
 
@@ -736,12 +757,12 @@ impl BlockStore for OwnedObjectStore {
         self.advance_pending_read(slot)
     }
 
-    fn next_hedge_deadline(&self) -> Option<Instant> {
-        self.next_hedge_deadline()
+    fn next_read_deadline(&self) -> Option<Instant> {
+        self.next_read_deadline()
     }
 
-    fn issue_due_hedges(&mut self, now: Instant) {
-        self.issue_due_hedges(now);
+    fn advance_read_deadlines(&mut self, now: Instant) -> bool {
+        self.advance_read_deadlines(now)
     }
 }
 
@@ -787,6 +808,45 @@ mod tests {
                 }
                 Err(error) => panic!("read request: {error}"),
             }
+        }
+    }
+
+    #[test]
+    fn parallel_reads_timeout_whole_and_packed_requests_without_waiting_for_socket_events() {
+        use std::net::TcpListener;
+        for packed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let config = network_config(listener.local_addr().unwrap().port(), "read-timeout");
+            let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+            let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+            store.enable_async_gets();
+            let id = BlockId::of(b"held read");
+            let container = BlockId::of(b"held packed read");
+            let mut output = [0u8; 128];
+            crate::mem::guard::forbid_alloc(|| {
+                let initial = if packed {
+                    store.get_packed(&container, 0, 80, &id, &mut output, &mut [])
+                } else {
+                    store.get(&id, &mut output)
+                };
+                assert_eq!(initial, Err(StoreError::NotReady));
+                let started = store.slots[0].started_at.unwrap();
+                assert_eq!(
+                    store.next_read_deadline(),
+                    Some(started + Duration::from_secs(30))
+                );
+                assert!(!store.advance_read_deadlines(started + Duration::from_secs(29)));
+                assert!(store.advance_read_deadlines(started + Duration::from_secs(30)));
+                assert!(store.pending_read_fd(0).is_none());
+                assert!(store.next_read_deadline().is_none());
+                let result = if packed {
+                    store.get_packed(&container, 0, 80, &id, &mut output, &mut [])
+                } else {
+                    store.get(&id, &mut output)
+                };
+                assert_eq!(result, Err(StoreError::ReadTimedOut));
+                assert!(OwnedObjectStore::slot_is_free(&store.slots[0]));
+            });
         }
     }
 
@@ -1387,7 +1447,7 @@ mod tests {
         finish_request_sends(&mut store);
         request_started_rx.recv().unwrap();
         assert!(store.async_reads_busy());
-        assert!(store.next_hedge_deadline().is_none());
+        assert!(store.next_read_deadline().is_some());
         release_response_tx.send(()).unwrap();
 
         let mut complete = false;
@@ -1538,11 +1598,11 @@ mod tests {
         let mut output = [0u8; 64];
         assert_eq!(store.get(&id, &mut output), Err(StoreError::NotReady));
         let deadline = store
-            .next_hedge_deadline()
+            .next_read_deadline()
             .expect("pending read has a deadline");
         // Exercise the timer's strictly-due branch, not equality at an
         // `Instant` boundary whose precision differs across CI runners.
-        store.issue_due_hedges(deadline + std::time::Duration::from_nanos(1));
+        store.advance_read_deadlines(deadline + std::time::Duration::from_nanos(1));
         finish_request_sends(&mut store);
         hedge_ready.recv().unwrap();
         assert!(

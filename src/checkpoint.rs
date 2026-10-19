@@ -2127,18 +2127,18 @@ impl Checkpointer {
             .advance_pending_read(slot)
     }
 
-    pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next_block_read_deadline(&self) -> Option<std::time::Instant> {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
-            .next_hedge_deadline()
+            .next_read_deadline()
     }
 
-    pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
+    pub(crate) fn advance_block_read_deadlines(&mut self, now: std::time::Instant) -> bool {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
-            .issue_due_hedges(now);
+            .advance_read_deadlines(now)
     }
 
     fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {

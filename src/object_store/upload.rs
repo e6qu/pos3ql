@@ -27,7 +27,6 @@ pub(crate) enum Condition {
     ImmutableCreate,
     PublishAbsent,
     PublishMatch(EntityTag),
-    Unconditional,
 }
 
 impl Condition {
@@ -35,7 +34,6 @@ impl Condition {
         match self {
             Self::ImmutableCreate | Self::PublishAbsent => Precondition::IfNoneMatchAny,
             Self::PublishMatch(etag) => Precondition::IfMatch(etag),
-            Self::Unconditional => Precondition::None,
         }
     }
 }
@@ -245,10 +243,7 @@ impl Uploads {
                     match result {
                         Ok(etag) => slot.state = State::Complete(Ok(etag)),
                         Err(Error::WouldBlock) => {}
-                        Err(error)
-                            if error.is_precondition_failed()
-                                && !matches!(slot.condition, Condition::Unconditional) =>
-                        {
+                        Err(error) if error.is_precondition_failed() => {
                             slot.conditional_failure = Some(error);
                             // A lost create response can leave the object durable.
                             // Compare every byte, including length, before accepting it.
@@ -290,7 +285,6 @@ impl Uploads {
                 .conditional_failure
                 .take()
                 .expect("publication comparison follows a failed conditional request"),
-            Condition::Unconditional => unreachable!("unconditional PUT has no comparison"),
         }
     }
 

@@ -6,7 +6,7 @@
 //! acknowledgement.
 
 use crate::io::tcp::connect as open_nonblocking;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::mem::budget::{Budget, BudgetError};

@@ -251,17 +251,17 @@ impl<S: BlockStore> BlockStore for Layer<S> {
         }
     }
 
-    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+    fn next_read_deadline(&self) -> Option<std::time::Instant> {
         match self {
-            Layer::Base(store) => store.next_hedge_deadline(),
-            Layer::Disk(cache) => cache.next_hedge_deadline(),
+            Layer::Base(store) => store.next_read_deadline(),
+            Layer::Disk(cache) => cache.next_read_deadline(),
         }
     }
 
-    fn issue_due_hedges(&mut self, now: std::time::Instant) {
+    fn advance_read_deadlines(&mut self, now: std::time::Instant) -> bool {
         match self {
-            Layer::Base(store) => store.issue_due_hedges(now),
-            Layer::Disk(cache) => cache.issue_due_hedges(now),
+            Layer::Base(store) => store.advance_read_deadlines(now),
+            Layer::Disk(cache) => cache.advance_read_deadlines(now),
         }
     }
 
@@ -415,17 +415,17 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
         }
     }
 
-    fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
+    fn next_read_deadline(&self) -> Option<std::time::Instant> {
         match self {
-            TieredStore::WithRam(cache) => cache.next_hedge_deadline(),
-            TieredStore::WithoutRam(layer) => layer.next_hedge_deadline(),
+            TieredStore::WithRam(cache) => cache.next_read_deadline(),
+            TieredStore::WithoutRam(layer) => layer.next_read_deadline(),
         }
     }
 
-    fn issue_due_hedges(&mut self, now: std::time::Instant) {
+    fn advance_read_deadlines(&mut self, now: std::time::Instant) -> bool {
         match self {
-            TieredStore::WithRam(cache) => cache.issue_due_hedges(now),
-            TieredStore::WithoutRam(layer) => layer.issue_due_hedges(now),
+            TieredStore::WithRam(cache) => cache.advance_read_deadlines(now),
+            TieredStore::WithoutRam(layer) => layer.advance_read_deadlines(now),
         }
     }
 

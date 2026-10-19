@@ -22834,7 +22834,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         responder.command_complete("SET")?;
                         Ok(Ok(()))
                     } else {
-                        match super::apply_current_transaction_setting(txn, *characteristics) {
+                        match super::apply_current_transaction_setting(&engine.storage, txn, *characteristics) {
                             Ok(()) => {
                                 responder.command_complete("SET")?;
                                 Ok(Ok(()))

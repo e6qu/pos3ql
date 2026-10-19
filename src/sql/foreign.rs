@@ -136,7 +136,6 @@ fn poll_client(
             "foreign PostgreSQL operation timed out"
         ));
     }
-    let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
     let mut descriptor = libc::pollfd {
         fd: client.raw_fd(),
         events: libc::POLLIN
@@ -148,6 +147,17 @@ fn poll_client(
         revents: 0,
     };
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(sql_err!(
+                sqlstate::QUERY_CANCELED,
+                "foreign PostgreSQL operation timed out"
+            ));
+        }
+        let timeout = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
         let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
         if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;
@@ -175,7 +185,7 @@ fn poll_client(
         client.writable().map_err(client_error)?;
     }
     if descriptor.revents & libc::POLLIN != 0 {
-        client.readable(visit).map_err(client_error)?;
+        client.readable(usize::MAX, visit).map_err(client_error)?;
     }
     Ok(())
 }

@@ -85173,7 +85173,7 @@ fn check_cleanup_during_download(
             assert!(engine.checkpoint_can_progress());
             assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
             assert_eq!(engine.pending_block_read_fd(0), Some(fd));
-            assert!(engine.object_store_reads_busy());
+            assert!(engine.object_store_io_busy());
             turns += 1;
         }
         assert!(turns > 2, "the fixture must exercise sliced copying");
@@ -85238,7 +85238,7 @@ fn check_cleanup_during_download(
             );
             assert_eq!(&output[..payload.len()], payload);
         }
-        assert!(!engine.object_store_reads_busy());
+        assert!(!engine.object_store_io_busy());
     });
 }
 
@@ -86479,7 +86479,7 @@ fn bounded_snapshot_history_progresses_while_unrelated_download_waits() {
                     }
                     assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
                     assert_eq!(engine.pending_block_read_fd(0), Some(fd));
-                    assert!(engine.object_store_reads_busy());
+                    assert!(engine.object_store_io_busy());
                 }
                 assert!(!engine.storage.history_cleanup_pending());
                 assert_eq!(

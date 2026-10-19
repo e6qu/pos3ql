@@ -91,12 +91,12 @@ impl<Store: BlockStore + ?Sized> BlockStore for SharedBlockStore<'_, Store> {
         self.lock().advance_pending_read(slot)
     }
 
-    fn next_hedge_deadline(&self) -> Option<Instant> {
-        self.lock().next_hedge_deadline()
+    fn next_read_deadline(&self) -> Option<Instant> {
+        self.lock().next_read_deadline()
     }
 
-    fn issue_due_hedges(&mut self, now: Instant) {
-        self.lock().issue_due_hedges(now);
+    fn advance_read_deadlines(&mut self, now: Instant) -> bool {
+        self.lock().advance_read_deadlines(now)
     }
 
     fn io_stats(&self) -> BlockIoStats {
@@ -176,12 +176,13 @@ mod tests {
             into[0] = 7;
             Ok(Some((1, BlockType::ValueIndexData)))
         }
-        fn next_hedge_deadline(&self) -> Option<Instant> {
+        fn next_read_deadline(&self) -> Option<Instant> {
             Some(self.hedge)
         }
-        fn issue_due_hedges(&mut self, now: Instant) {
+        fn advance_read_deadlines(&mut self, now: Instant) -> bool {
             assert_eq!(now, self.hedge);
             self.hedged = true;
+            true
         }
         fn io_stats(&self) -> BlockIoStats {
             BlockIoStats {
@@ -208,8 +209,8 @@ mod tests {
             assert_eq!(shared.async_read_slots(), 3);
             assert!(shared.async_reads_busy());
             assert_eq!(shared.pending_read_fd(2), Some(42));
-            assert_eq!(shared.next_hedge_deadline(), Some(hedge));
-            shared.issue_due_hedges(hedge);
+            assert_eq!(shared.next_read_deadline(), Some(hedge));
+            assert!(shared.advance_read_deadlines(hedge));
             assert!(shared.advance_pending_read(2).unwrap());
             assert!(!shared.async_reads_busy());
             assert_eq!(shared.pending_read_fd(2), None);

@@ -1202,16 +1202,16 @@ impl Server {
                 self.engine.checkpoint_can_progress(),
                 Instant::now(),
             );
-            let hedge_timeout = self
+            let read_timeout = self
                 .engine
-                .next_block_read_hedge_deadline()
+                .next_block_read_deadline()
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
             let timeout = [
                 checkpoint_timeout,
                 self.next_lock_wait_timeout(),
                 self.next_replication_keepalive_timeout(),
                 self.next_termination_timeout(),
-                hedge_timeout,
+                read_timeout,
                 self.buffered_subscription_work().then_some(Duration::ZERO),
                 self.engine
                     .next_publication_deadline()
@@ -1319,8 +1319,10 @@ impl Server {
                 self.reload_object_store_credentials();
             }
             self.close_expired_terminations();
-            self.engine
-                .issue_due_block_read_hedges(std::time::Instant::now());
+            if self.engine.advance_block_read_deadlines(Instant::now()) && self.durability_ready {
+                self.wake_io_waiters();
+                had_responses |= self.finish_response_batch(None);
+            }
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }

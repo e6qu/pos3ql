@@ -1457,10 +1457,35 @@ impl Checkpointer {
         );
         let outcome = match job.phase {
             MergePhase::Schedule { rank, resume_lo } => {
-                self.merge_schedule_beat(&mut job, rank, resume_lo)?
+                self.merge_schedule_beat(&mut job, rank, resume_lo)
             }
-            MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor)?,
-            MergePhase::Finish { merged } => MergeBeatOutcome::Finished(merged),
+            MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor),
+            MergePhase::Finish { merged } => Ok(MergeBeatOutcome::Finished(merged)),
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A read can fail after cursors, checksum or writer state changed.
+                // Retry the same immutable pair with one coherent empty output.
+                self.block_output
+                    .discard(&mut self.block_uploads)
+                    .map_err(upload_to_sql)?;
+                self.merge_writer.reset();
+                self.merge_scratch.clear();
+                self.merge_source_cursors = [
+                    Some(SstVersionCursor::new(job.old0.handle)),
+                    Some(SstVersionCursor::new(job.old1.handle)),
+                ];
+                job.phase = MergePhase::Schedule {
+                    rank: 0,
+                    resume_lo: SstKey::MIN,
+                };
+                job.schedule_len = 0;
+                job.count = 0;
+                job.crc = Crc32c::new();
+                self.merge_job = Some(job);
+                return Err(error);
+            }
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -2137,6 +2162,15 @@ impl Checkpointer {
     #[cfg(test)]
     pub(crate) fn sliced_generation(&self, slot: usize) -> u64 {
         self.sliced_generation.get(slot).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_source_read_ready(&self) -> bool {
+        self.block_output.is_empty()
+            && self
+                .merge_job
+                .as_ref()
+                .is_some_and(|job| matches!(job.phase, MergePhase::Write { .. }))
     }
 
     #[cfg(test)]

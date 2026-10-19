@@ -87934,3 +87934,202 @@ fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }
+
+#[test]
+fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_rows() {
+    for writing in [false, true] {
+        let mut config = test_config(&format!("physical-merge-source-failure-{writing}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!(
+            "physical-merge-source-failure-{writing}-{}",
+            std::process::id()
+        );
+        config.max_tables = 4;
+        config.table_rows = 32;
+        config.max_spill_generations_per_table = 2;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 223);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE merge_retry(id integer, qty integer); \
+             INSERT INTO merge_retry SELECT i,i FROM generate_series(1,16) AS source(i)",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        assert!(engine.checkpoint().unwrap());
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE merge_retry SET qty=qty+100",
+        );
+        assert!(error_sqlstates(&changed).is_empty());
+        assert!(engine.checkpoint().unwrap());
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE merge_retry SET qty=qty+1000 WHERE id=7",
+        );
+        assert!(error_sqlstates(&changed).is_empty());
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+        if writing {
+            let mut ready = false;
+            for _ in 0..64 {
+                if engine.ckpt.as_ref().unwrap().merge_source_read_ready() {
+                    ready = true;
+                    break;
+                }
+                assert!(matches!(
+                    engine
+                        .ckpt
+                        .as_mut()
+                        .unwrap()
+                        .checkpoint_step(&mut engine.storage)
+                        .unwrap(),
+                    crate::checkpoint::CheckpointStep::Working
+                ));
+            }
+            assert!(ready, "fixture must reach merge row reads");
+        }
+        namespace.borrow_mut().faults.transient_per_mille = 1000;
+        let error = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage)
+            .err()
+            .expect("source read must report storage failure");
+        assert_eq!(error.sqlstate, "58030");
+        assert!(
+            engine.ckpt.as_ref().unwrap().retained_output_pending(),
+            "a source failure must retain its merge pair for retry"
+        );
+        namespace.borrow_mut().faults.transient_per_mille = 0;
+        assert!(engine.checkpoint().unwrap());
+        let query =
+            "SELECT count(*),sum(qty) FROM merge_retry; SELECT qty FROM merge_retry WHERE id=7";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["16|2736", "1107"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["16|2736", "1107"]
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_index_changes_cancel_unready_uploads_in_both_modes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let label = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        let mut config = test_config(&format!("physical-index-cancel-{label}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("physical-index-cancel-{label}-{}", std::process::id());
+        config.object_store_block_put_slots = 1;
+        config.max_tables = 4;
+        config.table_rows = 8;
+        config.value_index_rows = 8;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE cancel_index(id integer, code text); \
+             INSERT INTO cancel_index VALUES(1,'one'),(2,'two'); \
+             CREATE INDEX cancel_index_code ON cancel_index(code)",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        let mut queued = false;
+        for _ in 0..64 {
+            let checkpointer = engine.ckpt.as_mut().unwrap();
+            if checkpointer.value_index_job_active() && checkpointer.physical_output_pending() {
+                assert!(
+                    !checkpointer
+                        .advance_physical_output(&engine.storage)
+                        .unwrap()
+                );
+                assert!(!checkpointer.physical_output_ready(std::time::Instant::now()));
+                queued = true;
+                break;
+            }
+            assert!(matches!(
+                checkpointer.checkpoint_step(&mut engine.storage).unwrap(),
+                crate::checkpoint::CheckpointStep::Working
+            ));
+        }
+        assert!(
+            queued,
+            "fixture must have an unfinished upload and no free slot"
+        );
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE cancel_index SET code='after' WHERE id=1",
+        );
+        assert!(error_sqlstates(&changed).is_empty());
+        assert!(
+            engine
+                .ckpt
+                .as_ref()
+                .unwrap()
+                .physical_output_stale(&engine.storage)
+        );
+        assert!(
+            engine.checkpoint_can_progress(),
+            "stale output must not wait for a socket"
+        );
+        assert!(engine.maybe_checkpoint());
+        assert!(!engine.ckpt.as_ref().unwrap().physical_output_pending());
+        assert!(engine.checkpoint().unwrap());
+        let query = "SELECT id FROM cancel_index WHERE code='after'; \
+                     SELECT count(*) FROM cancel_index WHERE code='one'; \
+                     SELECT count(*) FROM cancel_index";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["1", "0", "2"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["1", "0", "2"]
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}

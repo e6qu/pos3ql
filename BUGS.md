@@ -2,7 +2,8 @@
 
 Only defects blocked by an external condition or a genuinely intractable repair
 belong here. Fix every other defect, including CI regressions, in the PR that
-finds it, including invalid saved-file references after a merge or table reuse.
+finds it, including publication that exposes a renamed type before its dependent
+definitions or keeps earlier owners locked while waiting.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded.

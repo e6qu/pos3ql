@@ -50,7 +50,7 @@ pub(super) struct LockWait<'lock> {
 }
 
 impl LockWait<'_> {
-    fn wait(self) {
+    pub(super) fn wait(self) {
         match self.target {
             WaitTarget::Mutex(lock) => lock.wait(self.poison),
             WaitTarget::Read(lock) => lock.wait_read(self.poison),

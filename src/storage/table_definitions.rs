@@ -107,6 +107,13 @@ impl TableDefinition {
         super::row_ownership::try_read(&self.state, "table definition lock poisoned")
     }
 
+    pub(super) fn try_write_for_batch(
+        &self,
+    ) -> Result<DefinitionWrite<'_>, super::row_ownership::LockWait<'_>> {
+        let state = super::row_ownership::try_write(&self.state, "table definition lock poisoned")?;
+        Ok(DefinitionWrite::shared(state, &self.names))
+    }
+
     pub(super) fn read(&self) -> RwLockReadGuard<'_, DefinitionState> {
         self.state.read().expect("table definition lock poisoned")
     }

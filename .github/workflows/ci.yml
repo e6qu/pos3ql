@@ -66,6 +66,8 @@ jobs:
         run: cargo miri test --lib --locked stable_spill_generation_ranges -- --test-threads=1
       - name: Saved-file reservation boundaries
         run: cargo miri test --lib --locked stable_spill_generation_exhaustion -- --test-threads=1
+      - name: Type publication workspace ownership
+        run: cargo miri test --lib --locked type_publication_workspace_exact_startup_budget -- --test-threads=1
 
   release-package:
     runs-on: ubuntu-latest

@@ -38,8 +38,12 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Finish protection for engine-wide publication, type-name changes and remaining
-table rewrites. Retain historical row, index and backup references before
+Type-name publication now owns affected definitions and dependent catalogs
+together, releases all earlier owners before waiting, and uses startup-reserved
+space. Public type commits remain exclusive: reference builders must validate
+what they submit before that restriction can be removed.
+Finish protection for engine-wide publication, reference construction and
+remaining table rewrites. Retain historical row, index and backup references before
 publishing replacements. Heap maintenance, pressure waits, capture and
 reader-history cleanup already use bounded turns. Metadata capture and some
 maintenance reads remain synchronous. Raising memory limits is not a completion

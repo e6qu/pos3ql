@@ -35,9 +35,12 @@ impl Storage {
         if current.schema != pending.schema || current.name != pending.name {
             return EnumMemberPublication::IdentityMoveRequired;
         }
+        let mut images = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned");
         assert!(
-            self.install_enum_alter_locked(&mut catalog, slot, txid)
-                .is_none(),
+            Self::install_enum_alter_locked(&mut catalog, &mut images, slot, txid).is_none(),
             "member publication cannot move a type identity"
         );
         EnumMemberPublication::Complete

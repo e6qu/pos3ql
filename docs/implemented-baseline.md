@@ -366,8 +366,7 @@ Creation, renaming, schema moves and journal replay use the same name check.
 A conflicting visible name returns `42710`; another transaction's pending
 creation, rename or drop waits through the existing transaction wait path.
 A pending rename reserves both names for other transactions. Its owner can
-reuse the old name, and rollback releases the proposed name. No memory
-reservation or catalog lock is added.
+reuse the old name, and rollback releases the proposed name.
 For example, after `CREATE TYPE order_code AS (value integer)`, renaming a
 domain to `order_code` fails instead of creating two types with that name.
 
@@ -380,13 +379,18 @@ domain's current name, so recovery can resolve it. Type usage and ownership
 checks resolve the name visible inside that transaction while internal references
 retain their bound identity until commit. Converting an identifier to regtype
 or calling format_type also uses the current domain or domain-array name.
-The reference walk uses each table's existing lifecycle and definition guards.
-An unrelated definition can stay open for reading while a type move inspects it.
-Waiting for a matching definition holds no shared catalog or definition allocator;
-all pending images receive the new type name before their owner can roll back.
-The reference walk adds no startup pool. Complete type-name changes and other
-type publication still require exclusive storage access; coordinating them and
-enabling SQL workers remain planned work.
+Publication acquires affected table definitions and the dependent catalogs before
+changing the source type. If any owner is busy, it releases every earlier owner,
+waits for that one, then selects the current references again. An unrelated
+definition can stay open for reading. Waiting holds no table lifecycle, shared
+catalog or definition allocator. All pending images receive the new type name
+before their owner can roll back.
+The ownership workspace is reserved at startup for every configured table plus
+the internal large-object relation: one optional table-owner record per slot,
+alignment padding and its mutex/arena controls. It never grows at runtime.
+Complete type-name changes still require exclusive storage access: definitions
+built before a rename must not later restore the old name. Coordinating that
+reference construction and enabling SQL workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade
@@ -395,6 +399,11 @@ requirement for this record.
 **User example:** two databases can both define `app.customer_id`. Renaming that
 domain in one database leaves the other database's columns, functions and comments
 unchanged, including after rollback or recovery without local caches.
+If a report retains an affected table definition, publication waits with the old
+type name intact. Once that reader releases it, the type and its dependent
+definitions change together; an earlier table in the update does not remain
+locked while publication waits for a later one. This tests the storage ownership
+boundary; SQL statements still execute on one CPU worker.
 
 Routine selection permits implicit conversion through a domain's base type,
 then checks the declared domain before calling the function. For example,

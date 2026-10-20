@@ -13747,6 +13747,7 @@ pub struct Storage {
     row_walks: std::sync::Arc<RowWalkPool>,
     snapshot_reclamation: SnapshotReclamation,
     heap_row_ownership: row_ownership::HeapRowOwnership,
+    type_publication: type_reference_moves::TypePublication,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
@@ -17762,6 +17763,25 @@ impl Storage {
             .stored_query_dependencies
             .lock()
             .expect("stored-query dependency catalog lock poisoned");
+        self.rename_stored_query_dependency_locked(
+            &mut catalog,
+            class,
+            slot,
+            old_identity,
+            schema,
+            name,
+        );
+    }
+
+    fn rename_stored_query_dependency_locked(
+        &self,
+        catalog: &mut StoredQueryDependencyCatalog,
+        class: DependencyClass,
+        slot: usize,
+        old_identity: Option<(SqlName, SqlName)>,
+        schema: SqlName,
+        name: SqlName,
+    ) {
         for image in 0..catalog.counts.len() {
             let count = catalog.counts[image];
             rename_dependency(
@@ -17910,6 +17930,7 @@ impl Storage {
             + Self::retained_row_walk_budget_bytes(config)
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
+            + type_reference_moves::TypePublication::budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -18040,6 +18061,7 @@ impl Storage {
         let row_walks = RowWalkPool::new(config, budget)?;
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
+        let type_publication = type_reference_moves::TypePublication::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
@@ -18793,6 +18815,7 @@ impl Storage {
             row_walks,
             snapshot_reclamation,
             heap_row_ownership,
+            type_publication,
             spill_roots,
             query_roots,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
@@ -39221,7 +39244,7 @@ impl Storage {
     }
 
     pub(crate) fn commit_domain_alter(&mut self, slot: usize, txid: u32) {
-        let rename = {
+        let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
@@ -39235,17 +39258,27 @@ impl Storage {
                 return;
             }
             let definition = domain.definition_for(txid);
-            catalog.domains[slot] = definition;
-            (definition.schema != domain.schema || definition.name != domain.name).then_some((
-                domain.schema,
-                domain.name,
-                definition.schema,
-                definition.name,
-            ))
+            if definition.schema == domain.schema && definition.name == domain.name {
+                catalog.domains[slot] = definition;
+                return;
+            }
+            type_reference_moves::TypeReferenceMove::new(
+                domain.database,
+                type_reference_moves::TypeReferenceKind::Domain,
+                slot,
+                UserTypeName {
+                    schema: domain.schema,
+                    name: domain.name,
+                },
+                UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                },
+            )
         };
-        if let Some((old_schema, old_name, schema, name)) = rename {
-            self.rename_domain_references(slot, old_schema, old_name, schema, name);
-        }
+        self.publish_type_move(movement, |catalog, _members| {
+            catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
+        });
     }
 
     pub(crate) fn rollback_domain_alter(
@@ -39265,27 +39298,6 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned")
             .domains[slot] = prior;
-    }
-
-    fn rename_domain_references(
-        &mut self,
-        slot: usize,
-        old_schema: SqlName,
-        old_name: SqlName,
-        schema: SqlName,
-        name: SqlName,
-    ) {
-        let movement = type_reference_moves::TypeReferenceMove::new(
-            self.domain(slot).database,
-            type_reference_moves::TypeReferenceKind::Domain,
-            slot,
-            UserTypeName {
-                schema: old_schema,
-                name: old_name,
-            },
-            UserTypeName { schema, name },
-        );
-        self.move_type_references(movement);
     }
 
     pub fn drop_domain(
@@ -39806,15 +39818,25 @@ impl Storage {
         slot: u32,
         keep: Option<u32>,
     ) -> Option<u32> {
+        let mut images = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned");
+        Self::release_pending_enum_members_locked(catalog, &mut images, slot, keep)
+    }
+
+    fn release_pending_enum_members_locked(
+        catalog: &mut TypeCatalog,
+        images: &mut EnumMemberImages,
+        slot: u32,
+        keep: Option<u32>,
+    ) -> Option<u32> {
         let pending = catalog.pending_enum_members[slot as usize];
         catalog.pending_enum_members[slot as usize] = PendingEnumMemberSlot::EMPTY;
         if let Some(image) = pending.image
             && Some(image) != keep
         {
-            self.enum_member_images
-                .lock()
-                .expect("enum member-image lock poisoned")
-                .release(image);
+            images.release(image);
         }
         pending.previous
     }
@@ -39850,21 +39872,35 @@ impl Storage {
             EnumMemberPublication::Complete => return,
             EnumMemberPublication::IdentityMoveRequired => {}
         }
-        let rename = {
-            let mut catalog = self
+        let movement = {
+            let catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            self.install_enum_alter_locked(&mut catalog, slot, txid)
+            let previous = catalog.enums[slot];
+            let definition = previous.definition_for(txid);
+            type_reference_moves::TypeReferenceMove::new(
+                previous.database,
+                type_reference_moves::TypeReferenceKind::Enum,
+                slot,
+                UserTypeName {
+                    schema: previous.schema,
+                    name: previous.name,
+                },
+                UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                },
+            )
         };
-        if let Some((old_schema, old_name, schema, name)) = rename {
-            self.move_enum_references(slot, old_schema, old_name, schema, name);
-        }
+        self.publish_type_move(movement, |catalog, members| {
+            Self::install_enum_alter_locked(catalog, members, slot, txid);
+        });
     }
 
     fn install_enum_alter_locked(
-        &self,
         catalog: &mut TypeCatalog,
+        images: &mut EnumMemberImages,
         slot: usize,
         txid: u32,
     ) -> Option<(SqlName, SqlName, SqlName, SqlName)> {
@@ -39874,16 +39910,17 @@ impl Storage {
         let definition = catalog.enums[slot].definition_for(txid);
         let previous = catalog.enums[slot];
         catalog.enums[slot] = definition;
-        self.clear_pending_enum_member_chain(
-            catalog,
-            Some(pending.member_slot),
-            Some(pending.image),
-        );
+        let mut tail = Some(pending.member_slot);
+        while let Some(slot) = tail {
+            tail = Self::release_pending_enum_members_locked(
+                catalog,
+                images,
+                slot,
+                Some(pending.image),
+            );
+        }
         if let Some(image) = previous.member_image {
-            self.enum_member_images
-                .lock()
-                .expect("enum member-image lock poisoned")
-                .release(image);
+            images.release(image);
         }
         (definition.schema != previous.schema || definition.name != previous.name).then_some((
             previous.schema,
@@ -39899,18 +39936,37 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        self.require_named_type_name(&catalog, schema, name, 0, Some(NamedTypeSlot::Enum(slot)))?;
-        let previous = catalog.enums[slot];
-        if schema != previous.schema || name != previous.name {
+        let movement = {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.require_named_type_name(
+                &catalog,
+                schema,
+                name,
+                0,
+                Some(NamedTypeSlot::Enum(slot)),
+            )?;
+            let previous = catalog.enums[slot];
+            if schema == previous.schema && name == previous.name {
+                return Ok(());
+            }
+            type_reference_moves::TypeReferenceMove::new(
+                previous.database,
+                type_reference_moves::TypeReferenceKind::Enum,
+                slot,
+                UserTypeName {
+                    schema: previous.schema,
+                    name: previous.name,
+                },
+                UserTypeName { schema, name },
+            )
+        };
+        self.publish_type_move(movement, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
-            drop(catalog);
-            self.move_enum_references(slot, previous.schema, previous.name, schema, name);
-        }
+        });
         Ok(())
     }
 
@@ -39930,33 +39986,6 @@ impl Storage {
         };
         self.release_pending_enum_members(&mut catalog, current.member_slot, None);
         catalog.enums[slot].pending_definition = undo.prior;
-    }
-
-    /// Moves an enum and every persisted reference to its type identity. Runtime
-    /// slots and value sort keys stay stable; comments are name-keyed and move
-    /// with the type just as PostgreSQL keeps the same `pg_type` OID.
-    fn move_enum_references(
-        &mut self,
-        slot: usize,
-        old_schema: SqlName,
-        old_name: SqlName,
-        new_schema: SqlName,
-        new_name: SqlName,
-    ) {
-        let movement = type_reference_moves::TypeReferenceMove::new(
-            self.enum_for(slot, 0).database,
-            type_reference_moves::TypeReferenceKind::Enum,
-            slot,
-            UserTypeName {
-                schema: old_schema,
-                name: old_name,
-            },
-            UserTypeName {
-                schema: new_schema,
-                name: new_name,
-            },
-        );
-        self.move_type_references(movement);
     }
 
     pub fn drop_enum(
@@ -40249,62 +40278,53 @@ impl Storage {
     }
 
     pub(crate) fn commit_composite_alter(&mut self, slot: usize, txid: u32) {
-        let renamed = {
+        let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            let composite = &mut catalog.composites[slot];
-            if let Some(pending) = composite.pending_definition
-                && pending.txid == txid
-            {
-                let prior_schema = composite.schema;
-                let prior_name = composite.name;
-                composite.schema = pending.schema;
-                composite.name = pending.name;
-                composite.fields = pending.fields;
-                composite.n_fields = pending.n_fields;
-                composite.pending_definition = None;
-                (prior_schema != composite.schema || prior_name != composite.name).then_some((
-                    prior_schema,
-                    prior_name,
-                    composite.schema,
-                    composite.name,
-                ))
-            } else {
-                None
+            let composite = catalog.composites[slot];
+            let Some(pending) = composite
+                .pending_definition
+                .filter(|pending| pending.txid == txid)
+            else {
+                return;
+            };
+            if pending.schema == composite.schema && pending.name == composite.name {
+                Self::install_composite_alter_locked(&mut catalog, slot, txid);
+                return;
             }
+            type_reference_moves::TypeReferenceMove::new(
+                composite.database,
+                type_reference_moves::TypeReferenceKind::Composite,
+                slot,
+                UserTypeName {
+                    schema: composite.schema,
+                    name: composite.name,
+                },
+                UserTypeName {
+                    schema: pending.schema,
+                    name: pending.name,
+                },
+            )
         };
-        if let Some((prior_schema, prior_name, new_schema, new_name)) = renamed {
-            self.move_composite_references(slot, prior_schema, prior_name, new_schema, new_name);
-        }
+        self.publish_type_move(movement, |catalog, _members| {
+            Self::install_composite_alter_locked(catalog, slot, txid);
+        });
     }
 
-    /// A composite slot is durable identity, while persisted definitions retain
-    /// the SQL identity needed to rebind that slot after recovery. Move every
-    /// such identity in the same catalog commit that changes its schema or name.
-    fn move_composite_references(
-        &mut self,
-        slot: usize,
-        old_schema: SqlName,
-        old_name: SqlName,
-        new_schema: SqlName,
-        new_name: SqlName,
-    ) {
-        let movement = type_reference_moves::TypeReferenceMove::new(
-            self.composite(slot).database,
-            type_reference_moves::TypeReferenceKind::Composite,
-            slot,
-            UserTypeName {
-                schema: old_schema,
-                name: old_name,
-            },
-            UserTypeName {
-                schema: new_schema,
-                name: new_name,
-            },
-        );
-        self.move_type_references(movement);
+    fn install_composite_alter_locked(catalog: &mut TypeCatalog, slot: usize, txid: u32) {
+        let composite = &mut catalog.composites[slot];
+        if let Some(pending) = composite
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            composite.schema = pending.schema;
+            composite.name = pending.name;
+            composite.fields = pending.fields;
+            composite.n_fields = pending.n_fields;
+            composite.pending_definition = None;
+        }
     }
 
     pub(crate) fn rollback_composite_alter(

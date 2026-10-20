@@ -16,20 +16,20 @@ pub(crate) enum MaintenanceStep {
     Complete,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeapCleanup {
     AllSaved,
     Durable,
     PressuredDurable,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntryCleanup {
     AllSaved,
     Pressured,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowCleanupTask {
     SavedMarkers { through_lsn: u64, generation: u64 },
     DurableHistory,
@@ -167,12 +167,9 @@ impl Storage {
                 .then(|| try_mutex(&self.snapshots, "snapshot state lock poisoned"))
                 .transpose()?;
             let definition = table.definition.try_read_for_batch()?;
-            let publication = matches!(
-                task,
-                RowCleanupTask::HeapRows(_) | RowCleanupTask::SavedMarkers { .. }
-            )
-            .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
-            .transpose()?;
+            let publication = matches!(task, RowCleanupTask::SavedMarkers { .. })
+                .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
+                .transpose()?;
             let generations = table.spill_generations.try_read_for_batch()?;
             let versions = matches!(
                 task,
@@ -242,12 +239,18 @@ impl Storage {
                     through_lsn,
                     generation,
                 } => {
-                    if publication.as_ref().unwrap().generation == generation
-                        && state.checkpoint_change_lsn <= through_lsn
-                    {
+                    let saved = if temporary {
+                        state
+                            .committed_generation
+                            .is_some_and(|revision| revision <= generation)
+                    } else {
+                        publication.as_ref().unwrap().generation == generation
+                    };
+                    if saved && state.checkpoint_change_lsn <= through_lsn {
                         state.checkpoint_change_lsn = 0;
                     }
                     if state.committed.is_none()
+                        && (!temporary || saved)
                         && state.committed_lsn <= through_lsn
                         && state.history.is_empty()
                         && state.pending.is_none()
@@ -274,7 +277,9 @@ impl Storage {
                     if let Some(RowHome::Heap(location)) = state.committed
                         && let Some(sst) = generations.eviction_member(
                             state.committed_lsn,
-                            publication.as_ref().unwrap().generation,
+                            state
+                                .committed_generation
+                                .expect("committed heap image has a revision"),
                         )
                     {
                         state.committed = Some(RowHome::Spilled {
@@ -324,9 +329,9 @@ mod tests {
     use crate::sql::types::{ColType, Datum};
     use crate::storage::tests::{make_def, test_budget, test_config};
 
-    fn fixture(persistence: RelationPersistence) -> (Storage, usize, usize) {
+    fn fixture(persistence: RelationPersistence, table_rows: usize) -> (Storage, usize, usize) {
         let mut config = test_config();
-        config.table_rows = 2;
+        config.table_rows = table_rows;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let mut definition = make_def("cleanup_owned", &[("id", ColType::Int4, false)]);
@@ -725,54 +730,106 @@ mod tests {
 
     #[test]
     fn bounded_row_cleanup_temporary_eviction_rechecks_generation_between_batches() {
-        let (mut storage, table, _) = fixture(RelationPersistence::Temporary);
-        let location = storage.heap.append_row(&[Datum::Int4(10)]).unwrap();
-        storage.tables[table]
-            .rows
-            .insert(2, RowState::committed_only_at(location, 7))
-            .unwrap();
-        let selected = selected(&storage, table, 7);
-        let generation = storage.tables[table].generation();
-        storage
-            .install_temporary_spill(table, saved_handle(1), generation, false)
-            .unwrap();
-        let mut cleanup = RowCleanup::new(
-            RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
-            RowCleanupTarget::Table(table),
-        );
-        crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(
-                storage.advance_row_cleanup(
-                    &mut cleanup,
-                    core::num::NonZeroUsize::new(1).unwrap(),
-                    MaintenanceMode::Background,
-                ),
-                MaintenanceStep::Advanced
+        for delete_after_save in [false, true] {
+            let (mut storage, table, _) = fixture(RelationPersistence::Temporary, 4);
+            let location = storage.heap.append_row(&[Datum::Int4(10)]).unwrap();
+            for rowid in [2, 3] {
+                storage.tables[table]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(location, 7))
+                    .unwrap();
+            }
+            for (_, row) in storage.tables[table].rows.write().iter_mut() {
+                row.committed_lsn = 0;
+                row.checkpoint_change_lsn = 0;
+            }
+            storage.set_lsn(0);
+            let selected = selected(&storage, table, 0);
+            let generation = storage.tables[table].generation();
+            storage
+                .install_temporary_spill(table, saved_handle(1), generation, false)
+                .unwrap();
+            let mut cleanup = RowCleanup::new(
+                RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                RowCleanupTarget::Table(table),
             );
-            update(&storage, table, 2, 30, 8, 9);
-            assert_eq!(
-                storage.advance_row_cleanup(
-                    &mut cleanup,
-                    core::num::NonZeroUsize::new(1).unwrap(),
-                    MaintenanceMode::Background,
-                ),
-                MaintenanceStep::Complete
-            );
-            assert!(matches!(
-                storage.tables[table].rows.get(&1).unwrap().committed,
-                Some(RowHome::Spilled { .. })
-            ));
-            assert!(matches!(
-                storage.tables[table].rows.get(&2).unwrap().committed,
-                Some(RowHome::Heap(_))
-            ));
-            assert_value(&storage, table, selected, 10);
-        });
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    ),
+                    MaintenanceStep::Advanced
+                );
+                // Temporary commits can share a journal position; revisions must differ.
+                update(&storage, table, 2, 30, 8, 0);
+                assert_eq!(
+                    storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    ),
+                    MaintenanceStep::Advanced
+                );
+                assert!(matches!(
+                    storage.tables[table].rows.get(&2).unwrap().committed,
+                    Some(RowHome::Heap(_))
+                ));
+                assert_eq!(
+                    storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    ),
+                    MaintenanceStep::Complete
+                );
+                for rowid in [1, 3] {
+                    assert!(matches!(
+                        storage.tables[table].rows.get(&rowid).unwrap().committed,
+                        Some(RowHome::Spilled { .. })
+                    ));
+                }
+                if delete_after_save {
+                    storage
+                        .write_pending_image_untracked(table, 2, 10, 1, None)
+                        .unwrap();
+                    storage.commit_row(table, 2, 10, 0).unwrap();
+                    let rejected = storage.heap.append_row_image(&[Datum::Int4(99)]).unwrap();
+                    let undo = storage
+                        .write_pending_image_untracked(table, 2, 12, 1, Some(rejected))
+                        .unwrap();
+                    storage.restore_pending(table, 2, 12, undo);
+                }
+                storage.finish_row_cleanup(
+                    RowCleanupTask::SavedMarkers {
+                        through_lsn: 0,
+                        generation,
+                    },
+                    RowCleanupTarget::Table(table),
+                );
+                storage.finish_row_cleanup(
+                    RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+                    RowCleanupTarget::Table(table),
+                );
+                assert_eq!(storage.tables[table].rows.len(), 1);
+                let current = storage.tables[table].rows.get(&2).unwrap();
+                assert_eq!(current.committed_lsn, 0);
+                assert_eq!(current.committed.is_none(), delete_after_save);
+                assert!(
+                    current
+                        .committed_generation
+                        .is_some_and(|revision| revision > generation)
+                );
+                assert_eq!(current.checkpoint_change_lsn, 0);
+                assert_value(&storage, table, selected, 10);
+            });
+        }
     }
 
     #[test]
     fn row_lock_owners_shared_cleanup_preserves_retained_bytes_and_later_writes() {
-        let (mut storage, first, second) = fixture(RelationPersistence::Permanent);
+        let (mut storage, first, second) = fixture(RelationPersistence::Permanent, 2);
         let location = storage.heap.append_row(&[Datum::Int4(40)]).unwrap();
         storage.tables[first]
             .rows
@@ -847,7 +904,7 @@ mod tests {
     #[test]
     fn row_lock_owners_local_history_rechecks_readers_and_temporary_generation() {
         for matching_generation in [true, false] {
-            let (mut storage, table, _) = fixture(RelationPersistence::Temporary);
+            let (mut storage, table, _) = fixture(RelationPersistence::Temporary, 2);
             crate::mem::guard::forbid_alloc(|| {
                 storage.register_snapshot(99, 7).unwrap();
                 update(&storage, table, 1, 20, 8, 9);

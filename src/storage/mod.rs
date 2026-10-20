@@ -2382,10 +2382,12 @@ impl RowLoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,
-    /// Commit LSN of `committed`, or of the deletion when `committed` is
-    /// absent but the entry shadows an older SST row. Zero means no committed
-    /// image has been installed.
+    /// Commit LSN of the current image or deletion shadowing an older SST row.
+    /// Temporary changes may share zero; their committed revision records presence.
     pub committed_lsn: u64,
+    /// None means no committed image. Saved/replayed images use Some(0);
+    /// new publications use the table's next revision for temporary spill coverage.
+    pub(crate) committed_generation: Option<u64>,
     /// Latest committed row change not yet captured by a published row SST.
     /// Keeping this identity in the bounded overlay lets delta checkpoints
     /// avoid a complete immutable-table walk even if the row bytes spill.
@@ -2518,6 +2520,10 @@ pub struct PendingWriteUndo {
 pub(crate) const SNAPSHOT_ALL: u32 = u32::MAX;
 
 impl RowState {
+    pub(crate) fn has_committed_version(&self) -> bool {
+        self.committed_generation.is_some()
+    }
+
     pub fn committed_only(loc: RowLoc) -> Self {
         Self::committed_only_at(loc, 0)
     }
@@ -2526,6 +2532,7 @@ impl RowState {
         Self {
             committed: Some(RowHome::Heap(loc)),
             committed_lsn: commit_lsn,
+            committed_generation: Some(0),
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
@@ -31381,7 +31388,7 @@ impl Storage {
                 "temporary spill no longer matches its captured table"
             ));
         }
-        let coverage = spill_generations::SpillCoverage::ResidentAtGeneration(generation);
+        let coverage = spill_generations::SpillCoverage::ResidentThroughGeneration(generation);
         if delta {
             table
                 .spill_generations
@@ -31904,6 +31911,7 @@ impl Storage {
                 RowState {
                     committed: None,
                     committed_lsn: commit_lsn,
+                    committed_generation: Some(0),
                     checkpoint_change_lsn: commit_lsn,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
@@ -32043,7 +32051,7 @@ impl Storage {
         // Publish the location protected by the write transition, not its old copy.
         let pending = pending_last(&versions.pending_row_versions, state.pending)
             .expect("validated pending head");
-        if snapshots.retains_for(txid) && (state.committed.is_some() || state.committed_lsn != 0) {
+        if snapshots.retains_for(txid) && state.has_committed_version() {
             let old = CommittedVersion {
                 home: state.committed,
                 lsn: state.committed_lsn,
@@ -32104,6 +32112,7 @@ impl Storage {
         }
         state.committed = pending.loc.map(RowHome::Heap);
         state.committed_lsn = commit_lsn;
+        state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
         if state.committed.is_none()
@@ -52931,6 +52940,7 @@ mod tests {
                 commit_lsn: 42,
             }),
             committed_lsn: 42,
+            committed_generation: Some(0),
             checkpoint_change_lsn: 42,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
@@ -61229,6 +61239,7 @@ mod tests {
         let mut state = RowState {
             committed: None,
             committed_lsn: 0,
+            committed_generation: None,
             checkpoint_change_lsn: 0,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),

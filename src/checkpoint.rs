@@ -898,13 +898,12 @@ impl TemporarySpiller {
         sort_scratch.clear();
         storage.for_each_row_state(slot, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let has_version =
-                state.committed.is_some() || state.committed_lsn != 0 || !state.history.is_empty();
+            let has_version = state.has_committed_version() || !state.history.is_empty();
             if !has_version {
                 return Ok(ControlFlow::Continue(()));
             }
             let resident = matches!(state.committed, Some(RowHome::Heap(_)))
-                || (state.committed.is_none() && state.committed_lsn != 0)
+                || (state.committed.is_none() && state.has_committed_version())
                 || (0..state.history.len()).any(|index| {
                     state.history_get(index).is_some_and(|version| {
                         version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
@@ -974,7 +973,7 @@ impl TemporarySpiller {
                     }
                     Ok(())
                 };
-            if state.committed.is_some() || state.committed_lsn != 0 {
+            if state.has_committed_version() {
                 append_version(state.committed_lsn, state.committed)?;
             }
             for index in 0..state.history.len() {
@@ -12649,7 +12648,7 @@ impl Checkpointer {
                             )
                         })
                 };
-            if state.committed.is_some() || state.committed_lsn != 0 {
+            if state.has_committed_version() {
                 version(state.committed_lsn, state.committed, true)?;
             }
             for index in 0..state.history.len() {

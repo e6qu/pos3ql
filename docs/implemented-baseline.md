@@ -954,9 +954,13 @@ commit position. A later update stays in the heap; history newer than that
 boundary stays resident too. Recovered roots have no eviction boundary and do
 not justify discarding newer heap bytes. A temporary spill records the table
 generation it copied, because temporary commits may share a zero journal
-position. Only that exact table generation can evict to the temporary snapshot;
-a later spill names its own object. These kinds of boundary are distinct states in the
-startup-sized root metadata. For example, if a checkpoint saved an order before its price
+position. Each newly committed image records its table revision in startup-charged
+row metadata. Cleanup can evict an unchanged row covered by that capture even
+if another row changes meanwhile; a newer image stays in memory until saved.
+A later spill names its own object. A committed temporary deletion is distinct
+from a row that never committed, including at journal position zero; saving or
+rolling back another change cannot make the deleted row reappear. These boundary
+kinds are distinct states in the startup-sized root metadata. For example, if a checkpoint saved an order before its price
 changed, cleanup keeps the new price in memory until another checkpoint saves
 it; it never redirects that row to the older object.
 

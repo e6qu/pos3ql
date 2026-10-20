@@ -32,8 +32,10 @@ waits.
   release, heap-row eviction and redundant-entry removal by
   an explicit row-slot quota. Keep their positions between turns, including
   across free-slot reuse and changes made after the checkpoint.
-- Use the same bounded work for temporary tables. Check the saved generation
-  again before replacing a cached row with its saved reference.
+- Use the same bounded work for temporary tables. Compare each committed row's
+  revision to the saved boundary, so later writes do not prevent freeing unchanged
+  saved rows. Preserve updates and deletions at shared or zero journal positions,
+  including rollback. Charge their row revisions in the startup reservation.
 - Skip busy tables and retry without retaining catalog, version, publication or
   row owners. Preserve progress and complete ready tables while another is busy.
 - Charge retained controls at startup. Keep explicit CHECKPOINT and shutdown

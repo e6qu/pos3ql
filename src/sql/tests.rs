@@ -64603,6 +64603,16 @@ fn temporary_rows_spill_locally_without_object_publication() {
             String::from_utf8_lossy(&inserted)
         );
         assert!(engine.maybe_checkpoint());
+        for _ in 0..128 {
+            if engine.local_cleanup.is_none() {
+                break;
+            }
+            assert!(engine.maybe_checkpoint());
+        }
+        assert!(
+            engine.local_cleanup.is_none(),
+            "bounded temporary cleanup completes"
+        );
     }
 
     let crate::storage::ResolvedRelation::Table(table) = engine
@@ -64675,6 +64685,16 @@ fn temporary_rows_spill_locally_without_object_publication() {
         let inserted = run_as(&mut engine, &mut budget, 42, &statement);
         assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
         assert!(engine.maybe_checkpoint());
+        for _ in 0..128 {
+            if engine.local_cleanup.is_none() {
+                break;
+            }
+            assert!(engine.maybe_checkpoint());
+        }
+        assert!(
+            engine.local_cleanup.is_none(),
+            "bounded temporary cleanup completes"
+        );
     }
     let blocks_before_disconnect = engine.temporary_spiller.as_ref().unwrap().block_count();
     engine.drop_connection(41);
@@ -64727,6 +64747,16 @@ fn temporary_rows_spill_with_durable_object_storage_disabled() {
             String::from_utf8_lossy(&inserted)
         );
         assert!(engine.maybe_checkpoint());
+        for _ in 0..128 {
+            if engine.local_cleanup.is_none() {
+                break;
+            }
+            assert!(engine.maybe_checkpoint());
+        }
+        assert!(
+            engine.local_cleanup.is_none(),
+            "bounded temporary cleanup completes"
+        );
     }
     let crate::storage::ResolvedRelation::Table(table) = engine
         .storage
@@ -64744,6 +64774,37 @@ fn temporary_rows_spill_with_durable_object_storage_disabled() {
             "SELECT count(*) FROM object_off_temp_rows",
         )),
         ["480"]
+    );
+    assert_eq!(engine.storage.lsn(), 0);
+    let changed = run_as(
+        &mut engine,
+        &mut budget,
+        51,
+        "UPDATE object_off_temp_rows SET payload='changed' WHERE id=1; \
+         DELETE FROM object_off_temp_rows WHERE id=2; \
+         INSERT INTO object_off_temp_rows SELECT value, repeat('q',200) \
+         FROM generate_series(481,720) AS g(value)",
+    );
+    assert!(error_sqlstates(&changed).is_empty());
+    assert!(engine.maybe_checkpoint());
+    for _ in 0..128 {
+        if engine.local_cleanup.is_none() {
+            break;
+        }
+        assert!(engine.maybe_checkpoint());
+    }
+    assert!(engine.local_cleanup.is_none());
+    assert_eq!(engine.storage.lsn(), 0);
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            51,
+            "SELECT payload FROM object_off_temp_rows WHERE id=1; \
+             SELECT count(*) FROM object_off_temp_rows WHERE id=2; \
+             SELECT count(*) FROM object_off_temp_rows",
+        )),
+        ["changed", "0", "719"]
     );
     engine.drop_connection(51);
     assert_eq!(engine.temporary_spiller.as_ref().unwrap().block_count(), 0);
@@ -89483,7 +89544,27 @@ fn sort_keys_reuse_projected_values_without_repeating_effects() {
 
 #[test]
 fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches() {
-    let (mut engine, budget, config) = sliced_cleanup_fixture("bounded-row-cleanup-turns", true);
+    let mut config = test_config("bounded-row-cleanup-turns");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.table_rows = 128;
+    config.memtable_bytes = 1 << 20;
+    config.object_store_bucket = format!("bounded-row-cleanup-turns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let budget_bytes = test_engine_budget_bytes(1 << 29);
+    let mut budget = test_engine_budget(&config, budget_bytes);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
+         INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
+         FROM generate_series(1,80) AS g(i)",
+        32 << 20,
+    );
+    assert!(error_sqlstates(&setup).is_empty());
     let published = publish_cleanup_fixture(&mut engine);
     engine.begin_checkpoint_cleanup(published);
     let mut partial = [false; 3];
@@ -89501,8 +89582,14 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
         })
         .unwrap();
         assert_ne!(progress, MaintenanceStep::WaitingForOwner);
-        if let (Some(task), Some(after)) = (task, engine.local_cleanup)
-            && matches!(after.phase, LocalCleanupPhase::Rows(_))
+        if let (
+            Some(task),
+            Some(LocalCleanup {
+                phase: LocalCleanupPhase::Rows(after),
+                ..
+            }),
+        ) = (task, engine.local_cleanup)
+            && after.task() == task
         {
             let index = match task {
                 RowCleanupTask::DurableHistory => 0,
@@ -89536,7 +89623,7 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
     }
     assert!(
         partial.iter().all(|&seen| seen),
-        "all row walks must span turns"
+        "all row walks must span turns: {partial:?}"
     );
     assert!(engine.local_cleanup.is_none());
     assert!(!engine.compact_scratch.active());
@@ -89574,14 +89661,21 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
         &mut budget,
         "CREATE TABLE bounded_markers(id integer); \
          INSERT INTO bounded_markers SELECT i FROM generate_series(1,129) AS g(i); \
-         CREATE TABLE bounded_other(id integer); INSERT INTO bounded_other VALUES(1); \
-         DELETE FROM bounded_markers WHERE id<=128",
+         CREATE TABLE bounded_other(id integer); INSERT INTO bounded_other VALUES(1)",
     );
     assert!(error_sqlstates(&setup).is_empty());
+    assert!(engine.checkpoint().unwrap());
     let table = engine
         .storage
         .find_table("public", "bounded_markers")
         .unwrap();
+    assert!(!engine.storage.table(table).spill_generations().is_empty());
+    let deleted = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM bounded_markers WHERE id<=128",
+    );
+    assert!(error_sqlstates(&deleted).is_empty());
     for _ in 0..512 {
         let checkpoint = engine.ckpt.as_mut().unwrap();
         if checkpoint.manifest_installing() {

@@ -485,6 +485,7 @@ mod tests {
                         RowState {
                             committed: None,
                             committed_lsn: 7,
+                            committed_generation: Some(0),
                             checkpoint_change_lsn: 7,
                             history: super::super::CommittedHistory::empty(),
                             pending: super::super::PendingVersions::empty(),

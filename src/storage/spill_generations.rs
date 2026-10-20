@@ -26,7 +26,7 @@ pub(crate) struct SpillGeneration {
 pub(super) enum SpillCoverage {
     Unknown,
     CommittedThrough(u64),
-    ResidentAtGeneration(u64),
+    ResidentThroughGeneration(u64),
 }
 
 impl SpillCoverage {
@@ -36,7 +36,10 @@ impl SpillCoverage {
             (Self::Unknown, _)
                 | (_, Self::Unknown)
                 | (Self::CommittedThrough(_), Self::CommittedThrough(_))
-                | (Self::ResidentAtGeneration(_), Self::ResidentAtGeneration(_))
+                | (
+                    Self::ResidentThroughGeneration(_),
+                    Self::ResidentThroughGeneration(_)
+                )
         )
     }
 
@@ -46,8 +49,8 @@ impl SpillCoverage {
             (Self::CommittedThrough(left), Self::CommittedThrough(right)) => {
                 Self::CommittedThrough(left.max(right))
             }
-            (Self::ResidentAtGeneration(left), Self::ResidentAtGeneration(right)) => {
-                Self::ResidentAtGeneration(left.max(right))
+            (Self::ResidentThroughGeneration(left), Self::ResidentThroughGeneration(right)) => {
+                Self::ResidentThroughGeneration(left.max(right))
             }
             _ => panic!("temporary and durable SST coverage cannot mix"),
         }
@@ -80,13 +83,15 @@ impl SpillGenerationList {
         self.members.get(index).map(|member| member.handle)
     }
 
-    pub(super) fn eviction_member(&self, commit_lsn: u64, table_generation: u64) -> Option<u32> {
+    pub(super) fn eviction_member(&self, commit_lsn: u64, row_generation: u64) -> Option<u32> {
         self.members
             .iter()
             .position(|member| match member.coverage {
                 SpillCoverage::Unknown => false,
                 SpillCoverage::CommittedThrough(through) => commit_lsn <= through,
-                SpillCoverage::ResidentAtGeneration(generation) => generation == table_generation,
+                SpillCoverage::ResidentThroughGeneration(generation) => {
+                    row_generation <= generation
+                }
             })
             .map(|index| index as u32)
     }
@@ -1140,6 +1145,7 @@ impl SpilledRowState {
                 commit_lsn: self.version.commit_lsn,
             }),
             committed_lsn: self.version.commit_lsn,
+            committed_generation: Some(0),
             checkpoint_change_lsn: 0,
             history: super::CommittedHistory::empty(),
             pending: super::PendingVersions::empty(),
@@ -2622,14 +2628,15 @@ mod tests {
             let mut list = roster.write();
             list.replace(1, core::iter::once(handle(1))).unwrap();
             assert_eq!(list.eviction_member(0, 7), None);
-            list.append_covered(handle(5), SpillCoverage::ResidentAtGeneration(7))
+            list.append_covered(handle(5), SpillCoverage::ResidentThroughGeneration(7))
                 .unwrap();
+            assert_eq!(list.eviction_member(0, 6), Some(1));
             assert_eq!(list.eviction_member(0, 7), Some(1));
             assert_eq!(list.eviction_member(0, 8), None);
             let error = list.append(handle(9), 0).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert_eq!(list.len(), 2);
-            list.append_covered(handle(9), SpillCoverage::ResidentAtGeneration(8))
+            list.append_covered(handle(9), SpillCoverage::ResidentThroughGeneration(8))
                 .unwrap();
             assert_eq!(list.eviction_member(0, 8), Some(2));
             assert_eq!(list.published_through(), None);

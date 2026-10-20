@@ -60,7 +60,7 @@ impl TypeReferenceMove {
             return false;
         }
         // Recovery declarations have names before their runtime slots bind.
-        match self.identity.slot {
+        match self.identity.slot() {
             NamedTypeSlot::Domain(_) => true,
             NamedTypeSlot::Enum(expected) => matches!(ctype,
                 ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
@@ -104,7 +104,7 @@ impl TypeReferenceMove {
         parent: &mut Option<UserTypeName>,
         user_type: &mut Option<UserTypeName>,
     ) {
-        if matches!(self.identity.slot, NamedTypeSlot::Domain(_)) {
+        if matches!(self.identity.slot(), NamedTypeSlot::Domain(_)) {
             self.rewrite(base, parent);
             if parent.is_none() {
                 self.rewrite(base, user_type);
@@ -134,7 +134,7 @@ impl TypeReferenceMove {
     }
 
     fn class(self) -> DependencyClass {
-        match self.identity.slot {
+        match self.identity.slot() {
             NamedTypeSlot::Domain(_) => DependencyClass::Domain,
             NamedTypeSlot::Enum(_) => DependencyClass::Enum,
             NamedTypeSlot::Composite(_) => DependencyClass::Composite,
@@ -327,7 +327,7 @@ impl TypePublication {
                     storage.rename_stored_query_dependency_locked(
                         &mut dependencies,
                         movement.class(),
-                        movement.identity.slot.index(),
+                        movement.identity.slot().index(),
                         None,
                         movement.current.schema,
                         movement.current.name,
@@ -587,17 +587,17 @@ mod tests {
     }
 
     fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
-        let (schema, name) = match movement.identity.slot {
+        let (schema, name) = match movement.identity.slot() {
             NamedTypeSlot::Domain(_) => {
-                let definition = catalog.domains[movement.identity.slot.index()];
+                let definition = catalog.domains[movement.identity.slot().index()];
                 (definition.schema, definition.name)
             }
             NamedTypeSlot::Enum(_) => {
-                let definition = catalog.enums[movement.identity.slot.index()];
+                let definition = catalog.enums[movement.identity.slot().index()];
                 (definition.schema, definition.name)
             }
             NamedTypeSlot::Composite(_) => {
-                let definition = catalog.composites[movement.identity.slot.index()];
+                let definition = catalog.composites[movement.identity.slot().index()];
                 (definition.schema, definition.name)
             }
         };
@@ -666,22 +666,22 @@ mod tests {
             match kind {
                 TypeReferenceKind::Domain => {
                     storage.drop_domain("public", "prior_type", 0).unwrap();
-                    storage.commit_domain_drop(key.slot.index());
+                    storage.commit_domain_drop(key.slot().index());
                 }
                 TypeReferenceKind::Enum => {
                     storage.drop_enum("public", "prior_type", 0).unwrap();
-                    storage.commit_enum_drop(key.slot.index());
+                    storage.commit_enum_drop(key.slot().index());
                 }
                 TypeReferenceKind::Composite => {
                     storage.drop_composite("public", "prior_type", 0).unwrap();
-                    storage.commit_composite_drop(key.slot.index());
+                    storage.commit_composite_drop(key.slot().index());
                 }
             }
             for replace in [false, true] {
                 if replace {
                     assert_eq!(
                         create_kind(&mut storage, kind, movement.prior).0,
-                        key.slot.index()
+                        key.slot().index()
                     );
                 }
                 crate::mem::guard::forbid_alloc(|| {
@@ -978,22 +978,23 @@ mod tests {
         storage
             .type_publication
             .publish(storage, movement, |catalog, _members| {
-                match movement.identity.slot {
+                match movement.identity.slot() {
                     NamedTypeSlot::Domain(_) => {
-                        catalog.domains[movement.identity.slot.index()].schema =
+                        catalog.domains[movement.identity.slot().index()].schema =
                             movement.current.schema;
-                        catalog.domains[movement.identity.slot.index()].name =
+                        catalog.domains[movement.identity.slot().index()].name =
                             movement.current.name;
                     }
                     NamedTypeSlot::Enum(_) => {
-                        catalog.enums[movement.identity.slot.index()].schema =
+                        catalog.enums[movement.identity.slot().index()].schema =
                             movement.current.schema;
-                        catalog.enums[movement.identity.slot.index()].name = movement.current.name;
+                        catalog.enums[movement.identity.slot().index()].name =
+                            movement.current.name;
                     }
                     NamedTypeSlot::Composite(_) => {
-                        catalog.composites[movement.identity.slot.index()].schema =
+                        catalog.composites[movement.identity.slot().index()].schema =
                             movement.current.schema;
-                        catalog.composites[movement.identity.slot.index()].name =
+                        catalog.composites[movement.identity.slot().index()].name =
                             movement.current.name;
                     }
                 }
@@ -1321,12 +1322,12 @@ mod tests {
             ),
         ] {
             let movement = TypeReferenceMove::new(
-                TypeIdentity {
-                    origin: super::super::type_references::TypeOrigin::new().unwrap(),
-                    database: DatabaseOid::POSTGRES,
-                    slot: named_slot(kind, 0),
-                    created_at: 1,
-                },
+                TypeIdentity::new(
+                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    DatabaseOid::POSTGRES,
+                    named_slot(kind, 0),
+                    1,
+                ),
                 prior,
                 current,
             );
@@ -1359,12 +1360,12 @@ mod tests {
             ),
         ] {
             let movement = TypeReferenceMove::new(
-                TypeIdentity {
-                    origin: super::super::type_references::TypeOrigin::new().unwrap(),
-                    database: DatabaseOid::POSTGRES,
-                    slot: named_slot(kind, 0),
-                    created_at: 1,
-                },
+                TypeIdentity::new(
+                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    DatabaseOid::POSTGRES,
+                    named_slot(kind, 0),
+                    1,
+                ),
                 prior,
                 current,
             );

@@ -18076,7 +18076,7 @@ impl Storage {
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
-    pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
         let type_origin = type_references::TypeOrigin::new()?;
         budget.draw(
             size_of::<type_references::TypeOrigin>(),
@@ -39343,12 +39343,12 @@ impl Storage {
                 return;
             }
             type_reference_moves::TypeReferenceMove::new(
-                type_references::TypeIdentity {
-                    origin: catalog.origin,
-                    database: domain.database,
-                    slot: NamedTypeSlot::Domain(slot),
-                    created_at: domain.created_at,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    domain.database,
+                    NamedTypeSlot::Domain(slot),
+                    domain.created_at,
+                ),
                 UserTypeName::declaration(domain.schema, domain.name),
                 UserTypeName::declaration(definition.schema, definition.name),
             )
@@ -39957,12 +39957,12 @@ impl Storage {
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
             type_reference_moves::TypeReferenceMove::new(
-                type_references::TypeIdentity {
-                    origin: catalog.origin,
-                    database: previous.database,
-                    slot: NamedTypeSlot::Enum(slot),
-                    created_at: previous.created_at,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    previous.database,
+                    NamedTypeSlot::Enum(slot),
+                    previous.created_at,
+                ),
                 UserTypeName::declaration(previous.schema, previous.name),
                 UserTypeName::declaration(definition.schema, definition.name),
             )
@@ -40025,12 +40025,12 @@ impl Storage {
                 return Ok(());
             }
             type_reference_moves::TypeReferenceMove::new(
-                type_references::TypeIdentity {
-                    origin: catalog.origin,
-                    database: previous.database,
-                    slot: NamedTypeSlot::Enum(slot),
-                    created_at: previous.created_at,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    previous.database,
+                    NamedTypeSlot::Enum(slot),
+                    previous.created_at,
+                ),
                 UserTypeName::declaration(previous.schema, previous.name),
                 UserTypeName::declaration(schema, name),
             )
@@ -40383,12 +40383,12 @@ impl Storage {
                 return;
             }
             type_reference_moves::TypeReferenceMove::new(
-                type_references::TypeIdentity {
-                    origin: catalog.origin,
-                    database: composite.database,
-                    slot: NamedTypeSlot::Composite(slot),
-                    created_at: composite.created_at,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    composite.database,
+                    NamedTypeSlot::Composite(slot),
+                    composite.created_at,
+                ),
                 UserTypeName::declaration(composite.schema, composite.name),
                 UserTypeName::declaration(pending.schema, pending.name),
             )
@@ -42496,15 +42496,15 @@ impl Storage {
         let bound = catalog
             .bind_type_reference(RoutineResult { ctype, user_type }, current_database(), txid)
             .ok()?;
-        let array = match snapshot.identity.slot {
+        let array = match snapshot.identity.slot() {
             NamedTypeSlot::Domain(_) => {
                 matches!(bound.ctype, ColType::Array(ArrElem::Domain { .. }))
                     && !matches!(snapshot.base, ColType::Array(ArrElem::Domain { .. }))
             }
             _ => matches!(bound.ctype, ColType::Array(_)),
         };
-        let slot = u16::try_from(snapshot.identity.slot.index()).ok()?;
-        Some(match (snapshot.identity.slot, array) {
+        let slot = u16::try_from(snapshot.identity.slot().index()).ok()?;
+        Some(match (snapshot.identity.slot(), array) {
             (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
             (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
             (NamedTypeSlot::Enum(_), false) => oid::enum_oid(slot),
@@ -42695,8 +42695,8 @@ impl Storage {
         let source = catalog
             .resolve_type_reference(identity, current_database(), txid)
             .ok()??;
-        let index = u16::try_from(source.identity.slot.index()).ok()?;
-        Some(match (source.identity.slot, array) {
+        let index = u16::try_from(source.identity.slot().index()).ok()?;
+        Some(match (source.identity.slot(), array) {
             (NamedTypeSlot::Domain(_), false) => oid::domain_oid(index),
             (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(index),
             (NamedTypeSlot::Enum(_), false) => oid::enum_oid(index),

@@ -71,16 +71,72 @@ impl TypeOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CapturedTypeSlot {
+    Domain(u16),
+    Enum(u16),
+    Composite(u16),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TypeIdentity {
     pub(super) origin: TypeOrigin,
     pub(super) database: DatabaseOid,
-    pub(super) slot: NamedTypeSlot,
     pub(super) created_at: u64,
+    source: CapturedTypeSlot,
+}
+
+impl TypeIdentity {
+    pub(super) fn new(
+        origin: TypeOrigin,
+        database: DatabaseOid,
+        slot: NamedTypeSlot,
+        created_at: u64,
+    ) -> Self {
+        // Configuration caps each catalog within its PostgreSQL OID band.
+        let index = u16::try_from(slot.index()).expect("configured type slot is representable");
+        let source = match slot {
+            NamedTypeSlot::Domain(_) => CapturedTypeSlot::Domain(index),
+            NamedTypeSlot::Enum(_) => CapturedTypeSlot::Enum(index),
+            NamedTypeSlot::Composite(_) => CapturedTypeSlot::Composite(index),
+        };
+        Self {
+            origin,
+            database,
+            created_at,
+            source,
+        }
+    }
+
+    pub(super) fn slot(self) -> NamedTypeSlot {
+        match self.source {
+            CapturedTypeSlot::Domain(index) => NamedTypeSlot::Domain(usize::from(index)),
+            CapturedTypeSlot::Enum(index) => NamedTypeSlot::Enum(usize::from(index)),
+            CapturedTypeSlot::Composite(index) => NamedTypeSlot::Composite(usize::from(index)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_type_reference_layout_keeps_slots_in_their_oid_width() {
+        use core::mem::size_of;
+        assert_eq!(size_of::<CapturedTypeSlot>(), 4);
+        assert_eq!(size_of::<TypeIdentity>(), 24);
+        assert_eq!(size_of::<TypeBinding>(), 32);
+        for source in [
+            NamedTypeSlot::Domain(0),
+            NamedTypeSlot::Enum(65535),
+            NamedTypeSlot::Composite(1600),
+        ] {
+            let identity =
+                TypeIdentity::new(TypeOrigin::new().unwrap(), DatabaseOid::POSTGRES, source, 1);
+            assert_eq!(identity.slot(), source);
+        }
+    }
 
     #[test]
     fn bound_type_origin_never_reuses_an_exhausted_identifier() {
@@ -151,7 +207,7 @@ pub(super) struct TypeSnapshot {
 
 impl TypeSnapshot {
     pub(super) fn representation(&self, declared: ColType) -> Result<ColType, SqlError> {
-        match self.identity.slot {
+        match self.identity.slot() {
             NamedTypeSlot::Domain(slot)
                 if matches!(declared, ColType::Array(ArrElem::Domain { .. }))
                     && !matches!(self.base, ColType::Array(ArrElem::Domain { .. })) =>
@@ -200,7 +256,7 @@ impl TypeCatalog {
                     ));
                 }
                 Ok(self
-                    .type_snapshot(key.slot, transaction)?
+                    .type_snapshot(key.slot(), transaction)?
                     .filter(|snapshot| snapshot.identity == key))
             }
             TypeBinding::Declaration => self.lookup_reference_name(identity, database, transaction),
@@ -299,12 +355,7 @@ impl TypeCatalog {
                 )
             }
         };
-        let identity = TypeIdentity {
-            origin: self.origin,
-            database,
-            slot,
-            created_at,
-        };
+        let identity = TypeIdentity::new(self.origin, database, slot, created_at);
         Ok(Some(TypeSnapshot {
             identity,
             name: UserTypeName::captured(identity, schema, name),

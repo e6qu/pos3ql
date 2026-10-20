@@ -83,7 +83,7 @@ runtest:*)
     # build — and run several times slower for nothing. (A fresh CI runner has
     # no such binary; this matters for back-to-back local runs.)
     touch src/lib.rs
-    cargo build --release 2>&1 | tail -1
+    cargo build --release --locked
     BIN="$PWD/target/release/pos3ql"
     run_groups_strict "${SHARD#runtest:}"
     echo "test-only shard: no coverage to write (uninstrumented, servers kill -9'd)"
@@ -107,7 +107,8 @@ lib:* | sql | run:*)
     ;;
 esac
 
-eval "$(cargo llvm-cov show-env --sh)"
+coverage_environment=$(cargo llvm-cov show-env --sh)
+eval "$coverage_environment"
 # `cargo llvm-cov clean` shells out to `cargo clean`, which refuses to touch a
 # target/ without a CACHEDIR.TAG; drop the raw profiles directly instead.
 find target -name '*.profraw' -delete 2>/dev/null || true
@@ -194,7 +195,7 @@ echo "=== building the instrumented server ==="
 # uninstrumented binary can survive this build and silently contribute no
 # profile at all. Touching the crate root forces the rebuild.
 touch src/lib.rs
-cargo build --release 2>&1 | tail -1
+cargo build --release --locked
 BIN="$PWD/target/release/pos3ql"
 
 run_differential() {

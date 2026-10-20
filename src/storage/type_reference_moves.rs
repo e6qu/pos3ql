@@ -1,11 +1,20 @@
 //! A type move updates only references belonging to its owning database.
 
+use core::mem::{align_of, size_of};
+use std::sync::{Mutex, MutexGuard};
+
+use super::row_ownership::{LockWait, try_mutex};
 use super::table_definitions::TableIdentity;
+use super::table_names::DefinitionWrite;
 use super::{
     ArrElem, CatalogDdlState, ColType, CommentClass, DatabaseOid, DependencyClass,
-    OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition, RoutineArgumentDef,
-    RoutineKind, RoutineResult, Storage, TableDef, UserTypeName,
+    EnumMemberImages, OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition,
+    RoutineArgumentDef, RoutineKind, RoutineResult, Storage, TableDef, TablePublication,
+    TypeCatalog, UserTypeName,
 };
+use crate::config::Config;
+use crate::mem::arena::Arena;
+use crate::mem::budget::{Budget, BudgetError};
 
 #[derive(Clone, Copy)]
 pub(super) enum TypeReferenceKind {
@@ -131,139 +140,292 @@ impl TypeReferenceMove {
     }
 }
 
-impl Storage {
-    // Type commit callers still retain exclusive storage ownership. The
-    // shared walk waits for one table without holding catalogs or allocators.
-    pub(super) fn move_type_references(&self, movement: TypeReferenceMove) {
-        for table in self.tables.iter() {
-            let _lifecycle = table
-                .lifecycle
-                .lock()
-                .expect("table lifecycle lock poisoned");
+/// Only type-identity publication uses this startup workspace. Ordinary reads
+/// and writes do not acquire its mutex.
+pub(super) struct TypePublication {
+    scratch: Mutex<Arena>,
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicUsize,
+}
+
+struct TableOwner<'storage> {
+    definition: DefinitionWrite<'storage>,
+    publication: MutexGuard<'storage, TablePublication>,
+    _lifecycle: MutexGuard<'storage, ()>,
+}
+
+struct TableAttempt<'slots, 'storage> {
+    slots: &'slots mut [Option<TableOwner<'storage>>],
+}
+
+impl Drop for TableAttempt<'_, '_> {
+    fn drop(&mut self) {
+        for owner in self.slots.iter_mut() {
+            drop(owner.take());
+        }
+    }
+}
+
+impl TypePublication {
+    fn scratch_bytes(config: &Config) -> usize {
+        super::table_slot_capacity(config)
+            .saturating_mul(size_of::<Option<TableOwner<'static>>>())
+            .saturating_add(align_of::<Option<TableOwner<'static>>>() - 1)
+    }
+
+    pub(super) fn budget_bytes(config: &Config) -> usize {
+        size_of::<Self>().saturating_add(Self::scratch_bytes(config))
+    }
+
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        budget.draw(size_of::<Self>(), "type publication controls")?;
+        Ok(Self {
+            scratch: Mutex::new(Arena::new(
+                budget,
+                "type publication",
+                Self::scratch_bytes(config),
+            )?),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn acquire_tables<'storage>(
+        storage: &'storage Storage,
+        movement: TypeReferenceMove,
+        owners: &mut TableAttempt<'_, 'storage>,
+    ) -> Result<(), LockWait<'storage>> {
+        for (slot, table) in storage.tables.iter().enumerate() {
+            let state = table.definition.try_read_for_batch()?;
+            if !movement.applies_to(state.identity)
+                || !storage.pending_table_defs.references_type(&state, movement)
             {
-                let state = table.definition.read();
-                if !movement.applies_to(state.identity)
-                    || !self.pending_table_defs.references_type(&state, movement)
-                {
-                    continue;
+                continue;
+            }
+            drop(state);
+            let lifecycle = try_mutex(&table.lifecycle, "table lifecycle lock poisoned")?;
+            let definition = table.definition.try_write_for_batch()?;
+            // A shared drop may retire the selected table between the read and
+            // write owners. Never dirty or rewrite that retired incarnation.
+            if !movement.applies_to(definition.identity)
+                || !storage
+                    .pending_table_defs
+                    .references_type(&definition, movement)
+            {
+                continue;
+            }
+            let publication = try_mutex(&table.publication, "table publication lock poisoned")?;
+            owners.slots[slot] = Some(TableOwner {
+                definition,
+                publication,
+                _lifecycle: lifecycle,
+            });
+        }
+        Ok(())
+    }
+
+    // The public caller requires &mut Storage: a by-value definition built
+    // before this move must not be submitted afterward with its old type name.
+    // This internal shared operation establishes the publication boundary; it
+    // does not make earlier reference construction safe for parallel writers.
+    fn publish(
+        &self,
+        storage: &Storage,
+        movement: TypeReferenceMove,
+        install_source: impl FnOnce(&mut TypeCatalog, &mut EnumMemberImages),
+    ) {
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("type publication scratch poisoned");
+        scratch.reset();
+        // Startup reserves one slot per physical table, including the internal
+        // relation. This is the only allocation from the reset workspace.
+        let mut slots = scratch
+            .alloc_owned_slice_with(storage.tables.len(), |_| None)
+            .expect("startup type publication reservation covers every table");
+        loop {
+            let mut owners = TableAttempt { slots: &mut slots };
+            let attempt: Result<_, LockWait<'_>> = (|| {
+                Self::acquire_tables(storage, movement, &mut owners)?;
+                let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
+                let members = try_mutex(
+                    &storage.enum_member_images,
+                    "enum member-image lock poisoned",
+                )?;
+                let comments = try_mutex(&storage.comments, "comment catalog lock poisoned")?;
+                let routines = try_mutex(&storage.routines, "routine catalog lock poisoned")?;
+                let operators =
+                    try_mutex(&storage.operator_catalog, "operator catalog lock poisoned")?;
+                let casts = try_mutex(&storage.casts, "cast catalog lock poisoned")?;
+                let dependencies = try_mutex(
+                    &storage.stored_query_dependencies,
+                    "stored-query dependency catalog lock poisoned",
+                )?;
+                Ok((
+                    types,
+                    members,
+                    comments,
+                    routines,
+                    operators,
+                    casts,
+                    dependencies,
+                ))
+            })();
+            match attempt {
+                Err(wait) => {
+                    drop(owners);
+                    #[cfg(test)]
+                    self.waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    wait.wait();
+                }
+                Ok((
+                    mut types,
+                    mut members,
+                    mut comments,
+                    mut routines,
+                    mut operators,
+                    mut casts,
+                    mut dependencies,
+                )) => {
+                    // Preflight every fallible counter before changing any
+                    // source, pending version or dependent definition.
+                    for owner in owners.slots.iter().flatten() {
+                        owner
+                            .publication
+                            .generation
+                            .checked_add(1)
+                            .expect("table publication generation exhausted");
+                    }
+                    install_source(&mut types, &mut members);
+                    for owner in owners.slots.iter_mut().flatten() {
+                        assert!(
+                            storage
+                                .pending_table_defs
+                                .move_type_references_locked(&mut owner.definition, movement)
+                        );
+                        owner.publication.generation += 1;
+                        owner.publication.dirty = true;
+                    }
+                    movement.rewrite_catalog(&mut types);
+                    for comment in comments.entries.iter_mut().filter(|comment| {
+                        comment.used
+                            && comment.database == Some(movement.database)
+                            && comment.class == CommentClass::Type
+                            && comment.schema == movement.prior.schema
+                            && comment.name == movement.prior.name
+                    }) {
+                        comment.schema = movement.current.schema;
+                        comment.name = movement.current.name;
+                    }
+                    movement.rewrite_routines(&mut routines);
+                    movement.rewrite_operators(&mut operators);
+                    movement.rewrite_casts(&mut casts);
+                    storage.rename_stored_query_dependency_locked(
+                        &mut dependencies,
+                        movement.class(),
+                        movement.slot,
+                        None,
+                        movement.current.schema,
+                        movement.current.name,
+                    );
+                    return;
                 }
             }
-            let changed = {
-                let mut state = table.definition.write();
-                self.pending_table_defs
-                    .move_type_references_locked(&mut state, movement)
-            };
-            if changed {
-                table.mark_dirty();
-            }
         }
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+    }
+}
+
+impl Storage {
+    pub(super) fn publish_type_move(
+        &mut self,
+        movement: TypeReferenceMove,
+        install_source: impl FnOnce(&mut TypeCatalog, &mut EnumMemberImages),
+    ) {
+        self.type_publication
+            .publish(self, movement, install_source);
+    }
+}
+
+impl TypeReferenceMove {
+    fn rewrite_catalog(self, catalog: &mut TypeCatalog) {
         for composite in catalog.composites.iter_mut().filter(|composite| {
-            composite.database == movement.database
-                && composite.ddl_state != CatalogDdlState::Absent
+            composite.database == self.database && composite.ddl_state != CatalogDdlState::Absent
         }) {
             for field in composite.fields.iter_mut().take(composite.n_fields) {
-                movement.rewrite(field.ctype, &mut field.user_type);
+                self.rewrite(field.ctype, &mut field.user_type);
             }
             if let Some(pending) = &mut composite.pending_definition {
                 for field in pending.fields.iter_mut().take(pending.n_fields) {
-                    movement.rewrite(field.ctype, &mut field.user_type);
+                    self.rewrite(field.ctype, &mut field.user_type);
                 }
             }
         }
         for domain in catalog.domains.iter_mut().filter(|domain| {
-            domain.database == movement.database && domain.ddl_state != CatalogDdlState::Absent
+            domain.database == self.database && domain.ddl_state != CatalogDdlState::Absent
         }) {
-            movement.rewrite_domain(
+            self.rewrite_domain(
                 domain.base,
                 &mut domain.base_domain,
                 &mut domain.base_user_type,
             );
             if let Some(pending) = &mut domain.pending_definition {
-                movement.rewrite_domain(
+                self.rewrite_domain(
                     pending.spec.base,
                     &mut pending.spec.base_domain,
                     &mut pending.spec.base_user_type,
                 );
             }
         }
-        drop(catalog);
-        for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
-            comment.used
-                && comment.database == Some(movement.database)
-                && comment.class == CommentClass::Type
-                && comment.schema == movement.prior.schema
-                && comment.name == movement.prior.name
-        }) {
-            comment.schema = movement.current.schema;
-            comment.name = movement.current.name;
-        }
-        self.move_routine_type_references(movement);
-        self.move_callable_type_references(movement);
-        self.rename_stored_query_dependency(
-            movement.class(),
-            movement.slot,
-            None,
-            movement.current.schema,
-            movement.current.name,
-        );
     }
 
-    fn move_callable_type_references(&self, movement: TypeReferenceMove) {
-        {
-            let mut catalog = self
-                .operator_catalog
-                .lock()
-                .expect("operator catalog lock poisoned");
-            for operator in catalog.operators.iter_mut().filter(|operator| {
-                operator.database == movement.database
-                    && operator.ddl_state != CatalogDdlState::Absent
-            }) {
-                movement.rewrite_operator(&mut operator.definition);
-                if let Some(pending) = &mut operator.pending {
-                    movement.rewrite_operator(&mut pending.definition);
-                }
-            }
-            for family in catalog.families.iter_mut().filter(|family| {
-                family.database == movement.database && family.ddl_state != CatalogDdlState::Absent
-            }) {
-                movement.rewrite_family(&mut family.definition);
-                if let Some(pending) = &mut family.pending {
-                    movement.rewrite_family(&mut pending.definition);
-                }
-            }
-            for class in catalog.classes.iter_mut().filter(|class| {
-                class.database == movement.database && class.ddl_state != CatalogDdlState::Absent
-            }) {
-                movement.rewrite_class(&mut class.definition);
-                if let Some(pending) = &mut class.pending {
-                    movement.rewrite_class(&mut pending.definition);
-                }
+    fn rewrite_operators(self, catalog: &mut super::OperatorCatalog) {
+        for operator in catalog.operators.iter_mut().filter(|operator| {
+            operator.database == self.database && operator.ddl_state != CatalogDdlState::Absent
+        }) {
+            self.rewrite_operator(&mut operator.definition);
+            if let Some(pending) = &mut operator.pending {
+                self.rewrite_operator(&mut pending.definition);
             }
         }
-        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        for family in catalog.families.iter_mut().filter(|family| {
+            family.database == self.database && family.ddl_state != CatalogDdlState::Absent
+        }) {
+            self.rewrite_family(&mut family.definition);
+            if let Some(pending) = &mut family.pending {
+                self.rewrite_family(&mut pending.definition);
+            }
+        }
+        for class in catalog.classes.iter_mut().filter(|class| {
+            class.database == self.database && class.ddl_state != CatalogDdlState::Absent
+        }) {
+            self.rewrite_class(&mut class.definition);
+            if let Some(pending) = &mut class.pending {
+                self.rewrite_class(&mut pending.definition);
+            }
+        }
+    }
+
+    fn rewrite_casts(self, casts: &mut crate::mem::fixed_vec::FixedVec<super::CastDef>) {
         for cast in casts.iter_mut().filter(|cast| {
-            cast.database == movement.database && cast.ddl_state != CatalogDdlState::Absent
+            cast.database == self.database && cast.ddl_state != CatalogDdlState::Absent
         }) {
             super::type_contracts::CatalogTypes::Cast(cast)
-                .for_each(|result| movement.rewrite_result(result));
+                .for_each(|result| self.rewrite_result(result));
         }
     }
 
-    fn move_routine_type_references(&self, movement: TypeReferenceMove) {
+    fn rewrite_routines(self, routines: &mut crate::mem::fixed_vec::FixedVec<super::RoutineDef>) {
         let move_argument = |argument: &mut RoutineArgumentDef| {
-            movement.rewrite(argument.ctype, &mut argument.user_type);
+            self.rewrite(argument.ctype, &mut argument.user_type);
         };
         let move_result = |result: &mut RoutineResult| {
-            movement.rewrite_result(result);
+            self.rewrite_result(result);
         };
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
         for routine in routines
             .iter_mut()
-            .filter(|routine| routine.database == movement.database)
+            .filter(|routine| routine.database == self.database)
         {
             for argument in routine.arguments.iter_mut().take(routine.argument_count) {
                 move_argument(argument);
@@ -479,23 +641,247 @@ mod tests {
         result
     }
 
-    fn publish_source(storage: &Storage, movement: TypeReferenceMove) {
-        // Reproduce the caller's completed source update before reference fanout.
-        let mut catalog = storage.type_catalog.lock().unwrap();
-        match movement.kind {
+    fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
+        let (schema, name) = match movement.kind {
             TypeReferenceKind::Domain => {
-                catalog.domains[movement.slot].schema = movement.current.schema;
-                catalog.domains[movement.slot].name = movement.current.name;
+                let definition = catalog.domains[movement.slot];
+                (definition.schema, definition.name)
             }
             TypeReferenceKind::Enum => {
-                catalog.enums[movement.slot].schema = movement.current.schema;
-                catalog.enums[movement.slot].name = movement.current.name;
+                let definition = catalog.enums[movement.slot];
+                (definition.schema, definition.name)
             }
             TypeReferenceKind::Composite => {
-                catalog.composites[movement.slot].schema = movement.current.schema;
-                catalog.composites[movement.slot].name = movement.current.name;
+                let definition = catalog.composites[movement.slot];
+                (definition.schema, definition.name)
+            }
+        };
+        UserTypeName { schema, name }
+    }
+
+    fn wait_until_contended(storage: &Storage) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while storage
+            .type_publication
+            .waits
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    #[test]
+    fn type_publication_workspace_exact_startup_budget() {
+        for max_tables in [1, 3, 128] {
+            let mut config = test_config();
+            config.max_tables = max_tables;
+            let bytes = TypePublication::budget_bytes(&config);
+            let mut insufficient = Budget::new(bytes - 1);
+            let error = TypePublication::new(&config, &mut insufficient)
+                .err()
+                .unwrap();
+            assert_eq!(error.what, "type publication");
+            let mut exact = Budget::new(bytes);
+            let publication = TypePublication::new(&config, &mut exact).unwrap();
+            assert_eq!(exact.remaining(), 0);
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..3 {
+                    let mut scratch = publication.scratch.lock().unwrap();
+                    scratch.reset();
+                    let owners = scratch
+                        .alloc_owned_slice_with::<Option<TableOwner<'_>>>(
+                            super::super::table_slot_capacity(&config),
+                            |_| None,
+                        )
+                        .unwrap();
+                    assert_eq!(owners.len(), max_tables + 1);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn shared_type_move_catalog_wait_releases_every_table_and_catalog_prefix() {
+        for kind in KINDS {
+            for blocked in 0..7 {
+                let (storage, related, _, movement) = fixture(kind);
+                let generation = storage.tables[related].generation();
+                let types = (blocked == 0).then(|| storage.type_catalog.lock().unwrap());
+                let members = (blocked == 1).then(|| storage.enum_member_images.lock().unwrap());
+                let comments = (blocked == 2).then(|| storage.comments.lock().unwrap());
+                let routines = (blocked == 3).then(|| storage.routines.lock().unwrap());
+                let operators = (blocked == 4).then(|| storage.operator_catalog.lock().unwrap());
+                let casts = (blocked == 5).then(|| storage.casts.lock().unwrap());
+                let dependencies =
+                    (blocked == 6).then(|| storage.stored_query_dependencies.lock().unwrap());
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        crate::mem::guard::forbid_alloc(|| {
+                            publish_move(&storage, movement);
+                        })
+                    });
+                    let waiting = wait_until_contended(&storage);
+                    // Try every prefix before releasing the injected blocker.
+                    // A regression must fail without stranding the writer.
+                    let prefix_free = crate::mem::guard::forbid_alloc(|| {
+                        storage.tables[related].definition.test_write().is_ok()
+                            && storage.tables[related].lifecycle.try_lock().is_ok()
+                            && storage.tables[related].publication.try_lock().is_ok()
+                            && (blocked == 0 || storage.type_catalog.try_lock().is_ok())
+                            && (blocked <= 1 || storage.enum_member_images.try_lock().is_ok())
+                            && (blocked <= 2 || storage.comments.try_lock().is_ok())
+                            && (blocked <= 3 || storage.routines.try_lock().is_ok())
+                            && (blocked <= 4 || storage.operator_catalog.try_lock().is_ok())
+                            && (blocked <= 5 || storage.casts.try_lock().is_ok())
+                    });
+                    let unchanged = if prefix_free {
+                        let references_unchanged = storage
+                            .table_def(related, 0)
+                            .columns()
+                            .iter()
+                            .all(|column| column.user_type == Some(movement.prior));
+                        let source = types.as_ref().map_or_else(
+                            || source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                            |catalog| source_identity(catalog, movement),
+                        );
+                        references_unchanged
+                            && source == movement.prior
+                            && storage.tables[related].generation() == generation
+                    } else {
+                        false
+                    };
+                    drop((
+                        types,
+                        members,
+                        comments,
+                        routines,
+                        operators,
+                        casts,
+                        dependencies,
+                    ));
+                    writer.join().unwrap();
+                    assert!(
+                        waiting,
+                        "publication never reached the injected catalog wait"
+                    );
+                    assert!(prefix_free, "catalog wait retained an earlier owner");
+                    assert!(
+                        unchanged,
+                        "publication changed state before acquiring every owner"
+                    );
+                });
+                assert_identity(&storage, related, 0, movement.current);
+                assert_eq!(
+                    source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                    movement.current
+                );
+                assert_eq!(storage.tables[related].generation(), generation + 1);
             }
         }
+    }
+
+    #[test]
+    fn shared_type_move_later_table_wait_releases_earlier_definitions() {
+        for kind in KINDS {
+            let (mut storage, first, _, movement) = fixture(kind);
+            let mut definition = *storage.table_def(first, 0);
+            definition.name = SqlName::parse("last_dependency").unwrap();
+            let last = storage.create_table(definition).unwrap();
+            let held = storage.table_def(last, 0);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    crate::mem::guard::forbid_alloc(|| {
+                        publish_move(&storage, movement);
+                    })
+                });
+                let waiting = wait_until_contended(&storage);
+                let prefix_free = storage.tables[first].definition.test_write().is_ok()
+                    && storage.tables[first].lifecycle.try_lock().is_ok()
+                    && storage.tables[first].publication.try_lock().is_ok()
+                    && storage.tables[last].lifecycle.try_lock().is_ok();
+                let source = source_identity(&storage.type_catalog.lock().unwrap(), movement);
+                drop(held);
+                writer.join().unwrap();
+                assert!(waiting);
+                assert!(prefix_free, "later-table wait retained an earlier table");
+                assert_eq!(source, movement.prior);
+            });
+            assert_identity(&storage, first, 0, movement.current);
+            assert_identity(&storage, last, 0, movement.current);
+        }
+    }
+
+    #[test]
+    fn shared_type_move_catalog_wait_reselects_new_pending_references() {
+        for kind in KINDS {
+            let (storage, related, unrelated, movement) = fixture(kind);
+            let mut pending = *storage.table_def(related, 0);
+            pending.name = storage.table_def(unrelated, 0).name;
+            let blocker = storage.casts.lock().unwrap();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    crate::mem::guard::forbid_alloc(|| {
+                        publish_move(&storage, movement);
+                    })
+                });
+                let waiting = wait_until_contended(&storage);
+                let available = storage.tables[unrelated].definition.test_write().is_ok()
+                    && storage.tables[unrelated].lifecycle.try_lock().is_ok()
+                    && storage.comments.try_lock().is_ok();
+                let staged = if waiting && available {
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.write_table_def(unrelated, 7, pending, &mapping("id"), false)
+                    })
+                    .is_ok()
+                } else {
+                    false
+                };
+                drop(blocker);
+                writer.join().unwrap();
+                assert!(waiting);
+                assert!(available);
+                assert!(staged);
+            });
+            crate::mem::guard::forbid_alloc(|| {
+                assert_identity(&storage, unrelated, 7, movement.current);
+                assert!(
+                    storage.table_def(unrelated, 0).columns()[0]
+                        .user_type
+                        .is_none()
+                );
+                storage.rollback_table_def(unrelated, 7);
+                assert!(
+                    storage.table_def(unrelated, 7).columns()[0]
+                        .user_type
+                        .is_none()
+                );
+                assert!(storage.pending_table_defs.test_write().is_ok());
+            });
+        }
+    }
+
+    fn publish_move(storage: &Storage, movement: TypeReferenceMove) {
+        storage
+            .type_publication
+            .publish(storage, movement, |catalog, _members| match movement.kind {
+                TypeReferenceKind::Domain => {
+                    catalog.domains[movement.slot].schema = movement.current.schema;
+                    catalog.domains[movement.slot].name = movement.current.name;
+                }
+                TypeReferenceKind::Enum => {
+                    catalog.enums[movement.slot].schema = movement.current.schema;
+                    catalog.enums[movement.slot].name = movement.current.name;
+                }
+                TypeReferenceKind::Composite => {
+                    catalog.composites[movement.slot].schema = movement.current.schema;
+                    catalog.composites[movement.slot].name = movement.current.name;
+                }
+            });
     }
 
     fn assert_identity(storage: &Storage, table: usize, transaction: u32, expected: UserTypeName) {
@@ -515,8 +901,7 @@ mod tests {
                 let storage = &storage;
                 let writer = scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_source(storage, movement);
-                        storage.move_type_references(movement);
+                        publish_move(storage, movement);
                     });
                     send.send(()).unwrap();
                 });
@@ -567,17 +952,19 @@ mod tests {
                     let storage = &storage;
                     let writer = scope.spawn(move || {
                         crate::mem::guard::forbid_alloc(|| {
-                            publish_source(storage, movement);
-                            storage.move_type_references(movement);
+                            publish_move(storage, movement);
                         });
                         done_send.send(()).unwrap();
                     });
                     let deadline = Instant::now() + Duration::from_secs(5);
                     let waiting = loop {
-                        match storage.tables[related].lifecycle.try_lock() {
-                            Err(std::sync::TryLockError::WouldBlock) => break true,
-                            Ok(owner) => drop(owner),
-                            Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                        if storage
+                            .type_publication
+                            .waits
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            > 0
+                        {
+                            break true;
                         }
                         if Instant::now() >= deadline {
                             break false;
@@ -591,6 +978,15 @@ mod tests {
                                 || storage.operator_catalog.try_lock().is_err()
                                 || storage.casts.try_lock().is_err()
                             {
+                                return false;
+                            }
+                            if storage.tables[related].lifecycle.try_lock().is_err() {
+                                return false;
+                            }
+                            let catalog = storage.type_catalog.lock().unwrap();
+                            let source = source_identity(&catalog, movement);
+                            drop(catalog);
+                            if source != movement.prior {
                                 return false;
                             }
                             for _ in 0..16 {
@@ -627,10 +1023,7 @@ mod tests {
                     writer.join().unwrap();
                     other.join().unwrap();
                     assert_eq!(retained_identity, Some(movement.prior));
-                    assert!(
-                        waiting,
-                        "the move did not acquire its selected lifecycle owner"
-                    );
+                    assert!(waiting, "the move did not reach its retained definition");
                     assert!(
                         !completed_early,
                         "a type move changed a retained definition"
@@ -680,8 +1073,7 @@ mod tests {
                 .write_table_def(related, 7, pending, &mapping("id"), false)
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
-                publish_source(&storage, movement);
-                storage.move_type_references(movement);
+                publish_move(&storage, movement);
                 assert_identity(&storage, related, 7, movement.current);
                 assert!(
                     storage
@@ -734,8 +1126,7 @@ mod tests {
                 let storage = &storage;
                 let writer = scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_source(storage, movement);
-                        storage.move_type_references(movement);
+                        publish_move(storage, movement);
                     });
                     send.send(()).unwrap();
                 });

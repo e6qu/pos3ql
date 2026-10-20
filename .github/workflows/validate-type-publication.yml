@@ -1,0 +1,35 @@
+name: Validate type publication
+
+on:
+  push:
+    branches: [source-type-publication-owners]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: type-publication-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-type-publication-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-library-tests-
+      - run: cargo clean -p pos3ql
+      - name: Check publication ownership and typed recovery
+        run: >-
+          cargo test --lib --locked --
+          storage::type_reference_moves::tests
+          storage::type_references::tests
+          sql::tests::captured_type_references
+          --test-threads=1

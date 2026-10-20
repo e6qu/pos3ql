@@ -17359,15 +17359,12 @@ impl Storage {
         self.rule_count() + self.policy_count() + self.routine_count() + slot
     }
 
-    fn write_dependency_image(
+    fn write_dependency_image_in(
         &self,
+        catalog: &mut StoredQueryDependencyCatalog,
         image: usize,
         dependencies: StoredQueryDependencyView<'_>,
     ) -> Result<(), SqlError> {
-        let mut catalog = self
-            .stored_query_dependencies
-            .lock()
-            .expect("stored-query dependency catalog lock poisoned");
         let count = catalog.write_image(
             image,
             dependencies,
@@ -17377,23 +17374,24 @@ impl Storage {
         Ok(())
     }
 
+    fn write_dependency_image(
+        &self,
+        image: usize,
+        dependencies: StoredQueryDependencyView<'_>,
+    ) -> Result<(), SqlError> {
+        let mut catalog = self
+            .stored_query_dependencies
+            .lock()
+            .expect("stored-query dependency catalog lock poisoned");
+        self.write_dependency_image_in(&mut catalog, image, dependencies)
+    }
+
     fn write_committed_dependencies(
         &self,
         owner: StoredQueryDependencyOwner,
         dependencies: StoredQueryDependencyView<'_>,
     ) -> Result<(), SqlError> {
-        let image = self.committed_dependency_image(owner);
-        let mut catalog = self
-            .stored_query_dependencies
-            .lock()
-            .expect("stored-query dependency catalog lock poisoned");
-        let count = catalog.write_image(
-            image,
-            dependencies,
-            self.stored_query_dependencies_per_image,
-        )?;
-        catalog.counts[image] = count;
-        Ok(())
+        self.write_dependency_image(self.committed_dependency_image(owner), dependencies)
     }
 
     fn clear_committed_dependencies(&self, owner: StoredQueryDependencyOwner) {
@@ -17519,6 +17517,21 @@ impl Storage {
             .stored_query_dependencies
             .lock()
             .expect("stored-query dependency catalog lock poisoned");
+        self.allocate_pending_stored_query_dependencies_in(
+            &mut catalog,
+            owner,
+            previous,
+            dependencies,
+        )
+    }
+
+    fn allocate_pending_stored_query_dependencies_in(
+        &self,
+        catalog: &mut StoredQueryDependencyCatalog,
+        owner: StoredQueryDependencyOwner,
+        previous: Option<u32>,
+        dependencies: StoredQueryDependencyView<'_>,
+    ) -> Result<u32, SqlError> {
         if previous.is_some_and(|slot| {
             catalog.pending[slot as usize].depth >= self.max_catalog_versions_per_object
         }) {
@@ -17560,6 +17573,19 @@ impl Storage {
             .stored_query_dependencies
             .lock()
             .expect("stored-query dependency catalog lock poisoned");
+        self.allocate_pending_stored_query_dependencies_from_current_in(
+            &mut catalog,
+            owner,
+            previous,
+        )
+    }
+
+    fn allocate_pending_stored_query_dependencies_from_current_in(
+        &self,
+        catalog: &mut StoredQueryDependencyCatalog,
+        owner: StoredQueryDependencyOwner,
+        previous: Option<u32>,
+    ) -> Result<u32, SqlError> {
         if previous.is_some_and(|slot| {
             catalog.pending[slot as usize].depth >= self.max_catalog_versions_per_object
         }) {
@@ -43097,7 +43123,15 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         let allocated_ownership =
             matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let mut owners = self.routine_type_owners();
+        owners.bind_routine_contract(
+            &mut arguments[..argument_count],
+            &mut parameters[..parameter_count],
+            &mut result_columns[..result_column_count],
+            &mut kind,
+            txid,
+        )?;
+        let routines = &mut owners.catalog;
         if let Some(blocker) = routines.iter().find_map(|routine| {
             (routine.database == current_database()
                 && routine.schema_for(txid) == schema
@@ -43112,7 +43146,7 @@ impl Storage {
             .then_some(routine.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
-            drop(routines);
+            drop(owners);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if routines.iter().any(|routine| {
@@ -43157,6 +43191,11 @@ impl Storage {
                 (created_at, ownership)
             }
         };
+        self.write_dependency_image_in(
+            &mut owners.dependencies,
+            self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
+            dependencies.view(),
+        )?;
         routines[slot] = RoutineDef {
             database: current_database(),
             created_at,
@@ -43181,16 +43220,8 @@ impl Storage {
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        drop(routines);
+        drop(owners);
         self.clear_object_acl_entries(Self::routine_access_object(slot));
-        if let Err(error) = self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            dependencies.view(),
-        ) {
-            self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
-            self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
-            return Err(error);
-        }
         Ok(slot)
     }
 
@@ -43234,20 +43265,36 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let previous = routine
-            .pending_definition
-            .filter(|pending| pending.txid == definition.txid)
-            .map(|pending| pending.dependency_slot);
-        definition.dependency_slot = self.allocate_pending_stored_query_dependencies(
-            StoredQueryDependencyOwner::Routine(slot as u16),
+        let mut owners = self.routine_type_owners();
+        if owners.catalog[slot].database != routine.database
+            || owners.catalog[slot].created_at != routine.created_at
+            || !owners.catalog[slot].visible_to(definition.txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "routine changed before its definition could be published"
+            ));
+        }
+        owners.bind_routine_contract(
+            &mut definition.arguments[..definition.argument_count],
+            &mut definition.parameters[..definition.parameter_count],
+            &mut definition.result_columns[..definition.result_column_count],
+            &mut definition.kind,
             definition.txid,
+        )?;
+        let prior = owners.catalog[slot].pending_definition;
+        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
+        }
+        let previous = prior.map(|pending| pending.dependency_slot);
+        definition.dependency_slot = self.allocate_pending_stored_query_dependencies_in(
+            &mut owners.dependencies,
+            StoredQueryDependencyOwner::Routine(slot as u16),
             previous,
             dependencies,
         )?;
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        let routine = &mut routines[slot];
-        let prior = routine.pending_definition;
-        routine.pending_definition = Some(definition);
+        owners.catalog[slot].pending_definition = Some(definition);
         Ok(prior)
     }
 
@@ -43273,18 +43320,36 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let previous = routine
-            .pending_definition
-            .filter(|pending| pending.txid == definition.txid)
-            .map(|pending| pending.dependency_slot);
-        definition.dependency_slot = self.allocate_pending_stored_query_dependencies_from_current(
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            previous,
+        let mut owners = self.routine_type_owners();
+        if owners.catalog[slot].database != routine.database
+            || owners.catalog[slot].created_at != routine.created_at
+            || !owners.catalog[slot].visible_to(definition.txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "routine changed before its definition could be published"
+            ));
+        }
+        owners.bind_routine_contract(
+            &mut definition.arguments[..definition.argument_count],
+            &mut definition.parameters[..definition.parameter_count],
+            &mut definition.result_columns[..definition.result_column_count],
+            &mut definition.kind,
+            definition.txid,
         )?;
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        let routine = &mut routines[slot];
-        let prior = routine.pending_definition;
-        routine.pending_definition = Some(definition);
+        let prior = owners.catalog[slot].pending_definition;
+        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
+        }
+        let previous = prior.map(|pending| pending.dependency_slot);
+        definition.dependency_slot = self
+            .allocate_pending_stored_query_dependencies_from_current_in(
+                &mut owners.dependencies,
+                StoredQueryDependencyOwner::Routine(slot as u16),
+                previous,
+            )?;
+        owners.catalog[slot].pending_definition = Some(definition);
         Ok(prior)
     }
 
@@ -48840,7 +48905,20 @@ impl Storage {
         if Self::builtin_cast_exists(source_oid, target_oid) {
             return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
-        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        let mut definition = CastDef {
+            database: current_database(),
+            created_at: 0,
+            source,
+            target,
+            method,
+            context,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        let mut owners = self.catalog_type_owners(&self.casts);
+        owners.bind_definition(&mut definition, txid)?;
+        let source = definition.source;
+        let target = definition.target;
+        let casts = &mut owners.catalog;
         if let Some(blocker) = casts.iter().find_map(|definition| {
             (definition.database == current_database()
                 && definition.source == source
@@ -48848,7 +48926,7 @@ impl Storage {
                 .then_some(definition.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
-            drop(casts);
+            drop(owners);
             return Err(self.catalog_ddl_wait_error(txid, blocker, "cast"));
         }
         if casts.iter().any(|definition| {
@@ -48870,15 +48948,8 @@ impl Storage {
             ));
         };
         let created_at = self.catalog_sequence.next()?;
-        casts[slot] = CastDef {
-            database: current_database(),
-            created_at,
-            source,
-            target,
-            method,
-            context,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
+        definition.created_at = created_at;
+        casts[slot] = definition;
         Ok(slot)
     }
 
@@ -48891,7 +48962,9 @@ impl Storage {
         definition.source = self.bind_routine_result(definition.source, 0)?;
         definition.target = self.bind_routine_result(definition.target, 0)?;
         self.validate_cast_definition(definition, 0)?;
-        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.casts);
+        owners.bind_definition(&mut definition, 0)?;
+        let casts = &mut owners.catalog;
         if casts.iter().any(|candidate| {
             candidate.database == current_database()
                 && candidate.visible_to(0)
@@ -51447,10 +51520,9 @@ impl Storage {
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
         let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         if catalog.operators.iter().any(|operator| {
             operator.database == current_database()
                 && operator.visible_to(txid)
@@ -51565,17 +51637,13 @@ impl Storage {
         definition = self.bind_catalog_definition(definition, txid)?;
         let oid = self.operator(slot).oid();
         self.validate_operator_definition(definition, txid, Some(oid))?;
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         let prior = catalog.operators[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                prior.expect("checked Some").txid,
-                definition.name.as_str(),
-            ));
+        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
         }
         catalog.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
         Ok(prior)
@@ -51850,10 +51918,9 @@ impl Storage {
         definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_family_definition(definition, txid)?;
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         if catalog.families.iter().any(|family| {
             family.database == current_database()
                 && family.visible_to(txid)
@@ -51959,17 +52026,13 @@ impl Storage {
     ) -> Result<Option<PendingOperatorFamilyDefinition>, SqlError> {
         definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_family_definition(definition, txid)?;
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         let prior = catalog.families[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                prior.expect("checked Some").txid,
-                definition.name.as_str(),
-            ));
+        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
         }
         catalog.families[slot].pending = Some(PendingOperatorFamilyDefinition { txid, definition });
         Ok(prior)
@@ -52346,10 +52409,9 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         if catalog.classes.iter().any(|class| {
             class.database == current_database()
                 && class.visible_to(txid)
@@ -52466,17 +52528,13 @@ impl Storage {
     ) -> Result<Option<PendingOperatorClassDefinition>, SqlError> {
         definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_class_definition(definition, txid)?;
-        let mut catalog = self
-            .operator_catalog
-            .lock()
-            .expect("operator catalog lock poisoned");
+        let mut owners = self.catalog_type_owners(&self.operator_catalog);
+        owners.bind_definition(&mut definition, txid)?;
+        let catalog = &mut owners.catalog;
         let prior = catalog.classes[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                prior.expect("checked Some").txid,
-                definition.name.as_str(),
-            ));
+        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
         }
         catalog.classes[slot].pending = Some(PendingOperatorClassDefinition { txid, definition });
         Ok(prior)

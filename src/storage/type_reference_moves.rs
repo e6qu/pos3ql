@@ -152,7 +152,7 @@ impl TypeReferenceMove {
 pub(super) struct TypePublication {
     scratch: Mutex<Arena>,
     #[cfg(test)]
-    waits: std::sync::atomic::AtomicUsize,
+    pub(super) waits: std::sync::atomic::AtomicUsize,
 }
 
 struct TableOwner<'storage> {
@@ -624,6 +624,67 @@ mod tests {
             std::thread::yield_now();
         }
         true
+    }
+
+    #[test]
+    fn dependent_type_publication_releases_destination_before_source_wait() {
+        use crate::storage::{CastContext, CastDef, CastMethod, RoutineResult};
+        for kind in KINDS {
+            let (storage, related, _, movement) = fixture(kind);
+            let column = storage.table_def(related, 0).columns[0];
+            let database = storage.current_database_oid();
+            let mut definition = CastDef {
+                database,
+                created_at: 1,
+                source: RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                },
+                target: RoutineResult::builtin(ColType::Text),
+                method: CastMethod::InOut,
+                context: CastContext::Explicit,
+                ddl_state: CatalogDdlState::Present,
+            };
+            let mut source = storage.type_catalog.lock().unwrap();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    crate::sql::set_execution_database_oid(database);
+                    crate::mem::guard::forbid_alloc(|| {
+                        let mut owners = storage.catalog_type_owners(&storage.casts);
+                        owners.bind_definition(&mut definition, 0).unwrap();
+                        assert!(storage.type_catalog.try_lock().is_err());
+                        owners.catalog[0] = definition;
+                        assert!(storage.type_catalog.try_lock().is_err());
+                    });
+                });
+                let waiting = wait_until_contended(&storage);
+                let destination_free = storage.casts.try_lock().is_ok();
+                crate::mem::guard::forbid_alloc(|| match movement.identity.slot() {
+                    NamedTypeSlot::Domain(slot) => {
+                        source.domains[slot].schema = movement.current.schema;
+                        source.domains[slot].name = movement.current.name;
+                    }
+                    NamedTypeSlot::Enum(slot) => {
+                        source.enums[slot].schema = movement.current.schema;
+                        source.enums[slot].name = movement.current.name;
+                    }
+                    NamedTypeSlot::Composite(slot) => {
+                        source.composites[slot].schema = movement.current.schema;
+                        source.composites[slot].name = movement.current.name;
+                    }
+                });
+                drop(source);
+                writer.join().unwrap();
+                assert!(waiting, "writer did not reach the protected publication");
+                assert!(destination_free, "source wait retained the destination");
+            });
+            let submitted = storage.cast(0).source.user_type.unwrap();
+            assert_eq!(submitted, column.user_type.unwrap());
+            assert_eq!(submitted.schema, movement.current.schema);
+            assert_eq!(submitted.name, movement.current.name);
+            assert!(storage.type_catalog.try_lock().is_ok());
+            assert!(storage.casts.try_lock().is_ok());
+        }
     }
 
     #[test]

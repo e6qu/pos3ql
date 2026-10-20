@@ -16063,10 +16063,8 @@ impl Storage {
         }
     }
 
-    pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
-        let lock_wait = if object_io {
-            None
-        } else {
+    pub(crate) fn park_backend_statement(&self, pid: i32, reason: crate::sql::StatementWait) {
+        let lock_wait = if reason == crate::sql::StatementWait::Lock {
             let locks = self.lock_state();
             if locks.advisory.blocker_pid_count(pid) != 0 {
                 Some("advisory")
@@ -16075,20 +16073,22 @@ impl Storage {
             } else {
                 None
             }
-        };
-        let wait = if object_io {
-            (Some("Extension"), Some("ObjectStorageRead"))
-        } else if let Some(wait_event) = lock_wait {
-            (Some("Lock"), Some(wait_event))
         } else {
-            (None, None)
+            None
+        };
+        let wait = match reason {
+            crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
+            crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
+            crate::sql::StatementWait::Lock => {
+                lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
+            }
         };
         if let Some(activity) = self
             .backend_state()
             .activities
             .iter_mut()
             .find(|activity| activity.pid == pid)
-            && (object_io || activity.wait_event_type.is_none())
+            && (reason != crate::sql::StatementWait::Lock || activity.wait_event_type.is_none())
         {
             activity.wait_event_type = wait.0;
             activity.wait_event = wait.1;
@@ -30633,7 +30633,7 @@ impl Storage {
         RowReadView::capture_with(&self.row_versions, &versions, state, |state, captured| {
             let heap = captured
                 .has_heap(state)
-                .then(|| self.heap.retain_allocation());
+                .then(|| self.heap.retain_read_view());
             let objects = if generations.is_empty() {
                 None
             } else {

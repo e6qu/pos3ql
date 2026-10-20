@@ -1378,16 +1378,20 @@ impl Server {
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
-            // regardless of traffic. Work is paced unless critical cache
-            // pressure requires publication before dispatch resumes; bucket
-            // errors back off.
+            // regardless of traffic. Each turn is bounded; writers can wait
+            // for cache space while other connections run. Bucket errors back off.
             if checkpoint_schedule.should_run(
                 self.engine.checkpoint_work_pending() || had_responses,
                 Instant::now(),
             ) {
+                let cache_generation = self.engine.cache_capacity_generation();
                 let beat = self.engine.checkpoint_beat();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
                 self.durability_ready &= !self.engine.publication_failed();
+                if self.engine.cache_capacity_generation() != cache_generation {
+                    self.wake_lock_waiters();
+                    self.finish_response_batch(publication_error.as_ref());
+                }
                 if matches!(
                     beat,
                     CheckpointBeat::Durable

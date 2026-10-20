@@ -402,9 +402,9 @@ pub struct Conn {
     /// `recv`; completed statements in that message are not replayed.
     parked: bool,
     parked_generation: u64,
-    /// I/O waits are resumed by the block-read completion event, whereas row
-    /// locks wait for a changed lock generation or their timeout.
-    parked_for_io: bool,
+    /// Each resource has its own wake condition; cache progress cannot retry
+    /// an unrelated object download.
+    parked_wait: crate::sql::StatementWait,
     /// Absolute deadline for the current lock acquisition. `None` means
     /// `lock_timeout = 0`; the reactor uses this to wake an otherwise idle
     /// server and retry the retained frontend message as a timeout error.
@@ -520,7 +520,7 @@ impl Conn {
             backend_start: 0,
             parked: false,
             parked_generation: 0,
-            parked_for_io: false,
+            parked_wait: crate::sql::StatementWait::Lock,
             parked_deadline: None,
             resume_statement: 0,
             tls: None,
@@ -573,7 +573,7 @@ impl Conn {
         self.backend_start = crate::sql::datetime::now_micros();
         self.parked = false;
         self.parked_generation = 0;
-        self.parked_for_io = false;
+        self.parked_wait = crate::sql::StatementWait::Lock;
         self.parked_deadline = None;
         self.resume_statement = 0;
         self.tls = None;
@@ -608,7 +608,9 @@ impl Conn {
     }
 
     pub(crate) fn owns_pending_object_reads(&self) -> bool {
-        self.parked && self.parked_for_io && self.txn.staged_commit().is_none()
+        self.parked
+            && self.parked_wait == crate::sql::StatementWait::ObjectIo
+            && self.txn.staged_commit().is_none()
     }
 
     pub(crate) fn wants_read(&self) -> bool {
@@ -1003,14 +1005,21 @@ impl Conn {
         &mut self,
         engine: &mut Engine,
         generation: u64,
-        retry_io_waiters: bool,
+        retry_waiters: bool,
     ) -> Option<PendingResponse> {
-        if !self.parked
-            || (self.parked_for_io && !retry_io_waiters)
-            || (!self.parked_for_io
-                && self.parked_generation == generation
-                && !self.lock_timeout_expired())
-        {
+        if !self.parked {
+            return None;
+        }
+        let ready = match self.parked_wait {
+            crate::sql::StatementWait::Lock => {
+                self.parked_generation != generation || self.lock_timeout_expired()
+            }
+            crate::sql::StatementWait::ObjectIo => retry_waiters,
+            crate::sql::StatementWait::CacheCapacity => {
+                self.parked_generation != engine.cache_capacity_generation()
+            }
+        };
+        if !ready {
             return None;
         }
         self.parked = false;
@@ -1044,11 +1053,11 @@ impl Conn {
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    fn park(&mut self, io_wait: bool, generation: u64) {
+    fn park(&mut self, wait: crate::sql::StatementWait, generation: u64) {
         self.parked = true;
         self.parked_generation = generation;
-        self.parked_for_io = io_wait;
-        if !io_wait && self.parked_deadline.is_none() {
+        self.parked_wait = wait;
+        if wait == crate::sql::StatementWait::Lock && self.parked_deadline.is_none() {
             let timeout_ms = self.guc.lock_timeout_ms();
             if timeout_ms != 0 {
                 self.parked_deadline =
@@ -1061,7 +1070,7 @@ impl Conn {
         self.txn.release_suspended_statement();
         self.parked = false;
         self.parked_generation = 0;
-        self.parked_for_io = false;
+        self.parked_wait = crate::sql::StatementWait::Lock;
         self.parked_deadline = None;
     }
 
@@ -1790,8 +1799,8 @@ impl Conn {
                         && self.txn.staged_commit().is_some()
                     {
                         let generation = engine.lock_generation();
-                        self.park(true, generation);
-                        engine.park_backend_statement(self.id, true);
+                        self.park(crate::sql::StatementWait::ObjectIo, generation);
+                        engine.park_backend_statement(self.id, crate::sql::StatementWait::ObjectIo);
                         return Step::Parked;
                     }
                     self.cursors.on_rollback();
@@ -1850,7 +1859,10 @@ impl Conn {
                     };
                 }
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
-                    self.park(true, engine.lock_generation());
+                    self.park(
+                        crate::sql::StatementWait::ObjectIo,
+                        engine.lock_generation(),
+                    );
                     return Step::Parked;
                 }
                 Err(error) => {
@@ -1980,9 +1992,9 @@ impl Conn {
         };
         match result {
             Ok(crate::sql::ExtendedExecutionStatus::Complete(_)) => Step::Continue,
-            Ok(crate::sql::ExtendedExecutionStatus::Blocked { io_wait }) => {
-                self.park(io_wait, engine.lock_generation());
-                engine.park_backend_statement(self.id, io_wait);
+            Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
+                self.park(wait, engine.statement_wait_generation(wait));
+                engine.park_backend_statement(self.id, wait);
                 Step::Parked
             }
             Err(WireFull) => Step::Close,
@@ -2595,8 +2607,11 @@ impl Conn {
             && self.txn.staged_commit().is_some()
         {
             self.copy = Some(copy);
-            self.park(true, engine.lock_generation());
-            engine.park_backend_statement(self.id, true);
+            self.park(
+                crate::sql::StatementWait::ObjectIo,
+                engine.lock_generation(),
+            );
+            engine.park_backend_statement(self.id, crate::sql::StatementWait::ObjectIo);
             return Step::Parked;
         }
         self.copy_transition_scratch.clear();
@@ -3410,15 +3425,14 @@ impl Conn {
                     self.phase = Phase::SkipToSync;
                     return Step::Continue;
                 }
-                Ok(crate::sql::ExtendedExecutionStatus::Blocked { io_wait }) => {
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
                     if paged {
                         self.portals[portal_slot].result.clear();
                     } else {
                         self.send.truncate_to(send_mark);
                     }
-                    let generation = engine.lock_generation();
-                    self.park(io_wait, generation);
-                    engine.park_backend_statement(self.id, io_wait);
+                    self.park(wait, engine.statement_wait_generation(wait));
+                    engine.park_backend_statement(self.id, wait);
                     return Step::Parked;
                 }
                 Err(WireFull) => {
@@ -3662,13 +3676,12 @@ impl Conn {
             Ok(crate::sql::ExecutionStatus::Blocked {
                 completed_statements,
                 output_mark,
-                io_wait,
+                wait,
             }) => {
                 self.send.truncate_to(output_mark);
                 self.resume_statement = completed_statements;
-                let generation = engine.lock_generation();
-                self.park(io_wait, generation);
-                engine.park_backend_statement(self.id, io_wait);
+                self.park(wait, engine.statement_wait_generation(wait));
+                engine.park_backend_statement(self.id, wait);
                 self.arena.reset();
                 return Step::Parked;
             }
@@ -5701,7 +5714,7 @@ mod tests {
                 });
                 assert_eq!(pending.after, After::Continue);
                 assert!(!conn.parked);
-                assert!(!conn.parked_for_io);
+                assert_eq!(conn.parked_wait, crate::sql::StatementWait::Lock);
                 assert!(conn.recv.is_empty());
                 assert!(conn.copy.is_none());
                 assert!(conn.copy_transition_scratch.is_empty());
@@ -5732,6 +5745,184 @@ mod tests {
                 std::fs::remove_dir_all(directory).unwrap();
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             }
+        }
+    }
+
+    #[test]
+    fn bounded_cache_protocol_waits_resume_or_cancel_without_object_io_retries() {
+        fn request(conn: &mut Conn, engine: &mut Engine, sql: &str) {
+            conn.send.clear();
+            let mut payload = sql.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{sql}"
+            );
+        }
+        for (extended, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
+            let name = format!("cache-protocol-{extended}-{cancel}-{}", std::process::id());
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.memtable_bytes = 1 << 20;
+            config.max_tables = 4;
+            config.table_rows = 64;
+            config.max_connections = 2;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 64;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
+            config.max_value_indexes = 2;
+            config.value_index_rows = 64;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 4 << 20;
+            config.wal_buffer_bytes = 1 << 20;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = false;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let mut other = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let role = engine.role_login("postgres").unwrap().slot;
+            for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
+                let (server, _) = listener.accept().unwrap();
+                server.set_nonblocking(true).unwrap();
+                connection.open(server, id);
+                connection.phase = Phase::Ready;
+                engine
+                    .register_backend(
+                        id,
+                        crate::storage::DatabaseOid::POSTGRES,
+                        role,
+                        "",
+                        None,
+                        -1,
+                        connection.backend_start,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            request(
+                &mut conn,
+                &mut engine,
+                "CREATE TABLE cache_orders(id integer, note text); INSERT INTO cache_orders SELECT i, repeat('x', 4096) FROM generate_series(1, 20) AS g(i)",
+            );
+            for _ in 0..10 {
+                request(
+                    &mut conn,
+                    &mut engine,
+                    "UPDATE cache_orders SET note = repeat('y', 4096)",
+                );
+            }
+            engine.enable_async_durability();
+            other
+                .recv
+                .append(&frontend(wire::FMSG_QUERY, b"CHECKPOINT\0"));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| other.process_message(&mut engine)),
+                Step::Parked
+            ));
+            assert!(!engine.checkpoint_beat().failed());
+            assert!(crate::mem::guard::forbid_alloc(
+                || other.cancel_parked(&mut engine)
+            ));
+            conn.send.clear();
+            if extended {
+                conn.recv.append(&frontend(
+                    wire::FMSG_PARSE,
+                    b"\0INSERT INTO cache_orders VALUES (21, 'new')\0\0\0",
+                ));
+                conn.recv
+                    .append(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+                conn.recv
+                    .append(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+                conn.recv.append(&frontend(wire::FMSG_SYNC, &[]));
+                assert!(matches!(conn.process_message(&mut engine), Step::Continue));
+                assert!(matches!(conn.process_message(&mut engine), Step::Continue));
+            } else {
+                conn.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT 17; INSERT INTO cache_orders VALUES (21, 'new'); SELECT 23\0",
+                ));
+            }
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+                Step::Parked
+            ));
+            assert_eq!(conn.parked_wait, crate::sql::StatementWait::CacheCapacity);
+            let prefix = conn.send.readable().to_vec();
+            assert!(
+                crate::mem::guard::forbid_alloc(|| conn.retry_parked(&mut engine, u64::MAX, true))
+                    .is_none()
+            );
+            assert_eq!(conn.send.readable(), prefix);
+            request(&mut other, &mut engine, "SELECT count(*) FROM cache_orders");
+            if cancel {
+                assert!(crate::mem::guard::forbid_alloc(
+                    || conn.cancel_parked(&mut engine)
+                ));
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(5)
+                        .any(|bytes| bytes == b"57014")
+                );
+                assert!(!conn.parked);
+            } else {
+                let turn_bound = config.max_tables * config.table_rows * 8
+                    + config.memtable_bytes / (64 << 10) * 4;
+                for _ in 0..turn_bound {
+                    assert!(!engine.checkpoint_beat().failed());
+                    if let Some(pending) =
+                        crate::mem::guard::forbid_alloc(|| conn.retry_parked(&mut engine, 0, false))
+                    {
+                        assert_eq!(pending.after, After::Continue);
+                    }
+                    if !conn.parked {
+                        break;
+                    }
+                }
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                assert_eq!(
+                    conn.send
+                        .readable()
+                        .windows(11)
+                        .filter(|bytes| *bytes == b"INSERT 0 1\0")
+                        .count(),
+                    1
+                );
+                assert!(conn.send.readable().starts_with(&prefix));
+            }
+            engine.drop_connection(73);
+            engine.drop_connection(74);
+            drop(conn);
+            drop(other);
+            drop(client);
+            drop(other_client);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
     }
 
@@ -7323,7 +7514,7 @@ mod tests {
         connection.recv.append(b"E\0\0\0\x04S\0\0\0\x04");
         connection.txn.mode = crate::sql::txn::TxnMode::Explicit;
         connection.txn.txid = 1;
-        connection.park(false, 0);
+        connection.park(crate::sql::StatementWait::Lock, 0);
         assert!(connection.cancel_parked(&mut engine));
         assert!(!connection.parked);
         assert!(connection.recv.is_empty());
@@ -7389,7 +7580,7 @@ mod tests {
             crate::sql::txn::CommitTarget::Ordinary,
             crate::sql::txn::CommitBarrier::Journal,
         );
-        connection.park(true, 0);
+        connection.park(crate::sql::StatementWait::ObjectIo, 0);
         client.write_all(b"Q\0\0\0\x0dSELECT 1\0").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
         let error = crate::sql_err!(sqlstate::IO_ERROR, "publication response lost");
@@ -7439,7 +7630,7 @@ mod tests {
         let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.recv.append(b"Q\0\0\0\x05");
-        connection.park(false, 0);
+        connection.park(crate::sql::StatementWait::Lock, 0);
         assert!(connection.terminate_by_administrator());
         assert!(connection.is_terminating());
         assert!(!connection.wants_read());

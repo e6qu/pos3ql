@@ -20,27 +20,11 @@ separate synchronous read client where replay could repeat effects. Metadata
 capture and some maintenance reads also remain synchronous. Same-host MinIO
 and SeaweedFS checks establish portability; they do not prove production speed.
 
-## Current work: bound cleanup after a save
-
-**Example:** after saving a large table, the server releases old row metadata
-and cached values in small turns. A customer can read an order or roll back an
-update between turns. A busy table must not hold global owners while cleanup
-waits.
-
-- Bound deletion-marker pruning and saved-change acknowledgement during checkpoint
-  installation, saved-history
-  release, heap-row eviction and redundant-entry removal by
-  an explicit row-slot quota. Keep their positions between turns, including
-  across free-slot reuse and changes made after the checkpoint.
-- Use the same bounded work for temporary tables. Compare each committed row's
-  revision to the saved boundary, so later writes do not prevent freeing unchanged
-  saved rows. Preserve updates and deletions at shared or zero journal positions,
-  including rollback. Charge their row revisions in the startup reservation.
-- Skip busy tables and retry without retaining catalog, version, publication or
-  row owners. Preserve progress and complete ready tables while another is busy.
-- Charge retained controls at startup. Keep explicit CHECKPOINT and shutdown
-  completion, named exhaustion errors, rollback and empty-cache recovery.
-- Require complete CI, Differential, Drivers and coverage on the final head.
+Heap capture, copying, row-address updates and saved-row cleanup now use bounded
+turns. Queries retain readable bytes across a heap switch. Eligible writing
+commands can wait for an active reclaim task before their effects; reads and
+cancellation continue. Explicit CHECKPOINT and shutdown finish synchronously.
+See the [current contract and examples](docs/implemented-baseline.md).
 
 ## Remaining work
 
@@ -51,11 +35,8 @@ its rows or definitions. Cleanup should let ordinary queries run between turns.
 
 Finish protection for engine-wide publication, type-name changes and remaining
 table rewrites. Retain historical row, index and backup references before
-publishing replacements. Finish bounded heap remapping and critical-pressure
-admission; capture and reader-history cleanup already use bounded turns.
-At 85% heap use, automatic cleanup still selects synchronous completion.
-Removing that pause requires preserving space for incoming writes while cached
-reads and cancellation continue; raising memory limits is not a solution.
+publishing replacements. Heap maintenance, pressure waits, capture and reader-history cleanup already use
+bounded turns. Metadata capture and some maintenance reads remain synchronous. Raising memory limits is not a completion criterion.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

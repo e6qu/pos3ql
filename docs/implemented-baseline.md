@@ -768,117 +768,95 @@ reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
 use statement memory.
 
-Heap relocation reserves the existing spare buffer and starts a fixed cursor;
-starting it does not sweep row metadata. Ordinary capture visits at most 64
-stable row slots per turn, including empty or deleted slots. An empty table
-costs one control visit. Each batch reads one table and its version chains,
-then releases both owners. A busy owner leaves the cursor unchanged and retries
-on the existing one-second schedule without changing storage readiness.
-The quota counts slots, not elapsed time: one row can have retained versions.
+Heap relocation keeps queries running while it moves cached rows. For example,
+a report can keep its selected order total of 10 while another connection writes
+a total of 20. Both retain their own bytes, even when the old and new heaps use
+the same byte offset. Heap addresses describe caches, not durable row identity.
 
-Sorting, source validation, destination assignment and copying then run privately
-in bounded turns. Final remapping still acquires the shared version owner and
-every row map. A busy map releases the already acquired maps and version owner
-before waiting. Preflight and application use that same complete set, so
-publication cannot stop midway to acquire a map.
-A write prepared before capture
-moves its unpublished input into the append tail; writes after capture already
-use that tail. A database cloned into an already visited table slot also
-publishes heap references into the tail. Removing the source table cannot leave
-the clone pointing at an uncaptured location. Template rows are copied in one
-metadata pass rather than restarting the source walk for every row.
-Relocation copies later appends before publishing. If the tail
-advances again, publication requests another copy turn without changing row
-locations. Current rows, history, pending versions and aliases are remapped by
-their old location rather than reusable allocator slots.
+The startup workspace reserves the spare heap and captures locations in turns
+of at most 64 stable row slots, including empty or deleted slots. An empty table
+costs one visit. Sorting, validation, destination assignment and copying share
+65,536 work units per ordinary turn. A sorting unit starts one heap-sort root,
+extracts one entry, or sifts one level (at most two comparisons and one swap).
+Validation and packing charge one unit per captured location; copying charges
+one per byte or skipped alias/zero-length entry, at most 64 KiB per turn.
+Overlapping nonempty locations return XX000, "heap compaction contains overlapping
+row locations", before publication, including across zero-length entries.
 
-For example, one connection can retain an old order while another updates a
-different order between capture, sorting or copying turns. Both still read their own selected bytes after
-the buffer switch. Table retirement clears its rows through version ownership;
-a replaced slot's new rows survive publication. A held table definition does
-not keep copying or unrelated publication waiting.
+Row-reference preflight and address updates also visit at most 64 stable slots
+per ordinary turn. The quota counts slots: one row can have retained versions.
+Each batch owns one table and its version chains, then releases both owners.
+A busy owner retains the cursor for the existing one-second retry without
+changing storage readiness. No all-table row-map lock is acquired by this path.
 
-The two heap buffers and coordination controls are charged at startup.
-Relocation scratch stores typed source/destination entries. A separate mutex and
-arena reserve one optional row-map write guard per physical table slot
-(`max_tables + 1`), plus alignment. Sizing and construction charge the exact
-guard and control sizes. Scoped owners release every guard on contention or
-error; the arena resets before reuse. An undersized workspace returns 54000,
-"heap row-map ownership workspace exhausted", without running publication.
-Exhaustion also returns 54000: "heap compaction scratch overflow", "row heap relocation
-buffers are retained by readers", or "row heap relocation is already active".
-Cancellation releases the private buffer and capture boundary. Exclusive
-callers can still compact an unretained active buffer in place when an older
-reader retains the other buffer. Shared callers always use the private copy
-path.
+Before switching heaps, new references to an already captured prefix are copied
+into the append tail. This includes database-template clones into reused slots.
+Later appends are copied before the switch; a growing tail requests another
+copy turn. The switch briefly owns version publication and the heap controls.
+Both heaps remain readable while subsequent turns update committed rows,
+history and pending writes. New publications use the current heap, so rollback,
+late writes and slot reuse cannot restore an old address behind the cursor.
 
-The caller explicitly selects the row-slot quota, the preparation/copy quota,
-and whether to perform background work or finish synchronously. Ordinary
-automatic checkpoint cleanup shares 65,536 work units across preparation
-and copying in each step. A sorting unit starts one heap-sort root, extracts one
-entry, or sifts one level (at most two key comparisons and one swap). Validation
-and destination assignment charge one unit per captured location. Copying charges
-one unit per byte or skipped alias/zero-length entry, so a step copies at most
-64 KiB. Validation retains the prior nonempty location across turns; an overlap
-returns XX000, "heap compaction contains overlapping row locations", before
-publishing, even when zero-length entries occur between the overlapping rows.
-The server advances one step between messages or while idle,
-including while an unrelated object download is waiting. For example, a slow
-invoice download does not prevent the server from reclaiming unused row memory.
-After local cleanup finishes, the reactor waits for download readiness rather
-than repeatedly polling maintenance that needs that download to finish. Each SQL
-statement also advances at most one step before executing; it does not drain
-the complete copy. For
-example, a large cleanup can remain pending while a client reads an order,
-updates another order, and reads the result. Later appends join the copied tail.
-An explicit CHECKPOINT waits for all cleanup phases and preserves exclusive
-in-place reclamation when the active buffer has no retained readers. At the
-existing 85% critical heap threshold, automatic checkpointing also finishes
-publication and cleanup before dispatch resumes, preserving headroom for the
-next write. This pressure path can still delay connections.
+The published heap owns the mapping and progress until all references have been
+updated. Dropping the original maintenance task cannot discard them; another
+startup workspace can resume the published move. Errors after the switch retain
+its mapping and completed updates. Cancellation before the switch releases the
+private copy. Using the original workspace against another storage instance
+returns XX000, "heap relocation belongs to another storage instance", and leaves
+its original task intact. Moving the engine does not invalidate either task.
+
+Both heap buffers, shared controls, mapping storage and progress are charged
+exactly at startup. Retained ordered row records remain 32 bytes; their source
+explicitly identifies the old or new heap. Exhaustion returns 54000 and names
+"heap compaction scratch overflow", "row heap relocation buffers are retained by
+readers", "row heap relocation is already active", or "heap relocation scratch
+is retained by publication". Explicit synchronous callers also reserve one
+optional row-map guard per physical table slot (`max_tables + 1`), including
+alignment and mutex/arena controls; an undersized reservation returns 54000,
+"heap row-map ownership workspace exhausted", before publication.
+
+Automatic maintenance runs bounded turns between messages and while idle,
+including while an unrelated object download is waiting. At 85% heap use,
+top-level writing commands wait before executing their expressions or triggers
+when checkpoint publication or local cleanup is already in progress. Prepared
+writes use the same admission rule; prepared reads remain runnable. Temporary
+row-map pressure also waits for an active spill cleanup. For example, an INSERT
+can wait for space while another connection reads its orders, then resume
+without repeating an earlier SELECT or its own sequence increment or trigger.
+The reactor wakes this wait when capacity changes, cleanup ends, or maintenance
+reports an error; an unrelated object GET is not retried on those wakes.
+`pg_stat_activity` reports Extension/CacheCapacity for the wait. Cancellation
+releases the retained frontend command through the normal protocol boundary.
+
+A transaction's own pending writes or DDL do not wait for space they might pin.
+Transaction completion, rollback, explicit CHECKPOINT and VACUUM remain runnable.
+Once the active task ends, an operation that cannot fit still receives its named
+capacity error. This admission rule does not make a single large statement or a
+routine invoked from SELECT resumable midway through its effects. Explicit
+CHECKPOINT and shutdown finish cleanup synchronously and may reclaim an
+unretained active heap in place.
 
 Post-checkpoint history release, heap-row eviction and redundant-entry removal
-use shared storage access in turns of at most 64 stable row slots. Their retained
-positions contain no locks. Busy tables are skipped and retried after ready
-tables; failed partial acquisition releases every earlier owner. Table and saved
-file state are checked again on each batch. Selection of a half-full row map is
-kept through its partial batches even after removals reduce its occupancy.
-Durable history release preserves versions newer than the installed boundary. Local history pruning checks current
-readers under the same registry owner used for admission, including for temporary
-tables. Temporary eviction still requires the exact captured table generation.
+also use at most 64 stable row slots per turn. Busy tables are skipped and
+retried; partial acquisition releases all earlier owners. A pressured table
+remains selected across partial batches after its occupancy falls. Durable
+history pruning preserves newer versions; local history pruning checks current
+readers under the same registry owner used for admission. Temporary rows use
+their own committed revision through the saved boundary, so a later write does
+not prevent eviction of unchanged saved rows.
 
-Removing redundant saved-row metadata and already published deletion markers
-evaluates each map entry once, including collision chains that wrap around.
-Pending changes and retained history stay resident. Ordinary eviction also keeps
-heap rows, deletion markers and unpublished saved rows. Checkpoint installation
-removes only deletion markers covered by its captured log position, in turns of
-at most 64 row-map slots; later deletions remain for a later save. The same
-pass clears saved-change markers only while the captured table generation still
-matches. A write between turns keeps the table dirty and its new marker intact.
-Its retained cursor and exact next table stay with the durable publication until installation
-finishes. The cursor is included in startup manifest-state accounting.
+Pending changes and retained history stay resident. Ordinary metadata eviction
+also keeps heap rows, deletion markers and unpublished saved rows. Checkpoint
+installation clears only deletion and change markers covered by its captured
+boundary, in at most 64 slots per turn; later writes remain dirty. Journal
+cleanup preserves the suffix after that boundary for recovery. The same startup
+state machine handles temporary history, saved rows, compaction and metadata.
 
-**User example:** cleanup can release an order's old metadata while a report
-keeps its already selected total of 10, another transaction saves a total of 20,
-and an unrelated table accepts a write. These storage ownership rules do not
-enable parallel SQL statement execution.
-
-The startup relocation workspace owns its scratch, preparation state and copy
-controls across turns; their exact sizes are charged at startup. Moving the
-engine does not invalidate them. Cancellation or a preparation/copy error
-releases the reservation. Using a workspace with a different storage
-instance returns XX000, "heap relocation belongs to another storage instance",
-without publishing either instance. Journal cleanup runs once for the published
-prefix; writes after it keep their journal suffix for recovery. The same startup-accounted cleanup state machine handles temporary-table
-history release, saved-row eviction, compaction and redundant entries. It keeps
-the original captured-generation checks and lets statements run between its
-row batches. No extra runtime pool is created. Explicit CHECKPOINT and shutdown
-select synchronous completion; the existing critical-pressure path still does
-so at 85% heap use. Final heap remapping and some other maintenance still finish
-as whole operations within server turns. Checkpoint metadata uploads and immutable table, index and
-merge output now retain their own bytes while network requests overlap.
-Metadata capture and other atomic maintenance reads can still wait
-synchronously. Fixed SQL execution workers remain unfinished.
+These ownership and scheduling rules do not enable SQL execution on several CPU
+workers. Engine-wide catalog coordination, remaining table rewrites, metadata
+capture and some atomic maintenance reads still need further work. Checkpoint
+metadata uploads and immutable table, index and merge output retain their own
+bytes while network requests overlap.
 
 For example, while one connection downloads an uncached invoice, another can
 update a cached order and receive its durable commit acknowledgement. INSERT,
@@ -1031,8 +1009,8 @@ definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
 different image when readers retain the old one. Other type publication remains exclusive.
 
-Transaction-wide catalog coordination, remaining table rewrites, bounded final
-heap remapping, critical-pressure admission and SQL execution workers remain open.
+Transaction-wide catalog coordination, remaining table rewrites and SQL execution
+workers remain open.
 Concurrent and batched object-store I/O and ordered durable publication are
 implemented; the storage and transaction guides describe their limits.
 

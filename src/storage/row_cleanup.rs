@@ -31,6 +31,7 @@ pub(crate) enum EntryCleanup {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RowCleanupTask {
+    Tombstones { through_lsn: u64 },
     DurableHistory,
     SnapshotHistory,
     HeapRows(HeapCleanup),
@@ -100,17 +101,6 @@ impl Storage {
     /// under the same row lock, so a deletion cannot disappear after capture.
     pub(crate) fn retain_checkpoint_deletions(&self, slot: usize) -> std::sync::Arc<()> {
         std::sync::Arc::clone(&self.tables[slot].checkpoint_deletions)
-    }
-
-    /// Publication still owns storage exclusively until every saved-file list
-    /// is installed; only then may unneeded deletion markers disappear.
-    pub(crate) fn clear_tombstones(&mut self, slot: usize, through_lsn: u64) {
-        self.tables[slot].rows.write().retain(|_, state| {
-            state.committed.is_some()
-                || state.committed_lsn > through_lsn
-                || !state.history.is_empty()
-                || state.pending.is_some()
-        });
     }
 
     pub(crate) fn advance_row_cleanup(
@@ -206,7 +196,7 @@ impl Storage {
         let through_lsn = generations.published_through();
         let eligible = match task {
             RowCleanupTask::DurableHistory => live && !temporary && through_lsn.is_some(),
-            RowCleanupTask::SnapshotHistory => live,
+            RowCleanupTask::SnapshotHistory | RowCleanupTask::Tombstones { .. } => live,
             RowCleanupTask::HeapRows(selection) => {
                 live && !generations.is_empty()
                     && match selection {
@@ -245,6 +235,16 @@ impl Storage {
                 continue;
             };
             match task {
+                RowCleanupTask::Tombstones { through_lsn } => {
+                    if state.committed.is_none()
+                        && state.committed_lsn <= through_lsn
+                        && state.history.is_empty()
+                        && state.pending.is_none()
+                    {
+                        rows.remove(&rowid).expect("selected row exists");
+                        changed = true;
+                    }
+                }
                 RowCleanupTask::DurableHistory => {
                     release_committed_history_through(
                         &mut versions.as_mut().unwrap().committed_row_versions,
@@ -408,7 +408,7 @@ mod tests {
                     !state.history.is_empty()
                 }
                 RowCleanupTask::HeapRows(_) => matches!(state.committed, Some(RowHome::Heap(_))),
-                RowCleanupTask::SavedEntries(_) => true,
+                RowCleanupTask::SavedEntries(_) | RowCleanupTask::Tombstones { .. } => true,
             })
             .count()
     }
@@ -421,6 +421,13 @@ mod tests {
         task: RowCleanupTask,
     ) {
         match task {
+            RowCleanupTask::Tombstones { .. } => {
+                for table in [first, second] {
+                    for (_, state) in storage.tables[table].rows.write().iter_mut() {
+                        state.committed = None;
+                    }
+                }
+            }
             RowCleanupTask::DurableHistory | RowCleanupTask::SnapshotHistory => {
                 storage.register_snapshot(99, 7).unwrap();
                 for table in [first, second] {
@@ -442,7 +449,8 @@ mod tests {
         }
     }
 
-    const BOUNDED_TASKS: [RowCleanupTask; 7] = [
+    const BOUNDED_TASKS: [RowCleanupTask; 8] = [
+        RowCleanupTask::Tombstones { through_lsn: 7 },
         RowCleanupTask::DurableHistory,
         RowCleanupTask::SnapshotHistory,
         RowCleanupTask::HeapRows(HeapCleanup::Durable),
@@ -610,6 +618,7 @@ mod tests {
             let location = storage.heap.append_row(&[Datum::Int4(90)]).unwrap();
             storage.tables[first]
                 .rows
+                .write()
                 .insert(99, RowState::committed_only_at(location, 9))
                 .unwrap();
             assert_eq!(
@@ -881,7 +890,10 @@ mod tests {
                 .rows
                 .insert((DELETED + retained.len()) as u64, later_delete)
                 .unwrap();
-            storage.clear_tombstones(table, 7);
+            storage.finish_row_cleanup(
+                RowCleanupTask::Tombstones { through_lsn: 7 },
+                RowCleanupTarget::Table(table),
+            );
             assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
             for rowid in 0..DELETED {
                 assert!(storage.tables[table].rows.get(&(rowid as u64)).is_none());
@@ -892,7 +904,10 @@ mod tests {
                     Some(*state)
                 );
             }
-            storage.clear_tombstones(table, 7);
+            storage.finish_row_cleanup(
+                RowCleanupTask::Tombstones { through_lsn: 7 },
+                RowCleanupTarget::Table(table),
+            );
             assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
             assert_eq!(
                 storage.tables[table]
@@ -900,7 +915,10 @@ mod tests {
                     .get(&((DELETED + retained.len()) as u64)),
                 Some(later_delete)
             );
-            storage.clear_tombstones(table, 8);
+            storage.finish_row_cleanup(
+                RowCleanupTask::Tombstones { through_lsn: 8 },
+                RowCleanupTarget::Table(table),
+            );
             assert_eq!(storage.tables[table].rows.len(), retained.len());
         });
     }

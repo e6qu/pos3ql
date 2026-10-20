@@ -9159,7 +9159,9 @@ impl Engine {
                         self.prepare_checkpoint_cleanup(cleanup.lsn);
                         RowCleanupTask::DurableHistory
                     }
-                    LocalCleanupSource::TemporaryTable(_) => RowCleanupTask::SnapshotHistory,
+                    LocalCleanupSource::TemporaryTable(_) => RowCleanupTask::Tombstones {
+                        through_lsn: cleanup.lsn,
+                    },
                 };
                 LocalCleanupPhase::Rows(RowCleanup::new(task, cleanup.source.target()))
             }
@@ -9179,6 +9181,10 @@ impl Engine {
                     }
                 }
                 match rows.task() {
+                    RowCleanupTask::Tombstones { .. } => LocalCleanupPhase::Rows(RowCleanup::new(
+                        RowCleanupTask::SnapshotHistory,
+                        cleanup.source.target(),
+                    )),
                     RowCleanupTask::DurableHistory => LocalCleanupPhase::Compact,
                     RowCleanupTask::SnapshotHistory => LocalCleanupPhase::Rows(RowCleanup::new(
                         RowCleanupTask::HeapRows(HeapCleanup::AllSaved),

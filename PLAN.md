@@ -27,7 +27,8 @@ and cached values in small turns. A customer can read an order or roll back an
 update between turns. A busy table must not hold global owners while cleanup
 waits.
 
-- Bound saved-history release, heap-row eviction and redundant-entry removal by
+- Bound deletion-marker pruning during checkpoint installation, saved-history
+  release, heap-row eviction and redundant-entry removal by
   an explicit row-slot quota. Keep their positions between turns, including
   across free-slot reuse and changes made after the checkpoint.
 - Use the same bounded work for temporary tables. Check the saved generation

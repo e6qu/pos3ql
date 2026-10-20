@@ -89508,7 +89508,9 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
                 RowCleanupTask::DurableHistory => 0,
                 RowCleanupTask::HeapRows(_) => 1,
                 RowCleanupTask::SavedEntries(_) => 2,
-                RowCleanupTask::SnapshotHistory => unreachable!(),
+                RowCleanupTask::SnapshotHistory | RowCleanupTask::Tombstones { .. } => {
+                    unreachable!()
+                }
             };
             if !partial[index] {
                 partial[index] = true;
@@ -89548,6 +89550,108 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
         ["80|655360"],
     );
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_recovery() {
+    let mut config = test_config("bounded-checkpoint-markers");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_tables = 4;
+    config.table_rows = 256;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    config.object_store_bucket = format!("bounded-checkpoint-markers-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_markers(id integer); \
+         INSERT INTO bounded_markers SELECT i FROM generate_series(1,129) AS g(i); \
+         CREATE TABLE bounded_other(id integer); INSERT INTO bounded_other VALUES(1); \
+         DELETE FROM bounded_markers WHERE id<=128",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let table = engine
+        .storage
+        .find_table("public", "bounded_markers")
+        .unwrap();
+    for _ in 0..512 {
+        let checkpoint = engine.ckpt.as_mut().unwrap();
+        if checkpoint.manifest_installing() {
+            break;
+        }
+        assert!(matches!(
+            checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+            crate::checkpoint::CheckpointStep::Working,
+        ));
+    }
+    assert!(engine.ckpt.as_ref().unwrap().manifest_installing());
+    let marker_count = |engine: &Engine| {
+        engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .filter(|(_, row)| row.committed.is_none())
+            .count()
+    };
+    assert_eq!(marker_count(&engine), 128);
+    let mut inserted_later_delete = false;
+    let mut published = None;
+    for _ in 0..128 {
+        let before = marker_count(&engine);
+        let step = crate::mem::guard::forbid_alloc(|| {
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .advance_manifest_publication(&mut engine.storage)
+        })
+        .unwrap();
+        let after = marker_count(&engine);
+        assert!(before.saturating_sub(after) <= 64);
+        if !inserted_later_delete && after > 0 && after < before {
+            let changed = run_with(
+                &mut engine,
+                &mut budget,
+                "DELETE FROM bounded_markers WHERE id=129; \
+                 UPDATE bounded_other SET id=2; \
+                 SELECT count(*) FROM bounded_markers",
+            );
+            assert!(error_sqlstates(&changed).is_empty());
+            assert_eq!(data_rows(&changed), ["0"]);
+            inserted_later_delete = true;
+        }
+        if let crate::checkpoint::CheckpointStep::Published { lsn } = step {
+            published = Some(lsn);
+            break;
+        }
+    }
+    assert!(inserted_later_delete);
+    assert_eq!(marker_count(&engine), 1);
+    let lsn = published.expect("bounded installation completes");
+    engine.begin_checkpoint_cleanup(lsn);
+    engine.finish_local_cleanup().unwrap();
+    let query = "SELECT count(*) FROM bounded_markers; SELECT id FROM bounded_other";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, query)),
+        ["0", "2"]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+        ["0", "2"]
+    );
+    drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

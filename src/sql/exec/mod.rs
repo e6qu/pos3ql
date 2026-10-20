@@ -32527,7 +32527,7 @@ pub(crate) fn drop_operator_classes(
     sql_ok()
 }
 
-const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + 2 * (1 + 63));
+const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + (1 + 63) + (1 + 128));
 
 fn encode_routine_signature<'a>(
     arguments: &[crate::storage::RoutineArgumentDef],
@@ -32552,7 +32552,7 @@ fn encode_routine_signature<'a>(
             Some(identity) => {
                 output[at] = 1;
                 at += 1;
-                for name in [identity.schema.as_str(), identity.name.as_str()] {
+                for name in [identity.schema.as_str(), identity.storage_name().as_str()] {
                     output[at] = u8::try_from(name.len()).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -40761,7 +40761,11 @@ pub fn create_domain(
     };
     let lsn = storage.bump_lsn();
     let definition = storage.domain(slot);
-    if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateDomain(&definition)) {
+    if let Err(e) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::CreateDomain(slot as u16, &definition),
+    ) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -41811,7 +41815,7 @@ pub fn alter_domain(
     if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
-        &WalOp::CreateDomain(&storage.domain_for(slot, txn.txid)),
+        &WalOp::CreateDomain(slot as u16, &storage.domain_for(slot, txn.txid)),
     ) {
         storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
@@ -42085,6 +42089,8 @@ pub fn create_enum(
         txn.txid,
         lsn,
         &WalOp::CreateEnum {
+            slot: slot as u16,
+            created_at: storage.enum_for(slot, txn.txid).created_at,
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
             members: spec.members,
@@ -44939,6 +44945,8 @@ pub fn alter_type(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
+                    slot: slot as u16,
+                    created_at: storage.enum_for(slot, txn.txid).created_at,
                     schema: current_schema.as_str(),
                     name: current_name.as_str(),
                     members: altered,
@@ -45145,6 +45153,8 @@ pub fn alter_type(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
+                    slot: slot as u16,
+                    created_at: storage.enum_for(slot, txn.txid).created_at,
                     schema: current_schema.as_str(),
                     name: current_name.as_str(),
                     members: altered,
@@ -46072,7 +46082,10 @@ fn rewrite_composite_dependent_domains(
         if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
-            &WalOp::CreateDomain(&storage.domain_for(domain_slot, txn.txid)),
+            &WalOp::CreateDomain(
+                domain_slot as u16,
+                &storage.domain_for(domain_slot, txn.txid),
+            ),
         ) {
             storage.rollback_domain_alter(domain_slot, prior);
             return Err(error);

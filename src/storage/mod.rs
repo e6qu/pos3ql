@@ -25,7 +25,7 @@ mod type_references;
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
-use type_names::NamedTypeSlot;
+pub(crate) use type_names::NamedTypeSlot;
 pub(crate) use type_references::StorageSetupError;
 pub(crate) mod foreign;
 mod partition_rows;
@@ -6599,7 +6599,7 @@ fn polymorphic_type(ctype: ColType, user_type: Option<UserTypeName>) -> Option<P
     let identity = user_type?;
     match identity.binding {
         type_references::TypeBinding::Polymorphic(kind) => Some(kind),
-        type_references::TypeBinding::Captured(_) => None,
+        type_references::TypeBinding::Captured(_) | type_references::TypeBinding::Stored(_) => None,
         type_references::TypeBinding::Declaration => (identity.schema.as_str() == "pg_catalog")
             .then(|| PolymorphicType::from_name(identity.name.as_str()))
             .flatten(),
@@ -7939,7 +7939,7 @@ impl AggregateRoutine {
             if let Some(identity) = value.user_type {
                 hex(out, identity.schema.as_str())?;
                 out.write_str(" ")?;
-                hex(out, identity.name.as_str())
+                hex(out, identity.storage_name().as_str())
             } else {
                 out.write_str("- -")
             }
@@ -8086,11 +8086,14 @@ impl AggregateRoutine {
                 None
             } else {
                 let schema = decode_hex::<63>(schema)?;
-                let name = decode_hex::<63>(name)?;
-                Some(UserTypeName::declaration(
-                    SqlName::parse(schema.as_str()).ok()?,
-                    SqlName::parse(name.as_str()).ok()?,
-                ))
+                let name = decode_hex::<128>(name)?;
+                Some(
+                    UserTypeName::from_storage(
+                        SqlName::parse(schema.as_str()).ok()?,
+                        name.as_str(),
+                    )
+                    .ok()?,
+                )
             };
             Some(RoutineResult { ctype, user_type })
         }
@@ -13585,7 +13588,6 @@ impl CatalogSequence {
             .fetch_max(value, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     fn current(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -38866,15 +38868,15 @@ impl Storage {
         }
         if !defer_manifest_binding {
             if let Some(parent) = spec.base_domain {
-                spec.base_domain = self
-                    .bind_routine_result(
-                        RoutineResult {
-                            ctype: spec.base,
-                            user_type: Some(parent),
-                        },
-                        txid,
-                    )?
-                    .user_type;
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(parent),
+                    },
+                    txid,
+                )?;
+                spec.base = result.ctype;
+                spec.base_domain = result.user_type;
             }
             if let Some(base) = spec.base_user_type {
                 let result = self.bind_routine_result(
@@ -39235,15 +39237,15 @@ impl Storage {
     ) -> Result<Option<PendingDomainDefinition>, SqlError> {
         for identity in [&mut spec.base_domain, &mut spec.base_user_type] {
             if let Some(name) = *identity {
-                *identity = self
-                    .bind_routine_result(
-                        RoutineResult {
-                            ctype: spec.base,
-                            user_type: Some(name),
-                        },
-                        txid,
-                    )?
-                    .user_type;
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(name),
+                    },
+                    txid,
+                )?;
+                spec.base = result.ctype;
+                *identity = result.user_type;
             }
         }
         let mut catalog = self
@@ -40521,33 +40523,21 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        for field in spec.fields.iter_mut().take(spec.n_fields) {
-            let Some(identity) = field.user_type else {
-                continue;
-            };
-            if let Some(ctype) = match field.ctype {
-                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => self
-                    .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|type_slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Enum(type_slot as u16))
-                        } else {
-                            ColType::Enum(type_slot as u16)
-                        }
-                    }),
-                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => self
-                    .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|type_slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Composite(type_slot as u16))
-                        } else {
-                            ColType::Composite(type_slot as u16)
-                        }
-                    }),
-                _ => None,
-            } {
-                field.ctype = ctype;
-            }
+        for field in spec
+            .fields
+            .iter_mut()
+            .take(spec.n_fields)
+            .filter(|field| !field.dropped)
+        {
+            let result = self.bind_routine_result(
+                RoutineResult {
+                    ctype: field.ctype,
+                    user_type: field.user_type,
+                },
+                txid,
+            )?;
+            field.ctype = result.ctype;
+            field.user_type = result.user_type;
         }
         let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);

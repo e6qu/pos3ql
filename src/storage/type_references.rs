@@ -117,6 +117,112 @@ impl TypeIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StoredTypeIdentity {
+    source: CapturedTypeSlot,
+    pub(super) created_at: u64,
+}
+
+impl StoredTypeIdentity {
+    pub(super) fn slot(self) -> NamedTypeSlot {
+        match self.source {
+            CapturedTypeSlot::Domain(index) => NamedTypeSlot::Domain(usize::from(index)),
+            CapturedTypeSlot::Enum(index) => NamedTypeSlot::Enum(usize::from(index)),
+            CapturedTypeSlot::Composite(index) => NamedTypeSlot::Composite(usize::from(index)),
+        }
+    }
+}
+
+impl UserTypeName {
+    /// One encoding is shared by WAL, manifests and aggregate type fields.
+    /// Prefixing every name makes quoted SQL names containing ':' unambiguous.
+    pub(crate) fn storage_name(self) -> crate::util::StackStr<128> {
+        use core::fmt::Write;
+        let mut output = crate::util::StackStr::new();
+        let stored = match self.binding {
+            TypeBinding::Captured(key) => Some(StoredTypeIdentity {
+                source: key.source,
+                created_at: key.created_at,
+            }),
+            TypeBinding::Stored(key) => Some(key),
+            TypeBinding::Declaration | TypeBinding::Polymorphic(_) => None,
+        };
+        if let Some(key) = stored {
+            let (kind, slot) = match key.source {
+                CapturedTypeSlot::Domain(slot) => ('d', slot),
+                CapturedTypeSlot::Enum(slot) => ('e', slot),
+                CapturedTypeSlot::Composite(slot) => ('c', slot),
+            };
+            write!(
+                output,
+                "r:{kind}:{slot}:{}:{}",
+                key.created_at,
+                self.name.as_str()
+            )
+            .expect("bounded stored type name");
+        } else {
+            let prefix = if matches!(self.binding, TypeBinding::Polymorphic(_)) {
+                'p'
+            } else {
+                'n'
+            };
+            write!(output, "{prefix}:{}", self.name.as_str()).expect("bounded stored type name");
+        }
+        output
+    }
+
+    pub(crate) fn from_storage(schema: SqlName, encoded: &str) -> Result<Self, SqlError> {
+        let invalid = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "invalid stored type identity");
+        if let Some(name) = encoded.strip_prefix("n:") {
+            return Ok(Self::declaration(schema, SqlName::parse(name)?));
+        }
+        if let Some(name) = encoded.strip_prefix("p:") {
+            if schema.as_str() != "pg_catalog" {
+                return Err(invalid());
+            }
+            return PolymorphicType::from_name(name)
+                .map(Self::polymorphic)
+                .ok_or_else(invalid);
+        }
+        let mut fields = encoded
+            .strip_prefix("r:")
+            .ok_or_else(invalid)?
+            .splitn(4, ':');
+        let kind = fields.next().ok_or_else(invalid)?;
+        let slot: u16 = fields
+            .next()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        let created_at: u64 = fields
+            .next()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        let name = SqlName::parse(fields.next().ok_or_else(invalid)?)?;
+        let source = match kind {
+            "d" if usize::from(slot) < super::MAX_DOMAIN_CATALOG_SLOTS => {
+                CapturedTypeSlot::Domain(slot)
+            }
+            "e" if usize::from(slot) < super::MAX_ENUM_CATALOG_SLOTS => {
+                CapturedTypeSlot::Enum(slot)
+            }
+            "c" if usize::from(slot) < super::MAX_COMPOSITE_CATALOG_SLOTS => {
+                CapturedTypeSlot::Composite(slot)
+            }
+            _ => return Err(invalid()),
+        };
+        if created_at == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            schema,
+            name,
+            binding: TypeBinding::Stored(StoredTypeIdentity { source, created_at }),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,7 +232,7 @@ mod tests {
         use core::mem::size_of;
         assert_eq!(size_of::<CapturedTypeSlot>(), 4);
         assert_eq!(size_of::<TypeIdentity>(), 24);
-        assert_eq!(size_of::<TypeBinding>(), 32);
+        assert!(size_of::<TypeBinding>() <= 32);
         for source in [
             NamedTypeSlot::Domain(0),
             NamedTypeSlot::Enum(65535),
@@ -136,6 +242,34 @@ mod tests {
                 TypeIdentity::new(TypeOrigin::new().unwrap(), DatabaseOid::POSTGRES, source, 1);
             assert_eq!(identity.slot(), source);
         }
+    }
+
+    #[test]
+    fn stored_type_names_preserve_sql_prefixes_and_reject_invalid_keys() {
+        let schema = SqlName::parse("public").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for name in ["n:plain", "r:d:0:1:quoted:name", "p:anyelement", "é:名"] {
+                let original = UserTypeName::declaration(schema, SqlName::parse(name).unwrap());
+                let encoded = original.storage_name();
+                assert_eq!(
+                    UserTypeName::from_storage(schema, encoded.as_str()).unwrap(),
+                    original
+                );
+            }
+            for encoded in [
+                "plain",
+                "r:z:0:1:x",
+                "r:d:65536:1:x",
+                "r:d:0:0:x",
+                "r:d:0:1",
+                "p:anyelement",
+            ] {
+                assert!(
+                    UserTypeName::from_storage(schema, encoded).is_err(),
+                    "{encoded}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -159,6 +293,7 @@ mod tests {
 pub(super) enum TypeBinding {
     Declaration,
     Captured(TypeIdentity),
+    Stored(StoredTypeIdentity),
     Polymorphic(PolymorphicType),
 }
 
@@ -189,6 +324,7 @@ impl PartialEq for UserTypeName {
         match (self.binding, other.binding) {
             (TypeBinding::Captured(left), TypeBinding::Captured(right)) => left == right,
             (TypeBinding::Polymorphic(left), TypeBinding::Polymorphic(right)) => left == right,
+            (TypeBinding::Stored(left), TypeBinding::Stored(right)) => left == right,
             (TypeBinding::Declaration, TypeBinding::Declaration) => {
                 self.schema == other.schema && self.name == other.name
             }
@@ -258,6 +394,14 @@ impl TypeCatalog {
                 Ok(self
                     .type_snapshot(key.slot(), transaction)?
                     .filter(|snapshot| snapshot.identity == key))
+            }
+            TypeBinding::Stored(key) => {
+                Ok(self
+                    .type_snapshot(key.slot(), transaction)?
+                    .filter(|snapshot| {
+                        snapshot.identity.database == database
+                            && snapshot.identity.created_at == key.created_at
+                    }))
             }
             TypeBinding::Declaration => self.lookup_reference_name(identity, database, transaction),
             TypeBinding::Polymorphic(_) => Ok(None),
@@ -427,6 +571,13 @@ impl TypeCatalog {
                 )
             })?;
         let ctype = snapshot.representation(result.ctype)?;
+        if matches!(identity.binding, TypeBinding::Stored(_)) && ctype.code() != result.ctype.code()
+        {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "stored type reference has an invalid representation"
+            ));
+        }
         if matches!(identity.binding, TypeBinding::Captured(_)) && ctype != result.ctype {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -588,5 +739,100 @@ impl super::Storage {
             super::type_contracts::CatalogTypes::Class(&mut class.definition).try_for_each(bind)?;
         }
         Ok(())
+    }
+}
+
+impl super::Storage {
+    pub(crate) fn catalog_identity_sequence(&self) -> u64 {
+        self.catalog_sequence.current()
+    }
+
+    pub(crate) fn restore_catalog_identity_sequence(&self, value: u64) {
+        self.catalog_sequence.observe(value);
+    }
+
+    /// Recovery creates a complete object under exclusive access, then installs
+    /// its recorded slot and lifetime before any dependent declaration binds.
+    pub(crate) fn restore_type_identity(
+        &mut self,
+        allocated: NamedTypeSlot,
+        target: NamedTypeSlot,
+        created_at: u64,
+    ) -> Result<(), SqlError> {
+        if created_at == 0 {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type creation identity is zero"
+            ));
+        }
+        let invalid = || {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type catalog slot is unavailable"
+            )
+        };
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let old = allocated.index();
+        let new = target.index();
+        match (allocated, target) {
+            (NamedTypeSlot::Domain(_), NamedTypeSlot::Domain(_)) => {
+                if new >= catalog.domains.len()
+                    || old >= catalog.domains.len()
+                    || old != new
+                        && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
+                {
+                    return Err(invalid());
+                }
+                catalog.domains.swap(old, new);
+                catalog.domains[new].created_at = created_at;
+            }
+            (NamedTypeSlot::Enum(_), NamedTypeSlot::Enum(_)) => {
+                if new >= catalog.enums.len()
+                    || old >= catalog.enums.len()
+                    || old != new && catalog.enums[new].ddl_state != super::CatalogDdlState::Absent
+                {
+                    return Err(invalid());
+                }
+                catalog.enums.swap(old, new);
+                catalog.enums[new].created_at = created_at;
+            }
+            (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_)) => {
+                if new >= catalog.composites.len()
+                    || old >= catalog.composites.len()
+                    || old != new
+                        && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
+                {
+                    return Err(invalid());
+                }
+                catalog.composites.swap(old, new);
+                catalog.composites[new].created_at = created_at;
+            }
+            _ => return Err(invalid()),
+        }
+        self.catalog_sequence.observe(created_at);
+        Ok(())
+    }
+}
+
+impl super::Storage {
+    pub(crate) fn finish_recovered_type_sources(&mut self) -> Result<(), SqlError> {
+        let selected = self.current_database_oid();
+        let result = (|| {
+            for slot in 0..self.database_count() {
+                let database = self.database(slot);
+                if !database.visible_to(0) {
+                    continue;
+                }
+                self.select_database_for_recovery(database.oid)?;
+                self.rebind_domain_base_types()?;
+                self.rebind_user_type_declarations()?;
+            }
+            Ok(())
+        })();
+        self.select_database_for_recovery(selected)?;
+        result
     }
 }

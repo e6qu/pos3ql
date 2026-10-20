@@ -171,12 +171,13 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v16";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v17";
 
 struct ManifestMetadata {
     lsn: u64,
     next_rowid: u64,
     latest_transaction_id: u64,
+    catalog_sequence: u64,
     next_large_object_oid: Option<crate::sql::ast::LargeObjectId>,
     writer: WriterToken,
     writer_range: (usize, usize),
@@ -190,10 +191,12 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
     let mut lsn = None;
     let mut next_rowid = None;
     let mut latest_transaction_id = None;
+    let mut catalog_sequence = None;
     let mut next_large_object_oid = None;
     let mut writer = None;
     let mut writer_range = None;
     let mut ended = false;
+    let mut types_finished = false;
     let mut offset = header.len() + 1;
     for line in body.split_inclusive('\n') {
         if ended {
@@ -240,6 +243,18 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 );
                 true
             }
+            Some("catalog_sequence") => {
+                if catalog_sequence.is_some() {
+                    return Err("duplicate catalog identity allocator");
+                }
+                catalog_sequence = Some(
+                    words
+                        .next()
+                        .and_then(|word| word.parse().ok())
+                        .ok_or("invalid catalog identity allocator")?,
+                );
+                true
+            }
             Some("next_lo_oid") => {
                 if next_large_object_oid.is_some() {
                     return Err("duplicate large-object allocator");
@@ -279,6 +294,16 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 writer_range = Some((offset, offset + content.len()));
                 true
             }
+            Some("types_end") => {
+                if types_finished {
+                    return Err("duplicate type catalog boundary");
+                }
+                types_finished = true;
+                true
+            }
+            Some("dom5" | "enm2" | "cmp2") if types_finished => {
+                return Err("type source follows its catalog boundary");
+            }
             Some("end") => {
                 ended = true;
                 true
@@ -293,11 +318,15 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
     if !ended {
         return Err("manifest has no final terminator");
     }
+    if !types_finished {
+        return Err("manifest lacks type catalog boundary");
+    }
     Ok(ManifestMetadata {
         lsn: lsn.ok_or("manifest LSN missing")?,
         next_rowid: next_rowid.ok_or("manifest lacks row identity allocator")?,
         latest_transaction_id: latest_transaction_id
             .ok_or("manifest lacks transaction identity allocator")?,
+        catalog_sequence: catalog_sequence.ok_or("manifest lacks catalog identity allocator")?,
         next_large_object_oid: next_large_object_oid
             .ok_or("manifest lacks large-object allocator")?,
         writer: writer.ok_or("manifest writer identity missing")?,
@@ -3649,6 +3678,7 @@ impl Checkpointer {
         let metadata = parse_manifest_metadata(text).map_err(CheckpointSetupError::Corrupt)?;
         let lsn = metadata.lsn;
         let next_rowid = metadata.next_rowid;
+        storage.restore_catalog_identity_sequence(metadata.catalog_sequence);
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
@@ -3682,8 +3712,22 @@ impl Checkpointer {
         for line in lines {
             let mut words = line.split(' ');
             match words.next() {
-                Some("lsn" | "next_rowid" | "latest_transaction_id" | "next_lo_oid" | "writer") => {
+                Some("types_end") => {
+                    storage.finish_recovered_type_sources().map_err(|error| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "manifest type sources rejected: {}",
+                            error.message.as_str()
+                        ))
+                    })?;
                 }
+                Some(
+                    "lsn"
+                    | "next_rowid"
+                    | "latest_transaction_id"
+                    | "next_lo_oid"
+                    | "catalog_sequence"
+                    | "writer",
+                ) => {}
                 Some("transaction_status") => {
                     let transaction_id = parse_field(words.next(), "transaction_status")?;
                     let committed = match words.next() {
@@ -3937,13 +3981,15 @@ impl Checkpointer {
                     let domain = if domain_hex == "0" {
                         None
                     } else {
-                        Some(sql_name(&decode_hex_name(domain_hex)?)?)
+                        Some(decode_hex_name(domain_hex)?)
                     };
                     let user_type = match (user_type_schema, domain) {
                         (None, None) => None,
-                        (Some(schema), Some(name)) => {
-                            Some(crate::storage::UserTypeName::declaration(schema, name))
-                        }
+                        (Some(schema), Some(name)) => Some(
+                            crate::storage::UserTypeName::from_storage(schema, &name).map_err(
+                                |_| CheckpointSetupError::Corrupt("invalid column type identity"),
+                            )?,
+                        ),
                         _ => {
                             return Err(CheckpointSetupError::Corrupt(
                                 "column user type identity is incomplete",
@@ -5662,10 +5708,15 @@ impl Checkpointer {
                         argument.user_type = if schema == "-" && name == "-" {
                             None
                         } else {
-                            Some(crate::storage::UserTypeName::declaration(
-                                sql_name(&decode_hex_name(schema)?)?,
-                                sql_name(&decode_hex_name(name)?)?,
-                            ))
+                            Some(
+                                crate::storage::UserTypeName::from_storage(
+                                    sql_name(&decode_hex_name(schema)?)?,
+                                    &decode_hex_name(name)?,
+                                )
+                                .map_err(|_| {
+                                    CheckpointSetupError::Corrupt("invalid stored type identity")
+                                })?,
+                            )
                         };
                     }
                     let parameter_count: usize =
@@ -5692,10 +5743,15 @@ impl Checkpointer {
                         parameter.user_type = if schema == "-" && name == "-" {
                             None
                         } else {
-                            Some(crate::storage::UserTypeName::declaration(
-                                sql_name(&decode_hex_name(schema)?)?,
-                                sql_name(&decode_hex_name(name)?)?,
-                            ))
+                            Some(
+                                crate::storage::UserTypeName::from_storage(
+                                    sql_name(&decode_hex_name(schema)?)?,
+                                    &decode_hex_name(name)?,
+                                )
+                                .map_err(|_| {
+                                    CheckpointSetupError::Corrupt("invalid stored type identity")
+                                })?,
+                            )
                         };
                         let mode: u8 = parse_field(words.next(), "routine parameter mode")?;
                         let default_word = words.next().ok_or(CheckpointSetupError::Corrupt(
@@ -5824,10 +5880,15 @@ impl Checkpointer {
                     let result_user_type = if result_schema == "-" && result_name == "-" {
                         None
                     } else {
-                        Some(crate::storage::UserTypeName::declaration(
-                            sql_name(&decode_hex_name(result_schema)?)?,
-                            sql_name(&decode_hex_name(result_name)?)?,
-                        ))
+                        Some(
+                            crate::storage::UserTypeName::from_storage(
+                                sql_name(&decode_hex_name(result_schema)?)?,
+                                &decode_hex_name(result_name)?,
+                            )
+                            .map_err(|_| {
+                                CheckpointSetupError::Corrupt("invalid stored type identity")
+                            })?,
+                        )
                     };
                     let result = crate::storage::RoutineResult {
                         ctype: ColType::from_code(result_code)
@@ -5866,10 +5927,17 @@ impl Checkpointer {
                                 column.user_type = if schema == "-" && name == "-" {
                                     None
                                 } else {
-                                    Some(crate::storage::UserTypeName::declaration(
-                                        sql_name(&decode_hex_name(schema)?)?,
-                                        sql_name(&decode_hex_name(name)?)?,
-                                    ))
+                                    Some(
+                                        crate::storage::UserTypeName::from_storage(
+                                            sql_name(&decode_hex_name(schema)?)?,
+                                            &decode_hex_name(name)?,
+                                        )
+                                        .map_err(|_| {
+                                            CheckpointSetupError::Corrupt(
+                                                "invalid stored type identity",
+                                            )
+                                        })?,
+                                    )
                                 };
                             }
                             crate::storage::RoutineKind::from_wire_code(code, result)
@@ -7078,10 +7146,22 @@ impl Checkpointer {
                         log_count,
                     );
                 }
-                tag @ (Some("dom") | Some("dom2") | Some("dom3") | Some("dom4")) => {
-                    let has_parent = matches!(tag, Some("dom2") | Some("dom3") | Some("dom4"));
-                    let has_base_identity = matches!(tag, Some("dom3") | Some("dom4"));
-                    let has_validation = tag == Some("dom4");
+                Some("dom5") => {
+                    let source_slot: usize = parse_field(words.next(), "domain source slot")?;
+                    if source_slot >= storage.domain_count() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "stored domain slot exceeds configured capacity",
+                        ));
+                    }
+                    let created_at: u64 = parse_field(words.next(), "domain source lifetime")?;
+                    if created_at == 0 || created_at > metadata.catalog_sequence {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid domain source lifetime",
+                        ));
+                    }
+                    let has_parent = true;
+                    let has_base_identity = true;
+                    let has_validation = true;
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -7143,10 +7223,15 @@ impl Checkpointer {
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
                     {
                         (true, true) => None,
-                        (false, false) => Some(crate::storage::UserTypeName::declaration(
-                            sql_name(&base_domain_schema)?,
-                            sql_name(&base_domain)?,
-                        )),
+                        (false, false) => Some(
+                            crate::storage::UserTypeName::from_storage(
+                                sql_name(&base_domain_schema)?,
+                                &base_domain,
+                            )
+                            .map_err(|_| {
+                                CheckpointSetupError::Corrupt("invalid stored type identity")
+                            })?,
+                        ),
                         _ => {
                             return Err(CheckpointSetupError::Corrupt(
                                 "domain parent identity is incomplete",
@@ -7156,10 +7241,15 @@ impl Checkpointer {
                     let base_user_type =
                         match (base_user_type.is_empty(), base_user_type_schema.is_empty()) {
                             (true, true) => None,
-                            (false, false) => Some(crate::storage::UserTypeName::declaration(
-                                sql_name(&base_user_type_schema)?,
-                                sql_name(&base_user_type)?,
-                            )),
+                            (false, false) => Some(
+                                crate::storage::UserTypeName::from_storage(
+                                    sql_name(&base_user_type_schema)?,
+                                    &base_user_type,
+                                )
+                                .map_err(|_| {
+                                    CheckpointSetupError::Corrupt("invalid stored type identity")
+                                })?,
+                            ),
                             _ => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "domain base type identity is incomplete",
@@ -7177,7 +7267,7 @@ impl Checkpointer {
                         checks,
                         n_checks,
                     };
-                    storage
+                    let allocated = storage
                         .create_domain_from_manifest(sql_name(&schema)?, sql_name(&name)?, spec)
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -7185,8 +7275,27 @@ impl Checkpointer {
                                 e.message.as_str()
                             ))
                         })?;
+                    storage
+                        .restore_type_identity(
+                            crate::storage::NamedTypeSlot::Domain(allocated),
+                            crate::storage::NamedTypeSlot::Domain(source_slot),
+                            created_at,
+                        )
+                        .map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid restored domain identity")
+                        })?;
                 }
-                Some("enm") => {
+                Some("enm2") => {
+                    let source_slot: usize = parse_field(words.next(), "enm source slot")?;
+                    if source_slot >= storage.enum_count() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "stored enm slot exceeds configured capacity",
+                        ));
+                    }
+                    let created_at: u64 = parse_field(words.next(), "enm source lifetime")?;
+                    if created_at == 0 || created_at > metadata.catalog_sequence {
+                        return Err(CheckpointSetupError::Corrupt("invalid enm source lifetime"));
+                    }
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let hexstr = |w: Option<&str>,
                                   what: &'static str|
@@ -7228,7 +7337,7 @@ impl Checkpointer {
                         };
                     }
                     drop(members);
-                    storage
+                    let allocated = storage
                         .finish_enum_replay(sql_name(&schema)?, sql_name(&name)?, n_members)
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -7236,8 +7345,27 @@ impl Checkpointer {
                                 e.message.as_str()
                             ))
                         })?;
+                    storage
+                        .restore_type_identity(
+                            crate::storage::NamedTypeSlot::Enum(allocated),
+                            crate::storage::NamedTypeSlot::Enum(source_slot),
+                            created_at,
+                        )
+                        .map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid restored enm identity")
+                        })?;
                 }
-                Some("cmp") => {
+                Some("cmp2") => {
+                    let source_slot: usize = parse_field(words.next(), "cmp source slot")?;
+                    if source_slot >= storage.composite_count() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "stored cmp slot exceeds configured capacity",
+                        ));
+                    }
+                    let created_at: u64 = parse_field(words.next(), "cmp source lifetime")?;
+                    if created_at == 0 || created_at > metadata.catalog_sequence {
+                        return Err(CheckpointSetupError::Corrupt("invalid cmp source lifetime"));
+                    }
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let hexstr = |w: Option<&str>,
                                   what: &'static str|
@@ -7298,10 +7426,15 @@ impl Checkpointer {
                         let user_name = hexstr(words.next(), "cmp field user name missing")?;
                         let user_type = match (user_schema.is_empty(), user_name.is_empty()) {
                             (true, true) => None,
-                            (false, false) => Some(crate::storage::UserTypeName::declaration(
-                                sql_name(&user_schema)?,
-                                sql_name(&user_name)?,
-                            )),
+                            (false, false) => Some(
+                                crate::storage::UserTypeName::from_storage(
+                                    sql_name(&user_schema)?,
+                                    &user_name,
+                                )
+                                .map_err(|_| {
+                                    CheckpointSetupError::Corrupt("invalid stored type identity")
+                                })?,
+                            ),
                             _ => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "composite field user type identity is incomplete",
@@ -7320,7 +7453,7 @@ impl Checkpointer {
                             not_null,
                         };
                     }
-                    storage
+                    let allocated = storage
                         .create_composite_from_manifest(
                             sql_name(&schema)?,
                             sql_name(&name)?,
@@ -7331,6 +7464,15 @@ impl Checkpointer {
                                 "manifest composite rejected: {}",
                                 e.message.as_str()
                             ))
+                        })?;
+                    storage
+                        .restore_type_identity(
+                            crate::storage::NamedTypeSlot::Composite(allocated),
+                            crate::storage::NamedTypeSlot::Composite(source_slot),
+                            created_at,
+                        )
+                        .map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid restored cmp identity")
                         })?;
                 }
                 Some("ext") => {
@@ -8993,6 +9135,10 @@ impl Checkpointer {
         write_manifest(&mut self.manifest_output, format_args!("lsn {lsn}"))?;
         write_manifest(
             &mut self.manifest_output,
+            format_args!("catalog_sequence {}", storage.catalog_identity_sequence()),
+        )?;
+        write_manifest(
+            &mut self.manifest_output,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
         let mut identity_result = Ok(());
@@ -9350,7 +9496,13 @@ impl Checkpointer {
         // [<hex-cname> <hex-cexpr> <validation>]...`. Like enums, domains precede tables
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
-        for (_, d) in storage.checkpoint_domains() {
+        for (slot, d) in storage.checkpoint_domains() {
+            let parent_name = d
+                .base_domain
+                .map(crate::storage::UserTypeName::storage_name);
+            let base_name = d
+                .base_user_type
+                .map(crate::storage::UserTypeName::storage_name);
             write_database_context(&mut self.manifest_output, &mut database_context, d.database)?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
@@ -9365,7 +9517,9 @@ impl Checkpointer {
             };
             let _ = write!(
                 line,
-                "dom4 {} {} {} {} ",
+                "dom5 {} {} {} {} {} {} ",
+                slot,
+                d.created_at,
                 d.base.code(),
                 d.base_type_mod,
                 u8::from(d.not_null),
@@ -9377,10 +9531,7 @@ impl Checkpointer {
             let _ = write!(line, " ");
             hex(
                 &mut line,
-                d.base_domain
-                    .as_ref()
-                    .map(|identity| identity.name.as_str())
-                    .unwrap_or(""),
+                parent_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
             );
             let _ = write!(line, " ");
             hex(
@@ -9393,10 +9544,7 @@ impl Checkpointer {
             let _ = write!(line, " ");
             hex(
                 &mut line,
-                d.base_user_type
-                    .as_ref()
-                    .map(|identity| identity.name.as_str())
-                    .unwrap_or(""),
+                base_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
             );
             let _ = write!(line, " ");
             hex(
@@ -9438,7 +9586,8 @@ impl Checkpointer {
                 }
                 Ok(())
             };
-            write!(&mut self.manifest_output, "enm ").map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_output, "enm2 {} {} ", slot, e.created_at)
+                .map_err(|_| manifest_full())?;
             hex(&mut self.manifest_output, e.schema.as_str()).map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
             hex(&mut self.manifest_output, e.name.as_str()).map_err(|_| manifest_full())?;
@@ -9460,7 +9609,7 @@ impl Checkpointer {
         }
         // Named composites precede tables because composite columns rebind by
         // catalog identity while the table definitions are restored.
-        for (_, definition) in storage.checkpoint_composites() {
+        for (slot, definition) in storage.checkpoint_composites() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -9475,13 +9624,18 @@ impl Checkpointer {
             };
             write!(
                 &mut self.manifest_output,
-                "cmp {} {} {}",
+                "cmp2 {} {} {} {} {}",
+                slot,
+                definition.created_at,
                 ManifestZeroName(definition.schema.as_str()),
                 ManifestZeroName(definition.name.as_str()),
                 definition.n_fields
             )
             .map_err(|_| manifest_full())?;
             for field in definition.fields() {
+                let type_name = field
+                    .user_type
+                    .map(crate::storage::UserTypeName::storage_name);
                 write!(
                     &mut self.manifest_output,
                     " {} {} {} {} {} {} {} {} {}",
@@ -9499,18 +9653,13 @@ impl Checkpointer {
                             .map(|identity| identity.schema.as_str())
                             .unwrap_or("")
                     ),
-                    ManifestZeroName(
-                        field
-                            .user_type
-                            .as_ref()
-                            .map(|identity| identity.name.as_str())
-                            .unwrap_or("")
-                    )
+                    ManifestZeroName(type_name.as_ref().map(|name| name.as_str()).unwrap_or(""))
                 )
                 .map_err(|_| manifest_full())?;
             }
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
+        write_manifest(&mut self.manifest_output, "types_end")?;
         for (_, method) in storage.checkpoint_access_methods() {
             write_database_context(
                 &mut self.manifest_output,
@@ -9690,10 +9839,10 @@ impl Checkpointer {
                         let _ = write!(domain_schema_hex, "0");
                     }
                 }
-                let mut domain_hex = StackStr::<130>::new();
+                let mut domain_hex = StackStr::<256>::new();
                 match c.user_type {
                     Some(identity) => {
-                        for b in identity.name.as_str().as_bytes() {
+                        for b in identity.storage_name().as_str().as_bytes() {
                             let _ = write!(domain_hex, "{b:02x}");
                         }
                     }
@@ -10736,7 +10885,7 @@ impl Checkpointer {
                 for byte in identity.schema.as_str().as_bytes() {
                     let _ = write!(result_schema, "{byte:02x}");
                 }
-                for byte in identity.name.as_str().as_bytes() {
+                for byte in identity.storage_name().as_str().as_bytes() {
                     let _ = write!(result_name, "{byte:02x}");
                 }
             } else {
@@ -17924,7 +18073,7 @@ fn write_manifest_routine_type(
             output,
             " {} {}",
             ManifestName(identity.schema.as_str()),
-            ManifestName(identity.name.as_str())
+            ManifestName(identity.storage_name().as_str())
         ),
         None => output.write_str(" - -"),
     }
@@ -18090,7 +18239,7 @@ impl core::fmt::Display for ManifestRoutineResult {
                 output,
                 "{} {}",
                 ManifestName(identity.schema.as_str()),
-                ManifestName(identity.name.as_str())
+                ManifestName(identity.storage_name().as_str())
             ),
             None => output.write_str("- -"),
         }
@@ -18198,10 +18347,13 @@ fn manifest_routine_result(
                 "partial catalog type identity",
             ));
         }
-        _ => Some(crate::storage::UserTypeName::declaration(
-            sql_name(&decode_hex_name(schema)?)?,
-            sql_name(&decode_hex_name(name)?)?,
-        )),
+        _ => Some(
+            crate::storage::UserTypeName::from_storage(
+                sql_name(&decode_hex_name(schema)?)?,
+                &decode_hex_name(name)?,
+            )
+            .map_err(|_| CheckpointSetupError::Corrupt("invalid stored type identity"))?,
+        ),
     };
     Ok(crate::storage::RoutineResult { ctype, user_type })
 }
@@ -19091,7 +19243,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v16\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\nend\n",
+            "pos3ql-manifest-v17\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19495,7 +19647,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\n");
+                    let mut manifest = String::from("pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19521,7 +19673,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
+                        "pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19530,7 +19682,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v16\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
+                    let manifest = format!("pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -19672,7 +19824,7 @@ mod stored_dependency_tests {
         crate::mem::guard::forbid_alloc(|| {
             let current = stack_format!(
                 512,
-                "{MANIFEST_HEADER}\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter {:032x}\nend\n",
+                "{MANIFEST_HEADER}\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter {:032x}\ntypes_end\nend\n",
                 1u128
             );
             let parsed = parse_manifest_metadata(current.as_str()).unwrap();
@@ -19692,8 +19844,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v13",
                 "pos3ql-manifest-v14",
                 "pos3ql-manifest-v15",
-                "pos3ql-manifest-v17",
-                "pos3ql-manifest-v16 trailing",
+                "pos3ql-manifest-v18",
+                "pos3ql-manifest-v17 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -19770,11 +19922,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v16\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
+        let manifest = b"pos3ql-manifest-v17\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v16\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\nend\n";
+        let slot_only = b"pos3ql-manifest-v17\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -19987,7 +20139,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v16\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
+                b"pos3ql-manifest-v17\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();
@@ -20000,7 +20152,7 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v13",
             "pos3ql-manifest-v14",
             "pos3ql-manifest-v15",
-            "pos3ql-manifest-v17",
+            "pos3ql-manifest-v18",
         ] {
             let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());

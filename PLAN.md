@@ -42,8 +42,9 @@ Type-name publication now owns affected definitions and dependent catalogs
 together, releases all earlier owners before waiting, and uses startup-reserved
 space. Captured type references now identify their catalog, database and source
 lifetime. Definition submission validates them and refreshes names; recovery and
-template copies bind their declarations explicitly. Public type commits and the
-existing transaction barrier remain exclusive. Finish ownership across each
+template copies bind their declarations explicitly. Journal and checkpoint
+references retain source lifetimes across renames and reversed commit order.
+Public type commits and the existing transaction barrier remain exclusive. Finish ownership across each
 source check and dependent publication before removing those restrictions.
 Finish protection for engine-wide publication and remaining table rewrites. Retain historical row, index and backup references before
 publishing replacements. Heap maintenance, pressure waits, capture and

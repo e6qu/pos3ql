@@ -76085,7 +76085,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v16\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v17\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -76114,7 +76114,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v13",
         "pos3ql-manifest-v14",
         "pos3ql-manifest-v15",
-        "pos3ql-manifest-v17",
+        "pos3ql-manifest-v18",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -76271,7 +76271,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v16\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v17\n"))
     );
     drop(recovered);
 
@@ -90062,54 +90062,74 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
 }
 
 #[test]
-fn captured_type_references_keep_staged_journal_names_behind_schema_waits() {
-    let config = test_config("captured-type-journal-wait");
-    {
-        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut owner =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut rename =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        owner.success(&mut engine, "CREATE DOMAIN captured_code AS integer", true);
-        owner.success(
-            &mut engine,
-            "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
-            true,
-        );
-        let waiting = rename.execute(
-            &mut engine,
+fn captured_type_references_recover_journal_definitions_committed_after_a_rename() {
+    for (kind, declaration, rename_statement) in [
+        (
+            "domain",
+            "CREATE DOMAIN captured_code AS integer",
             "ALTER DOMAIN captured_code RENAME TO current_code",
-            true,
-        );
-        assert!(waiting.is_empty(), "{}", String::from_utf8_lossy(&waiting));
-        assert!(
-            engine
-                .storage
-                .domain_slot("public", "captured_code", 0)
-                .is_some()
-        );
-        assert!(
-            engine
-                .storage
-                .domain_slot("public", "current_code", 0)
-                .is_none()
-        );
-        owner.success(&mut engine, "COMMIT", true);
-        rename.success(
-            &mut engine,
-            "ALTER DOMAIN captured_code RENAME TO current_code",
-            true,
-        );
-        assert_eq!(data_rows(&rename.success(&mut engine,
-            "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid", true)), ["current_code"]);
-        engine.commit_wal().unwrap();
-    }
-    {
-        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid", true)), ["current_code"]);
+        ),
+        (
+            "enum",
+            "CREATE TYPE captured_code AS ENUM ('ready')",
+            "ALTER TYPE captured_code RENAME TO current_code",
+        ),
+        (
+            "composite",
+            "CREATE TYPE captured_code AS (value integer)",
+            "ALTER TYPE captured_code RENAME TO current_code",
+        ),
+    ] {
+        for checkpoint in [false, true] {
+            let mut config = test_config(&format!("captured-type-journal-{kind}-{checkpoint}"));
+            if checkpoint {
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.object_store_bucket =
+                    format!("captured-type-journal-{kind}-{}", std::process::id());
+                config.object_store_response_bytes = 1 << 20;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.wal_upload_buffer_bytes = 1 << 20;
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+            let snapshot = "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid";
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut owner =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+                let mut rename =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                owner.success(&mut engine, declaration, true);
+                owner.success(
+                    &mut engine,
+                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
+                    true,
+                );
+                rename.success(&mut engine, rename_statement, true);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                owner.success(&mut engine, "COMMIT", true);
+                assert_eq!(
+                    data_rows(&rename.success(&mut engine, snapshot, true)),
+                    ["current_code"]
+                );
+                engine.commit_wal().unwrap();
+            }
+            if checkpoint {
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+            }
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, snapshot, true)),
+                    ["current_code"]
+                );
+            }
+        }
     }
 }

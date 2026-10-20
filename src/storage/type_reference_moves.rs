@@ -53,6 +53,10 @@ impl TypeReferenceMove {
         };
         match identity.binding {
             TypeBinding::Captured(key) => return key == self.identity,
+            TypeBinding::Stored(key) => {
+                return key.slot() == self.identity.slot()
+                    && key.created_at == self.identity.created_at;
+            }
             TypeBinding::Polymorphic(_) => return false,
             TypeBinding::Declaration => {}
         }
@@ -226,10 +230,9 @@ impl TypePublication {
         Ok(())
     }
 
-    // The public caller requires &mut Storage: a by-value definition built
-    // before this move must not be submitted afterward with its old type name.
-    // This internal shared operation establishes the publication boundary; it
-    // does not make earlier reference construction safe for parallel writers.
+    // Exclusive callers remain necessary until final source validation and
+    // dependent submission share ownership. Captured lifetimes alone do not
+    // establish that publication boundary for parallel writers.
     fn publish(
         &self,
         storage: &Storage,
@@ -779,6 +782,69 @@ mod tests {
                 }
             });
             storage.select_database(DatabaseOid::POSTGRES).unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_type_references_keep_persisted_keys_through_moves_and_reuse() {
+        for kind in KINDS {
+            let (mut storage, table, _, movement) = fixture(kind);
+            let column = storage.table_def(table, 0).columns()[0];
+            let captured = column.user_type.unwrap();
+            let encoded = captured.storage_name();
+            let stored = UserTypeName::from_storage(captured.schema, encoded.as_str()).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                publish_move(&storage, movement);
+                let rebound = storage
+                    .bind_routine_result(
+                        RoutineResult {
+                            ctype: column.ctype,
+                            user_type: Some(stored),
+                        },
+                        0,
+                    )
+                    .unwrap();
+                assert_eq!(rebound.user_type, Some(captured));
+                assert!(
+                    rebound
+                        .user_type
+                        .unwrap()
+                        .is_named(movement.current.schema, movement.current.name)
+                );
+            });
+            match kind {
+                TypeReferenceKind::Domain => {
+                    storage.drop_domain("public", "current_type", 0).unwrap();
+                    storage.commit_domain_drop(movement.identity.slot().index());
+                }
+                TypeReferenceKind::Enum => {
+                    storage.drop_enum("public", "current_type", 0).unwrap();
+                    storage.commit_enum_drop(movement.identity.slot().index());
+                }
+                TypeReferenceKind::Composite => {
+                    storage.drop_composite("public", "current_type", 0).unwrap();
+                    storage.commit_composite_drop(movement.identity.slot().index());
+                }
+            }
+            assert_eq!(
+                create_kind(&mut storage, kind, movement.current).0,
+                movement.identity.slot().index()
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    storage
+                        .bind_routine_result(
+                            RoutineResult {
+                                ctype: column.ctype,
+                                user_type: Some(stored)
+                            },
+                            0
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                );
+            });
         }
     }
 

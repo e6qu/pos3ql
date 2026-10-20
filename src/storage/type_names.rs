@@ -7,7 +7,7 @@ use super::{
 use crate::sql_err;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum NamedTypeSlot {
+pub(crate) enum NamedTypeSlot {
     Domain(usize),
     Enum(usize),
     Composite(usize),

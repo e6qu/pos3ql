@@ -398,9 +398,10 @@ one field walk for binding and renames. Checkpoint declarations bind after their
 type catalogs exist. A database template copy explicitly binds copied references
 to the new database's types.
 
-Complete type-name changes still require exclusive storage access. The existing
-transaction barrier also keeps a rename behind other active transactions, which
-protects previously staged journal records. Removing those restrictions requires
+Complete type-name changes still require exclusive storage access. Saved journal references retain their source lifetime even when a rename commits
+before an older dependent definition. Checkpoints preserve the same identities
+and resolve type definitions before their dependents. Some schema changes still
+wait for retained snapshots. Removing the remaining restrictions requires
 ownership across final source validation and dependent publication; SQL CPU
 workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name

@@ -20,7 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v16` | yes | yes | Requires typed block identities; retains current enum member identities and legacy label bindings. |
+| Checkpoint manifest | `pos3ql-manifest-v17` | yes | yes | Requires durable type slots/lifetimes, a catalog identity counter and a completed type-loading boundary; retains typed blocks and enum member identities. |
+| Journal record | Version `1` at header byte 17; bytes 18–23 are zero | yes | yes | Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -37,7 +38,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v15 and older manifests are rejected before their references are used.
+Manifest v16 and older manifests are rejected before their references are used.
 
 ## Why the storage layout matters
 
@@ -160,7 +161,7 @@ identity. Row values keep this identity separately from their cached label and
 sort position. Catalog-aware reads select the current label and sort position.
 
 Manifest v15 adds an optional legacy label after each enum member's sort bits.
-Older manifests and enum journal kinds 23/147 initialize this binding from their
+The retained enum payload readers for kinds 23/147 initialize this binding from their
 labels. Journal kind 149 writes the current label, sort bits, and an optional
 legacy label for each member; it retains the u32 member count. Existing legacy
 bindings survive later label changes. No missing identity is guessed.
@@ -206,13 +207,13 @@ source use kind 154; their preceding table kind remains readable. These distinct
 survive prepared-transaction re-encoding. Bound view defaults use column-default
 tag 3; the preceding expression tag 2 remains readable.
 
-Legacy enum indexes hashed labels. Loading an older manifest explicitly retires
+Legacy enum indexes hashed labels. Legacy index records explicitly retire
 those generations and schedules replacements; scalar key hashes use stable member
 identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-journal kinds 149–154 or manifest v15. Kind 153 applies to ordinary row writes
+current journal records or manifest v17. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
 Journal routine type codes leave catalog slots unresolved until startup has
@@ -220,7 +221,43 @@ replayed all definitions. Enum and composite name moves update those declaration
 by their exact saved name as well; a missing name or a different resolved slot
 cannot select a type. Startup then binds the moved name to its current slot.
 
-### Composite type name changes
+### Type lifetimes and saved references
+
+**User example:** one connection creates a cast using `order_code` inside a
+transaction. Another connection renames that type to `current_code` and commits
+first. The first connection can then commit. After restart, the cast still
+refers to that same type, now named `current_code`. Its saved name cannot select
+a replacement that reused `order_code`.
+
+Manifest v17 and current journal records preserve the physical slot and
+`created_at` identity of each domain, enum and named composite. The required
+`catalog_sequence` manifest field remembers the highest creation number used,
+including objects deleted before checkpoint. Restore never assigns
+a fresh lifetime to a saved type. Slots are checked against configured capacity;
+zero creation identities, mismatched lifetimes and unavailable slots are errors.
+
+The manifest writes `dom5`, `enm2` and `cmp2` records before a required
+`types_end` record. At that boundary, recovery resolves domain chains and
+composite fields in each database before loading dependent definitions. Missing
+or duplicate boundaries and later type records are rejected.
+
+Every stored user-type name has an explicit prefix. `r:<kind>:<slot>:<creation>:<name>`
+identifies a bound type; kinds `d`, `e` and `c` mean domain, enum and composite.
+`n:<name>` is a declaration requiring binding; `p:<name>` is a validated
+PostgreSQL polymorphic type. The schema is stored separately and database scope
+comes from the enclosing record. The SQL name after the prefix retains its
+original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
+composites, routine signatures/results, aggregate types, casts and operator
+contracts share this encoding. Table definition payloads use version 5.
+
+Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
+0–15; byte 16 selects the operation; byte 17 is version 1; bytes 18–23 are zero.
+A checksum-valid unsupported version stops local replay without truncating the
+journal. Uploaded records validate the same version before decoding. Update all
+recovery candidates together and use a fresh prefix or verified logical transfer
+from an incompatible binary; no automatic conversion is provided.
+
+## Composite type name changes
 
 Renaming a composite type or moving it to another schema writes journal kind
 148. It contains the prior name, prior schema, new schema and new name, using
@@ -235,8 +272,7 @@ Prepared transactions retain the same name-change records through checkpoints.
 
 Binaries that predate kind 148 cannot recover a journal containing it. Upgrade
 all recovery and replacement candidates before executing composite type renames
-or schema moves; do not downgrade that prefix afterward. Existing manifest,
-composite definition and name-change record grammars remain readable.
+or schema moves; do not downgrade that prefix afterward. The current manifest and journal identities above apply to these records too.
 
 Full cast and operator catalog records freeze the transaction's current type
 names before journal staging. A domain rename followed by an operator, family
@@ -268,7 +304,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v15. Startup, backup retention, and
+The only accepted checkpoint manifest is v17. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

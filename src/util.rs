@@ -14,13 +14,13 @@ pub(crate) fn stderr_line(message: &str) {
 #[derive(Clone, Copy)]
 pub struct StackStr<const N: usize> {
     buffer: [u8; N],
-    len: usize,
-    truncated: bool,
+    // The high bit records truncation; the other bits hold the byte length.
+    length_and_truncation: u32,
 }
 
 impl<const N: usize> PartialEq for StackStr<N> {
     fn eq(&self, other: &Self) -> bool {
-        self.truncated == other.truncated && self.as_str() == other.as_str()
+        self.is_truncated() == other.is_truncated() && self.as_str() == other.as_str()
     }
 }
 
@@ -40,10 +40,13 @@ impl<const N: usize> fmt::Display for StackStr<N> {
 
 impl<const N: usize> StackStr<N> {
     pub const fn new() -> Self {
+        assert!(
+            N <= 0x7fff_ffff,
+            "fixed string capacity exceeds its length field"
+        );
         Self {
             buffer: [0; N],
-            len: 0,
-            truncated: false,
+            length_and_truncation: 0,
         }
     }
 
@@ -57,30 +60,28 @@ impl<const N: usize> StackStr<N> {
 
     pub fn as_str(&self) -> &str {
         // Only whole UTF-8 sequences are ever appended.
-        unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len]) }
+        unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len()]) }
     }
 
     pub fn is_truncated(&self) -> bool {
-        self.truncated
+        self.length_and_truncation & 0x8000_0000 != 0
     }
 
     pub fn clear(&mut self) {
-        self.len = 0;
-        self.truncated = false;
+        self.length_and_truncation = 0;
     }
 
     pub const fn len(&self) -> usize {
-        self.len
+        (self.length_and_truncation & 0x7fff_ffff) as usize
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     pub fn truncate(&mut self, len: usize) {
-        assert!(len <= self.len && self.as_str().is_char_boundary(len));
-        self.len = len;
-        self.truncated = false;
+        assert!(len <= self.len() && self.as_str().is_char_boundary(len));
+        self.length_and_truncation = len as u32;
     }
 }
 
@@ -92,19 +93,19 @@ impl<const N: usize> Default for StackStr<N> {
 
 impl<const N: usize> fmt::Write for StackStr<N> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let space = N - self.len;
+        let len = self.len();
+        let space = N - len;
         if s.len() <= space {
-            self.buffer[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
-            self.len += s.len();
+            self.buffer[len..len + s.len()].copy_from_slice(s.as_bytes());
+            self.length_and_truncation += s.len() as u32;
         } else {
             // Take the longest prefix that is still valid UTF-8.
             let mut cut = space;
             while cut > 0 && !s.is_char_boundary(cut) {
                 cut -= 1;
             }
-            self.buffer[self.len..self.len + cut].copy_from_slice(&s.as_bytes()[..cut]);
-            self.len += cut;
-            self.truncated = true;
+            self.buffer[len..len + cut].copy_from_slice(&s.as_bytes()[..cut]);
+            self.length_and_truncation = (len + cut) as u32 | 0x8000_0000;
         }
         Ok(())
     }
@@ -150,6 +151,32 @@ mod tests {
         reused.clear();
         reused.write_str("ok").unwrap();
         assert_eq!(reused, StackStr::from_str("ok"));
+    }
+
+    #[test]
+    fn compact_length_preserves_truncation_until_an_explicit_reset() {
+        assert_eq!(core::mem::size_of::<StackStr<120>>(), 124);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut text = StackStr::<5>::from_str("aé€");
+            assert_eq!(text.len(), 3);
+            text.write_str("x").unwrap();
+            assert_eq!(text.as_str(), "aéx");
+            assert!(text.is_truncated());
+            text.truncate(3);
+            assert!(!text.is_truncated());
+            text.write_str("é").unwrap();
+            assert_eq!(text.as_str(), "aéé");
+            assert_eq!(text.len(), 5);
+            text.clear();
+            assert!(text.is_empty());
+            assert!(!text.is_truncated());
+            let mut empty = StackStr::<0>::new();
+            empty.write_str("x").unwrap();
+            assert!(empty.is_empty());
+            assert!(empty.is_truncated());
+            empty.truncate(0);
+            assert!(!empty.is_truncated());
+        });
     }
 
     #[test]

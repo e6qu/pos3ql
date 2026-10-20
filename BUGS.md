@@ -4,7 +4,9 @@ Only defects blocked by an external condition or a genuinely intractable repair
 belong here. Fix every other defect, including CI regressions, in the PR that
 finds it, including stale definitions that refer to dropped or replaced types, publication or recovery
 that exposes incomplete changes, owners held while waiting, and test harnesses
-that hide failures or repeat expensive startup until they time out.
+that hide failures or repeat expensive startup until they time out. This includes
+damaged journal lengths mistaken for capacity errors, incomplete collation
+decoding, and stale type references after a column changes type.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded.

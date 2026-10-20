@@ -66713,6 +66713,7 @@ fn alter_table_relation(
                         crate::storage::ColumnDefault::Constant { value, expression };
                 }
                 new_def.columns[i].ctype = target;
+                new_def.columns[i].user_type = None;
                 new_def.columns[i].type_mod = *type_mod;
                 new_def.columns[i].collation = target_collation;
             }

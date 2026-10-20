@@ -90094,6 +90094,8 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             }
             let snapshot = "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid";
+            let source_oid;
+            let identity_floor;
             {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -90101,19 +90103,44 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                     ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
                 let mut rename =
                     ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-                owner.success(&mut engine, declaration, true);
+                owner.success(
+                    &mut engine,
+                    &declaration.replace("captured_code", "discarded_code"),
+                    !checkpoint,
+                );
+                owner.success(&mut engine, declaration, !checkpoint);
+                let discard = if kind == "domain" {
+                    "DROP DOMAIN discarded_code"
+                } else {
+                    "DROP TYPE discarded_code"
+                };
+                owner.success(&mut engine, discard, !checkpoint);
+                source_oid = data_rows(&owner.success(
+                    &mut engine,
+                    "SELECT 'captured_code'::regtype::oid",
+                    !checkpoint,
+                ));
                 owner.success(
                     &mut engine,
                     "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
-                    true,
+                    !checkpoint,
                 );
-                rename.success(&mut engine, rename_statement, true);
+                rename.success(&mut engine, rename_statement, !checkpoint);
+                for _ in 0..8 {
+                    rename.success(
+                        &mut engine,
+                        &declaration.replace("captured_code", "discarded_code"),
+                        !checkpoint,
+                    );
+                    rename.success(&mut engine, discard, !checkpoint);
+                }
+                identity_floor = engine.storage.catalog_identity_sequence();
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
-                owner.success(&mut engine, "COMMIT", true);
+                owner.success(&mut engine, "COMMIT", !checkpoint);
                 assert_eq!(
-                    data_rows(&rename.success(&mut engine, snapshot, true)),
+                    data_rows(&rename.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
                 );
                 engine.commit_wal().unwrap();
@@ -90125,8 +90152,17 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert!(engine.storage.catalog_identity_sequence() >= identity_floor);
                 assert_eq!(
-                    data_rows(&session.success(&mut engine, snapshot, true)),
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT 'current_code'::regtype::oid",
+                        !checkpoint
+                    )),
+                    source_oid
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
                 );
             }

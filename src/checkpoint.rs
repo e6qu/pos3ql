@@ -20046,7 +20046,8 @@ mod stored_dependency_tests {
     fn uploaded_wal_record_reconstruction_keeps_the_full_commit_frame() {
         let mut budget = Budget::new(1024);
         let mut scratch = FixedBuf::new(&mut budget, "replication scratch", 128).unwrap();
-        let record = [37, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0];
+        let mut record = [37, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0];
+        record[1] = crate::wal::RECORD_VERSION;
         append_uploaded_wal_record(&mut scratch, 44, &record).unwrap();
         let frame = scratch.readable();
         assert_eq!(frame.len(), crate::wal::HEADER_LEN + 4);

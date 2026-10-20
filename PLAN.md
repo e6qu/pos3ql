@@ -44,6 +44,9 @@ space. Captured type references now identify their catalog, database and source
 lifetime. Definition submission validates them and refreshes names; recovery and
 template copies bind their declarations explicitly. Journal and checkpoint
 references retain source lifetimes across renames and reversed commit order.
+Recovery verifies damaged record lengths before reporting capacity errors, and
+table records use the complete shared collation decoder. Compact fixed-string
+metadata preserves the existing memory and recovery-stack limits.
 Public type commits and the existing transaction barrier remain exclusive. Finish ownership across each
 source check and dependent publication before removing those restrictions.
 Finish protection for engine-wide publication and remaining table rewrites. Retain historical row, index and backup references before

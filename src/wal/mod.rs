@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-const RECORD_VERSION: u8 = 1;
+pub(crate) const RECORD_VERSION: u8 = 1;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1970,13 +1970,46 @@ impl Wal {
                 if lsn <= last_seen_lsn {
                     break 'outer;
                 }
+                let total = HEADER_LEN + payload_len;
+                let Some(record_end) = parsed_offset
+                    .checked_add(total as u64)
+                    .filter(|end| *end <= self.capacity)
+                else {
+                    break 'outer;
+                };
                 if payload_len > self.buffer.capacity() - HEADER_LEN {
+                    // A damaged length is not proof that the configured buffer
+                    // shrank. Check the claimed record without growing it.
+                    let mut checksum = crc32c::Crc32c::new();
+                    checksum.update(&data[4..HEADER_LEN]);
+                    let mut scratch = [0u8; 4096];
+                    let mut offset = parsed_offset + HEADER_LEN as u64;
+                    while offset < record_end {
+                        let count = scratch.len().min((record_end - offset) as usize);
+                        let read = self
+                            .file
+                            .read_at(&mut scratch[..count], offset)
+                            .map_err(|error| WalSetupError::Io("validate journal record", error))?;
+                        if read == 0 {
+                            break 'outer;
+                        }
+                        checksum.update(&scratch[..read]);
+                        offset += read as u64;
+                    }
+                    if checksum.finish() != stored_crc {
+                        break 'outer;
+                    }
+                    if !record_kind_known(kind)
+                        || data[17] != RECORD_VERSION
+                        || data[18..24].iter().any(|byte| *byte != 0)
+                    {
+                        return Err(WalSetupError::UnsupportedRecordFormat);
+                    }
                     return Err(WalSetupError::Replay(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "wal_buffer_bytes is too small to replay the journal"
                     )));
                 }
-                let total = HEADER_LEN + payload_len;
                 if data.len() < total {
                     continue 'outer;
                 }
@@ -1992,7 +2025,9 @@ impl Wal {
                 if decode_op(kind, &data[HEADER_LEN..total]).is_none() {
                     return Err(WalSetupError::Replay(sql_err!(
                         sqlstate::DATA_EXCEPTION,
-                        "invalid journal operation payload"
+                        "invalid journal operation payload (kind {}, LSN {})",
+                        kind,
+                        lsn
                     )));
                 }
                 last_seen_lsn = lsn;
@@ -7657,14 +7692,7 @@ fn decode_op_inner<'a>(
             let collations = payload.get(at..at + n_cols)?;
             at += n_cols;
             for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
-                column.collation = match code {
-                    0 => crate::sql::ast::Collation::Default,
-                    1 => crate::sql::ast::Collation::C,
-                    2 => crate::sql::ast::Collation::Posix,
-                    3 => crate::sql::ast::Collation::UcsBasic,
-                    4 => crate::sql::ast::Collation::None,
-                    _ => return None,
-                }
+                column.collation = crate::sql::ast::Collation::from_code(*code)?;
             }
             def.partition = decode_partition(payload, &mut at)?;
             let n_parents = *payload.get(at)? as usize;
@@ -12976,7 +13004,8 @@ mod tests {
         assert!(decode_op(KIND_CREATE_ENUM_V3, &payload[..payload.len() - 1]).is_none());
 
         let mut legacy = [0; 256];
-        let mut at = 0;
+        legacy[2..10].copy_from_slice(&1u64.to_le_bytes());
+        let mut at = 10;
         for value in ["mood", "public"] {
             legacy[at] = value.len() as u8;
             at += 1;
@@ -12994,7 +13023,7 @@ mod tests {
             legacy[at..at + 8].copy_from_slice(&member.sort.to_le_bytes());
             at += 8;
         }
-        let prefix = 1 + "mood".len() + 1 + "public".len();
+        let prefix = 10 + 1 + "mood".len() + 1 + "public".len();
         let mut wide = [0u8; 256];
         wide[..prefix].copy_from_slice(&legacy[..prefix]);
         wide[prefix..prefix + 4].copy_from_slice(&(members.len() as u32).to_le_bytes());
@@ -13752,6 +13781,24 @@ mod tests {
         ));
         let truncated_len = payload.len() - definition.n_columns;
         assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
+    }
+
+    #[test]
+    fn table_payload_preserves_every_supported_collation_code() {
+        let mut definition = sample_def();
+        let mut bytes = [0; 65536];
+        for code in 0..=u8::MAX {
+            let Some(collation) = crate::sql::ast::Collation::from_code(code) else {
+                continue;
+            };
+            definition.columns[1].collation = collation;
+            crate::mem::guard::forbid_alloc(|| {
+                let payload =
+                    encode_catalog_operation(&WalOp::CreateTable(&definition), &mut bytes);
+                let restored = decode_table_payload(payload).unwrap();
+                assert_eq!(restored.columns[1].collation, collation);
+            });
+        }
     }
 
     #[test]
@@ -15194,6 +15241,8 @@ mod tests {
     fn domain_payload_rejects_overlong_text_and_invalid_boolean_codes() {
         fn payload(default: &str, expression: &str, not_null: u8) -> Vec<u8> {
             let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
             for name in ["bounded_domain", "public"] {
                 bytes.push(name.len() as u8);
                 bytes.extend_from_slice(name.as_bytes());
@@ -15673,6 +15722,88 @@ mod tests {
             drop(wal);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn replay_checks_oversized_record_crc_before_reporting_a_small_buffer() {
+        let dir = temp_dir("replay-record-length");
+        let config = test_config(&dir);
+        let large_start;
+        {
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 1,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                    committed_at: None,
+                },
+            )
+            .unwrap();
+            large_start = wal.buffer.len();
+            wal.append_committed(
+                3,
+                &WalOp::Upsert {
+                    schema: "public",
+                    table: "t",
+                    rowid: 2,
+                    row: &[0u8; 256],
+                    is_update: false,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                4,
+                &WalOp::Commit {
+                    transaction_id: 2,
+                    assigned_transaction_identity: false,
+                    committed_at: None,
+                },
+            )
+            .unwrap();
+            wal.commit();
+        }
+        let path = format!("{dir}/journal.wal");
+        let original = std::fs::read(&path).unwrap();
+        let mut small = config.clone();
+        small.wal_buffer_bytes = 128;
+        {
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&small, &mut budget).unwrap();
+            assert!(matches!(wal.replay(0, |_, _| Ok(())),
+                Err(WalSetupError::Replay(error)) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        for claimed in [8192u32, u32::MAX] {
+            let mut corrupted = original.clone();
+            corrupted[large_start + 4..large_start + 8].copy_from_slice(&claimed.to_le_bytes());
+            std::fs::write(&path, corrupted).unwrap();
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&small, &mut budget).unwrap();
+            let mut seen = Vec::new();
+            wal.replay(0, |lsn, _| {
+                seen.push(lsn);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(wal.last_lsn(), 2);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

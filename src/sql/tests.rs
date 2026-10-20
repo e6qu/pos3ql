@@ -7091,6 +7091,9 @@ fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() 
 fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let mut config = test_config("prepared-object-cold-recovery");
     config.max_prepared_transactions = 4;
+    // Each transaction below changes fewer than sixteen catalog objects. The
+    // development capacity reserves 256 complete undo images per prepared slot.
+    config.max_ddl_per_transaction = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;

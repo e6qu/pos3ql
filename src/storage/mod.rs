@@ -42554,7 +42554,7 @@ impl Storage {
                 _ => NamedTypeSlot::Composite(index),
             };
             let snapshot = catalog.type_snapshot(slot, txid).ok()??;
-            if snapshot.identity.database != current_database() {
+            if snapshot.identity.database() != current_database() {
                 return None;
             }
             let ctype = if array && matches!(slot, NamedTypeSlot::Domain(_)) {

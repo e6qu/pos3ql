@@ -73,7 +73,8 @@ use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    ColumnMeta, ColumnSet, HeapRelocationMode, HeapRelocationStep, RowHome, SqlName, Storage,
+    ColumnMeta, ColumnSet, EntryCleanup, HeapCleanup, MaintenanceMode, MaintenanceStep, RowCleanup,
+    RowCleanupTarget, RowCleanupTask, RowHome, SqlName, Storage,
 };
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
@@ -406,18 +407,44 @@ pub(crate) enum ProtocolReset {
 }
 
 #[derive(Clone, Copy)]
-struct PostPublishCleanup {
+struct LocalCleanup {
     lsn: u64,
-    phase: PostPublishPhase,
+    source: LocalCleanupSource,
+    phase: LocalCleanupPhase,
 }
 
 #[derive(Clone, Copy)]
-enum PostPublishPhase {
+enum LocalCleanupSource {
+    Checkpoint,
+    TemporaryTable { slot: usize, generation: u64 },
+}
+
+#[derive(Clone, Copy)]
+enum LocalCleanupPhase {
     Prepare,
+    Rows(RowCleanup),
     Compact,
-    Evict,
     CompactAfterEviction,
     Finish,
+}
+
+impl LocalCleanupSource {
+    fn target(self) -> RowCleanupTarget {
+        match self {
+            Self::Checkpoint => RowCleanupTarget::AllTables,
+            Self::TemporaryTable { slot, .. } => RowCleanupTarget::Table(slot),
+        }
+    }
+
+    fn entries(self) -> RowCleanup {
+        RowCleanup::new(
+            RowCleanupTask::SavedEntries(match self {
+                Self::Checkpoint => EntryCleanup::Pressured,
+                Self::TemporaryTable { .. } => EntryCleanup::AllSaved,
+            }),
+            self.target(),
+        )
+    }
 }
 
 /// Local progress does not prove that a failed durable publication recovered.
@@ -474,7 +501,7 @@ pub struct Engine {
     temporary_spiller: Option<TemporarySpiller>,
     /// A durable, installed manifest whose heap and journal cleanup remains.
     /// Cleanup retries preserve the publication's captured log boundary.
-    post_publish_cleanup: Option<PostPublishCleanup>,
+    local_cleanup: Option<LocalCleanup>,
     checkpoint_failure: Option<(u64, SqlError)>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
@@ -3510,7 +3537,7 @@ impl Engine {
             + crate::storage::HeapRelocationWorkspace::budget_bytes(
                 crate::storage::row_heap_image_capacity(config),
             )
-            + size_of::<Option<PostPublishCleanup>>()
+            + size_of::<Option<LocalCleanup>>()
             + config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
@@ -3802,7 +3829,7 @@ impl Engine {
         }
         let work = QueryWorkspaces::new(config, budget)?;
         budget.draw(
-            size_of::<Option<PostPublishCleanup>>(),
+            size_of::<Option<LocalCleanup>>(),
             "post-publication cleanup controls",
         )?;
         Ok(Self {
@@ -3810,7 +3837,7 @@ impl Engine {
             wal,
             ckpt,
             temporary_spiller,
-            post_publish_cleanup: None,
+            local_cleanup: None,
             checkpoint_failure: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
@@ -8984,8 +9011,8 @@ impl Engine {
             ));
         }
         self.retry_pending_wal_upload()?;
-        if self.post_publish_cleanup.is_some() {
-            self.finish_post_publish_cleanup()?;
+        if self.local_cleanup.is_some() {
+            self.finish_local_cleanup()?;
         }
         self.refresh_prepared_transaction_catalog()?;
         let Some(ckpt) = self.ckpt.as_mut() else {
@@ -9011,8 +9038,8 @@ impl Engine {
         };
         match checkpoint? {
             Some(lsn) => {
-                self.begin_post_publish_cleanup(lsn);
-                self.finish_post_publish_cleanup()?;
+                self.begin_checkpoint_cleanup(lsn);
+                self.finish_local_cleanup()?;
                 let ckpt = self
                     .ckpt
                     .as_mut()
@@ -9054,7 +9081,7 @@ impl Engine {
     }
 
     /// The published prefix is durable; preserve any later journal suffix.
-    fn prepare_post_publish_cleanup(&mut self, lsn: u64) {
+    fn prepare_checkpoint_cleanup(&mut self, lsn: u64) {
         if !self.storage.has_active_snapshots() {
             if self.wal_upload
                 && let Some(ckpt) = self.ckpt.as_mut()
@@ -9085,39 +9112,34 @@ impl Engine {
                 self.wal.reset_after_checkpoint();
             }
         }
-        // The checkpoint installed each table's spill-SST list as it
-        // wrote (full rewrites collapse a list, deltas append).
-        self.storage.release_durable_histories();
     }
 
-    fn begin_post_publish_cleanup(&mut self, lsn: u64) {
+    fn begin_checkpoint_cleanup(&mut self, lsn: u64) {
         // Cleanup may retry, but publication already marked only the table
         // generations the manifest captured as clean.
-        assert!(self.post_publish_cleanup.is_none());
+        assert!(self.local_cleanup.is_none());
         assert!(!self.compact_scratch.active());
-        self.post_publish_cleanup = Some(PostPublishCleanup {
+        self.local_cleanup = Some(LocalCleanup {
             lsn,
-            phase: PostPublishPhase::Prepare,
+            source: LocalCleanupSource::Checkpoint,
+            phase: LocalCleanupPhase::Prepare,
         });
     }
 
-    fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
-        while self.post_publish_cleanup.is_some() {
-            self.post_publish_cleanup_step(HeapRelocationMode::Finish)?;
+    fn finish_local_cleanup(&mut self) -> Result<(), SqlError> {
+        while self.local_cleanup.is_some() {
+            self.local_cleanup_step(MaintenanceMode::Finish)?;
         }
         Ok(())
     }
 
-    fn post_publish_cleanup_step(
-        &mut self,
-        mode: HeapRelocationMode,
-    ) -> Result<HeapRelocationStep, SqlError> {
+    fn local_cleanup_step(&mut self, mode: MaintenanceMode) -> Result<MaintenanceStep, SqlError> {
         let cleanup = self
-            .post_publish_cleanup
+            .local_cleanup
             .expect("post-publication cleanup has its published LSN");
         #[cfg(feature = "checkpoint-profile")]
         let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
-        let result = self.advance_post_publish_cleanup(cleanup, mode);
+        let result = self.advance_local_cleanup(cleanup, mode);
         #[cfg(feature = "checkpoint-profile")]
         if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
             ckpt.profile_phase("local_cleanup", cleanup.lsn, started, before);
@@ -9125,61 +9147,108 @@ impl Engine {
         result
     }
 
-    fn advance_post_publish_cleanup(
+    fn advance_local_cleanup(
         &mut self,
-        cleanup: PostPublishCleanup,
-        mode: HeapRelocationMode,
-    ) -> Result<HeapRelocationStep, SqlError> {
+        cleanup: LocalCleanup,
+        mode: MaintenanceMode,
+    ) -> Result<MaintenanceStep, SqlError> {
         let next = match cleanup.phase {
-            PostPublishPhase::Prepare => {
-                self.prepare_post_publish_cleanup(cleanup.lsn);
-                PostPublishPhase::Compact
+            LocalCleanupPhase::Prepare => {
+                let task = match cleanup.source {
+                    LocalCleanupSource::Checkpoint => {
+                        self.prepare_checkpoint_cleanup(cleanup.lsn);
+                        RowCleanupTask::DurableHistory
+                    }
+                    LocalCleanupSource::TemporaryTable { generation, .. } => {
+                        RowCleanupTask::SavedMarkers {
+                            through_lsn: cleanup.lsn,
+                            generation,
+                        }
+                    }
+                };
+                LocalCleanupPhase::Rows(RowCleanup::new(task, cleanup.source.target()))
             }
-            PostPublishPhase::Compact | PostPublishPhase::CompactAfterEviction => {
+            LocalCleanupPhase::Rows(mut rows) => {
+                match self.storage.advance_row_cleanup(
+                    &mut rows,
+                    core::num::NonZeroUsize::new(64).unwrap(),
+                    mode,
+                ) {
+                    MaintenanceStep::Complete => {}
+                    pending => {
+                        self.local_cleanup = Some(LocalCleanup {
+                            phase: LocalCleanupPhase::Rows(rows),
+                            ..cleanup
+                        });
+                        return Ok(pending);
+                    }
+                }
+                match rows.task() {
+                    RowCleanupTask::SavedMarkers { .. } => LocalCleanupPhase::Rows(
+                        RowCleanup::new(RowCleanupTask::SnapshotHistory, cleanup.source.target()),
+                    ),
+                    RowCleanupTask::DurableHistory => LocalCleanupPhase::Compact,
+                    RowCleanupTask::SnapshotHistory => LocalCleanupPhase::Rows(RowCleanup::new(
+                        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                        cleanup.source.target(),
+                    )),
+                    RowCleanupTask::HeapRows(_) if rows.changed() => {
+                        LocalCleanupPhase::CompactAfterEviction
+                    }
+                    RowCleanupTask::HeapRows(_) => {
+                        LocalCleanupPhase::Rows(cleanup.source.entries())
+                    }
+                    RowCleanupTask::SavedEntries(_) => LocalCleanupPhase::Finish,
+                }
+            }
+            LocalCleanupPhase::Compact | LocalCleanupPhase::CompactAfterEviction => {
                 match self.compact_scratch.compact_step(
                     &mut self.storage,
                     core::num::NonZeroUsize::new(64).unwrap(),
                     core::num::NonZeroUsize::new(64 << 10).unwrap(),
                     mode,
                 )? {
-                    HeapRelocationStep::Complete => {}
+                    MaintenanceStep::Complete => {}
                     pending => return Ok(pending),
                 }
                 match cleanup.phase {
-                    PostPublishPhase::Compact => PostPublishPhase::Evict,
-                    _ => PostPublishPhase::Finish,
+                    LocalCleanupPhase::Compact => {
+                        let selection = match cleanup.source {
+                            LocalCleanupSource::TemporaryTable { .. } => HeapCleanup::AllSaved,
+                            LocalCleanupSource::Checkpoint
+                                if self.storage.heap.used() * 100
+                                    >= self.storage.heap.capacity() * 50 =>
+                            {
+                                HeapCleanup::Durable
+                            }
+                            LocalCleanupSource::Checkpoint => HeapCleanup::PressuredDurable,
+                        };
+                        LocalCleanupPhase::Rows(RowCleanup::new(
+                            RowCleanupTask::HeapRows(selection),
+                            cleanup.source.target(),
+                        ))
+                    }
+                    _ => LocalCleanupPhase::Rows(cleanup.source.entries()),
                 }
             }
-            PostPublishPhase::Evict => {
-                if self.storage.spill_attached()
-                    && (self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
-                        || self.storage.map_pressure())
-                {
-                    self.storage.evict_committed();
-                    PostPublishPhase::CompactAfterEviction
-                } else {
-                    PostPublishPhase::Finish
-                }
-            }
-            PostPublishPhase::Finish => {
-                self.storage.evict_entries();
-                self.post_publish_cleanup = None;
-                return Ok(HeapRelocationStep::Complete);
+            LocalCleanupPhase::Finish => {
+                self.local_cleanup = None;
+                return Ok(MaintenanceStep::Complete);
             }
         };
-        self.post_publish_cleanup = Some(PostPublishCleanup {
-            lsn: cleanup.lsn,
+        self.local_cleanup = Some(LocalCleanup {
             phase: next,
+            ..cleanup
         });
-        Ok(HeapRelocationStep::Advanced)
+        Ok(MaintenanceStep::Advanced)
     }
 
-    fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
-        if self.post_publish_cleanup.is_some() {
+    fn retry_local_cleanup(&mut self) -> Result<(), SqlError> {
+        if self.local_cleanup.is_some() {
             if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
-                self.finish_post_publish_cleanup()?;
+                self.finish_local_cleanup()?;
             } else {
-                self.post_publish_cleanup_step(HeapRelocationMode::Background)?;
+                self.local_cleanup_step(MaintenanceMode::Background)?;
             }
         }
         Ok(())
@@ -9535,7 +9604,7 @@ impl Engine {
     /// messages and while idle until their pending work completes.
     pub fn checkpoint_work_pending(&self) -> bool {
         self.storage.history_cleanup_pending()
-            || self.post_publish_cleanup.is_some()
+            || self.local_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|c| {
                 c.sweep_active()
                     || c.maintenance_pending(&self.storage)
@@ -9555,7 +9624,7 @@ impl Engine {
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.credential_install_pending()
         {
-            return self.post_publish_cleanup.is_some()
+            return self.local_cleanup.is_some()
                 || self.storage.history_cleanup_pending()
                 || (checkpointer.physical_output_pending()
                     && (checkpointer.physical_output_ready(std::time::Instant::now())
@@ -9565,7 +9634,7 @@ impl Engine {
             checkpointer.physical_output_ready(std::time::Instant::now())
                 || checkpointer.physical_output_stale(&self.storage)
         });
-        self.post_publish_cleanup.is_some()
+        self.local_cleanup.is_some()
             || self.storage.history_cleanup_pending()
             || (self
                 .ckpt
@@ -9623,7 +9692,7 @@ impl Engine {
             }
             return match checkpointer.advance_manifest_publication(&mut self.storage) {
                 Ok(CheckpointStep::Published { lsn }) => {
-                    self.begin_post_publish_cleanup(lsn);
+                    self.begin_checkpoint_cleanup(lsn);
                     CheckpointBeat::Durable
                 }
                 Ok(CheckpointStep::Working) => CheckpointBeat::Advanced,
@@ -9669,7 +9738,7 @@ impl Engine {
                 && self.durable_retry_pending());
         if journal_pending
             && !credential_draining
-            && self.post_publish_cleanup.is_none()
+            && self.local_cleanup.is_none()
             && !self.block_reads_pending()
             && let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.retained_output_ready()
@@ -9704,7 +9773,7 @@ impl Engine {
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
         let history_pending = self.storage.history_cleanup_pending();
-        if reads_pending && self.post_publish_cleanup.is_none() && !history_pending {
+        if reads_pending && self.local_cleanup.is_none() && !history_pending {
             return CheckpointBeat::WaitingForReads;
         }
         // Preserve the durable retry barrier whenever storage work can run.
@@ -9727,15 +9796,15 @@ impl Engine {
         } else {
             crate::storage::HistoryReclamation::Idle
         };
-        if self.post_publish_cleanup.is_some() {
+        if self.local_cleanup.is_some() {
             let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
-                self.finish_post_publish_cleanup()
-                    .map(|()| HeapRelocationStep::Complete)
+                self.finish_local_cleanup()
+                    .map(|()| MaintenanceStep::Complete)
             } else {
-                self.post_publish_cleanup_step(HeapRelocationMode::Background)
+                self.local_cleanup_step(MaintenanceMode::Background)
             };
             return match cleanup {
-                Ok(HeapRelocationStep::WaitingForOwner) if !retried_upload => {
+                Ok(MaintenanceStep::WaitingForOwner) if !retried_upload => {
                     CheckpointBeat::WaitingForOwner
                 }
                 Ok(_) => {
@@ -9806,23 +9875,16 @@ impl Engine {
                 }
             }
         {
-            self.storage.release_table_histories(slot);
-            self.storage.evict_committed_table(slot);
-            if let Err(error) = self.compact_scratch.compact_exclusive(&mut self.storage) {
-                let message = stack_format!(
-                    512,
-                    "temporary spill cleanup failed ({}): {}\n",
-                    error.sqlstate,
-                    error.message.as_str()
-                );
-                crate::util::stderr_line(message.as_str());
-                return if retried_upload {
-                    CheckpointBeat::DurableWithLocalFailure
-                } else {
-                    CheckpointBeat::LocalFailure
-                };
-            }
-            self.storage.evict_redundant_entries(slot);
+            assert!(self.local_cleanup.is_none());
+            assert!(!self.compact_scratch.active());
+            self.local_cleanup = Some(LocalCleanup {
+                lsn: self.storage.lsn(),
+                source: LocalCleanupSource::TemporaryTable {
+                    slot,
+                    generation: self.storage.table(slot).generation(),
+                },
+                phase: LocalCleanupPhase::Prepare,
+            });
             return if retried_upload {
                 CheckpointBeat::Durable
             } else {
@@ -9868,11 +9930,11 @@ impl Engine {
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
-                self.begin_post_publish_cleanup(lsn);
+                self.begin_checkpoint_cleanup(lsn);
                 let cleanup = if critical {
-                    self.finish_post_publish_cleanup()
+                    self.finish_local_cleanup()
                 } else {
-                    self.post_publish_cleanup_step(HeapRelocationMode::Background)
+                    self.local_cleanup_step(MaintenanceMode::Background)
                         .map(|_| ())
                 };
                 if let Err(e) = cleanup {
@@ -10086,9 +10148,9 @@ impl Engine {
             .skip(resume_statement)
         {
             let statement = statement.as_ref().expect("parsed query statement");
-            if self.post_publish_cleanup.is_some()
+            if self.local_cleanup.is_some()
                 && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
-                && let Err(error) = self.retry_post_publish_cleanup()
+                && let Err(error) = self.retry_local_cleanup()
             {
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
@@ -10344,9 +10406,9 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
-        if self.post_publish_cleanup.is_some()
+        if self.local_cleanup.is_some()
             && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
-            && let Err(error) = self.retry_post_publish_cleanup()
+            && let Err(error) = self.retry_local_cleanup()
         {
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExtendedExecutionStatus::Complete(false));

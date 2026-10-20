@@ -13,151 +13,49 @@ One server owns the right to publish changes to a prefix. That does not require
 performing every storage request one at a time. SQL execution on several CPU
 workers is separate from overlapping network requests.
 
-Current SQL execution is serial. There are already multiple download slots,
-read lookahead, immutable journal batches, packed row groups, and independently
-readable column groups. The integrated storage path must meet the acceptance
-criteria below. Same-host MinIO and SeaweedFS tests establish portability;
-they do not establish production performance.
+SQL execution still uses one CPU worker. [PR #680](https://github.com/e6qu/pos3ql/pull/680)
+completed concurrent and batched storage I/O, ordered durable commits, aligned
+column groups and explicit MVCC/locking modes. State-changing statements use a
+separate synchronous read client where replay could repeat effects. Metadata
+capture and some maintenance reads also remain synchronous. Same-host MinIO
+and SeaweedFS checks establish portability; they do not prove production speed.
 
-## Current PR: qualify concurrent object-store reads and writes
+## Current work: bound cleanup after a save
 
-The integrated implementation provides shared download ownership, selected-column
-read batches, independent journal and physical upload clients, ordered durable
-commit completion, aligned column groups and explicit transaction modes.
-Table capture and merges retain their selected bytes across turns. File handles
-stay private until every upload succeeds; metadata publication preserves later
-updates, deletions and analysis. SQL CHECKPOINT, readiness checks and credential
-validation yield while network requests wait.
+**Example:** after saving a large table, the server releases old row metadata
+and cached values in small turns. A customer can read an order or roll back an
+update between turns. A busy table must not hold global owners while cleanup
+waits.
 
-**Scope limit:** data-changing execution uses a separate synchronous read client
-where restarting could repeat effects. A SELECT switches to that client when
-a routine or expression starts changing state, and keeps it through the rest of
-the statement. For example, a function that prepares a query must not prepare it
-again because a later invoice download waits. Pure reads retain concurrent I/O.
-Metadata capture and some maintenance
-reads also remain synchronous. SQL still executes on one CPU worker. The current
-PR must not imply that every database operation is nonblocking or that CPU work
-already runs on several workers.
+- Bound deletion-marker pruning and saved-change acknowledgement during checkpoint
+  installation, saved-history
+  release, heap-row eviction and redundant-entry removal by
+  an explicit row-slot quota. Keep their positions between turns, including
+  across free-slot reuse and changes made after the checkpoint.
+- Use the same bounded work for temporary tables. Compare each committed row's
+  revision to the saved boundary, so later writes do not prevent freeing unchanged
+  saved rows. Preserve updates and deletions at shared or zero journal positions,
+  including rollback. Charge their row revisions in the startup reservation.
+- Skip busy tables and retry without retaining catalog, version, publication or
+  row owners. Preserve progress and complete ready tables while another is busy.
+- Charge retained controls at startup. Keep explicit CHECKPOINT and shutdown
+  completion, named exhaustion errors, rollback and empty-cache recovery.
+- Require complete CI, Differential, Drivers and coverage on the final head.
 
-The checks below define acceptance. Require CI, Differential, Drivers and coverage
-to pass on the final PR version, including PostgreSQL 18 comparisons, Miri and
-actual MinIO and SeaweedFS qualification. Focused runner passes are development
-evidence, not merge qualification. Do not increase timeouts to obtain a pass.
-
-### Concurrent and batched reads
-
-**Example:** two customers request different uncached invoices. Both downloads
-can start before either finishes. A cached invoice remains available meanwhile.
-A report asking for two columns should download those columns together, without
-fetching the large notes column it did not request.
-
-- Start multiple independent requests within explicitly configured startup slots.
-- Share requests for the same data; preserve completed bytes and failures until
-  their consumers can handle them. Cancellation must release abandoned work.
-- Issue a bounded batch of selected column or scan reads before waiting for the
-  first response. Preserve validation, selected versions and completed work on
-  resumption; never repeat a data-changing expression.
-- Save CTE, sorted, subquery and INSERT SELECT results in one scan; do not
-  evaluate expressions once to count rows and again to save them. For example,
-  saving a query that prepares a statement must prepare it exactly once.
-  Sorting by an output label or position must reuse that output value, including
-  in grouped and windowed queries.
-- Release shared cache and storage owners before waiting on network I/O.
-- Retain read-completion wakeups until queued responses have been released;
-  a ready result must not leave a customer waiting for another socket event.
-
-### Concurrent and batched writes
-
-**Example:** two customers save different orders. Their changes can share one
-durable log upload. Independent immutable uploads can overlap, but neither
-customer receives success before their change is recoverable.
-
-- Reserve upload clients, immutable request bytes, progress and completion queues
-  at startup. Slots and batch sizes are explicit settings.
-- Allow independent uploads to complete out of order; publish references and
-  commit outcomes in the required order. A root must never name incomplete data.
-- Keep a finished merge alive through cleanup for an earlier checkpoint, until
-  its own publication installs it or a replacement discards it. Cleanup must
-  retain the file's roster as well as the blocks that roster lists.
-- Batch committed journal records and physical output. While storage waits,
-  continue unrelated queries, cancellation and bounded maintenance.
-- Reject work after an ownership probe detects a replaced writer, before a new
-  commit enters the journal. Flush an uncertain commit's terminal error before
-  closing its connection.
-- Preserve writer fencing, retries, savepoints, prepared transactions and cold
-  recovery. Restore the column layout when retrying a failed merge writer. Never turn an uncertain commit into a claim that it rolled back.
-- Retain COPY completion messages while durability is pending; resume without
-  replaying row or statement triggers or consuming later client messages early.
-- Pause transaction boundaries instead of sending internal wait statuses. For
-  example, `INSERT ...; BEGIN; ...; ROLLBACK` commits the first insert once;
-  concurrent partition detach finishes publishing each phase before continuing.
-- Preserve a usable connection after prepared-transaction commit or rollback,
-  including binary catalog queries and pipelined extended-protocol messages. Retain
-  whether each waiting command started inside a transaction block; retries must
-  keep the original restrictions, statement identity, clock and deadline.
-- Keep reads, durable commits and maintenance from starving one another.
-- Permit credential reload between attempts while immutable output bytes remain
-  retained; only live requests own the credentials used to sign them.
-
-### Physical layout
-
-**Example:** a report sums invoice amounts without downloading descriptions;
-updating one order appends a small change instead of rewriting the full table.
-
-- Use immutable packed objects and column groups, with small logged row changes.
-  Reuse existing groups when their data has not changed.
-- Include block type in immutable content identities, so equal payloads in
-  different formats cannot overwrite one another. Verify rejection of old headers.
-- Keep column boundaries and offsets explicit and checked. Choose alignment for
-  decoding and useful byte-range requests, not an assumed object-store sector.
-- Measure requests, downloaded bytes and rewritten bytes. Demonstrate batching
-  and projection savings, including with both caches empty.
-
-### Explicit transaction mode
-
-**Example:** with MVCC enabled, a report can keep reading the earlier order
-while another transaction updates it. With MVCC disabled, conflicting work
-waits on locks.
-
-- Require an explicit mode. MVCC means retaining older committed values for
-  readers; locking mode keeps current committed values and waits on conflicts.
-- Preserve supported PostgreSQL isolation behavior in each mode. Reject an
-  isolation request that cannot be implemented correctly; never silently weaken it.
-- Cover lock upgrades, deadlocks, cancellation, savepoints, triggers, COPY,
-  replication, transaction end, bounded history, and recovery.
-- Count all retained state at startup and name exhaustion errors.
-
-### Completion evidence
-
-Exercise actual overlapping HTTP GETs and PUTs, batched requests, duplicate
-requests, out-of-order completion, transport failures, cancellation, capacity
-pressure and fairness. Verify TLS setup and record failures remain inside
-the fixed memory contract, including failed allocations and released TLS buffers
-in optimized builds. Verify durable acknowledgement and cold recovery against
-MinIO and SeaweedFS, and SQL results against vanilla PostgreSQL 18. Keep complete
-CI passing on the final PR head without increasing timeouts. These checks
-establish correctness and request costs; speed claims require the measurements
-below.
-
-Design references: Neon overlaps reads and [parallel S3 uploads](https://neon.com/blog/recent-storage-performance-improvements-at-neon),
-but [acknowledges a replicated log before S3](https://neon.com/docs/introduction/architecture-overview).
-[SlateDB](https://slatedb.io/docs/design/writes/) batches log writes to object
-storage and tracks durability separately from acceptance. These are design
-references, not pos3ql performance evidence or permission to acknowledge
-local-only data.
-
-## Remaining work after storage I/O
+## Remaining work
 
 ### Finish shared publication and bounded maintenance
 
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Finish protection for engine-wide publication, type-name changes, table rewrites,
-checkpoint publication and object deletion. Retain historical row, index and
-backup references before publishing replacements. Finish bounded heap remapping,
-post-checkpoint eviction and critical-pressure work; capture and reader-history
-cleanup already use bounded turns.
+Finish protection for engine-wide publication, type-name changes and remaining
+table rewrites. Retain historical row, index and backup references before
+publishing replacements. Finish bounded heap remapping and critical-pressure
+admission; capture and reader-history cleanup already use bounded turns.
+At 85% heap use, automatic cleanup still selects synchronous completion.
+Removing that pause requires preserving space for incoming writes while cached
+reads and cancellation continue; raising memory limits is not a solution.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
@@ -172,7 +70,7 @@ Protect remaining shared execution state, replace the serial dispatcher with
 fixed workers, and preserve database identity, fair queues, cancellation, storage
 waits and commit order. A global lock that runs every statement in turn does
 not satisfy this goal. Measure useful scaling for read, write and mixed loads,
-including overload. This is separate from the current PR's object-store I/O.
+including overload. Storage I/O already overlaps; execution on several CPU cores is separate.
 
 ### Publish realistic performance and recovery evidence
 

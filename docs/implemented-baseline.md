@@ -837,10 +837,13 @@ existing 85% critical heap threshold, automatic checkpointing also finishes
 publication and cleanup before dispatch resumes, preserving headroom for the
 next write. This pressure path can still delay connections.
 
-Post-checkpoint history release and row eviction use shared storage access.
-Each table's definition, installed files, version pool and row map are protected
-where needed; waiting releases earlier owners. Durable history release preserves
-versions newer than the installed boundary. Local history pruning checks current
+Post-checkpoint history release, heap-row eviction and redundant-entry removal
+use shared storage access in turns of at most 64 stable row slots. Their retained
+positions contain no locks. Busy tables are skipped and retried after ready
+tables; failed partial acquisition releases every earlier owner. Table and saved
+file state are checked again on each batch. Selection of a half-full row map is
+kept through its partial batches even after removals reduce its occupancy.
+Durable history release preserves versions newer than the installed boundary. Local history pruning checks current
 readers under the same registry owner used for admission, including for temporary
 tables. Temporary eviction still requires the exact captured table generation.
 
@@ -849,7 +852,11 @@ evaluates each map entry once, including collision chains that wrap around.
 Pending changes and retained history stay resident. Ordinary eviction also keeps
 heap rows, deletion markers and unpublished saved rows. Checkpoint installation
 removes only deletion markers covered by its captured log position, in turns of
-at most 64 row-map slots; later deletions remain for a later save.
+at most 64 row-map slots; later deletions remain for a later save. The same
+pass clears saved-change markers only while the captured table generation still
+matches. A write between turns keeps the table dirty and its new marker intact.
+Its retained cursor and exact next table stay with the durable publication until installation
+finishes. The cursor is included in startup manifest-state accounting.
 
 **User example:** cleanup can release an order's old metadata while a report
 keeps its already selected total of 10, another transaction saves a total of 20,
@@ -862,9 +869,13 @@ engine does not invalidate them. Cancellation or a preparation/copy error
 releases the reservation. Using a workspace with a different storage
 instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
-prefix; writes after it keep their journal suffix for recovery. Final heap
-remapping, eviction and other maintenance still finish as whole operations
-within server turns. Checkpoint metadata uploads and immutable table, index and
+prefix; writes after it keep their journal suffix for recovery. The same startup-accounted cleanup state machine handles temporary-table
+history release, saved-row eviction, compaction and redundant entries. It keeps
+the original captured-generation checks and lets statements run between its
+row batches. No extra runtime pool is created. Explicit CHECKPOINT and shutdown
+select synchronous completion; the existing critical-pressure path still does
+so at 85% heap use. Final heap remapping and some other maintenance still finish
+as whole operations within server turns. Checkpoint metadata uploads and immutable table, index and
 merge output now retain their own bytes while network requests overlap.
 Metadata capture and other atomic maintenance reads can still wait
 synchronously. Fixed SQL execution workers remain unfinished.
@@ -943,9 +954,13 @@ commit position. A later update stays in the heap; history newer than that
 boundary stays resident too. Recovered roots have no eviction boundary and do
 not justify discarding newer heap bytes. A temporary spill records the table
 generation it copied, because temporary commits may share a zero journal
-position. Only that exact table generation can evict to the temporary snapshot;
-a later spill names its own object. These kinds of boundary are distinct states in the
-startup-sized root metadata. For example, if a checkpoint saved an order before its price
+position. Each newly committed image records its table revision in startup-charged
+row metadata. Cleanup can evict an unchanged row covered by that capture even
+if another row changes meanwhile; a newer image stays in memory until saved.
+A later spill names its own object. A committed temporary deletion is distinct
+from a row that never committed, including at journal position zero; saving or
+rolling back another change cannot make the deleted row reappear. These boundary
+kinds are distinct states in the startup-sized root metadata. For example, if a checkpoint saved an order before its price
 changed, cleanup keeps the new price in memory until another checkpoint saves
 it; it never redirects that row to the older object.
 
@@ -1016,8 +1031,10 @@ definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
 different image when readers retain the old one. Other type publication remains exclusive.
 
-Transaction-wide catalog and durable publication, concurrent cache/object I/O
-and maintenance, remaining table rewrites, and execution workers are still open.
+Transaction-wide catalog coordination, remaining table rewrites, bounded final
+heap remapping, critical-pressure admission and SQL execution workers remain open.
+Concurrent and batched object-store I/O and ordered durable publication are
+implemented; the storage and transaction guides describe their limits.
 
 ## What the tests establish
 

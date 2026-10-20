@@ -11,6 +11,7 @@ struct PreparedPendingWrite {
     pending_identity: Option<u64>,
     committed: Option<RowHome>,
     committed_lsn: u64,
+    committed_generation: Option<u64>,
     change: PendingChange,
     existed: bool,
     track_statistics: bool,
@@ -275,6 +276,14 @@ impl Storage {
             },
             |state| state.committed_lsn,
         );
+        let committed_generation = expected.map_or_else(
+            || {
+                spilled
+                    .as_ref()
+                    .and_then(|source| source.state().committed_generation)
+            },
+            |state| state.committed_generation,
+        );
         let changes_existence = committed.is_some() != image.is_some();
         let changed_columns = if track_statistics
             && self.tables[table].pending_definition_transaction() != Some(txid)
@@ -307,6 +316,7 @@ impl Storage {
             pending_identity,
             committed,
             committed_lsn,
+            committed_generation,
             change: PendingChange {
                 txid,
                 cid,
@@ -331,6 +341,7 @@ impl Storage {
             pending_identity,
             committed,
             committed_lsn,
+            committed_generation,
             change,
             existed,
             track_statistics,
@@ -409,13 +420,14 @@ impl Storage {
         let mut state = current.unwrap_or(RowState {
             committed,
             committed_lsn,
+            committed_generation,
             checkpoint_change_lsn: 0,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         });
         // Readers at or after the current image need no earlier boundary.
-        let retained =
-            oldest.filter(|snapshot| state.committed_lsn == 0 || *snapshot < state.committed_lsn);
+        let retained = oldest
+            .filter(|snapshot| !state.has_committed_version() || *snapshot < state.committed_lsn);
         prune_committed_history(
             &mut versions.committed_row_versions,
             &mut state.history,
@@ -428,7 +440,7 @@ impl Storage {
         }
         if oldest.is_some()
             && state.pending.is_none()
-            && (state.committed.is_some() || state.committed_lsn != 0)
+            && state.has_committed_version()
             && state.history.len() == self.max_row_versions_per_row
         {
             return Err(sql_err!(
@@ -486,10 +498,7 @@ impl Storage {
         }
         pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
         // A committed deletion still shadows older immutable SST images.
-        if (state.committed.is_none()
-            && state.committed_lsn == 0
-            && state.history.is_empty()
-            && state.pending.is_none())
+        if (!state.has_committed_version() && state.history.is_empty() && state.pending.is_none())
             || Self::redundant_spilled_row_state(state)
         {
             rows.remove(&rowid);
@@ -536,6 +545,7 @@ mod tests {
                     commit_lsn: 7,
                 }),
                 committed_lsn: 7,
+                committed_generation: Some(0),
                 checkpoint_change_lsn: 0,
                 history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
@@ -1349,6 +1359,7 @@ mod tests {
         let marker = RowState {
             committed: None,
             committed_lsn: 9,
+            committed_generation: Some(0),
             checkpoint_change_lsn: 9,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),

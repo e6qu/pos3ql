@@ -21,7 +21,8 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
     CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
-    OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy, RowHome,
+    MaintenanceMode, MaintenanceStep, OwnedDatum, PartitionBound, PartitionBoundValue,
+    PartitionDef, PartitionStrategy, RowCleanup, RowCleanupTarget, RowCleanupTask, RowHome,
     SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
 };
 use crate::store::{
@@ -897,13 +898,12 @@ impl TemporarySpiller {
         sort_scratch.clear();
         storage.for_each_row_state(slot, &mut |rowid, state| {
             use core::ops::ControlFlow;
-            let has_version =
-                state.committed.is_some() || state.committed_lsn != 0 || !state.history.is_empty();
+            let has_version = state.has_committed_version() || !state.history.is_empty();
             if !has_version {
                 return Ok(ControlFlow::Continue(()));
             }
             let resident = matches!(state.committed, Some(RowHome::Heap(_)))
-                || (state.committed.is_none() && state.committed_lsn != 0)
+                || (state.committed.is_none() && state.has_committed_version())
                 || (0..state.history.len()).any(|index| {
                     state.history_get(index).is_some_and(|version| {
                         version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
@@ -973,7 +973,7 @@ impl TemporarySpiller {
                     }
                     Ok(())
                 };
-            if state.committed.is_some() || state.committed_lsn != 0 {
+            if state.has_committed_version() {
                 append_version(state.committed_lsn, state.committed)?;
             }
             for index in 0..state.history.len() {
@@ -995,8 +995,7 @@ impl TemporarySpiller {
             }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
-        storage.clear_tombstones(slot, storage.lsn());
-        storage.clear_table_dirty_through(slot, generation);
+        storage.clear_table_dirty_at_generation(slot, generation);
         self.reclaim(storage)?;
         Ok(Some(slot))
     }
@@ -1163,6 +1162,7 @@ enum ManifestPublication {
         row_position: usize,
         value_position: usize,
         cleanup_position: usize,
+        cleanup_rows: Option<RowCleanup>,
     },
 }
 
@@ -1440,6 +1440,7 @@ impl Checkpointer {
             MANIFEST_UPLOAD_SLOTS,
             config.checkpoint_manifest_bytes,
         ) + config.checkpoint_manifest_bytes
+            + core::mem::size_of::<Option<ManifestPublication>>()
     }
 
     pub(crate) fn physical_output_budget_bytes(config: &Config) -> usize {
@@ -2032,6 +2033,12 @@ impl Checkpointer {
         }
         let table_capacity = crate::storage::table_slot_capacity(config);
         let manifest_capacity = config.checkpoint_manifest_bytes;
+        budget
+            .draw(
+                core::mem::size_of::<Option<ManifestPublication>>(),
+                "manifest publication state",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         budget
             .draw(
                 Self::workspace_budget_bytes(config),
@@ -12360,6 +12367,7 @@ impl Checkpointer {
                             row_position: 0,
                             value_position: 0,
                             cleanup_position: 0,
+                            cleanup_rows: None,
                         });
                     }
                     Ok(None) => {
@@ -12396,12 +12404,14 @@ impl Checkpointer {
                 row_position,
                 value_position,
                 cleanup_position,
+                mut cleanup_rows,
             } => {
                 self.manifest_publication = Some(ManifestPublication::Installing {
                     lsn,
                     row_position,
                     value_position,
                     cleanup_position,
+                    cleanup_rows,
                 });
                 if row_position < self.pending_installs.len() {
                     let (slot, install) = self.pending_installs[row_position];
@@ -12428,6 +12438,7 @@ impl Checkpointer {
                         row_position: row_position + 1,
                         value_position,
                         cleanup_position,
+                        cleanup_rows,
                     });
                 } else if value_position < self.pending_value_installs.len() {
                     let install = self.pending_value_installs[value_position];
@@ -12457,28 +12468,51 @@ impl Checkpointer {
                         row_position,
                         value_position: value_position + 1,
                         cleanup_position,
+                        cleanup_rows,
                     });
                 } else if cleanup_position < self.checkpoint_deletions.len() {
-                    let end = (cleanup_position + 64).min(self.checkpoint_deletions.len());
-                    for slot in cleanup_position..end {
-                        if self.captured_table_current(storage, slot) {
-                            if self.sliced_this_sweep[slot] {
-                                storage.clear_tombstones(slot, self.sliced_lsn[slot]);
+                    let slot = cleanup_position;
+                    if self.captured_table_current(storage, slot) {
+                        if self.sliced_this_sweep[slot] {
+                            let rows = cleanup_rows.get_or_insert_with(|| {
+                                RowCleanup::new(
+                                    RowCleanupTask::SavedMarkers {
+                                        through_lsn: self.sliced_lsn[slot],
+                                        generation: self.sliced_generation[slot],
+                                    },
+                                    RowCleanupTarget::Table(slot),
+                                )
+                            });
+                            if storage.advance_row_cleanup(
+                                rows,
+                                core::num::NonZeroUsize::new(64).unwrap(),
+                                MaintenanceMode::Background,
+                            ) != MaintenanceStep::Complete
+                            {
+                                self.manifest_publication = Some(ManifestPublication::Installing {
+                                    lsn,
+                                    row_position,
+                                    value_position,
+                                    cleanup_position,
+                                    cleanup_rows,
+                                });
+                                return Ok(CheckpointStep::Working);
                             }
-                            storage.clear_table_dirty_through(slot, self.sliced_generation[slot]);
-                            if let Some(receipt) = self.checkpoint_statistics[slot].take() {
-                                receipt.acknowledge(storage);
-                            }
-                        } else {
-                            self.checkpoint_statistics[slot] = None;
                         }
-                        self.checkpoint_deletions[slot] = None;
+                        storage.clear_table_dirty_at_generation(slot, self.sliced_generation[slot]);
+                        if let Some(receipt) = self.checkpoint_statistics[slot].take() {
+                            receipt.acknowledge(storage);
+                        }
+                    } else {
+                        self.checkpoint_statistics[slot] = None;
                     }
+                    self.checkpoint_deletions[slot] = None;
                     self.manifest_publication = Some(ManifestPublication::Installing {
                         lsn,
                         row_position,
                         value_position,
-                        cleanup_position: end,
+                        cleanup_position: slot + 1,
+                        cleanup_rows: None,
                     });
                 } else {
                     self.pending_installs.clear();
@@ -12614,7 +12648,7 @@ impl Checkpointer {
                             )
                         })
                 };
-            if state.committed.is_some() || state.committed_lsn != 0 {
+            if state.has_committed_version() {
                 version(state.committed_lsn, state.committed, true)?;
             }
             for index in 0..state.history.len() {

@@ -32,7 +32,11 @@ mod heap_relocation;
 mod row_heap;
 #[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
-pub(crate) use heap_relocation::{HeapRelocationMode, HeapRelocationStep, HeapRelocationWorkspace};
+pub(crate) use heap_relocation::HeapRelocationWorkspace;
+pub(crate) use row_cleanup::{
+    EntryCleanup, HeapCleanup, MaintenanceMode, MaintenanceStep, RowCleanup, RowCleanupTarget,
+    RowCleanupTask,
+};
 mod row_cleanup;
 mod row_identities;
 mod row_images;
@@ -2378,10 +2382,12 @@ impl RowLoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,
-    /// Commit LSN of `committed`, or of the deletion when `committed` is
-    /// absent but the entry shadows an older SST row. Zero means no committed
-    /// image has been installed.
+    /// Commit LSN of the current image or deletion shadowing an older SST row.
+    /// Temporary changes may share zero; their committed revision records presence.
     pub committed_lsn: u64,
+    /// None means no committed image. Saved/replayed images use Some(0);
+    /// new publications use the table's next revision for temporary spill coverage.
+    pub(crate) committed_generation: Option<u64>,
     /// Latest committed row change not yet captured by a published row SST.
     /// Keeping this identity in the bounded overlay lets delta checkpoints
     /// avoid a complete immutable-table walk even if the row bytes spill.
@@ -2514,6 +2520,10 @@ pub struct PendingWriteUndo {
 pub(crate) const SNAPSHOT_ALL: u32 = u32::MAX;
 
 impl RowState {
+    pub(crate) fn has_committed_version(&self) -> bool {
+        self.committed_generation.is_some()
+    }
+
     pub fn committed_only(loc: RowLoc) -> Self {
         Self::committed_only_at(loc, 0)
     }
@@ -2522,6 +2532,7 @@ impl RowState {
         Self {
             committed: Some(RowHome::Heap(loc)),
             committed_lsn: commit_lsn,
+            committed_generation: Some(0),
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
@@ -31247,14 +31258,11 @@ impl Storage {
         }
     }
 
-    pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
+    pub(crate) fn clear_table_dirty_at_generation(&mut self, slot: usize, generation: u64) {
         let table = &mut self.tables[slot];
         let mut publication = table.publication();
         if publication.generation == generation {
             publication.dirty = false;
-            for (_, state) in table.rows.write().iter_mut() {
-                state.checkpoint_change_lsn = 0;
-            }
         }
     }
 
@@ -31380,7 +31388,7 @@ impl Storage {
                 "temporary spill no longer matches its captured table"
             ));
         }
-        let coverage = spill_generations::SpillCoverage::ResidentAtGeneration(generation);
+        let coverage = spill_generations::SpillCoverage::ResidentThroughGeneration(generation);
         if delta {
             table
                 .spill_generations
@@ -31903,6 +31911,7 @@ impl Storage {
                 RowState {
                     committed: None,
                     committed_lsn: commit_lsn,
+                    committed_generation: Some(0),
                     checkpoint_change_lsn: commit_lsn,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
@@ -32042,7 +32051,7 @@ impl Storage {
         // Publish the location protected by the write transition, not its old copy.
         let pending = pending_last(&versions.pending_row_versions, state.pending)
             .expect("validated pending head");
-        if snapshots.retains_for(txid) && (state.committed.is_some() || state.committed_lsn != 0) {
+        if snapshots.retains_for(txid) && state.has_committed_version() {
             let old = CommittedVersion {
                 home: state.committed,
                 lsn: state.committed_lsn,
@@ -32103,6 +32112,7 @@ impl Storage {
         }
         state.committed = pending.loc.map(RowHome::Heap);
         state.committed_lsn = commit_lsn;
+        state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
         if state.committed.is_none()
@@ -52930,6 +52940,7 @@ mod tests {
                 commit_lsn: 42,
             }),
             committed_lsn: 42,
+            committed_generation: Some(0),
             checkpoint_change_lsn: 42,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
@@ -54044,7 +54055,10 @@ mod tests {
                     .insert(rowid, RowState::committed_only_at(location, commit_lsn))
                     .unwrap();
             }
-            storage.evict_committed_table(target);
+            storage.finish_row_cleanup(
+                RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                RowCleanupTarget::Table(target),
+            );
             for (rowid, sst, commit_lsn) in [(1, 0, 7), (2, 1, 9), (3, 2, 11)] {
                 let state = storage.resident_row_state(target, rowid).unwrap().unwrap();
                 assert!(
@@ -60000,7 +60014,14 @@ mod tests {
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
-        storage.clear_table_dirty_through(slot, captured);
+        storage.finish_row_cleanup(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 42,
+                generation: captured,
+            },
+            RowCleanupTarget::Table(slot),
+        );
+        storage.clear_table_dirty_at_generation(slot, captured);
         assert!(storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
@@ -60011,7 +60032,14 @@ mod tests {
             42
         );
         let current = storage.table(slot).generation();
-        storage.clear_table_dirty_through(slot, current);
+        storage.finish_row_cleanup(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 42,
+                generation: current,
+            },
+            RowCleanupTarget::Table(slot),
+        );
+        storage.clear_table_dirty_at_generation(slot, current);
         assert!(!storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
@@ -61211,6 +61239,7 @@ mod tests {
         let mut state = RowState {
             committed: None,
             committed_lsn: 0,
+            committed_generation: None,
             checkpoint_change_lsn: 0,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),

@@ -327,7 +327,7 @@ reported rather than required to be linear.
 
 ## Remaining qualification
 
-Execution remains serial. The [roadmap](../PLAN.md#remaining-work-after-storage-io) defines
+Execution remains serial. The [roadmap](../PLAN.md#remaining-work) defines
 the shared-state and worker prerequisites, representative deployment inputs,
 and required scaling, recovery, freshness, and failover evidence. Timing claims
 require repeated long runs on pinned hardware with independent object storage;

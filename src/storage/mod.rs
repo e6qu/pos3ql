@@ -31306,7 +31306,7 @@ impl Storage {
         Ok(SpillGenerationReservation { target, id })
     }
 
-    /// Full replacement preserves the identities of every input generation.
+    /// Empty publication retires files without reusing their identities.
     pub(crate) fn clear_spill_publication(
         &self,
         target: &SpillPublication,
@@ -31405,7 +31405,7 @@ impl Storage {
     }
 
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
-    /// existing spilled entries keep their slots. The caller guarantees the
+    /// existing spilled entries keep their identities. The caller guarantees the
     /// list has room.
     pub(crate) fn append_spill_through(
         &self,

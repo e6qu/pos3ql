@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_sst_retirement_remaps_every_version_home() {
+    fn historical_sst_retirement_preserves_every_version_home() {
         use super::super::CommittedVersion;
         use super::super::row_versions::push_committed_version;
         use crate::store::{BlockId, RowSstFormat, SstHandle};

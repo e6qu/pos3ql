@@ -1775,13 +1775,16 @@ impl<'a> CapturedSpillRoots<'a> {
     pub(super) fn matches_read(&self, read: &SpilledRowRead) -> Result<bool, SqlError> {
         self.with_view(|source| {
             read.roots.with_snapshot(|other| {
-                let Some(member) = source
+                let member = source
                     .ranges
-                    .iter()
-                    .position(|range| range.contains(read.member))
-                else {
+                    .partition_point(|range| range.last < read.member);
+                if !source
+                    .ranges
+                    .get(member)
+                    .is_some_and(|range| range.contains(read.member))
+                {
                     return Ok(false);
-                };
+                }
                 let handle = source.handles[member];
                 let readers_match = match (source.reader, other.reader.as_ref()) {
                     (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -1999,10 +2002,11 @@ impl SpillGenerationSnapshot {
     }
 
     fn handle_for_generation(&self, id: SpillGenerationId) -> Result<SstHandle, SqlError> {
+        let member = self.ranges.partition_point(|range| range.last < id);
         self.ranges
-            .iter()
-            .position(|range| range.contains(id))
-            .and_then(|member| self.handles.get(member))
+            .get(member)
+            .filter(|range| range.contains(id))
+            .and_then(|_| self.handles.get(member))
             .copied()
             .ok_or_else(|| {
                 sql_err!(
@@ -4418,6 +4422,20 @@ mod tests {
                     storage.table(table).rewrite_generation(),
                 )
                 .unwrap();
+            storage.tables[table].publication().rewrite_generation += 1;
+            assert_eq!(
+                storage
+                    .append_spill_through(&pending, handle(9), 11)
+                    .unwrap(),
+                SpillInstallation::RetiredTable
+            );
+            let pending = storage
+                .reserve_spill_generation(
+                    table,
+                    storage.table(table).created_at(),
+                    storage.table(table).rewrite_generation(),
+                )
+                .unwrap();
             storage.commit_drop(table);
             assert_eq!(
                 storage
@@ -4693,7 +4711,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_row_scans_resident_spill_uses_captured_versions_after_remapping() {
+    fn captured_row_scans_resident_spill_uses_captured_versions_after_replacement() {
         use crate::sql::types::Datum;
         let PointFixture {
             storage,
@@ -4720,7 +4738,7 @@ mod tests {
                 generations.replace(1, [roots[2]].into_iter()).unwrap();
                 rows.get_mut(&1).unwrap().committed = Some(super::super::RowHome::Spilled {
                     len: 7,
-                    sst: crate::storage::SpillGenerationId::fixture(0),
+                    sst: crate::storage::SpillGenerationId::fixture(2),
                     commit_lsn: 9,
                 });
             }

@@ -11,6 +11,7 @@ struct PreparedPendingWrite {
     pending_identity: Option<u64>,
     committed: Option<RowHome>,
     committed_lsn: u64,
+    committed_generation: Option<u64>,
     change: PendingChange,
     existed: bool,
     track_statistics: bool,
@@ -315,6 +316,7 @@ impl Storage {
             pending_identity,
             committed,
             committed_lsn,
+            committed_generation,
             change: PendingChange {
                 txid,
                 cid,
@@ -339,6 +341,7 @@ impl Storage {
             pending_identity,
             committed,
             committed_lsn,
+            committed_generation,
             change,
             existed,
             track_statistics,

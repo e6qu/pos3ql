@@ -173,6 +173,12 @@ ordinals. The remaining bits retain the physical attribute count. The marker
 covers nested records and arrays; ordinary text fields retain their original text.
 Frozen enum defaults use journal/default tag 42 for a member identity; tag 12
 remains readable.
+Their labels obey the [PostgreSQL 18 limit of 63 bytes](https://www.postgresql.org/docs/18/datatype-enum.html#DATATYPE-ENUM-IMPLEMENTATION-DETAILS).
+Object-reference defaults such as `'orders'::regclass` retain the full type and
+target OIDs in the encoded record. Their memory cache uses a closed type tag;
+unknown type OIDs fail decoding. The largest encoded default is 130 bytes,
+including its tag and a 120-byte cached object name. The reference-type set
+follows [PostgreSQL 18's object identifier types](https://www.postgresql.org/docs/18/datatype-oid.html).
 New row writes use journal kind 153, which permits both explicitly tagged member
 cells and legacy cells. The preceding row kind remains readable. Even before
 the next checkpoint, an older recovery candidate must reject the new row kind

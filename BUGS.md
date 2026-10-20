@@ -7,6 +7,8 @@ that exposes incomplete changes, owners held while waiting, and test harnesses
 that hide failures or repeat expensive startup until they time out. This includes
 damaged journal lengths mistaken for capacity errors, incomplete collation
 decoding, and stale type references after a column changes type.
+Default caches must also reject oversized enum labels and invalid object-reference
+type tags at their parse boundaries.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded.

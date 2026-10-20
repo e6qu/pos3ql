@@ -48,6 +48,8 @@ Recovery verifies damaged record lengths before reporting capacity errors, and
 table records use the complete shared collation decoder. Compact fixed-string
 metadata and padding-free captured identities preserve the existing memory and
 recovery-stack limits.
+Default caches use validated enum labels and object-reference type tags instead
+of reserving space for values PostgreSQL cannot accept.
 Public type commits and the existing transaction barrier remain exclusive. Finish ownership across each
 source check and dependent publication before removing those restrictions.
 Finish protection for engine-wide publication and remaining table rewrites. Retain historical row, index and backup references before

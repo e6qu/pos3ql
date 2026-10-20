@@ -690,7 +690,7 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     RegObject {
-        type_oid: i32,
+        kind: RegObjectType,
         referenced_oid: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
@@ -769,9 +769,58 @@ pub enum OwnedDatum {
         slot: u16,
         member: Option<crate::sql::types::EnumMemberId>,
         sort: f64,
-        len: u8,
-        bytes: [u8; MAX_DEFAULT_TEXT],
+        label: SqlName,
     },
+}
+
+/// PostgreSQL's object-reference types; an arbitrary OID is not a type tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegObjectType {
+    Regproc,
+    Regprocedure,
+    Regoper,
+    Regoperator,
+    Regclass,
+    Regnamespace,
+    Regrole,
+    Regconfig,
+    Regdictionary,
+    Regcollation,
+}
+
+impl RegObjectType {
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        Some(match ColType::from_oid(oid)? {
+            ColType::Regproc => Self::Regproc,
+            ColType::Regprocedure => Self::Regprocedure,
+            ColType::Regoper => Self::Regoper,
+            ColType::Regoperator => Self::Regoperator,
+            ColType::Regclass => Self::Regclass,
+            ColType::Regnamespace => Self::Regnamespace,
+            ColType::Regrole => Self::Regrole,
+            ColType::Regconfig => Self::Regconfig,
+            ColType::Regdictionary => Self::Regdictionary,
+            ColType::Regcollation => Self::Regcollation,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn oid(self) -> i32 {
+        match self {
+            Self::Regproc => ColType::Regproc,
+            Self::Regprocedure => ColType::Regprocedure,
+            Self::Regoper => ColType::Regoper,
+            Self::Regoperator => ColType::Regoperator,
+            Self::Regclass => ColType::Regclass,
+            Self::Regnamespace => ColType::Regnamespace,
+            Self::Regrole => ColType::Regrole,
+            Self::Regconfig => ColType::Regconfig,
+            Self::Regdictionary => ColType::Regdictionary,
+            Self::Regcollation => ColType::Regcollation,
+        }
+        .oid()
+    }
 }
 
 /// Fixed catalog capacity for a parsed default value. It matches the bounded
@@ -877,7 +926,12 @@ impl OwnedDatum {
             } => {
                 let (len, bytes) = Self::bytes(name.as_bytes(), "catalog object")?;
                 Self::RegObject {
-                    type_oid: *type_oid,
+                    kind: RegObjectType::from_oid(*type_oid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "invalid object-reference default type"
+                        )
+                    })?,
                     referenced_oid: *referenced_oid,
                     len,
                     bytes,
@@ -957,24 +1011,12 @@ impl OwnedDatum {
                 member,
                 sort,
                 label,
-            } => {
-                if label.len() > MAX_DEFAULT_TEXT {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "enum defaults are limited to {} bytes",
-                        MAX_DEFAULT_TEXT
-                    ));
-                }
-                let mut bytes = [0u8; MAX_DEFAULT_TEXT];
-                bytes[..label.len()].copy_from_slice(label.as_bytes());
-                Self::Enum {
-                    slot: *slot,
-                    member: *member,
-                    sort: *sort,
-                    len: label.len() as u8,
-                    bytes,
-                }
-            }
+            } => Self::Enum {
+                slot: *slot,
+                member: *member,
+                sort: *sort,
+                label: SqlName::parse(label)?,
+            },
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(
@@ -1057,12 +1099,12 @@ impl OwnedDatum {
                     .expect("stored from valid UTF-8"),
             },
             Self::RegObject {
-                type_oid,
+                kind,
                 referenced_oid,
                 len,
                 bytes,
             } => Datum::RegObject {
-                type_oid: *type_oid,
+                type_oid: kind.oid(),
                 referenced_oid: *referenced_oid,
                 name: core::str::from_utf8(&bytes[..*len as usize])
                     .expect("stored from valid UTF-8"),
@@ -1161,14 +1203,12 @@ impl OwnedDatum {
                 slot,
                 member,
                 sort,
-                len,
-                bytes,
+                label,
             } => Datum::Enum {
                 slot: *slot,
                 member: *member,
                 sort: *sort,
-                label: core::str::from_utf8(&bytes[..*len as usize])
-                    .expect("stored from valid UTF-8"),
+                label: label.as_str(),
             },
         }
     }

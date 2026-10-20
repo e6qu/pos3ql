@@ -11334,8 +11334,8 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr(_)) => 6,
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
-        Some(OwnedDatum::Enum { len, member, .. }) => {
-            11 + usize::from(member.is_some()) * 4 + *len as usize
+        Some(OwnedDatum::Enum { label, member, .. }) => {
+            11 + usize::from(member.is_some()) * 4 + label.as_str().len()
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
@@ -11491,7 +11491,7 @@ pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> b
 
 /// Largest encoded default: an enum's tag, identity, ordering key, length and
 /// bounded label. Array and ACL payloads carry less metadata.
-pub(crate) const MAX_DEFAULT_ENCODED: usize = 16 + crate::storage::MAX_DEFAULT_TEXT;
+pub(crate) const MAX_DEFAULT_ENCODED: usize = 10 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
 pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
@@ -11580,13 +11580,13 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             6 + *len as usize
         }
         Some(OwnedDatum::RegObject {
-            type_oid,
+            kind,
             referenced_oid,
             len,
             bytes,
         }) => {
             out[0] = 26;
-            out[1..5].copy_from_slice(&type_oid.to_le_bytes());
+            out[1..5].copy_from_slice(&kind.oid().to_le_bytes());
             out[5..9].copy_from_slice(&referenced_oid.to_le_bytes());
             out[9] = *len;
             out[10..10 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
@@ -11701,8 +11701,7 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             slot,
             member,
             sort,
-            len,
-            bytes,
+            label,
         }) => {
             out[0] = if member.is_some() { 42 } else { 12 };
             out[1..3].copy_from_slice(&slot.to_le_bytes());
@@ -11713,9 +11712,10 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             } else {
                 11
             };
-            out[prefix] = *len;
-            out[prefix + 1..prefix + 1 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            prefix + 1 + *len as usize
+            let bytes = label.as_str().as_bytes();
+            out[prefix] = bytes.len() as u8;
+            out[prefix + 1..prefix + 1 + bytes.len()].copy_from_slice(bytes);
+            prefix + 1 + bytes.len()
         }
         Some(OwnedDatum::Json { jsonb, len, bytes }) => {
             out[0] = 20;
@@ -11973,20 +11973,14 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             };
             let len = *payload.get(*at)? as usize;
             *at += 1;
-            if len > crate::storage::MAX_DEFAULT_TEXT {
-                return None;
-            }
             let raw = payload.get(*at..*at + len)?;
             *at += len;
-            core::str::from_utf8(raw).ok()?;
-            let mut bytes = [0u8; crate::storage::MAX_DEFAULT_TEXT];
-            bytes[..len].copy_from_slice(raw);
+            let label = SqlName::parse(core::str::from_utf8(raw).ok()?).ok()?;
             Some(OwnedDatum::Enum {
                 slot,
                 member,
                 sort,
-                len: len as u8,
-                bytes,
+                label,
             })
         }
         13 => {
@@ -12178,7 +12172,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             core::str::from_utf8(&bytes[..len]).ok()?;
             Some(OwnedDatum::RegObject {
-                type_oid,
+                kind: crate::storage::RegObjectType::from_oid(type_oid)?,
                 referenced_oid,
                 len: len as u8,
                 bytes,
@@ -12605,6 +12599,99 @@ mod tests {
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
             Some(WalOp::SetTextSearch { slot: 7, .. })
         ));
+    }
+
+    #[test]
+    fn compact_catalog_defaults_keep_postgresql_label_and_reference_types() {
+        use crate::sql::types::Datum;
+        assert!(core::mem::size_of::<OwnedDatum>() <= 128);
+        let label = "é".repeat(31) + "a";
+        let too_long = "é".repeat(32);
+        let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
+        crate::mem::guard::forbid_alloc(|| {
+            for member in [None, crate::sql::types::EnumMemberId::from_ordinal(7)] {
+                let value = OwnedDatum::from_datum(&Datum::Enum {
+                    slot: 7,
+                    member,
+                    sort: 1.0,
+                    label: &label,
+                })
+                .unwrap();
+                let length = encode_default_bytes(&Some(value), &mut encoded);
+                assert_eq!(length, encoded_default_len(&Some(value)));
+                let mut at = 0;
+                assert_eq!(
+                    decode_default(&encoded[..length], &mut at),
+                    Some(Some(value))
+                );
+                assert_eq!(at, length);
+                let prefix = if member.is_some() { 15 } else { 11 };
+                encoded[prefix] = 64;
+                encoded[length] = b'x';
+                at = 0;
+                assert!(decode_default(&encoded[..length + 1], &mut at).is_none());
+            }
+            assert!(
+                OwnedDatum::from_datum(&Datum::Enum {
+                    slot: 7,
+                    member: None,
+                    sort: 1.0,
+                    label: &too_long,
+                })
+                .is_err()
+            );
+            for ctype in [
+                ColType::Regproc,
+                ColType::Regprocedure,
+                ColType::Regoper,
+                ColType::Regoperator,
+                ColType::Regclass,
+                ColType::Regnamespace,
+                ColType::Regrole,
+                ColType::Regconfig,
+                ColType::Regdictionary,
+                ColType::Regcollation,
+            ] {
+                let value = OwnedDatum::from_datum(&Datum::RegObject {
+                    type_oid: ctype.oid(),
+                    referenced_oid: 37,
+                    name: "public.object",
+                })
+                .unwrap();
+                let length = encode_default_bytes(&Some(value), &mut encoded);
+                assert_eq!(
+                    i32::from_le_bytes(encoded[1..5].try_into().unwrap()),
+                    ctype.oid()
+                );
+                let mut at = 0;
+                assert_eq!(
+                    decode_default(&encoded[..length], &mut at),
+                    Some(Some(value))
+                );
+                assert_eq!(at, length);
+                assert!(matches!(value.as_datum(), Datum::RegObject {
+                    type_oid, referenced_oid: 37, name: "public.object",
+                } if type_oid == ctype.oid()));
+            }
+            for oid in [
+                -1,
+                ColType::Int4.oid(),
+                ColType::Oid.oid(),
+                ColType::Regtype.oid(),
+            ] {
+                assert!(
+                    OwnedDatum::from_datum(&Datum::RegObject {
+                        type_oid: oid,
+                        referenced_oid: 37,
+                        name: "public.object",
+                    })
+                    .is_err()
+                );
+                encoded[1..5].copy_from_slice(&oid.to_le_bytes());
+                let mut at = 0;
+                assert!(decode_default(&encoded[..23], &mut at).is_none());
+            }
+        });
     }
 
     #[test]
@@ -13247,10 +13334,9 @@ mod tests {
             at = 0;
             assert!(decode_view_default(reencoded.readable(), &mut at).is_none());
         });
-        let widest = OwnedDatum::Enum {
-            slot: 0,
-            member: Some(crate::sql::types::EnumMemberId::from_ordinal(0).unwrap()),
-            sort: 1.0,
+        let widest = OwnedDatum::RegObject {
+            kind: crate::storage::RegObjectType::Regclass,
+            referenced_oid: 1,
             len: crate::storage::MAX_DEFAULT_TEXT as u8,
             bytes: [b'x'; crate::storage::MAX_DEFAULT_TEXT],
         };

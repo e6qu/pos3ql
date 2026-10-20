@@ -135,6 +135,8 @@ runner is a scheduling delay, not evidence of an execution timeout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
+Coverage stops at a failed build or instrumentation setup and retains its
+diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort
 addresses with the runner's `addr2line`, so the log names the allocating code.
 

@@ -247,7 +247,7 @@ impl TypePublication {
         let mut install_source = Some(install_source);
         loop {
             let mut owners = TableAttempt { slots: &mut slots };
-            let attempt = (|| {
+            let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_tables(storage, movement, &mut owners)?;
                 let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
                 let members = try_mutex(

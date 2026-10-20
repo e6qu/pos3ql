@@ -13786,16 +13786,20 @@ mod tests {
     #[test]
     fn table_payload_preserves_every_supported_collation_code() {
         let mut definition = sample_def();
-        let mut bytes = [0; 65536];
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "table collation payload", 4096).unwrap();
         for code in 0..=u8::MAX {
             let Some(collation) = crate::sql::ast::Collation::from_code(code) else {
                 continue;
             };
             definition.columns[1].collation = collation;
             crate::mem::guard::forbid_alloc(|| {
-                let payload =
-                    encode_catalog_operation(&WalOp::CreateTable(&definition), &mut bytes);
-                let restored = decode_table_payload(payload).unwrap();
+                payload.clear();
+                assert!(append_payload(
+                    &mut payload,
+                    &WalOp::CreateTable(&definition)
+                ));
+                let restored = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.columns[1].collation, collation);
             });
         }

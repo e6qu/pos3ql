@@ -924,7 +924,7 @@ mod tests {
     #[test]
     fn row_lock_owners_local_history_rechecks_readers_and_temporary_generation() {
         for matching_generation in [true, false] {
-            let (mut storage, table, _) = fixture(RelationPersistence::Temporary, 2);
+            let (storage, table, _) = fixture(RelationPersistence::Temporary, 2);
             crate::mem::guard::forbid_alloc(|| {
                 storage.register_snapshot(99, 7).unwrap();
                 update(&storage, table, 1, 20, 8, 9);

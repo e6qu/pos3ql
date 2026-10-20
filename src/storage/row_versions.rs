@@ -8,7 +8,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
-    PendingVersions, PendingWriteUndo, RowHome, RowLoc, RowState, committed_row_version_capacity,
+    PendingVersions, PendingWriteUndo, RowHome, RowLoc, committed_row_version_capacity,
     pending_row_version_capacity,
 };
 use crate::config::Config;

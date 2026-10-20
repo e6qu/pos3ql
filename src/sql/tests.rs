@@ -88923,6 +88923,14 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
         .spill_generations()
         .handle(0)
         .unwrap();
+    let injected = engine
+        .storage
+        .reserve_spill_generation(
+            second,
+            engine.storage.table(second).created_at(),
+            engine.storage.table(second).rewrite_generation(),
+        )
+        .unwrap();
     assert!(
         error_sqlstates(&run_with(
             &mut engine,
@@ -88946,7 +88954,7 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
     // capacity failure after the first table has installed successfully.
     engine
         .storage
-        .append_spill_through(second, old_second, 0)
+        .append_spill_through(&injected, old_second, 0)
         .unwrap();
     let mut failure = None;
     for _ in 0..128 {
@@ -88971,7 +88979,18 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
     assert!(engine.ckpt.as_ref().unwrap().manifest_installing());
     assert_eq!(engine.storage.spill_generation_count(first), 2);
     let roots = engine.ckpt.as_ref().unwrap().root_etags_for_test();
-    engine.storage.set_spill_list(second, &[old_second]);
+    let target = engine
+        .storage
+        .capture_spill_publication(
+            second,
+            engine.storage.table(second).created_at(),
+            engine.storage.table(second).rewrite_generation(),
+        )
+        .unwrap();
+    engine
+        .storage
+        .merge_spill_pair(&target, 0, (old_second, old_second), Some(old_second))
+        .unwrap();
     assert!(engine.checkpoint().unwrap());
     assert_eq!(
         engine.ckpt.as_ref().unwrap().root_etags_for_test(),

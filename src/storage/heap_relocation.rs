@@ -1167,7 +1167,7 @@ mod tests {
             for (rowid, member, lsn) in [(1, 0, 7), (2, 1, 11)] {
                 let row = storage.resident_row_state(table, rowid).unwrap().unwrap();
                 assert!(matches!(row.committed,
-                    Some(RowHome::Spilled { sst, commit_lsn, .. }) if sst == member && commit_lsn == lsn));
+                    Some(RowHome::Spilled { sst, commit_lsn, .. }) if sst == crate::storage::SpillGenerationId::fixture(member) && commit_lsn == lsn));
             }
             assert_row(&storage, table, 3, 0, u64::MAX, 3, "later");
             let row = storage.resident_row_state(table, 3).unwrap().unwrap();
@@ -1209,10 +1209,10 @@ mod tests {
             assert!(matches!(
                 row.committed,
                 Some(RowHome::Spilled {
-                    sst: crate::storage::SpillGenerationId::fixture(1),
+                    sst,
                     commit_lsn: 7,
                     ..
-                })
+                }) if sst == crate::storage::SpillGenerationId::fixture(1)
             ));
         });
     }

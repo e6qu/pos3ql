@@ -45,7 +45,10 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
         .unwrap();
     assert_eq!(engine.storage.table(table).spill_generations().len(), 1);
     engine.storage.set_commit_snapshot(engine.storage.lsn());
-    engine.storage.evict_redundant_entries(table);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
     assert!(
         engine
             .storage
@@ -71257,8 +71260,14 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
     );
     assert!(engine.checkpoint().unwrap());
     let slot = engine.storage.find_table("public", "value_stream").unwrap();
-    engine.storage.evict_committed_table(slot);
-    engine.storage.evict_redundant_entries(slot);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
     assert!(engine.storage.spill_rows_are_unshadowed(slot));
     let changed = run_with(
         &mut engine,
@@ -71353,8 +71362,14 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
             )
             .unwrap()
     );
-    engine.storage.evict_committed_table(slot);
-    engine.storage.evict_redundant_entries(slot);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
     assert!(engine.storage.spill_rows_are_unshadowed(slot));
     loop {
         let before = engine.storage.block_io_stats();
@@ -71556,8 +71571,14 @@ fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
     old.roster.write_key(&mut hex);
     let key = format!("blocks/{}", std::str::from_utf8(&hex).unwrap());
     assert!(namespace.borrow().object_bytes(&key).is_some());
-    engine.storage.evict_committed_table(slot);
-    engine.storage.evict_redundant_entries(slot);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
     let mut cursor = crate::storage::CheckpointValueCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
@@ -71782,8 +71803,14 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
     assert!(!message_types(&index).contains(&b'E'));
     assert!(engine.checkpoint().unwrap());
     let slot = engine.storage.find_table("public", "pax_resume").unwrap();
-    engine.storage.evict_committed_table(slot);
-    engine.storage.evict_redundant_entries(slot);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
     let changed = run_with(
         &mut engine,
         &mut budget,
@@ -71821,8 +71848,8 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
         }
     };
     assert!(value_beats > 1, "the PAX source walk must span beats");
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -72118,8 +72145,8 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         writer_beats > 3,
         "value-index output was not split across beats"
     );
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -72296,8 +72323,14 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
         .storage
         .find_table("public", "incremental_navigation")
         .unwrap();
-    engine.storage.evict_committed_table(slot);
-    engine.storage.evict_redundant_entries(slot);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(slot),
+    );
 
     let changed = run_with(
         &mut engine,
@@ -72345,8 +72378,8 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
         value_puts <= 12,
         "incremental navigation rewrote the complete generation: {value_puts} PUTs"
     );
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -73231,8 +73264,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             }
         }
     };
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
 
     fn obsolete_objects(engine: &mut Engine) -> usize {
@@ -73420,8 +73453,8 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
             }
         }
     };
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
 
     let second = run_with(
         &mut engine,
@@ -73562,8 +73595,14 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         .storage
         .find_table("public", "resliced_rows")
         .unwrap();
-    engine.storage.evict_committed_table(table);
-    engine.storage.evict_redundant_entries(table);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
     assert!(engine.storage.spill_rows_are_unshadowed(table));
 
     let changed = run_with(
@@ -73663,7 +73702,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         )),
         ["4096", "final", "256"]
     );
-    engine.storage.evict_committed_table(table);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -73982,8 +74024,8 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
         beats > 3,
         "full roster was not paced across checkpoint beats"
     );
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -74133,8 +74175,8 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
         "one merge beat read too much: {max_beat_gets}"
     );
     assert!(beats > 2, "the wide merge must cross dispatch beats");
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -74413,8 +74455,14 @@ fn metadata_alter_keeps_immutable_roots_and_survives_cold_recovery() {
         .spill_generations()
         .handle(0)
         .unwrap();
-    engine.storage.evict_committed_table(table);
-    engine.storage.evict_redundant_entries(table);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
     let response = run_with(
         &mut engine,
         &mut budget,
@@ -74590,8 +74638,14 @@ fn historical_sst_reads_survive_paced_roster_replacement_and_cold_recovery() {
             .published_spill_generation_count(table),
         2
     );
-    engine.storage.evict_committed_table(table);
-    engine.storage.evict_redundant_entries(table);
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
+    engine.storage.finish_row_cleanup(
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTarget::Table(table),
+    );
     run_txn(
         &mut engine,
         &mut budget,
@@ -74829,8 +74883,8 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
             }
         }
     };
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(published_lsn);
+    engine.finish_local_cleanup().unwrap();
     assert!(engine.checkpoint_work_pending());
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
@@ -84716,10 +84770,23 @@ fn sliced_cleanup_fixture_with_wal(
     (engine, budget, config)
 }
 
+fn prepare_sliced_cleanup(engine: &mut Engine) {
+    for _ in 0..64 {
+        if matches!(
+            engine.local_cleanup.unwrap().phase,
+            LocalCleanupPhase::Compact
+        ) {
+            return;
+        }
+        assert!(engine.maybe_checkpoint());
+    }
+    panic!("fixture history cleanup did not reach heap compaction");
+}
+
 fn start_sliced_cleanup(engine: &mut Engine, lsn: u64) {
     crate::mem::guard::forbid_alloc(|| {
-        engine.begin_post_publish_cleanup(lsn);
-        assert!(engine.maybe_checkpoint());
+        engine.begin_checkpoint_cleanup(lsn);
+        prepare_sliced_cleanup(engine);
         assert!(engine.maybe_checkpoint());
         assert!(engine.compact_scratch.active());
     });
@@ -84728,7 +84795,7 @@ fn start_sliced_cleanup(engine: &mut Engine, lsn: u64) {
 fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
     let mut turns = 0;
     crate::mem::guard::forbid_alloc(|| {
-        while engine.post_publish_cleanup.is_some() {
+        while engine.local_cleanup.is_some() {
             assert!(turns < 64, "bounded fixture cleanup did not finish");
             assert!(engine.maybe_checkpoint());
             turns += 1;
@@ -84842,7 +84909,7 @@ fn sliced_heap_cleanup_explicit_checkpoint_finishes_a_paused_copy() {
     );
     assert!(!message_types(&output).contains(&b'E'));
     assert_eq!(data_rows(&output), ["80|655360"]);
-    assert!(engine.post_publish_cleanup.is_none());
+    assert!(engine.local_cleanup.is_none());
     assert!(!engine.compact_scratch.active());
 }
 
@@ -84873,15 +84940,16 @@ fn sliced_heap_cleanup_retained_buffers_fail_explicitly_and_resume_after_release
     finish_sliced_cleanup(&mut engine);
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
-        engine.begin_post_publish_cleanup(lsn);
+        engine.begin_checkpoint_cleanup(lsn);
         assert_eq!(
             engine
-                .post_publish_cleanup_step(HeapRelocationMode::Background)
+                .local_cleanup_step(MaintenanceMode::Background)
                 .unwrap(),
-            HeapRelocationStep::Advanced
+            MaintenanceStep::Advanced
         );
+        prepare_sliced_cleanup(&mut engine);
         let error = engine
-            .post_publish_cleanup_step(HeapRelocationMode::Background)
+            .local_cleanup_step(MaintenanceMode::Background)
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(
@@ -85183,11 +85251,12 @@ fn check_cleanup_during_download(
     let mut reactor = Reactor::new(&mut io_budget, 4).unwrap();
     reactor.register_read(fd, 7).unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        engine.begin_post_publish_cleanup(lsn);
+        engine.begin_checkpoint_cleanup(lsn);
         assert!(engine.checkpoint_can_progress());
         assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
         assert_eq!(reactor.poll(Some(Duration::ZERO)).unwrap(), 0);
         if retain_both {
+            prepare_sliced_cleanup(&mut engine);
             assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
             assert!(!engine.compact_scratch.active());
             assert_eq!(engine.pending_block_read_fd(0), Some(fd));
@@ -85196,7 +85265,7 @@ fn check_cleanup_during_download(
     drop(older);
     let mut turns = 0;
     crate::mem::guard::forbid_alloc(|| {
-        while engine.post_publish_cleanup.is_some() {
+        while engine.local_cleanup.is_some() {
             assert!(turns < 64, "cleanup must finish without the GET response");
             assert!(engine.checkpoint_can_progress());
             assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
@@ -85311,9 +85380,9 @@ fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_r
         }
     }
     assert!(published);
-    assert!(engine.post_publish_cleanup.is_some());
+    assert!(engine.local_cleanup.is_some());
     crate::mem::guard::forbid_alloc(|| {
-        while engine.post_publish_cleanup.is_some() {
+        while engine.local_cleanup.is_some() {
             assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
         }
     });
@@ -85396,7 +85465,7 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let older = retain_row(&engine);
     let lsn = engine.storage.lsn();
     start_sliced_cleanup(&mut engine, lsn);
-    crate::mem::guard::forbid_alloc(|| engine.finish_post_publish_cleanup())
+    crate::mem::guard::forbid_alloc(|| engine.finish_local_cleanup())
         .expect("initial setup can reclaim the unretained active buffer in place");
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
@@ -85409,7 +85478,7 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
         engine.checkpoint_beat(),
         CheckpointBeat::DurableWithLocalFailure
     );
-    assert!(engine.post_publish_cleanup.is_some());
+    assert!(engine.local_cleanup.is_some());
     assert!(!engine.compact_scratch.active());
     drop(older);
     finish_sliced_cleanup(&mut engine);
@@ -85479,11 +85548,11 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
             namespace.borrow_mut().faults.fail_from_op = Some(0);
             published
         };
-        engine.begin_post_publish_cleanup(published);
+        engine.begin_checkpoint_cleanup(published);
         assert_eq!(engine.checkpoint_beat(), CheckpointBeat::StorageFailure);
         assert!(matches!(
-            engine.post_publish_cleanup.unwrap().phase,
-            PostPublishPhase::Prepare
+            engine.local_cleanup.unwrap().phase,
+            LocalCleanupPhase::Prepare
         ));
         assert!(!engine.compact_scratch.active());
         let pending_bytes = engine.wal.pending_batch_bytes();
@@ -85491,15 +85560,17 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
             // Exercise the CPU-only turn used while an object GET owns I/O.
             assert_eq!(
                 engine
-                    .post_publish_cleanup_step(HeapRelocationMode::Background)
+                    .local_cleanup_step(MaintenanceMode::Background)
                     .unwrap(),
-                HeapRelocationStep::Advanced
+                MaintenanceStep::Advanced
             );
             assert_eq!(engine.wal.pending_batch_bytes(), pending_bytes);
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Durable);
         assert!(!engine.durable_retry_pending());
+        prepare_sliced_cleanup(&mut engine);
+        assert!(engine.maybe_checkpoint());
         assert!(engine.compact_scratch.active());
         assert_ne!(
             namespace.borrow().object_bytes(&head_key).unwrap(),
@@ -85928,8 +85999,14 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
             .handle(0)
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            engine.storage.evict_committed_table(table);
-            engine.storage.evict_redundant_entries(table);
+            engine.storage.finish_row_cleanup(
+                RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                RowCleanupTarget::Table(table),
+            );
+            engine.storage.finish_row_cleanup(
+                RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+                RowCleanupTarget::Table(table),
+            );
             assert!(engine.storage.table(table).rows.is_empty());
         });
         reader.success(
@@ -86574,7 +86651,7 @@ fn sliced_heap_capture_queries_and_writes_run_between_one_slot_turns() {
     crate::mem::guard::forbid_alloc(|| {
         engine
             .compact_scratch
-            .begin(&engine.storage, HeapRelocationMode::Background)
+            .begin(&engine.storage, MaintenanceMode::Background)
             .unwrap();
         assert_eq!(
             engine
@@ -86583,10 +86660,10 @@ fn sliced_heap_capture_queries_and_writes_run_between_one_slot_turns() {
                     &engine.storage,
                     NonZeroUsize::MIN,
                     NonZeroUsize::MIN,
-                    HeapRelocationMode::Background,
+                    MaintenanceMode::Background,
                 )
                 .unwrap(),
-            HeapRelocationStep::Advanced
+            MaintenanceStep::Advanced
         );
     });
     assert_eq!(
@@ -86617,10 +86694,10 @@ fn sliced_heap_capture_queries_and_writes_run_between_one_slot_turns() {
                     &engine.storage,
                     NonZeroUsize::MIN,
                     NonZeroUsize::new(64 << 10).unwrap(),
-                    HeapRelocationMode::Background,
+                    MaintenanceMode::Background,
                 )
                 .unwrap()
-                == HeapRelocationStep::Complete
+                == MaintenanceStep::Complete
             {
                 finished = true;
                 break;
@@ -86706,7 +86783,7 @@ fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
     crate::mem::guard::forbid_alloc(|| {
         engine
             .compact_scratch
-            .begin(&engine.storage, HeapRelocationMode::Background)
+            .begin(&engine.storage, MaintenanceMode::Background)
             .unwrap();
         assert_eq!(
             engine
@@ -86715,10 +86792,10 @@ fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
                     &engine.storage,
                     NonZeroUsize::MIN,
                     NonZeroUsize::MIN,
-                    HeapRelocationMode::Background,
+                    MaintenanceMode::Background,
                 )
                 .unwrap(),
-            HeapRelocationStep::Advanced
+            MaintenanceStep::Advanced
         );
     });
     let output = run_with_fixed_memory(
@@ -86758,10 +86835,10 @@ fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
                     &engine.storage,
                     NonZeroUsize::MIN,
                     NonZeroUsize::new(64 << 10).unwrap(),
-                    HeapRelocationMode::Background,
+                    MaintenanceMode::Background,
                 )
                 .unwrap()
-                == HeapRelocationStep::Complete
+                == MaintenanceStep::Complete
             {
                 finished = true;
                 break;
@@ -87721,8 +87798,8 @@ fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
             .published_spill_generation_count(table),
         1
     );
-    engine.begin_post_publish_cleanup(lsn);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.begin_checkpoint_cleanup(lsn);
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -87908,8 +87985,8 @@ fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
                     .is_some()
             );
         }
-        engine.begin_post_publish_cleanup(lsn);
-        engine.finish_post_publish_cleanup().unwrap();
+        engine.begin_checkpoint_cleanup(lsn);
+        engine.finish_local_cleanup().unwrap();
         engine
             .ckpt
             .as_mut()
@@ -88238,7 +88315,7 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
             (0..engine.storage.value_binding_count(table))
                 .any(|binding| engine.storage.value_binding_needs_publish(table, binding))
         );
-        engine.finish_post_publish_cleanup().unwrap();
+        engine.finish_local_cleanup().unwrap();
         engine
             .ckpt
             .as_mut()
@@ -88339,7 +88416,7 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
             }
         }
         assert!(completed);
-        engine.finish_post_publish_cleanup().unwrap();
+        engine.finish_local_cleanup().unwrap();
         engine
             .ckpt
             .as_mut()
@@ -88760,7 +88837,7 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         }
     }
     assert!(saved);
-    engine.finish_post_publish_cleanup().unwrap();
+    engine.finish_local_cleanup().unwrap();
     engine
         .ckpt
         .as_mut()
@@ -88926,8 +89003,14 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
             .handle(0)
             .unwrap()
             .roster;
-        engine.storage.evict_committed_table(table);
-        engine.storage.evict_redundant_entries(table);
+        engine.storage.finish_row_cleanup(
+            RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+            RowCleanupTarget::Table(table),
+        );
+        engine.storage.finish_row_cleanup(
+            RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+            RowCleanupTarget::Table(table),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -89396,4 +89479,75 @@ fn sort_keys_reuse_projected_values_without_repeating_effects() {
         assert!(errors.is_empty(), "{sql}: {errors:?}");
         assert_eq!(data_rows(&output), expected, "{sql}");
     }
+}
+
+#[test]
+fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches() {
+    let (mut engine, budget, config) = sliced_cleanup_fixture("bounded-row-cleanup-turns", true);
+    let published = publish_cleanup_fixture(&mut engine);
+    engine.begin_checkpoint_cleanup(published);
+    let mut partial = [false; 3];
+    for _ in 0..256 {
+        let Some(cleanup) = engine.local_cleanup else {
+            break;
+        };
+        let task = if let LocalCleanupPhase::Rows(rows) = cleanup.phase {
+            Some(rows.task())
+        } else {
+            None
+        };
+        let progress = crate::mem::guard::forbid_alloc(|| {
+            engine.local_cleanup_step(MaintenanceMode::Background)
+        })
+        .unwrap();
+        assert_ne!(progress, MaintenanceStep::WaitingForOwner);
+        if let (Some(task), Some(after)) = (task, engine.local_cleanup)
+            && matches!(after.phase, LocalCleanupPhase::Rows(_))
+        {
+            let index = match task {
+                RowCleanupTask::DurableHistory => 0,
+                RowCleanupTask::HeapRows(_) => 1,
+                RowCleanupTask::SavedEntries(_) => 2,
+                RowCleanupTask::SnapshotHistory => unreachable!(),
+            };
+            if !partial[index] {
+                partial[index] = true;
+                let output = run_with_fixed_memory(
+                    &mut engine,
+                    &budget,
+                    "SELECT count(*),sum(id) FROM cleanup_orders",
+                    32 << 20,
+                );
+                assert!(error_sqlstates(&output).is_empty());
+                assert_eq!(data_rows(&output), ["80|3240"]);
+                if index == 0 {
+                    let rolled_back = run_with_fixed_memory(
+                        &mut engine,
+                        &budget,
+                        "BEGIN; UPDATE cleanup_orders SET note='changed' WHERE id=80; ROLLBACK",
+                        32 << 20,
+                    );
+                    assert!(error_sqlstates(&rolled_back).is_empty());
+                }
+            }
+        }
+    }
+    assert!(
+        partial.iter().all(|&seen| seen),
+        "all row walks must span turns"
+    );
+    assert!(engine.local_cleanup.is_none());
+    assert!(!engine.compact_scratch.active());
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*),sum(length(note)) FROM cleanup_orders",
+            8 << 20,
+        )),
+        ["80|655360"],
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

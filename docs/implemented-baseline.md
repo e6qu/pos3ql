@@ -837,10 +837,13 @@ existing 85% critical heap threshold, automatic checkpointing also finishes
 publication and cleanup before dispatch resumes, preserving headroom for the
 next write. This pressure path can still delay connections.
 
-Post-checkpoint history release and row eviction use shared storage access.
-Each table's definition, installed files, version pool and row map are protected
-where needed; waiting releases earlier owners. Durable history release preserves
-versions newer than the installed boundary. Local history pruning checks current
+Post-checkpoint history release, heap-row eviction and redundant-entry removal
+use shared storage access in turns of at most 64 stable row slots. Their retained
+positions contain no locks. Busy tables are skipped and retried after ready
+tables; failed partial acquisition releases every earlier owner. Table and saved
+file state are checked again on each batch. Selection of a half-full row map is
+kept through its partial batches even after removals reduce its occupancy.
+Durable history release preserves versions newer than the installed boundary. Local history pruning checks current
 readers under the same registry owner used for admission, including for temporary
 tables. Temporary eviction still requires the exact captured table generation.
 
@@ -862,9 +865,13 @@ engine does not invalidate them. Cancellation or a preparation/copy error
 releases the reservation. Using a workspace with a different storage
 instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
-prefix; writes after it keep their journal suffix for recovery. Final heap
-remapping, eviction and other maintenance still finish as whole operations
-within server turns. Checkpoint metadata uploads and immutable table, index and
+prefix; writes after it keep their journal suffix for recovery. The same startup-accounted cleanup state machine handles temporary-table
+history release, saved-row eviction, compaction and redundant entries. It keeps
+the original captured-generation checks and lets statements run between its
+row batches. No extra runtime pool is created. Explicit CHECKPOINT and shutdown
+select synchronous completion; the existing critical-pressure path still does
+so at 85% heap use. Final heap remapping and some other maintenance still finish
+as whole operations within server turns. Checkpoint metadata uploads and immutable table, index and
 merge output now retain their own bytes while network requests overlap.
 Metadata capture and other atomic maintenance reads can still wait
 synchronously. Fixed SQL execution workers remain unfinished.
@@ -1016,8 +1023,10 @@ definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
 different image when readers retain the old one. Other type publication remains exclusive.
 
-Transaction-wide catalog and durable publication, concurrent cache/object I/O
-and maintenance, remaining table rewrites, and execution workers are still open.
+Transaction-wide catalog coordination, remaining table rewrites, bounded final
+heap remapping, critical-pressure admission and SQL execution workers remain open.
+Concurrent and batched object-store I/O and ordered durable publication are
+implemented; the storage and transaction guides describe their limits.
 
 ## What the tests establish
 

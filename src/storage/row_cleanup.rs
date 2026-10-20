@@ -3,6 +3,98 @@
 use super::row_ownership::{acquire, try_mutex};
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceMode {
+    Background,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceStep {
+    Advanced,
+    WaitingForOwner,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HeapCleanup {
+    AllSaved,
+    Durable,
+    PressuredDurable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EntryCleanup {
+    AllSaved,
+    Pressured,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RowCleanupTask {
+    DurableHistory,
+    SnapshotHistory,
+    HeapRows(HeapCleanup),
+    SavedEntries(EntryCleanup),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RowCleanupTarget {
+    AllTables,
+    Table(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RowCleanupPosition {
+    table: usize,
+    slot: usize,
+    selected: Option<bool>,
+}
+
+/// A pass owns positions, never table or allocator guards between turns.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowCleanup {
+    task: RowCleanupTask,
+    target: RowCleanupTarget,
+    position: RowCleanupPosition,
+    retry: Option<RowCleanupPosition>,
+    changed: bool,
+}
+
+impl RowCleanup {
+    pub(crate) fn new(task: RowCleanupTask, target: RowCleanupTarget) -> Self {
+        Self {
+            task,
+            target,
+            position: RowCleanupPosition {
+                table: match target {
+                    RowCleanupTarget::AllTables => 0,
+                    RowCleanupTarget::Table(table) => table,
+                },
+                slot: 0,
+                selected: None,
+            },
+            retry: None,
+            changed: false,
+        }
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        self.changed
+    }
+
+    pub(crate) fn task(&self) -> RowCleanupTask {
+        self.task
+    }
+}
+
+struct CleanedSlots {
+    next: usize,
+    visited: usize,
+    complete: bool,
+    selected: bool,
+    changed: bool,
+}
+
 impl Storage {
     /// Retain before scanning row metadata. Row publication observes this owner
     /// under the same row lock, so a deletion cannot disappear after capture.
@@ -21,131 +113,196 @@ impl Storage {
         });
     }
 
-    /// Evict only versions covered by installed roots, retaining later writes.
-    pub fn evict_committed(&self) {
-        for slot in 0..self.tables.len() {
-            self.evict_committed_rows(slot, false);
-        }
-    }
-
-    /// Temporary spill may evict only its captured table generation.
-    pub(crate) fn evict_committed_table(&self, slot: usize) {
-        self.evict_committed_rows(slot, true);
-    }
-
-    fn evict_committed_rows(&self, slot: usize, include_temporary: bool) {
-        let table = &self.tables[slot];
-        let (definition, publication, generations, mut rows) = acquire(|| {
-            Ok((
-                table.definition.try_read_for_batch()?,
-                try_mutex(&table.publication, "table publication lock poisoned")?,
-                table.spill_generations.try_read_for_batch()?,
-                table.rows.try_write_for_batch()?,
-            ))
-        });
-        if !definition.identity.live()
-            || generations.is_empty()
-            || (!include_temporary
-                && definition.committed.persistence == RelationPersistence::Temporary)
-        {
-            return;
-        }
-        for (_, state) in rows.iter_mut() {
-            if let Some(RowHome::Heap(location)) = state.committed
-                && let Some(sst) =
-                    generations.eviction_member(state.committed_lsn, publication.generation)
-            {
-                state.committed = Some(RowHome::Spilled {
-                    len: location.len,
-                    sst,
-                    commit_lsn: state.committed_lsn,
-                });
-            }
-        }
-    }
-
-    /// Reader admission and pruning select the same retained history boundary.
-    pub(crate) fn release_table_histories(&self, slot: usize) {
-        let table = &self.tables[slot];
-        let (snapshots, _definition, mut versions, mut rows) = acquire(|| {
-            Ok((
-                try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
-                table.definition.try_read_for_batch()?,
-                self.row_versions.try_write_for_batch()?,
-                table.rows.try_write_for_batch()?,
-            ))
-        });
-        let oldest = snapshots.oldest();
-        for (_, state) in rows.iter_mut() {
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                oldest,
+    pub(crate) fn advance_row_cleanup(
+        &self,
+        cleanup: &mut RowCleanup,
+        work: core::num::NonZeroUsize,
+        mode: MaintenanceMode,
+    ) -> MaintenanceStep {
+        let end = match cleanup.target {
+            RowCleanupTarget::AllTables => self.tables.len(),
+            RowCleanupTarget::Table(table) => table + 1,
+        };
+        let mut remaining = work.get();
+        while remaining != 0 && cleanup.position.table < end {
+            let position = cleanup.position;
+            let batch = self.clean_row_slots(
+                cleanup.task,
+                position,
+                core::num::NonZeroUsize::new(remaining).unwrap(),
+                mode,
             );
+            match batch {
+                Some(batch) => {
+                    remaining -= batch.visited.max(1);
+                    cleanup.changed |= batch.changed;
+                    if !batch.complete {
+                        cleanup.position.slot = batch.next;
+                        cleanup.position.selected = Some(batch.selected);
+                        continue;
+                    }
+                }
+                None => {
+                    cleanup.retry.get_or_insert(position);
+                    remaining -= 1;
+                }
+            }
+            cleanup.position = RowCleanupPosition {
+                table: position.table + 1,
+                slot: 0,
+                selected: None,
+            };
+        }
+        if cleanup.position.table != end {
+            return MaintenanceStep::Advanced;
+        }
+        if let Some(retry) = cleanup.retry.take() {
+            cleanup.position = retry;
+            MaintenanceStep::WaitingForOwner
+        } else {
+            MaintenanceStep::Complete
         }
     }
 
-    /// Installed roots reproduce the removed prefix; later history stays local.
-    pub fn release_durable_histories(&self) {
-        for table in self.tables.iter() {
-            let (definition, generations, mut versions, mut rows) = acquire(|| {
-                Ok((
-                    table.definition.try_read_for_batch()?,
-                    table.spill_generations.try_read_for_batch()?,
-                    self.row_versions.try_write_for_batch()?,
-                    table.rows.try_write_for_batch()?,
-                ))
-            });
-            if !definition.identity.live()
-                || definition.committed.persistence == RelationPersistence::Temporary
-            {
-                continue;
+    fn clean_row_slots(
+        &self,
+        task: RowCleanupTask,
+        position: RowCleanupPosition,
+        work: core::num::NonZeroUsize,
+        mode: MaintenanceMode,
+    ) -> Option<CleanedSlots> {
+        let table = &self.tables[position.table];
+        let attempt = || {
+            let snapshots = matches!(task, RowCleanupTask::SnapshotHistory)
+                .then(|| try_mutex(&self.snapshots, "snapshot state lock poisoned"))
+                .transpose()?;
+            let definition = table.definition.try_read_for_batch()?;
+            let publication = matches!(task, RowCleanupTask::HeapRows(_))
+                .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
+                .transpose()?;
+            let generations = table.spill_generations.try_read_for_batch()?;
+            let versions = matches!(
+                task,
+                RowCleanupTask::DurableHistory | RowCleanupTask::SnapshotHistory
+            )
+            .then(|| self.row_versions.try_write_for_batch())
+            .transpose()?;
+            let rows = table.rows.try_write_for_batch()?;
+            Ok((
+                snapshots,
+                definition,
+                publication,
+                generations,
+                versions,
+                rows,
+            ))
+        };
+        let (snapshots, definition, publication, generations, mut versions, mut rows) = match mode {
+            MaintenanceMode::Finish => acquire(attempt),
+            MaintenanceMode::Background => attempt().ok()?,
+        };
+        let live = definition.identity.live();
+        let temporary = definition.committed.persistence == RelationPersistence::Temporary;
+        let through_lsn = generations.published_through();
+        let eligible = match task {
+            RowCleanupTask::DurableHistory => live && !temporary && through_lsn.is_some(),
+            RowCleanupTask::SnapshotHistory => live,
+            RowCleanupTask::HeapRows(selection) => {
+                live && !generations.is_empty()
+                    && match selection {
+                        HeapCleanup::Durable | HeapCleanup::PressuredDurable => !temporary,
+                        HeapCleanup::AllSaved => true,
+                    }
             }
-            let Some(through_lsn) = generations.published_through() else {
+            RowCleanupTask::SavedEntries(_) => live && !generations.is_empty(),
+        };
+        let pressure_only = matches!(
+            task,
+            RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
+                | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
+        );
+        let selected = position
+            .selected
+            .unwrap_or_else(|| !pressure_only || rows.len() * 100 >= rows.capacity() * 50);
+        if !eligible || !selected || rows.is_empty() {
+            return Some(CleanedSlots {
+                next: rows.scan_end(),
+                visited: 0,
+                complete: true,
+                selected,
+                changed: false,
+            });
+        }
+        let start = position.slot;
+        assert!(
+            start <= rows.scan_end(),
+            "cleanup cursor exceeds used row slots"
+        );
+        let end = start.saturating_add(work.get()).min(rows.scan_end());
+        let mut changed = false;
+        for slot in start..end {
+            let Some((&rowid, state)) = rows.entry_at_slot_mut(slot) else {
                 continue;
             };
-            for (_, state) in rows.iter_mut() {
-                release_committed_history_through(
-                    &mut versions.committed_row_versions,
-                    &mut state.history,
-                    through_lsn,
-                );
+            match task {
+                RowCleanupTask::DurableHistory => {
+                    release_committed_history_through(
+                        &mut versions.as_mut().unwrap().committed_row_versions,
+                        &mut state.history,
+                        through_lsn.unwrap(),
+                    );
+                }
+                RowCleanupTask::SnapshotHistory => {
+                    prune_committed_history(
+                        &mut versions.as_mut().unwrap().committed_row_versions,
+                        &mut state.history,
+                        snapshots.as_ref().unwrap().oldest(),
+                    );
+                }
+                RowCleanupTask::HeapRows(_) => {
+                    if let Some(RowHome::Heap(location)) = state.committed
+                        && let Some(sst) = generations.eviction_member(
+                            state.committed_lsn,
+                            publication.as_ref().unwrap().generation,
+                        )
+                    {
+                        state.committed = Some(RowHome::Spilled {
+                            len: location.len,
+                            sst,
+                            commit_lsn: state.committed_lsn,
+                        });
+                        changed = true;
+                    }
+                }
+                RowCleanupTask::SavedEntries(_) => {
+                    if Self::redundant_spilled_row_state(state) {
+                        rows.remove(&rowid).expect("selected row exists");
+                        changed = true;
+                    }
+                }
             }
         }
+        Some(CleanedSlots {
+            next: end,
+            visited: end - start,
+            complete: end == rows.scan_end(),
+            selected,
+            changed,
+        })
     }
 
-    /// Remove only states exactly reproduced by the installed saved files.
-    pub fn evict_redundant_entries(&self, slot: usize) {
-        let table = &self.tables[slot];
-        let (_definition, generations, mut rows) = acquire(|| {
-            Ok((
-                table.definition.try_read_for_batch()?,
-                table.spill_generations.try_read_for_batch()?,
-                table.rows.try_write_for_batch()?,
-            ))
-        });
-        if !generations.is_empty() {
-            Self::evict_redundant_rows(&mut rows);
-        }
-    }
-
-    /// Half-full overlays shed only redundant entries, within their table owner.
-    pub fn evict_entries(&self) {
-        for table in self.tables.iter() {
-            let (definition, generations, mut rows) = acquire(|| {
-                Ok((
-                    table.definition.try_read_for_batch()?,
-                    table.spill_generations.try_read_for_batch()?,
-                    table.rows.try_write_for_batch()?,
-                ))
-            });
-            if !definition.identity.live()
-                || generations.is_empty()
-                || rows.len() * 100 < rows.capacity() * 50
+    #[cfg(test)]
+    pub(crate) fn finish_row_cleanup(&self, task: RowCleanupTask, target: RowCleanupTarget) {
+        let mut cleanup = RowCleanup::new(task, target);
+        loop {
+            if self.advance_row_cleanup(
+                &mut cleanup,
+                core::num::NonZeroUsize::new(64).unwrap(),
+                MaintenanceMode::Finish,
+            ) == MaintenanceStep::Complete
             {
-                continue;
+                break;
             }
-            Self::evict_redundant_rows(&mut rows);
         }
     }
 }
@@ -216,6 +373,307 @@ mod tests {
             .unwrap();
     }
 
+    fn bounded_fixture(count: usize) -> (Storage, usize, usize) {
+        let mut config = test_config();
+        config.table_rows = count * 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let first = storage
+            .create_table(make_def("bounded_first", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let second = storage
+            .create_table(make_def("bounded_second", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(10)]).unwrap();
+        for table in [first, second] {
+            for rowid in 1..=count as u64 {
+                storage.tables[table]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(location, 7))
+                    .unwrap();
+            }
+            storage
+                .append_spill_through(table, saved_handle(table as u8 * 4 + 1), 7)
+                .unwrap();
+        }
+        storage.set_lsn(7);
+        (storage, first, second)
+    }
+
+    fn remaining_rows(storage: &Storage, table: usize, task: RowCleanupTask) -> usize {
+        let rows = storage.tables[table].rows.read();
+        rows.iter()
+            .filter(|(_, state)| match task {
+                RowCleanupTask::DurableHistory | RowCleanupTask::SnapshotHistory => {
+                    !state.history.is_empty()
+                }
+                RowCleanupTask::HeapRows(_) => matches!(state.committed, Some(RowHome::Heap(_))),
+                RowCleanupTask::SavedEntries(_) => true,
+            })
+            .count()
+    }
+
+    fn prepare_task(
+        storage: &Storage,
+        first: usize,
+        second: usize,
+        count: usize,
+        task: RowCleanupTask,
+    ) {
+        match task {
+            RowCleanupTask::DurableHistory | RowCleanupTask::SnapshotHistory => {
+                storage.register_snapshot(99, 7).unwrap();
+                for table in [first, second] {
+                    for rowid in 1..=count as u64 {
+                        update(storage, table, rowid, 20, 8, 9);
+                    }
+                }
+                if matches!(task, RowCleanupTask::SnapshotHistory) {
+                    storage.end_transaction_snapshots(99, SnapshotCleanup::Schedule);
+                }
+            }
+            RowCleanupTask::SavedEntries(_) => {
+                storage.finish_row_cleanup(
+                    RowCleanupTask::HeapRows(HeapCleanup::Durable),
+                    RowCleanupTarget::AllTables,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    const BOUNDED_TASKS: [RowCleanupTask; 7] = [
+        RowCleanupTask::DurableHistory,
+        RowCleanupTask::SnapshotHistory,
+        RowCleanupTask::HeapRows(HeapCleanup::Durable),
+        RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable),
+        RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+        RowCleanupTask::SavedEntries(EntryCleanup::Pressured),
+    ];
+
+    #[test]
+    fn bounded_row_cleanup_limits_every_walk_and_keeps_pressure_selection() {
+        const ROWS: usize = 129;
+        for task in BOUNDED_TASKS {
+            let (storage, first, second) = bounded_fixture(ROWS);
+            prepare_task(&storage, first, second, ROWS, task);
+            let mut cleanup = RowCleanup::new(task, RowCleanupTarget::Table(first));
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(remaining_rows(&storage, first, task), ROWS, "{task:?}");
+                assert_eq!(
+                    storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    ),
+                    MaintenanceStep::Advanced
+                );
+                assert_eq!(remaining_rows(&storage, first, task), ROWS - 1, "{task:?}");
+                assert_eq!(remaining_rows(&storage, second, task), ROWS);
+                let mut finished = false;
+                for _ in 0..ROWS {
+                    let before = remaining_rows(&storage, first, task);
+                    let step = storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    );
+                    let after = remaining_rows(&storage, first, task);
+                    assert!(before - after <= 1, "{task:?}");
+                    if step == MaintenanceStep::Complete {
+                        finished = true;
+                        break;
+                    }
+                    assert_eq!(step, MaintenanceStep::Advanced);
+                }
+                assert!(finished, "{task:?}");
+                assert_eq!(remaining_rows(&storage, first, task), 0, "{task:?}");
+                assert_eq!(remaining_rows(&storage, second, task), ROWS);
+            });
+        }
+    }
+
+    #[test]
+    fn bounded_row_cleanup_skips_busy_tables_and_releases_every_prefix_owner() {
+        for task in BOUNDED_TASKS {
+            let (storage, first, second) = bounded_fixture(3);
+            prepare_task(&storage, first, second, 3, task);
+            let held = storage.tables[first].rows.write();
+            let mut cleanup = RowCleanup::new(task, RowCleanupTarget::AllTables);
+            crate::mem::guard::forbid_alloc(|| {
+                let mut waited = false;
+                for _ in 0..storage.tables.len() * 4 + 1 {
+                    let step = storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    );
+                    assert!(storage.snapshots.try_lock().is_ok());
+                    assert!(storage.row_versions.test_write().is_ok());
+                    assert!(storage.tables[first].publication.try_lock().is_ok());
+                    if step == MaintenanceStep::WaitingForOwner {
+                        waited = true;
+                        break;
+                    }
+                    assert_eq!(step, MaintenanceStep::Advanced);
+                }
+                assert!(waited, "{task:?}");
+                assert_eq!(remaining_rows(&storage, second, task), 0, "{task:?}");
+                assert_eq!(held.len(), 3);
+                assert_eq!(cleanup.position.table, first);
+                assert_eq!(cleanup.position.slot, 0);
+            });
+            drop(held);
+            crate::mem::guard::forbid_alloc(|| {
+                let mut finished = false;
+                for _ in 0..storage.tables.len() * 4 + 1 {
+                    match storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    ) {
+                        MaintenanceStep::Complete => {
+                            finished = true;
+                            break;
+                        }
+                        MaintenanceStep::Advanced => {}
+                        MaintenanceStep::WaitingForOwner => panic!("uncontended cleanup waited"),
+                    }
+                }
+                assert!(finished, "{task:?}");
+                assert_eq!(remaining_rows(&storage, first, task), 0, "{task:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn bounded_row_cleanup_rechecks_later_writes_and_retained_bytes() {
+        let (storage, first, second) = bounded_fixture(4);
+        let selected = selected(&storage, first, 7);
+        let mut cleanup = RowCleanup::new(
+            RowCleanupTask::HeapRows(HeapCleanup::Durable),
+            RowCleanupTarget::Table(first),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Advanced
+            );
+            update(&storage, first, 2, 30, 8, 9);
+            update(&storage, second, 1, 50, 10, 11);
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(64).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Complete
+            );
+            assert!(matches!(
+                storage.tables[first].rows.get(&2).unwrap().committed,
+                Some(RowHome::Heap(_))
+            ));
+            assert_eq!(remaining_rows(&storage, first, cleanup.task()), 1);
+            assert_value(&storage, first, selected, 10);
+            assert_eq!(
+                storage.tables[second].rows.get(&1).unwrap().committed_lsn,
+                11
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_row_cleanup_survives_free_slot_reuse() {
+        let (storage, first, _) = bounded_fixture(4);
+        let mut cleanup = RowCleanup::new(
+            RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+            RowCleanupTarget::Table(first),
+        );
+        storage.finish_row_cleanup(
+            RowCleanupTask::HeapRows(HeapCleanup::Durable),
+            RowCleanupTarget::Table(first),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Advanced
+            );
+            let location = storage.heap.append_row(&[Datum::Int4(90)]).unwrap();
+            storage.tables[first]
+                .rows
+                .insert(99, RowState::committed_only_at(location, 9))
+                .unwrap();
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(64).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Complete
+            );
+            assert_eq!(storage.tables[first].rows.len(), 1);
+            assert!(storage.tables[first].rows.get(&99).is_some());
+            assert!(storage.row_versions.test_write().is_ok());
+            update(&storage, first, 99, 100, 8, 10);
+        });
+    }
+
+    #[test]
+    fn bounded_row_cleanup_temporary_eviction_rechecks_generation_between_batches() {
+        let (mut storage, table, _) = fixture(RelationPersistence::Temporary);
+        let location = storage.heap.append_row(&[Datum::Int4(10)]).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(2, RowState::committed_only_at(location, 7))
+            .unwrap();
+        let selected = selected(&storage, table, 7);
+        let generation = storage.tables[table].generation();
+        storage
+            .install_temporary_spill(table, saved_handle(1), generation, false)
+            .unwrap();
+        let mut cleanup = RowCleanup::new(
+            RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+            RowCleanupTarget::Table(table),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Advanced
+            );
+            update(&storage, table, 2, 30, 8, 9);
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Complete
+            );
+            assert!(matches!(
+                storage.tables[table].rows.get(&1).unwrap().committed,
+                Some(RowHome::Spilled { .. })
+            ));
+            assert!(matches!(
+                storage.tables[table].rows.get(&2).unwrap().committed,
+                Some(RowHome::Heap(_))
+            ));
+            assert_value(&storage, table, selected, 10);
+        });
+    }
+
     #[test]
     fn row_lock_owners_shared_cleanup_preserves_retained_bytes_and_later_writes() {
         let (mut storage, first, second) = fixture(RelationPersistence::Permanent);
@@ -241,10 +699,22 @@ mod tests {
             let shared = &storage;
             let cleanup = scope.spawn(move || {
                 crate::mem::guard::forbid_alloc(|| {
-                    shared.release_durable_histories();
-                    shared.evict_committed();
-                    shared.evict_entries();
-                    shared.evict_redundant_entries(first);
+                    shared.finish_row_cleanup(
+                        RowCleanupTask::DurableHistory,
+                        RowCleanupTarget::AllTables,
+                    );
+                    shared.finish_row_cleanup(
+                        RowCleanupTask::HeapRows(HeapCleanup::Durable),
+                        RowCleanupTarget::AllTables,
+                    );
+                    shared.finish_row_cleanup(
+                        RowCleanupTask::SavedEntries(EntryCleanup::Pressured),
+                        RowCleanupTarget::AllTables,
+                    );
+                    shared.finish_row_cleanup(
+                        RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
+                        RowCleanupTarget::Table(first),
+                    );
                 });
             });
             crate::mem::guard::forbid_alloc(|| {
@@ -286,22 +756,37 @@ mod tests {
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 let shared = &storage;
-                shared.release_table_histories(table);
+                shared.finish_row_cleanup(
+                    RowCleanupTask::SnapshotHistory,
+                    RowCleanupTarget::Table(table),
+                );
                 assert_eq!(shared.tables[table].rows.get(&1).unwrap().history.len(), 1);
-                shared.release_durable_histories();
+                shared.finish_row_cleanup(
+                    RowCleanupTask::DurableHistory,
+                    RowCleanupTarget::AllTables,
+                );
                 assert_eq!(shared.tables[table].rows.get(&1).unwrap().history.len(), 1);
 
-                shared.evict_committed();
+                shared.finish_row_cleanup(
+                    RowCleanupTask::HeapRows(HeapCleanup::Durable),
+                    RowCleanupTarget::AllTables,
+                );
                 assert!(matches!(
                     shared.tables[table].rows.get(&1).unwrap().committed,
                     Some(RowHome::Heap(_))
                 ));
                 if !matching_generation {
                     update(shared, table, 1, 30, 10, 11);
-                    shared.release_table_histories(table);
+                    shared.finish_row_cleanup(
+                        RowCleanupTask::SnapshotHistory,
+                        RowCleanupTarget::Table(table),
+                    );
                     assert_eq!(shared.tables[table].rows.get(&1).unwrap().history.len(), 2);
                 }
-                shared.evict_committed_table(table);
+                shared.finish_row_cleanup(
+                    RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                    RowCleanupTarget::Table(table),
+                );
                 let state = shared.tables[table].rows.get(&1).unwrap();
                 if matching_generation {
                     assert!(matches!(
@@ -313,7 +798,10 @@ mod tests {
                     assert_value(shared, table, selected(shared, table, u64::MAX), 30);
                 }
                 shared.release_snapshot(99);
-                shared.release_table_histories(table);
+                shared.finish_row_cleanup(
+                    RowCleanupTask::SnapshotHistory,
+                    RowCleanupTarget::Table(table),
+                );
                 assert!(
                     shared.tables[table]
                         .rows

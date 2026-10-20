@@ -32,7 +32,11 @@ mod heap_relocation;
 mod row_heap;
 #[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
-pub(crate) use heap_relocation::{HeapRelocationMode, HeapRelocationStep, HeapRelocationWorkspace};
+pub(crate) use heap_relocation::HeapRelocationWorkspace;
+pub(crate) use row_cleanup::{
+    EntryCleanup, HeapCleanup, MaintenanceMode, MaintenanceStep, RowCleanup, RowCleanupTarget,
+    RowCleanupTask,
+};
 mod row_cleanup;
 mod row_identities;
 mod row_images;
@@ -54044,7 +54048,10 @@ mod tests {
                     .insert(rowid, RowState::committed_only_at(location, commit_lsn))
                     .unwrap();
             }
-            storage.evict_committed_table(target);
+            storage.finish_row_cleanup(
+                RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
+                RowCleanupTarget::Table(target),
+            );
             for (rowid, sst, commit_lsn) in [(1, 0, 7), (2, 1, 9), (3, 2, 11)] {
                 let state = storage.resident_row_state(target, rowid).unwrap().unwrap();
                 assert!(

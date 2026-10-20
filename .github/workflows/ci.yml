@@ -58,6 +58,7 @@ jobs:
             stable_spill_generation_ranges
             stable_spill_generation_exhaustion
             type_publication_workspace_exact_startup_budget
+            bound_type_origin_never_reuses_an_exhausted_identifier
           )
           # All libtest filters share one interpreter startup.
           cargo miri test --lib --locked -- "${filters[@]}" --test-threads=1 --color=never --format=pretty \

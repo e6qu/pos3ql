@@ -249,6 +249,20 @@ impl From<BudgetError> for EngineSetupError {
     }
 }
 
+impl From<crate::storage::StorageSetupError> for EngineSetupError {
+    fn from(error: crate::storage::StorageSetupError) -> Self {
+        match error {
+            crate::storage::StorageSetupError::Budget(error) => Self::Budget(error),
+            crate::storage::StorageSetupError::TypeIdentitySpaceExhausted => {
+                Self::Storage(sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "type catalog identity space exhausted"
+                ))
+            }
+        }
+    }
+}
+
 impl From<WalSetupError> for EngineSetupError {
     fn from(e: WalSetupError) -> Self {
         Self::Wal(e)
@@ -19543,10 +19557,9 @@ fn decode_wal_routine_signature(
                     })?)?;
                 at += len;
             }
-            argument.user_type = Some(crate::storage::UserTypeName {
-                schema: names[0],
-                name: names[1],
-            });
+            argument.user_type = Some(crate::storage::UserTypeName::declaration(
+                names[0], names[1],
+            ));
         } else if tag != 0 {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,

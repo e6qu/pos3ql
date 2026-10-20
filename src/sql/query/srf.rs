@@ -2575,33 +2575,16 @@ fn table_function_array_element_type(
     storage: &Storage,
     txid: u32,
     element: crate::sql::types::ArrElem,
-) -> (ColType, Option<crate::storage::UserTypeName>) {
-    use crate::sql::types::ArrElem;
-    let user_type = match element {
-        ArrElem::Domain { slot, .. } => {
-            let domain = storage.domain(slot as usize).definition_for(txid);
-            Some(crate::storage::UserTypeName {
-                schema: domain.schema,
-                name: domain.name,
-            })
-        }
-        ArrElem::Enum(slot) => {
-            let definition = storage.enum_for(slot as usize, txid);
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            })
-        }
-        ArrElem::Composite(slot) => {
-            let definition = storage.composite_for(slot as usize, txid);
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            })
-        }
-        _ => None,
-    };
-    (element.to_coltype(), user_type)
+) -> Result<(ColType, Option<crate::storage::UserTypeName>), SqlError> {
+    let result = storage
+        .routine_result_for_oid(element.element_oid(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "array element type does not exist"
+            )
+        })?;
+    Ok((result.ctype, result.user_type))
 }
 
 /// [`table_func_def`] with column types supplied by an enclosing row or the
@@ -3211,12 +3194,12 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 let (ctype, user_type) = match crate::sql::eval::static_type_pub(argument, columns)
                 {
                     Some(ColType::Array(element)) => {
-                        table_function_array_element_type(storage, txid, element)
+                        table_function_array_element_type(storage, txid, element)?
                     }
                     Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
                     _ => match crate::sql::eval::eval(argument, arena, params, columns)? {
                         Datum::Array { element, .. } => {
-                            table_function_array_element_type(storage, txid, element)
+                            table_function_array_element_type(storage, txid, element)?
                         }
                         Datum::Multirange { kind, .. } => (ColType::Range(kind), None),
                         _ => (ColType::Text, None),

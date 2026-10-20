@@ -3942,7 +3942,7 @@ impl Checkpointer {
                     let user_type = match (user_type_schema, domain) {
                         (None, None) => None,
                         (Some(schema), Some(name)) => {
-                            Some(crate::storage::UserTypeName { schema, name })
+                            Some(crate::storage::UserTypeName::declaration(schema, name))
                         }
                         _ => {
                             return Err(CheckpointSetupError::Corrupt(
@@ -5662,10 +5662,10 @@ impl Checkpointer {
                         argument.user_type = if schema == "-" && name == "-" {
                             None
                         } else {
-                            Some(crate::storage::UserTypeName {
-                                schema: sql_name(&decode_hex_name(schema)?)?,
-                                name: sql_name(&decode_hex_name(name)?)?,
-                            })
+                            Some(crate::storage::UserTypeName::declaration(
+                                sql_name(&decode_hex_name(schema)?)?,
+                                sql_name(&decode_hex_name(name)?)?,
+                            ))
                         };
                     }
                     let parameter_count: usize =
@@ -5692,10 +5692,10 @@ impl Checkpointer {
                         parameter.user_type = if schema == "-" && name == "-" {
                             None
                         } else {
-                            Some(crate::storage::UserTypeName {
-                                schema: sql_name(&decode_hex_name(schema)?)?,
-                                name: sql_name(&decode_hex_name(name)?)?,
-                            })
+                            Some(crate::storage::UserTypeName::declaration(
+                                sql_name(&decode_hex_name(schema)?)?,
+                                sql_name(&decode_hex_name(name)?)?,
+                            ))
                         };
                         let mode: u8 = parse_field(words.next(), "routine parameter mode")?;
                         let default_word = words.next().ok_or(CheckpointSetupError::Corrupt(
@@ -5824,10 +5824,10 @@ impl Checkpointer {
                     let result_user_type = if result_schema == "-" && result_name == "-" {
                         None
                     } else {
-                        Some(crate::storage::UserTypeName {
-                            schema: sql_name(&decode_hex_name(result_schema)?)?,
-                            name: sql_name(&decode_hex_name(result_name)?)?,
-                        })
+                        Some(crate::storage::UserTypeName::declaration(
+                            sql_name(&decode_hex_name(result_schema)?)?,
+                            sql_name(&decode_hex_name(result_name)?)?,
+                        ))
                     };
                     let result = crate::storage::RoutineResult {
                         ctype: ColType::from_code(result_code)
@@ -5866,10 +5866,10 @@ impl Checkpointer {
                                 column.user_type = if schema == "-" && name == "-" {
                                     None
                                 } else {
-                                    Some(crate::storage::UserTypeName {
-                                        schema: sql_name(&decode_hex_name(schema)?)?,
-                                        name: sql_name(&decode_hex_name(name)?)?,
-                                    })
+                                    Some(crate::storage::UserTypeName::declaration(
+                                        sql_name(&decode_hex_name(schema)?)?,
+                                        sql_name(&decode_hex_name(name)?)?,
+                                    ))
                                 };
                             }
                             crate::storage::RoutineKind::from_wire_code(code, result)
@@ -7143,10 +7143,10 @@ impl Checkpointer {
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
                     {
                         (true, true) => None,
-                        (false, false) => Some(crate::storage::UserTypeName {
-                            schema: sql_name(&base_domain_schema)?,
-                            name: sql_name(&base_domain)?,
-                        }),
+                        (false, false) => Some(crate::storage::UserTypeName::declaration(
+                            sql_name(&base_domain_schema)?,
+                            sql_name(&base_domain)?,
+                        )),
                         _ => {
                             return Err(CheckpointSetupError::Corrupt(
                                 "domain parent identity is incomplete",
@@ -7156,10 +7156,10 @@ impl Checkpointer {
                     let base_user_type =
                         match (base_user_type.is_empty(), base_user_type_schema.is_empty()) {
                             (true, true) => None,
-                            (false, false) => Some(crate::storage::UserTypeName {
-                                schema: sql_name(&base_user_type_schema)?,
-                                name: sql_name(&base_user_type)?,
-                            }),
+                            (false, false) => Some(crate::storage::UserTypeName::declaration(
+                                sql_name(&base_user_type_schema)?,
+                                sql_name(&base_user_type)?,
+                            )),
                             _ => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "domain base type identity is incomplete",
@@ -7298,10 +7298,10 @@ impl Checkpointer {
                         let user_name = hexstr(words.next(), "cmp field user name missing")?;
                         let user_type = match (user_schema.is_empty(), user_name.is_empty()) {
                             (true, true) => None,
-                            (false, false) => Some(crate::storage::UserTypeName {
-                                schema: sql_name(&user_schema)?,
-                                name: sql_name(&user_name)?,
-                            }),
+                            (false, false) => Some(crate::storage::UserTypeName::declaration(
+                                sql_name(&user_schema)?,
+                                sql_name(&user_name)?,
+                            )),
                             _ => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "composite field user type identity is incomplete",
@@ -7321,11 +7321,10 @@ impl Checkpointer {
                         };
                     }
                     storage
-                        .create_composite(
+                        .create_composite_from_manifest(
                             sql_name(&schema)?,
                             sql_name(&name)?,
                             crate::storage::CompositeSpec { fields, n_fields },
-                            0,
                         )
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -18199,10 +18198,10 @@ fn manifest_routine_result(
                 "partial catalog type identity",
             ));
         }
-        _ => Some(crate::storage::UserTypeName {
-            schema: sql_name(&decode_hex_name(schema)?)?,
-            name: sql_name(&decode_hex_name(name)?)?,
-        }),
+        _ => Some(crate::storage::UserTypeName::declaration(
+            sql_name(&decode_hex_name(schema)?)?,
+            sql_name(&decode_hex_name(name)?)?,
+        )),
     };
     Ok(crate::storage::RoutineResult { ctype, user_type })
 }

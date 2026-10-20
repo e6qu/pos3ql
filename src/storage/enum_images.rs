@@ -588,10 +588,10 @@ mod tests {
 
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
-        let identity = UserTypeName {
-            schema: SqlName::parse("public").unwrap(),
-            name: SqlName::parse("state").unwrap(),
-        };
+        let identity = UserTypeName::declaration(
+            SqlName::parse("public").unwrap(),
+            SqlName::parse("state").unwrap(),
+        );
         let mut definition = make_def(
             "enum_reader",
             &[("state", ColType::Enum(slot as u16), false)],
@@ -660,14 +660,11 @@ mod tests {
 
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
-        let before = UserTypeName {
-            schema: SqlName::parse("public").unwrap(),
-            name: SqlName::parse("state").unwrap(),
-        };
-        let after = UserTypeName {
-            schema: before.schema,
-            name: SqlName::parse("moved").unwrap(),
-        };
+        let before = UserTypeName::declaration(
+            SqlName::parse("public").unwrap(),
+            SqlName::parse("state").unwrap(),
+        );
+        let after = UserTypeName::declaration(before.schema, SqlName::parse("moved").unwrap());
         let mut definition = make_def(
             "enum_reference",
             &[("state", ColType::Enum(slot as u16), false)],

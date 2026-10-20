@@ -3,19 +3,23 @@
 use core::mem::{align_of, size_of};
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(test)]
+use super::DatabaseOid;
 use super::row_ownership::{LockWait, try_mutex};
 use super::table_definitions::TableIdentity;
 use super::table_names::DefinitionWrite;
+use super::type_names::NamedTypeSlot;
+use super::type_references::{TypeBinding, TypeIdentity};
 use super::{
-    ArrElem, CatalogDdlState, ColType, CommentClass, DatabaseOid, DependencyClass,
-    EnumMemberImages, OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition,
-    RoutineArgumentDef, RoutineKind, RoutineResult, Storage, TableDef, TablePublication,
-    TypeCatalog, UserTypeName,
+    ArrElem, CatalogDdlState, ColType, CommentClass, DependencyClass, EnumMemberImages,
+    OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition, RoutineResult, Storage,
+    TableDef, TablePublication, TypeCatalog, UserTypeName,
 };
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) enum TypeReferenceKind {
     Domain,
@@ -25,58 +29,58 @@ pub(super) enum TypeReferenceKind {
 
 #[derive(Clone, Copy)]
 pub(super) struct TypeReferenceMove {
-    database: DatabaseOid,
-    kind: TypeReferenceKind,
-    slot: usize,
+    identity: TypeIdentity,
     prior: UserTypeName,
     current: UserTypeName,
 }
 
 impl TypeReferenceMove {
-    pub(super) fn new(
-        database: DatabaseOid,
-        kind: TypeReferenceKind,
-        slot: usize,
-        prior: UserTypeName,
-        current: UserTypeName,
-    ) -> Self {
+    pub(super) fn new(identity: TypeIdentity, prior: UserTypeName, current: UserTypeName) -> Self {
         Self {
-            database,
-            kind,
-            slot,
+            identity,
             prior,
             current,
         }
     }
 
     pub(super) fn applies_to(self, identity: TableIdentity) -> bool {
-        identity.database == self.database && identity.existence != CatalogDdlState::Absent
+        identity.database == self.identity.database && identity.existence != CatalogDdlState::Absent
     }
 
     fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
-        match self.kind {
-            TypeReferenceKind::Domain => identity == Some(self.prior),
-            // Journal declarations retain names before startup resolves slots.
-            // An explicit unresolved slot is valid only with the exact prior name.
-            TypeReferenceKind::Enum => {
-                identity == Some(self.prior)
-                    && matches!(ctype, ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
-                        if usize::from(slot) == self.slot || slot == ColType::ENUM_SLOT_UNRESOLVED)
-            }
-            TypeReferenceKind::Composite => {
-                identity == Some(self.prior)
-                    && matches!(ctype, ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
-                        if usize::from(slot) == self.slot || slot == ColType::COMPOSITE_SLOT_UNRESOLVED)
-            }
+        let Some(identity) = identity else {
+            return false;
+        };
+        match identity.binding {
+            TypeBinding::Captured(key) => return key == self.identity,
+            TypeBinding::Polymorphic(_) => return false,
+            TypeBinding::Declaration => {}
+        }
+        if identity.schema != self.prior.schema || identity.name != self.prior.name {
+            return false;
+        }
+        // Recovery declarations have names before their runtime slots bind.
+        match self.identity.slot {
+            NamedTypeSlot::Domain(_) => true,
+            NamedTypeSlot::Enum(expected) => matches!(ctype,
+                ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
+                    if usize::from(slot) == expected || slot == ColType::ENUM_SLOT_UNRESOLVED),
+            NamedTypeSlot::Composite(expected) => matches!(ctype,
+                ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
+                    if usize::from(slot) == expected || slot == ColType::COMPOSITE_SLOT_UNRESOLVED),
         }
     }
 
     fn rewrite(self, ctype: ColType, identity: &mut Option<UserTypeName>) -> bool {
-        let matches = self.matches(ctype, *identity);
-        if matches {
-            *identity = Some(self.current);
+        let Some(identity) = identity else {
+            return false;
+        };
+        if !self.matches(ctype, Some(*identity)) {
+            return false;
         }
-        matches
+        identity.schema = self.current.schema;
+        identity.name = self.current.name;
+        true
     }
 
     pub(super) fn references_definition(self, definition: &TableDef) -> bool {
@@ -100,10 +104,8 @@ impl TypeReferenceMove {
         parent: &mut Option<UserTypeName>,
         user_type: &mut Option<UserTypeName>,
     ) {
-        if matches!(self.kind, TypeReferenceKind::Domain) {
-            if *parent == Some(self.prior) {
-                *parent = Some(self.current);
-            }
+        if matches!(self.identity.slot, NamedTypeSlot::Domain(_)) {
+            self.rewrite(base, parent);
             if parent.is_none() {
                 self.rewrite(base, user_type);
             }
@@ -132,10 +134,10 @@ impl TypeReferenceMove {
     }
 
     fn class(self) -> DependencyClass {
-        match self.kind {
-            TypeReferenceKind::Domain => DependencyClass::Domain,
-            TypeReferenceKind::Enum => DependencyClass::Enum,
-            TypeReferenceKind::Composite => DependencyClass::Composite,
+        match self.identity.slot {
+            NamedTypeSlot::Domain(_) => DependencyClass::Domain,
+            NamedTypeSlot::Enum(_) => DependencyClass::Enum,
+            NamedTypeSlot::Composite(_) => DependencyClass::Composite,
         }
     }
 }
@@ -311,7 +313,7 @@ impl TypePublication {
                     movement.rewrite_catalog(&mut types);
                     for comment in comments.entries.iter_mut().filter(|comment| {
                         comment.used
-                            && comment.database == Some(movement.database)
+                            && comment.database == Some(movement.identity.database)
                             && comment.class == CommentClass::Type
                             && comment.schema == movement.prior.schema
                             && comment.name == movement.prior.name
@@ -325,7 +327,7 @@ impl TypePublication {
                     storage.rename_stored_query_dependency_locked(
                         &mut dependencies,
                         movement.class(),
-                        movement.slot,
+                        movement.identity.slot.index(),
                         None,
                         movement.current.schema,
                         movement.current.name,
@@ -351,7 +353,8 @@ impl Storage {
 impl TypeReferenceMove {
     fn rewrite_catalog(self, catalog: &mut TypeCatalog) {
         for composite in catalog.composites.iter_mut().filter(|composite| {
-            composite.database == self.database && composite.ddl_state != CatalogDdlState::Absent
+            composite.database == self.identity.database
+                && composite.ddl_state != CatalogDdlState::Absent
         }) {
             for field in composite.fields.iter_mut().take(composite.n_fields) {
                 self.rewrite(field.ctype, &mut field.user_type);
@@ -363,7 +366,7 @@ impl TypeReferenceMove {
             }
         }
         for domain in catalog.domains.iter_mut().filter(|domain| {
-            domain.database == self.database && domain.ddl_state != CatalogDdlState::Absent
+            domain.database == self.identity.database && domain.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_domain(
                 domain.base,
@@ -382,7 +385,8 @@ impl TypeReferenceMove {
 
     fn rewrite_operators(self, catalog: &mut super::OperatorCatalog) {
         for operator in catalog.operators.iter_mut().filter(|operator| {
-            operator.database == self.database && operator.ddl_state != CatalogDdlState::Absent
+            operator.database == self.identity.database
+                && operator.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_operator(&mut operator.definition);
             if let Some(pending) = &mut operator.pending {
@@ -390,7 +394,7 @@ impl TypeReferenceMove {
             }
         }
         for family in catalog.families.iter_mut().filter(|family| {
-            family.database == self.database && family.ddl_state != CatalogDdlState::Absent
+            family.database == self.identity.database && family.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_family(&mut family.definition);
             if let Some(pending) = &mut family.pending {
@@ -398,7 +402,7 @@ impl TypeReferenceMove {
             }
         }
         for class in catalog.classes.iter_mut().filter(|class| {
-            class.database == self.database && class.ddl_state != CatalogDdlState::Absent
+            class.database == self.identity.database && class.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_class(&mut class.definition);
             if let Some(pending) = &mut class.pending {
@@ -409,7 +413,7 @@ impl TypeReferenceMove {
 
     fn rewrite_casts(self, casts: &mut crate::mem::fixed_vec::FixedVec<super::CastDef>) {
         for cast in casts.iter_mut().filter(|cast| {
-            cast.database == self.database && cast.ddl_state != CatalogDdlState::Absent
+            cast.database == self.identity.database && cast.ddl_state != CatalogDdlState::Absent
         }) {
             super::type_contracts::CatalogTypes::Cast(cast)
                 .for_each(|result| self.rewrite_result(result));
@@ -417,82 +421,12 @@ impl TypeReferenceMove {
     }
 
     fn rewrite_routines(self, routines: &mut crate::mem::fixed_vec::FixedVec<super::RoutineDef>) {
-        let move_argument = |argument: &mut RoutineArgumentDef| {
-            self.rewrite(argument.ctype, &mut argument.user_type);
-        };
-        let move_result = |result: &mut RoutineResult| {
-            self.rewrite_result(result);
-        };
-        for routine in routines
-            .iter_mut()
-            .filter(|routine| routine.database == self.database)
-        {
-            for argument in routine.arguments.iter_mut().take(routine.argument_count) {
-                move_argument(argument);
-            }
-            for column in routine
-                .result_columns
-                .iter_mut()
-                .take(routine.result_column_count)
-            {
-                move_argument(column);
-            }
-            for parameter in routine.parameters.iter_mut().take(routine.parameter_count) {
-                let mut argument = RoutineArgumentDef {
-                    name: parameter.name,
-                    ctype: parameter.ctype,
-                    user_type: parameter.user_type,
-                };
-                move_argument(&mut argument);
-                parameter.user_type = argument.user_type;
-            }
-            match &mut routine.kind {
-                RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-                    move_result(result)
-                }
-                RoutineKind::Aggregate(aggregate) => {
-                    move_result(&mut aggregate.state_type);
-                    move_result(&mut aggregate.result_type);
-                    if let Some(moving) = &mut aggregate.moving {
-                        move_result(&mut moving.state_type);
-                    }
-                }
-                _ => {}
-            }
-            if let Some(pending) = &mut routine.pending_definition {
-                for argument in pending.arguments.iter_mut().take(pending.argument_count) {
-                    move_argument(argument);
-                }
-                for column in pending
-                    .result_columns
-                    .iter_mut()
-                    .take(pending.result_column_count)
-                {
-                    move_argument(column);
-                }
-                for parameter in pending.parameters.iter_mut().take(pending.parameter_count) {
-                    let mut argument = RoutineArgumentDef {
-                        name: parameter.name,
-                        ctype: parameter.ctype,
-                        user_type: parameter.user_type,
-                    };
-                    move_argument(&mut argument);
-                    parameter.user_type = argument.user_type;
-                }
-                match &mut pending.kind {
-                    RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-                        move_result(result)
-                    }
-                    RoutineKind::Aggregate(aggregate) => {
-                        move_result(&mut aggregate.state_type);
-                        move_result(&mut aggregate.result_type);
-                        if let Some(moving) = &mut aggregate.moving {
-                            move_result(&mut moving.state_type);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        for routine in routines.iter_mut().filter(|routine| {
+            routine.database == self.identity.database
+                && routine.ddl_state != CatalogDdlState::Absent
+        }) {
+            super::type_contracts::CatalogTypes::Routine(routine)
+                .for_each(|result| self.rewrite_result(result));
         }
     }
 }
@@ -513,6 +447,14 @@ mod tests {
         TypeReferenceKind::Enum,
         TypeReferenceKind::Composite,
     ];
+
+    fn named_slot(kind: TypeReferenceKind, slot: usize) -> NamedTypeSlot {
+        match kind {
+            TypeReferenceKind::Domain => NamedTypeSlot::Domain(slot),
+            TypeReferenceKind::Enum => NamedTypeSlot::Enum(slot),
+            TypeReferenceKind::Composite => NamedTypeSlot::Composite(slot),
+        }
+    }
 
     fn create_kind(
         storage: &mut Storage,
@@ -599,10 +541,10 @@ mod tests {
         config.max_catalog_versions_per_object = 2;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let prior = UserTypeName {
-            schema: SqlName::parse("public").unwrap(),
-            name: SqlName::parse("prior_type").unwrap(),
-        };
+        let prior = UserTypeName::declaration(
+            SqlName::parse("public").unwrap(),
+            SqlName::parse("prior_type").unwrap(),
+        );
         let (slot, scalar, array) = create_kind(&mut storage, kind, prior);
         let mut definition = make_def("related", &[("id", scalar, false), ("items", array, false)]);
         for column in definition.columns.iter_mut().take(2) {
@@ -621,15 +563,18 @@ mod tests {
                 Some(comment_stackstr("type reference ownership").unwrap()),
             )
             .unwrap();
+        let identity = {
+            let catalog = storage.type_catalog.lock().unwrap();
+            catalog
+                .type_snapshot(named_slot(kind, slot), 0)
+                .unwrap()
+                .unwrap()
+                .identity
+        };
         let movement = TypeReferenceMove::new(
-            DatabaseOid::POSTGRES,
-            kind,
-            slot,
+            identity,
             prior,
-            UserTypeName {
-                schema: prior.schema,
-                name: SqlName::parse("current_type").unwrap(),
-            },
+            UserTypeName::declaration(prior.schema, SqlName::parse("current_type").unwrap()),
         );
         (storage, related, unrelated, movement)
     }
@@ -642,21 +587,21 @@ mod tests {
     }
 
     fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
-        let (schema, name) = match movement.kind {
-            TypeReferenceKind::Domain => {
-                let definition = catalog.domains[movement.slot];
+        let (schema, name) = match movement.identity.slot {
+            NamedTypeSlot::Domain(_) => {
+                let definition = catalog.domains[movement.identity.slot.index()];
                 (definition.schema, definition.name)
             }
-            TypeReferenceKind::Enum => {
-                let definition = catalog.enums[movement.slot];
+            NamedTypeSlot::Enum(_) => {
+                let definition = catalog.enums[movement.identity.slot.index()];
                 (definition.schema, definition.name)
             }
-            TypeReferenceKind::Composite => {
-                let definition = catalog.composites[movement.slot];
+            NamedTypeSlot::Composite(_) => {
+                let definition = catalog.composites[movement.identity.slot.index()];
                 (definition.schema, definition.name)
             }
         };
-        UserTypeName { schema, name }
+        UserTypeName::declaration(schema, name)
     }
 
     fn wait_until_contended(storage: &Storage) -> bool {
@@ -673,6 +618,149 @@ mod tests {
             std::thread::yield_now();
         }
         true
+    }
+
+    #[test]
+    fn captured_type_references_follow_moves_before_late_table_publication() {
+        for kind in KINDS {
+            let (storage, table, _, movement) = fixture(kind);
+            let mut captured = *storage.table_def(table, 0);
+            let originals = [captured.columns[0].user_type, captured.columns[1].user_type];
+            let oids = captured
+                .columns()
+                .iter()
+                .map(|column| {
+                    storage
+                        .routine_type_oid(column.ctype, column.user_type, 0)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            crate::mem::guard::forbid_alloc(|| {
+                publish_move(&storage, movement);
+                captured.name = SqlName::parse("late_create").unwrap();
+                let created = storage.create_table_in(captured, 7).unwrap();
+                assert_identity(&storage, created, 7, movement.current);
+                for (index, column) in storage.table_def(created, 7).columns().iter().enumerate() {
+                    assert_eq!(column.user_type, originals[index]);
+                    assert_eq!(
+                        storage.routine_type_oid(column.ctype, column.user_type, 7),
+                        Some(oids[index])
+                    );
+                }
+                storage
+                    .write_table_def(table, 9, captured, &mapping("id"), false)
+                    .unwrap();
+                assert_identity(&storage, table, 9, movement.current);
+                storage.rollback_table_def(table, 9);
+                assert_identity(&storage, table, 0, movement.current);
+            });
+        }
+    }
+
+    #[test]
+    fn captured_type_references_reject_retired_and_reused_source_lifetimes() {
+        for kind in KINDS {
+            let (mut storage, table, _, movement) = fixture(kind);
+            let captured = *storage.table_def(table, 0);
+            let key = movement.identity;
+            match kind {
+                TypeReferenceKind::Domain => {
+                    storage.drop_domain("public", "prior_type", 0).unwrap();
+                    storage.commit_domain_drop(key.slot.index());
+                }
+                TypeReferenceKind::Enum => {
+                    storage.drop_enum("public", "prior_type", 0).unwrap();
+                    storage.commit_enum_drop(key.slot.index());
+                }
+                TypeReferenceKind::Composite => {
+                    storage.drop_composite("public", "prior_type", 0).unwrap();
+                    storage.commit_composite_drop(key.slot.index());
+                }
+            }
+            for replace in [false, true] {
+                if replace {
+                    assert_eq!(
+                        create_kind(&mut storage, kind, movement.prior).0,
+                        key.slot.index()
+                    );
+                }
+                crate::mem::guard::forbid_alloc(|| {
+                    for column in captured.columns() {
+                        let result = RoutineResult {
+                            ctype: column.ctype,
+                            user_type: column.user_type,
+                        };
+                        assert_eq!(
+                            storage.bind_routine_result(result, 0).unwrap_err().sqlstate,
+                            crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                        );
+                        assert!(
+                            storage
+                                .routine_type_oid(result.ctype, result.user_type, 0)
+                                .is_none()
+                        );
+                        assert!(
+                            storage
+                                .user_type_identity_oid(result.user_type.unwrap(), false, 0)
+                                .is_none()
+                        );
+                    }
+                    let mut submitted = captured;
+                    submitted.name = SqlName::parse("invalid_create").unwrap();
+                    assert_eq!(
+                        storage.create_table_in(submitted, 7).unwrap_err().sqlstate,
+                        crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                    );
+                    assert_eq!(
+                        storage
+                            .write_table_def(table, 7, submitted, &mapping("id"), false)
+                            .unwrap_err()
+                            .sqlstate,
+                        crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                    );
+                    assert!(
+                        storage
+                            .find_visible("public", "invalid_create", 7)
+                            .is_none()
+                    );
+                    assert!(storage.pending_table_def(table).is_none());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn captured_type_references_reject_other_catalogs_and_invalid_representations() {
+        for kind in KINDS {
+            let (storage, table, _, _) = fixture(kind);
+            let (other, _, _, _) = fixture(kind);
+            let definition = *storage.table_def(table, 0);
+            crate::mem::guard::forbid_alloc(|| {
+                for column in definition.columns() {
+                    let result = RoutineResult {
+                        ctype: column.ctype,
+                        user_type: column.user_type,
+                    };
+                    assert_eq!(
+                        other.bind_routine_result(result, 0).unwrap_err().sqlstate,
+                        crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                    );
+                    assert_eq!(
+                        storage
+                            .bind_routine_result(
+                                RoutineResult {
+                                    ctype: ColType::Int8,
+                                    user_type: result.user_type
+                                },
+                                0
+                            )
+                            .unwrap_err()
+                            .sqlstate,
+                        crate::sql::eval::sqlstate::DATATYPE_MISMATCH
+                    );
+                }
+            });
+        }
     }
 
     #[test]
@@ -744,7 +832,9 @@ mod tests {
                             .table_def(related, 0)
                             .columns()
                             .iter()
-                            .all(|column| column.user_type == Some(movement.prior));
+                            .all(|column| {
+                                name_of(column.user_type) == name_of(Some(movement.prior))
+                            });
                         let source = types.as_ref().map_or_else(
                             || source_identity(&storage.type_catalog.lock().unwrap(), movement),
                             |catalog| source_identity(catalog, movement),
@@ -868,26 +958,41 @@ mod tests {
     fn publish_move(storage: &Storage, movement: TypeReferenceMove) {
         storage
             .type_publication
-            .publish(storage, movement, |catalog, _members| match movement.kind {
-                TypeReferenceKind::Domain => {
-                    catalog.domains[movement.slot].schema = movement.current.schema;
-                    catalog.domains[movement.slot].name = movement.current.name;
-                }
-                TypeReferenceKind::Enum => {
-                    catalog.enums[movement.slot].schema = movement.current.schema;
-                    catalog.enums[movement.slot].name = movement.current.name;
-                }
-                TypeReferenceKind::Composite => {
-                    catalog.composites[movement.slot].schema = movement.current.schema;
-                    catalog.composites[movement.slot].name = movement.current.name;
+            .publish(storage, movement, |catalog, _members| {
+                match movement.identity.slot {
+                    NamedTypeSlot::Domain(_) => {
+                        catalog.domains[movement.identity.slot.index()].schema =
+                            movement.current.schema;
+                        catalog.domains[movement.identity.slot.index()].name =
+                            movement.current.name;
+                    }
+                    NamedTypeSlot::Enum(_) => {
+                        catalog.enums[movement.identity.slot.index()].schema =
+                            movement.current.schema;
+                        catalog.enums[movement.identity.slot.index()].name = movement.current.name;
+                    }
+                    NamedTypeSlot::Composite(_) => {
+                        catalog.composites[movement.identity.slot.index()].schema =
+                            movement.current.schema;
+                        catalog.composites[movement.identity.slot.index()].name =
+                            movement.current.name;
+                    }
                 }
             });
     }
 
     fn assert_identity(storage: &Storage, table: usize, transaction: u32, expected: UserTypeName) {
         for column in storage.table_def(table, transaction).columns() {
-            assert_eq!(column.user_type, Some(expected));
+            assert_eq!(name_of(column.user_type), name_of(Some(expected)));
+            assert!(matches!(
+                column.user_type.map(|name| name.binding),
+                Some(TypeBinding::Captured(_))
+            ));
         }
+    }
+
+    fn name_of(name: Option<UserTypeName>) -> Option<(SqlName, SqlName)> {
+        name.map(|name| (name.schema, name.name))
     }
 
     #[test]
@@ -1022,7 +1127,7 @@ mod tests {
                     drop(held);
                     writer.join().unwrap();
                     other.join().unwrap();
-                    assert_eq!(retained_identity, Some(movement.prior));
+                    assert_eq!(name_of(retained_identity), name_of(Some(movement.prior)));
                     assert!(waiting, "the move did not reach its retained definition");
                     assert!(
                         !completed_early,
@@ -1114,7 +1219,10 @@ mod tests {
                 &[("id", scalar, false), ("items", array, false)],
             );
             for column in definition.columns.iter_mut().take(2) {
-                column.user_type = Some(movement.prior);
+                column.user_type = Some(UserTypeName::declaration(
+                    movement.prior.schema,
+                    movement.prior.name,
+                ));
             }
             let foreign = storage.create_table(definition).unwrap();
             storage.select_database(DatabaseOid::POSTGRES).unwrap();
@@ -1136,8 +1244,8 @@ mod tests {
                 drop(retired_view);
                 drop(foreign_view);
                 writer.join().unwrap();
-                assert_eq!(retired_identity, Some(movement.prior));
-                assert_eq!(foreign_identity, Some(movement.prior));
+                assert_eq!(name_of(retired_identity), name_of(Some(movement.prior)));
+                assert_eq!(name_of(foreign_identity), name_of(Some(movement.prior)));
                 assert!(progress.is_ok(), "an excluded table blocked a type move");
             });
             assert_identity(&storage, related, 0, movement.current);
@@ -1155,9 +1263,11 @@ mod tests {
     }
     #[test]
     fn enum_value_identity_type_moves_preserve_outer_domains() {
-        let identity = |name| UserTypeName {
-            schema: super::super::SqlName::parse("public").unwrap(),
-            name: super::super::SqlName::parse(name).unwrap(),
+        let identity = |name| {
+            UserTypeName::declaration(
+                super::super::SqlName::parse("public").unwrap(),
+                super::super::SqlName::parse(name).unwrap(),
+            )
         };
         let prior = identity("prior");
         let current = identity("current");
@@ -1191,7 +1301,16 @@ mod tests {
                 ColType::Array(ArrElem::domain(0, ColType::Enum(0)).unwrap()),
             ),
         ] {
-            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let movement = TypeReferenceMove::new(
+                TypeIdentity {
+                    origin: super::super::type_references::TypeOrigin::new().unwrap(),
+                    database: DatabaseOid::POSTGRES,
+                    slot: named_slot(kind, 0),
+                    created_at: 1,
+                },
+                prior,
+                current,
+            );
             let mut declared = None;
             assert!(!movement.rewrite(ctype, &mut declared));
             assert_eq!(declared, None);
@@ -1220,7 +1339,16 @@ mod tests {
                 ColType::Array(ArrElem::Composite(1)),
             ),
         ] {
-            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let movement = TypeReferenceMove::new(
+                TypeIdentity {
+                    origin: super::super::type_references::TypeOrigin::new().unwrap(),
+                    database: DatabaseOid::POSTGRES,
+                    slot: named_slot(kind, 0),
+                    created_at: 1,
+                },
+                prior,
+                current,
+            );
             let mut declared = Some(prior);
             assert!(!movement.rewrite(ctype, &mut declared));
             assert_eq!(declared, Some(prior));

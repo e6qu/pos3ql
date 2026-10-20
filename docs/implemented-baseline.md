@@ -388,9 +388,21 @@ before their owner can roll back.
 The ownership workspace is reserved at startup for every configured table plus
 the internal large-object relation: one optional table-owner record per slot,
 alignment padding and its mutex/arena controls. It never grows at runtime.
-Complete type-name changes still require exclusive storage access: definitions
-built before a rename must not later restore the old name. Coordinating that
-reference construction and enabling SQL workers remain planned work.
+Saved type references carry the source catalog, database, type slot and creation
+stamp. A definition submitted after a rename receives the source's current name.
+A reference to a dropped type fails with `42704`, even if another type has reused
+its name or slot. A captured reference with a different representation fails with
+`42804`. These checks use startup memory and do not allocate during execution.
+Routine arguments, parameters, result columns and aggregate state/results share
+one field walk for binding and renames. Checkpoint declarations bind after their
+type catalogs exist. A database template copy explicitly binds copied references
+to the new database's types.
+
+Complete type-name changes still require exclusive storage access. The existing
+transaction barrier also keeps a rename behind other active transactions, which
+protects previously staged journal records. Removing those restrictions requires
+ownership across final source validation and dependent publication; SQL CPU
+workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade

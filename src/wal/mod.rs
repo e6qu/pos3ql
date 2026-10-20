@@ -6816,10 +6816,10 @@ fn decode_routine_result(payload: &[u8], at: &mut usize) -> Option<crate::storag
         }
         1 => {
             *at += 1;
-            Some(crate::storage::UserTypeName {
-                schema: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
-                name: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
-            })
+            Some(crate::storage::UserTypeName::declaration(
+                SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
+                SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
+            ))
         }
         _ => return None,
     };
@@ -7411,7 +7411,7 @@ fn decode_op_inner<'a>(
                     } else {
                         return None;
                     };
-                    Some(crate::storage::UserTypeName { schema, name })
+                    Some(crate::storage::UserTypeName::declaration(schema, name))
                 } else {
                     None
                 };
@@ -9402,17 +9402,19 @@ fn decode_op_inner<'a>(
             };
             let base_domain = match (base_domain, base_domain_schema) {
                 (None, None) => None,
-                (Some(name), Some(schema)) => Some(crate::storage::UserTypeName { schema, name }),
+                (Some(name), Some(schema)) => {
+                    Some(crate::storage::UserTypeName::declaration(schema, name))
+                }
                 _ => return None,
             };
             let base_name = take_name(&mut at)?;
             let base_schema = take_name(&mut at)?;
             let base_user_type = match (base_name.is_empty(), base_schema.is_empty()) {
                 (true, true) => None,
-                (false, false) => Some(crate::storage::UserTypeName {
-                    schema: SqlName::parse(base_schema).ok()?,
-                    name: SqlName::parse(base_name).ok()?,
-                }),
+                (false, false) => Some(crate::storage::UserTypeName::declaration(
+                    SqlName::parse(base_schema).ok()?,
+                    SqlName::parse(base_name).ok()?,
+                )),
                 _ => return None,
             };
             let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
@@ -9635,10 +9637,10 @@ fn decode_op_inner<'a>(
                 at += 1;
                 let user_type = match has_user_type {
                     0 => None,
-                    1 => Some(crate::storage::UserTypeName {
-                        schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                        name: SqlName::parse(take_name(&mut at)?).ok()?,
-                    }),
+                    1 => Some(crate::storage::UserTypeName::declaration(
+                        SqlName::parse(take_name(&mut at)?).ok()?,
+                        SqlName::parse(take_name(&mut at)?).ok()?,
+                    )),
                     _ => return None,
                 };
                 *field = crate::storage::CompositeFieldDef {
@@ -9702,10 +9704,10 @@ fn decode_op_inner<'a>(
                     0 => None,
                     1 => {
                         at += 1;
-                        Some(crate::storage::UserTypeName {
-                            schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                            name: SqlName::parse(take_name(&mut at)?).ok()?,
-                        })
+                        Some(crate::storage::UserTypeName::declaration(
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                        ))
                     }
                     _ => return None,
                 };
@@ -9733,10 +9735,10 @@ fn decode_op_inner<'a>(
                     0 => None,
                     1 => {
                         at += 1;
-                        Some(crate::storage::UserTypeName {
-                            schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                            name: SqlName::parse(take_name(&mut at)?).ok()?,
-                        })
+                        Some(crate::storage::UserTypeName::declaration(
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                        ))
                     }
                     _ => return None,
                 };
@@ -9768,10 +9770,10 @@ fn decode_op_inner<'a>(
                 0 => None,
                 1 => {
                     at += 1;
-                    Some(crate::storage::UserTypeName {
-                        schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                        name: SqlName::parse(take_name(&mut at)?).ok()?,
-                    })
+                    Some(crate::storage::UserTypeName::declaration(
+                        SqlName::parse(take_name(&mut at)?).ok()?,
+                        SqlName::parse(take_name(&mut at)?).ok()?,
+                    ))
                 }
                 _ => return None,
             };
@@ -9890,10 +9892,10 @@ fn decode_op_inner<'a>(
                         0 => None,
                         1 => {
                             at += 1;
-                            Some(crate::storage::UserTypeName {
-                                schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                                name: SqlName::parse(take_name(&mut at)?).ok()?,
-                            })
+                            Some(crate::storage::UserTypeName::declaration(
+                                SqlName::parse(take_name(&mut at)?).ok()?,
+                                SqlName::parse(take_name(&mut at)?).ok()?,
+                            ))
                         }
                         _ => return None,
                     };
@@ -12261,10 +12263,10 @@ mod tests {
         let public = SqlName::parse("public").unwrap();
         let custom = crate::storage::RoutineResult {
             ctype: ColType::Enum(7),
-            user_type: Some(crate::storage::UserTypeName {
-                schema: public,
-                name: SqlName::parse("mood").unwrap(),
-            }),
+            user_type: Some(crate::storage::UserTypeName::declaration(
+                public,
+                SqlName::parse("mood").unwrap(),
+            )),
         };
         let binary_signature = crate::storage::OperatorSignature {
             left: Some(custom),
@@ -12903,10 +12905,10 @@ mod tests {
         domain.schema = SqlName::parse("public").unwrap();
         domain.name = SqlName::parse("guarded_state").unwrap();
         domain.base = ColType::Enum(0);
-        domain.base_user_type = Some(crate::storage::UserTypeName {
-            schema: domain.schema,
-            name: SqlName::parse("state").unwrap(),
-        });
+        domain.base_user_type = Some(crate::storage::UserTypeName::declaration(
+            domain.schema,
+            SqlName::parse("state").unwrap(),
+        ));
         domain.n_checks = 1;
         domain.checks[0].name = SqlName::parse("allowed").unwrap();
         domain.checks[0].expression =
@@ -14087,10 +14089,10 @@ mod tests {
             ctype: ColType::Composite(3),
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
-            user_type: Some(crate::storage::UserTypeName {
-                schema: crate::storage::SqlName::parse("public").unwrap(),
-                name: crate::storage::SqlName::parse("root").unwrap(),
-            }),
+            user_type: Some(crate::storage::UserTypeName::declaration(
+                crate::storage::SqlName::parse("public").unwrap(),
+                crate::storage::SqlName::parse("root").unwrap(),
+            )),
             dropped: false,
             not_null: true,
         };

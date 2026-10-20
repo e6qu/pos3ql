@@ -39594,10 +39594,10 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         .expect("routine remains visible");
     assert_eq!(
         engine.storage.routine(echo_count).arguments()[0].user_type,
-        Some(crate::storage::UserTypeName {
-            schema: crate::storage::SqlName::parse("routine_type_target").unwrap(),
-            name: crate::storage::SqlName::parse("routine_count_moved").unwrap(),
-        })
+        Some(crate::storage::UserTypeName::declaration(
+            crate::storage::SqlName::parse("routine_type_target").unwrap(),
+            crate::storage::SqlName::parse("routine_count_moved").unwrap()
+        ))
     );
     assert_eq!(
         engine.storage.routine_type_oid(
@@ -84439,10 +84439,10 @@ fn type_reference_moves_preserve_other_database_definitions_and_comments() {
         let definition = engine.storage.table_def(table, 0);
         assert_eq!(
             definition.columns()[0].user_type,
-            Some(crate::storage::UserTypeName {
-                schema: SqlName::parse("type_scope").unwrap(),
-                name: SqlName::parse("shared_domain").unwrap(),
-            }),
+            Some(crate::storage::UserTypeName::declaration(
+                SqlName::parse("type_scope").unwrap(),
+                SqlName::parse("shared_domain").unwrap()
+            )),
             "type rename changed another database"
         );
     }
@@ -90054,4 +90054,57 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
     drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn captured_type_references_keep_staged_journal_names_behind_schema_waits() {
+    let config = test_config("captured-type-journal-wait");
+    {
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut owner =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut rename =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        owner.success(&mut engine, "CREATE DOMAIN captured_code AS integer", true);
+        owner.success(
+            &mut engine,
+            "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
+            true,
+        );
+        let waiting = rename.execute(
+            &mut engine,
+            "ALTER DOMAIN captured_code RENAME TO current_code",
+            true,
+        );
+        assert!(waiting.is_empty(), "{}", String::from_utf8_lossy(&waiting));
+        assert!(
+            engine
+                .storage
+                .domain_slot("public", "captured_code", 0)
+                .is_some()
+        );
+        assert!(
+            engine
+                .storage
+                .domain_slot("public", "current_code", 0)
+                .is_none()
+        );
+        owner.success(&mut engine, "COMMIT", true);
+        rename.success(
+            &mut engine,
+            "ALTER DOMAIN captured_code RENAME TO current_code",
+            true,
+        );
+        assert_eq!(data_rows(&rename.success(&mut engine,
+            "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid", true)), ["current_code"]);
+        engine.commit_wal().unwrap();
+    }
+    {
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid", true)), ["current_code"]);
+    }
 }

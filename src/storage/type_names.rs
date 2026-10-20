@@ -13,35 +13,39 @@ pub(super) enum NamedTypeSlot {
     Composite(usize),
 }
 
-struct NameReservation {
-    slot: NamedTypeSlot,
-    database: DatabaseOid,
-    state: CatalogDdlState,
-    current: UserTypeName,
-    pending: Option<(u32, UserTypeName)>,
+impl NamedTypeSlot {
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::Domain(slot) | Self::Enum(slot) | Self::Composite(slot) => slot,
+        }
+    }
+}
+
+pub(super) struct NameReservation {
+    pub(super) slot: NamedTypeSlot,
+    pub(super) database: DatabaseOid,
+    pub(super) state: CatalogDdlState,
+    pub(super) current: UserTypeName,
+    pub(super) pending: Option<(u32, UserTypeName)>,
 }
 
 impl TypeCatalog {
-    fn name_reservations(&self) -> impl Iterator<Item = NameReservation> + '_ {
+    pub(super) fn name_reservations(&self) -> impl Iterator<Item = NameReservation> + '_ {
         self.domains
             .iter()
             .enumerate()
             .map(|(slot, definition)| {
-                let current = UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                };
+                let current = UserTypeName::declaration(definition.schema, definition.name);
                 NameReservation {
                     slot: NamedTypeSlot::Domain(slot),
                     database: definition.database,
                     state: definition.ddl_state,
                     current,
-                    pending: definition.pending_definition.map(|pending| {
+                    pending: definition.pending_definition.as_ref().map(|pending| {
                         (
                             pending.txid,
-                            pending.identity.map_or(current, |identity| UserTypeName {
-                                schema: identity.schema,
-                                name: identity.name,
+                            pending.identity.map_or(current, |identity| {
+                                UserTypeName::declaration(identity.schema, identity.name)
                             }),
                         )
                     }),
@@ -55,17 +59,11 @@ impl TypeCatalog {
                         slot: NamedTypeSlot::Enum(slot),
                         database: definition.database,
                         state: definition.ddl_state,
-                        current: UserTypeName {
-                            schema: definition.schema,
-                            name: definition.name,
-                        },
-                        pending: definition.pending_definition.map(|pending| {
+                        current: UserTypeName::declaration(definition.schema, definition.name),
+                        pending: definition.pending_definition.as_ref().map(|pending| {
                             (
                                 pending.txid,
-                                UserTypeName {
-                                    schema: pending.schema,
-                                    name: pending.name,
-                                },
+                                UserTypeName::declaration(pending.schema, pending.name),
                             )
                         }),
                     }),
@@ -78,17 +76,11 @@ impl TypeCatalog {
                         slot: NamedTypeSlot::Composite(slot),
                         database: definition.database,
                         state: definition.ddl_state,
-                        current: UserTypeName {
-                            schema: definition.schema,
-                            name: definition.name,
-                        },
-                        pending: definition.pending_definition.map(|pending| {
+                        current: UserTypeName::declaration(definition.schema, definition.name),
+                        pending: definition.pending_definition.as_ref().map(|pending| {
                             (
                                 pending.txid,
-                                UserTypeName {
-                                    schema: pending.schema,
-                                    name: pending.name,
-                                },
+                                UserTypeName::declaration(pending.schema, pending.name),
                             )
                         }),
                     }),
@@ -107,7 +99,7 @@ impl Storage {
         txid: u32,
         excluding: Option<NamedTypeSlot>,
     ) -> Result<(), SqlError> {
-        let target = UserTypeName { schema, name };
+        let target = UserTypeName::declaration(schema, name);
         let mut exists = false;
         for reservation in catalog.name_reservations() {
             if reservation.database != current_database()
@@ -160,10 +152,10 @@ mod tests {
     ];
 
     fn identity(name: &str) -> UserTypeName {
-        UserTypeName {
-            schema: SqlName::parse("public").unwrap(),
-            name: SqlName::parse(name).unwrap(),
-        }
+        UserTypeName::declaration(
+            SqlName::parse("public").unwrap(),
+            SqlName::parse(name).unwrap(),
+        )
     }
 
     fn fixture() -> Storage {
@@ -178,7 +170,7 @@ mod tests {
         name: &str,
         txid: u32,
     ) -> Result<NamedTypeSlot, SqlError> {
-        let UserTypeName { schema, name } = identity(name);
+        let UserTypeName::declaration(schema, name) = identity(name);
         match kind {
             NamedTypeSlot::Domain(_) => storage
                 .create_domain(
@@ -231,7 +223,7 @@ mod tests {
         name: &str,
         txid: u32,
     ) -> Result<(), SqlError> {
-        let UserTypeName { schema, name } = identity(name);
+        let UserTypeName::declaration(schema, name) = identity(name);
         match slot {
             NamedTypeSlot::Domain(slot) => {
                 storage.stage_domain_identity(slot, schema, name, txid)?;

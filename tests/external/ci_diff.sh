@@ -4,6 +4,7 @@
 # differential.sh (which spins up its own hermetic Postgres), this expects an
 # already-running PostgreSQL — a GitHub Actions `postgres:` service — reached
 # via the standard PG* env vars, so it works headless on CI runners.
+# Usage: bash tests/external/ci_diff.sh /absolute/path/to/pos3ql
 #
 # Env:
 #   PGHOST / PGPORT / PGUSER   PostgreSQL to diff against (default 127.0.0.1 / 5432 / postgres)
@@ -25,6 +26,11 @@
 # FUZZ_BUDGET so its known edge-case divergences can be ratcheted to zero.
 
 set -u
+if [[ $# != 1 || "$1" != /* || ! -f "$1" || ! -x "$1" ]]; then
+  printf '%s\n' 'usage: ci_diff.sh /absolute/path/to/executable-pos3ql' >&2
+  exit 2
+fi
+P3_BIN=$1
 cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
 DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit 1
@@ -100,6 +106,10 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 cleanup() {
   local status=$?
+  if (( status != 0 )) && [[ -f "$WORK/p3.log" ]]; then
+    printf '%s\n' 'pos3ql log after differential failure:' >&2
+    tail -80 "$WORK/p3.log" >&2
+  fi
   [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
   rm -rf "$WORK"
   trap - EXIT
@@ -122,6 +132,7 @@ fi
 # objects so a root-cause rerun observes the same oracle as the first run.
 # Keep the bootstrap public schema: catalog-reference binary values contain
 # its OID, so replacing the schema would manufacture a cross-cluster mismatch.
+printf '%s\n' 'Resetting the PostgreSQL oracle'
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 SET client_min_messages = warning;
@@ -211,11 +222,12 @@ $$;
 SQL
 
 # --- start pos3ql (object storage off: this suite is pure SQL semantics) ----
-cargo build --release -q || { echo "build failed"; exit 1; }
+printf 'pos3ql executable: %s\n' "$P3_BIN"
 cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = off
+log_format = text
 max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
@@ -224,7 +236,9 @@ ${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = 256MiB
 extension_control_path = ${EXTENSION_CONTROL_ROOT}
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+printf '%s\n' 'Starting pos3ql'
+: > "$WORK/p3.log"
+"$P3_BIN" --config "$WORK/p3.conf" >> "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
 wait_up() { # host port
@@ -241,8 +255,14 @@ wait_p3() {
       tail -40 "$WORK/p3.log"
       return 1
     fi
-    psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" \
-      >/dev/null 2>&1 && return 0
+    # The listener binds before recovery. A startup SQL probe can otherwise
+    # connect and block beyond the polling loop's entire deadline.
+    if grep -q '^startup complete:.*accepting connections$' "$WORK/p3.log" \
+      && psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" \
+        >/dev/null 2>&1; then
+      printf '%s\n' 'pos3ql startup complete; SQL probe passed'
+      return 0
+    fi
     sleep 0.1
   done
   return 1
@@ -254,7 +274,8 @@ echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 
 restart_p3() {
   kill "$P3_PID" 2>/dev/null
   wait "$P3_PID" 2>/dev/null
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  : > "$WORK/p3.log"
+  "$P3_BIN" --config "$WORK/p3.conf" >> "$WORK/p3.log" 2>&1 &
   P3_PID=$!
   wait_p3 && return 0
   echo "pos3ql did not restart on 127.0.0.1:$P3_PORT"
@@ -265,7 +286,8 @@ restart_p3_fresh() {
   kill "$P3_PID" 2>/dev/null
   wait "$P3_PID" 2>/dev/null
   rm -rf "${WORK}/p3data"
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  : > "$WORK/p3.log"
+  "$P3_BIN" --config "$WORK/p3.conf" >> "$WORK/p3.log" 2>&1 &
   P3_PID=$!
   wait_p3 && return 0
   echo "pos3ql did not restart on 127.0.0.1:$P3_PORT"
@@ -1558,7 +1580,7 @@ else
 fi
 if (set -o pipefail
     "$PY" -u "$EXT/atomic_writes_diff.py" --pg "$PGPORT" --host "$PGHOST" --user "$PGUSER" \
-      --binary "${POS3QL_BIN:-./target/release/pos3ql}" --work "$WORK/atomic-writes" \
+      --binary "$P3_BIN" --work "$WORK/atomic-writes" \
       2>&1 | tee "$WORK/atomic-writes.out"); then
   ok "atomic writes during held object GETs ($(tail -1 "$WORK/atomic-writes.out"))"
 else

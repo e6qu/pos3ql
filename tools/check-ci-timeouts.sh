@@ -152,6 +152,14 @@ done
 # The differential matrix owns every disjoint deterministic phase and all ten
 # slices of the original seeded fuzz sequence.
 differential_workflow=.github/workflows/differential.yml
+if grep -nE '^[[:space:]]*cargo[[:space:]]+(build|run|test)' tests/external/ci_diff.sh; then
+    printf '%s\n' 'CI timeout guard: comparison shards must use the verified release artifact without rebuilding' >&2
+    failed=1
+fi
+if ! grep -Fq -- '    needs: build' "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: comparison shards require the shared release build' >&2
+    failed=1
+fi
 for differential_shard in \
     slt-1 slt-2 slt-3 slt-4 slt-5 slt-6 slt-7 slt-8 \
     fuzz-1 fuzz-2 fuzz-3 fuzz-4 fuzz-5 \

@@ -124,6 +124,10 @@ temporary validation workflows before the final PR head. Fix failures on the
 same PR branch and rerun the affected gates; merge only when every required
 check passes on that head.
 
+PostgreSQL comparison shards share one release binary built from their checkout.
+Each shard verifies its recorded revision and checksum before use. The CI harness
+takes an explicit executable path and never compiles during a comparison run.
+
 Root-cause execution timeouts using step timings, logs, resource use, and the
 smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
 partitioning; do not increase timeout durations. A job waiting without an assigned

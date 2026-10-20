@@ -1041,7 +1041,7 @@ impl Conn {
     }
 
     pub(crate) fn lock_wait_remaining(&self) -> Option<Duration> {
-        if !self.parked {
+        if !self.parked || self.parked_wait != crate::sql::StatementWait::Lock {
             return None;
         }
         self.parked_deadline
@@ -1063,6 +1063,8 @@ impl Conn {
                 self.parked_deadline =
                     Instant::now().checked_add(Duration::from_millis(timeout_ms));
             }
+        } else if wait != crate::sql::StatementWait::Lock {
+            self.parked_deadline = None;
         }
     }
 
@@ -5862,11 +5864,16 @@ mod tests {
                     b"SELECT 17; INSERT INTO cache_orders VALUES (21, 'new'); SELECT 23\0",
                 ));
             }
+            // A granted row lock can leave time on its original lock timeout.
+            // A new cache wait must not keep that reactor deadline alive.
+            conn.parked_deadline = Some(Instant::now() + Duration::from_secs(1));
             assert!(matches!(
                 crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
                 Step::Parked
             ));
             assert_eq!(conn.parked_wait, crate::sql::StatementWait::CacheCapacity);
+            assert!(conn.lock_wait_remaining().is_none());
+            assert!(!conn.lock_timeout_expired());
             let prefix = conn.send.readable().to_vec();
             assert!(
                 crate::mem::guard::forbid_alloc(|| conn.retry_parked(&mut engine, u64::MAX, true))

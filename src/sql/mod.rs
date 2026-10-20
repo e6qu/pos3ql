@@ -776,7 +776,7 @@ pub enum StatementWait {
 pub enum ExecutionStatus {
     Complete,
     /// The current statement emitted no client-visible output and is parked
-    /// on a row lock or a non-blocking block fetch. Statements before it in
+    /// on a row lock, object I/O or cache capacity. Statements before it in
     /// the same simple-query message completed exactly once and are skipped
     /// when the message resumes.
     Blocked {

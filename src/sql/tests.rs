@@ -78598,6 +78598,63 @@ fn statement_timeout_checks_every_deadline_boundary() {
 }
 
 #[test]
+fn statement_timeout_nested_sql_inherits_outer_deadline_before_effects() {
+    let config = test_config("nested-statement-deadline");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE deadline_sequence; CREATE TABLE deadline_rows(id integer); SET statement_timeout = 0; BEGIN", true);
+    for expired in [false, true] {
+        session.arena.reset();
+        let statement = Parser::new(
+            "INSERT INTO deadline_rows VALUES (nextval('deadline_sequence'))",
+            &session.arena,
+        )
+        .unwrap()
+        .next_stmt()
+        .unwrap()
+        .unwrap();
+        let deadline = if expired {
+            1
+        } else {
+            datetime::now_micros() + 10_000_000
+        };
+        query::restore_statement_deadline(deadline);
+        let result = crate::mem::guard::forbid_alloc(|| {
+            let mut responder = Responder::new(&mut session.send);
+            engine
+                .execute_routine_stmt(
+                    &statement,
+                    &session.arena,
+                    &[],
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    None,
+                )
+                .unwrap()
+        });
+        assert_eq!(query::statement_deadline(), deadline);
+        query::disarm_timeout();
+        if expired {
+            assert_eq!(result.unwrap_err().sqlstate, "57014");
+        } else {
+            result.unwrap();
+        }
+    }
+    session.success(&mut engine, "COMMIT", true);
+    let output = session.success(
+        &mut engine,
+        "SELECT count(*) FROM deadline_rows; SELECT last_value FROM deadline_sequence",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["1", "1"]);
+}
+
+#[test]
 fn string_agg_aggregate() {
     // Values validated against PostgreSQL 18.4. Without an aggregate
     // ORDER BY, PostgreSQL leaves the concatenation order unspecified; our

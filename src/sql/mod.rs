@@ -14798,6 +14798,19 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if reset_workspace {
+            if txn.staged_commit().is_some() {
+                query::arm_timeout(0);
+            } else if let Some(deadline) = txn.suspended_statement_deadline() {
+                query::restore_statement_deadline(deadline);
+            } else {
+                query::arm_timeout(guc.statement_timeout_ms());
+            }
+        }
+        // Nested SQL shares its caller's deadline, including after a wait.
+        if let Err(error) = query::check_timeout() {
+            return Ok(Err(error));
+        }
         if !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
             && txn.staged_commit().is_none()
             && let Err(error) = self.check_writer_fence()
@@ -14862,16 +14875,6 @@ impl Engine {
             eval::funcs::system::current_user_owned()
         };
         if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
-            return Ok(Err(error));
-        }
-        if txn.staged_commit().is_some() {
-            query::arm_timeout(0);
-        } else if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
-        }
-        if let Err(error) = query::check_timeout() {
             return Ok(Err(error));
         }
         let statement_clock = datetime::statement_clock();

@@ -3,7 +3,8 @@
 Only defects blocked by an external condition or a genuinely intractable repair
 belong here. Fix every other defect, including CI regressions, in the PR that
 finds it, including publication that exposes a renamed type before its dependent
-definitions or keeps earlier owners locked while waiting.
+definitions, owners held while waiting, and test harnesses that hide failures or
+repeat expensive startup until they time out.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded.

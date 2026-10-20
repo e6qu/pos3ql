@@ -40,34 +40,44 @@ jobs:
         with:
           components: miri
       - run: cargo miri setup
-      - name: Shared heap aliasing and publication
-        run: cargo miri test --lib --locked shared_heap_append -- --test-threads=1
-      - name: Scoped arena ownership and destruction
-        run: cargo miri test --lib --locked owned_write_inputs_scoped_arena -- --test-threads=1
-      - name: Arena list snapshots and bounded mutation
-        run: cargo miri test --lib --locked arena_owned_list_ -- --test-threads=1
-      - name: Private heap copy ownership and publication
-        run: cargo miri test --lib --locked shared_heap_relocation_heap_ -- --test-threads=1
-      - name: Heap row-map ownership and lock release
-        run: cargo miri test --lib --locked row_lock_owners_heap_ -- --test-threads=1
-      - name: Stable row slots and bounded iteration
-        run: cargo miri test --lib --locked stable_row_slots_ -- --test-threads=1
-      - name: Resumable heap copy ownership
-        run: cargo miri test --lib --locked sliced_heap_cleanup_heap_ -- --test-threads=1
-      - name: Statement file ownership
-        run: cargo miri test --lib --locked statement_files_miri_ -- --test-threads=1
-      - name: Index file ownership
-        run: cargo miri test --lib --locked index_file_owners_miri_ -- --test-threads=1
-      - name: Enum member image ownership
-        run: cargo miri test --lib --locked enum_image_ownership_pool_ -- --test-threads=1
-      - name: Ordered row source pointer provenance
-        run: cargo miri test --lib --locked owned_ordered_source_tags -- --test-threads=1
-      - name: Stable saved-file identities and exhaustion
-        run: cargo miri test --lib --locked stable_spill_generation_ranges -- --test-threads=1
-      - name: Saved-file reservation boundaries
-        run: cargo miri test --lib --locked stable_spill_generation_exhaustion -- --test-threads=1
-      - name: Type publication workspace ownership
-        run: cargo miri test --lib --locked type_publication_workspace_exact_startup_budget -- --test-threads=1
+      - name: Shared ownership and publication
+        shell: bash
+        run: |
+          filters=(
+            shared_heap_append
+            owned_write_inputs_scoped_arena
+            arena_owned_list_
+            shared_heap_relocation_heap_
+            row_lock_owners_heap_
+            stable_row_slots_
+            sliced_heap_cleanup_heap_
+            statement_files_miri_
+            index_file_owners_miri_
+            enum_image_ownership_pool_
+            owned_ordered_source_tags
+            stable_spill_generation_ranges
+            stable_spill_generation_exhaustion
+            type_publication_workspace_exact_startup_budget
+          )
+          # All libtest filters share one interpreter startup.
+          cargo miri test --lib --locked -- "${filters[@]}" --test-threads=1 --color=never --format=pretty \
+            2>&1 | tee "$RUNNER_TEMP/miri-ownership.log"
+          python3 - "$RUNNER_TEMP/miri-ownership.log" "${filters[@]}" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          log = pathlib.Path(sys.argv[1]).read_text()
+          passed = re.findall(r"^test (\S+)(?: - should panic)? \.\.\. ok$", log, re.MULTILINE)
+          results = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", log, re.MULTILINE)
+          if len(results) != 1 or results[0] != (str(len(passed)), "0", "0"):
+              raise SystemExit("Miri did not report one complete passing test run")
+          missing = [pattern for pattern in sys.argv[2:]
+                     if not any(pattern in name for name in passed)]
+          if missing:
+              raise SystemExit("Miri filters matched no passing tests: " + ", ".join(missing))
+          print(f"Miri ownership: {len(passed)} passed across {len(sys.argv) - 2} filters")
+          PY
 
   release-package:
     runs-on: ubuntu-latest

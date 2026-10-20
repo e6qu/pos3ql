@@ -135,6 +135,9 @@ runner is a scheduling delay, not evidence of an execution timeout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
+Pass the selected ownership filters together to share one interpreter startup;
+[Rust's test harness accepts multiple filters](https://doc.rust-lang.org/src/test/cli.rs.html#161-163).
+Every configured filter must produce passing tests, with none failed or ignored.
 Coverage stops at a failed build or instrumentation setup and retains its
 diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort

@@ -249,6 +249,20 @@ impl From<BudgetError> for EngineSetupError {
     }
 }
 
+impl From<crate::storage::StorageSetupError> for EngineSetupError {
+    fn from(error: crate::storage::StorageSetupError) -> Self {
+        match error {
+            crate::storage::StorageSetupError::Budget(error) => Self::Budget(error),
+            crate::storage::StorageSetupError::TypeIdentitySpaceExhausted => {
+                Self::Storage(sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "type catalog identity space exhausted"
+                ))
+            }
+        }
+    }
+}
+
 impl From<WalSetupError> for EngineSetupError {
     fn from(e: WalSetupError) -> Self {
         Self::Wal(e)
@@ -19519,7 +19533,7 @@ fn decode_wal_routine_signature(
         })?;
         at += 1;
         if tag == 1 {
-            let mut names = [crate::storage::SqlName::EMPTY; 2];
+            let mut names = [""; 2];
             for name in &mut names {
                 let len = usize::from(*encoded.get(at).ok_or_else(|| {
                     sql_err!(
@@ -19534,19 +19548,18 @@ fn decode_wal_routine_signature(
                         "routine WAL type identity is truncated"
                     )
                 })?;
-                *name =
-                    crate::storage::SqlName::parse(core::str::from_utf8(bytes).map_err(|_| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "routine WAL type identity is not UTF-8"
-                        )
-                    })?)?;
+                *name = core::str::from_utf8(bytes).map_err(|_| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "routine WAL type identity is not UTF-8"
+                    )
+                })?;
                 at += len;
             }
-            argument.user_type = Some(crate::storage::UserTypeName {
-                schema: names[0],
-                name: names[1],
-            });
+            argument.user_type = Some(crate::storage::UserTypeName::from_storage(
+                crate::storage::SqlName::parse(names[0])?,
+                names[1],
+            )?);
         } else if tag != 0 {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
@@ -20469,12 +20482,26 @@ fn apply_composite_wal_definition(
     slot: usize,
     def: crate::storage::CompositeDef,
 ) -> Result<(), SqlError> {
+    if slot >= storage.composite_count() {
+        return Err(sql_err!(
+            eval::sqlstate::DATA_EXCEPTION,
+            "journal composite slot exceeds configured capacity"
+        ));
+    }
     let spec = crate::storage::CompositeSpec {
         fields: def.fields,
         n_fields: def.n_fields,
     };
     if storage.composite(slot).visible_to(0) {
         let mut definition = storage.composite_for(slot, 0);
+        if definition.database != storage.current_database_oid()
+            || definition.created_at != def.created_at
+        {
+            return Err(sql_err!(
+                eval::sqlstate::DATA_EXCEPTION,
+                "journal composite lifetime does not match its source"
+            ));
+        }
         definition.schema = def.schema;
         definition.name = def.name;
         definition.fields = spec.fields;
@@ -20483,6 +20510,11 @@ fn apply_composite_wal_definition(
         storage.commit_composite_alter(slot, 0);
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
+        storage.restore_type_identity(
+            crate::storage::NamedTypeSlot::Composite(slot),
+            crate::storage::NamedTypeSlot::Composite(slot),
+            def.created_at,
+        )?;
     }
     Ok(())
 }
@@ -21964,7 +21996,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
         WalOp::RestoreDomain(payload) | WalOp::RestoreTypedDomain(payload) => {
-            let def = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
+            let (slot, def) = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "journal domain definition is corrupt"
@@ -21982,14 +22014,35 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 checks: def.checks,
                 n_checks: def.n_checks,
             };
-            if let Some(slot) = storage.domain_slot(def.schema.as_str(), def.name.as_str(), 0) {
+            let slot = usize::from(slot);
+            if slot >= storage.domain_count() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal domain slot exceeds configured capacity"
+                ));
+            }
+            let current = storage.domain(slot);
+            if current.visible_to(0) {
+                if current.database != storage.current_database_oid()
+                    || current.created_at != def.created_at
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal domain lifetime does not match its source"
+                    ));
+                }
                 storage.stage_domain_alter(slot, spec, 0)?;
                 storage.commit_domain_alter(slot, 0);
             } else {
-                storage.create_domain(def.schema, def.name, spec, 0)?;
+                let allocated = storage.create_domain(def.schema, def.name, spec, 0)?;
+                storage.restore_type_identity(
+                    crate::storage::NamedTypeSlot::Domain(allocated),
+                    crate::storage::NamedTypeSlot::Domain(slot),
+                    def.created_at,
+                )?;
             }
         }
-        WalOp::CreateDomain(_) => {
+        WalOp::CreateDomain(_, _) => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "journal decoder returned an unstaged domain definition"
@@ -22049,6 +22102,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.commit_routine_identity(slot, 0);
         }
         WalOp::CreateEnum {
+            slot,
+            created_at,
             schema,
             name,
             members,
@@ -22056,10 +22111,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage
                 .enum_replay_members(members.len())?
                 .copy_from_slice(members);
-            storage.finish_enum_replay(
+            let allocated = storage.finish_enum_replay(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 members.len(),
+            )?;
+            storage.restore_type_identity(
+                crate::storage::NamedTypeSlot::Enum(allocated),
+                crate::storage::NamedTypeSlot::Enum(usize::from(slot)),
+                created_at,
             )?;
         }
         WalOp::RestoreEnum {

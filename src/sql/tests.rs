@@ -7091,6 +7091,9 @@ fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() 
 fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let mut config = test_config("prepared-object-cold-recovery");
     config.max_prepared_transactions = 4;
+    // Each transaction below changes fewer than sixteen catalog objects. The
+    // development capacity reserves 256 complete undo images per prepared slot.
+    config.max_ddl_per_transaction = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
@@ -39592,13 +39595,19 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         .storage
         .routine_slot_by_signature("public", "echo_count", &[ColType::Int4], 0)
         .expect("routine remains visible");
+    let captured = engine.storage.routine(echo_count).arguments()[0].user_type;
     assert_eq!(
-        engine.storage.routine(echo_count).arguments()[0].user_type,
-        Some(crate::storage::UserTypeName {
-            schema: crate::storage::SqlName::parse("routine_type_target").unwrap(),
-            name: crate::storage::SqlName::parse("routine_count_moved").unwrap(),
-        })
+        captured,
+        engine
+            .storage
+            .routine_result_for_oid(crate::sql::types::oid::domain_oid(moved_domain as u16), 0)
+            .unwrap()
+            .user_type
     );
+    assert!(captured.unwrap().is_named(
+        crate::storage::SqlName::parse("routine_type_target").unwrap(),
+        crate::storage::SqlName::parse("routine_count_moved").unwrap()
+    ));
     assert_eq!(
         engine.storage.routine_type_oid(
             engine.storage.routine(echo_count).arguments()[0].ctype,
@@ -76079,7 +76088,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v16\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v17\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -76108,7 +76117,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v13",
         "pos3ql-manifest-v14",
         "pos3ql-manifest-v15",
-        "pos3ql-manifest-v17",
+        "pos3ql-manifest-v18",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -76265,7 +76274,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v16\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v17\n"))
     );
     drop(recovered);
 
@@ -84437,12 +84446,11 @@ fn type_reference_moves_preserve_other_database_definitions_and_comments() {
         .unwrap();
     {
         let definition = engine.storage.table_def(table, 0);
-        assert_eq!(
-            definition.columns()[0].user_type,
-            Some(crate::storage::UserTypeName {
-                schema: SqlName::parse("type_scope").unwrap(),
-                name: SqlName::parse("shared_domain").unwrap(),
-            }),
+        assert!(
+            definition.columns()[0].user_type.unwrap().is_named(
+                SqlName::parse("type_scope").unwrap(),
+                SqlName::parse("shared_domain").unwrap()
+            ),
             "type rename changed another database"
         );
     }
@@ -90054,4 +90062,113 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
     drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn captured_type_references_recover_journal_definitions_committed_after_a_rename() {
+    for (kind, declaration, rename_statement) in [
+        (
+            "domain",
+            "CREATE DOMAIN captured_code AS integer",
+            "ALTER DOMAIN captured_code RENAME TO current_code",
+        ),
+        (
+            "enum",
+            "CREATE TYPE captured_code AS ENUM ('ready')",
+            "ALTER TYPE captured_code RENAME TO current_code",
+        ),
+        (
+            "composite",
+            "CREATE TYPE captured_code AS (value integer)",
+            "ALTER TYPE captured_code RENAME TO current_code",
+        ),
+    ] {
+        for checkpoint in [false, true] {
+            let mut config = test_config(&format!("captured-type-journal-{kind}-{checkpoint}"));
+            if checkpoint {
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.object_store_bucket =
+                    format!("captured-type-journal-{kind}-{}", std::process::id());
+                config.object_store_response_bytes = 1 << 20;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.wal_upload_buffer_bytes = 1 << 20;
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+            let snapshot = "SELECT castsource::regtype::text FROM pg_cast WHERE castsource = 'current_code'::regtype::oid AND casttarget = 'text'::regtype::oid";
+            let source_oid;
+            let identity_floor;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut owner =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+                let mut rename =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                owner.success(
+                    &mut engine,
+                    &declaration.replace("captured_code", "discarded_code"),
+                    !checkpoint,
+                );
+                owner.success(&mut engine, declaration, !checkpoint);
+                let discard = if kind == "domain" {
+                    "DROP DOMAIN discarded_code"
+                } else {
+                    "DROP TYPE discarded_code"
+                };
+                owner.success(&mut engine, discard, !checkpoint);
+                source_oid = data_rows(&owner.success(
+                    &mut engine,
+                    "SELECT 'captured_code'::regtype::oid",
+                    !checkpoint,
+                ));
+                owner.success(
+                    &mut engine,
+                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
+                    !checkpoint,
+                );
+                rename.success(&mut engine, rename_statement, !checkpoint);
+                for _ in 0..8 {
+                    rename.success(
+                        &mut engine,
+                        &declaration.replace("captured_code", "discarded_code"),
+                        !checkpoint,
+                    );
+                    rename.success(&mut engine, discard, !checkpoint);
+                }
+                identity_floor = engine.storage.catalog_identity_sequence();
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                owner.success(&mut engine, "COMMIT", !checkpoint);
+                assert_eq!(
+                    data_rows(&rename.success(&mut engine, snapshot, !checkpoint)),
+                    ["current_code"]
+                );
+                engine.commit_wal().unwrap();
+            }
+            if checkpoint {
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+            }
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert!(engine.storage.catalog_identity_sequence() >= identity_floor);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT 'current_code'::regtype::oid",
+                        !checkpoint
+                    )),
+                    source_oid
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, snapshot, !checkpoint)),
+                    ["current_code"]
+                );
+            }
+        }
+    }
 }

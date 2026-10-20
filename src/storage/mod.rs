@@ -21,10 +21,12 @@ mod table_names;
 mod type_contracts;
 mod type_names;
 mod type_reference_moves;
+mod type_references;
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
-use type_names::NamedTypeSlot;
+pub(crate) use type_names::NamedTypeSlot;
+pub(crate) use type_references::StorageSetupError;
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
@@ -688,7 +690,7 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     RegObject {
-        type_oid: i32,
+        kind: RegObjectType,
         referenced_oid: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
@@ -767,9 +769,58 @@ pub enum OwnedDatum {
         slot: u16,
         member: Option<crate::sql::types::EnumMemberId>,
         sort: f64,
-        len: u8,
-        bytes: [u8; MAX_DEFAULT_TEXT],
+        label: SqlName,
     },
+}
+
+/// PostgreSQL's object-reference types; an arbitrary OID is not a type tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegObjectType {
+    Regproc,
+    Regprocedure,
+    Regoper,
+    Regoperator,
+    Regclass,
+    Regnamespace,
+    Regrole,
+    Regconfig,
+    Regdictionary,
+    Regcollation,
+}
+
+impl RegObjectType {
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        Some(match ColType::from_oid(oid)? {
+            ColType::Regproc => Self::Regproc,
+            ColType::Regprocedure => Self::Regprocedure,
+            ColType::Regoper => Self::Regoper,
+            ColType::Regoperator => Self::Regoperator,
+            ColType::Regclass => Self::Regclass,
+            ColType::Regnamespace => Self::Regnamespace,
+            ColType::Regrole => Self::Regrole,
+            ColType::Regconfig => Self::Regconfig,
+            ColType::Regdictionary => Self::Regdictionary,
+            ColType::Regcollation => Self::Regcollation,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn oid(self) -> i32 {
+        match self {
+            Self::Regproc => ColType::Regproc,
+            Self::Regprocedure => ColType::Regprocedure,
+            Self::Regoper => ColType::Regoper,
+            Self::Regoperator => ColType::Regoperator,
+            Self::Regclass => ColType::Regclass,
+            Self::Regnamespace => ColType::Regnamespace,
+            Self::Regrole => ColType::Regrole,
+            Self::Regconfig => ColType::Regconfig,
+            Self::Regdictionary => ColType::Regdictionary,
+            Self::Regcollation => ColType::Regcollation,
+        }
+        .oid()
+    }
 }
 
 /// Fixed catalog capacity for a parsed default value. It matches the bounded
@@ -875,7 +926,12 @@ impl OwnedDatum {
             } => {
                 let (len, bytes) = Self::bytes(name.as_bytes(), "catalog object")?;
                 Self::RegObject {
-                    type_oid: *type_oid,
+                    kind: RegObjectType::from_oid(*type_oid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "invalid object-reference default type"
+                        )
+                    })?,
                     referenced_oid: *referenced_oid,
                     len,
                     bytes,
@@ -955,24 +1011,12 @@ impl OwnedDatum {
                 member,
                 sort,
                 label,
-            } => {
-                if label.len() > MAX_DEFAULT_TEXT {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "enum defaults are limited to {} bytes",
-                        MAX_DEFAULT_TEXT
-                    ));
-                }
-                let mut bytes = [0u8; MAX_DEFAULT_TEXT];
-                bytes[..label.len()].copy_from_slice(label.as_bytes());
-                Self::Enum {
-                    slot: *slot,
-                    member: *member,
-                    sort: *sort,
-                    len: label.len() as u8,
-                    bytes,
-                }
-            }
+            } => Self::Enum {
+                slot: *slot,
+                member: *member,
+                sort: *sort,
+                label: SqlName::parse(label)?,
+            },
             Datum::Numeric(n) => {
                 if n.digits.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(
@@ -1055,12 +1099,12 @@ impl OwnedDatum {
                     .expect("stored from valid UTF-8"),
             },
             Self::RegObject {
-                type_oid,
+                kind,
                 referenced_oid,
                 len,
                 bytes,
             } => Datum::RegObject {
-                type_oid: *type_oid,
+                type_oid: kind.oid(),
                 referenced_oid: *referenced_oid,
                 name: core::str::from_utf8(&bytes[..*len as usize])
                     .expect("stored from valid UTF-8"),
@@ -1159,14 +1203,12 @@ impl OwnedDatum {
                 slot,
                 member,
                 sort,
-                len,
-                bytes,
+                label,
             } => Datum::Enum {
                 slot: *slot,
                 member: *member,
                 sort: *sort,
-                label: core::str::from_utf8(&bytes[..*len as usize])
-                    .expect("stored from valid UTF-8"),
+                label: label.as_str(),
             },
         }
     }
@@ -1362,11 +1404,23 @@ impl NotNullOrigin {
     }
 }
 
-/// A durable schema-qualified user-type identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A type declaration or captured source, with its schema-qualified name.
+#[derive(Debug, Clone, Copy)]
 pub struct UserTypeName {
     pub schema: SqlName,
     pub name: SqlName,
+    binding: type_references::TypeBinding,
+}
+
+impl UserTypeName {
+    /// A declaration requests name lookup when its type is bound.
+    pub const fn declaration(schema: SqlName, name: SqlName) -> Self {
+        Self {
+            schema,
+            name,
+            binding: type_references::TypeBinding::Declaration,
+        }
+    }
 }
 
 /// The durable identity of a table column's declared type.
@@ -6579,10 +6633,17 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
 }
 
 fn polymorphic_type(ctype: ColType, user_type: Option<UserTypeName>) -> Option<PolymorphicType> {
-    let _ = ctype;
-    user_type
-        .filter(|identity| identity.schema.as_str() == "pg_catalog")
-        .and_then(|identity| PolymorphicType::from_name(identity.name.as_str()))
+    if ctype != ColType::Text {
+        return None;
+    }
+    let identity = user_type?;
+    match identity.binding {
+        type_references::TypeBinding::Polymorphic(kind) => Some(kind),
+        type_references::TypeBinding::Captured(_) | type_references::TypeBinding::Stored(_) => None,
+        type_references::TypeBinding::Declaration => (identity.schema.as_str() == "pg_catalog")
+            .then(|| PolymorphicType::from_name(identity.name.as_str()))
+            .flatten(),
+    }
 }
 
 impl RoutineArgumentDef {
@@ -6601,6 +6662,12 @@ pub(crate) struct RoutineResult {
 }
 
 impl RoutineResult {
+    fn requires_type_catalog(self) -> bool {
+        self.user_type.is_some()
+            || matches!(self.ctype, ColType::Enum(_) | ColType::Composite(_))
+            || matches!(self.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+    }
+
     pub(crate) const TEXT: Self = Self {
         ctype: ColType::Text,
         user_type: None,
@@ -7170,6 +7237,7 @@ struct OperatorClassIter<'a> {
 
 #[derive(Debug)]
 struct TypeCatalog {
+    origin: type_references::TypeOrigin,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
@@ -7911,7 +7979,7 @@ impl AggregateRoutine {
             if let Some(identity) = value.user_type {
                 hex(out, identity.schema.as_str())?;
                 out.write_str(" ")?;
-                hex(out, identity.name.as_str())
+                hex(out, identity.storage_name().as_str())
             } else {
                 out.write_str("- -")
             }
@@ -8058,11 +8126,14 @@ impl AggregateRoutine {
                 None
             } else {
                 let schema = decode_hex::<63>(schema)?;
-                let name = decode_hex::<63>(name)?;
-                Some(UserTypeName {
-                    schema: SqlName::parse(schema.as_str()).ok()?,
-                    name: SqlName::parse(name.as_str()).ok()?,
-                })
+                let name = decode_hex::<128>(name)?;
+                Some(
+                    UserTypeName::from_storage(
+                        SqlName::parse(schema.as_str()).ok()?,
+                        name.as_str(),
+                    )
+                    .ok()?,
+                )
             };
             Some(RoutineResult { ctype, user_type })
         }
@@ -13557,7 +13628,6 @@ impl CatalogSequence {
             .fetch_max(value, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     fn current(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -17931,6 +18001,7 @@ impl Storage {
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::TypePublication::budget_bytes(config)
+            + size_of::<type_references::TypeOrigin>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -18047,7 +18118,12 @@ impl Storage {
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
-    pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
+        let type_origin = type_references::TypeOrigin::new()?;
+        budget.draw(
+            size_of::<type_references::TypeOrigin>(),
+            "type reference origin",
+        )?;
         budget.draw(size_of::<std::sync::Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
@@ -18884,6 +18960,7 @@ impl Storage {
                 values: sequence_values,
             }),
             type_catalog: std::sync::Mutex::new(TypeCatalog {
+                origin: type_origin,
                 domains,
                 enums,
                 pending_enum_members,
@@ -21412,9 +21489,11 @@ impl Storage {
                     state: attachment.state,
                 });
             }
+            self.redeclare_template_type_references(source, target)?;
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
             self.rebind_routine_types_to(txid)?;
+            self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid)?;
             Ok(())
         })();
@@ -34723,10 +34802,11 @@ impl Storage {
         &self,
         index: usize,
         txid: u32,
-        def: TableDef,
+        mut def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
+        self.bind_user_type_columns_to(&mut def, txid)?;
         table_edits::TableDefinitionEdit::new(self, index).stage(
             txid,
             def,
@@ -34800,17 +34880,38 @@ impl Storage {
     /// across restart; scalar enums and enum/domain arrays therefore never
     /// trust the slot encoded in the table definition.
     fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
+        if def.columns().iter().all(|column| {
+            !RoutineResult {
+                ctype: column.ctype,
+                user_type: column.user_type,
+            }
+            .requires_type_catalog()
+        }) {
+            return Ok(());
+        }
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         for column in def.columns.iter_mut().take(def.n_columns) {
-            if let Some(identity) = column.user_type {
-                column.ctype = self.rebind_declared_user_type(column.ctype, identity, txid)?;
-            } else if matches!(column.ctype, ColType::Enum(_) | ColType::Composite(_))
-                || matches!(column.ctype, ColType::Array(element) if element.user_type_slot().is_some())
-            {
+            let result = catalog.bind_type_reference(
+                RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                },
+                current_database(),
+                txid,
+            )?;
+            if let Some(kind) = result.polymorphic_type() {
                 return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "reloaded user-defined column has no type identity"
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "column \"{}\" has pseudo-type {}",
+                    column.name.as_str(),
+                    kind.name()
                 ));
             }
+            column.ctype = result.ctype;
+            column.user_type = result.user_type;
         }
         Ok(())
     }
@@ -34965,6 +35066,7 @@ impl Storage {
                 def.name.as_str()
             ));
         }
+        self.bind_user_type_columns_to(&mut def, txid)?;
         let slot = creation.allocate(def, Some(txid))?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
@@ -38396,10 +38498,25 @@ impl Storage {
         txid: u32,
     ) -> Result<DeclaredColumnType, SqlError> {
         use crate::sql::types::oid;
+        let mut rebound = *column;
+        if column.user_type.is_some_and(|identity| {
+            matches!(identity.binding, type_references::TypeBinding::Captured(_))
+        }) {
+            let result = self.bind_routine_result(
+                RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                },
+                txid,
+            )?;
+            rebound.ctype = result.ctype;
+            rebound.user_type = result.user_type;
+        }
+        let column = &rebound;
 
         // A scalar domain may contain an array of another domain. Its base
         // element's slot is not the identity of the column declaration.
-        if let Some(UserTypeName { schema, name }) = column.user_type
+        if let Some(UserTypeName { schema, name, .. }) = column.user_type
             && let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
             && matches!(
                 self.domain_for(slot, txid).base,
@@ -38414,7 +38531,7 @@ impl Storage {
         }
         match column.ctype {
             ColType::Array(ArrElem::Domain { slot, .. }) => {
-                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "domain-array column type lacks its durable identity"
@@ -38437,7 +38554,8 @@ impl Storage {
                     .is_some()
             }) =>
             {
-                let UserTypeName { schema, name } = column.user_type.expect("domain checked above");
+                let UserTypeName { schema, name, .. } =
+                    column.user_type.expect("domain checked above");
                 let slot = self
                     .domain_identity_slot(schema.as_str(), name.as_str(), txid)
                     .expect("domain checked above");
@@ -38448,7 +38566,7 @@ impl Storage {
                 });
             }
             ColType::Enum(slot) => {
-                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "enum column type lacks its durable identity"
@@ -38469,7 +38587,7 @@ impl Storage {
                 });
             }
             ColType::Array(ArrElem::Enum(slot)) => {
-                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "enum-array column type lacks its durable identity"
@@ -38488,7 +38606,7 @@ impl Storage {
                 });
             }
             ColType::Composite(slot) => {
-                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "composite column type lacks its durable identity"
@@ -38509,7 +38627,7 @@ impl Storage {
                 });
             }
             ColType::Array(ArrElem::Composite(slot)) => {
-                let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
+                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "composite-array column type lacks its durable identity"
@@ -38530,7 +38648,7 @@ impl Storage {
             _ => {}
         }
 
-        let Some(UserTypeName { schema, name }) = column.user_type else {
+        let Some(UserTypeName { schema, name, .. }) = column.user_type else {
             return Ok(DeclaredColumnType::Builtin {
                 oid: column.ctype.oid(),
             });
@@ -38648,7 +38766,23 @@ impl Storage {
         txid: u32,
         defer_manifest_binding: bool,
     ) -> Result<usize, SqlError> {
-        if let Some(identity) = spec.base_user_type {
+        if !defer_manifest_binding
+            && let Some(identity) = spec.base_user_type
+            && matches!(identity.binding, type_references::TypeBinding::Captured(_))
+        {
+            let result = self.bind_routine_result(
+                RoutineResult {
+                    ctype: spec.base,
+                    user_type: Some(identity),
+                },
+                txid,
+            )?;
+            spec.base = result.ctype;
+            spec.base_user_type = result.user_type;
+        }
+        if let Some(identity) = spec.base_user_type
+            && matches!(identity.binding, type_references::TypeBinding::Declaration)
+        {
             spec.base = match spec.base {
                 ColType::Enum(slot)
                     if slot != ColType::ENUM_SLOT_UNRESOLVED
@@ -38659,10 +38793,10 @@ impl Storage {
                     // WAL preserves the catalog slot. Its spelling can be stale
                     // after an older domain image is replayed over a moved type.
                     let definition = self.enum_for(slot as usize, txid);
-                    spec.base_user_type = Some(UserTypeName {
-                        schema: definition.schema,
-                        name: definition.name,
-                    });
+                    spec.base_user_type = Some(UserTypeName::declaration(
+                        definition.schema,
+                        definition.name,
+                    ));
                     ColType::Enum(slot)
                 }
                 ColType::Enum(_) => {
@@ -38691,10 +38825,10 @@ impl Storage {
                     // See the enum case: slot identity is durable; names are a
                     // rebindable catalog projection.
                     let definition = self.composite_for(slot as usize, txid);
-                    spec.base_user_type = Some(UserTypeName {
-                        schema: definition.schema,
-                        name: definition.name,
-                    });
+                    spec.base_user_type = Some(UserTypeName::declaration(
+                        definition.schema,
+                        definition.name,
+                    ));
                     ColType::Composite(slot)
                 }
                 ColType::Composite(_) => match self.composite_slot(
@@ -38728,10 +38862,10 @@ impl Storage {
                                     && self.enum_for(slot, txid).visible_to(txid) =>
                             {
                                 let definition = self.enum_for(slot, txid);
-                                Some(UserTypeName {
-                                    schema: definition.schema,
-                                    name: definition.name,
-                                })
+                                Some(UserTypeName::declaration(
+                                    definition.schema,
+                                    definition.name,
+                                ))
                             }
                             ArrElem::Composite(_)
                                 if slot < self.composite_count()
@@ -38740,10 +38874,10 @@ impl Storage {
                                     && self.composite_for(slot, txid).visible_to(txid) =>
                             {
                                 let definition = self.composite_for(slot, txid);
-                                Some(UserTypeName {
-                                    schema: definition.schema,
-                                    name: definition.name,
-                                })
+                                Some(UserTypeName::declaration(
+                                    definition.schema,
+                                    definition.name,
+                                ))
                             }
                             ArrElem::Domain { .. }
                                 if slot < self.domain_count()
@@ -38752,10 +38886,10 @@ impl Storage {
                                     && self.domain_for(slot, txid).visible_to(txid) =>
                             {
                                 let definition = self.domain_for(slot, txid);
-                                Some(UserTypeName {
-                                    schema: definition.schema,
-                                    name: definition.name,
-                                })
+                                Some(UserTypeName::declaration(
+                                    definition.schema,
+                                    definition.name,
+                                ))
                             }
                             _ => None,
                         };
@@ -38771,6 +38905,30 @@ impl Storage {
                     ));
                 }
             };
+        }
+        if !defer_manifest_binding {
+            if let Some(parent) = spec.base_domain {
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(parent),
+                    },
+                    txid,
+                )?;
+                spec.base = result.ctype;
+                spec.base_domain = result.user_type;
+            }
+            if let Some(base) = spec.base_user_type {
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(base),
+                    },
+                    txid,
+                )?;
+                spec.base = result.ctype;
+                spec.base_user_type = result.user_type;
+            }
         }
         self.require_schema_create(schema.as_str(), txid)?;
         let created_at = self.catalog_sequence.next()?;
@@ -38986,6 +39144,36 @@ impl Storage {
                 ));
             }
         }
+        for slot in 0..catalog.domains.len() {
+            let definition = catalog.domains[slot].definition_for(txid);
+            if definition.database != current_database || !definition.visible_to(txid) {
+                continue;
+            }
+            for parent in [true, false] {
+                let name = if parent {
+                    definition.base_domain
+                } else {
+                    definition.base_user_type
+                };
+                if let Some(name) = name {
+                    let captured = catalog
+                        .bind_type_reference(
+                            RoutineResult {
+                                ctype: definition.base,
+                                user_type: Some(name),
+                            },
+                            current_database,
+                            txid,
+                        )?
+                        .user_type;
+                    if parent {
+                        catalog.domains[slot].base_domain = captured;
+                    } else {
+                        catalog.domains[slot].base_user_type = captured;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -38999,51 +39187,14 @@ impl Storage {
         identity: UserTypeName,
         txid: u32,
     ) -> Result<ColType, SqlError> {
-        if let Some(slot) =
-            self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            let domain = self.domain_for(slot, txid);
-            return match ctype {
-                ColType::Array(ArrElem::Domain { .. })
-                    if !matches!(domain.base, ColType::Array(ArrElem::Domain { .. })) =>
-                {
-                    ArrElem::domain(slot as u16, domain.base)
-                        .map(ColType::Array)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "arrays of domain {} require a supported element base type",
-                                identity.name.as_str()
-                            )
-                        })
-                }
-                _ => Ok(domain.base),
-            };
-        }
-        if let Some(slot) =
-            self.enum_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            return Ok(if matches!(ctype, ColType::Array(_)) {
-                ColType::Array(ArrElem::Enum(slot as u16))
-            } else {
-                ColType::Enum(slot as u16)
-            });
-        }
-        if let Some(slot) =
-            self.composite_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            return Ok(if matches!(ctype, ColType::Array(_)) {
-                ColType::Array(ArrElem::Composite(slot as u16))
-            } else {
-                ColType::Composite(slot as u16)
-            });
-        }
-        Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "declared type \"{}.{}\" does not exist",
-            identity.schema.as_str(),
-            identity.name.as_str()
-        ))
+        self.bind_routine_result(
+            RoutineResult {
+                ctype,
+                user_type: Some(identity),
+            },
+            txid,
+        )
+        .map(|result| result.ctype)
     }
 
     /// Completes checkpoint-time binding for every table and composite field.
@@ -39077,14 +39228,20 @@ impl Storage {
                 let Some(identity) = field_definition.user_type else {
                     continue;
                 };
-                let rebound =
-                    self.rebind_declared_user_type(field_definition.ctype, identity, txid)?;
-                self.type_catalog
+                let rebound = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: field_definition.ctype,
+                        user_type: Some(identity),
+                    },
+                    txid,
+                )?;
+                let mut catalog = self
+                    .type_catalog
                     .lock()
-                    .expect("type catalog lock poisoned")
-                    .composites[composite]
-                    .fields[field]
-                    .ctype = rebound;
+                    .expect("type catalog lock poisoned");
+                let field = &mut catalog.composites[composite].fields[field];
+                field.ctype = rebound.ctype;
+                field.user_type = rebound.user_type;
             }
         }
         Ok(())
@@ -39098,63 +39255,15 @@ impl Storage {
     }
 
     fn rebind_routine_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
-        fn rebind(
-            storage: &Storage,
-            ctype: ColType,
-            identity: UserTypeName,
-            txid: u32,
-        ) -> Result<ColType, SqlError> {
-            if polymorphic_type(ctype, Some(identity)).is_some() {
-                Ok(ctype)
-            } else {
-                storage.rebind_declared_user_type(ctype, identity, txid)
-            }
-        }
         for slot in 0..self.routine_count() {
             let mut routine = self.routine(slot);
             if routine.database != current_database() || !routine.visible_to(txid) {
                 continue;
             }
-            for argument in &mut routine.arguments[..routine.argument_count] {
-                if let Some(identity) = argument.user_type {
-                    argument.ctype = rebind(self, argument.ctype, identity, txid)?;
-                }
-            }
-            for parameter in &mut routine.parameters[..routine.parameter_count] {
-                if let Some(identity) = parameter.user_type {
-                    parameter.ctype = rebind(self, parameter.ctype, identity, txid)?;
-                }
-            }
-            for column in &mut routine.result_columns[..routine.result_column_count] {
-                if let Some(identity) = column.user_type {
-                    column.ctype = rebind(self, column.ctype, identity, txid)?;
-                }
-            }
-            match &mut routine.kind {
-                RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-                    if let Some(identity) = result.user_type {
-                        result.ctype = rebind(self, result.ctype, identity, txid)?;
-                    }
-                }
-                RoutineKind::Aggregate(aggregate) => {
-                    for result in [&mut aggregate.state_type, &mut aggregate.result_type] {
-                        if let Some(identity) = result.user_type {
-                            result.ctype = rebind(self, result.ctype, identity, txid)?;
-                        }
-                    }
-                    if let Some(moving) = &mut aggregate.moving
-                        && let Some(identity) = moving.state_type.user_type
-                    {
-                        moving.state_type.ctype =
-                            rebind(self, moving.state_type.ctype, identity, txid)?;
-                    }
-                }
-                RoutineKind::RecordFunction { .. }
-                | RoutineKind::TableFunction
-                | RoutineKind::Trigger
-                | RoutineKind::EventTrigger
-                | RoutineKind::Procedure => {}
-            }
+            type_contracts::CatalogTypes::Routine(&mut routine).try_for_each(|result| {
+                *result = self.bind_routine_result(*result, txid)?;
+                Ok::<(), SqlError>(())
+            })?;
             self.routines.lock().expect("routine catalog lock poisoned")[slot] = routine;
         }
         Ok(())
@@ -39163,9 +39272,22 @@ impl Storage {
     pub(crate) fn stage_domain_alter(
         &mut self,
         slot: usize,
-        spec: DomainSpec,
+        mut spec: DomainSpec,
         txid: u32,
     ) -> Result<Option<PendingDomainDefinition>, SqlError> {
+        for identity in [&mut spec.base_domain, &mut spec.base_user_type] {
+            if let Some(name) = *identity {
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(name),
+                    },
+                    txid,
+                )?;
+                spec.base = result.ctype;
+                *identity = result.user_type;
+            }
+        }
         let mut catalog = self
             .type_catalog
             .lock()
@@ -39263,17 +39385,14 @@ impl Storage {
                 return;
             }
             type_reference_moves::TypeReferenceMove::new(
-                domain.database,
-                type_reference_moves::TypeReferenceKind::Domain,
-                slot,
-                UserTypeName {
-                    schema: domain.schema,
-                    name: domain.name,
-                },
-                UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    domain.database,
+                    NamedTypeSlot::Domain(slot),
+                    domain.created_at,
+                ),
+                UserTypeName::declaration(domain.schema, domain.name),
+                UserTypeName::declaration(definition.schema, definition.name),
             )
         };
         self.publish_type_move(movement, |catalog, _members| {
@@ -39880,17 +39999,14 @@ impl Storage {
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
             type_reference_moves::TypeReferenceMove::new(
-                previous.database,
-                type_reference_moves::TypeReferenceKind::Enum,
-                slot,
-                UserTypeName {
-                    schema: previous.schema,
-                    name: previous.name,
-                },
-                UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    previous.database,
+                    NamedTypeSlot::Enum(slot),
+                    previous.created_at,
+                ),
+                UserTypeName::declaration(previous.schema, previous.name),
+                UserTypeName::declaration(definition.schema, definition.name),
             )
         };
         self.publish_type_move(movement, |catalog, members| {
@@ -39951,14 +40067,14 @@ impl Storage {
                 return Ok(());
             }
             type_reference_moves::TypeReferenceMove::new(
-                previous.database,
-                type_reference_moves::TypeReferenceKind::Enum,
-                slot,
-                UserTypeName {
-                    schema: previous.schema,
-                    name: previous.name,
-                },
-                UserTypeName { schema, name },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    previous.database,
+                    NamedTypeSlot::Enum(slot),
+                    previous.created_at,
+                ),
+                UserTypeName::declaration(previous.schema, previous.name),
+                UserTypeName::declaration(schema, name),
             )
         };
         self.publish_type_move(movement, |catalog, _members| {
@@ -40243,9 +40359,25 @@ impl Storage {
     pub(crate) fn stage_composite_alter(
         &mut self,
         slot: usize,
-        definition: CompositeDef,
+        mut definition: CompositeDef,
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
+        for field in definition
+            .fields
+            .iter_mut()
+            .take(definition.n_fields)
+            .filter(|field| !field.dropped)
+        {
+            let result = self.bind_routine_result(
+                RoutineResult {
+                    ctype: field.ctype,
+                    user_type: field.user_type,
+                },
+                txid,
+            )?;
+            field.ctype = result.ctype;
+            field.user_type = result.user_type;
+        }
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40293,17 +40425,14 @@ impl Storage {
                 return;
             }
             type_reference_moves::TypeReferenceMove::new(
-                composite.database,
-                type_reference_moves::TypeReferenceKind::Composite,
-                slot,
-                UserTypeName {
-                    schema: composite.schema,
-                    name: composite.name,
-                },
-                UserTypeName {
-                    schema: pending.schema,
-                    name: pending.name,
-                },
+                type_references::TypeIdentity::new(
+                    catalog.origin,
+                    composite.database,
+                    NamedTypeSlot::Composite(slot),
+                    composite.created_at,
+                ),
+                UserTypeName::declaration(composite.schema, composite.name),
+                UserTypeName::declaration(pending.schema, pending.name),
             )
         };
         self.publish_type_move(movement, |catalog, _members| {
@@ -40341,37 +40470,46 @@ impl Storage {
         &mut self,
         schema: SqlName,
         name: SqlName,
-        mut spec: CompositeSpec,
+        spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        self.create_composite_with_binding(schema, name, spec, txid, false)
+    }
+
+    pub(crate) fn create_composite_from_manifest(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: CompositeSpec,
+    ) -> Result<usize, SqlError> {
+        self.create_composite_with_binding(schema, name, spec, 0, true)
+    }
+
+    fn create_composite_with_binding(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        mut spec: CompositeSpec,
+        txid: u32,
+        defer_manifest_binding: bool,
+    ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
-        for field in spec.fields.iter_mut().take(spec.n_fields) {
-            let Some(identity) = field.user_type else {
-                continue;
-            };
-            let rebound = match field.ctype {
-                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => self
-                    .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Enum(slot as u16))
-                        } else {
-                            ColType::Enum(slot as u16)
-                        }
-                    }),
-                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => self
-                    .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Composite(slot as u16))
-                        } else {
-                            ColType::Composite(slot as u16)
-                        }
-                    }),
-                _ => None,
-            };
-            if let Some(ctype) = rebound {
-                field.ctype = ctype;
+        if !defer_manifest_binding {
+            for field in spec
+                .fields
+                .iter_mut()
+                .take(spec.n_fields)
+                .filter(|field| !field.dropped)
+            {
+                let result = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: field.ctype,
+                        user_type: field.user_type,
+                    },
+                    txid,
+                )?;
+                field.ctype = result.ctype;
+                field.user_type = result.user_type;
             }
         }
         let created_at = self.catalog_sequence.next()?;
@@ -40425,33 +40563,21 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        for field in spec.fields.iter_mut().take(spec.n_fields) {
-            let Some(identity) = field.user_type else {
-                continue;
-            };
-            if let Some(ctype) = match field.ctype {
-                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => self
-                    .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|type_slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Enum(type_slot as u16))
-                        } else {
-                            ColType::Enum(type_slot as u16)
-                        }
-                    }),
-                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => self
-                    .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .map(|type_slot| {
-                        if matches!(field.ctype, ColType::Array(_)) {
-                            ColType::Array(ArrElem::Composite(type_slot as u16))
-                        } else {
-                            ColType::Composite(type_slot as u16)
-                        }
-                    }),
-                _ => None,
-            } {
-                field.ctype = ctype;
-            }
+        for field in spec
+            .fields
+            .iter_mut()
+            .take(spec.n_fields)
+            .filter(|field| !field.dropped)
+        {
+            let result = self.bind_routine_result(
+                RoutineResult {
+                    ctype: field.ctype,
+                    user_type: field.user_type,
+                },
+                txid,
+            )?;
+            field.ctype = result.ctype;
+            field.user_type = result.user_type;
         }
         let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
@@ -42381,46 +42507,41 @@ impl Storage {
         user_type: Option<UserTypeName>,
         txid: u32,
     ) -> Option<i32> {
-        use crate::sql::types::{ArrElem, oid};
-
-        if let Some(polymorphic) = polymorphic_type(ctype, user_type) {
-            return Some(polymorphic.oid());
-        }
-
-        if let Some(identity) = user_type
-            && let Some(slot) =
-                self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            return Some(
-                if matches!(ctype, ColType::Array(ArrElem::Domain { .. }))
-                    && !matches!(
-                        self.domain_for(slot, txid).base,
-                        ColType::Array(ArrElem::Domain { .. })
-                    )
-                {
-                    oid::domain_array_oid(slot as u16)
-                } else {
-                    oid::domain_oid(slot as u16)
-                },
-            );
-        }
-        match ctype {
-            ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
-            ColType::Composite(slot) => return Some(oid::composite_oid(slot)),
-            ColType::Array(ArrElem::Enum(slot)) => return Some(oid::enum_array_oid(slot)),
-            ColType::Array(ArrElem::Composite(slot)) => {
-                return Some(oid::composite_array_oid(slot));
-            }
-            ColType::Array(ArrElem::Domain { slot, .. }) => {
-                return Some(oid::domain_array_oid(slot));
-            }
-            _ => {}
+        use crate::sql::types::oid;
+        if let Some(kind) = polymorphic_type(ctype, user_type) {
+            return Some(kind.oid());
         }
         let Some(identity) = user_type else {
-            return Some(ctype.oid());
+            return (!matches!(ctype, ColType::Enum(_) | ColType::Composite(_))
+                && !matches!(ctype, ColType::Array(element) if element.user_type_slot().is_some()))
+            .then(|| ctype.oid());
         };
-        let array = matches!(ctype, ColType::Array(_));
-        self.user_type_identity_oid(identity, array, txid)
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let snapshot = catalog
+            .resolve_type_reference(identity, current_database(), txid)
+            .ok()??;
+        let bound = catalog
+            .bind_type_reference(RoutineResult { ctype, user_type }, current_database(), txid)
+            .ok()?;
+        let array = match snapshot.identity.slot() {
+            NamedTypeSlot::Domain(_) => {
+                matches!(bound.ctype, ColType::Array(ArrElem::Domain { .. }))
+                    && !matches!(snapshot.base, ColType::Array(ArrElem::Domain { .. }))
+            }
+            _ => matches!(bound.ctype, ColType::Array(_)),
+        };
+        let slot = u16::try_from(snapshot.identity.slot().index()).ok()?;
+        Some(match (snapshot.identity.slot(), array) {
+            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
+            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
+            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(slot),
+            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(slot),
+            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(slot),
+            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(slot),
+        })
     }
 
     /// Binds the transient representation slot in a persisted routine type to
@@ -42428,84 +42549,72 @@ impl Storage {
     /// unresolved slots because catalog allocation order is process-local.
     pub(crate) fn bind_routine_result(
         &self,
-        mut result: RoutineResult,
+        result: RoutineResult,
         txid: u32,
     ) -> Result<RoutineResult, SqlError> {
-        if let Some(identity) = result.user_type
-            && polymorphic_type(result.ctype, result.user_type).is_none()
-        {
-            result.ctype = self.rebind_declared_user_type(result.ctype, identity, txid)?;
+        if !result.requires_type_catalog() {
+            return Ok(result);
         }
-        Ok(result)
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .bind_type_reference(result, current_database(), txid)
     }
 
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
-        use crate::sql::types::{ArrElem, ColType, oid};
-
-        let identity = |schema: SqlName, name: SqlName| Some(UserTypeName { schema, name });
-        if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + self.domain_count() as i32).contains(&type_oid) {
-            let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
-            let domain = self.domain_for(slot, txid);
-            return (domain.database == current_database() && domain.visible_to(txid)).then_some(
-                RoutineResult {
-                    ctype: domain.base,
-                    user_type: identity(domain.schema, domain.name),
-                },
-            );
-        }
-        if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + self.domain_count() as i32)
-            .contains(&type_oid)
-        {
-            let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN_ARRAY).ok()?;
-            let domain = self.domain_for(slot, txid);
-            return (domain.database == current_database() && domain.visible_to(txid)).then_some(
-                RoutineResult {
-                    ctype: ColType::Array(ArrElem::domain(slot as u16, domain.base)?),
-                    user_type: identity(domain.schema, domain.name),
-                },
-            );
-        }
-        if (oid::FIRST_ENUM..oid::FIRST_ENUM + self.enum_count() as i32).contains(&type_oid) {
-            let slot = usize::try_from(type_oid - oid::FIRST_ENUM).ok()?;
-            let enumeration = self.enum_for(slot, txid);
-            return (enumeration.database == current_database() && enumeration.visible_to(txid))
-                .then_some(RoutineResult {
-                    ctype: ColType::Enum(slot as u16),
-                    user_type: identity(enumeration.schema, enumeration.name),
-                });
-        }
-        if (oid::FIRST_ENUM_ARRAY..oid::FIRST_ENUM_ARRAY + self.enum_count() as i32)
-            .contains(&type_oid)
-        {
-            let slot = usize::try_from(type_oid - oid::FIRST_ENUM_ARRAY).ok()?;
-            let enumeration = self.enum_for(slot, txid);
-            return (enumeration.database == current_database() && enumeration.visible_to(txid))
-                .then_some(RoutineResult {
-                    ctype: ColType::Array(ArrElem::Enum(slot as u16)),
-                    user_type: identity(enumeration.schema, enumeration.name),
-                });
-        }
-        if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + self.composite_count() as i32)
-            .contains(&type_oid)
-        {
-            let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE).ok()?;
-            let composite = self.composite_for(slot, txid);
-            return (composite.database == current_database() && composite.visible_to(txid))
-                .then_some(RoutineResult {
-                    ctype: ColType::Composite(slot as u16),
-                    user_type: identity(composite.schema, composite.name),
-                });
-        }
-        if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + self.composite_count() as i32)
-            .contains(&type_oid)
-        {
-            let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE_ARRAY).ok()?;
-            let composite = self.composite_for(slot, txid);
-            return (composite.database == current_database() && composite.visible_to(txid))
-                .then_some(RoutineResult {
-                    ctype: ColType::Array(ArrElem::Composite(slot as u16)),
-                    user_type: identity(composite.schema, composite.name),
-                });
+        use crate::sql::types::oid;
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let sources = [
+            (oid::FIRST_DOMAIN, catalog.domains.len(), false, 0u8),
+            (oid::FIRST_DOMAIN_ARRAY, catalog.domains.len(), true, 0u8),
+            (oid::FIRST_ENUM, catalog.enums.len(), false, 1u8),
+            (oid::FIRST_ENUM_ARRAY, catalog.enums.len(), true, 1u8),
+            (oid::FIRST_COMPOSITE, catalog.composites.len(), false, 2u8),
+            (
+                oid::FIRST_COMPOSITE_ARRAY,
+                catalog.composites.len(),
+                true,
+                2u8,
+            ),
+        ];
+        for (first, count, array, kind) in sources {
+            let Some(index) = type_oid
+                .checked_sub(first)
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < count)
+            else {
+                continue;
+            };
+            let slot = match kind {
+                0 => NamedTypeSlot::Domain(index),
+                1 => NamedTypeSlot::Enum(index),
+                _ => NamedTypeSlot::Composite(index),
+            };
+            let snapshot = catalog.type_snapshot(slot, txid).ok()??;
+            if snapshot.identity.database() != current_database() {
+                return None;
+            }
+            let ctype = if array && matches!(slot, NamedTypeSlot::Domain(_)) {
+                ColType::Array(ArrElem::domain(u16::try_from(index).ok()?, snapshot.base)?)
+            } else if array {
+                match snapshot.base {
+                    ColType::Enum(slot) => ColType::Array(ArrElem::Enum(slot)),
+                    ColType::Composite(slot) => ColType::Array(ArrElem::Composite(slot)),
+                    _ if matches!(slot, NamedTypeSlot::Domain(_)) => {
+                        ColType::Array(ArrElem::domain(u16::try_from(index).ok()?, snapshot.base)?)
+                    }
+                    _ => return None,
+                }
+            } else {
+                snapshot.base
+            };
+            return Some(RoutineResult {
+                ctype,
+                user_type: Some(snapshot.name),
+            });
         }
         ColType::from_oid(type_oid).map(RoutineResult::builtin)
     }
@@ -42609,33 +42718,22 @@ impl Storage {
         txid: u32,
     ) -> Option<i32> {
         use crate::sql::types::oid;
-
-        if let Some(slot) =
-            self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            return Some(if array {
-                oid::domain_array_oid(slot as u16)
-            } else {
-                oid::domain_oid(slot as u16)
-            });
-        }
-        if let Some(slot) =
-            self.enum_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-        {
-            return Some(if array {
-                oid::enum_array_oid(slot as u16)
-            } else {
-                oid::enum_oid(slot as u16)
-            });
-        }
-        self.composite_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-            .map(|slot| {
-                if array {
-                    oid::composite_array_oid(slot as u16)
-                } else {
-                    oid::composite_oid(slot as u16)
-                }
-            })
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let source = catalog
+            .resolve_type_reference(identity, current_database(), txid)
+            .ok()??;
+        let index = u16::try_from(source.identity.slot().index()).ok()?;
+        Some(match (source.identity.slot(), array) {
+            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(index),
+            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(index),
+            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(index),
+            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(index),
+            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(index),
+            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(index),
+        })
     }
 
     pub(crate) fn routine_slot_by_signature(
@@ -42680,7 +42778,16 @@ impl Storage {
                     .iter()
                     .zip(arguments)
                     .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
+                        self.bind_routine_result(
+                            RoutineResult {
+                                ctype: right.ctype,
+                                user_type: right.user_type,
+                            },
+                            txid,
+                        )
+                        .is_ok_and(|right| {
+                            left.ctype == right.ctype && left.user_type == right.user_type
+                        })
                     }))
             .then_some(slot)
         })
@@ -42848,12 +42955,12 @@ impl Storage {
             identity,
             schema,
             name,
-            arguments,
+            mut arguments,
             argument_count,
-            parameters,
+            mut parameters,
             parameter_count,
-            kind,
-            result_columns,
+            mut kind,
+            mut result_columns,
             result_column_count,
             language,
             attributes,
@@ -42977,6 +43084,16 @@ impl Storage {
             | RoutineKind::Procedure
             | RoutineKind::Aggregate(_) => {}
         }
+        type_contracts::routine_type_fields(
+            &mut arguments[..argument_count],
+            &mut parameters[..parameter_count],
+            &mut result_columns[..result_column_count],
+            &mut kind,
+            &mut |result| {
+                *result = self.bind_routine_result(*result, txid)?;
+                Ok::<(), SqlError>(())
+            },
+        )?;
         self.require_schema_create(schema.as_str(), txid)?;
         let allocated_ownership =
             matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
@@ -43100,6 +43217,16 @@ impl Storage {
         mut definition: PendingRoutineDefinition,
         dependencies: StoredQueryDependencyView<'_>,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
+        type_contracts::routine_type_fields(
+            &mut definition.arguments[..definition.argument_count],
+            &mut definition.parameters[..definition.parameter_count],
+            &mut definition.result_columns[..definition.result_column_count],
+            &mut definition.kind,
+            &mut |result| {
+                *result = self.bind_routine_result(*result, definition.txid)?;
+                Ok::<(), SqlError>(())
+            },
+        )?;
         let routine = self.routine(slot);
         let name = routine.name;
         if let Some(pending) = routine.pending_definition
@@ -43129,6 +43256,16 @@ impl Storage {
         slot: usize,
         mut definition: PendingRoutineDefinition,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
+        type_contracts::routine_type_fields(
+            &mut definition.arguments[..definition.argument_count],
+            &mut definition.parameters[..definition.parameter_count],
+            &mut definition.result_columns[..definition.result_column_count],
+            &mut definition.kind,
+            &mut |result| {
+                *result = self.bind_routine_result(*result, definition.txid)?;
+                Ok::<(), SqlError>(())
+            },
+        )?;
         let routine = self.routine(slot);
         let name = routine.name;
         if let Some(pending) = routine.pending_definition
@@ -48674,6 +48811,8 @@ impl Storage {
         context: CastContext,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let source = self.bind_routine_result(source, txid)?;
+        let target = self.bind_routine_result(target, txid)?;
         if source == target {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -51301,9 +51440,10 @@ impl Storage {
 
     pub(crate) fn create_operator(
         &self,
-        definition: OperatorDefinition,
+        mut definition: OperatorDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
         let created_at = self.catalog_sequence.next()?;
@@ -51419,9 +51559,10 @@ impl Storage {
     pub(crate) fn stage_operator_definition(
         &self,
         slot: usize,
-        definition: OperatorDefinition,
+        mut definition: OperatorDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorDefinition>, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         let oid = self.operator(slot).oid();
         self.validate_operator_definition(definition, txid, Some(oid))?;
         let mut catalog = self
@@ -51703,9 +51844,10 @@ impl Storage {
 
     pub(crate) fn create_operator_family(
         &self,
-        definition: OperatorFamilyDefinition,
+        mut definition: OperatorFamilyDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_family_definition(definition, txid)?;
         let mut catalog = self
@@ -51812,9 +51954,10 @@ impl Storage {
     pub(crate) fn stage_operator_family_definition(
         &self,
         slot: usize,
-        definition: OperatorFamilyDefinition,
+        mut definition: OperatorFamilyDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorFamilyDefinition>, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_family_definition(definition, txid)?;
         let mut catalog = self
             .operator_catalog
@@ -52188,9 +52331,10 @@ impl Storage {
 
     pub(crate) fn create_operator_class(
         &self,
-        definition: OperatorClassDefinition,
+        mut definition: OperatorClassDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_class_definition(definition, txid)?;
         if definition.default
@@ -52317,9 +52461,10 @@ impl Storage {
     pub(crate) fn stage_operator_class_definition(
         &self,
         slot: usize,
-        definition: OperatorClassDefinition,
+        mut definition: OperatorClassDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorClassDefinition>, SqlError> {
+        definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_class_definition(definition, txid)?;
         let mut catalog = self
             .operator_catalog
@@ -52899,7 +53044,14 @@ mod tests {
 
     #[test]
     fn column_metadata_stays_within_recovery_stack_budget() {
-        assert!(core::mem::size_of::<ColumnMeta>() <= 512);
+        assert!(
+            core::mem::size_of::<ColumnMeta>() <= 512,
+            "column metadata: {} bytes; type reference: {}; default: {}; value: {}",
+            core::mem::size_of::<ColumnMeta>(),
+            core::mem::size_of::<Option<UserTypeName>>(),
+            core::mem::size_of::<ColumnDefault>(),
+            core::mem::size_of::<OwnedDatum>()
+        );
     }
 
     #[test]
@@ -60086,10 +60238,10 @@ mod tests {
                 .sqlstate,
             sqlstate::PROTOCOL_VIOLATION
         );
-        column.user_type = Some(UserTypeName {
-            schema: SqlName::parse("public").unwrap(),
-            name: SqlName::parse("missing_type").unwrap(),
-        });
+        column.user_type = Some(UserTypeName::declaration(
+            SqlName::parse("public").unwrap(),
+            SqlName::parse("missing_type").unwrap(),
+        ));
         assert_eq!(
             storage
                 .declared_column_type(&column, 0)

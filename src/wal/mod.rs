@@ -26,6 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
+pub(crate) const RECORD_VERSION: u8 = 1;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -249,7 +250,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 4;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 5;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -761,7 +762,35 @@ pub(crate) fn apply_enum_payload(
     wide_count: bool,
     stable_members: bool,
 ) -> Result<(), SqlError> {
-    let mut at = 0usize;
+    let invalid = || {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid enum journal source identity"
+        )
+    };
+    let slot = u16::from_le_bytes(
+        payload
+            .get(..2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid)?,
+    );
+    let created_at = u64::from_le_bytes(
+        payload
+            .get(2..10)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid)?,
+    );
+    if usize::from(slot) >= storage.enum_count() || created_at == 0 {
+        return Err(invalid());
+    }
+    let existing = storage.enum_for(usize::from(slot), 0);
+    if existing.visible_to(0)
+        && (existing.database != storage.current_database_oid()
+            || existing.created_at != created_at)
+    {
+        return Err(invalid());
+    }
+    let mut at = 10usize;
     let take_name = |at: &mut usize| -> Result<&str, SqlError> {
         let length =
             usize::from(*payload.get(*at).ok_or_else(|| {
@@ -777,6 +806,12 @@ pub(crate) fn apply_enum_payload(
     };
     let name = crate::storage::SqlName::parse(take_name(&mut at)?)?;
     let schema = crate::storage::SqlName::parse(take_name(&mut at)?)?;
+    if storage
+        .enum_slot(schema.as_str(), name.as_str(), 0)
+        .is_some_and(|existing| existing != usize::from(slot))
+    {
+        return Err(invalid());
+    }
     let count = if wide_count {
         let bytes: [u8; 4] = payload
             .get(at..at + 4)
@@ -840,7 +875,12 @@ pub(crate) fn apply_enum_payload(
         ));
     }
     drop(members);
-    storage.finish_enum_replay(schema, name, count)?;
+    let allocated = storage.finish_enum_replay(schema, name, count)?;
+    storage.restore_type_identity(
+        crate::storage::NamedTypeSlot::Enum(allocated),
+        crate::storage::NamedTypeSlot::Enum(usize::from(slot)),
+        created_at,
+    )?;
     Ok(())
 }
 
@@ -1433,7 +1473,7 @@ pub(crate) enum WalOp<'a> {
     },
     /// CREATE or ALTER DOMAIN stages a borrowed absolute definition. Catalog
     /// lifecycle state is not journaled; replay establishes that state.
-    CreateDomain(&'a crate::storage::DomainDef),
+    CreateDomain(u16, &'a crate::storage::DomainDef),
     /// The validated durable domain image, materialized only while applying it.
     RestoreDomain(&'a [u8]),
     RestoreTypedDomain(&'a [u8]),
@@ -1445,6 +1485,8 @@ pub(crate) enum WalOp<'a> {
     /// absolutely, so an ALTER replays as a redefinition). Carries the whole
     /// definition as a borrowed startup-bounded member image.
     CreateEnum {
+        slot: u16,
+        created_at: u64,
         schema: &'a str,
         name: &'a str,
         members: &'a [crate::storage::EnumMember],
@@ -1755,6 +1797,7 @@ struct TransactionStage {
 
 #[derive(Debug)]
 pub enum WalSetupError {
+    UnsupportedRecordFormat,
     Budget(BudgetError),
     Io(&'static str, std::io::Error),
     /// The journal on disk is larger than `wal_bytes` — refusing to
@@ -1769,6 +1812,7 @@ pub enum WalSetupError {
 impl std::fmt::Display for WalSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedRecordFormat => f.write_str("unsupported journal record format"),
             Self::Budget(e) => write!(f, "wal: {e}"),
             Self::Io(what, e) => write!(f, "wal: {what}: {e}"),
             Self::ShrinkRefused { file, config } => write!(
@@ -1802,7 +1846,7 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
     let mut appended = buffer.append(&[0u8; 4]);
     appended &= buffer.append(&(payload_len as u32).to_le_bytes());
     appended &= buffer.append(&lsn.to_le_bytes());
-    appended &= buffer.append(&[op_kind(operation), 0, 0, 0, 0, 0, 0, 0]);
+    appended &= buffer.append(&[op_kind(operation), RECORD_VERSION, 0, 0, 0, 0, 0, 0]);
     appended &= append_payload(buffer, operation);
     assert!(appended, "record size was checked against buffer capacity");
     assert_eq!(
@@ -1923,21 +1967,68 @@ impl Wal {
                 let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !record_kind_known(kind)
-                    || payload_len > self.buffer.capacity() - HEADER_LEN
-                    || lsn <= last_seen_lsn
-                {
+                if lsn <= last_seen_lsn {
                     break 'outer;
                 }
                 let total = HEADER_LEN + payload_len;
+                let Some(record_end) = parsed_offset
+                    .checked_add(total as u64)
+                    .filter(|end| *end <= self.capacity)
+                else {
+                    break 'outer;
+                };
+                if payload_len > self.buffer.capacity() - HEADER_LEN {
+                    // A damaged length is not proof that the configured buffer
+                    // shrank. Check the claimed record without growing it.
+                    let mut checksum = crc32c::Crc32c::new();
+                    checksum.update(&data[4..HEADER_LEN]);
+                    let mut scratch = [0u8; 4096];
+                    let mut offset = parsed_offset + HEADER_LEN as u64;
+                    while offset < record_end {
+                        let count = scratch.len().min((record_end - offset) as usize);
+                        let read = self
+                            .file
+                            .read_at(&mut scratch[..count], offset)
+                            .map_err(|error| WalSetupError::Io("validate journal record", error))?;
+                        if read == 0 {
+                            break 'outer;
+                        }
+                        checksum.update(&scratch[..read]);
+                        offset += read as u64;
+                    }
+                    if checksum.finish() != stored_crc {
+                        break 'outer;
+                    }
+                    if !record_kind_known(kind)
+                        || data[17] != RECORD_VERSION
+                        || data[18..24].iter().any(|byte| *byte != 0)
+                    {
+                        return Err(WalSetupError::UnsupportedRecordFormat);
+                    }
+                    return Err(WalSetupError::Replay(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "wal_buffer_bytes is too small to replay the journal"
+                    )));
+                }
                 if data.len() < total {
                     continue 'outer;
                 }
                 if crc32c(&data[4..total]) != stored_crc {
                     break 'outer;
                 }
+                if !record_kind_known(kind)
+                    || data[17] != RECORD_VERSION
+                    || data[18..24].iter().any(|byte| *byte != 0)
+                {
+                    return Err(WalSetupError::UnsupportedRecordFormat);
+                }
                 if decode_op(kind, &data[HEADER_LEN..total]).is_none() {
-                    break 'outer;
+                    return Err(WalSetupError::Replay(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "invalid journal operation payload (kind {}, LSN {})",
+                        kind,
+                        lsn
+                    )));
                 }
                 last_seen_lsn = lsn;
                 pending.push((lsn, data[16..total].to_vec()));
@@ -2411,7 +2502,7 @@ impl Wal {
             scratch.advance(payload_len);
             if crc32c(&scratch.filled_mut()[mark + 4..mark + total])
                 != u32::from_le_bytes(header[..4].try_into().unwrap())
-                || decode_op(header[16], &scratch.readable()[mark + 24..mark + total]).is_none()
+                || decode_record(&scratch.readable()[mark + 16..mark + total]).is_none()
             {
                 return Err(sql_err!(
                     sqlstate::PROTOCOL_VIOLATION,
@@ -2596,7 +2687,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
         WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
-        WalOp::CreateDomain(definition) => {
+        WalOp::CreateDomain(_, definition) => {
             if domain_needs_typed_journal(definition) {
                 KIND_CREATE_DOMAIN_TYPED
             } else {
@@ -2703,7 +2794,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
     }
     fn routine_result_len(result: crate::storage::RoutineResult) -> usize {
         2 + result.user_type.map_or(0, |identity| {
-            1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
+            1 + identity.schema.as_str().len() + 1 + identity.storage_name().as_str().len()
         })
     }
     fn operator_signature_len(signature: crate::storage::OperatorSignature) -> usize {
@@ -2792,7 +2883,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 n += 2; // attstorage + attcompression
                 // User-defined column: name, then a format marker and schema.
                 if let Some(identity) = c.user_type {
-                    n += 1 + identity.name.as_str().len();
+                    n += 1 + identity.storage_name().as_str().len();
                     n += 2 + identity.schema.as_str().len();
                 }
             }
@@ -3357,22 +3448,24 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 })
         }
         WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::CreateDomain(def) => {
+        WalOp::CreateDomain(_, def) => {
             let de = def.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
-            let parent = def.base_domain.map(|d| d.name.as_str().len()).unwrap_or(0);
+            let parent = def.base_domain.map(|d| d.storage_name().len()).unwrap_or(0);
             let parent_schema = def
                 .base_domain
                 .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
             let base_name = def
                 .base_user_type
-                .map(|d| d.name.as_str().len())
+                .map(|d| d.storage_name().len())
                 .unwrap_or(0);
             let base_schema = def
                 .base_user_type
                 .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
-            let mut n = 1
+            let mut n = 2
+                + 8
+                + 1
                 + def.name.as_str().len()
                 + 1
                 + def.schema.as_str().len()
@@ -3409,8 +3502,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             name,
             members,
+            ..
         } => {
-            let mut n = 1 + name.len() + 1 + schema.len() + 4;
+            let mut n = 2 + 8 + 1 + name.len() + 1 + schema.len() + 4;
             for m in *members {
                 n += 1
                     + m.label.as_str().len()
@@ -3442,11 +3536,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateComposite {
             definition: def, ..
         } => {
-            let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 2;
+            let mut n = 2 + 8 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 2;
             for field in def.fields() {
                 n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1 + 1;
                 if let Some(identity) = field.user_type {
-                    n += 1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len();
+                    n += 1
+                        + identity.schema.as_str().len()
+                        + 1
+                        + identity.storage_name().as_str().len();
                 }
             }
             n
@@ -3482,7 +3579,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                             + argument.user_type.map_or(0, |identity| {
                                 1 + identity.schema.as_str().len()
                                     + 1
-                                    + identity.name.as_str().len()
+                                    + identity.storage_name().as_str().len()
                             })
                     })
                     .sum::<usize>()
@@ -3497,7 +3594,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                             + parameter.user_type.map_or(0, |identity| {
                                 1 + identity.schema.as_str().len()
                                     + 1
-                                    + identity.name.as_str().len()
+                                    + identity.storage_name().as_str().len()
                             })
                             + 1
                             + 2
@@ -3513,12 +3610,16 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     crate::storage::RoutineKind::Function { result }
                     | crate::storage::RoutineKind::SetFunction { result } => {
                         result.user_type.map_or(0, |identity| {
-                            1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
+                            1 + identity.schema.as_str().len()
+                                + 1
+                                + identity.storage_name().as_str().len()
                         })
                     }
                     crate::storage::RoutineKind::Aggregate(aggregate) => {
                         aggregate.result_type.user_type.map_or(0, |identity| {
-                            1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
+                            1 + identity.schema.as_str().len()
+                                + 1
+                                + identity.storage_name().as_str().len()
                         })
                     }
                     _ => 0,
@@ -3543,7 +3644,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                                     + column.user_type.map_or(0, |identity| {
                                         1 + identity.schema.as_str().len()
                                             + 1
-                                            + identity.name.as_str().len()
+                                            + identity.storage_name().as_str().len()
                                     })
                             })
                             .sum::<usize>()
@@ -4162,7 +4263,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         match result.user_type {
             Some(identity) => {
                 ok &= buffer.append(&[1]);
-                for name in [identity.schema.as_str(), identity.name.as_str()] {
+                for name in [identity.schema.as_str(), identity.storage_name().as_str()] {
                     ok &= buffer.append(&[name.len() as u8]) && buffer.append(name.as_bytes());
                 }
             }
@@ -4448,7 +4549,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&n_distinct_inherited.to_le_bytes());
                 ok &= buffer.append(&[c.storage.code(), c.compression.code()]);
                 if let Some(identity) = c.user_type {
-                    ok &= name_bytes(buffer, identity.name.as_str());
+                    ok &= name_bytes(buffer, identity.storage_name().as_str());
                     ok &= buffer.append(&[u8::MAX]);
                     ok &= name_bytes(buffer, identity.schema.as_str());
                 }
@@ -5404,17 +5505,22 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropSequence { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
-        WalOp::CreateDomain(def) => {
+        WalOp::CreateDomain(slot, def) => {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
-            let mut ok = name_bytes(buffer, def.name.as_str())
+            let parent_name = def
+                .base_domain
+                .map(crate::storage::UserTypeName::storage_name);
+            let base_name = def
+                .base_user_type
+                .map(crate::storage::UserTypeName::storage_name);
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&def.created_at.to_le_bytes())
+                && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
                 && buffer.append(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION])
                 && name_bytes(
                     buffer,
-                    def.base_domain
-                        .as_ref()
-                        .map(|d| d.name.as_str())
-                        .unwrap_or(""),
+                    parent_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
                 )
                 && name_bytes(
                     buffer,
@@ -5425,10 +5531,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 )
                 && name_bytes(
                     buffer,
-                    def.base_user_type
-                        .as_ref()
-                        .map(|identity| identity.name.as_str())
-                        .unwrap_or(""),
+                    base_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
                 )
                 && name_bytes(
                     buffer,
@@ -5462,6 +5565,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
         WalOp::CreateEnum {
+            slot,
+            created_at,
             schema,
             name,
             members,
@@ -5469,7 +5574,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let Ok(count) = u32::try_from(members.len()) else {
                 return false;
             };
-            let mut ok = name_bytes(buffer, name)
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&count.to_le_bytes());
             for m in *members {
@@ -5514,6 +5621,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             definition: def,
         } => {
             let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&def.created_at.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
                 && buffer.append(&(def.n_fields as u16).to_le_bytes());
@@ -5529,7 +5637,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
                             && name_bytes(buffer, identity.schema.as_str())
-                            && name_bytes(buffer, identity.name.as_str())
+                            && name_bytes(buffer, identity.storage_name().as_str())
                     }
                     None => ok &= buffer.append(&[0]),
                 }
@@ -5556,7 +5664,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
                             && name_bytes(buffer, identity.schema.as_str())
-                            && name_bytes(buffer, identity.name.as_str());
+                            && name_bytes(buffer, identity.storage_name().as_str());
                     }
                     None => ok &= buffer.append(&[0]),
                 }
@@ -5569,7 +5677,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
                             && name_bytes(buffer, identity.schema.as_str())
-                            && name_bytes(buffer, identity.name.as_str());
+                            && name_bytes(buffer, identity.storage_name().as_str());
                     }
                     None => ok &= buffer.append(&[0]),
                 }
@@ -5590,7 +5698,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 Some(identity) => {
                     ok &= buffer.append(&[1])
                         && name_bytes(buffer, identity.schema.as_str())
-                        && name_bytes(buffer, identity.name.as_str());
+                        && name_bytes(buffer, identity.storage_name().as_str());
                 }
                 None => ok &= buffer.append(&[0]),
             }
@@ -5641,7 +5749,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                         Some(identity) => {
                             ok &= buffer.append(&[1])
                                 && name_bytes(buffer, identity.schema.as_str())
-                                && name_bytes(buffer, identity.name.as_str());
+                                && name_bytes(buffer, identity.storage_name().as_str());
                         }
                         None => ok &= buffer.append(&[0]),
                     }
@@ -6250,11 +6358,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
 }
 
 /// Decodes an uploaded-segment record starting at the kind byte. The
-/// on-disk record header is `crc(4) len(4) lsn(8) kind(1) pad(7)`; callers
+/// on-disk record header is `crc(4) len(4) lsn(8) kind(1) version(1) pad(6)`; callers
 /// pass the slice from the kind byte onward, so the payload begins 8 bytes
-/// in (kind + 7 pad), matching the local journal layout.
+/// in (kind + version + 6 pad), matching the local journal layout.
 pub(crate) fn decode_record(record: &[u8]) -> Option<WalOp<'_>> {
-    if record.len() < 8 {
+    if record.len() < 8 || record[1] != RECORD_VERSION || record[2..8].iter().any(|byte| *byte != 0)
+    {
         return None;
     }
     decode_op(record[0], &record[8..])
@@ -6816,10 +6925,13 @@ fn decode_routine_result(payload: &[u8], at: &mut usize) -> Option<crate::storag
         }
         1 => {
             *at += 1;
-            Some(crate::storage::UserTypeName {
-                schema: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
-                name: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
-            })
+            Some(
+                crate::storage::UserTypeName::from_storage(
+                    SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
+                    decode_catalog_name(payload, at)?,
+                )
+                .ok()?,
+            )
         }
         _ => return None,
     };
@@ -6931,7 +7043,7 @@ pub(crate) fn decode_table_payload(payload: &[u8]) -> Option<TableDef> {
     Some(definition)
 }
 
-pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<crate::storage::DomainDef> {
+pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<(u16, crate::storage::DomainDef)> {
     let mut definition = crate::storage::DomainDef::EMPTY;
     decode_op_inner(
         KIND_CREATE_DOMAIN,
@@ -6941,7 +7053,10 @@ pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<crate::storage::Do
             ..WalDecodeOutput::NONE
         },
     )?;
-    Some(definition)
+    Some((
+        u16::from_le_bytes(payload.get(..2)?.try_into().ok()?),
+        definition,
+    ))
 }
 
 #[inline(never)]
@@ -7404,14 +7519,14 @@ fn decode_op_inner<'a>(
                 at += 2;
                 // Bit 7 set means a durable user-type identity follows.
                 let user_type = if meta[1] & 128 != 0 {
-                    let name = SqlName::parse(take_name(&mut at)?).ok()?;
+                    let name = take_name(&mut at)?;
                     let schema = if payload.get(at).copied() == Some(u8::MAX) {
                         at += 1;
                         SqlName::parse(take_name(&mut at)?).ok()?
                     } else {
                         return None;
                     };
-                    Some(crate::storage::UserTypeName { schema, name })
+                    Some(crate::storage::UserTypeName::from_storage(schema, name).ok()?)
                 } else {
                     None
                 };
@@ -7577,14 +7692,7 @@ fn decode_op_inner<'a>(
             let collations = payload.get(at..at + n_cols)?;
             at += n_cols;
             for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
-                column.collation = match code {
-                    0 => crate::sql::ast::Collation::Default,
-                    1 => crate::sql::ast::Collation::C,
-                    2 => crate::sql::ast::Collation::Posix,
-                    3 => crate::sql::ast::Collation::UcsBasic,
-                    4 => crate::sql::ast::Collation::None,
-                    _ => return None,
-                }
+                column.collation = crate::sql::ast::Collation::from_code(*code)?;
             }
             def.partition = decode_partition(payload, &mut at)?;
             let n_parents = *payload.get(at)? as usize;
@@ -9378,6 +9486,13 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_CREATE_DOMAIN | KIND_CREATE_DOMAIN_TYPED => decode_large_op(|| {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            if usize::from(slot) >= crate::storage::MAX_DOMAIN_CATALOG_SLOTS || created_at == 0 {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
@@ -9392,7 +9507,7 @@ fn decode_op_inner<'a>(
             let base_domain = if base_domain_name.is_empty() {
                 None
             } else {
-                Some(SqlName::parse(base_domain_name).ok()?)
+                Some(base_domain_name)
             };
             let base_domain_schema_name = take_name(&mut at)?;
             let base_domain_schema = if base_domain_schema_name.is_empty() {
@@ -9402,17 +9517,22 @@ fn decode_op_inner<'a>(
             };
             let base_domain = match (base_domain, base_domain_schema) {
                 (None, None) => None,
-                (Some(name), Some(schema)) => Some(crate::storage::UserTypeName { schema, name }),
+                (Some(name), Some(schema)) => {
+                    Some(crate::storage::UserTypeName::from_storage(schema, name).ok()?)
+                }
                 _ => return None,
             };
             let base_name = take_name(&mut at)?;
             let base_schema = take_name(&mut at)?;
             let base_user_type = match (base_name.is_empty(), base_schema.is_empty()) {
                 (true, true) => None,
-                (false, false) => Some(crate::storage::UserTypeName {
-                    schema: SqlName::parse(base_schema).ok()?,
-                    name: SqlName::parse(base_name).ok()?,
-                }),
+                (false, false) => Some(
+                    crate::storage::UserTypeName::from_storage(
+                        SqlName::parse(base_schema).ok()?,
+                        base_name,
+                    )
+                    .ok()?,
+                ),
                 _ => return None,
             };
             let base = crate::sql::types::ColType::from_code(*payload.get(at)?)?;
@@ -9499,7 +9619,7 @@ fn decode_op_inner<'a>(
             }
             let definition = crate::storage::DomainDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
-                created_at: 0,
+                created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 ownership: crate::storage::Ownership::BOOTSTRAP,
@@ -9534,6 +9654,13 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
         }),
         KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 | KIND_CREATE_ENUM_V3 => decode_large_op(|| {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            if usize::from(slot) >= crate::storage::MAX_ENUM_CATALOG_SLOTS || created_at == 0 {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             SqlName::parse(name).ok()?;
@@ -9592,6 +9719,11 @@ fn decode_op_inner<'a>(
             let wide_fields = kind == KIND_CREATE_COMPOSITE_V2;
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            if created_at == 0 {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let n_fields = if wide_fields {
@@ -9635,10 +9767,13 @@ fn decode_op_inner<'a>(
                 at += 1;
                 let user_type = match has_user_type {
                     0 => None,
-                    1 => Some(crate::storage::UserTypeName {
-                        schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                        name: SqlName::parse(take_name(&mut at)?).ok()?,
-                    }),
+                    1 => Some(
+                        crate::storage::UserTypeName::from_storage(
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                            take_name(&mut at)?,
+                        )
+                        .ok()?,
+                    ),
                     _ => return None,
                 };
                 *field = crate::storage::CompositeFieldDef {
@@ -9657,7 +9792,7 @@ fn decode_op_inner<'a>(
             }
             let definition = crate::storage::CompositeDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
-                created_at: 0,
+                created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 ownership: crate::storage::Ownership::BOOTSTRAP,
@@ -9702,10 +9837,13 @@ fn decode_op_inner<'a>(
                     0 => None,
                     1 => {
                         at += 1;
-                        Some(crate::storage::UserTypeName {
-                            schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                            name: SqlName::parse(take_name(&mut at)?).ok()?,
-                        })
+                        Some(
+                            crate::storage::UserTypeName::from_storage(
+                                SqlName::parse(take_name(&mut at)?).ok()?,
+                                take_name(&mut at)?,
+                            )
+                            .ok()?,
+                        )
                     }
                     _ => return None,
                 };
@@ -9733,10 +9871,13 @@ fn decode_op_inner<'a>(
                     0 => None,
                     1 => {
                         at += 1;
-                        Some(crate::storage::UserTypeName {
-                            schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                            name: SqlName::parse(take_name(&mut at)?).ok()?,
-                        })
+                        Some(
+                            crate::storage::UserTypeName::from_storage(
+                                SqlName::parse(take_name(&mut at)?).ok()?,
+                                take_name(&mut at)?,
+                            )
+                            .ok()?,
+                        )
                     }
                     _ => return None,
                 };
@@ -9768,10 +9909,13 @@ fn decode_op_inner<'a>(
                 0 => None,
                 1 => {
                     at += 1;
-                    Some(crate::storage::UserTypeName {
-                        schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                        name: SqlName::parse(take_name(&mut at)?).ok()?,
-                    })
+                    Some(
+                        crate::storage::UserTypeName::from_storage(
+                            SqlName::parse(take_name(&mut at)?).ok()?,
+                            take_name(&mut at)?,
+                        )
+                        .ok()?,
+                    )
                 }
                 _ => return None,
             };
@@ -9890,10 +10034,13 @@ fn decode_op_inner<'a>(
                         0 => None,
                         1 => {
                             at += 1;
-                            Some(crate::storage::UserTypeName {
-                                schema: SqlName::parse(take_name(&mut at)?).ok()?,
-                                name: SqlName::parse(take_name(&mut at)?).ok()?,
-                            })
+                            Some(
+                                crate::storage::UserTypeName::from_storage(
+                                    SqlName::parse(take_name(&mut at)?).ok()?,
+                                    take_name(&mut at)?,
+                                )
+                                .ok()?,
+                            )
                         }
                         _ => return None,
                     };
@@ -11187,8 +11334,8 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr(_)) => 6,
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
-        Some(OwnedDatum::Enum { len, member, .. }) => {
-            11 + usize::from(member.is_some()) * 4 + *len as usize
+        Some(OwnedDatum::Enum { label, member, .. }) => {
+            11 + usize::from(member.is_some()) * 4 + label.as_str().len()
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
@@ -11344,7 +11491,7 @@ pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> b
 
 /// Largest encoded default: an enum's tag, identity, ordering key, length and
 /// bounded label. Array and ACL payloads carry less metadata.
-pub(crate) const MAX_DEFAULT_ENCODED: usize = 16 + crate::storage::MAX_DEFAULT_TEXT;
+pub(crate) const MAX_DEFAULT_ENCODED: usize = 10 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
 pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
@@ -11433,13 +11580,13 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             6 + *len as usize
         }
         Some(OwnedDatum::RegObject {
-            type_oid,
+            kind,
             referenced_oid,
             len,
             bytes,
         }) => {
             out[0] = 26;
-            out[1..5].copy_from_slice(&type_oid.to_le_bytes());
+            out[1..5].copy_from_slice(&kind.oid().to_le_bytes());
             out[5..9].copy_from_slice(&referenced_oid.to_le_bytes());
             out[9] = *len;
             out[10..10 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
@@ -11554,8 +11701,7 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             slot,
             member,
             sort,
-            len,
-            bytes,
+            label,
         }) => {
             out[0] = if member.is_some() { 42 } else { 12 };
             out[1..3].copy_from_slice(&slot.to_le_bytes());
@@ -11566,9 +11712,10 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             } else {
                 11
             };
-            out[prefix] = *len;
-            out[prefix + 1..prefix + 1 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            prefix + 1 + *len as usize
+            let bytes = label.as_str().as_bytes();
+            out[prefix] = bytes.len() as u8;
+            out[prefix + 1..prefix + 1 + bytes.len()].copy_from_slice(bytes);
+            prefix + 1 + bytes.len()
         }
         Some(OwnedDatum::Json { jsonb, len, bytes }) => {
             out[0] = 20;
@@ -11826,20 +11973,14 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             };
             let len = *payload.get(*at)? as usize;
             *at += 1;
-            if len > crate::storage::MAX_DEFAULT_TEXT {
-                return None;
-            }
             let raw = payload.get(*at..*at + len)?;
             *at += len;
-            core::str::from_utf8(raw).ok()?;
-            let mut bytes = [0u8; crate::storage::MAX_DEFAULT_TEXT];
-            bytes[..len].copy_from_slice(raw);
+            let label = SqlName::parse(core::str::from_utf8(raw).ok()?).ok()?;
             Some(OwnedDatum::Enum {
                 slot,
                 member,
                 sort,
-                len: len as u8,
-                bytes,
+                label,
             })
         }
         13 => {
@@ -12031,7 +12172,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             core::str::from_utf8(&bytes[..len]).ok()?;
             Some(OwnedDatum::RegObject {
-                type_oid,
+                kind: crate::storage::RegObjectType::from_oid(type_oid)?,
                 referenced_oid,
                 len: len as u8,
                 bytes,
@@ -12261,10 +12402,10 @@ mod tests {
         let public = SqlName::parse("public").unwrap();
         let custom = crate::storage::RoutineResult {
             ctype: ColType::Enum(7),
-            user_type: Some(crate::storage::UserTypeName {
-                schema: public,
-                name: SqlName::parse("mood").unwrap(),
-            }),
+            user_type: Some(crate::storage::UserTypeName::declaration(
+                public,
+                SqlName::parse("mood").unwrap(),
+            )),
         };
         let binary_signature = crate::storage::OperatorSignature {
             left: Some(custom),
@@ -12458,6 +12599,99 @@ mod tests {
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
             Some(WalOp::SetTextSearch { slot: 7, .. })
         ));
+    }
+
+    #[test]
+    fn compact_catalog_defaults_keep_postgresql_label_and_reference_types() {
+        use crate::sql::types::Datum;
+        assert!(core::mem::size_of::<OwnedDatum>() <= 128);
+        let label = "é".repeat(31) + "a";
+        let too_long = "é".repeat(32);
+        let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
+        crate::mem::guard::forbid_alloc(|| {
+            for member in [None, crate::sql::types::EnumMemberId::from_ordinal(7)] {
+                let value = OwnedDatum::from_datum(&Datum::Enum {
+                    slot: 7,
+                    member,
+                    sort: 1.0,
+                    label: &label,
+                })
+                .unwrap();
+                let length = encode_default_bytes(&Some(value), &mut encoded);
+                assert_eq!(length, encoded_default_len(&Some(value)));
+                let mut at = 0;
+                assert_eq!(
+                    decode_default(&encoded[..length], &mut at),
+                    Some(Some(value))
+                );
+                assert_eq!(at, length);
+                let prefix = if member.is_some() { 15 } else { 11 };
+                encoded[prefix] = 64;
+                encoded[length] = b'x';
+                at = 0;
+                assert!(decode_default(&encoded[..length + 1], &mut at).is_none());
+            }
+            assert!(
+                OwnedDatum::from_datum(&Datum::Enum {
+                    slot: 7,
+                    member: None,
+                    sort: 1.0,
+                    label: &too_long,
+                })
+                .is_err()
+            );
+            for ctype in [
+                ColType::Regproc,
+                ColType::Regprocedure,
+                ColType::Regoper,
+                ColType::Regoperator,
+                ColType::Regclass,
+                ColType::Regnamespace,
+                ColType::Regrole,
+                ColType::Regconfig,
+                ColType::Regdictionary,
+                ColType::Regcollation,
+            ] {
+                let value = OwnedDatum::from_datum(&Datum::RegObject {
+                    type_oid: ctype.oid(),
+                    referenced_oid: 37,
+                    name: "public.object",
+                })
+                .unwrap();
+                let length = encode_default_bytes(&Some(value), &mut encoded);
+                assert_eq!(
+                    i32::from_le_bytes(encoded[1..5].try_into().unwrap()),
+                    ctype.oid()
+                );
+                let mut at = 0;
+                assert_eq!(
+                    decode_default(&encoded[..length], &mut at),
+                    Some(Some(value))
+                );
+                assert_eq!(at, length);
+                assert!(matches!(value.as_datum(), Datum::RegObject {
+                    type_oid, referenced_oid: 37, name: "public.object",
+                } if type_oid == ctype.oid()));
+            }
+            for oid in [
+                -1,
+                ColType::Int4.oid(),
+                ColType::Oid.oid(),
+                ColType::Regtype.oid(),
+            ] {
+                assert!(
+                    OwnedDatum::from_datum(&Datum::RegObject {
+                        type_oid: oid,
+                        referenced_oid: 37,
+                        name: "public.object",
+                    })
+                    .is_err()
+                );
+                encoded[1..5].copy_from_slice(&oid.to_le_bytes());
+                let mut at = 0;
+                assert!(decode_default(&encoded[..23], &mut at).is_none());
+            }
+        });
     }
 
     #[test]
@@ -12838,6 +13072,8 @@ mod tests {
             },
         ];
         let operation = WalOp::CreateEnum {
+            slot: 0,
+            created_at: 1,
             schema: "public",
             name: "mood",
             members: &members,
@@ -12855,7 +13091,8 @@ mod tests {
         assert!(decode_op(KIND_CREATE_ENUM_V3, &payload[..payload.len() - 1]).is_none());
 
         let mut legacy = [0; 256];
-        let mut at = 0;
+        legacy[2..10].copy_from_slice(&1u64.to_le_bytes());
+        let mut at = 10;
         for value in ["mood", "public"] {
             legacy[at] = value.len() as u8;
             at += 1;
@@ -12873,7 +13110,7 @@ mod tests {
             legacy[at..at + 8].copy_from_slice(&member.sort.to_le_bytes());
             at += 8;
         }
-        let prefix = 1 + "mood".len() + 1 + "public".len();
+        let prefix = 10 + 1 + "mood".len() + 1 + "public".len();
         let mut wide = [0u8; 256];
         wide[..prefix].copy_from_slice(&legacy[..prefix]);
         wide[prefix..prefix + 4].copy_from_slice(&(members.len() as u32).to_le_bytes());
@@ -12899,14 +13136,17 @@ mod tests {
 
     #[test]
     fn enum_value_identity_journal_versions_keep_source_and_hash_provenance() {
-        let mut domain = crate::storage::DomainDef::EMPTY;
+        let mut domain = crate::storage::DomainDef {
+            created_at: 1,
+            ..crate::storage::DomainDef::EMPTY
+        };
         domain.schema = SqlName::parse("public").unwrap();
         domain.name = SqlName::parse("guarded_state").unwrap();
         domain.base = ColType::Enum(0);
-        domain.base_user_type = Some(crate::storage::UserTypeName {
-            schema: domain.schema,
-            name: SqlName::parse("state").unwrap(),
-        });
+        domain.base_user_type = Some(crate::storage::UserTypeName::declaration(
+            domain.schema,
+            SqlName::parse("state").unwrap(),
+        ));
         domain.n_checks = 1;
         domain.checks[0].name = SqlName::parse("allowed").unwrap();
         domain.checks[0].expression =
@@ -12933,7 +13173,7 @@ mod tests {
         ));
         let operations = [
             (KIND_CREATE_TYPED, WalOp::CreateTable(&table)),
-            (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(&domain)),
+            (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(0, &domain)),
             (
                 KIND_CREATE_VIEW_BOUND,
                 WalOp::CreateView {
@@ -12996,7 +13236,10 @@ mod tests {
                     KIND_CREATE_DOMAIN_TYPED => {
                         assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
                         assert_eq!(
-                            decode_domain_payload(payload.readable()).unwrap().checks()[0]
+                            decode_domain_payload(payload.readable())
+                                .unwrap()
+                                .1
+                                .checks()[0]
                                 .expression,
                             domain.checks[0].expression
                         );
@@ -13039,7 +13282,7 @@ mod tests {
             crate::sql::types::ArrElem::domain(11, ColType::Enum(7)).unwrap(),
         ] {
             domain.base = ColType::Array(element);
-            let operation = WalOp::CreateDomain(&domain);
+            let operation = WalOp::CreateDomain(0, &domain);
             crate::mem::guard::forbid_alloc(|| {
                 payload.clear();
                 assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
@@ -13047,7 +13290,7 @@ mod tests {
                 let decoded = decode_op(KIND_CREATE_DOMAIN_TYPED, payload.readable()).unwrap();
                 assert_eq!(op_kind(&decoded), KIND_CREATE_DOMAIN_TYPED);
                 assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
-                let definition = decode_domain_payload(payload.readable()).unwrap();
+                let (_, definition) = decode_domain_payload(payload.readable()).unwrap();
                 let ColType::Array(rebound) = definition.base else {
                     panic!("expected array base");
                 };
@@ -13067,11 +13310,11 @@ mod tests {
         domain.default_expr = Some(StackStr::from_str("pos3ql-enum-check-v1\n/*p3c:0*/'old'"));
         crate::mem::guard::forbid_alloc(|| {
             payload.clear();
-            let operation = WalOp::CreateDomain(&domain);
+            let operation = WalOp::CreateDomain(0, &domain);
             assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
             assert!(append_payload(&mut payload, &operation));
             assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
-            let decoded = decode_domain_payload(payload.readable()).unwrap();
+            let (_, decoded) = decode_domain_payload(payload.readable()).unwrap();
             assert_eq!(decoded.default_expr, domain.default_expr);
             payload.clear();
             assert!(append_view_default(
@@ -13091,10 +13334,9 @@ mod tests {
             at = 0;
             assert!(decode_view_default(reencoded.readable(), &mut at).is_none());
         });
-        let widest = OwnedDatum::Enum {
-            slot: 0,
-            member: Some(crate::sql::types::EnumMemberId::from_ordinal(0).unwrap()),
-            sort: 1.0,
+        let widest = OwnedDatum::RegObject {
+            kind: crate::storage::RegObjectType::Regclass,
+            referenced_oid: 1,
             len: crate::storage::MAX_DEFAULT_TEXT as u8,
             bytes: [b'x'; crate::storage::MAX_DEFAULT_TEXT],
         };
@@ -13595,7 +13837,7 @@ mod tests {
                     format!("{lsn}:CreateTable({definition:?})")
                 }
                 WalOp::RestoreDomain(payload) => {
-                    let definition = decode_domain_payload(payload).unwrap();
+                    let (_, definition) = decode_domain_payload(payload).unwrap();
                     format!("{lsn}:CreateDomain({definition:?})")
                 }
                 operation => format!("{lsn}:{operation:?}"),
@@ -13625,6 +13867,28 @@ mod tests {
         ));
         let truncated_len = payload.len() - definition.n_columns;
         assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
+    }
+
+    #[test]
+    fn table_payload_preserves_every_supported_collation_code() {
+        let mut definition = sample_def();
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "table collation payload", 4096).unwrap();
+        for code in 0..=u8::MAX {
+            let Some(collation) = crate::sql::ast::Collation::from_code(code) else {
+                continue;
+            };
+            definition.columns[1].collation = collation;
+            crate::mem::guard::forbid_alloc(|| {
+                payload.clear();
+                assert!(append_payload(
+                    &mut payload,
+                    &WalOp::CreateTable(&definition)
+                ));
+                let restored = decode_table_payload(payload.readable()).unwrap();
+                assert_eq!(restored.columns[1].collation, collation);
+            });
+        }
     }
 
     #[test]
@@ -14087,10 +14351,10 @@ mod tests {
             ctype: ColType::Composite(3),
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
-            user_type: Some(crate::storage::UserTypeName {
-                schema: crate::storage::SqlName::parse("public").unwrap(),
-                name: crate::storage::SqlName::parse("root").unwrap(),
-            }),
+            user_type: Some(crate::storage::UserTypeName::declaration(
+                crate::storage::SqlName::parse("public").unwrap(),
+                crate::storage::SqlName::parse("root").unwrap(),
+            )),
             dropped: false,
             not_null: true,
         };
@@ -14106,7 +14370,7 @@ mod tests {
         };
         let definition = crate::storage::CompositeDef {
             database: crate::storage::DatabaseOid::POSTGRES,
-            created_at: 0,
+            created_at: 1,
             schema: crate::storage::SqlName::parse("public").unwrap(),
             name: crate::storage::SqlName::parse("evolving").unwrap(),
             ownership: crate::storage::Ownership::BOOTSTRAP,
@@ -15023,7 +15287,10 @@ mod tests {
 
     #[test]
     fn wide_domain_payload_round_trips_without_embedding_the_definition() {
-        let mut definition = crate::storage::DomainDef::EMPTY;
+        let mut definition = crate::storage::DomainDef {
+            created_at: 1,
+            ..crate::storage::DomainDef::EMPTY
+        };
         definition.schema = SqlName::parse("public").unwrap();
         definition.name = SqlName::parse("wide_domain").unwrap();
         definition.base = ColType::Int4;
@@ -15034,7 +15301,7 @@ mod tests {
             check.expression = StackStr::from_str("VALUE >= 0");
             check.validation = crate::storage::ConstraintValidation::NotEnforced;
         }
-        let operation = WalOp::CreateDomain(&definition);
+        let operation = WalOp::CreateDomain(0, &definition);
         let length = encoded_payload_len(&operation);
         let mut budget = Budget::new(length);
         let mut payload = FixedBuf::new(&mut budget, "wide domain payload", length).unwrap();
@@ -15045,7 +15312,7 @@ mod tests {
             else {
                 panic!("expected encoded domain image");
             };
-            let decoded = decode_domain_payload(encoded).unwrap();
+            let (_, decoded) = decode_domain_payload(encoded).unwrap();
             assert_eq!(decoded.schema, definition.schema);
             assert_eq!(decoded.name, definition.name);
             assert_eq!(decoded.base, definition.base);
@@ -15064,6 +15331,8 @@ mod tests {
     fn domain_payload_rejects_overlong_text_and_invalid_boolean_codes() {
         fn payload(default: &str, expression: &str, not_null: u8) -> Vec<u8> {
             let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
             for name in ["bounded_domain", "public"] {
                 bytes.push(name.len() as u8);
                 bytes.extend_from_slice(name.as_bytes());
@@ -15498,6 +15767,133 @@ mod tests {
                 committed_at: Some(820_497_600_123_456),
             })
         ));
+    }
+
+    #[test]
+    fn unsupported_record_versions_leave_a_valid_journal_intact() {
+        for version in [0, RECORD_VERSION + 1] {
+            let dir = temp_dir(&format!("record-version-{version}"));
+            let config = test_config(&dir);
+            let mut budget = Budget::new(1 << 20);
+            {
+                let mut wal = Wal::open(&config, &mut budget).unwrap();
+                wal.append_committed(
+                    1,
+                    &WalOp::Commit {
+                        transaction_id: 1,
+                        assigned_transaction_identity: false,
+                        committed_at: None,
+                    },
+                )
+                .unwrap();
+                wal.commit();
+            }
+            let path = format!("{dir}/journal.wal");
+            let mut bytes = std::fs::read(&path).unwrap();
+            let length = HEADER_LEN + u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            assert!(decode_record(&bytes[16..length]).is_some());
+            bytes[17] = version;
+            let crc = crc32c(&bytes[4..length]);
+            bytes[..4].copy_from_slice(&crc.to_le_bytes());
+            assert!(decode_record(&bytes[16..length]).is_none());
+            std::fs::write(&path, &bytes).unwrap();
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            let mut callbacks = 0;
+            assert!(matches!(
+                wal.replay(0, |_, _| {
+                    callbacks += 1;
+                    Ok(())
+                }),
+                Err(WalSetupError::UnsupportedRecordFormat)
+            ));
+            assert_eq!(callbacks, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            drop(wal);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_checks_oversized_record_crc_before_reporting_a_small_buffer() {
+        let dir = temp_dir("replay-record-length");
+        let config = test_config(&dir);
+        let large_start;
+        {
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 1,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                    committed_at: None,
+                },
+            )
+            .unwrap();
+            large_start = wal.buffer.len();
+            wal.append_committed(
+                3,
+                &WalOp::Upsert {
+                    schema: "public",
+                    table: "t",
+                    rowid: 2,
+                    row: &[0u8; 256],
+                    is_update: false,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                4,
+                &WalOp::Commit {
+                    transaction_id: 2,
+                    assigned_transaction_identity: false,
+                    committed_at: None,
+                },
+            )
+            .unwrap();
+            wal.commit();
+        }
+        let path = format!("{dir}/journal.wal");
+        let original = std::fs::read(&path).unwrap();
+        let mut small = config.clone();
+        small.wal_buffer_bytes = 128;
+        {
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&small, &mut budget).unwrap();
+            assert!(matches!(wal.replay(0, |_, _| Ok(())),
+                Err(WalSetupError::Replay(error)) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        for claimed in [8192u32, u32::MAX] {
+            let mut corrupted = original.clone();
+            corrupted[large_start + 4..large_start + 8].copy_from_slice(&claimed.to_le_bytes());
+            std::fs::write(&path, corrupted).unwrap();
+            let mut budget = Budget::new(1 << 20);
+            let mut wal = Wal::open(&small, &mut budget).unwrap();
+            let mut seen = Vec::new();
+            wal.replay(0, |lsn, _| {
+                seen.push(lsn);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(wal.last_lsn(), 2);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

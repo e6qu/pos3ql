@@ -1763,14 +1763,18 @@ pub fn register_named_composite_shape(
         for (out, field) in pool.named[at].fields.iter_mut().zip(fields) {
             out.name = crate::util::StackStr::from_str(field.name.as_str());
             out.ctype = field.ctype;
-            out.type_oid = storage
-                .routine_type_oid(field.ctype, field.user_type, txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "composite field type is absent from the catalog"
-                    )
-                })?;
+            out.type_oid = if field.dropped {
+                0
+            } else {
+                storage
+                    .routine_type_oid(field.ctype, field.user_type, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "composite field type is absent from the catalog"
+                        )
+                    })?
+            };
             out.type_mod = field.type_mod;
             out.collation = field.collation;
             out.nested = -1;

@@ -1,15 +1,15 @@
 //! Stored type fields share one walk for renames and journal publication.
 
 use super::{
-    CastDef, OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition,
-    OperatorFamilyFunction, OperatorFamilyOperator, OperatorImplementation, RoutineResult, Storage,
-    UserTypeName,
+    CastDef, ColType, OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition,
+    OperatorFamilyFunction, OperatorFamilyOperator, OperatorImplementation, RoutineArgumentDef,
+    RoutineDef, RoutineKind, RoutineParameterDef, RoutineResult, Storage, UserTypeName,
 };
-use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql_err;
+use crate::sql::eval::SqlError;
 use core::convert::Infallible;
 
 pub(crate) enum CatalogTypes<'a> {
+    Routine(&'a mut RoutineDef),
     Cast(&'a mut CastDef),
     Operator(&'a mut OperatorDefinition),
     Family(&'a mut OperatorFamilyDefinition),
@@ -30,6 +30,7 @@ macro_rules! catalog_type_definition {
     };
 }
 catalog_type_definition!(CastDef, Cast);
+catalog_type_definition!(RoutineDef, Routine);
 catalog_type_definition!(OperatorDefinition, Operator);
 catalog_type_definition!(OperatorFamilyDefinition, Family);
 catalog_type_definition!(OperatorClassDefinition, Class);
@@ -56,6 +57,24 @@ impl CatalogTypes<'_> {
         mut visit: impl FnMut(&mut RoutineResult) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
+            Self::Routine(definition) => {
+                routine_type_fields(
+                    &mut definition.arguments[..definition.argument_count],
+                    &mut definition.parameters[..definition.parameter_count],
+                    &mut definition.result_columns[..definition.result_column_count],
+                    &mut definition.kind,
+                    &mut visit,
+                )?;
+                if let Some(pending) = &mut definition.pending_definition {
+                    routine_type_fields(
+                        &mut pending.arguments[..pending.argument_count],
+                        &mut pending.parameters[..pending.parameter_count],
+                        &mut pending.result_columns[..pending.result_column_count],
+                        &mut pending.kind,
+                        &mut visit,
+                    )?;
+                }
+            }
             Self::Cast(definition) => {
                 visit(&mut definition.source)?;
                 visit(&mut definition.target)?;
@@ -106,50 +125,68 @@ impl CatalogTypes<'_> {
     }
 }
 
+fn type_pair<E>(
+    ctype: &mut ColType,
+    name: &mut Option<UserTypeName>,
+    visit: &mut impl FnMut(&mut RoutineResult) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut result = RoutineResult {
+        ctype: *ctype,
+        user_type: *name,
+    };
+    visit(&mut result)?;
+    *ctype = result.ctype;
+    *name = result.user_type;
+    Ok(())
+}
+
+pub(super) fn routine_type_fields<E>(
+    arguments: &mut [RoutineArgumentDef],
+    parameters: &mut [RoutineParameterDef],
+    columns: &mut [RoutineArgumentDef],
+    kind: &mut RoutineKind,
+    visit: &mut impl FnMut(&mut RoutineResult) -> Result<(), E>,
+) -> Result<(), E> {
+    for argument in arguments.iter_mut().chain(columns.iter_mut()) {
+        type_pair(&mut argument.ctype, &mut argument.user_type, visit)?;
+    }
+    for parameter in parameters {
+        type_pair(&mut parameter.ctype, &mut parameter.user_type, visit)?;
+    }
+    match kind {
+        RoutineKind::Function { result } | RoutineKind::SetFunction { result } => visit(result)?,
+        RoutineKind::Aggregate(aggregate) => {
+            visit(&mut aggregate.state_type)?;
+            visit(&mut aggregate.result_type)?;
+            if let Some(moving) = &mut aggregate.moving {
+                visit(&mut moving.state_type)?;
+            }
+        }
+        RoutineKind::RecordFunction { .. }
+        | RoutineKind::TableFunction
+        | RoutineKind::Trigger
+        | RoutineKind::EventTrigger
+        | RoutineKind::Procedure => {}
+    }
+    Ok(())
+}
+
 impl Storage {
-    /// Freeze current names before a full catalog image reaches the journal.
-    /// Existing catalog images can still hold the committed spelling while the
-    /// same transaction has a pending type rename.
-    pub(crate) fn journal_catalog_definition<T: CatalogTypeDefinition>(
+    /// Validate every type field and refresh its name from the captured source.
+    /// Journal images also use this walk before discarding process-local keys.
+    pub(crate) fn bind_catalog_definition<T: CatalogTypeDefinition>(
         &self,
         mut definition: T,
         txid: u32,
     ) -> Result<T, SqlError> {
-        definition
-            .catalog_types()
-            .try_for_each(|result| -> Result<(), SqlError> {
-                let Some(identity) = result.user_type else {
-                    return Ok(());
-                };
-                if result.polymorphic_type().is_some() {
-                    return Ok(());
-                }
-                if let Some(slot) = self.domain_identity_slot(
-                    identity.schema.as_str(),
-                    identity.name.as_str(),
-                    txid,
-                ) {
-                    let domain = self.domain_for(slot, txid);
-                    result.user_type = Some(UserTypeName {
-                        schema: domain.schema,
-                        name: domain.name,
-                    });
-                    return Ok(());
-                }
-                let canonical = self
-                    .routine_type_oid(result.ctype, result.user_type, txid)
-                    .and_then(|oid| self.routine_result_for_oid(oid, txid))
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "stored type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })?;
-                result.user_type = canonical.user_type;
-                Ok(())
-            })?;
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        definition.catalog_types().try_for_each(|result| {
+            *result = catalog.bind_type_reference(*result, super::current_database(), txid)?;
+            Ok::<(), SqlError>(())
+        })?;
         Ok(definition)
     }
 }

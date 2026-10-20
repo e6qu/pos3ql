@@ -28449,10 +28449,7 @@ pub(crate) fn resolve_routine_type(
     if let Some(polymorphic) = crate::storage::PolymorphicType::from_name(written) {
         return Ok(crate::storage::RoutineResult {
             ctype: ColType::Text,
-            user_type: Some(crate::storage::UserTypeName {
-                schema: SqlName::parse("pg_catalog").expect("static schema name"),
-                name: SqlName::parse(polymorphic.name()).expect("static pseudo-type name"),
-            }),
+            user_type: Some(crate::storage::UserTypeName::polymorphic(polymorphic)),
         });
     }
     if let Some(ctype) = ColType::from_sql_name(written) {
@@ -28461,7 +28458,7 @@ pub(crate) fn resolve_routine_type(
     let (base, array) = written
         .strip_suffix("[]")
         .map_or((written, false), |base| (base, true));
-    let user_type = |schema, name| crate::storage::UserTypeName { schema, name };
+    let user_type = |schema, name| crate::storage::UserTypeName::declaration(schema, name);
     let (result, usage_identity) = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
         let domain = storage.domain(slot);
         let ctype = if array {
@@ -28525,7 +28522,7 @@ pub(crate) fn resolve_routine_type(
         usage_identity.name.as_str(),
         txid,
     )?;
-    Ok(result)
+    storage.bind_routine_result(result, txid)
 }
 
 /// Parses a routine identity into the same typed contract stored on its
@@ -28889,7 +28886,7 @@ pub(crate) fn create_cast(
             "cast will be ignored because the target data type is a domain",
         )?;
     }
-    let definition = match storage.journal_catalog_definition(storage.cast(slot), txn.txid) {
+    let definition = match storage.bind_catalog_definition(storage.cast(slot), txn.txid) {
         Ok(definition) => definition,
         Err(error) => {
             storage.rollback_cast_create(slot);
@@ -28916,7 +28913,7 @@ fn stage_cast_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.cast(slot);
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     let dropped_slot = storage
         .drop_cast(definition.source, definition.target, txn.txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"))?;
@@ -29084,7 +29081,7 @@ fn operator_link_or_shell(
     } else {
         definition.negator = Some(request.source_oid);
     }
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     let slot = storage.create_operator(definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -29194,7 +29191,7 @@ pub(crate) fn create_operator(
         merges: operator.merges,
         owner: storage.initial_catalog_owner(txn.txid),
     };
-    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+    let durable = match storage.bind_catalog_definition(definition, txn.txid) {
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
@@ -31135,7 +31132,7 @@ fn stage_operator(
     slot: usize,
     definition: crate::storage::OperatorDefinition,
 ) -> Result<(), SqlError> {
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31167,7 +31164,7 @@ fn stage_operator_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.operator_for(slot, txn.txid);
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     storage.drop_operator(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
@@ -31814,7 +31811,7 @@ fn stage_operator_family(
     slot: usize,
     definition: crate::storage::OperatorFamilyDefinition,
 ) -> Result<(), SqlError> {
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_family(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -32017,7 +32014,7 @@ fn stage_operator_class(
     slot: usize,
     definition: crate::storage::OperatorClassDefinition,
 ) -> Result<(), SqlError> {
-    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
+    let durable = storage.bind_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_class(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -32316,7 +32313,7 @@ pub(crate) fn create_operator_class(
         operators,
         functions,
     };
-    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+    let durable = match storage.bind_catalog_definition(definition, txn.txid) {
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
@@ -32530,7 +32527,7 @@ pub(crate) fn drop_operator_classes(
     sql_ok()
 }
 
-const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + 2 * (1 + 63));
+const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + (1 + 63) + (1 + 128));
 
 fn encode_routine_signature<'a>(
     arguments: &[crate::storage::RoutineArgumentDef],
@@ -32555,7 +32552,7 @@ fn encode_routine_signature<'a>(
             Some(identity) => {
                 output[at] = 1;
                 at += 1;
-                for name in [identity.schema.as_str(), identity.name.as_str()] {
+                for name in [identity.schema.as_str(), identity.storage_name().as_str()] {
                     output[at] = u8::try_from(name.len()).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -39250,82 +39247,9 @@ pub(crate) fn catalog_column_type(
     txid: u32,
     type_oid: i32,
 ) -> Option<(ColType, Option<crate::storage::UserTypeName>)> {
-    use crate::sql::types::{ArrElem, oid};
-    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32).contains(&type_oid) {
-        let domain = storage.domain_for((type_oid - oid::FIRST_DOMAIN) as usize, txid);
-        return domain.visible_to(txid).then_some((
-            domain.base,
-            Some(crate::storage::UserTypeName {
-                schema: domain.schema,
-                name: domain.name,
-            }),
-        ));
-    }
-    if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
-        .contains(&type_oid)
-    {
-        let slot = (type_oid - oid::FIRST_DOMAIN_ARRAY) as usize;
-        let domain = storage.domain_for(slot, txid);
-        let element = ArrElem::domain(slot as u16, domain.base)?;
-        return domain.visible_to(txid).then_some((
-            ColType::Array(element),
-            Some(crate::storage::UserTypeName {
-                schema: domain.schema,
-                name: domain.name,
-            }),
-        ));
-    }
-    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + storage.composite_count() as i32)
-        .contains(&type_oid)
-    {
-        let slot = (type_oid - oid::FIRST_COMPOSITE) as usize;
-        let definition = storage.composite_for(slot, txid);
-        return definition.visible_to(txid).then_some((
-            ColType::Composite(slot as u16),
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
-        .contains(&type_oid)
-    {
-        let slot = (type_oid - oid::FIRST_COMPOSITE_ARRAY) as usize;
-        let definition = storage.composite_for(slot, txid);
-        return definition.visible_to(txid).then_some((
-            ColType::Array(ArrElem::Composite(slot as u16)),
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            }),
-        ));
-    }
-    let ctype = coltype_of_oid(type_oid)?;
-    let user_type = match ctype {
-        ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot)) => {
-            let enumeration = storage.enum_for(slot as usize, txid);
-            if !enumeration.visible_to(txid) {
-                return None;
-            }
-            Some(crate::storage::UserTypeName {
-                schema: enumeration.schema,
-                name: enumeration.name,
-            })
-        }
-        ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot)) => {
-            let definition = storage.composite_for(slot as usize, txid);
-            if !definition.visible_to(txid) {
-                return None;
-            }
-            Some(crate::storage::UserTypeName {
-                schema: definition.schema,
-                name: definition.name,
-            })
-        }
-        _ => None,
-    };
-    Some((ctype, user_type))
+    storage
+        .routine_result_for_oid(type_oid, txid)
+        .map(|result| (result.ctype, result.user_type))
 }
 
 /// REFRESH MATERIALIZED VIEW: re-run the stored query, replacing every row of
@@ -40837,7 +40761,11 @@ pub fn create_domain(
     };
     let lsn = storage.bump_lsn();
     let definition = storage.domain(slot);
-    if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateDomain(&definition)) {
+    if let Err(e) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::CreateDomain(slot as u16, &definition),
+    ) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -40875,27 +40803,18 @@ fn routine_result_uses_selected_type(
         .take(storage.domain_count())
         .any(|(slot, selected)| {
             *selected
-                && identity
-                    == crate::storage::UserTypeName {
-                        schema: storage.domain_for(slot, txid).schema,
-                        name: storage.domain_for(slot, txid).name,
-                    }
+                && identity.is_named(
+                    storage.domain_for(slot, txid).schema,
+                    storage.domain_for(slot, txid).name,
+                )
         })
         || selected_enum.is_some_and(|slot| {
             let definition = storage.enum_for(slot, txid);
-            identity
-                == crate::storage::UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                }
+            identity.is_named(definition.schema, definition.name)
         })
         || selected_composite.is_some_and(|slot| {
             let definition = storage.composite_for(slot, txid);
-            identity
-                == crate::storage::UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                }
+            identity.is_named(definition.schema, definition.name)
         })
 }
 
@@ -41372,11 +41291,9 @@ fn drop_domain_selection(
                 let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
                 let mut column_count = 0;
                 for column in def.columns() {
-                    if column.user_type
-                        == Some(crate::storage::UserTypeName {
-                            schema: domain_schema,
-                            name: domain_name,
-                        })
+                    if column
+                        .user_type
+                        .is_some_and(|identity| identity.is_named(domain_schema, domain_name))
                     {
                         columns[column_count] = column.name;
                         column_count += 1;
@@ -41412,12 +41329,11 @@ fn drop_domain_selection(
                 ));
             }
             let domain = storage.domain(slot);
-            let identity = crate::storage::UserTypeName {
-                schema: domain.schema,
-                name: domain.name,
-            };
+            let identity = crate::storage::UserTypeName::declaration(domain.schema, domain.name);
             cascade_drop_composite_fields(storage, wal, txn, composite_slot, |field| {
-                field.user_type == Some(identity)
+                field
+                    .user_type
+                    .is_some_and(|field_type| field_type.is_named(identity.schema, identity.name))
             })?;
         }
     }
@@ -41495,11 +41411,9 @@ fn domain_column_in_use(
         }
         let def = storage.table_def(table_index, txid);
         for column in def.columns() {
-            if column.user_type
-                == Some(crate::storage::UserTypeName {
-                    schema: domain.schema,
-                    name: domain.name,
-                })
+            if column
+                .user_type
+                .is_some_and(|identity| identity.is_named(domain.schema, domain.name))
             {
                 return Some((def.schema, def.name, column.name));
             }
@@ -41901,7 +41815,7 @@ pub fn alter_domain(
     if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
-        &WalOp::CreateDomain(&storage.domain_for(slot, txn.txid)),
+        &WalOp::CreateDomain(slot as u16, &storage.domain_for(slot, txn.txid)),
     ) {
         storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
@@ -42175,6 +42089,8 @@ pub fn create_enum(
         txn.txid,
         lsn,
         &WalOp::CreateEnum {
+            slot: slot as u16,
+            created_at: storage.enum_for(slot, txn.txid).created_at,
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
             members: spec.members,
@@ -42255,10 +42171,10 @@ fn build_composite_spec(
             };
             (
                 ctype,
-                Some(crate::storage::UserTypeName {
-                    schema: domain.schema,
-                    name: domain.name,
-                }),
+                Some(crate::storage::UserTypeName::declaration(
+                    domain.schema,
+                    domain.name,
+                )),
             )
         } else if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
             let definition = storage.enum_for(slot, txid);
@@ -42268,10 +42184,10 @@ fn build_composite_spec(
                 } else {
                     ColType::Enum(slot as u16)
                 },
-                Some(crate::storage::UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                }),
+                Some(crate::storage::UserTypeName::declaration(
+                    definition.schema,
+                    definition.name,
+                )),
             )
         } else if let Some(slot) = storage.resolve_composite_slot(base_name, txid) {
             let definition = storage.composite_for(slot, txid);
@@ -42281,10 +42197,10 @@ fn build_composite_spec(
                 } else {
                     ColType::Composite(slot as u16)
                 },
-                Some(crate::storage::UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                }),
+                Some(crate::storage::UserTypeName::declaration(
+                    definition.schema,
+                    definition.name,
+                )),
             )
         } else {
             return Err(sql_err!(
@@ -42624,16 +42540,17 @@ fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> 
 
 fn composite_field_uses_domain(storage: &Storage, domain_slot: usize, txid: u32) -> Option<usize> {
     let domain = storage.domain(domain_slot);
-    let identity = crate::storage::UserTypeName {
-        schema: domain.schema,
-        name: domain.name,
-    };
+    let identity = crate::storage::UserTypeName::declaration(domain.schema, domain.name);
     (0..storage.composite_count()).find(|&composite_slot| {
         storage.composite(composite_slot).visible_to(txid)
             && storage
                 .composite_for(composite_slot, txid)
                 .active_fields()
-                .any(|field| field.user_type == Some(identity))
+                .any(|field| {
+                    field.user_type.is_some_and(|field_type| {
+                        field_type.is_named(identity.schema, identity.name)
+                    })
+                })
     })
 }
 
@@ -42716,11 +42633,9 @@ fn drop_composite_type(
         let domain = storage.domain_for(domain_slot, txn.txid);
         *selected = domain.visible_to(txn.txid)
             && matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
-            && domain.base_user_type
-                == Some(crate::storage::UserTypeName {
-                    schema: definition.schema,
-                    name: definition.name,
-                });
+            && domain
+                .base_user_type
+                .is_some_and(|identity| identity.is_named(definition.schema, definition.name));
     }
     if dependent_domains.iter().any(|&selected| selected) && !cascade {
         return Err(sql_err!(
@@ -45030,6 +44945,8 @@ pub fn alter_type(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
+                    slot: slot as u16,
+                    created_at: storage.enum_for(slot, txn.txid).created_at,
                     schema: current_schema.as_str(),
                     name: current_name.as_str(),
                     members: altered,
@@ -45236,6 +45153,8 @@ pub fn alter_type(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
+                    slot: slot as u16,
+                    created_at: storage.enum_for(slot, txn.txid).created_at,
                     schema: current_schema.as_str(),
                     name: current_name.as_str(),
                     members: altered,
@@ -46163,7 +46082,10 @@ fn rewrite_composite_dependent_domains(
         if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
-            &WalOp::CreateDomain(&storage.domain_for(domain_slot, txn.txid)),
+            &WalOp::CreateDomain(
+                domain_slot as u16,
+                &storage.domain_for(domain_slot, txn.txid),
+            ),
         ) {
             storage.rollback_domain_alter(domain_slot, prior);
             return Err(error);
@@ -66791,6 +66713,7 @@ fn alter_table_relation(
                         crate::storage::ColumnDefault::Constant { value, expression };
                 }
                 new_def.columns[i].ctype = target;
+                new_def.columns[i].user_type = None;
                 new_def.columns[i].type_mod = *type_mod;
                 new_def.columns[i].collation = target_collation;
             }

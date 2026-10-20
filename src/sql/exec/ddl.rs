@@ -145,10 +145,7 @@ pub(super) fn build_column(
                     (
                         ColType::Array(element),
                         -1,
-                        Some(crate::storage::UserTypeName {
-                            schema: d.schema,
-                            name: d.name,
-                        }),
+                        Some(crate::storage::UserTypeName::declaration(d.schema, d.name)),
                         None,
                     )
                 } else if let Some(slot) = storage.resolve_enum_slot(element_name, txid) {
@@ -156,10 +153,10 @@ pub(super) fn build_column(
                     (
                         ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16)),
                         -1,
-                        Some(crate::storage::UserTypeName {
-                            schema: definition.schema,
-                            name: definition.name,
-                        }),
+                        Some(crate::storage::UserTypeName::declaration(
+                            definition.schema,
+                            definition.name,
+                        )),
                         None,
                     )
                 } else if let Some(slot) = storage.resolve_composite_slot(element_name, txid) {
@@ -167,10 +164,10 @@ pub(super) fn build_column(
                     (
                         ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16)),
                         -1,
-                        Some(crate::storage::UserTypeName {
-                            schema: definition.schema,
-                            name: definition.name,
-                        }),
+                        Some(crate::storage::UserTypeName::declaration(
+                            definition.schema,
+                            definition.name,
+                        )),
                         None,
                     )
                 } else {
@@ -185,10 +182,7 @@ pub(super) fn build_column(
                     Some(d) => (
                         d.base,
                         d.base_type_mod,
-                        Some(crate::storage::UserTypeName {
-                            schema: d.schema,
-                            name: d.name,
-                        }),
+                        Some(crate::storage::UserTypeName::declaration(d.schema, d.name)),
                         d.default_expr,
                     ),
                     None => match storage.resolve_enum_slot(c.type_name, txid) {
@@ -197,10 +191,10 @@ pub(super) fn build_column(
                             (
                                 ColType::Enum(slot as u16),
                                 -1,
-                                Some(crate::storage::UserTypeName {
-                                    schema: definition.schema,
-                                    name: definition.name,
-                                }),
+                                Some(crate::storage::UserTypeName::declaration(
+                                    definition.schema,
+                                    definition.name,
+                                )),
                                 None,
                             )
                         }
@@ -210,10 +204,10 @@ pub(super) fn build_column(
                                 (
                                     ColType::Composite(slot as u16),
                                     -1,
-                                    Some(crate::storage::UserTypeName {
-                                        schema: definition.schema,
-                                        name: definition.name,
-                                    }),
+                                    Some(crate::storage::UserTypeName::declaration(
+                                        definition.schema,
+                                        definition.name,
+                                    )),
                                     None,
                                 )
                             }
@@ -238,6 +232,9 @@ pub(super) fn build_column(
             c.type_name
         ));
     }
+    let bound =
+        storage.bind_routine_result(crate::storage::RoutineResult { ctype, user_type }, txid)?;
+    let (ctype, user_type) = (bound.ctype, bound.user_type);
     if let Some(identity) = user_type {
         storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
     }

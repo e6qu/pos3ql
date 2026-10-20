@@ -26,6 +26,9 @@ commands can wait for an active reclaim task before their effects; reads and
 cancellation continue. Explicit CHECKPOINT and shutdown finish synchronously.
 Waiting preserves statement deadlines, and recovered maintenance errors do not
 poison later writes.
+Saved row files now have stable identities. Merging adjacent files publishes
+their replacement without walking every current and historical row reference;
+reports retain the files they selected before the merge.
 See the [current contract and examples](docs/implemented-baseline.md).
 
 ## Remaining work

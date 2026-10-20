@@ -1135,10 +1135,30 @@ mod tests {
                     .unwrap();
             }
             storage
-                .append_spill_through(table, saved_handle(1), 7)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(1),
+                    7,
+                )
                 .unwrap();
             storage
-                .append_spill_through(table, saved_handle(5), 11)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(5),
+                    11,
+                )
                 .unwrap();
             storage.finish_row_cleanup(
                 RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
@@ -1147,7 +1167,7 @@ mod tests {
             for (rowid, member, lsn) in [(1, 0, 7), (2, 1, 11)] {
                 let row = storage.resident_row_state(table, rowid).unwrap().unwrap();
                 assert!(matches!(row.committed,
-                    Some(RowHome::Spilled { sst, commit_lsn, .. }) if sst == member && commit_lsn == lsn));
+                    Some(RowHome::Spilled { sst, commit_lsn, .. }) if sst == crate::storage::SpillGenerationId::fixture(member) && commit_lsn == lsn));
             }
             assert_row(&storage, table, 3, 0, u64::MAX, 3, "later");
             let row = storage.resident_row_state(table, 3).unwrap().unwrap();
@@ -1169,7 +1189,17 @@ mod tests {
             drop(row);
             assert_row(&storage, table, 1, 0, 7, 10, "old");
             storage
-                .append_spill_through(table, saved_handle(5), 9)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(5),
+                    9,
+                )
                 .unwrap();
             storage.finish_row_cleanup(
                 RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
@@ -1179,10 +1209,10 @@ mod tests {
             assert!(matches!(
                 row.committed,
                 Some(RowHome::Spilled {
-                    sst: 1,
+                    sst,
                     commit_lsn: 7,
                     ..
-                })
+                }) if sst == crate::storage::SpillGenerationId::fixture(1)
             ));
         });
     }
@@ -1214,7 +1244,17 @@ mod tests {
                 2
             );
             storage
-                .append_spill_through(table, saved_handle(5), 7)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(5),
+                    7,
+                )
                 .unwrap();
             storage.finish_row_cleanup(RowCleanupTask::DurableHistory, RowCleanupTarget::AllTables);
             assert_eq!(
@@ -1229,7 +1269,17 @@ mod tests {
             assert_row(&storage, table, 1, 99, 9, 20, "later");
             assert_row(&storage, table, 1, 0, u64::MAX, 30, "later");
             storage
-                .append_spill_through(table, saved_handle(9), 11)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(9),
+                    11,
+                )
                 .unwrap();
             storage.finish_row_cleanup(RowCleanupTask::DurableHistory, RowCleanupTarget::AllTables);
             assert!(

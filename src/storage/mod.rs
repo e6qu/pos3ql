@@ -61,7 +61,11 @@ use snapshot_leases::{
     ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
+pub(crate) use spill_generations::SpillGenerationId;
 pub(crate) use spill_generations::StatementFileScope;
+pub(crate) use spill_generations::{
+    SpillGenerationReservation, SpillInstallation, SpillPublication,
+};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -76,7 +80,7 @@ pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
-    release_committed_history_through, release_pending_chain, remap_committed_homes,
+    release_committed_history_through, release_pending_chain,
 };
 use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
@@ -2409,7 +2413,7 @@ pub enum RowHome {
     Heap(RowLoc),
     Spilled {
         len: u32,
-        sst: u32,
+        sst: SpillGenerationId,
         /// Exact immutable version to fetch.
         commit_lsn: u64,
     },
@@ -14345,6 +14349,7 @@ impl MemberCursor {
 struct SpillVersion {
     len: Option<u32>,
     member: u32,
+    generation: spill_generations::SpillGenerationId,
     commit_lsn: u64,
 }
 
@@ -29313,6 +29318,7 @@ impl Storage {
                             verdict = Some(SpillVersion {
                                 len: (!tombstone).then_some(len),
                                 member: member as u32,
+                                generation: relation.generation_id(member),
                                 commit_lsn: key.commit_lsn,
                             });
                         }
@@ -29323,6 +29329,7 @@ impl Storage {
                 if let Some(SpillVersion {
                     len: Some(len),
                     member,
+                    generation,
                     commit_lsn,
                 }) = verdict
                     && !overlay_rowids.contains(rowid)
@@ -29334,6 +29341,7 @@ impl Storage {
                             SpillVersion {
                                 len: Some(len),
                                 member,
+                                generation,
                                 commit_lsn,
                             },
                         ),
@@ -29516,6 +29524,7 @@ impl Storage {
                     verdict = Some(SpillVersion {
                         len: (!tombstone).then_some(len),
                         member: member as u32,
+                        generation: relation.generation_id(member),
                         commit_lsn: key.commit_lsn,
                     });
                 }
@@ -29524,6 +29533,7 @@ impl Storage {
                 len: Some(len),
                 member,
                 commit_lsn,
+                ..
             }) = verdict
                 && match overlay_mode {
                     SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
@@ -30224,6 +30234,7 @@ impl Storage {
                 best = Some(SpillVersion {
                     len: probe.len,
                     member: member as u32,
+                    generation: relation.generation_id(member),
                     commit_lsn: probe.key.commit_lsn,
                 });
             }
@@ -30253,7 +30264,7 @@ impl Storage {
         table: usize,
         rowid: u64,
         len: u32,
-        member: u32,
+        member: spill_generations::SpillGenerationId,
         commit_lsn: u64,
     ) -> Result<SpilledRowRead, SqlError> {
         let roots = self.query_roots.retain_point(self, table, commit_lsn)?;
@@ -30813,7 +30824,7 @@ impl Storage {
                             "selected row version is absent from the captured objects"
                         )
                     })?
-                    .member;
+                    .generation;
                 let source = SpilledRowRead::new(source, rowid, len, member, commit_lsn)?;
                 if source.snapshot().created_at != snapshot.created_at
                     || source.snapshot().version != snapshot.version
@@ -31258,145 +31269,202 @@ impl Storage {
         }
     }
 
-    pub(crate) fn clear_table_dirty_at_generation(&mut self, slot: usize, generation: u64) {
-        let table = &mut self.tables[slot];
+    pub(crate) fn clear_table_dirty_at_generation(&self, slot: usize, generation: u64) {
+        let table = &self.tables[slot];
         let mut publication = table.publication();
         if publication.generation == generation {
             publication.dirty = false;
         }
     }
 
-    /// A full rewrite: the new SST holds every committed row, so the list
-    /// collapses to it and every spilled map entry is remapped to slot 0.
+    pub(crate) fn capture_spill_publication(
+        &self,
+        slot: usize,
+        created_at: u64,
+        rewrite_generation: u64,
+    ) -> Result<SpillPublication, SqlError> {
+        SpillPublication::capture(self, slot, created_at, rewrite_generation)
+    }
+
+    /// Reservations precede the manifest CAS. Failed attempts burn identities;
+    /// installation cannot newly exhaust the identity space after durability.
+    pub(crate) fn reserve_spill_generation(
+        &self,
+        slot: usize,
+        created_at: u64,
+        rewrite_generation: u64,
+    ) -> Result<SpillGenerationReservation, SqlError> {
+        let target = self.capture_spill_publication(slot, created_at, rewrite_generation)?;
+        let id = target
+            .with_table(self, |table| table.spill_generations.write().reserve_id())?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "SST publication table identity changed"
+                )
+            })?;
+        Ok(SpillGenerationReservation { target, id })
+    }
+
+    /// Empty publication retires files without reusing their identities.
+    pub(crate) fn clear_spill_publication(
+        &self,
+        target: &SpillPublication,
+    ) -> Result<SpillInstallation, SqlError> {
+        let installed = target.with_table(self, |table| {
+            table.spill_generations.write().clear();
+            Ok(())
+        })?;
+        Ok(match installed {
+            Some(()) => SpillInstallation::Installed,
+            None => SpillInstallation::RetiredTable,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn collapse_spill(
         &mut self,
         slot: usize,
         handle: crate::store::SstHandle,
     ) -> Result<(), SqlError> {
-        self.collapse_spill_covered(slot, handle, spill_generations::SpillCoverage::Unknown)
+        let reservation = self.reserve_spill_generation(
+            slot,
+            self.table(slot).created_at(),
+            self.table(slot).rewrite_generation(),
+        )?;
+        self.collapse_spill_covered(
+            &reservation,
+            handle,
+            spill_generations::SpillCoverage::Unknown,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn collapse_spill_through(
-        &mut self,
-        slot: usize,
+        &self,
+        reservation: &SpillGenerationReservation,
         handle: crate::store::SstHandle,
         through_lsn: u64,
-    ) -> Result<(), SqlError> {
+    ) -> Result<SpillInstallation, SqlError> {
         self.collapse_spill_covered(
-            slot,
+            reservation,
             handle,
             spill_generations::SpillCoverage::CommittedThrough(through_lsn),
         )
     }
 
     fn collapse_spill_covered(
-        &mut self,
-        slot: usize,
+        &self,
+        reservation: &SpillGenerationReservation,
         handle: crate::store::SstHandle,
         coverage: spill_generations::SpillCoverage,
-    ) -> Result<(), SqlError> {
-        let versions = &mut self.row_versions.exclusive().committed_row_versions;
-        let table = &mut self.tables[slot];
-        let mut generations = table.spill_generations.write();
-        generations.collapse_covered(handle, coverage)?;
-        for (_, state) in table.rows.iter_mut() {
-            remap_committed_homes(versions, state, |home| match home {
-                RowHome::Spilled {
-                    len, commit_lsn, ..
-                } => RowHome::Spilled {
-                    len,
-                    sst: 0,
-                    commit_lsn,
-                },
-                RowHome::Heap(_) => home,
-            });
-        }
-        Ok(())
+    ) -> Result<SpillInstallation, SqlError> {
+        let installed = reservation.target.with_table(self, |table| {
+            table
+                .spill_generations
+                .write()
+                .collapse_reserved(handle, coverage, reservation.id)
+        })?;
+        Ok(match installed {
+            Some(()) => SpillInstallation::Installed,
+            None => SpillInstallation::RetiredTable,
+        })
     }
 
     /// Paced compaction merged the adjacent spill-SST pair at (`at`,
     /// `at + 1`) into one (`None` when nothing in the pair survived): the
-    /// merged member takes position `at`, later members shift down, and every
-    /// spilled row's index follows. A live row can only reference a dropped
+    /// merged member takes position `at`; generation identities remain stable.
+    /// A live row can only reference a dropped
     /// pair when the merge kept it, so `None` never strands one.
     pub(crate) fn merge_spill_pair(
-        &mut self,
-        slot: usize,
+        &self,
+        target: &SpillPublication,
         at: usize,
+        expected: (crate::store::SstHandle, crate::store::SstHandle),
         handle: Option<crate::store::SstHandle>,
-    ) {
-        let versions = &mut self.row_versions.exclusive().committed_row_versions;
-        let table = &mut self.tables[slot];
-        let removed = if handle.is_some() { 1u32 } else { 2u32 };
-        let mut generations = table.spill_generations.write();
-        generations.merge_pair(at, handle);
-        let at = at as u32;
-        for (_, state) in table.rows.iter_mut() {
-            remap_committed_homes(versions, state, |home| match home {
-                RowHome::Spilled {
-                    len,
-                    sst,
-                    commit_lsn,
-                } => {
-                    let sst = if sst < at {
-                        sst
-                    } else if sst == at || sst == at + 1 {
-                        at
-                    } else {
-                        sst - removed
-                    };
-                    RowHome::Spilled {
-                        len,
-                        sst,
-                        commit_lsn,
-                    }
-                }
-                RowHome::Heap(_) => home,
-            });
-        }
+    ) -> Result<SpillInstallation, SqlError> {
+        let installed = target.with_table(self, |table| {
+            let mut generations = table.spill_generations.write();
+            if generations
+                .handle(at)
+                .zip(at.checked_add(1).and_then(|next| generations.handle(next)))
+                != Some(expected)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "SST merge inputs changed before publication"
+                ));
+            }
+            generations.merge_pair(at, handle);
+            Ok(())
+        })?;
+        Ok(match installed {
+            Some(()) => SpillInstallation::Installed,
+            None => SpillInstallation::RetiredTable,
+        })
     }
 
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
-    /// existing spilled entries keep their slots. The caller guarantees the
+    /// existing spilled entries keep their identities. The caller guarantees the
     /// list has room.
     pub(crate) fn append_spill_through(
-        &mut self,
-        slot: usize,
+        &self,
+        reservation: &SpillGenerationReservation,
         handle: crate::store::SstHandle,
         through_lsn: u64,
-    ) -> Result<(), SqlError> {
-        self.tables[slot]
-            .spill_generations
-            .write()
-            .append(handle, through_lsn)
+    ) -> Result<SpillInstallation, SqlError> {
+        let installed = reservation.target.with_table(self, |table| {
+            table.spill_generations.write().append_reserved(
+                handle,
+                spill_generations::SpillCoverage::CommittedThrough(through_lsn),
+                reservation.id,
+            )
+        })?;
+        Ok(match installed {
+            Some(()) => SpillInstallation::Installed,
+            None => SpillInstallation::RetiredTable,
+        })
     }
 
     pub(crate) fn install_temporary_spill(
-        &mut self,
+        &self,
         slot: usize,
         handle: crate::store::SstHandle,
         generation: u64,
         delta: bool,
     ) -> Result<(), SqlError> {
-        let table = &self.tables[slot];
-        if table.definition().persistence != RelationPersistence::Temporary
-            || table.generation() != generation
-        {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "temporary spill no longer matches its captured table"
-            ));
-        }
+        let reservation = self.reserve_spill_generation(
+            slot,
+            self.table(slot).created_at(),
+            self.table(slot).rewrite_generation(),
+        )?;
         let coverage = spill_generations::SpillCoverage::ResidentThroughGeneration(generation);
-        if delta {
-            table
-                .spill_generations
-                .write()
-                .append_covered(handle, coverage)
-        } else {
-            self.collapse_spill_covered(slot, handle, coverage)
-        }
+        reservation
+            .target
+            .with_table(self, |table| {
+                let persistence = table.definition().persistence;
+                let mut generations = table.spill_generations.write();
+                let publication = table.publication();
+                if persistence != RelationPersistence::Temporary
+                    || publication.generation != generation
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "temporary spill no longer matches its captured table"
+                    ));
+                }
+                if delta {
+                    generations.append_reserved(handle, coverage, reservation.id)
+                } else {
+                    generations.collapse_reserved(handle, coverage, reservation.id)
+                }
+            })?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "temporary spill no longer matches its captured table"
+                )
+            })
     }
 
     /// Installs a validated cold-start list without allocating or partial publication.
@@ -52936,7 +53004,7 @@ mod tests {
         let mut state = RowState {
             committed: Some(RowHome::Spilled {
                 len: 4,
-                sst: 0,
+                sst: crate::storage::SpillGenerationId::fixture(0),
                 commit_lsn: 42,
             }),
             committed_lsn: 42,
@@ -54029,8 +54097,32 @@ mod tests {
             .create_table(make_def("saved_orders", &[("id", ColType::Int4, false)]))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.append_spill_through(source, handle(1), 7).unwrap();
-            storage.append_spill_through(source, handle(5), 9).unwrap();
+            storage
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            source,
+                            storage.table(source).created_at(),
+                            storage.table(source).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    handle(1),
+                    7,
+                )
+                .unwrap();
+            storage
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            source,
+                            storage.table(source).created_at(),
+                            storage.table(source).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    handle(5),
+                    9,
+                )
+                .unwrap();
             let database = storage
                 .create_database(
                     None,
@@ -54045,7 +54137,19 @@ mod tests {
             storage.select_database(oid).unwrap();
             let target = storage.find_table("public", "saved_orders").unwrap();
             assert_ne!(source, target);
-            storage.append_spill_through(target, handle(9), 11).unwrap();
+            storage
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            target,
+                            storage.table(target).created_at(),
+                            storage.table(target).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    handle(9),
+                    11,
+                )
+                .unwrap();
             for (rowid, commit_lsn) in [(1, 7), (2, 9), (3, 11)] {
                 let values = [Datum::Int4(rowid as i32)];
                 let (location, bytes) = storage.heap.append(rowenc::encoded_len(&values)).unwrap();
@@ -54063,7 +54167,7 @@ mod tests {
                 let state = storage.resident_row_state(target, rowid).unwrap().unwrap();
                 assert!(
                     matches!(state.committed, Some(RowHome::Spilled { sst: member, commit_lsn: version, .. })
-                    if member == sst && version == commit_lsn)
+                    if member == SpillGenerationId::fixture(sst) && version == commit_lsn)
                 );
             }
             assert_eq!(storage.table(source).spill_generations().len(), 2);
@@ -58260,11 +58364,16 @@ mod tests {
         let first_handles = [first];
         let second_handles = [second];
         fn relation(handles: &[crate::store::SstHandle]) -> SpillRelation<'_> {
+            const RANGES: [spill_generations::SpillGenerationRange; 1] =
+                [spill_generations::SpillGenerationRange::single(
+                    SpillGenerationId::fixture(0),
+                )];
             SpillRelation {
                 persistence: RelationPersistence::Permanent,
                 schema: [ColType::Bool; MAX_COLUMNS],
                 n_columns: 0,
                 handles,
+                ranges: &RANGES,
             }
         }
         let first_relation = relation(&first_handles);

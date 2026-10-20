@@ -62,6 +62,10 @@ jobs:
         run: cargo miri test --lib --locked enum_image_ownership_pool_ -- --test-threads=1
       - name: Ordered row source pointer provenance
         run: cargo miri test --lib --locked owned_ordered_source_tags -- --test-threads=1
+      - name: Stable saved-file identities and exhaustion
+        run: cargo miri test --lib --locked stable_spill_generation_ranges -- --test-threads=1
+      - name: Saved-file reservation boundaries
+        run: cargo miri test --lib --locked stable_spill_generation_exhaustion -- --test-threads=1
 
   release-package:
     runs-on: ubuntu-latest

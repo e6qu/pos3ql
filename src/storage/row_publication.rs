@@ -541,7 +541,7 @@ mod tests {
             let spilled = RowState {
                 committed: Some(RowHome::Spilled {
                     len: 4,
-                    sst: 0,
+                    sst: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 7,
                 }),
                 committed_lsn: 7,

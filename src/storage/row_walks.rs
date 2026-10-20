@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_sst_retirement_remaps_every_version_home() {
+    fn historical_sst_retirement_preserves_every_version_home() {
         use super::super::CommittedVersion;
         use super::super::row_versions::push_committed_version;
         use crate::store::{BlockId, RowSstFormat, SstHandle};
@@ -881,7 +881,7 @@ mod tests {
         };
         let spilled = |sst, lsn| RowHome::Spilled {
             len: 16,
-            sst,
+            sst: crate::storage::SpillGenerationId::fixture(sst),
             commit_lsn: lsn,
         };
         for at in [0, 1] {
@@ -907,13 +907,24 @@ mod tests {
             storage.tables[table].rows.remove(&1);
             storage.tables[table].rows.insert(1, state).unwrap();
             crate::mem::guard::forbid_alloc(|| {
-                storage.merge_spill_pair(table, at, Some(handle(13)));
+                let target = storage
+                    .capture_spill_publication(
+                        table,
+                        storage.table(table).created_at(),
+                        storage.table(table).rewrite_generation(),
+                    )
+                    .unwrap();
+                storage
+                    .merge_spill_pair(
+                        &target,
+                        at,
+                        (handle(1 + at as u8 * 4), handle(5 + at as u8 * 4)),
+                        Some(handle(13)),
+                    )
+                    .unwrap();
                 let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-                assert_eq!(state.committed, Some(spilled(1, 11)));
-                assert_eq!(
-                    state.history_get(0).unwrap().home,
-                    Some(spilled(at as u32, 9))
-                );
+                assert_eq!(state.committed, Some(spilled(2, 11)));
+                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(1, 9)));
                 assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
                 assert_eq!(state.history_get(2).unwrap().home, None);
                 assert_eq!(
@@ -925,8 +936,8 @@ mod tests {
                 drop(state);
                 storage.collapse_spill(table, handle(17)).unwrap();
                 let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-                assert_eq!(state.committed, Some(spilled(0, 11)));
-                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(0, 9)));
+                assert_eq!(state.committed, Some(spilled(2, 11)));
+                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(1, 9)));
                 assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
                 assert_eq!(state.history_get(2).unwrap().home, None);
                 assert_eq!(state.history_get(3).unwrap().lsn, 3);
@@ -1452,7 +1463,7 @@ mod tests {
         let mut redundant = *storage.resident_row_state(table, 1).unwrap().unwrap();
         redundant.committed = Some(RowHome::Spilled {
             len: 4,
-            sst: 0,
+            sst: crate::storage::SpillGenerationId::fixture(0),
             commit_lsn: 7,
         });
         redundant.checkpoint_change_lsn = 0;

@@ -409,7 +409,17 @@ mod tests {
                     .unwrap();
             }
             storage
-                .append_spill_through(table, saved_handle(table as u8 * 4 + 1), 7)
+                .append_spill_through(
+                    &storage
+                        .reserve_spill_generation(
+                            table,
+                            storage.table(table).created_at(),
+                            storage.table(table).rewrite_generation(),
+                        )
+                        .unwrap(),
+                    saved_handle(table as u8 * 4 + 1),
+                    7,
+                )
                 .unwrap();
             let generation = storage.tables[table].generation();
             storage.finish_row_cleanup(
@@ -836,7 +846,17 @@ mod tests {
             .insert(2, RowState::committed_only_at(location, 7))
             .unwrap();
         storage
-            .append_spill_through(first, saved_handle(1), 7)
+            .append_spill_through(
+                &storage
+                    .reserve_spill_generation(
+                        first,
+                        storage.table(first).created_at(),
+                        storage.table(first).rewrite_generation(),
+                    )
+                    .unwrap(),
+                saved_handle(1),
+                7,
+            )
             .unwrap();
         let generation = storage.tables[first].generation();
         storage.finish_row_cleanup(
@@ -993,7 +1013,7 @@ mod tests {
             retained[0].committed = Some(RowHome::Heap(location));
             retained[1].committed = Some(RowHome::Spilled {
                 len: location.len,
-                sst: 0,
+                sst: crate::storage::SpillGenerationId::fixture(0),
                 commit_lsn: 7,
             });
             {

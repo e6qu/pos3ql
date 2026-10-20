@@ -15,11 +15,60 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::store::{BlockId, SstHandle, ValueIndexHandle};
 
+/// A table-local saved-file identity; never a position in its current file list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct SpillGenerationId(u32);
+
+impl SpillGenerationId {
+    fn checked(value: u64) -> Result<Self, SqlError> {
+        u32::try_from(value).map(Self).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table SST generation identity space exhausted"
+            )
+        })
+    }
+
+    pub(super) const fn encoded(self) -> u32 {
+        self.0
+    }
+
+    pub(super) const fn from_record(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fixture(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SpillGenerationRange {
+    first: SpillGenerationId,
+    last: SpillGenerationId,
+}
+
+impl SpillGenerationRange {
+    pub(super) const fn single(id: SpillGenerationId) -> Self {
+        Self {
+            first: id,
+            last: id,
+        }
+    }
+
+    fn contains(self, id: SpillGenerationId) -> bool {
+        self.first <= id && id <= self.last
+    }
+}
+
 /// Handles and their eviction boundaries are published as one complete list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpillGeneration {
     pub(crate) handle: SstHandle,
     coverage: SpillCoverage,
+    range: SpillGenerationRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +109,8 @@ impl SpillCoverage {
 pub(crate) struct SpillGenerationList {
     members: FixedVec<SpillGeneration>,
     staging: FixedVec<SpillGeneration>,
+    next_id: u64,
+    installed_before: u64,
 }
 
 impl SpillGenerationList {
@@ -83,17 +134,37 @@ impl SpillGenerationList {
         self.members.get(index).map(|member| member.handle)
     }
 
-    pub(super) fn eviction_member(&self, commit_lsn: u64, row_generation: u64) -> Option<u32> {
+    pub(super) fn reserve_id(&mut self) -> Result<SpillGenerationId, SqlError> {
+        let id = SpillGenerationId::checked(self.next_id)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
+    fn validate_reservation(&self, id: SpillGenerationId) -> Result<(), SqlError> {
+        if u64::from(id.0) >= self.next_id || u64::from(id.0) < self.installed_before {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "SST generation identity is not a fresh reservation"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn eviction_member(
+        &self,
+        commit_lsn: u64,
+        row_generation: u64,
+    ) -> Option<SpillGenerationId> {
         self.members
             .iter()
-            .position(|member| match member.coverage {
+            .find(|member| match member.coverage {
                 SpillCoverage::Unknown => false,
                 SpillCoverage::CommittedThrough(through) => commit_lsn <= through,
                 SpillCoverage::ResidentThroughGeneration(generation) => {
                     row_generation <= generation
                 }
             })
-            .map(|index| index as u32)
+            .map(|member| member.range.last)
     }
 
     pub(super) fn published_through(&self) -> Option<u64> {
@@ -124,6 +195,9 @@ impl SpillGenerationList {
                 self.capacity()
             ));
         }
+        if len != 0 {
+            SpillGenerationId::checked(self.next_id + len as u64 - 1)?;
+        }
         for handle in handles {
             if self.staging.len() == len {
                 self.staging.clear();
@@ -136,6 +210,9 @@ impl SpillGenerationList {
                 .push(SpillGeneration {
                     handle,
                     coverage: SpillCoverage::Unknown,
+                    range: SpillGenerationRange::single(SpillGenerationId::checked(
+                        self.next_id + self.staging.len() as u64,
+                    )?),
                 })
                 .expect("validated generation capacity");
         }
@@ -147,6 +224,10 @@ impl SpillGenerationList {
             ));
         }
         std::mem::swap(&mut self.members, &mut self.staging);
+        self.next_id += len as u64;
+        if len != 0 {
+            self.installed_before = self.next_id;
+        }
         self.staging.clear();
         Ok(())
     }
@@ -163,18 +244,33 @@ impl SpillGenerationList {
         for &member in source.iter() {
             self.members.push(member).expect("validated clone capacity");
         }
+        self.next_id = source.next_id;
+        self.installed_before = source.installed_before;
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn append(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
         self.append_covered(handle, SpillCoverage::CommittedThrough(through_lsn))
     }
 
+    #[cfg(test)]
     pub(super) fn append_covered(
         &mut self,
         handle: SstHandle,
         coverage: SpillCoverage,
     ) -> Result<(), SqlError> {
+        let id = self.reserve_id()?;
+        self.append_reserved(handle, coverage, id)
+    }
+
+    pub(super) fn append_reserved(
+        &mut self,
+        handle: SstHandle,
+        coverage: SpillCoverage,
+        id: SpillGenerationId,
+    ) -> Result<(), SqlError> {
+        self.validate_reservation(id)?;
         if self
             .members
             .iter()
@@ -186,14 +282,20 @@ impl SpillGenerationList {
             ));
         }
         self.members
-            .push(SpillGeneration { handle, coverage })
+            .push(SpillGeneration {
+                handle,
+                coverage,
+                range: SpillGenerationRange::single(id),
+            })
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table SST generations exceed startup capacity ({})",
                     self.capacity()
                 )
-            })
+            })?;
+        self.installed_before = u64::from(id.0) + 1;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -201,19 +303,40 @@ impl SpillGenerationList {
         self.collapse_covered(handle, SpillCoverage::CommittedThrough(through_lsn))
     }
 
+    #[cfg(test)]
     pub(super) fn collapse_covered(
         &mut self,
         handle: SstHandle,
         coverage: SpillCoverage,
     ) -> Result<(), SqlError> {
+        let id = self.reserve_id()?;
+        self.collapse_reserved(handle, coverage, id)
+    }
+
+    pub(super) fn collapse_reserved(
+        &mut self,
+        handle: SstHandle,
+        coverage: SpillCoverage,
+        id: SpillGenerationId,
+    ) -> Result<(), SqlError> {
+        self.validate_reservation(id)?;
         if self.capacity() == 0 {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "table SST generations exceed startup capacity (0)"
             ));
         }
+        let first = self.members.first().map_or(id, |member| member.range.first);
         self.clear();
-        self.append_covered(handle, coverage)
+        self.members
+            .push(SpillGeneration {
+                handle,
+                coverage,
+                range: SpillGenerationRange { first, last: id },
+            })
+            .expect("validated generation capacity");
+        self.installed_before = u64::from(id.0) + 1;
+        Ok(())
     }
 
     pub(super) fn merge_pair(&mut self, at: usize, handle: Option<SstHandle>) {
@@ -225,7 +348,15 @@ impl SpillGenerationList {
             .coverage
             .merged(self.members[at + 1].coverage);
         let removed = if let Some(handle) = handle {
-            self.members[at] = SpillGeneration { handle, coverage };
+            let range = SpillGenerationRange {
+                first: self.members[at].range.first,
+                last: self.members[at + 1].range.last,
+            };
+            self.members[at] = SpillGeneration {
+                handle,
+                coverage,
+                range,
+            };
             1
         } else {
             2
@@ -244,6 +375,79 @@ pub(super) struct SpillGenerationRoster {
     state: RwLock<SpillGenerationList>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SpillPublication {
+    registry: Arc<SpillRootRegistry>,
+    table: usize,
+    created_at: u64,
+    rewrite_generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct SpillGenerationReservation {
+    pub(super) target: SpillPublication,
+    pub(super) id: SpillGenerationId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillInstallation {
+    Installed,
+    RetiredTable,
+}
+
+impl SpillPublication {
+    pub(super) fn capture(
+        storage: &Storage,
+        table: usize,
+        created_at: u64,
+        rewrite_generation: u64,
+    ) -> Result<Self, SqlError> {
+        let target = Self {
+            registry: Arc::clone(&storage.spill_roots),
+            table,
+            created_at,
+            rewrite_generation,
+        };
+        if target.with_table(storage, |_| Ok(()))?.is_none() {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "SST publication table identity changed"
+            ));
+        }
+        Ok(target)
+    }
+
+    pub(super) fn with_table<R>(
+        &self,
+        storage: &Storage,
+        publish: impl FnOnce(&super::Table) -> Result<R, SqlError>,
+    ) -> Result<Option<R>, SqlError> {
+        if !Arc::ptr_eq(&self.registry, &storage.spill_roots) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "SST publication belongs to different storage"
+            ));
+        }
+        let table = storage.tables.get(self.table).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "SST publication table slot is invalid"
+            )
+        })?;
+        let _lifecycle = table
+            .lifecycle
+            .lock()
+            .expect("table lifecycle lock poisoned");
+        if !table.live()
+            || table.created_at() != self.created_at
+            || table.rewrite_generation() != self.rewrite_generation
+        {
+            return Ok(None);
+        }
+        publish(table).map(Some)
+    }
+}
+
 impl SpillGenerationRoster {
     pub(super) fn member_budget_bytes(capacity: usize) -> usize {
         2 * capacity * size_of::<SpillGeneration>()
@@ -254,6 +458,8 @@ impl SpillGenerationRoster {
             state: RwLock::new(SpillGenerationList {
                 members: FixedVec::new(budget, "table SST generations", capacity)?,
                 staging: FixedVec::new(budget, "table SST generation staging", capacity)?,
+                next_id: 0,
+                installed_before: 0,
             }),
         })
     }
@@ -901,6 +1107,7 @@ pub(super) struct SpillRelation<'a> {
     pub(super) schema: [ColType; MAX_COLUMNS],
     pub(super) n_columns: usize,
     pub(super) handles: &'a [SstHandle],
+    pub(super) ranges: &'a [SpillGenerationRange],
 }
 
 impl<'a> SpillRelation<'a> {
@@ -910,6 +1117,10 @@ impl<'a> SpillRelation<'a> {
 
     pub(super) fn handle(&self, member: usize) -> SstHandle {
         self.handles[member]
+    }
+
+    pub(super) fn generation_id(&self, member: usize) -> SpillGenerationId {
+        self.ranges[member].last
     }
 }
 
@@ -1141,7 +1352,7 @@ impl SpilledRowState {
         super::RowState {
             committed: self.version.len.map(|len| super::RowHome::Spilled {
                 len,
-                sst: self.version.member,
+                sst: self.version.generation,
                 commit_lsn: self.version.commit_lsn,
             }),
             committed_lsn: self.version.commit_lsn,
@@ -1177,7 +1388,7 @@ impl SpilledRowState {
             self.roots,
             self.rowid,
             len,
-            self.version.member,
+            self.version.generation,
             self.version.commit_lsn,
         )
     }
@@ -1207,13 +1418,21 @@ impl SpilledRowState {
         })?;
         let Some(super::SpillVersion {
             len: Some(len),
-            member,
+            generation,
             commit_lsn,
+            ..
         }) = version
         else {
             return Ok(None);
         };
-        SpilledRowRead::new(self.roots.try_clone()?, self.rowid, len, member, commit_lsn).map(Some)
+        SpilledRowRead::new(
+            self.roots.try_clone()?,
+            self.rowid,
+            len,
+            generation,
+            commit_lsn,
+        )
+        .map(Some)
     }
 }
 
@@ -1225,7 +1444,7 @@ pub(super) struct SpilledRowRead {
     pub(super) created_at: u64,
     pub(super) rowid: u64,
     pub(super) len: u32,
-    pub(super) member: u32,
+    pub(super) member: SpillGenerationId,
     pub(super) commit_lsn: u64,
 }
 
@@ -1234,11 +1453,13 @@ impl SpilledRowRead {
         roots: QueryRootLease,
         rowid: u64,
         len: u32,
-        member: u32,
+        member: SpillGenerationId,
         commit_lsn: u64,
     ) -> Result<Self, SqlError> {
-        let (table_slot, created_at) =
-            roots.with_snapshot(|source| Ok((source.table_slot, source.created_at)))?;
+        let (table_slot, created_at) = roots.with_snapshot(|source| {
+            source.handle_for_generation(member)?;
+            Ok((source.table_slot, source.created_at))
+        })?;
         Ok(Self {
             roots,
             table_slot,
@@ -1278,15 +1499,10 @@ impl SpilledRowRead {
                     "retained object row has no reader"
                 )
             })?;
-            let handle = source.handles.get(self.member as usize).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "retained object row has no SST member"
-                )
-            })?;
+            let handle = source.handle_for_generation(self.member)?;
             reader.copy_row_bytes(
                 source.persistence,
-                *handle,
+                handle,
                 self.rowid,
                 self.len,
                 self.commit_lsn,
@@ -1306,15 +1522,10 @@ impl SpilledRowRead {
                     "retained object row has no reader"
                 )
             })?;
-            let handle = source.handles.get(self.member as usize).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "retained object row has no SST member"
-                )
-            })?;
+            let handle = source.handle_for_generation(self.member)?;
             reader.with_row_bytes(
                 source.persistence,
-                *handle,
+                handle,
                 self.rowid,
                 self.len,
                 self.commit_lsn,
@@ -1392,6 +1603,7 @@ pub(super) struct SpillSourceView<'a> {
     registry: &'a Arc<SpillRootRegistry>,
     pub(super) reader: Option<&'a Arc<SpillReader>>,
     handles: &'a [SstHandle],
+    ranges: &'a [SpillGenerationRange],
     metadata: SpillGenerationMetadata,
     schema: &'a [ColType],
 }
@@ -1417,6 +1629,7 @@ impl SpillSourceView<'_> {
             schema,
             n_columns: self.schema.len(),
             handles: self.handles,
+            ranges: self.ranges,
         }
     }
 
@@ -1431,6 +1644,7 @@ pub(super) struct StatementSpillRoots<'a> {
     metadata: SpillGenerationMetadata,
     schema: &'a [ColType],
     handles: &'a [SstHandle],
+    ranges: &'a [SpillGenerationRange],
 }
 
 impl<'a> StatementSpillRoots<'a> {
@@ -1459,6 +1673,14 @@ impl<'a> StatementSpillRoots<'a> {
                     "retained scan SST roots exceed the statement arena"
                 )
             })?;
+        let ranges = arena
+            .alloc_slice_with(generations.len(), |index| generations.members[index].range)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "retained scan SST identities exceed the statement arena"
+                )
+            })?;
         storage
             .spill_roots
             .pin(handles, image.persistence != RelationPersistence::Temporary)?;
@@ -1468,6 +1690,7 @@ impl<'a> StatementSpillRoots<'a> {
             metadata,
             schema,
             handles,
+            ranges,
         })
     }
 
@@ -1476,6 +1699,7 @@ impl<'a> StatementSpillRoots<'a> {
             registry: &self.registry,
             reader: self.reader.as_ref(),
             handles: self.handles,
+            ranges: self.ranges,
             metadata: self.metadata,
             schema: self.schema,
         }
@@ -1551,9 +1775,14 @@ impl<'a> CapturedSpillRoots<'a> {
     pub(super) fn matches_read(&self, read: &SpilledRowRead) -> Result<bool, SqlError> {
         self.with_view(|source| {
             read.roots.with_snapshot(|other| {
-                let Some(handle) = source.handles.get(read.member as usize) else {
+                let Some(member) = source
+                    .ranges
+                    .iter()
+                    .position(|range| range.contains(read.member))
+                else {
                     return Ok(false);
                 };
+                let handle = source.handles[member];
                 let readers_match = match (source.reader, other.reader.as_ref()) {
                     (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                     (None, None) => true,
@@ -1566,7 +1795,9 @@ impl<'a> CapturedSpillRoots<'a> {
                         source.registry,
                         other.registry.as_ref().expect("retained registry"),
                     )
-                    && Some(handle) == other.handles.get(read.member as usize))
+                    && other
+                        .handle_for_generation(read.member)
+                        .is_ok_and(|other_handle| handle == other_handle))
             })
         })
         .map(|matches| matches.unwrap_or(false))
@@ -1579,6 +1810,7 @@ pub(super) struct SpillGenerationSnapshot {
     registry: Option<Arc<SpillRootRegistry>>,
     pub(super) reader: Option<Arc<SpillReader>>,
     handles: Vec<SstHandle>,
+    ranges: Vec<SpillGenerationRange>,
     image: SpillGenerationImage,
 }
 
@@ -1597,7 +1829,7 @@ impl DerefMut for SpillGenerationSnapshot {
 
 impl SpillGenerationSnapshot {
     pub(super) fn budget_bytes(max_generations: usize) -> usize {
-        max_generations * size_of::<SstHandle>()
+        max_generations * (size_of::<SstHandle>() + size_of::<SpillGenerationRange>())
     }
 
     pub(super) fn new(max_generations: usize) -> Self {
@@ -1605,6 +1837,7 @@ impl SpillGenerationSnapshot {
             registry: None,
             reader: None,
             handles: Vec::with_capacity(max_generations),
+            ranges: Vec::with_capacity(max_generations),
             image: SpillGenerationImage::EMPTY,
         }
     }
@@ -1645,6 +1878,7 @@ impl SpillGenerationSnapshot {
             registry: self.registry.as_ref().expect("captured source registry"),
             reader: self.reader.as_ref(),
             handles: &self.handles,
+            ranges: &self.ranges,
             metadata: self.image.metadata(),
             schema: &self.schema[..self.n_columns],
         }
@@ -1663,11 +1897,13 @@ impl SpillGenerationSnapshot {
         for &handle in source.handles {
             self.handles.push(handle);
         }
+        self.ranges.extend_from_slice(source.ranges);
         if let Err(error) = source.registry.pin(
             &self.handles,
             self.persistence != RelationPersistence::Temporary,
         ) {
             self.handles.clear();
+            self.ranges.clear();
             return Err(error);
         }
         self.registry = Some(Arc::clone(source.registry));
@@ -1689,12 +1925,14 @@ impl SpillGenerationSnapshot {
         }
         for member in generations.iter() {
             self.handles.push(member.handle);
+            self.ranges.push(member.range);
         }
         if let Err(error) = registry.pin(
             &self.handles,
             self.persistence != RelationPersistence::Temporary,
         ) {
             self.handles.clear();
+            self.ranges.clear();
             return Err(error);
         }
         self.registry = Some(Arc::clone(registry));
@@ -1744,6 +1982,7 @@ impl SpillGenerationSnapshot {
             schema: self.schema,
             n_columns: self.n_columns,
             handles: &self.handles,
+            ranges: &self.ranges,
         }
     }
 
@@ -1755,7 +1994,22 @@ impl SpillGenerationSnapshot {
             );
         }
         self.handles.clear();
+        self.ranges.clear();
         self.reader = None;
+    }
+
+    fn handle_for_generation(&self, id: SpillGenerationId) -> Result<SstHandle, SqlError> {
+        self.ranges
+            .iter()
+            .position(|range| range.contains(id))
+            .and_then(|member| self.handles.get(member))
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no SST generation"
+                )
+            })
     }
 }
 
@@ -2630,23 +2884,134 @@ mod tests {
             assert_eq!(list.eviction_member(0, 7), None);
             list.append_covered(handle(5), SpillCoverage::ResidentThroughGeneration(7))
                 .unwrap();
-            assert_eq!(list.eviction_member(0, 6), Some(1));
-            assert_eq!(list.eviction_member(0, 7), Some(1));
+            assert_eq!(
+                list.eviction_member(0, 6),
+                Some(SpillGenerationId::fixture(1))
+            );
+            assert_eq!(
+                list.eviction_member(0, 7),
+                Some(SpillGenerationId::fixture(1))
+            );
             assert_eq!(list.eviction_member(0, 8), None);
             let error = list.append(handle(9), 0).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert_eq!(list.len(), 2);
             list.append_covered(handle(9), SpillCoverage::ResidentThroughGeneration(8))
                 .unwrap();
-            assert_eq!(list.eviction_member(0, 8), Some(2));
+            assert_eq!(
+                list.eviction_member(0, 8),
+                Some(SpillGenerationId::fixture(3))
+            );
             assert_eq!(list.published_through(), None);
             list.merge_pair(1, Some(handle(13)));
-            assert_eq!(list.eviction_member(0, 8), Some(1));
+            assert_eq!(
+                list.eviction_member(0, 8),
+                Some(SpillGenerationId::fixture(3))
+            );
             list.clear();
             list.append(handle(17), 0).unwrap();
-            assert_eq!(list.eviction_member(0, 8), Some(0));
+            assert_eq!(
+                list.eviction_member(0, 8),
+                Some(SpillGenerationId::fixture(4))
+            );
             assert_eq!(list.eviction_member(1, 8), None);
             assert_eq!(list.published_through(), Some(0));
+        });
+    }
+
+    #[test]
+    fn stable_spill_generation_ranges_survive_merges_removals_and_clear() {
+        let mut budget = Budget::new(SpillGenerationRoster::member_budget_bytes(4));
+        let roster = SpillGenerationRoster::new(&mut budget, 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut list = roster.write();
+            for tag in [1, 5, 9, 13] {
+                list.append(handle(tag), u64::from(tag)).unwrap();
+            }
+            list.merge_pair(1, Some(handle(17)));
+            assert_eq!(
+                list.members[0].range,
+                SpillGenerationRange::single(SpillGenerationId::fixture(0))
+            );
+            assert!(
+                list.members[1]
+                    .range
+                    .contains(SpillGenerationId::fixture(1))
+            );
+            assert!(
+                list.members[1]
+                    .range
+                    .contains(SpillGenerationId::fixture(2))
+            );
+            assert_eq!(
+                list.members[2].range,
+                SpillGenerationRange::single(SpillGenerationId::fixture(3))
+            );
+            list.merge_pair(0, None);
+            assert_eq!(
+                list.members[0].range,
+                SpillGenerationRange::single(SpillGenerationId::fixture(3))
+            );
+            list.append(handle(21), 21).unwrap();
+            assert_eq!(
+                list.members[1].range,
+                SpillGenerationRange::single(SpillGenerationId::fixture(4))
+            );
+            list.clear();
+            assert_eq!(
+                list.append_reserved(
+                    handle(25),
+                    SpillCoverage::CommittedThrough(25),
+                    SpillGenerationId::fixture(4)
+                )
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            list.append(handle(25), 25).unwrap();
+            assert_eq!(
+                list.members[0].range,
+                SpillGenerationRange::single(SpillGenerationId::fixture(5))
+            );
+        });
+    }
+
+    #[test]
+    fn stable_spill_generation_exhaustion_preserves_the_published_list() {
+        let mut budget = Budget::new(SpillGenerationRoster::member_budget_bytes(2));
+        let roster = SpillGenerationRoster::new(&mut budget, 2).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut list = roster.write();
+            list.append(handle(1), 7).unwrap();
+            list.next_id = u64::from(u32::MAX);
+            assert_eq!(
+                list.replace(2, [handle(5), handle(9)].into_iter())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(list.handle(0), Some(handle(1)));
+            let last = list.reserve_id().unwrap();
+            assert_eq!(last, SpillGenerationId::fixture(u32::MAX));
+            assert_eq!(
+                list.reserve_id().unwrap_err().message.as_str(),
+                "table SST generation identity space exhausted"
+            );
+            // A receipt reserved before durability still installs after exhaustion.
+            list.collapse_reserved(handle(5), SpillCoverage::CommittedThrough(9), last)
+                .unwrap();
+            assert_eq!(list.handle(0), Some(handle(5)));
+            assert!(
+                list.members[0]
+                    .range
+                    .contains(SpillGenerationId::fixture(0))
+            );
+            list.clear();
+            assert_eq!(
+                list.reserve_id().unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert!(list.is_empty());
         });
     }
 
@@ -2683,7 +3048,8 @@ mod tests {
                 list.members[2],
                 SpillGeneration {
                     handle: handle(9),
-                    coverage: SpillCoverage::CommittedThrough(11)
+                    coverage: SpillCoverage::CommittedThrough(11),
+                    range: SpillGenerationRange::single(SpillGenerationId::fixture(2)),
                 }
             );
             list.merge_pair(0, Some(handle(13)));
@@ -2692,14 +3058,19 @@ mod tests {
                 list.members[0],
                 SpillGeneration {
                     handle: handle(13),
-                    coverage: SpillCoverage::CommittedThrough(9)
+                    coverage: SpillCoverage::CommittedThrough(9),
+                    range: SpillGenerationRange {
+                        first: SpillGenerationId::fixture(0),
+                        last: SpillGenerationId::fixture(1)
+                    },
                 }
             );
             assert_eq!(
                 list.members[1],
                 SpillGeneration {
                     handle: handle(9),
-                    coverage: SpillCoverage::CommittedThrough(11)
+                    coverage: SpillCoverage::CommittedThrough(11),
+                    range: SpillGenerationRange::single(SpillGenerationId::fixture(2)),
                 }
             );
             list.merge_pair(0, None);
@@ -3058,16 +3429,19 @@ mod tests {
                 super::super::SpillVersion {
                     len: None,
                     member: 0,
+                    generation: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 7,
                 },
                 super::super::SpillVersion {
                     len: Some(length),
                     member: 0,
+                    generation: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 9,
                 },
                 super::super::SpillVersion {
                     len: Some(length),
                     member: 2,
+                    generation: crate::storage::SpillGenerationId::fixture(2),
                     commit_lsn: 7,
                 },
             ] {
@@ -3097,6 +3471,7 @@ mod tests {
                 super::super::SpillVersion {
                     len: Some(length),
                     member: 0,
+                    generation: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 7,
                 },
             )
@@ -3306,7 +3681,7 @@ mod tests {
             let mut saved = RowState::committed_only_at(RowLoc::test(0, length), 7);
             saved.committed = Some(RowHome::Spilled {
                 len: length,
-                sst: 0,
+                sst: crate::storage::SpillGenerationId::fixture(0),
                 commit_lsn: 7,
             });
             storage.tables[table].rows.insert(2, saved).unwrap();
@@ -3843,7 +4218,9 @@ mod tests {
                 drop(state);
                 storage.set_spill_list(table, &[roots[2]]);
                 let changed = super::super::VisibleRowHome::spilled(
-                    storage.retain_spilled_row(table, 1, 18, 0, 11).unwrap(),
+                    storage
+                        .retain_spilled_row(table, 1, 18, SpillGenerationId::fixture(2), 11)
+                        .unwrap(),
                 );
                 assert_eq!(
                     source.retain(1, &changed).err().unwrap().sqlstate,
@@ -3917,6 +4294,149 @@ mod tests {
             .insert(0, super::super::RowState::committed_only_at(location, 7))
             .unwrap();
         fixture
+    }
+
+    #[test]
+    fn stable_spill_generation_shared_merge_keeps_old_reads_and_row_metadata() {
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = scan_fixture("stable-merge");
+        let mut state =
+            super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 9);
+        state.committed = Some(super::super::RowHome::Spilled {
+            len: 7,
+            sst: SpillGenerationId::fixture(1),
+            commit_lsn: 9,
+        });
+        storage.tables[table].rows.write().insert(1, state).unwrap();
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let old = storage
+                .retain_spilled_row(table, 1, 7, SpillGenerationId::fixture(0), 7)
+                .unwrap();
+            let current = storage
+                .retain_spilled_row(table, 1, 7, SpillGenerationId::fixture(1), 9)
+                .unwrap();
+            let row_owner = storage.tables[table].rows.read();
+            let version_owner = storage.row_versions.read();
+            let target = storage
+                .capture_spill_publication(
+                    table,
+                    storage.table(table).created_at(),
+                    storage.table(table).rewrite_generation(),
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .merge_spill_pair(&target, 0, (roots[0], roots[1]), Some(roots[2]))
+                    .unwrap(),
+                SpillInstallation::Installed
+            );
+            assert_eq!(row_owner.get(&1).unwrap().committed, state.committed);
+            assert_point_value(&old, &arena, 41);
+            assert_point_value(&current, &arena, 88);
+            for (id, lsn, value) in [(0, 7, 41), (1, 9, 88)] {
+                let new = storage
+                    .retain_spilled_row(table, 1, 7, SpillGenerationId::fixture(id), lsn)
+                    .unwrap();
+                assert_point_value(&new, &arena, value);
+            }
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert_eq!(retained, roots[..2]);
+            assert_eq!(
+                storage
+                    .merge_spill_pair(&target, 0, (roots[0], roots[1]), Some(roots[2]))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            drop(version_owner);
+            drop(row_owner);
+            drop(old);
+            drop(current);
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stable_spill_generation_receipts_reject_foreign_and_retired_tables() {
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("receipt", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let mut other_budget = test_budget(&config);
+        let other = Storage::new(&config, &mut other_budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let receipt = storage
+                .reserve_spill_generation(
+                    table,
+                    storage.table(table).created_at(),
+                    storage.table(table).rewrite_generation(),
+                )
+                .unwrap();
+            assert_eq!(
+                other
+                    .append_spill_through(&receipt, handle(1), 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            assert_eq!(
+                storage
+                    .append_spill_through(&receipt, handle(1), 7)
+                    .unwrap(),
+                SpillInstallation::Installed
+            );
+            storage.clear_spill_publication(&receipt.target).unwrap();
+            assert_eq!(
+                storage
+                    .append_spill_through(&receipt, handle(5), 9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            let pending = storage
+                .reserve_spill_generation(
+                    table,
+                    storage.table(table).created_at(),
+                    storage.table(table).rewrite_generation(),
+                )
+                .unwrap();
+            storage.commit_drop(table);
+            assert_eq!(
+                storage
+                    .create_table(make_def("replacement", &[("id", ColType::Text, true)]))
+                    .unwrap(),
+                table
+            );
+            assert_eq!(
+                storage
+                    .append_spill_through(&pending, handle(9), 11)
+                    .unwrap(),
+                SpillInstallation::RetiredTable
+            );
+            assert_eq!(
+                storage.clear_spill_publication(&pending.target).unwrap(),
+                SpillInstallation::RetiredTable
+            );
+            assert!(storage.table(table).spill_generations().is_empty());
+        });
     }
 
     #[test]
@@ -4114,7 +4634,7 @@ mod tests {
             super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
         state.committed = Some(super::super::RowHome::Spilled {
             len: 7,
-            sst: 0,
+            sst: crate::storage::SpillGenerationId::fixture(0),
             commit_lsn: 7,
         });
         state.checkpoint_change_lsn = 7;
@@ -4186,7 +4706,7 @@ mod tests {
             super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 9);
         state.committed = Some(super::super::RowHome::Spilled {
             len: 7,
-            sst: 1,
+            sst: crate::storage::SpillGenerationId::fixture(1),
             commit_lsn: 9,
         });
         state.checkpoint_change_lsn = 9;
@@ -4200,7 +4720,7 @@ mod tests {
                 generations.replace(1, [roots[2]].into_iter()).unwrap();
                 rows.get_mut(&1).unwrap().committed = Some(super::super::RowHome::Spilled {
                     len: 7,
-                    sst: 0,
+                    sst: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 9,
                 });
             }
@@ -4951,7 +5471,7 @@ mod tests {
             let mut row = RowState::committed_only_at(RowLoc::test(0, length), 9);
             row.committed = Some(RowHome::Spilled {
                 len: length,
-                sst: 1,
+                sst: crate::storage::SpillGenerationId::fixture(1),
                 commit_lsn: 9,
             });
             storage.tables[table].rows.insert(1, row).unwrap();

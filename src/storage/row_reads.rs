@@ -986,6 +986,7 @@ mod tests {
                 super::super::SpillVersion {
                     len: Some(4),
                     member: 0,
+                    generation: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 9,
                 },
             ));

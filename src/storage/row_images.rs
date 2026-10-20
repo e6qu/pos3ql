@@ -269,7 +269,7 @@ impl<'arena> TableRowSnapshot<'arena> {
                 (
                     read.commit_lsn,
                     OrderedVersionKind::CommittedSpilled,
-                    read.member,
+                    read.member.encoded(),
                     read.len,
                 )
             }
@@ -560,7 +560,7 @@ impl OrderedRowSnapshot<'_, '_> {
                     roots,
                     self.rowid,
                     self.len,
-                    self.offset_or_member,
+                    super::spill_generations::SpillGenerationId::from_record(self.offset_or_member),
                     self.version,
                 )
                 .map(VisibleRowHome::spilled)
@@ -947,8 +947,17 @@ mod tests {
             slot,
             1,
         );
-        let spilled =
-            VisibleRowHome::spilled(storage.retain_spilled_row(slot, u64::MAX, 4, 0, 4).unwrap());
+        let spilled = VisibleRowHome::spilled(
+            storage
+                .retain_spilled_row(
+                    slot,
+                    u64::MAX,
+                    4,
+                    crate::storage::SpillGenerationId::fixture(0),
+                    4,
+                )
+                .unwrap(),
+        );
         crate::mem::guard::forbid_alloc(|| {
             let resident = table.retain(1, &image).unwrap();
             let object = table.retain(u64::MAX, &spilled).unwrap();

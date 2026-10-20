@@ -683,9 +683,25 @@ back a write does not change its logical resume position. Eviction sends
 unprocessed rows through paced SST merging. Jobs restart if committed input or
 the table identity changes.
 
-Full SST rewrites and adjacent-generation merges remap retained committed
-versions, including their exact commit positions and deletion markers. Paced
-merges keep the historical baseline, and byte scans skip versions newer than
+Saved-file references use table-local identities rather than positions in a
+file list. An adjacent merge publishes one file covering both input identities;
+full replacement covers the earlier identities. Publication holds short table
+and file-list guards without walking rows or locking the row-version pool.
+Existing reports retain their original files and identity mapping.
+
+For example, a report reading yesterday's order values can continue while
+maintenance merges order files. New queries read the merged file. Neither the
+report's selected values nor the row references need to change.
+
+Identities are reserved before publishing a durable checkpoint. A failed attempt
+consumes its reservation; clearing a list never reuses identities. The 32-bit
+table-local identity limit returns `54000` with
+`table SST generation identity space exhausted` before publication. Pending
+installs belong to their storage instance, table lifetime and rewrite revision;
+they cannot install into a replacement table. Their controls and reader mappings
+are included in startup memory reservations. Durable file bytes are unchanged.
+
+Paced merges keep the historical baseline, and byte scans skip versions newer than
 the selected snapshot. Complete rewrites with historical object versions remain
 explicitly guarded until a complete historical source exists. Merge scratch
 exhaustion returns `54000`.

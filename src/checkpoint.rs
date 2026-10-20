@@ -453,20 +453,27 @@ impl CommitBatchId {
 }
 
 /// A spill-list update awaiting the manifest publish.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SlotInstall {
     Append {
+        reservation: crate::storage::SpillGenerationReservation,
         handle: SstHandle,
         through_lsn: u64,
     },
     Replace {
-        handle: Option<SstHandle>,
+        reservation: crate::storage::SpillGenerationReservation,
+        handle: SstHandle,
         through_lsn: u64,
+    },
+    Clear {
+        target: crate::storage::SpillPublication,
     },
     /// Paced compaction merged the adjacent pair at list positions
     /// (`at`, `at + 1`) into one (`None` when everything in the pair was
-    /// deleted): remap in-memory spill indexes.
+    /// deleted). Existing row references retain their generation identities.
     MergePair {
+        target: crate::storage::SpillPublication,
+        expected: (SstHandle, SstHandle),
         at: usize,
         handle: Option<SstHandle>,
     },
@@ -9905,15 +9912,22 @@ impl Checkpointer {
             let completed = self.merge_done[slot].as_ref().and_then(|done| {
                 (pair_at(&self.prev_scratch[slot], done.at)
                     == Some((done.old0.handle, done.old1.handle)))
-                .then_some((done.at, done.merged))
+                .then_some((done.at, done.merged, (done.old0.handle, done.old1.handle)))
             });
-            if let Some((at, merged)) = completed {
+            if let Some((at, merged, expected)) = completed {
+                let target = storage.capture_spill_publication(
+                    slot,
+                    storage.table(slot).created_at(),
+                    storage.table(slot).rewrite_generation(),
+                )?;
                 self.prev_scratch[slot].replace_pair(at, merged);
                 self.pending_installs
                     .retain(|(s, i)| !(*s == slot && matches!(i, SlotInstall::MergePair { .. })));
                 self.pending_installs.push((
                     slot,
                     SlotInstall::MergePair {
+                        target,
+                        expected,
                         at,
                         handle: merged.map(|member| member.handle),
                     },
@@ -12414,24 +12428,31 @@ impl Checkpointer {
                     cleanup_rows,
                 });
                 if row_position < self.pending_installs.len() {
-                    let (slot, install) = self.pending_installs[row_position];
+                    let (slot, install) = self.pending_installs[row_position].clone();
                     if self.captured_table_current(storage, slot) {
                         match install {
                             SlotInstall::Append {
+                                reservation,
                                 handle,
                                 through_lsn,
-                            } => storage.append_spill_through(slot, handle, through_lsn)?,
+                            } => storage.append_spill_through(&reservation, handle, through_lsn)?,
                             SlotInstall::Replace {
-                                handle: Some(handle),
+                                reservation,
+                                handle,
                                 through_lsn,
-                            } => storage.collapse_spill_through(slot, handle, through_lsn)?,
-                            SlotInstall::Replace { handle: None, .. } => {
-                                storage.set_spill_list(slot, &[])
+                            } => {
+                                storage.collapse_spill_through(&reservation, handle, through_lsn)?
                             }
-                            SlotInstall::MergePair { at, handle } => {
-                                storage.merge_spill_pair(slot, at, handle)
+                            SlotInstall::Clear { target } => {
+                                storage.clear_spill_publication(&target)?
                             }
-                        }
+                            SlotInstall::MergePair {
+                                target,
+                                expected,
+                                at,
+                                handle,
+                            } => storage.merge_spill_pair(&target, at, expected, handle)?,
+                        };
                     }
                     self.manifest_publication = Some(ManifestPublication::Installing {
                         lsn,
@@ -12554,14 +12575,21 @@ impl Checkpointer {
             self.merge_done[slot].as_ref().and_then(|done| {
                 (pair_at(&self.slice_scratch, done.at)
                     == Some((done.old0.handle, done.old1.handle)))
-                .then_some((done.at, done.merged))
+                .then_some((done.at, done.merged, (done.old0.handle, done.old1.handle)))
             })
         });
-        let mut installs = [None; 2];
+        let mut installs = [const { None }; 2];
         let mut install_count = 0;
-        if let Some((at, merged)) = completed.flatten() {
+        if let Some((at, merged, expected)) = completed.flatten() {
+            let target = storage.capture_spill_publication(
+                slot,
+                layout.created_at,
+                layout.rewrite_generation,
+            )?;
             self.slice_scratch.replace_pair(at, merged);
             installs[install_count] = Some(SlotInstall::MergePair {
+                target,
+                expected,
                 at,
                 handle: merged.map(|prior| prior.handle),
             });
@@ -12845,6 +12873,11 @@ impl Checkpointer {
                 let crc = job.crc.finish();
                 match (job.delta, handle) {
                     (true, Some(handle)) => {
+                        let reservation = storage.reserve_spill_generation(
+                            job.slot,
+                            job.layout.created_at,
+                            job.layout.rewrite_generation,
+                        )?;
                         push_slot_list(
                             &mut self.slice_scratch,
                             PrevSst {
@@ -12854,6 +12887,7 @@ impl Checkpointer {
                             },
                         )?;
                         job.installs[job.install_count] = Some(SlotInstall::Append {
+                            reservation,
                             handle,
                             through_lsn: job.through_lsn,
                         });
@@ -12861,9 +12895,23 @@ impl Checkpointer {
                     }
                     (true, None) => {}
                     (false, handle) => {
-                        job.installs[job.install_count] = Some(SlotInstall::Replace {
-                            handle,
-                            through_lsn: job.through_lsn,
+                        job.installs[job.install_count] = Some(match handle {
+                            Some(handle) => SlotInstall::Replace {
+                                reservation: storage.reserve_spill_generation(
+                                    job.slot,
+                                    job.layout.created_at,
+                                    job.layout.rewrite_generation,
+                                )?,
+                                handle,
+                                through_lsn: job.through_lsn,
+                            },
+                            None => SlotInstall::Clear {
+                                target: storage.capture_spill_publication(
+                                    job.slot,
+                                    job.layout.created_at,
+                                    job.layout.rewrite_generation,
+                                )?,
+                            },
                         });
                         job.install_count += 1;
                         self.slice_scratch.clear();
@@ -12888,7 +12936,7 @@ impl Checkpointer {
         if !job.reuse_slice {
             self.pending_installs.retain(|(slot, _)| *slot != job.slot);
         }
-        for install in job.installs[..job.install_count].iter().copied().flatten() {
+        for install in job.installs[..job.install_count].iter().cloned().flatten() {
             self.pending_installs.push((job.slot, install));
         }
         self.prev_scratch[job.slot].copy_from(&self.slice_scratch);

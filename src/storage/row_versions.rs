@@ -356,23 +356,6 @@ pub(super) fn push_committed_version(
     Ok(())
 }
 
-/// Root retirement changes placement without changing version identity. Every
-/// committed home, including snapshot history, crosses this one boundary.
-pub(super) fn remap_committed_homes(
-    pool: &mut RowVersionPool<CommittedVersionSlot>,
-    state: &mut RowState,
-    remap: impl Fn(RowHome) -> RowHome,
-) {
-    state.committed = state.committed.map(&remap);
-    let mut slot = state.history.tail;
-    while let Some(index) = slot {
-        let entry = &mut pool[index];
-        debug_assert!(entry.used);
-        entry.version.home = entry.version.home.map(&remap);
-        slot = entry.previous;
-    }
-}
-
 pub(super) fn release_committed_chain(
     pool: &mut RowVersionPool<CommittedVersionSlot>,
     mut slot: Option<usize>,
@@ -676,7 +659,7 @@ mod tests {
             let saved = CommittedVersion {
                 home: Some(RowHome::Spilled {
                     len: 4,
-                    sst: 0,
+                    sst: crate::storage::SpillGenerationId::fixture(0),
                     commit_lsn: 5,
                 }),
                 lsn: 5,

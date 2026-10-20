@@ -73,16 +73,18 @@ impl TypeOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum CapturedTypeSlot {
-    Domain(u16),
-    Enum(u16),
-    Composite(u16),
+    Domain([u8; 2]),
+    Enum([u8; 2]),
+    Composite([u8; 2]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TypeIdentity {
-    pub(super) origin: TypeOrigin,
-    pub(super) database: DatabaseOid,
-    pub(super) created_at: u64,
+    // Byte arrays preserve the full identity without padding every copied
+    // column or routine parameter to eight-byte alignment.
+    origin: [u8; 8],
+    database: [u8; 4],
+    created_at: [u8; 8],
     source: CapturedTypeSlot,
 }
 
@@ -94,25 +96,45 @@ impl TypeIdentity {
         created_at: u64,
     ) -> Self {
         // Configuration caps each catalog within its PostgreSQL OID band.
-        let index = u16::try_from(slot.index()).expect("configured type slot is representable");
+        let index = u16::try_from(slot.index())
+            .expect("configured type slot is representable")
+            .to_le_bytes();
         let source = match slot {
             NamedTypeSlot::Domain(_) => CapturedTypeSlot::Domain(index),
             NamedTypeSlot::Enum(_) => CapturedTypeSlot::Enum(index),
             NamedTypeSlot::Composite(_) => CapturedTypeSlot::Composite(index),
         };
         Self {
-            origin,
-            database,
-            created_at,
+            origin: origin.0.to_le_bytes(),
+            database: database.get().to_le_bytes(),
+            created_at: created_at.to_le_bytes(),
             source,
         }
     }
 
+    fn origin(self) -> TypeOrigin {
+        TypeOrigin(u64::from_le_bytes(self.origin))
+    }
+
+    pub(super) fn database(self) -> DatabaseOid {
+        DatabaseOid::parse(i32::from_le_bytes(self.database)).expect("captured database identity")
+    }
+
+    pub(super) fn created_at(self) -> u64 {
+        u64::from_le_bytes(self.created_at)
+    }
+
     pub(super) fn slot(self) -> NamedTypeSlot {
         match self.source {
-            CapturedTypeSlot::Domain(index) => NamedTypeSlot::Domain(usize::from(index)),
-            CapturedTypeSlot::Enum(index) => NamedTypeSlot::Enum(usize::from(index)),
-            CapturedTypeSlot::Composite(index) => NamedTypeSlot::Composite(usize::from(index)),
+            CapturedTypeSlot::Domain(index) => {
+                NamedTypeSlot::Domain(usize::from(u16::from_le_bytes(index)))
+            }
+            CapturedTypeSlot::Enum(index) => {
+                NamedTypeSlot::Enum(usize::from(u16::from_le_bytes(index)))
+            }
+            CapturedTypeSlot::Composite(index) => {
+                NamedTypeSlot::Composite(usize::from(u16::from_le_bytes(index)))
+            }
         }
     }
 }
@@ -120,15 +142,25 @@ impl TypeIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoredTypeIdentity {
     source: CapturedTypeSlot,
-    pub(super) created_at: u64,
+    created_at: [u8; 8],
 }
 
 impl StoredTypeIdentity {
+    pub(super) fn created_at(self) -> u64 {
+        u64::from_le_bytes(self.created_at)
+    }
+
     pub(super) fn slot(self) -> NamedTypeSlot {
         match self.source {
-            CapturedTypeSlot::Domain(index) => NamedTypeSlot::Domain(usize::from(index)),
-            CapturedTypeSlot::Enum(index) => NamedTypeSlot::Enum(usize::from(index)),
-            CapturedTypeSlot::Composite(index) => NamedTypeSlot::Composite(usize::from(index)),
+            CapturedTypeSlot::Domain(index) => {
+                NamedTypeSlot::Domain(usize::from(u16::from_le_bytes(index)))
+            }
+            CapturedTypeSlot::Enum(index) => {
+                NamedTypeSlot::Enum(usize::from(u16::from_le_bytes(index)))
+            }
+            CapturedTypeSlot::Composite(index) => {
+                NamedTypeSlot::Composite(usize::from(u16::from_le_bytes(index)))
+            }
         }
     }
 }
@@ -149,14 +181,14 @@ impl UserTypeName {
         };
         if let Some(key) = stored {
             let (kind, slot) = match key.source {
-                CapturedTypeSlot::Domain(slot) => ('d', slot),
-                CapturedTypeSlot::Enum(slot) => ('e', slot),
-                CapturedTypeSlot::Composite(slot) => ('c', slot),
+                CapturedTypeSlot::Domain(slot) => ('d', u16::from_le_bytes(slot)),
+                CapturedTypeSlot::Enum(slot) => ('e', u16::from_le_bytes(slot)),
+                CapturedTypeSlot::Composite(slot) => ('c', u16::from_le_bytes(slot)),
             };
             write!(
                 output,
                 "r:{kind}:{slot}:{}:{}",
-                key.created_at,
+                key.created_at(),
                 self.name.as_str()
             )
             .expect("bounded stored type name");
@@ -202,13 +234,13 @@ impl UserTypeName {
         let name = SqlName::parse(fields.next().ok_or_else(invalid)?)?;
         let source = match kind {
             "d" if usize::from(slot) < super::MAX_DOMAIN_CATALOG_SLOTS => {
-                CapturedTypeSlot::Domain(slot)
+                CapturedTypeSlot::Domain(slot.to_le_bytes())
             }
             "e" if usize::from(slot) < super::MAX_ENUM_CATALOG_SLOTS => {
-                CapturedTypeSlot::Enum(slot)
+                CapturedTypeSlot::Enum(slot.to_le_bytes())
             }
             "c" if usize::from(slot) < super::MAX_COMPOSITE_CATALOG_SLOTS => {
-                CapturedTypeSlot::Composite(slot)
+                CapturedTypeSlot::Composite(slot.to_le_bytes())
             }
             _ => return Err(invalid()),
         };
@@ -218,7 +250,10 @@ impl UserTypeName {
         Ok(Self {
             schema,
             name,
-            binding: TypeBinding::Stored(StoredTypeIdentity { source, created_at }),
+            binding: TypeBinding::Stored(StoredTypeIdentity {
+                source,
+                created_at: created_at.to_le_bytes(),
+            }),
         })
     }
 }
@@ -230,17 +265,22 @@ mod tests {
     #[test]
     fn captured_type_reference_layout_keeps_slots_in_their_oid_width() {
         use core::mem::size_of;
-        assert_eq!(size_of::<CapturedTypeSlot>(), 4);
-        assert_eq!(size_of::<TypeIdentity>(), 24);
-        assert!(size_of::<TypeBinding>() <= 32);
+        assert_eq!(size_of::<CapturedTypeSlot>(), 3);
+        assert_eq!(size_of::<TypeIdentity>(), 23);
+        assert!(size_of::<TypeBinding>() <= 24);
+        assert!(size_of::<Option<UserTypeName>>() <= 152);
         for source in [
             NamedTypeSlot::Domain(0),
             NamedTypeSlot::Enum(65535),
             NamedTypeSlot::Composite(1600),
         ] {
-            let identity =
-                TypeIdentity::new(TypeOrigin::new().unwrap(), DatabaseOid::POSTGRES, source, 1);
+            let origin = TypeOrigin(u64::MAX);
+            let database = DatabaseOid::parse(i32::MAX).unwrap();
+            let identity = TypeIdentity::new(origin, database, source, u64::MAX);
             assert_eq!(identity.slot(), source);
+            assert_eq!(identity.origin(), origin);
+            assert_eq!(identity.database(), database);
+            assert_eq!(identity.created_at(), u64::MAX);
         }
     }
 
@@ -385,7 +425,7 @@ impl TypeCatalog {
     ) -> Result<Option<TypeSnapshot>, SqlError> {
         match identity.binding {
             TypeBinding::Captured(key) => {
-                if key.origin != self.origin || key.database != database {
+                if key.origin() != self.origin || key.database() != database {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
                         "captured type reference belongs to a different catalog"
@@ -399,8 +439,8 @@ impl TypeCatalog {
                 Ok(self
                     .type_snapshot(key.slot(), transaction)?
                     .filter(|snapshot| {
-                        snapshot.identity.database == database
-                            && snapshot.identity.created_at == key.created_at
+                        snapshot.identity.database() == database
+                            && snapshot.identity.created_at() == key.created_at()
                     }))
             }
             TypeBinding::Declaration => self.lookup_reference_name(identity, database, transaction),
@@ -608,7 +648,7 @@ impl super::Storage {
             if let Some(identity) = name
                 && let TypeBinding::Captured(key) = identity.binding
             {
-                if key.origin != origin || key.database != source {
+                if key.origin() != origin || key.database() != source {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
                         "template type reference belongs to a different catalog"

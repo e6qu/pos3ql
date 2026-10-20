@@ -53006,8 +53006,11 @@ mod tests {
     fn column_metadata_stays_within_recovery_stack_budget() {
         assert!(
             core::mem::size_of::<ColumnMeta>() <= 512,
-            "column metadata occupies {} bytes",
-            core::mem::size_of::<ColumnMeta>()
+            "column metadata: {} bytes; type reference: {}; default: {}; value: {}",
+            core::mem::size_of::<ColumnMeta>(),
+            core::mem::size_of::<Option<UserTypeName>>(),
+            core::mem::size_of::<ColumnDefault>(),
+            core::mem::size_of::<OwnedDatum>()
         );
     }
 

@@ -44,7 +44,8 @@ impl TypeReferenceMove {
     }
 
     pub(super) fn applies_to(self, identity: TableIdentity) -> bool {
-        identity.database == self.identity.database && identity.existence != CatalogDdlState::Absent
+        identity.database == self.identity.database()
+            && identity.existence != CatalogDdlState::Absent
     }
 
     fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
@@ -55,7 +56,7 @@ impl TypeReferenceMove {
             TypeBinding::Captured(key) => return key == self.identity,
             TypeBinding::Stored(key) => {
                 return key.slot() == self.identity.slot()
-                    && key.created_at == self.identity.created_at;
+                    && key.created_at() == self.identity.created_at();
             }
             TypeBinding::Polymorphic(_) => return false,
             TypeBinding::Declaration => {}
@@ -316,7 +317,7 @@ impl TypePublication {
                     movement.rewrite_catalog(&mut types);
                     for comment in comments.entries.iter_mut().filter(|comment| {
                         comment.used
-                            && comment.database == Some(movement.identity.database)
+                            && comment.database == Some(movement.identity.database())
                             && comment.class == CommentClass::Type
                             && comment.schema == movement.prior.schema
                             && comment.name == movement.prior.name
@@ -356,7 +357,7 @@ impl Storage {
 impl TypeReferenceMove {
     fn rewrite_catalog(self, catalog: &mut TypeCatalog) {
         for composite in catalog.composites.iter_mut().filter(|composite| {
-            composite.database == self.identity.database
+            composite.database == self.identity.database()
                 && composite.ddl_state != CatalogDdlState::Absent
         }) {
             for field in composite.fields.iter_mut().take(composite.n_fields) {
@@ -369,7 +370,8 @@ impl TypeReferenceMove {
             }
         }
         for domain in catalog.domains.iter_mut().filter(|domain| {
-            domain.database == self.identity.database && domain.ddl_state != CatalogDdlState::Absent
+            domain.database == self.identity.database()
+                && domain.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_domain(
                 domain.base,
@@ -388,7 +390,7 @@ impl TypeReferenceMove {
 
     fn rewrite_operators(self, catalog: &mut super::OperatorCatalog) {
         for operator in catalog.operators.iter_mut().filter(|operator| {
-            operator.database == self.identity.database
+            operator.database == self.identity.database()
                 && operator.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_operator(&mut operator.definition);
@@ -397,7 +399,8 @@ impl TypeReferenceMove {
             }
         }
         for family in catalog.families.iter_mut().filter(|family| {
-            family.database == self.identity.database && family.ddl_state != CatalogDdlState::Absent
+            family.database == self.identity.database()
+                && family.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_family(&mut family.definition);
             if let Some(pending) = &mut family.pending {
@@ -405,7 +408,7 @@ impl TypeReferenceMove {
             }
         }
         for class in catalog.classes.iter_mut().filter(|class| {
-            class.database == self.identity.database && class.ddl_state != CatalogDdlState::Absent
+            class.database == self.identity.database() && class.ddl_state != CatalogDdlState::Absent
         }) {
             self.rewrite_class(&mut class.definition);
             if let Some(pending) = &mut class.pending {
@@ -416,7 +419,7 @@ impl TypeReferenceMove {
 
     fn rewrite_casts(self, casts: &mut crate::mem::fixed_vec::FixedVec<super::CastDef>) {
         for cast in casts.iter_mut().filter(|cast| {
-            cast.database == self.identity.database && cast.ddl_state != CatalogDdlState::Absent
+            cast.database == self.identity.database() && cast.ddl_state != CatalogDdlState::Absent
         }) {
             super::type_contracts::CatalogTypes::Cast(cast)
                 .for_each(|result| self.rewrite_result(result));
@@ -425,7 +428,7 @@ impl TypeReferenceMove {
 
     fn rewrite_routines(self, routines: &mut crate::mem::fixed_vec::FixedVec<super::RoutineDef>) {
         for routine in routines.iter_mut().filter(|routine| {
-            routine.database == self.identity.database
+            routine.database == self.identity.database()
                 && routine.ddl_state != CatalogDdlState::Absent
         }) {
             super::type_contracts::CatalogTypes::Routine(routine)

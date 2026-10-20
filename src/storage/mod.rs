@@ -31251,14 +31251,11 @@ impl Storage {
         }
     }
 
-    pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
+    pub(crate) fn clear_table_dirty_at_generation(&mut self, slot: usize, generation: u64) {
         let table = &mut self.tables[slot];
         let mut publication = table.publication();
         if publication.generation == generation {
             publication.dirty = false;
-            for (_, state) in table.rows.write().iter_mut() {
-                state.checkpoint_change_lsn = 0;
-            }
         }
     }
 
@@ -60007,7 +60004,14 @@ mod tests {
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
-        storage.clear_table_dirty_through(slot, captured);
+        storage.finish_row_cleanup(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 42,
+                generation: captured,
+            },
+            RowCleanupTarget::Table(slot),
+        );
+        storage.clear_table_dirty_at_generation(slot, captured);
         assert!(storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
@@ -60018,7 +60022,14 @@ mod tests {
             42
         );
         let current = storage.table(slot).generation();
-        storage.clear_table_dirty_through(slot, current);
+        storage.finish_row_cleanup(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 42,
+                generation: current,
+            },
+            RowCleanupTarget::Table(slot),
+        );
+        storage.clear_table_dirty_at_generation(slot, current);
         assert!(!storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]

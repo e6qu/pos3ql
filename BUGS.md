@@ -4,7 +4,7 @@ Record only defects whose repair is prevented by an external blocker or genuine
 intractability. Fix every fixable defect in the PR that finds it. Planned work
 and incomplete architecture belong in [PLAN.md](PLAN.md).
 
-No externally blocked defects are currently recorded. Fixable failures stay in
+No externally blocked defects are currently recorded. Fixable failures, including test-fixture defects, are repaired in
 the PR that finds them. Planned work and its acceptance checks belong in
 [PLAN.md](PLAN.md).
 

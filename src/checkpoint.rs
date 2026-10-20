@@ -996,7 +996,7 @@ impl TemporarySpiller {
             }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
-        storage.clear_table_dirty_through(slot, generation);
+        storage.clear_table_dirty_at_generation(slot, generation);
         self.reclaim(storage)?;
         Ok(Some(slot))
     }
@@ -12477,8 +12477,9 @@ impl Checkpointer {
                         if self.sliced_this_sweep[slot] {
                             let rows = cleanup_rows.get_or_insert_with(|| {
                                 RowCleanup::new(
-                                    RowCleanupTask::Tombstones {
+                                    RowCleanupTask::SavedMarkers {
                                         through_lsn: self.sliced_lsn[slot],
+                                        generation: self.sliced_generation[slot],
                                     },
                                     RowCleanupTarget::Table(slot),
                                 )
@@ -12499,7 +12500,7 @@ impl Checkpointer {
                                 return Ok(CheckpointStep::Working);
                             }
                         }
-                        storage.clear_table_dirty_through(slot, self.sliced_generation[slot]);
+                        storage.clear_table_dirty_at_generation(slot, self.sliced_generation[slot]);
                         if let Some(receipt) = self.checkpoint_statistics[slot].take() {
                             receipt.acknowledge(storage);
                         }

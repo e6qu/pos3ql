@@ -416,7 +416,7 @@ struct LocalCleanup {
 #[derive(Clone, Copy)]
 enum LocalCleanupSource {
     Checkpoint,
-    TemporaryTable(usize),
+    TemporaryTable { slot: usize, generation: u64 },
 }
 
 #[derive(Clone, Copy)]
@@ -432,7 +432,7 @@ impl LocalCleanupSource {
     fn target(self) -> RowCleanupTarget {
         match self {
             Self::Checkpoint => RowCleanupTarget::AllTables,
-            Self::TemporaryTable(table) => RowCleanupTarget::Table(table),
+            Self::TemporaryTable { slot, .. } => RowCleanupTarget::Table(slot),
         }
     }
 
@@ -440,7 +440,7 @@ impl LocalCleanupSource {
         RowCleanup::new(
             RowCleanupTask::SavedEntries(match self {
                 Self::Checkpoint => EntryCleanup::Pressured,
-                Self::TemporaryTable(_) => EntryCleanup::AllSaved,
+                Self::TemporaryTable { .. } => EntryCleanup::AllSaved,
             }),
             self.target(),
         )
@@ -9159,9 +9159,12 @@ impl Engine {
                         self.prepare_checkpoint_cleanup(cleanup.lsn);
                         RowCleanupTask::DurableHistory
                     }
-                    LocalCleanupSource::TemporaryTable(_) => RowCleanupTask::Tombstones {
-                        through_lsn: cleanup.lsn,
-                    },
+                    LocalCleanupSource::TemporaryTable { generation, .. } => {
+                        RowCleanupTask::SavedMarkers {
+                            through_lsn: cleanup.lsn,
+                            generation,
+                        }
+                    }
                 };
                 LocalCleanupPhase::Rows(RowCleanup::new(task, cleanup.source.target()))
             }
@@ -9181,10 +9184,9 @@ impl Engine {
                     }
                 }
                 match rows.task() {
-                    RowCleanupTask::Tombstones { .. } => LocalCleanupPhase::Rows(RowCleanup::new(
-                        RowCleanupTask::SnapshotHistory,
-                        cleanup.source.target(),
-                    )),
+                    RowCleanupTask::SavedMarkers { .. } => LocalCleanupPhase::Rows(
+                        RowCleanup::new(RowCleanupTask::SnapshotHistory, cleanup.source.target()),
+                    ),
                     RowCleanupTask::DurableHistory => LocalCleanupPhase::Compact,
                     RowCleanupTask::SnapshotHistory => LocalCleanupPhase::Rows(RowCleanup::new(
                         RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
@@ -9212,7 +9214,7 @@ impl Engine {
                 match cleanup.phase {
                     LocalCleanupPhase::Compact => {
                         let selection = match cleanup.source {
-                            LocalCleanupSource::TemporaryTable(_) => HeapCleanup::AllSaved,
+                            LocalCleanupSource::TemporaryTable { .. } => HeapCleanup::AllSaved,
                             LocalCleanupSource::Checkpoint
                                 if self.storage.heap.used() * 100
                                     >= self.storage.heap.capacity() * 50 =>
@@ -9877,7 +9879,10 @@ impl Engine {
             assert!(!self.compact_scratch.active());
             self.local_cleanup = Some(LocalCleanup {
                 lsn: self.storage.lsn(),
-                source: LocalCleanupSource::TemporaryTable(slot),
+                source: LocalCleanupSource::TemporaryTable {
+                    slot,
+                    generation: self.storage.table(slot).generation(),
+                },
                 phase: LocalCleanupPhase::Prepare,
             });
             return if retried_upload {

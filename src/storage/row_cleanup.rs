@@ -31,7 +31,7 @@ pub(crate) enum EntryCleanup {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RowCleanupTask {
-    Tombstones { through_lsn: u64 },
+    SavedMarkers { through_lsn: u64, generation: u64 },
     DurableHistory,
     SnapshotHistory,
     HeapRows(HeapCleanup),
@@ -167,9 +167,12 @@ impl Storage {
                 .then(|| try_mutex(&self.snapshots, "snapshot state lock poisoned"))
                 .transpose()?;
             let definition = table.definition.try_read_for_batch()?;
-            let publication = matches!(task, RowCleanupTask::HeapRows(_))
-                .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
-                .transpose()?;
+            let publication = matches!(
+                task,
+                RowCleanupTask::HeapRows(_) | RowCleanupTask::SavedMarkers { .. }
+            )
+            .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
+            .transpose()?;
             let generations = table.spill_generations.try_read_for_batch()?;
             let versions = matches!(
                 task,
@@ -196,7 +199,7 @@ impl Storage {
         let through_lsn = generations.published_through();
         let eligible = match task {
             RowCleanupTask::DurableHistory => live && !temporary && through_lsn.is_some(),
-            RowCleanupTask::SnapshotHistory | RowCleanupTask::Tombstones { .. } => live,
+            RowCleanupTask::SnapshotHistory | RowCleanupTask::SavedMarkers { .. } => live,
             RowCleanupTask::HeapRows(selection) => {
                 live && !generations.is_empty()
                     && match selection {
@@ -235,7 +238,15 @@ impl Storage {
                 continue;
             };
             match task {
-                RowCleanupTask::Tombstones { through_lsn } => {
+                RowCleanupTask::SavedMarkers {
+                    through_lsn,
+                    generation,
+                } => {
+                    if publication.as_ref().unwrap().generation == generation
+                        && state.checkpoint_change_lsn <= through_lsn
+                    {
+                        state.checkpoint_change_lsn = 0;
+                    }
                     if state.committed.is_none()
                         && state.committed_lsn <= through_lsn
                         && state.history.is_empty()
@@ -395,6 +406,15 @@ mod tests {
             storage
                 .append_spill_through(table, saved_handle(table as u8 * 4 + 1), 7)
                 .unwrap();
+            let generation = storage.tables[table].generation();
+            storage.finish_row_cleanup(
+                RowCleanupTask::SavedMarkers {
+                    through_lsn: 7,
+                    generation,
+                },
+                RowCleanupTarget::Table(table),
+            );
+            storage.clear_table_dirty_at_generation(table, generation);
         }
         storage.set_lsn(7);
         (storage, first, second)
@@ -408,7 +428,7 @@ mod tests {
                     !state.history.is_empty()
                 }
                 RowCleanupTask::HeapRows(_) => matches!(state.committed, Some(RowHome::Heap(_))),
-                RowCleanupTask::SavedEntries(_) | RowCleanupTask::Tombstones { .. } => true,
+                RowCleanupTask::SavedEntries(_) | RowCleanupTask::SavedMarkers { .. } => true,
             })
             .count()
     }
@@ -421,7 +441,7 @@ mod tests {
         task: RowCleanupTask,
     ) {
         match task {
-            RowCleanupTask::Tombstones { .. } => {
+            RowCleanupTask::SavedMarkers { .. } => {
                 for table in [first, second] {
                     for (_, state) in storage.tables[table].rows.write().iter_mut() {
                         state.committed = None;
@@ -450,7 +470,10 @@ mod tests {
     }
 
     const BOUNDED_TASKS: [RowCleanupTask; 8] = [
-        RowCleanupTask::Tombstones { through_lsn: 7 },
+        RowCleanupTask::SavedMarkers {
+            through_lsn: 7,
+            generation: 0,
+        },
         RowCleanupTask::DurableHistory,
         RowCleanupTask::SnapshotHistory,
         RowCleanupTask::HeapRows(HeapCleanup::Durable),
@@ -593,6 +616,70 @@ mod tests {
                 11
             );
         });
+        let (storage, first, _) = bounded_fixture(4);
+        for (_, state) in storage.tables[first].rows.write().iter_mut() {
+            state.checkpoint_change_lsn = 7;
+        }
+        let generation = storage.tables[first].generation();
+        let mut markers = RowCleanup::new(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 7,
+                generation,
+            },
+            RowCleanupTarget::Table(first),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut markers,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Advanced
+            );
+            assert_eq!(
+                storage.tables[first]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .checkpoint_change_lsn,
+                0
+            );
+            update(&storage, first, 1, 30, 8, 9);
+            update(&storage, first, 2, 40, 10, 11);
+            assert_eq!(
+                storage.advance_row_cleanup(
+                    &mut markers,
+                    core::num::NonZeroUsize::new(64).unwrap(),
+                    MaintenanceMode::Background,
+                ),
+                MaintenanceStep::Complete
+            );
+            for (rowid, expected) in [(1, 9), (2, 11), (3, 7), (4, 7)] {
+                assert_eq!(
+                    storage.tables[first]
+                        .rows
+                        .get(&rowid)
+                        .unwrap()
+                        .checkpoint_change_lsn,
+                    expected
+                );
+            }
+            storage.finish_row_cleanup(
+                RowCleanupTask::SavedMarkers {
+                    through_lsn: 11,
+                    generation: storage.tables[first].generation(),
+                },
+                RowCleanupTarget::Table(first),
+            );
+            assert!(
+                storage.tables[first]
+                    .rows
+                    .read()
+                    .iter()
+                    .all(|(_, state)| state.checkpoint_change_lsn == 0)
+            );
+        });
     }
 
     #[test]
@@ -695,7 +782,14 @@ mod tests {
             .append_spill_through(first, saved_handle(1), 7)
             .unwrap();
         let generation = storage.tables[first].generation();
-        storage.clear_table_dirty_through(first, generation);
+        storage.finish_row_cleanup(
+            RowCleanupTask::SavedMarkers {
+                through_lsn: 7,
+                generation,
+            },
+            RowCleanupTarget::Table(first),
+        );
+        storage.clear_table_dirty_at_generation(first, generation);
         crate::mem::guard::forbid_alloc(|| {
             storage.register_snapshot(99, 7).unwrap();
             update(&storage, first, 1, 20, 8, 9);
@@ -891,7 +985,10 @@ mod tests {
                 .insert((DELETED + retained.len()) as u64, later_delete)
                 .unwrap();
             storage.finish_row_cleanup(
-                RowCleanupTask::Tombstones { through_lsn: 7 },
+                RowCleanupTask::SavedMarkers {
+                    through_lsn: 7,
+                    generation: 0,
+                },
                 RowCleanupTarget::Table(table),
             );
             assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
@@ -905,7 +1002,10 @@ mod tests {
                 );
             }
             storage.finish_row_cleanup(
-                RowCleanupTask::Tombstones { through_lsn: 7 },
+                RowCleanupTask::SavedMarkers {
+                    through_lsn: 7,
+                    generation: 0,
+                },
                 RowCleanupTarget::Table(table),
             );
             assert_eq!(storage.tables[table].rows.len(), retained.len() + 1);
@@ -916,7 +1016,10 @@ mod tests {
                 Some(later_delete)
             );
             storage.finish_row_cleanup(
-                RowCleanupTask::Tombstones { through_lsn: 8 },
+                RowCleanupTask::SavedMarkers {
+                    through_lsn: 8,
+                    generation: 0,
+                },
                 RowCleanupTarget::Table(table),
             );
             assert_eq!(storage.tables[table].rows.len(), retained.len());

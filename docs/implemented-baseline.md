@@ -852,8 +852,10 @@ evaluates each map entry once, including collision chains that wrap around.
 Pending changes and retained history stay resident. Ordinary eviction also keeps
 heap rows, deletion markers and unpublished saved rows. Checkpoint installation
 removes only deletion markers covered by its captured log position, in turns of
-at most 64 row-map slots; later deletions remain for a later save. Its retained
-cursor and exact next table stay with the durable publication until installation
+at most 64 row-map slots; later deletions remain for a later save. The same
+pass clears saved-change markers only while the captured table generation still
+matches. A write between turns keeps the table dirty and its new marker intact.
+Its retained cursor and exact next table stay with the durable publication until installation
 finishes. The cursor is included in startup manifest-state accounting.
 
 **User example:** cleanup can release an order's old metadata while a report

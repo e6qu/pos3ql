@@ -89508,7 +89508,7 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
                 RowCleanupTask::DurableHistory => 0,
                 RowCleanupTask::HeapRows(_) => 1,
                 RowCleanupTask::SavedEntries(_) => 2,
-                RowCleanupTask::SnapshotHistory | RowCleanupTask::Tombstones { .. } => {
+                RowCleanupTask::SnapshotHistory | RowCleanupTask::SavedMarkers { .. } => {
                     unreachable!()
                 }
             };

@@ -244,7 +244,6 @@ impl TypePublication {
         let mut slots = scratch
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
             .expect("startup type publication reservation covers every table");
-        let mut install_source = Some(install_source);
         loop {
             let mut owners = TableAttempt { slots: &mut slots };
             let attempt: Result<_, LockWait<'_>> = (|| {
@@ -299,7 +298,7 @@ impl TypePublication {
                             .checked_add(1)
                             .expect("table publication generation exhausted");
                     }
-                    install_source.take().expect("source installs once")(&mut types, &mut members);
+                    install_source(&mut types, &mut members);
                     for owner in owners.slots.iter_mut().flatten() {
                         assert!(
                             storage

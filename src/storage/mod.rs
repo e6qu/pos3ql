@@ -39903,10 +39903,13 @@ impl Storage {
         images: &mut EnumMemberImages,
         slot: usize,
         txid: u32,
-    ) -> Option<(SqlName, SqlName, SqlName, SqlName)> {
-        let pending = catalog.enums[slot]
+    ) -> bool {
+        let Some(pending) = catalog.enums[slot]
             .pending_definition
-            .filter(|pending| pending.txid == txid)?;
+            .filter(|pending| pending.txid == txid)
+        else {
+            return false;
+        };
         let definition = catalog.enums[slot].definition_for(txid);
         let previous = catalog.enums[slot];
         catalog.enums[slot] = definition;
@@ -39922,12 +39925,7 @@ impl Storage {
         if let Some(image) = previous.member_image {
             images.release(image);
         }
-        (definition.schema != previous.schema || definition.name != previous.name).then_some((
-            previous.schema,
-            previous.name,
-            definition.schema,
-            definition.name,
-        ))
+        definition.schema != previous.schema || definition.name != previous.name
     }
 
     pub(crate) fn replay_enum_identity(

@@ -40,7 +40,7 @@ impl Storage {
             .lock()
             .expect("enum member-image lock poisoned");
         assert!(
-            Self::install_enum_alter_locked(&mut catalog, &mut images, slot, txid).is_none(),
+            !Self::install_enum_alter_locked(&mut catalog, &mut images, slot, txid),
             "member publication cannot move a type identity"
         );
         EnumMemberPublication::Complete

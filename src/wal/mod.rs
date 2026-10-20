@@ -7213,11 +7213,6 @@ fn decode_op_inner<'a>(
                 }
                 1 => {
                     at += 1;
-                    let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-                    at += 8;
-                    if created_at == 0 {
-                        return None;
-                    }
                     let name = SqlName::parse(take_name(&mut at)?).ok()?;
                     let handler = match *payload.get(at)? {
                         0 => crate::storage::foreign::ForeignDataHandler::None,
@@ -9696,6 +9691,11 @@ fn decode_op_inner<'a>(
             let wide_fields = kind == KIND_CREATE_COMPOSITE_V2;
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            if created_at == 0 {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let n_fields = if wide_fields {

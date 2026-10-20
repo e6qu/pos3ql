@@ -598,6 +598,7 @@ mod tests {
         );
         definition.columns[0].user_type = Some(identity);
         let table = storage.create_table(definition).unwrap();
+        let identity = storage.table_def(table, 0).columns()[0].user_type.unwrap();
         let unrelated = storage
             .create_table(make_def("unrelated", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -671,6 +672,7 @@ mod tests {
         );
         definition.columns[0].user_type = Some(before);
         let table = storage.create_table(definition).unwrap();
+        let captured = storage.table_def(table, 0).columns()[0].user_type;
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .stage_enum_alter(
@@ -691,10 +693,7 @@ mod tests {
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
             assert_eq!(storage.enum_for(slot, 77).members().len(), 2);
             assert_eq!(selected.sort_of("paid"), Some(2.0));
-            assert_eq!(
-                storage.table_def(table, 0).columns()[0].user_type,
-                Some(before)
-            );
+            assert_eq!(storage.table_def(table, 0).columns()[0].user_type, captured);
             assert_eq!(
                 storage.commit_enum_members(slot, 88),
                 EnumMemberPublication::Complete
@@ -704,11 +703,14 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage.commit_enum_alter(slot, 77);
             assert_eq!(storage.enum_for(slot, 0).name, after.name);
-            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
-            assert_eq!(
-                storage.table_def(table, 0).columns()[0].user_type,
-                Some(after)
+            assert!(
+                storage.table_def(table, 0).columns()[0]
+                    .user_type
+                    .unwrap()
+                    .is_named(after.schema, after.name)
             );
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
+            assert_eq!(storage.table_def(table, 0).columns()[0].user_type, captured);
             assert_eq!(
                 storage
                     .declared_column_type(&storage.table_def(table, 0).columns()[0], 0)

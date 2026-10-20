@@ -11,7 +11,7 @@ use crate::sql_err;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
-pub enum StorageSetupError {
+pub(crate) enum StorageSetupError {
     Budget(BudgetError),
     TypeIdentitySpaceExhausted,
 }
@@ -52,12 +52,21 @@ impl TypeOrigin {
     }
 
     fn reserve(sequence: &AtomicU64) -> Result<Self, StorageSetupError> {
-        sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map(Self)
-            .map_err(|_| StorageSetupError::TypeIdentitySpaceExhausted)
+        let mut current = sequence.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .ok_or(StorageSetupError::TypeIdentitySpaceExhausted)?;
+            match sequence.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(value) => return Ok(Self(value)),
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 

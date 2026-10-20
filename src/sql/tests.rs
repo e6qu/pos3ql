@@ -39592,13 +39592,19 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         .storage
         .routine_slot_by_signature("public", "echo_count", &[ColType::Int4], 0)
         .expect("routine remains visible");
+    let captured = engine.storage.routine(echo_count).arguments()[0].user_type;
     assert_eq!(
-        engine.storage.routine(echo_count).arguments()[0].user_type,
-        Some(crate::storage::UserTypeName::declaration(
-            crate::storage::SqlName::parse("routine_type_target").unwrap(),
-            crate::storage::SqlName::parse("routine_count_moved").unwrap()
-        ))
+        captured,
+        engine
+            .storage
+            .routine_result_for_oid(crate::sql::types::oid::domain_oid(moved_domain as u16), 0)
+            .unwrap()
+            .user_type
     );
+    assert!(captured.unwrap().is_named(
+        crate::storage::SqlName::parse("routine_type_target").unwrap(),
+        crate::storage::SqlName::parse("routine_count_moved").unwrap()
+    ));
     assert_eq!(
         engine.storage.routine_type_oid(
             engine.storage.routine(echo_count).arguments()[0].ctype,
@@ -84437,12 +84443,11 @@ fn type_reference_moves_preserve_other_database_definitions_and_comments() {
         .unwrap();
     {
         let definition = engine.storage.table_def(table, 0);
-        assert_eq!(
-            definition.columns()[0].user_type,
-            Some(crate::storage::UserTypeName::declaration(
+        assert!(
+            definition.columns()[0].user_type.unwrap().is_named(
                 SqlName::parse("type_scope").unwrap(),
                 SqlName::parse("shared_domain").unwrap()
-            )),
+            ),
             "type rename changed another database"
         );
     }

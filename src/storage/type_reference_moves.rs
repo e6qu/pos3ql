@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn captured_type_references_reject_other_catalogs_and_invalid_representations() {
         for kind in KINDS {
-            let (storage, table, _, _) = fixture(kind);
+            let (mut storage, table, _, _) = fixture(kind);
             let (other, _, _, _) = fixture(kind);
             let definition = *storage.table_def(table, 0);
             crate::mem::guard::forbid_alloc(|| {
@@ -760,6 +760,25 @@ mod tests {
                     );
                 }
             });
+            storage.select_database(DatabaseOid::TEMPLATE1).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                for column in definition.columns() {
+                    assert_eq!(
+                        storage
+                            .bind_routine_result(
+                                RoutineResult {
+                                    ctype: column.ctype,
+                                    user_type: column.user_type,
+                                },
+                                0
+                            )
+                            .unwrap_err()
+                            .sqlstate,
+                        crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                    );
+                }
+            });
+            storage.select_database(DatabaseOid::POSTGRES).unwrap();
         }
     }
 

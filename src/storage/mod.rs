@@ -26,7 +26,7 @@ use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 use type_names::NamedTypeSlot;
-pub use type_references::StorageSetupError;
+pub(crate) use type_references::StorageSetupError;
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};

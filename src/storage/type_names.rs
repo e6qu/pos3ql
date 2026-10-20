@@ -170,7 +170,7 @@ mod tests {
         name: &str,
         txid: u32,
     ) -> Result<NamedTypeSlot, SqlError> {
-        let UserTypeName::declaration(schema, name) = identity(name);
+        let UserTypeName { schema, name, .. } = identity(name);
         match kind {
             NamedTypeSlot::Domain(_) => storage
                 .create_domain(
@@ -223,7 +223,7 @@ mod tests {
         name: &str,
         txid: u32,
     ) -> Result<(), SqlError> {
-        let UserTypeName::declaration(schema, name) = identity(name);
+        let UserTypeName { schema, name, .. } = identity(name);
         match slot {
             NamedTypeSlot::Domain(slot) => {
                 storage.stage_domain_identity(slot, schema, name, txid)?;

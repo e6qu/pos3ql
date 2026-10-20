@@ -253,6 +253,13 @@ pub(super) struct CommitControl {
     command_counter: u32,
 }
 
+pub(super) struct CacheCapacityWait {
+    pub(super) failure_epoch: Option<u64>,
+    pub(super) clock: super::datetime::StatementClock,
+    pub(super) deadline: i64,
+    pub(super) context: super::exec::PlpgsqlTransactionContext,
+}
+
 pub struct TxnState {
     staged_commit: Option<StagedCommit>,
     pub mode: TxnMode,
@@ -276,6 +283,7 @@ pub struct TxnState {
     snapshot_taken: bool,
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
+    pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
@@ -976,6 +984,7 @@ impl TxnState {
             snapshot_taken: false,
             transaction_start: None,
             suspended_statement: None,
+            cache_capacity_wait: None,
             checkpoint_request: None,
             command_id: 1,
             command_counter: 1,
@@ -1196,6 +1205,8 @@ impl TxnState {
     pub(crate) fn begin_statement_clock(&self) {
         if let Some(suspended) = &self.suspended_statement {
             super::datetime::restore_statement_clock(suspended.clock);
+        } else if let Some(wait) = &self.cache_capacity_wait {
+            super::datetime::restore_statement_clock(wait.clock);
         } else {
             super::datetime::begin_statement();
             if let Some(start) = self.transaction_start {
@@ -1271,12 +1282,16 @@ impl TxnState {
         self.suspended_statement
             .as_ref()
             .map(|suspended| suspended.deadline)
+            .or_else(|| self.cache_capacity_wait.as_ref().map(|wait| wait.deadline))
     }
 
     pub(super) fn suspended_statement_context(
         &self,
     ) -> Option<super::exec::PlpgsqlTransactionContext> {
-        self.suspended_statement.as_ref().map(|state| state.context)
+        self.suspended_statement
+            .as_ref()
+            .map(|state| state.context)
+            .or_else(|| self.cache_capacity_wait.as_ref().map(|wait| wait.context))
     }
 
     pub(super) fn suspend_statement(
@@ -1311,6 +1326,7 @@ impl TxnState {
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.cache_capacity_wait = None;
         self.checkpoint_request = None;
     }
 
@@ -2491,6 +2507,7 @@ impl TxnState {
         self.snapshot_taken = false;
         self.transaction_start = None;
         self.suspended_statement = None;
+        self.cache_capacity_wait = None;
         self.checkpoint_request = None;
         self.touched.clear();
         self.truncates.clear();

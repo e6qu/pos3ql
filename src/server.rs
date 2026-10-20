@@ -1233,7 +1233,7 @@ impl Server {
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
             let timeout = [
                 checkpoint_timeout,
-                self.next_lock_wait_timeout(),
+                self.next_parked_wait_timeout(),
                 self.next_replication_keepalive_timeout(),
                 self.next_termination_timeout(),
                 read_timeout,
@@ -1315,8 +1315,8 @@ impl Server {
                 if completed_block_read {
                     self.wake_io_waiters();
                 }
-                // A lock timeout can be the event that woke the reactor, with
-                // no socket readiness and no lock-generation change.
+                // A statement or lock timeout can wake the reactor without
+                // socket readiness or a resource-generation change.
                 self.wake_lock_waiters();
             }
             if let Err(error) = self.engine.advance_wal_publication(Instant::now()) {
@@ -1907,10 +1907,10 @@ impl Server {
         }
     }
 
-    fn next_lock_wait_timeout(&self) -> Option<Duration> {
+    fn next_parked_wait_timeout(&self) -> Option<Duration> {
         self.slots
             .iter()
-            .filter_map(|slot| slot.conn.lock_wait_remaining())
+            .filter_map(|slot| slot.conn.parked_wait_remaining())
             .min()
     }
 

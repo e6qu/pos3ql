@@ -1010,15 +1010,18 @@ impl Conn {
         if !self.parked {
             return None;
         }
-        let ready = match self.parked_wait {
-            crate::sql::StatementWait::Lock => {
-                self.parked_generation != generation || self.lock_timeout_expired()
-            }
-            crate::sql::StatementWait::ObjectIo => retry_waiters,
-            crate::sql::StatementWait::CacheCapacity => {
-                self.parked_generation != engine.cache_capacity_generation()
-            }
-        };
+        let ready = self
+            .statement_wait_remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+            || match self.parked_wait {
+                crate::sql::StatementWait::Lock => {
+                    self.parked_generation != generation || self.lock_timeout_expired()
+                }
+                crate::sql::StatementWait::ObjectIo => retry_waiters,
+                crate::sql::StatementWait::CacheCapacity => {
+                    self.parked_generation != engine.cache_capacity_generation()
+                }
+            };
         if !ready {
             return None;
         }
@@ -1040,12 +1043,36 @@ impl Conn {
         })
     }
 
-    pub(crate) fn lock_wait_remaining(&self) -> Option<Duration> {
-        if !self.parked || self.parked_wait != crate::sql::StatementWait::Lock {
+    pub(crate) fn parked_wait_remaining(&self) -> Option<Duration> {
+        if !self.parked {
             return None;
         }
-        self.parked_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        let lock = if self.parked_wait == crate::sql::StatementWait::Lock {
+            self.parked_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        } else {
+            None
+        };
+        [lock, self.statement_wait_remaining()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn statement_wait_remaining(&self) -> Option<Duration> {
+        if self.txn.staged_commit().is_some() {
+            return None;
+        }
+        self.txn
+            .suspended_statement_deadline()
+            .filter(|deadline| *deadline != 0)
+            .map(|deadline| {
+                Duration::from_micros(
+                    deadline
+                        .saturating_sub(crate::sql::datetime::now_micros())
+                        .max(0) as u64,
+                )
+            })
     }
 
     fn lock_timeout_expired(&self) -> bool {
@@ -5766,8 +5793,18 @@ mod tests {
                 "{sql}"
             );
         }
-        for (extended, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
-            let name = format!("cache-protocol-{extended}-{cancel}-{}", std::process::id());
+        for (extended, cancel, timeout) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let name = format!(
+                "cache-protocol-{extended}-{cancel}-{timeout}-{}",
+                std::process::id()
+            );
             let directory = std::env::temp_dir().join(&name);
             let mut config = Config::default_dev();
             config.data_dir = directory.to_string_lossy().into_owned();
@@ -5845,6 +5882,9 @@ mod tests {
             assert!(crate::mem::guard::forbid_alloc(
                 || other.cancel_parked(&mut engine)
             ));
+            if timeout {
+                request(&mut conn, &mut engine, "SET statement_timeout = '1s'");
+            }
             conn.send.clear();
             if extended {
                 conn.recv.append(&frontend(
@@ -5872,7 +5912,7 @@ mod tests {
                 Step::Parked
             ));
             assert_eq!(conn.parked_wait, crate::sql::StatementWait::CacheCapacity);
-            assert!(conn.lock_wait_remaining().is_none());
+            assert_eq!(conn.parked_wait_remaining().is_some(), timeout);
             assert!(!conn.lock_timeout_expired());
             let prefix = conn.send.readable().to_vec();
             assert!(
@@ -5881,7 +5921,27 @@ mod tests {
             );
             assert_eq!(conn.send.readable(), prefix);
             request(&mut other, &mut engine, "SELECT count(*) FROM cache_orders");
-            if cancel {
+            if timeout {
+                // Let the configured deadline expire without advancing cache
+                // capacity or notifying the connection of object I/O.
+                std::thread::sleep(
+                    conn.parked_wait_remaining().unwrap() + Duration::from_millis(1),
+                );
+                assert_eq!(conn.parked_wait_remaining(), Some(Duration::ZERO));
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, conn.parked_generation, false)
+                })
+                .unwrap();
+                assert_eq!(pending.after, After::Continue);
+                assert!(!conn.parked);
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(b"canceling statement due to statement timeout".len())
+                        .any(|bytes| bytes == b"canceling statement due to statement timeout")
+                );
+                assert!(conn.txn.suspended_statement_deadline().is_none());
+            } else if cancel {
                 assert!(crate::mem::guard::forbid_alloc(
                     || conn.cancel_parked(&mut engine)
                 ));
@@ -5892,6 +5952,7 @@ mod tests {
                         .any(|bytes| bytes == b"57014")
                 );
                 assert!(!conn.parked);
+                assert!(conn.txn.suspended_statement_deadline().is_none());
             } else {
                 let turn_bound = config.max_tables * config.table_rows * 8
                     + config.memtable_bytes / (64 << 10) * 4;

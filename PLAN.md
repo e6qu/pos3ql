@@ -24,6 +24,8 @@ Heap capture, copying, row-address updates and saved-row cleanup now use bounded
 turns. Queries retain readable bytes across a heap switch. Eligible writing
 commands can wait for an active reclaim task before their effects; reads and
 cancellation continue. Explicit CHECKPOINT and shutdown finish synchronously.
+Waiting preserves statement deadlines, and recovered maintenance errors do not
+poison later writes.
 See the [current contract and examples](docs/implemented-baseline.md).
 
 ## Remaining work
@@ -35,8 +37,10 @@ its rows or definitions. Cleanup should let ordinary queries run between turns.
 
 Finish protection for engine-wide publication, type-name changes and remaining
 table rewrites. Retain historical row, index and backup references before
-publishing replacements. Heap maintenance, pressure waits, capture and reader-history cleanup already use
-bounded turns. Metadata capture and some maintenance reads remain synchronous. Raising memory limits is not a completion criterion.
+publishing replacements. Heap maintenance, pressure waits, capture and
+reader-history cleanup already use bounded turns. Metadata capture and some
+maintenance reads remain synchronous. Raising memory limits is not a completion
+criterion.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

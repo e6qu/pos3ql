@@ -84945,7 +84945,7 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
             }
         })
     }
-    for extended in [false, true] {
+    for (extended, fail) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut engine, mut budget, config) = sliced_cleanup_fixture(
             if extended {
                 "cache-admission-extended"
@@ -84961,6 +84961,7 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
         writer.success(&mut engine, "CREATE SEQUENCE admission_sequence; CREATE TABLE admission_audit(id integer); \
             CREATE FUNCTION admission_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO admission_audit VALUES (NEW.id); RETURN NEW; END $$; \
             CREATE TRIGGER admission_insert AFTER INSERT ON cleanup_orders FOR EACH ROW EXECUTE FUNCTION admission_trigger()", true);
+        writer.success(&mut engine, "SET statement_timeout = '10s'", true);
         writer.send.clear();
         crate::mem::guard::forbid_alloc(|| {
             let garbage = [0u8; 8192];
@@ -84970,11 +84971,16 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
         });
         let lsn = engine.storage.lsn();
         start_sliced_cleanup(&mut engine, lsn);
+        // A recovered storage failure must not poison a later request when
+        // that request first reaches the heap-pressure admission boundary.
+        engine.remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "old storage failure"));
         let skip = usize::from(!extended);
         assert!(matches!(execute(&mut engine, &mut writer, extended, 0),
             ExecutionStatus::Blocked { completed_statements, wait: StatementWait::CacheCapacity, .. }
                 if completed_statements == skip));
-        let prefix = writer.send.readable().to_vec();
+        let mut prefix = writer.send.readable().to_vec();
+        let deadline = writer.transaction.suspended_statement_deadline().unwrap();
+        let clock = datetime::statement_micros();
         let journal = engine.journal_lsn();
         for _ in 0..2 {
             assert!(matches!(
@@ -84986,6 +84992,37 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
             ));
             assert_eq!(writer.send.readable(), prefix);
             assert_eq!(engine.journal_lsn(), journal);
+            assert_eq!(
+                writer.transaction.suspended_statement_deadline(),
+                Some(deadline)
+            );
+            assert_eq!(datetime::statement_micros(), clock);
+        }
+        if fail {
+            engine
+                .remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "new storage failure"));
+            assert_eq!(
+                execute(&mut engine, &mut writer, extended, skip),
+                ExecutionStatus::Complete
+            );
+            assert!(
+                writer
+                    .send
+                    .readable()
+                    .windows(b"new storage failure".len())
+                    .any(|bytes| bytes == b"new storage failure")
+            );
+            assert!(writer.transaction.cache_capacity_wait.is_none());
+            assert!(writer.transaction.suspended_statement_deadline().is_none());
+            writer.send.clear();
+            assert!(matches!(
+                execute(&mut engine, &mut writer, extended, 0),
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::CacheCapacity,
+                    ..
+                }
+            ));
+            prefix = writer.send.readable().to_vec();
         }
         let report = reader.success(
             &mut engine,
@@ -85008,17 +85045,20 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
             })
             .unwrap();
         }
-        let expected = if extended { "1001" } else { "1002" };
+        let (expected, sequence) = match (extended, fail) {
+            (true, _) => ("1001", "1"),
+            (false, false) => ("1002", "2"),
+            (false, true) => ("1003", "3"),
+        };
         assert!(!message_types(writer.send.readable()).contains(&b'E'));
+        assert!(writer.send.readable().starts_with(&prefix));
+        assert!(writer.transaction.cache_capacity_wait.is_none());
         let report = reader.success(
             &mut engine,
             "SELECT id FROM admission_audit; SELECT last_value FROM admission_sequence",
             true,
         );
-        assert_eq!(
-            data_rows(&report),
-            [expected, if extended { "1" } else { "2" }]
-        );
+        assert_eq!(data_rows(&report), [expected, sequence]);
     }
 }
 

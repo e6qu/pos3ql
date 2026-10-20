@@ -1,8 +1,8 @@
 # Blocked defects
 
 Only defects blocked by an external condition or a genuinely intractable repair
-belong here. Fix every other defect in the PR that finds it. Planned work and
-acceptance checks belong in [PLAN.md](PLAN.md).
+belong here. Fix every other defect, including CI regressions, in the PR that
+finds it. Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded.
 

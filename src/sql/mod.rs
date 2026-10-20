@@ -504,7 +504,7 @@ pub struct Engine {
     local_cleanup: Option<LocalCleanup>,
     checkpoint_failure: Option<(u64, SqlError)>,
     cache_capacity_generation: u64,
-    cache_capacity_failure: Option<SqlError>,
+    cache_capacity_failure: Option<(u64, SqlError)>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -9283,10 +9283,24 @@ impl Engine {
     fn wait_for_cache_capacity(
         &self,
         statement: &Stmt<'_>,
-        txn: &TxnState,
+        txn: &mut TxnState,
         sqlprep: &SqlPreparedPool,
         arena: &Arena,
+        guc: &GucState,
+        context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
+        if let Some(wait) = &txn.cache_capacity_wait {
+            query::restore_statement_deadline(wait.deadline);
+            query::check_timeout()?;
+            if let Some((epoch, error)) = &self.cache_capacity_failure
+                && Some(*epoch) != wait.failure_epoch
+            {
+                return Err(SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                });
+            }
+        }
         if txn.failed
             || txn.staged_commit().is_some()
             || !txn.touched().is_empty()
@@ -9325,19 +9339,33 @@ impl Engine {
         if !statement_writes(command) {
             return Ok(false);
         }
-        if let Some(error) = &self.cache_capacity_failure {
-            return Err(SqlError {
-                sqlstate: error.sqlstate,
-                message: error.message,
-            });
-        }
         // Existing pending writes can pin the very space they would wait for.
         // They keep the normal named capacity error, as does an unreclaimable
         // working set after the current maintenance task has completed.
-        Ok(self.local_cleanup.is_some()
+        let active = self.local_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|checkpointer| {
                 checkpointer.sweep_active() || checkpointer.manifest_publication_pending()
-            }))
+            });
+        if active && txn.cache_capacity_wait.is_none() {
+            if let Some(deadline) = txn.suspended_statement_deadline() {
+                query::restore_statement_deadline(deadline);
+            } else {
+                query::arm_timeout(guc.statement_timeout_ms());
+            }
+            query::check_timeout()?;
+            // Old maintenance failures belong to their original requests. A
+            // new waiter observes only failures raised after it starts waiting.
+            txn.cache_capacity_wait = Some(txn::CacheCapacityWait {
+                failure_epoch: self
+                    .cache_capacity_failure
+                    .as_ref()
+                    .map(|(epoch, _)| *epoch),
+                clock: datetime::statement_clock(),
+                deadline: query::statement_deadline(),
+                context: txn.suspended_statement_context().unwrap_or(context),
+            });
+        }
+        Ok(active)
     }
 
     /// The COPY FROM the last statement started, if any; the connection
@@ -9746,11 +9774,14 @@ impl Engine {
     }
 
     fn remember_checkpoint_failure(&mut self, error: &SqlError) {
-        self.cache_capacity_failure = Some(SqlError {
-            sqlstate: error.sqlstate,
-            message: error.message,
-        });
         self.cache_capacity_generation = self.cache_capacity_generation.wrapping_add(1);
+        self.cache_capacity_failure = Some((
+            self.cache_capacity_generation,
+            SqlError {
+                sqlstate: error.sqlstate,
+                message: error.message,
+            },
+        ));
         if let Some(checkpointer) = self.ckpt.as_ref() {
             self.checkpoint_failure = Some((
                 checkpointer.requested_checkpoint_epoch(),
@@ -10244,7 +10275,14 @@ impl Engine {
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
-            match self.wait_for_cache_capacity(statement, txn, sqlprep, arena) {
+            match self.wait_for_cache_capacity(
+                statement,
+                txn,
+                sqlprep,
+                arena,
+                guc,
+                routine_transaction_context,
+            ) {
                 Ok(true) => {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_index,
@@ -10254,6 +10292,7 @@ impl Engine {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    txn.release_suspended_statement();
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
@@ -10519,7 +10558,14 @@ impl Engine {
             datetime::transaction_micros(),
             backend_xid,
         );
-        match self.wait_for_cache_capacity(&statement, txn, sqlprep, arena) {
+        match self.wait_for_cache_capacity(
+            &statement,
+            txn,
+            sqlprep,
+            arena,
+            guc,
+            routine_transaction_context,
+        ) {
             Ok(true) => {
                 return Ok(ExtendedExecutionStatus::Blocked {
                     wait: StatementWait::CacheCapacity,
@@ -10527,6 +10573,7 @@ impl Engine {
             }
             Ok(false) => {}
             Err(error) => {
+                txn.release_suspended_statement();
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
@@ -14521,6 +14568,7 @@ impl Engine {
             true,
             None,
         );
+        txn.cache_capacity_wait = None;
         txn.leave_ddl_origin(prior_origin);
         if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
@@ -14822,6 +14870,9 @@ impl Engine {
             query::restore_statement_deadline(deadline);
         } else {
             query::arm_timeout(guc.statement_timeout_ms());
+        }
+        if let Err(error) = query::check_timeout() {
+            return Ok(Err(error));
         }
         let statement_clock = datetime::statement_clock();
         let statement_deadline = query::statement_deadline();

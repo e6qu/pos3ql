@@ -827,6 +827,12 @@ The reactor wakes this wait when capacity changes, cleanup ends, or maintenance
 reports an error; an unrelated object GET is not retried on those wakes.
 `pg_stat_activity` reports Extension/CacheCapacity for the wait. Cancellation
 releases the retained frontend command through the normal protocol boundary.
+The statement keeps its original timestamp and timeout while waiting. Its
+deadline wakes the server even when no storage request or cleanup turn completes.
+New maintenance errors reach already waiting commands; an earlier failure does
+not poison a later request. For example, correcting object-store credentials
+allows subsequent inserts to wait for space and continue without inheriting the
+old authentication error.
 
 A transaction's own pending writes or DDL do not wait for space they might pin.
 Transaction completion, rollback, explicit CHECKPOINT and VACUUM remain runnable.

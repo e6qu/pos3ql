@@ -12936,7 +12936,7 @@ impl Checkpointer {
         if !job.reuse_slice {
             self.pending_installs.retain(|(slot, _)| *slot != job.slot);
         }
-        for install in job.installs[..job.install_count].iter().cloned().flatten() {
+        for install in job.installs[..job.install_count].iter().flatten().cloned() {
             self.pending_installs.push((job.slot, install));
         }
         self.prev_scratch[job.slot].copy_from(&self.slice_scratch);

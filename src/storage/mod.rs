@@ -61,7 +61,7 @@ use snapshot_leases::{
     ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
-pub use spill_generations::SpillGenerationId;
+pub(crate) use spill_generations::SpillGenerationId;
 pub(crate) use spill_generations::StatementFileScope;
 pub(crate) use spill_generations::{
     SpillGenerationReservation, SpillInstallation, SpillPublication,
@@ -2413,7 +2413,7 @@ pub enum RowHome {
     Heap(RowLoc),
     Spilled {
         len: u32,
-        sst: spill_generations::SpillGenerationId,
+        sst: SpillGenerationId,
         /// Exact immutable version to fetch.
         commit_lsn: u64,
     },

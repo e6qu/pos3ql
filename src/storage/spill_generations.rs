@@ -3837,8 +3837,14 @@ mod tests {
         } = point_fixture("captured-release");
         let alignment = core::mem::align_of::<SstHandle>();
         let schema_bytes = (core::mem::size_of::<ColType>() + alignment - 1) & !(alignment - 1);
-        let capacity = schema_bytes + 2 * core::mem::size_of::<SstHandle>();
-        let mut budget = Budget::new(capacity);
+        let root_capacity = schema_bytes + 2 * core::mem::size_of::<SstHandle>();
+        let range_alignment = core::mem::align_of::<SpillGenerationRange>();
+        let range_start = (root_capacity + range_alignment - 1) & !(range_alignment - 1);
+        let capacity = range_start + 2 * core::mem::size_of::<SpillGenerationRange>();
+        let mut budget = Budget::new(root_capacity + capacity);
+        let missing_identities =
+            crate::mem::arena::Arena::new(&mut budget, "captured roots only", root_capacity)
+                .unwrap();
         let small =
             crate::mem::arena::Arena::new(&mut budget, "captured metadata only", capacity).unwrap();
         let mut retained = Vec::with_capacity(3);
@@ -3850,6 +3856,15 @@ mod tests {
                 .rows
                 .insert(3, RowState::committed_only_at(location, 7))
                 .unwrap();
+            let error = storage
+                .captured_row_scan_in(table, 0, &missing_identities)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "retained scan SST identities exceed the statement arena"
+            );
             let error = storage
                 .captured_row_scan_in(table, 0, &small)
                 .err()

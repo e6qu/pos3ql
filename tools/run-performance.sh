@@ -262,6 +262,7 @@ write_config() {
   fi
   cat >"$config" <<EOF
 transaction_mode = mvcc
+log_format = text
 listen_addr = 127.0.0.1:$port
 data_dir = $data
 auth = trust
@@ -331,10 +332,13 @@ start_pos3ql() {
     cp "$METRICS" "$WORK/$recovery_label-before.json"
   fi
   startup_started=$(python3 -c 'import time; print(time.monotonic_ns())')
-  "$ROOT/target/release/pos3ql" --config "$config" >"$log" 2>&1 &
+  : >"$log"
+  "$ROOT/target/release/pos3ql" --config "$config" >>"$log" 2>&1 &
   SERVER_PID=$!
   for attempt in $(seq 1 200); do
-    if nc -z 127.0.0.1 "$POS3QL_PORT" >/dev/null 2>&1; then
+    # The listener binds before recovery; this process must finish startup.
+    if grep -q '^startup complete:.*accepting connections$' "$log" \
+      && nc -z 127.0.0.1 "$POS3QL_PORT" >/dev/null 2>&1; then
       MEMORY_PLAN_BYTES=$(awk '
         $1 == "total" {
           multiplier = ($3 == "GiB" ? 1073741824 : ($3 == "MiB" ? 1048576 : ($3 == "KiB" ? 1024 : 1)));
@@ -381,11 +385,13 @@ launch_replica() {
   replica_log="$WORK/$replica_name.log"
   mkdir -p "$replica_data"
   write_config "$replica_config" "$replica_data" "$replica_name" "$replica_port"
-  "$ROOT/target/release/pos3ql" --config "$replica_config" >"$replica_log" 2>&1 &
+  : >"$replica_log"
+  "$ROOT/target/release/pos3ql" --config "$replica_config" >>"$replica_log" 2>&1 &
   LAUNCHED_PID=$!
   REPLICA_PIDS="$REPLICA_PIDS $LAUNCHED_PID"
   for attempt in $(seq 1 200); do
-    if nc -z 127.0.0.1 "$replica_port" >/dev/null 2>&1; then return; fi
+    if grep -q '^startup complete:.*accepting connections$' "$replica_log" \
+      && nc -z 127.0.0.1 "$replica_port" >/dev/null 2>&1; then return; fi
     if ! server_alive "$LAUNCHED_PID"; then cat "$replica_log" >&2; exit 1; fi
     sleep 0.05
   done

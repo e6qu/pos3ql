@@ -13271,7 +13271,7 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
 }
 
 #[test]
-fn critical_cache_pressure_completes_checkpoint_before_small_autocommit_writes_fail() {
+fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() {
     let mut config = test_config("critical-cache-checkpoint-progress");
     config.max_tables = 32;
     config.table_rows = 512;
@@ -13294,21 +13294,67 @@ fn critical_cache_pressure_completes_checkpoint_before_small_autocommit_writes_f
     }
     session.success(&mut engine, "CREATE TABLE cache_pressure_rows(id int PRIMARY KEY, body text); INSERT INTO cache_pressure_rows SELECT i, repeat('x', 512) FROM generate_series(1, 300) AS g(i)", false);
     assert!(engine.maybe_checkpoint());
-    let mut critical_publications = 0;
+    let mut parked_writes = 0;
+    let mut waiting_turns = 0;
+    let turn_bound = config.max_tables * (config.table_rows.div_ceil(64) * 8 + 16)
+        + config.memtable_bytes.div_ceil(64 << 10) * 4;
     for id in 1..=300 {
-        session.success(
-            &mut engine,
-            &format!("UPDATE cache_pressure_rows SET body = repeat('x', 2048) WHERE id = {id}"),
-            false,
-        );
-        let critical = engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85;
-        assert!(engine.maybe_checkpoint());
-        if critical {
-            critical_publications += 1;
-            assert!(engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85);
+        let sql =
+            format!("UPDATE cache_pressure_rows SET body = repeat('x', 2048) WHERE id = {id}");
+        session.send.clear();
+        let mut waited = false;
+        let mut completed = false;
+        for _ in 0..turn_bound {
+            session.arena.reset();
+            let mut responder = Responder::new(&mut session.send);
+            let status = engine
+                .execute_simple(
+                    &sql,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    session.connection_id,
+                )
+                .unwrap();
+            match status {
+                ExecutionStatus::Complete => {
+                    completed = true;
+                    break;
+                }
+                ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } => {
+                    assert_eq!(wait, StatementWait::CacheCapacity);
+                    assert_eq!(completed_statements, 0);
+                    assert_eq!(output_mark, 0);
+                    assert!(session.send.is_empty());
+                    waited = true;
+                    waiting_turns += 1;
+                    assert!(engine.maybe_checkpoint());
+                }
+            }
         }
+        assert!(
+            completed,
+            "writer did not resume within the fixture's fixed work bound"
+        );
+        assert!(!message_types(session.send.readable()).contains(&b'E'));
+        assert_eq!(
+            message_types(session.send.readable())
+                .iter()
+                .filter(|&&kind| kind == b'C')
+                .count(),
+            1
+        );
+        parked_writes += usize::from(waited);
+        assert!(engine.maybe_checkpoint());
     }
-    assert!(critical_publications > 0);
+    assert!(parked_writes > 0 && waiting_turns > parked_writes);
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -85129,14 +85175,17 @@ fn sliced_heap_cleanup_retained_buffers_fail_explicitly_and_resume_after_release
         );
         assert!(!engine.compact_scratch.active());
     });
-    let blocked = run_with_fixed_memory(
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
+    let report = run_with_fixed_memory(
         &mut engine,
         &budget,
         "SELECT count(*) FROM cleanup_orders",
         4 << 20,
     );
-    assert_eq!(error_sqlstates(&blocked), ["54000"]);
+    assert!(error_sqlstates(&report).is_empty());
+    assert_eq!(data_rows(&report), ["80"]);
     drop(older);
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
     assert_eq!(
         data_rows(&run_with_fixed_memory(
             &mut engine,
@@ -85645,9 +85694,29 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
         }
     });
     assert!(engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85);
-    assert_eq!(
-        engine.checkpoint_beat(),
-        CheckpointBeat::DurableWithLocalFailure
+    let mut published = false;
+    let mut failed = false;
+    for _ in 0..64 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        match engine.checkpoint_beat() {
+            CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
+            CheckpointBeat::Durable => published = true,
+            CheckpointBeat::LocalFailure => {
+                assert!(
+                    published,
+                    "local failure must not erase an earlier durable publication"
+                );
+                failed = true;
+                break;
+            }
+            beat => panic!("unexpected checkpoint outcome: {beat:?}"),
+        }
+    }
+    assert!(
+        published && failed,
+        "bounded turns must publish before reporting the retained-buffer failure"
     );
     assert!(engine.local_cleanup.is_some());
     assert!(!engine.compact_scratch.active());

@@ -204,6 +204,9 @@ when Docker is used, `postgresql-server.json` and
 description, and container limits,
 the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
+Recovery timing ends after the process reports startup complete and its SQL
+listener accepts connections. This includes restoration from shared storage.
+
 Failed benchmark runs retain server logs in the output's `server-logs/` directory,
 alongside workload errors and the host inventory. SQL `version()` reports the
 compilation target rather than a fixed host label.

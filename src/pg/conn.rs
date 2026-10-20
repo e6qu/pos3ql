@@ -5896,10 +5896,13 @@ mod tests {
                 let turn_bound = config.max_tables * config.table_rows * 8
                     + config.memtable_bytes / (64 << 10) * 4;
                 for _ in 0..turn_bound {
+                    let before_durable = engine.durable_lsn();
+                    engine.advance_wal_publication(Instant::now()).unwrap();
+                    let durable_advanced = engine.durable_lsn() > before_durable;
                     assert!(!engine.checkpoint_beat().failed());
-                    if let Some(pending) =
-                        crate::mem::guard::forbid_alloc(|| conn.retry_parked(&mut engine, 0, false))
-                    {
+                    if let Some(pending) = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, 0, durable_advanced)
+                    }) {
                         assert_eq!(pending.after, After::Continue);
                     }
                     if !conn.parked {

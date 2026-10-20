@@ -376,30 +376,33 @@ pub(super) fn remap_committed_homes(
 pub(super) fn release_committed_chain(
     pool: &mut RowVersionPool<CommittedVersionSlot>,
     mut slot: Option<usize>,
-) {
+) -> bool {
     let (pool, free) = (&mut pool.slots, &mut pool.free);
+    let mut heap_changed = false;
     while let Some(index) = slot {
         let entry = pool[index];
         debug_assert!(entry.used);
+        heap_changed |= matches!(entry.version.home, Some(RowHome::Heap(_)));
         pool[index].used = false;
         pool[index].previous = *free;
         *free = Some(index);
         slot = entry.previous;
     }
+    heap_changed
 }
 
 /// Keeps every version newer than the oldest snapshot and the first version
 /// at or before it. That is the minimal chain that can answer every active
-/// snapshot.
+/// snapshot. Reports whether any heap reference was released.
 pub(super) fn prune_committed_history(
     pool: &mut RowVersionPool<CommittedVersionSlot>,
     history: &mut CommittedHistory,
     oldest_snapshot: Option<u64>,
-) {
+) -> bool {
     let Some(oldest) = oldest_snapshot else {
-        release_committed_chain(pool, history.tail.take());
+        let heap_changed = release_committed_chain(pool, history.tail.take());
         history.len = 0;
-        return;
+        return heap_changed;
     };
     let mut slot = history.tail;
     let mut retained = 0usize;
@@ -408,20 +411,21 @@ pub(super) fn prune_committed_history(
         let entry = pool[index];
         if entry.version.lsn <= oldest {
             pool[index].previous = None;
-            release_committed_chain(pool, entry.previous);
+            let heap_changed = release_committed_chain(pool, entry.previous);
             history.len = retained;
-            return;
+            return heap_changed;
         }
         slot = entry.previous;
     }
+    false
 }
 
-/// Published object roots reproduce the prefix; later versions remain resident.
+/// Published roots reproduce the prefix; reports released heap references.
 pub(super) fn release_committed_history_through(
     pool: &mut RowVersionPool<CommittedVersionSlot>,
     history: &mut CommittedHistory,
     through_lsn: u64,
-) {
+) -> bool {
     let mut slot = history.tail;
     let mut previous = None;
     let mut retained = 0;
@@ -433,14 +437,15 @@ pub(super) fn release_committed_history_through(
             } else {
                 history.tail = None;
             }
-            release_committed_chain(pool, Some(index));
+            let heap_changed = release_committed_chain(pool, Some(index));
             history.len = retained;
-            return;
+            return heap_changed;
         }
         retained += 1;
         previous = Some(index);
         slot = entry.previous;
     }
+    false
 }
 
 #[cfg(test)]
@@ -635,7 +640,11 @@ mod tests {
             )
             .unwrap();
             assert_eq!(state.pending_row_versions.len(), 2);
-            prune_committed_history(&mut state.committed_row_versions, &mut history, Some(2));
+            assert!(prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut history,
+                Some(2)
+            ));
             assert_eq!(history.len(), 1);
             assert_eq!(
                 committed_history_get(&state.committed_row_versions, history, 0)
@@ -652,9 +661,45 @@ mod tests {
             .unwrap();
             assert_eq!(state.committed_row_versions.len(), 2);
             clear_pending_versions(&mut state.pending_row_versions, &mut commands);
-            prune_committed_history(&mut state.committed_row_versions, &mut history, None);
+            assert!(prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut history,
+                None
+            ));
             assert!(commands.is_none());
             assert!(history.is_empty());
+            assert!(!prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut history,
+                None
+            ));
+            let saved = CommittedVersion {
+                home: Some(RowHome::Spilled {
+                    len: 4,
+                    sst: 0,
+                    commit_lsn: 5,
+                }),
+                lsn: 5,
+            };
+            push_committed_version(&mut state.committed_row_versions, &mut history, 3, saved)
+                .unwrap();
+            assert!(!release_committed_history_through(
+                &mut state.committed_row_versions,
+                &mut history,
+                5
+            ));
+            push_committed_version(
+                &mut state.committed_row_versions,
+                &mut history,
+                3,
+                committed(5),
+            )
+            .unwrap();
+            assert!(release_committed_history_through(
+                &mut state.committed_row_versions,
+                &mut history,
+                5
+            ));
             for epoch in 6..106 {
                 push_pending_version(
                     &mut state.pending_row_versions,

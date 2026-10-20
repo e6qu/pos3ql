@@ -260,14 +260,14 @@ impl Storage {
                     }
                 }
                 RowCleanupTask::DurableHistory => {
-                    release_committed_history_through(
+                    changed |= release_committed_history_through(
                         &mut versions.as_mut().unwrap().committed_row_versions,
                         &mut state.history,
                         through_lsn.unwrap(),
                     );
                 }
                 RowCleanupTask::SnapshotHistory => {
-                    prune_committed_history(
+                    changed |= prune_committed_history(
                         &mut versions.as_mut().unwrap().committed_row_versions,
                         &mut state.history,
                         snapshots.as_ref().unwrap().oldest(),

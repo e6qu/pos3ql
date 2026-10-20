@@ -10,7 +10,7 @@ use core::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use super::row_heap::HeapRowRead;
+use super::row_heap::HeapReadView;
 use super::row_images::RowVersionIdentity;
 use super::row_map::RowMap;
 use super::row_versions::{
@@ -95,7 +95,7 @@ pub(super) struct CapturedRowSources {
     pub(super) table: usize,
     pub(super) rowid: u64,
     pub(super) created_at: u64,
-    pub(super) heap: Option<HeapRowRead>,
+    pub(super) heap: Option<HeapReadView>,
     pub(super) objects: Option<QueryRootLease>,
 }
 

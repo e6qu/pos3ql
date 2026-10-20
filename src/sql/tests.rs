@@ -13271,7 +13271,7 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
 }
 
 #[test]
-fn critical_cache_pressure_completes_checkpoint_before_small_autocommit_writes_fail() {
+fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() {
     let mut config = test_config("critical-cache-checkpoint-progress");
     config.max_tables = 32;
     config.table_rows = 512;
@@ -13294,21 +13294,67 @@ fn critical_cache_pressure_completes_checkpoint_before_small_autocommit_writes_f
     }
     session.success(&mut engine, "CREATE TABLE cache_pressure_rows(id int PRIMARY KEY, body text); INSERT INTO cache_pressure_rows SELECT i, repeat('x', 512) FROM generate_series(1, 300) AS g(i)", false);
     assert!(engine.maybe_checkpoint());
-    let mut critical_publications = 0;
+    let mut parked_writes = 0;
+    let mut waiting_turns = 0;
+    let turn_bound = config.max_tables * (config.table_rows.div_ceil(64) * 8 + 16)
+        + config.memtable_bytes.div_ceil(64 << 10) * 4;
     for id in 1..=300 {
-        session.success(
-            &mut engine,
-            &format!("UPDATE cache_pressure_rows SET body = repeat('x', 2048) WHERE id = {id}"),
-            false,
-        );
-        let critical = engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85;
-        assert!(engine.maybe_checkpoint());
-        if critical {
-            critical_publications += 1;
-            assert!(engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85);
+        let sql =
+            format!("UPDATE cache_pressure_rows SET body = repeat('x', 2048) WHERE id = {id}");
+        session.send.clear();
+        let mut waited = false;
+        let mut completed = false;
+        for _ in 0..turn_bound {
+            session.arena.reset();
+            let mut responder = Responder::new(&mut session.send);
+            let status = engine
+                .execute_simple(
+                    &sql,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    session.connection_id,
+                )
+                .unwrap();
+            match status {
+                ExecutionStatus::Complete => {
+                    completed = true;
+                    break;
+                }
+                ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } => {
+                    assert_eq!(wait, StatementWait::CacheCapacity);
+                    assert_eq!(completed_statements, 0);
+                    assert_eq!(output_mark, 0);
+                    assert!(session.send.is_empty());
+                    waited = true;
+                    waiting_turns += 1;
+                    assert!(engine.maybe_checkpoint());
+                }
+            }
         }
+        assert!(
+            completed,
+            "writer did not resume within the fixture's fixed work bound"
+        );
+        assert!(!message_types(session.send.readable()).contains(&b'E'));
+        assert_eq!(
+            message_types(session.send.readable())
+                .iter()
+                .filter(|&&kind| kind == b'C')
+                .count(),
+            1
+        );
+        parked_writes += usize::from(waited);
+        assert!(engine.maybe_checkpoint());
     }
-    assert!(critical_publications > 0);
+    assert!(parked_writes > 0 && waiting_turns > parked_writes);
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -53742,7 +53788,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
         ExecutionStatus::Blocked {
             completed_statements: 0,
             output_mark: 0,
-            io_wait: false,
+            wait: crate::sql::StatementWait::Lock,
         }
     );
     assert!(send.is_empty(), "a parked statement emits no wire output");
@@ -65378,7 +65424,10 @@ fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
         .unwrap();
     assert!(matches!(
         status,
-        ExecutionStatus::Blocked { io_wait: false, .. }
+        ExecutionStatus::Blocked {
+            wait: crate::sql::StatementWait::Lock,
+            ..
+        }
     ));
     assert!(send.is_empty());
     let child = engine
@@ -65487,7 +65536,10 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
         .unwrap();
     assert!(matches!(
         status,
-        ExecutionStatus::Blocked { io_wait: false, .. }
+        ExecutionStatus::Blocked {
+            wait: crate::sql::StatementWait::Lock,
+            ..
+        }
     ));
     engine.commit_wal().unwrap();
     assert!(engine.checkpoint().unwrap());
@@ -78546,6 +78598,63 @@ fn statement_timeout_checks_every_deadline_boundary() {
 }
 
 #[test]
+fn statement_timeout_nested_sql_inherits_outer_deadline_before_effects() {
+    let config = test_config("nested-statement-deadline");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE deadline_sequence; CREATE TABLE deadline_rows(id integer); SET statement_timeout = 0; BEGIN", true);
+    for expired in [false, true] {
+        session.arena.reset();
+        let statement = Parser::new(
+            "INSERT INTO deadline_rows VALUES (nextval('deadline_sequence'))",
+            &session.arena,
+        )
+        .unwrap()
+        .next_stmt()
+        .unwrap()
+        .unwrap();
+        let deadline = if expired {
+            1
+        } else {
+            datetime::now_micros() + 10_000_000
+        };
+        query::restore_statement_deadline(deadline);
+        let result = crate::mem::guard::forbid_alloc(|| {
+            let mut responder = Responder::new(&mut session.send);
+            engine
+                .execute_routine_stmt(
+                    &statement,
+                    &session.arena,
+                    &[],
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    None,
+                )
+                .unwrap()
+        });
+        assert_eq!(query::statement_deadline(), deadline);
+        query::disarm_timeout();
+        if expired {
+            assert_eq!(result.unwrap_err().sqlstate, "57014");
+        } else {
+            result.unwrap();
+        }
+    }
+    session.success(&mut engine, "COMMIT", true);
+    let output = session.success(
+        &mut engine,
+        "SELECT count(*) FROM deadline_rows; SELECT last_value FROM deadline_sequence",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["1", "1"]);
+}
+
+#[test]
 fn string_agg_aggregate() {
     // Values validated against PostgreSQL 18.4. Without an aggregate
     // ORDER BY, PostgreSQL leaves the concatenation order unspecified; our
@@ -84867,6 +84976,150 @@ fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
 }
 
 #[test]
+fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols() {
+    fn execute(
+        engine: &mut Engine,
+        session: &mut ConfiguredTransactionSession,
+        extended: bool,
+        skip: usize,
+    ) -> ExecutionStatus {
+        session.arena.reset();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut responder = Responder::new(&mut session.send);
+            if extended {
+                match engine.execute_extended("INSERT INTO cleanup_orders VALUES (1000 + nextval('admission_sequence'), 'new')",
+                    &session.arena, &[], &[], &mut session.transaction, &mut session.pool,
+                    &mut session.cursors, &mut session.guc, &mut responder, session.connection_id, false).unwrap() {
+                    ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
+                    ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
+                        completed_statements: 0, output_mark: responder.buffer.mark(), wait,
+                    },
+                }
+            } else {
+                engine.execute_simple_from("SELECT nextval('admission_sequence'); INSERT INTO cleanup_orders VALUES (1000 + nextval('admission_sequence'), 'new')",
+                    skip, &session.arena, &mut session.transaction, &mut session.pool,
+                    &mut session.cursors, &mut session.guc, &mut responder, session.connection_id, false).unwrap()
+            }
+        })
+    }
+    for (extended, fail) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut engine, mut budget, config) = sliced_cleanup_fixture(
+            if extended {
+                "cache-admission-extended"
+            } else {
+                "cache-admission-simple"
+            },
+            false,
+        );
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(12);
+        writer.success(&mut engine, "CREATE SEQUENCE admission_sequence; CREATE TABLE admission_audit(id integer); \
+            CREATE FUNCTION admission_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO admission_audit VALUES (NEW.id); RETURN NEW; END $$; \
+            CREATE TRIGGER admission_insert AFTER INSERT ON cleanup_orders FOR EACH ROW EXECUTE FUNCTION admission_trigger()", true);
+        writer.success(&mut engine, "SET statement_timeout = '10s'", true);
+        writer.send.clear();
+        crate::mem::guard::forbid_alloc(|| {
+            let garbage = [0u8; 8192];
+            while engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85 {
+                engine.storage.heap.append_bytes(&garbage).unwrap();
+            }
+        });
+        let lsn = engine.storage.lsn();
+        start_sliced_cleanup(&mut engine, lsn);
+        // A recovered storage failure must not poison a later request when
+        // that request first reaches the heap-pressure admission boundary.
+        engine.remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "old storage failure"));
+        let skip = usize::from(!extended);
+        assert!(matches!(execute(&mut engine, &mut writer, extended, 0),
+            ExecutionStatus::Blocked { completed_statements, wait: StatementWait::CacheCapacity, .. }
+                if completed_statements == skip));
+        let mut prefix = writer.send.readable().to_vec();
+        let deadline = writer.transaction.suspended_statement_deadline().unwrap();
+        let clock = datetime::statement_micros();
+        let journal = engine.journal_lsn();
+        for _ in 0..2 {
+            assert!(matches!(
+                execute(&mut engine, &mut writer, extended, skip),
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::CacheCapacity,
+                    ..
+                }
+            ));
+            assert_eq!(writer.send.readable(), prefix);
+            assert_eq!(engine.journal_lsn(), journal);
+            assert_eq!(
+                writer.transaction.suspended_statement_deadline(),
+                Some(deadline)
+            );
+            assert_eq!(datetime::statement_micros(), clock);
+        }
+        if fail {
+            engine
+                .remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "new storage failure"));
+            assert_eq!(
+                execute(&mut engine, &mut writer, extended, skip),
+                ExecutionStatus::Complete
+            );
+            assert!(
+                writer
+                    .send
+                    .readable()
+                    .windows(b"new storage failure".len())
+                    .any(|bytes| bytes == b"new storage failure")
+            );
+            assert!(writer.transaction.cache_capacity_wait.is_none());
+            assert!(writer.transaction.suspended_statement_deadline().is_none());
+            writer.send.clear();
+            assert!(matches!(
+                execute(&mut engine, &mut writer, extended, 0),
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::CacheCapacity,
+                    ..
+                }
+            ));
+            prefix = writer.send.readable().to_vec();
+        }
+        let report = reader.success(
+            &mut engine,
+            "SELECT count(*), sum(id) FROM cleanup_orders; SELECT count(*) FROM admission_audit",
+            true,
+        );
+        assert_eq!(data_rows(&report), ["80|3240", "0"]);
+        let prepared_report = reader.success(&mut engine,
+            "PREPARE admission_report AS SELECT count(*) FROM cleanup_orders; EXECUTE admission_report", true);
+        assert_eq!(data_rows(&prepared_report), ["80"]);
+        assert!(engine.compact_scratch.active());
+        assert!(finish_sliced_cleanup(&mut engine) > 1);
+        assert_eq!(
+            execute(&mut engine, &mut writer, extended, skip),
+            ExecutionStatus::Complete
+        );
+        if extended {
+            crate::mem::guard::forbid_alloc(|| {
+                engine.commit_txn(&mut writer.transaction, &writer.guc)
+            })
+            .unwrap();
+        }
+        let (expected, sequence) = match (extended, fail) {
+            (true, _) => ("1001", "1"),
+            (false, false) => ("1002", "2"),
+            (false, true) => ("1003", "3"),
+        };
+        assert!(!message_types(writer.send.readable()).contains(&b'E'));
+        assert!(writer.send.readable().starts_with(&prefix));
+        assert!(writer.transaction.cache_capacity_wait.is_none());
+        let report = reader.success(
+            &mut engine,
+            "SELECT id FROM admission_audit; SELECT last_value FROM admission_sequence",
+            true,
+        );
+        assert_eq!(data_rows(&report), [expected, sequence]);
+    }
+}
+
+#[test]
 fn sliced_heap_cleanup_queries_and_late_writes_progress_between_server_turns() {
     let (mut engine, budget, _config) = sliced_cleanup_fixture("sliced-heap-queries", false);
     let table = engine
@@ -85019,14 +85272,17 @@ fn sliced_heap_cleanup_retained_buffers_fail_explicitly_and_resume_after_release
         );
         assert!(!engine.compact_scratch.active());
     });
-    let blocked = run_with_fixed_memory(
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
+    let report = run_with_fixed_memory(
         &mut engine,
         &budget,
         "SELECT count(*) FROM cleanup_orders",
         4 << 20,
     );
-    assert_eq!(error_sqlstates(&blocked), ["54000"]);
+    assert!(error_sqlstates(&report).is_empty());
+    assert_eq!(data_rows(&report), ["80"]);
     drop(older);
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
     assert_eq!(
         data_rows(&run_with_fixed_memory(
             &mut engine,
@@ -85527,7 +85783,7 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let lsn = engine.storage.lsn();
     start_sliced_cleanup(&mut engine, lsn);
     crate::mem::guard::forbid_alloc(|| engine.finish_local_cleanup())
-        .expect("initial setup can reclaim the unretained active buffer in place");
+        .expect("initial setup has a spare buffer for its single heap move");
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
         for _ in 0..4 {
@@ -85535,14 +85791,39 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
         }
     });
     assert!(engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85);
-    assert_eq!(
-        engine.checkpoint_beat(),
-        CheckpointBeat::DurableWithLocalFailure
+    let mut published = false;
+    let mut failed = false;
+    for _ in 0..64 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        match engine.checkpoint_beat() {
+            CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
+            CheckpointBeat::Durable => published = true,
+            CheckpointBeat::LocalFailure => {
+                assert!(
+                    published,
+                    "local failure must not erase an earlier durable publication"
+                );
+                failed = true;
+                break;
+            }
+            beat => panic!("unexpected checkpoint outcome: {beat:?}"),
+        }
+    }
+    assert!(
+        published && failed,
+        "bounded turns must publish before reporting the retained-buffer failure"
     );
     assert!(engine.local_cleanup.is_some());
     assert!(!engine.compact_scratch.active());
     drop(older);
     finish_sliced_cleanup(&mut engine);
+    assert_eq!(
+        engine.storage.heap.used(),
+        0,
+        "saved rows are evicted before the remaining heap is moved once"
+    );
     assert_eq!(
         data_rows(&run_with_fixed_memory(
             &mut engine,
@@ -87286,7 +87567,7 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
             status,
             ExecutionStatus::Blocked {
                 completed_statements: 1,
-                io_wait: true,
+                wait: crate::sql::StatementWait::ObjectIo,
                 ..
             }
         ));
@@ -87300,7 +87581,7 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                 status,
                 ExecutionStatus::Blocked {
                     completed_statements: 1,
-                    io_wait: true,
+                    wait: crate::sql::StatementWait::ObjectIo,
                     ..
                 }
             ));
@@ -87317,9 +87598,9 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                 ExecutionStatus::Blocked {
                     completed_statements,
                     output_mark,
-                    io_wait,
+                    wait,
                 } => {
-                    assert!(io_wait);
+                    assert_eq!(wait, StatementWait::ObjectIo);
                     assert_eq!(session.send.len(), output_mark);
                     assert!(session.transaction.staged_commit().is_some());
                     completed_statements
@@ -87379,10 +87660,10 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                     .unwrap()
                 {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
-                    ExtendedExecutionStatus::Blocked { io_wait } => ExecutionStatus::Blocked {
+                    ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
                         completed_statements: 0,
                         output_mark: responder.buffer.mark(),
-                        io_wait,
+                        wait,
                     },
                 }
             } else {
@@ -87442,7 +87723,10 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         for _ in 0..2 {
             assert!(matches!(
                 resume(&mut engine, &mut detacher, extended, 0),
-                ExecutionStatus::Blocked { io_wait: true, .. }
+                ExecutionStatus::Blocked {
+                    wait: crate::sql::StatementWait::ObjectIo,
+                    ..
+                }
             ));
             assert!(detacher.transaction.concurrent_partition_detach_pending());
             assert!(detacher.transaction.staged_commit().is_some());
@@ -87458,7 +87742,10 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         ));
         assert!(matches!(
             resume(&mut engine, &mut detacher, extended, 0),
-            ExecutionStatus::Blocked { io_wait: false, .. }
+            ExecutionStatus::Blocked {
+                wait: crate::sql::StatementWait::Lock,
+                ..
+            }
         ));
         assert!(detacher.transaction.staged_commit().is_none());
         assert!(!detacher.transaction.concurrent_partition_detach_pending());
@@ -87480,7 +87767,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                 status,
                 ExecutionStatus::Blocked {
                     completed_statements: 1,
-                    io_wait: true,
+                    wait: crate::sql::StatementWait::ObjectIo,
                     ..
                 }
             ));

@@ -23,8 +23,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build:
+    name: differential release binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-differential-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Rebuild checked-out release binary
+        run: |
+          cargo clean -p pos3ql
+          cargo build --release --locked
+          mkdir -p "$RUNNER_TEMP/differential-release"
+          cp target/release/pos3ql "$RUNNER_TEMP/differential-release/pos3ql"
+          git rev-parse HEAD > "$RUNNER_TEMP/differential-release/revision"
+          cd "$RUNNER_TEMP/differential-release"
+          sha256sum pos3ql > SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: differential-release-${{ github.sha }}
+          path: ${{ runner.temp }}/differential-release/
+          if-no-files-found: error
+          retention-days: 7
+
   differential:
     name: differential (${{ matrix.shard }})
+    needs: build
     runs-on: ubuntu-latest
     # Hard ceiling on every CI job: 15 minutes. The cap guarantees a
     # pathological query can never wedge CI.
@@ -484,20 +516,16 @@ jobs:
           chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
           echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
 
-      - name: Cache Rust build
-        uses: actions/cache@v5
+      - uses: actions/download-artifact@v8
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      # `target` is cached by dependency lockfile, not source revision. Keep
-      # dependencies warm but rebuild this checkout's crate every time.
-      - name: Rebuild checked-out crate
-        run: cargo clean -p pos3ql
+          name: differential-release-${{ github.sha }}
+          path: ${{ runner.temp }}/differential-release/
+      - name: Verify release provenance and bytes
+        run: |
+          test "$(cat "$RUNNER_TEMP/differential-release/revision")" = "$(git rev-parse HEAD)"
+          cd "$RUNNER_TEMP/differential-release"
+          sha256sum --strict --check SHA256SUMS
+          chmod +x pos3ql
 
       - uses: ./.github/actions/python-test-environment
         with:
@@ -549,4 +577,4 @@ jobs:
           FUZZ_BUDGET: "0"
           POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
-        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh "$RUNNER_TEMP/differential-release/pos3ql"

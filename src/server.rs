@@ -1233,7 +1233,7 @@ impl Server {
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
             let timeout = [
                 checkpoint_timeout,
-                self.next_lock_wait_timeout(),
+                self.next_parked_wait_timeout(),
                 self.next_replication_keepalive_timeout(),
                 self.next_termination_timeout(),
                 read_timeout,
@@ -1315,8 +1315,8 @@ impl Server {
                 if completed_block_read {
                     self.wake_io_waiters();
                 }
-                // A lock timeout can be the event that woke the reactor, with
-                // no socket readiness and no lock-generation change.
+                // A statement or lock timeout can wake the reactor without
+                // socket readiness or a resource-generation change.
                 self.wake_lock_waiters();
             }
             if let Err(error) = self.engine.advance_wal_publication(Instant::now()) {
@@ -1378,16 +1378,20 @@ impl Server {
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
-            // regardless of traffic. Work is paced unless critical cache
-            // pressure requires publication before dispatch resumes; bucket
-            // errors back off.
+            // regardless of traffic. Each turn is bounded; writers can wait
+            // for cache space while other connections run. Bucket errors back off.
             if checkpoint_schedule.should_run(
                 self.engine.checkpoint_work_pending() || had_responses,
                 Instant::now(),
             ) {
+                let cache_generation = self.engine.cache_capacity_generation();
                 let beat = self.engine.checkpoint_beat();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
                 self.durability_ready &= !self.engine.publication_failed();
+                if self.engine.cache_capacity_generation() != cache_generation {
+                    self.wake_lock_waiters();
+                    self.finish_response_batch(publication_error.as_ref());
+                }
                 if matches!(
                     beat,
                     CheckpointBeat::Durable
@@ -1903,10 +1907,10 @@ impl Server {
         }
     }
 
-    fn next_lock_wait_timeout(&self) -> Option<Duration> {
+    fn next_parked_wait_timeout(&self) -> Option<Duration> {
         self.slots
             .iter()
-            .filter_map(|slot| slot.conn.lock_wait_remaining())
+            .filter_map(|slot| slot.conn.parked_wait_remaining())
             .min()
     }
 

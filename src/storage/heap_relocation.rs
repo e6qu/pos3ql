@@ -2,11 +2,12 @@
 
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, TryLockError};
 
 mod sort;
 use sort::RelocationSort;
 
-use super::row_heap::{HeapCopy, RelocationValidation};
+use super::row_heap::{HeapCopy, HeapCutover, RelocationValidation};
 use super::row_versions::RowVersionState;
 use super::*;
 use crate::mem::fixed_vec::FixedVec;
@@ -16,6 +17,45 @@ use crate::mem::fixed_vec::FixedVec;
 pub(crate) struct HeapRelocationEntry {
     source: RowLoc,
     destination: u32,
+}
+
+#[derive(Clone, Copy)]
+struct HeapReferencePosition {
+    table: usize,
+    slot: usize,
+}
+
+struct HeapRemapPlan {
+    source_id: usize,
+    generation: u64,
+    frontier: usize,
+    packed_bytes: usize,
+    copied_tail: usize,
+    position: HeapReferencePosition,
+}
+
+pub(super) struct HeapRemap {
+    entries: FixedVec<HeapRelocationEntry>,
+    plan: Option<HeapRemapPlan>,
+}
+
+impl HeapRemap {
+    pub(super) fn matches_copy(
+        &self,
+        copy: &HeapCopy,
+        packed_bytes: usize,
+        copied_tail: usize,
+    ) -> bool {
+        self.plan.as_ref().is_some_and(|plan| {
+            plan.source_id == copy.source_id()
+                && plan.generation == copy.generation()
+                && plan.frontier == copy.frontier()
+                && plan.packed_bytes == packed_bytes
+                && plan.copied_tail == copied_tail
+                && plan.position.table == 0
+                && plan.position.slot == 0
+        })
+    }
 }
 
 // All row-map locations are included until retirement clears them.
@@ -58,6 +98,33 @@ where
         for (_, state) in rows.iter() {
             visit_row_heap_locations(state, versions, &mut visit)?;
         }
+    }
+    Ok(())
+}
+
+fn rewrite_row_heap_locations(
+    state: &mut RowState,
+    versions: &mut RowVersionState,
+    mut relocate: impl FnMut(RowLoc) -> Result<RowLoc, SqlError>,
+) -> Result<(), SqlError> {
+    if let Some(RowHome::Heap(location)) = state.committed {
+        state.committed = Some(RowHome::Heap(relocate(location)?));
+    }
+    let mut slot = state.history.tail;
+    while let Some(index) = slot {
+        let entry = &mut versions.committed_row_versions[index];
+        if let Some(RowHome::Heap(location)) = entry.version.home {
+            entry.version.home = Some(RowHome::Heap(relocate(location)?));
+        }
+        slot = entry.previous;
+    }
+    let mut slot = state.pending.tail;
+    while let Some(index) = slot {
+        let entry = &mut versions.pending_row_versions[index];
+        if let Some(location) = entry.change.loc {
+            entry.change.loc = Some(relocate(location)?);
+        }
+        slot = entry.previous;
     }
     Ok(())
 }
@@ -236,31 +303,12 @@ impl<'scratch> RelocationPlan<'scratch> {
     ) where
         Rows: DerefMut<Target = RowEntries>,
     {
-        let relocate = |location| {
-            self.relocated(location, generation, tail)
-                .expect("preflighted heap row")
-        };
         for mut rows in maps {
             for (_, state) in rows.iter_mut() {
-                if let Some(RowHome::Heap(location)) = state.committed {
-                    state.committed = Some(RowHome::Heap(relocate(location)));
-                }
-                let mut slot = state.history.tail;
-                while let Some(index) = slot {
-                    let entry = &mut versions.committed_row_versions[index];
-                    if let Some(RowHome::Heap(location)) = entry.version.home {
-                        entry.version.home = Some(RowHome::Heap(relocate(location)));
-                    }
-                    slot = entry.previous;
-                }
-                let mut slot = state.pending.tail;
-                while let Some(index) = slot {
-                    let entry = &mut versions.pending_row_versions[index];
-                    if let Some(location) = entry.change.loc {
-                        entry.change.loc = Some(relocate(location));
-                    }
-                    slot = entry.previous;
-                }
+                rewrite_row_heap_locations(state, versions, |location| {
+                    self.relocated(location, generation, tail)
+                })
+                .expect("preflighted heap row");
             }
         }
     }
@@ -293,6 +341,7 @@ struct HeapRelocationProgress {
     entry: usize,
     entry_at: usize,
     copied_tail: usize,
+    preflight: Option<HeapReferencePosition>,
 }
 
 pub(crate) enum HeapRelocationPublication<'storage, 'scratch> {
@@ -525,11 +574,17 @@ impl HeapRelocationProgress {
             |versions, rows| {
                 let tail = Some((self.copy.frontier(), self.copied_tail));
                 self.copy
-                    .try_publish(self.packed_bytes, self.copied_tail, |generation| {
-                        plan.preflight_rows(rows.iter(), versions, generation, tail)?;
-                        plan.apply_rows(rows.iter_mut(), versions, generation, tail);
-                        Ok(())
-                    })
+                    .try_cutover(
+                        self.packed_bytes,
+                        self.copied_tail,
+                        HeapCutover::Atomic(&mut |generation| {
+                            plan.preflight_rows(rows.iter(), versions, generation, tail)?;
+                            plan.apply_rows(rows.iter_mut(), versions, generation, tail);
+                            Ok(())
+                        }),
+                        MaintenanceMode::Finish,
+                    )
+                    .map(|step| step == MaintenanceStep::Complete)
             },
         )
     }
@@ -555,19 +610,28 @@ impl<'storage, 'scratch> HeapRelocationJob<'storage, 'scratch> {
 
 /// Owns startup scratch and preparation/copy controls across server turns.
 pub(crate) struct HeapRelocationWorkspace {
-    entries: FixedVec<HeapRelocationEntry>,
+    map: Arc<Mutex<HeapRemap>>,
     progress: Option<HeapRelocationProgress>,
 }
 
 impl HeapRelocationWorkspace {
     pub(crate) fn budget_bytes(capacity: usize) -> usize {
-        size_of::<Self>() + capacity.saturating_mul(size_of::<HeapRelocationEntry>())
+        size_of::<Self>()
+            + size_of::<Mutex<HeapRemap>>()
+            + 2 * size_of::<usize>()
+            + capacity.saturating_mul(size_of::<HeapRelocationEntry>())
     }
 
     pub(crate) fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
-        budget.draw(size_of::<Self>(), "heap relocation workspace controls")?;
+        budget.draw(
+            size_of::<Self>() + size_of::<Mutex<HeapRemap>>() + 2 * size_of::<usize>(),
+            "heap relocation workspace controls",
+        )?;
         Ok(Self {
-            entries: FixedVec::new(budget, "compact_scratch", capacity)?,
+            map: Arc::new(Mutex::new(HeapRemap {
+                entries: FixedVec::new(budget, "compact_scratch", capacity)?,
+                plan: None,
+            })),
             progress: None,
         })
     }
@@ -587,10 +651,16 @@ impl HeapRelocationWorkspace {
                 "row heap relocation is already active"
             ));
         }
+        if Arc::strong_count(&self.map) != 1 || Arc::weak_count(&self.map) != 0 {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "heap relocation scratch is retained by publication"
+            ));
+        }
         let Some(progress) = storage.start_heap_relocation(mode)? else {
             return Ok(MaintenanceStep::WaitingForOwner);
         };
-        self.entries.clear();
+        self.clear_map();
         self.progress = Some(progress);
         Ok(MaintenanceStep::Advanced)
     }
@@ -602,45 +672,141 @@ impl HeapRelocationWorkspace {
         budget: NonZeroUsize,
         mode: MaintenanceMode,
     ) -> Result<MaintenanceStep, SqlError> {
-        let result = (|| {
-            let progress = self.progress.as_mut().ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "heap relocation is not active")
-            })?;
-            if !progress.copy.belongs_to(&storage.heap) {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "heap relocation belongs to another storage instance"
-                ));
+        if let Some(progress) = &self.progress
+            && !progress.copy.belongs_to(&storage.heap)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "heap relocation belongs to another storage instance"
+            ));
+        }
+        if let Some(map) = storage.heap.published_remap() {
+            let step = storage.advance_heap_remap(&map, row_slots, mode)?;
+            if step == MaintenanceStep::Complete {
+                self.progress = None;
+                self.clear_map();
             }
-            match progress.capture_step(storage, &mut self.entries, row_slots, mode)? {
-                MaintenanceStep::Complete => {}
-                pending => return Ok(pending),
-            }
-            let mut remaining = budget.get();
-            if !progress.prepare_step(&mut self.entries, &mut remaining)? {
-                return Ok(MaintenanceStep::Advanced);
-            }
-            let Some(copy_budget) = NonZeroUsize::new(remaining) else {
-                return Ok(MaintenanceStep::Advanced);
-            };
-            if !progress.copy_step(&self.entries, copy_budget)? {
-                return Ok(MaintenanceStep::Advanced);
-            }
-            progress
-                .try_publish(storage, &mut self.entries)
-                .map(|published| {
-                    if published {
-                        MaintenanceStep::Complete
-                    } else {
-                        MaintenanceStep::Advanced
-                    }
-                })
-        })();
-        if matches!(&result, Ok(MaintenanceStep::Complete) | Err(_)) {
+            return Ok(step);
+        }
+        if self
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.copy.published())
+        {
             self.progress = None;
-            self.entries.clear();
+            self.clear_map();
+            return Ok(MaintenanceStep::Complete);
+        }
+        let result = self.copy_step(storage, row_slots, budget, mode);
+        if result.is_err() {
+            self.progress = None;
+            self.clear_map();
         }
         result
+    }
+
+    fn clear_map(&mut self) {
+        let mut map = self.map.lock().expect("heap remap lock poisoned");
+        map.entries.clear();
+        map.plan = None;
+    }
+
+    fn copy_step(
+        &mut self,
+        storage: &Storage,
+        row_slots: NonZeroUsize,
+        budget: NonZeroUsize,
+        mode: MaintenanceMode,
+    ) -> Result<MaintenanceStep, SqlError> {
+        let progress = self
+            .progress
+            .as_mut()
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "heap relocation is not active"))?;
+        let mut map = self.map.lock().expect("heap remap lock poisoned");
+        if matches!(
+            progress.preparation,
+            HeapRelocationPreparation::Capturing { .. }
+        ) {
+            return progress
+                .capture_step(storage, &mut map.entries, row_slots, mode)
+                .map(|step| {
+                    if step == MaintenanceStep::Complete {
+                        MaintenanceStep::Advanced
+                    } else {
+                        step
+                    }
+                });
+        }
+        let mut remaining = budget.get();
+        if !progress.prepare_step(&mut map.entries, &mut remaining)? {
+            return Ok(MaintenanceStep::Advanced);
+        }
+        let Some(copy_budget) = NonZeroUsize::new(remaining) else {
+            return Ok(MaintenanceStep::Advanced);
+        };
+        if !progress.copy_step(&map.entries, copy_budget)? {
+            return Ok(MaintenanceStep::Advanced);
+        }
+        if let Some(position) = &mut progress.preflight {
+            let plan = RelocationPlan {
+                entries: &mut map.entries,
+                packed_bytes: progress.packed_bytes,
+            };
+            let step =
+                storage.advance_heap_references(position, row_slots, mode, |state, versions| {
+                    visit_row_heap_locations(state, versions, |source| {
+                        progress
+                            .copy
+                            .validate_location(&mut RelocationValidation::default(), source)?;
+                        if (source.offset as usize) < progress.copy.frontier() {
+                            plan.relocated(source, progress.copy.generation(), None)
+                                .map(|_| ())
+                        } else {
+                            // A concurrent append is copied before cutover; it need
+                            // not be below this turn's copied tail yet.
+                            Ok(())
+                        }
+                    })
+                })?;
+            if step == MaintenanceStep::Complete {
+                progress.preflight = None;
+                return Ok(MaintenanceStep::Advanced);
+            }
+            return Ok(step);
+        }
+        map.plan = Some(HeapRemapPlan {
+            source_id: progress.copy.source_id(),
+            generation: progress.copy.generation(),
+            frontier: progress.copy.frontier(),
+            packed_bytes: progress.packed_bytes,
+            copied_tail: progress.copied_tail,
+            position: HeapReferencePosition { table: 0, slot: 0 },
+        });
+        drop(map);
+        let _versions = match mode {
+            MaintenanceMode::Finish => {
+                super::row_ownership::acquire(|| storage.row_versions.try_write_for_batch())
+            }
+            MaintenanceMode::Background => match storage.row_versions.try_write_for_batch() {
+                Ok(owner) => owner,
+                Err(_) => return Ok(MaintenanceStep::WaitingForOwner),
+            },
+        };
+        progress
+            .copy
+            .try_cutover(
+                progress.packed_bytes,
+                progress.copied_tail,
+                HeapCutover::Remapping(Arc::clone(&self.map)),
+                mode,
+            )
+            .map(|step| {
+                if step == MaintenanceStep::Complete {
+                    MaintenanceStep::Advanced
+                } else {
+                    step
+                }
+            })
     }
 
     pub(crate) fn compact_exclusive(&mut self, storage: &mut Storage) -> Result<(), SqlError> {
@@ -650,7 +816,8 @@ impl HeapRelocationWorkspace {
                 "row heap relocation is already active"
             ));
         }
-        storage.compact_heap(&mut self.entries)
+        let mut map = self.map.lock().expect("heap remap lock poisoned");
+        storage.compact_heap(&mut map.entries)
     }
 
     pub(crate) fn compact_step(
@@ -660,7 +827,7 @@ impl HeapRelocationWorkspace {
         budget: NonZeroUsize,
         mode: MaintenanceMode,
     ) -> Result<MaintenanceStep, SqlError> {
-        if !self.active() {
+        if !self.active() && storage.heap.published_remap().is_none() {
             if mode == MaintenanceMode::Finish && !storage.heap.current_is_retained() {
                 self.compact_exclusive(storage)?;
                 return Ok(MaintenanceStep::Complete);
@@ -671,9 +838,134 @@ impl HeapRelocationWorkspace {
         }
         self.step(storage, row_slots, budget, mode)
     }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.map
+            .lock()
+            .expect("heap remap lock poisoned")
+            .entries
+            .len()
+    }
+
+    #[cfg(test)]
+    fn entry_capacity(&self) -> usize {
+        self.map
+            .lock()
+            .expect("heap remap lock poisoned")
+            .entries
+            .capacity()
+    }
 }
 
 impl Storage {
+    fn advance_heap_references(
+        &self,
+        position: &mut HeapReferencePosition,
+        row_slots: NonZeroUsize,
+        mode: MaintenanceMode,
+        mut visit: impl FnMut(&mut RowState, &mut RowVersionState) -> Result<(), SqlError>,
+    ) -> Result<MaintenanceStep, SqlError> {
+        let mut remaining = row_slots.get();
+        while position.table < self.tables.len() && remaining != 0 {
+            let attempt = || {
+                Ok((
+                    self.row_versions.try_write_for_batch()?,
+                    self.tables[position.table].rows.try_write_for_batch()?,
+                ))
+            };
+            let (mut versions, mut rows) = match mode {
+                MaintenanceMode::Finish => super::row_ownership::acquire(attempt),
+                MaintenanceMode::Background => match attempt() {
+                    Ok(owners) => owners,
+                    Err(_) => return Ok(MaintenanceStep::WaitingForOwner),
+                },
+            };
+            assert!(
+                position.slot <= rows.scan_end(),
+                "heap remap cursor exceeds used row slots"
+            );
+            let start = position.slot;
+            let end = if rows.is_empty() {
+                rows.scan_end()
+            } else {
+                start.saturating_add(remaining).min(rows.scan_end())
+            };
+            if !rows.is_empty() {
+                for slot in start..end {
+                    if let Some((_, state)) = rows.entry_at_slot_mut(slot) {
+                        visit(state, &mut versions)?;
+                    }
+                }
+                remaining -= (end - start).max(1);
+            } else {
+                remaining -= 1;
+            }
+            if end == rows.scan_end() {
+                position.table += 1;
+                position.slot = 0;
+            } else {
+                position.slot = end;
+            }
+        }
+        Ok(if position.table == self.tables.len() {
+            MaintenanceStep::Complete
+        } else {
+            MaintenanceStep::Advanced
+        })
+    }
+
+    fn advance_heap_remap(
+        &self,
+        map_owner: &Arc<Mutex<HeapRemap>>,
+        row_slots: NonZeroUsize,
+        mode: MaintenanceMode,
+    ) -> Result<MaintenanceStep, SqlError> {
+        let mut map = match mode {
+            MaintenanceMode::Finish => map_owner.lock().expect("heap remap lock poisoned"),
+            MaintenanceMode::Background => match map_owner.try_lock() {
+                Ok(owner) => owner,
+                Err(TryLockError::WouldBlock) => return Ok(MaintenanceStep::WaitingForOwner),
+                Err(TryLockError::Poisoned(_)) => panic!("heap remap lock poisoned"),
+            },
+        };
+        let HeapRemap { entries, plan } = &mut *map;
+        let Some(remap) = plan else {
+            return Ok(MaintenanceStep::Complete);
+        };
+        let plan = RelocationPlan {
+            entries,
+            packed_bytes: remap.packed_bytes,
+        };
+        let step = self.advance_heap_references(
+            &mut remap.position,
+            row_slots,
+            mode,
+            |state, versions| {
+                rewrite_row_heap_locations(state, versions, |location| {
+                    if location.generation == remap.generation {
+                        Ok(location)
+                    } else {
+                        plan.relocated(
+                            location,
+                            remap.generation,
+                            Some((remap.frontier, remap.copied_tail)),
+                        )
+                    }
+                })
+            },
+        )?;
+        if step != MaintenanceStep::Complete {
+            return Ok(step);
+        }
+        let step = self.heap.finish_remap(map_owner, mode)?;
+        if step == MaintenanceStep::Complete {
+            map.plan = None;
+            map.entries.clear();
+        }
+        Ok(step)
+    }
+
     pub(crate) fn begin_heap_relocation<'storage, 'scratch>(
         &'storage self,
         entries: &'scratch mut FixedVec<HeapRelocationEntry>,
@@ -719,7 +1011,9 @@ impl Storage {
                 owner
             }
         };
-        let copy = self.heap.begin_copy()?;
+        let Some(copy) = self.heap.begin_copy(mode)? else {
+            return Ok(None);
+        };
         Ok(Some(HeapRelocationProgress {
             copy,
             preparation: HeapRelocationPreparation::Capturing { table: 0, slot: 0 },
@@ -727,6 +1021,7 @@ impl Storage {
             entry: 0,
             entry_at: 0,
             copied_tail: 0,
+            preflight: Some(HeapReferencePosition { table: 0, slot: 0 }),
         }))
     }
 
@@ -968,7 +1263,8 @@ mod tests {
             .iter()
             .map(|table| table.rows.capacity() + 1)
             .sum::<usize>()
-            + workspace.entries.capacity() * 128
+            * 3
+            + workspace.entry_capacity() * 128
             + storage.heap.used()
             + 1;
         for _ in 0..bound {
@@ -989,6 +1285,192 @@ mod tests {
         panic!("heap capture exceeded its fixed fixture work bound");
     }
 
+    fn reach_heap_cutover(storage: &Storage, workspace: &mut HeapRelocationWorkspace) {
+        let bound = workspace.entry_capacity() * 128
+            + storage.heap.used()
+            + storage
+                .tables
+                .iter()
+                .map(|table| table.rows.capacity() + 1)
+                .sum::<usize>()
+                * 3
+            + 1;
+        for _ in 0..bound {
+            assert_ne!(
+                workspace
+                    .step(
+                        storage,
+                        NonZeroUsize::MIN,
+                        NonZeroUsize::new(7).unwrap(),
+                        MaintenanceMode::Background
+                    )
+                    .unwrap(),
+                MaintenanceStep::Complete
+            );
+            if storage.heap.published_remap().is_some() {
+                return;
+            }
+        }
+        panic!("heap cutover exceeded its fixture work bound");
+    }
+
+    #[test]
+    fn bounded_heap_remap_keeps_readers_and_resumes_after_workspace_drop() {
+        let (mut storage, table, original) = fixture();
+        add_preparation_rows(&mut storage, table);
+        let mut first = workspace(128);
+        let mut replacement = workspace(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let before = storage.heap.retain_read_view();
+            let pending = storage
+                .heap
+                .append_row_image(&[Datum::Int4(91), Datum::Text("pending")])
+                .unwrap();
+            let undo = storage
+                .write_pending_image_untracked(table, 65, 77, 1, Some(pending))
+                .unwrap();
+            first.begin(&storage, MaintenanceMode::Background).unwrap();
+            reach_heap_cutover(&storage, &mut first);
+            assert_eq!(location(&storage, table, 1, 0), original);
+            let during = storage.heap.retain_read_view();
+            assert_eq!(
+                before.other(original).unwrap(),
+                during.other(original).unwrap()
+            );
+            assert_eq!(
+                first
+                    .step(
+                        &storage,
+                        NonZeroUsize::MIN,
+                        NonZeroUsize::MIN,
+                        MaintenanceMode::Background
+                    )
+                    .unwrap(),
+                MaintenanceStep::Advanced
+            );
+            let moved = location(&storage, table, 1, 0);
+            assert_eq!(moved.generation, original.generation + 1);
+            assert_eq!(
+                location(&storage, table, 2, 0).generation,
+                original.generation
+            );
+            assert_eq!(
+                before.other(moved).unwrap(),
+                during.other(original).unwrap()
+            );
+            let rows = storage.tables[table].rows.write();
+            assert_eq!(
+                first
+                    .step(
+                        &storage,
+                        NonZeroUsize::MIN,
+                        NonZeroUsize::MIN,
+                        MaintenanceMode::Background
+                    )
+                    .unwrap(),
+                MaintenanceStep::WaitingForOwner
+            );
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.heap.test_append_locks_available());
+            drop(rows);
+            drop(first);
+            assert!(storage.heap.published_remap().is_some());
+            storage.restore_pending(table, 65, 77, undo);
+            finish_bounded_capture(&storage, &mut replacement);
+            assert!(storage.heap.published_remap().is_none());
+            assert!(storage.heap.get(original).is_err());
+            assert_eq!(
+                before.other(original).unwrap(),
+                during.other(moved).unwrap()
+            );
+            for rowid in 2..=64 {
+                assert_row(&storage, table, rowid, 0, 7, rowid as i32, "kept");
+            }
+            assert!(storage.resident_row_state(table, 65).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn bounded_heap_remap_late_writes_and_slot_reuse_never_restore_old_locations() {
+        let (mut storage, table, _) = fixture();
+        add_preparation_rows(&mut storage, table);
+        let mut work = workspace(128);
+        crate::mem::guard::forbid_alloc(|| {
+            work.begin(&storage, MaintenanceMode::Background).unwrap();
+            reach_heap_cutover(&storage, &mut work);
+            work.step(
+                &storage,
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                MaintenanceMode::Background,
+            )
+            .unwrap();
+            let image = storage
+                .heap
+                .append_row_image(&[Datum::Int4(90), Datum::Text("new")])
+                .unwrap();
+            storage
+                .write_pending_image_untracked(table, 2, 77, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 2, 77, 9).unwrap();
+            storage.remove_row_state(table, 1).unwrap();
+            let image = storage
+                .heap
+                .append_row_image(&[Datum::Int4(91), Datum::Text("reused")])
+                .unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 78, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 78, 11).unwrap();
+            finish_bounded_capture(&storage, &mut work);
+            assert_row(&storage, table, 1, 0, u64::MAX, 91, "reused");
+            assert_row(&storage, table, 2, 0, u64::MAX, 90, "new");
+            for rowid in 3..=64 {
+                assert_row(&storage, table, rowid, 0, 7, rowid as i32, "kept");
+            }
+        });
+    }
+
+    #[test]
+    fn bounded_heap_remap_failure_retains_progress_and_can_resume() {
+        let (mut storage, table, _) = fixture();
+        add_preparation_rows(&mut storage, table);
+        let mut work = workspace(128);
+        crate::mem::guard::forbid_alloc(|| {
+            work.begin(&storage, MaintenanceMode::Background).unwrap();
+            reach_heap_cutover(&storage, &mut work);
+            let original = location(&storage, table, 2, 0);
+            storage.tables[table]
+                .rows
+                .write()
+                .get_mut(&2)
+                .unwrap()
+                .committed = Some(RowHome::Heap(RowLoc {
+                generation: original.generation + 2,
+                ..original
+            }));
+            let error = work
+                .step(
+                    &storage,
+                    NonZeroUsize::new(2).unwrap(),
+                    NonZeroUsize::MIN,
+                    MaintenanceMode::Background,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(work.active() && storage.heap.published_remap().is_some());
+            assert_row(&storage, table, 1, 0, 7, 10, "old");
+            storage.tables[table]
+                .rows
+                .write()
+                .get_mut(&2)
+                .unwrap()
+                .committed = Some(RowHome::Heap(original));
+            finish_bounded_capture(&storage, &mut work);
+            assert_row(&storage, table, 2, 0, 7, 2, "kept");
+        });
+    }
+
     #[test]
     fn sliced_heap_capture_one_slot_turns_survive_deletion_reuse_and_late_tables() {
         let (mut storage, table, original) = fixture();
@@ -1000,7 +1482,7 @@ mod tests {
                 .begin(&storage, MaintenanceMode::Background)
                 .unwrap();
             assert!(
-                workspace.entries.is_empty(),
+                workspace.entry_count() == 0,
                 "starting cleanup swept row metadata"
             );
             assert_eq!(
@@ -1014,7 +1496,7 @@ mod tests {
                     .unwrap(),
                 MaintenanceStep::Advanced
             );
-            assert_eq!(workspace.entries.len(), 1);
+            assert_eq!(workspace.entry_count(), 1);
             assert!(matches!(workspace.progress.as_ref().unwrap().preparation,
                 HeapRelocationPreparation::Capturing { table: at, slot: 1 } if at == table));
             assert!(storage.row_versions.test_write().is_ok());
@@ -1107,7 +1589,7 @@ mod tests {
                     MaintenanceStep::WaitingForOwner
                 );
                 assert!(workspace.active());
-                assert!(workspace.entries.is_empty());
+                assert!(workspace.entry_count() == 0);
                 if rows.is_some() {
                     assert!(
                         storage.row_versions.test_write().is_ok(),
@@ -1152,7 +1634,7 @@ mod tests {
                     .unwrap(),
                 MaintenanceStep::Advanced
             );
-            assert_eq!(short.entries.len(), 1);
+            assert_eq!(short.entry_count(), 1);
             let error = short
                 .step(
                     &storage,
@@ -1169,7 +1651,7 @@ mod tests {
                     .starts_with("heap compaction scratch overflow:")
             );
             assert!(!short.active());
-            assert!(short.entries.is_empty());
+            assert!(short.entry_count() == 0);
             assert_eq!(location(&storage, table, 1, 0), original);
             full.begin(&storage, MaintenanceMode::Background).unwrap();
             finish_bounded_capture(&storage, &mut full);
@@ -1225,7 +1707,7 @@ mod tests {
                     .unwrap(),
                 MaintenanceStep::Advanced
             );
-            assert_eq!(workspace.entries.len(), 2);
+            assert_eq!(workspace.entry_count(), 2);
             for (at, value, txid, lsn) in [(table, 30, 10, 11), (other, 6, 12, 13)] {
                 let image = storage
                     .heap
@@ -1578,13 +2060,12 @@ mod tests {
     }
 
     #[test]
-    fn sliced_heap_cleanup_wrong_instance_releases_an_orphaned_copy() {
+    fn sliced_heap_cleanup_wrong_instance_preserves_the_original_copy() {
         let (storage, _, original) = fixture();
         let retained = storage.heap.get(original).unwrap();
         let mut workspace = workspace(8);
         crate::mem::guard::forbid_alloc(|| workspace.begin(&storage, MaintenanceMode::Background))
             .unwrap();
-        drop(storage);
         let (replacement, table, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
             let error = workspace
@@ -1596,6 +2077,8 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert!(workspace.active());
+            finish_bounded_capture(&storage, &mut workspace);
             assert!(!workspace.active());
             let mut values = [Datum::Null; 2];
             rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values).unwrap();

@@ -1,6 +1,6 @@
 //! Visible heap images retain byte ownership; deferred reads retain snapshots.
 
-use super::row_heap::HeapRowRead;
+use super::row_heap::{HeapReadSlot, HeapReadView, HeapRowRead};
 use super::spill_generations::{
     CapturedSpillRoots, QueryRootPool, SpillGenerationImage, SpillGenerationList, SpilledRowRead,
 };
@@ -34,11 +34,12 @@ pub(super) enum RowVersionIdentity {
     Committed(u64),
 }
 
-/// One byte owner shared by every deferred row in a scan or table rewrite.
+/// Byte owners shared by every deferred row in a scan or table rewrite.
+#[repr(align(8))]
 pub(crate) struct TableRowSnapshot<'arena> {
     pub(super) created_at: u64,
     table_slot: usize,
-    heap: Option<HeapRowRead>,
+    heap: Option<HeapReadView>,
     roots: CapturedSpillRoots<'arena>,
     pool: Arc<QueryRootPool>,
 }
@@ -65,11 +66,13 @@ pub(super) struct CapturedRowRecord {
 
 #[derive(Clone, Copy)]
 enum CapturedRowKind {
-    PendingHeap,
-    CommittedHeap,
+    PendingPrimaryHeap,
+    CommittedPrimaryHeap,
     CommittedSpilled,
     Invisible,
     LookupSaved,
+    PendingSecondaryHeap,
+    CommittedSecondaryHeap,
 }
 
 impl CapturedRowRecord {
@@ -100,12 +103,14 @@ const _: () = assert!(size_of::<CapturedRowRecord>() == 32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 enum OrderedVersionKind {
-    PendingHeap,
-    CommittedHeap,
+    PendingPrimaryHeap,
+    CommittedPrimaryHeap,
     CommittedSpilled,
+    PendingSecondaryHeap,
+    CommittedSecondaryHeap,
 }
 
-/// The source's alignment leaves two address bits for the version kind.
+/// The source's alignment leaves three address bits for the version kind.
 /// Keep the complete identity and location widths in the 32-byte row record.
 #[derive(Clone, Copy)]
 struct OrderedRowSource<'source, 'arena> {
@@ -113,7 +118,7 @@ struct OrderedRowSource<'source, 'arena> {
     borrowed: PhantomData<&'source TableRowSnapshot<'arena>>,
 }
 
-const _: () = assert!(core::mem::align_of::<TableRowSnapshot<'static>>() >= 4);
+const _: () = assert!(core::mem::align_of::<TableRowSnapshot<'static>>() >= 8);
 
 impl<'source, 'arena> OrderedRowSource<'source, 'arena> {
     fn new(source: &'source TableRowSnapshot<'arena>, kind: OrderedVersionKind) -> Self {
@@ -127,10 +132,12 @@ impl<'source, 'arena> OrderedRowSource<'source, 'arena> {
     }
 
     fn kind(self) -> OrderedVersionKind {
-        match self.tagged.addr().get() & 3 {
-            0 => OrderedVersionKind::PendingHeap,
-            1 => OrderedVersionKind::CommittedHeap,
+        match self.tagged.addr().get() & 7 {
+            0 => OrderedVersionKind::PendingPrimaryHeap,
+            1 => OrderedVersionKind::CommittedPrimaryHeap,
             2 => OrderedVersionKind::CommittedSpilled,
+            3 => OrderedVersionKind::PendingSecondaryHeap,
+            4 => OrderedVersionKind::CommittedSecondaryHeap,
             _ => unreachable!("only checked version kinds are encoded"),
         }
     }
@@ -138,9 +145,9 @@ impl<'source, 'arena> OrderedRowSource<'source, 'arena> {
     fn owner(self) -> &'source TableRowSnapshot<'arena> {
         let pointer = self
             .tagged
-            .map_addr(|address| NonZeroUsize::new(address.get() & !3).expect("non-null source"));
+            .map_addr(|address| NonZeroUsize::new(address.get() & !7).expect("non-null source"));
         // SAFETY: construction borrows this aligned source for 'source. Both
-        // map_addr calls preserve provenance; clearing the two kind bits
+        // map_addr calls preserve provenance; clearing the three kind bits
         // restores its original address. Access is immutable, never as_mut.
         unsafe { pointer.as_ref() }
     }
@@ -173,7 +180,7 @@ impl<'arena> TableRowSnapshot<'arena> {
         Ok(Self {
             created_at: image.created_at,
             table_slot: image.table_slot(),
-            heap: retain_heap.then(|| storage.heap.retain_allocation()),
+            heap: retain_heap.then(|| storage.heap.retain_read_view()),
             roots: CapturedSpillRoots::capture(storage, image, generations, arena)?,
             pool: Arc::clone(&storage.query_roots),
         })
@@ -227,23 +234,28 @@ impl<'arena> TableRowSnapshot<'arena> {
         image.validate_request(self.table_slot, rowid)?;
         let (version, kind, offset_or_member, len) = match &image.bytes {
             VisibleRowBytes::Heap(bytes) => {
-                let heap = self
-                    .heap
-                    .as_ref()
-                    .filter(|heap| heap.same_allocation(bytes))
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::SERIALIZATION_FAILURE,
-                            "ordered row heap allocation changed"
-                        )
-                    })?;
+                let heap = self.heap.as_ref().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "ordered row heap allocation changed"
+                    )
+                })?;
+                let slot = heap.slot_for(bytes)?;
                 let location = bytes.location();
                 heap.other(location)?;
-                let (version, kind) = match image.snapshot.version {
-                    RowVersionIdentity::Pending(identity) => {
-                        (identity, OrderedVersionKind::PendingHeap)
+                let (version, kind) = match (image.snapshot.version, slot) {
+                    (RowVersionIdentity::Pending(identity), HeapReadSlot::Primary) => {
+                        (identity, OrderedVersionKind::PendingPrimaryHeap)
                     }
-                    RowVersionIdentity::Committed(lsn) => (lsn, OrderedVersionKind::CommittedHeap),
+                    (RowVersionIdentity::Pending(identity), HeapReadSlot::Secondary) => {
+                        (identity, OrderedVersionKind::PendingSecondaryHeap)
+                    }
+                    (RowVersionIdentity::Committed(lsn), HeapReadSlot::Primary) => {
+                        (lsn, OrderedVersionKind::CommittedPrimaryHeap)
+                    }
+                    (RowVersionIdentity::Committed(lsn), HeapReadSlot::Secondary) => {
+                        (lsn, OrderedVersionKind::CommittedSecondaryHeap)
+                    }
                 };
                 (version, kind, location.offset, location.len)
             }
@@ -340,9 +352,13 @@ impl<'arena> TableRowSnapshot<'arena> {
             offset_or_member: row.offset_or_member,
             len: row.len,
             kind: match row.source.kind() {
-                OrderedVersionKind::PendingHeap => CapturedRowKind::PendingHeap,
-                OrderedVersionKind::CommittedHeap => CapturedRowKind::CommittedHeap,
+                OrderedVersionKind::PendingPrimaryHeap => CapturedRowKind::PendingPrimaryHeap,
+                OrderedVersionKind::CommittedPrimaryHeap => CapturedRowKind::CommittedPrimaryHeap,
                 OrderedVersionKind::CommittedSpilled => CapturedRowKind::CommittedSpilled,
+                OrderedVersionKind::PendingSecondaryHeap => CapturedRowKind::PendingSecondaryHeap,
+                OrderedVersionKind::CommittedSecondaryHeap => {
+                    CapturedRowKind::CommittedSecondaryHeap
+                }
             },
         })
     }
@@ -380,9 +396,11 @@ impl<'arena> TableRowSnapshot<'arena> {
         row: CapturedRowRecord,
     ) -> Result<Option<VisibleRowHome>, SqlError> {
         let kind = match row.kind {
-            CapturedRowKind::PendingHeap => OrderedVersionKind::PendingHeap,
-            CapturedRowKind::CommittedHeap => OrderedVersionKind::CommittedHeap,
+            CapturedRowKind::PendingPrimaryHeap => OrderedVersionKind::PendingPrimaryHeap,
+            CapturedRowKind::CommittedPrimaryHeap => OrderedVersionKind::CommittedPrimaryHeap,
             CapturedRowKind::CommittedSpilled => OrderedVersionKind::CommittedSpilled,
+            CapturedRowKind::PendingSecondaryHeap => OrderedVersionKind::PendingSecondaryHeap,
+            CapturedRowKind::CommittedSecondaryHeap => OrderedVersionKind::CommittedSecondaryHeap,
             CapturedRowKind::Invisible => return Ok(None),
             CapturedRowKind::LookupSaved => {
                 return Err(sql_err!(
@@ -481,26 +499,47 @@ impl OrderedRowSnapshot<'_, '_> {
     pub(crate) fn sort_key(self) -> (u8, u64, u32) {
         match self.source.kind() {
             OrderedVersionKind::CommittedSpilled => (0, self.rowid, 0),
-            _ => (1, 0, self.offset_or_member),
+            OrderedVersionKind::PendingPrimaryHeap | OrderedVersionKind::CommittedPrimaryHeap => {
+                (1, 0, self.offset_or_member)
+            }
+            OrderedVersionKind::PendingSecondaryHeap
+            | OrderedVersionKind::CommittedSecondaryHeap => (2, 0, self.offset_or_member),
         }
     }
 
     pub(crate) fn read(self) -> Result<VisibleRowHome, SqlError> {
         let source = self.source.owner();
         match self.source.kind() {
-            OrderedVersionKind::PendingHeap | OrderedVersionKind::CommittedHeap => {
+            OrderedVersionKind::PendingPrimaryHeap
+            | OrderedVersionKind::CommittedPrimaryHeap
+            | OrderedVersionKind::PendingSecondaryHeap
+            | OrderedVersionKind::CommittedSecondaryHeap => {
                 let heap = source
                     .heap
                     .as_ref()
                     .expect("retained heap row has an owner");
                 let version = match self.source.kind() {
-                    OrderedVersionKind::PendingHeap => RowVersionIdentity::Pending(self.version),
-                    _ => RowVersionIdentity::Committed(self.version),
+                    OrderedVersionKind::PendingPrimaryHeap
+                    | OrderedVersionKind::PendingSecondaryHeap => {
+                        RowVersionIdentity::Pending(self.version)
+                    }
+                    OrderedVersionKind::CommittedPrimaryHeap
+                    | OrderedVersionKind::CommittedSecondaryHeap => {
+                        RowVersionIdentity::Committed(self.version)
+                    }
+                    OrderedVersionKind::CommittedSpilled => unreachable!("heap row kind"),
+                };
+                let slot = match self.source.kind() {
+                    OrderedVersionKind::PendingPrimaryHeap
+                    | OrderedVersionKind::CommittedPrimaryHeap => HeapReadSlot::Primary,
+                    OrderedVersionKind::PendingSecondaryHeap
+                    | OrderedVersionKind::CommittedSecondaryHeap => HeapReadSlot::Secondary,
+                    OrderedVersionKind::CommittedSpilled => unreachable!("heap row kind"),
                 };
                 let location = RowLoc {
                     offset: self.offset_or_member,
                     len: self.len,
-                    generation: heap.location().generation,
+                    generation: heap.generation(slot)?,
                 };
                 Ok(VisibleRowHome::heap(
                     RowSnapshot {
@@ -672,9 +711,11 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             for kind in [
-                OrderedVersionKind::PendingHeap,
-                OrderedVersionKind::CommittedHeap,
+                OrderedVersionKind::PendingPrimaryHeap,
+                OrderedVersionKind::CommittedPrimaryHeap,
                 OrderedVersionKind::CommittedSpilled,
+                OrderedVersionKind::PendingSecondaryHeap,
+                OrderedVersionKind::CommittedSecondaryHeap,
             ] {
                 let tagged = OrderedRowSource::new(&source, kind);
                 let copied = tagged;
@@ -765,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_ordered_rows_reject_changed_heap_owners_and_wrong_requests() {
+    fn owned_ordered_rows_accept_moved_images_and_reject_foreign_owners() {
         use super::super::tests::{make_def, test_budget, test_config};
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -776,7 +817,13 @@ mod tests {
                 &[("id", super::super::ColType::Int4, true)],
             ))
             .unwrap();
+        storage.heap.append_bytes(b"dead").unwrap();
         let location = storage.heap.append_bytes(b"keep").unwrap();
+        let foreign = super::super::row_heap::RowHeap::new(
+            &mut Budget::new(super::super::row_heap::RowHeap::control_bytes() + 64),
+            32,
+        )
+        .unwrap();
         storage.tables[table]
             .rows
             .insert(1, super::super::RowState::committed_only_at(location, 7))
@@ -800,15 +847,8 @@ mod tests {
                 sqlstate::INTERNAL_ERROR
             );
             storage.compact_heap(&mut scratch).unwrap();
-            let current = storage.tables[table]
-                .rows
-                .get(&1)
-                .unwrap()
-                .committed
-                .unwrap();
-            let RowHome::Heap(location) = current else {
-                panic!("heap fixture")
-            };
+            let location = storage.heap.append_bytes(b"next").unwrap();
+            assert_eq!(location.offset, retained.heap_loc().unwrap().offset);
             let moved = VisibleRowHome::heap(
                 RowSnapshot {
                     created_at: source.created_at,
@@ -818,8 +858,40 @@ mod tests {
                 table,
                 1,
             );
+            for version in [
+                RowVersionIdentity::Committed(7),
+                RowVersionIdentity::Pending(19),
+            ] {
+                let image = VisibleRowHome::heap(
+                    RowSnapshot {
+                        created_at: source.created_at,
+                        version,
+                    },
+                    storage.heap.get(location).unwrap(),
+                    table,
+                    1,
+                );
+                let captured = source.capture_image(1, &image).unwrap();
+                let restored = source.read_record(captured).unwrap().unwrap();
+                assert_eq!(restored.snapshot().version, version);
+                let VisibleRowBytes::Heap(bytes) = restored.bytes else {
+                    panic!("heap fixture");
+                };
+                assert_eq!(&*bytes, b"next");
+            }
+            let moved_record = source.retain(1, &moved).unwrap();
+            let VisibleRowBytes::Heap(bytes) = moved_record.read().unwrap().bytes else {
+                panic!("heap fixture");
+            };
+            assert_eq!(&*bytes, b"next");
+            let foreign = VisibleRowHome::heap(
+                moved.snapshot(),
+                foreign.append_image(b"lost").unwrap(),
+                table,
+                1,
+            );
             assert_eq!(
-                source.retain(1, &moved).err().unwrap().sqlstate,
+                source.retain(1, &foreign).err().unwrap().sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             let record = source.retain(1, &retained).unwrap();

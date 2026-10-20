@@ -411,6 +411,7 @@ struct LocalCleanup {
     lsn: u64,
     source: LocalCleanupSource,
     phase: LocalCleanupPhase,
+    heap_changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -424,7 +425,6 @@ enum LocalCleanupPhase {
     Prepare,
     Rows(RowCleanup),
     Compact,
-    CompactAfterEviction,
     Finish,
 }
 
@@ -503,6 +503,8 @@ pub struct Engine {
     /// Cleanup retries preserve the publication's captured log boundary.
     local_cleanup: Option<LocalCleanup>,
     checkpoint_failure: Option<(u64, SqlError)>,
+    cache_capacity_generation: u64,
+    cache_capacity_failure: Option<(u64, SqlError)>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -762,26 +764,32 @@ pub(crate) struct DatabaseLogin {
     pub connection_limit: i32,
 }
 
+/// The resource that must change before a suspended statement can resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementWait {
+    Lock,
+    ObjectIo,
+    CacheCapacity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionStatus {
     Complete,
     /// The current statement emitted no client-visible output and is parked
-    /// on a row lock or a non-blocking block fetch. Statements before it in
+    /// on a row lock, object I/O or cache capacity. Statements before it in
     /// the same simple-query message completed exactly once and are skipped
     /// when the message resumes.
     Blocked {
         completed_statements: usize,
         output_mark: usize,
-        /// True when the block is an I/O wait (retry on every reactor wake),
-        /// false for a lock wait (retry only on lock-generation change).
-        io_wait: bool,
+        wait: StatementWait,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtendedExecutionStatus {
     Complete(bool),
-    Blocked { io_wait: bool },
+    Blocked { wait: StatementWait },
 }
 
 fn statement_writes(statement: &Stmt<'_>) -> bool {
@@ -3839,6 +3847,8 @@ impl Engine {
             temporary_spiller,
             local_cleanup: None,
             checkpoint_failure: None,
+            cache_capacity_generation: 0,
+            cache_capacity_failure: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
             commit_progress: CommitProgressMode::Inline,
@@ -9123,6 +9133,7 @@ impl Engine {
             lsn,
             source: LocalCleanupSource::Checkpoint,
             phase: LocalCleanupPhase::Prepare,
+            heap_changed: false,
         });
     }
 
@@ -9139,7 +9150,17 @@ impl Engine {
             .expect("post-publication cleanup has its published LSN");
         #[cfg(feature = "checkpoint-profile")]
         let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
+        let heap_bytes = self.storage.heap.used();
         let result = self.advance_local_cleanup(cleanup, mode);
+        if result.is_ok() {
+            let cleared_failure = self.cache_capacity_failure.take().is_some();
+            if self.storage.heap.used() != heap_bytes
+                || self.local_cleanup.is_none()
+                || cleared_failure
+            {
+                self.cache_capacity_generation = self.cache_capacity_generation.wrapping_add(1);
+            }
+        }
         #[cfg(feature = "checkpoint-profile")]
         if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
             ckpt.profile_phase("local_cleanup", cleanup.lsn, started, before);
@@ -9149,7 +9170,7 @@ impl Engine {
 
     fn advance_local_cleanup(
         &mut self,
-        cleanup: LocalCleanup,
+        mut cleanup: LocalCleanup,
         mode: MaintenanceMode,
     ) -> Result<MaintenanceStep, SqlError> {
         let next = match cleanup.phase {
@@ -9183,17 +9204,40 @@ impl Engine {
                         return Ok(pending);
                     }
                 }
+                if matches!(
+                    rows.task(),
+                    RowCleanupTask::DurableHistory
+                        | RowCleanupTask::SnapshotHistory
+                        | RowCleanupTask::HeapRows(_)
+                ) {
+                    cleanup.heap_changed |= rows.changed();
+                }
                 match rows.task() {
                     RowCleanupTask::SavedMarkers { .. } => LocalCleanupPhase::Rows(
                         RowCleanup::new(RowCleanupTask::SnapshotHistory, cleanup.source.target()),
                     ),
-                    RowCleanupTask::DurableHistory => LocalCleanupPhase::Compact,
+                    RowCleanupTask::DurableHistory => {
+                        let selection = if self.storage.heap.used() * 100
+                            >= self.storage.heap.capacity() * 50
+                        {
+                            HeapCleanup::Durable
+                        } else {
+                            HeapCleanup::PressuredDurable
+                        };
+                        LocalCleanupPhase::Rows(RowCleanup::new(
+                            RowCleanupTask::HeapRows(selection),
+                            cleanup.source.target(),
+                        ))
+                    }
                     RowCleanupTask::SnapshotHistory => LocalCleanupPhase::Rows(RowCleanup::new(
                         RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
                         cleanup.source.target(),
                     )),
-                    RowCleanupTask::HeapRows(_) if rows.changed() => {
-                        LocalCleanupPhase::CompactAfterEviction
+                    RowCleanupTask::HeapRows(_)
+                        if cleanup.heap_changed
+                            || matches!(cleanup.source, LocalCleanupSource::Checkpoint) =>
+                    {
+                        LocalCleanupPhase::Compact
                     }
                     RowCleanupTask::HeapRows(_) => {
                         LocalCleanupPhase::Rows(cleanup.source.entries())
@@ -9201,7 +9245,7 @@ impl Engine {
                     RowCleanupTask::SavedEntries(_) => LocalCleanupPhase::Finish,
                 }
             }
-            LocalCleanupPhase::Compact | LocalCleanupPhase::CompactAfterEviction => {
+            LocalCleanupPhase::Compact => {
                 match self.compact_scratch.compact_step(
                     &mut self.storage,
                     core::num::NonZeroUsize::new(64).unwrap(),
@@ -9211,25 +9255,7 @@ impl Engine {
                     MaintenanceStep::Complete => {}
                     pending => return Ok(pending),
                 }
-                match cleanup.phase {
-                    LocalCleanupPhase::Compact => {
-                        let selection = match cleanup.source {
-                            LocalCleanupSource::TemporaryTable { .. } => HeapCleanup::AllSaved,
-                            LocalCleanupSource::Checkpoint
-                                if self.storage.heap.used() * 100
-                                    >= self.storage.heap.capacity() * 50 =>
-                            {
-                                HeapCleanup::Durable
-                            }
-                            LocalCleanupSource::Checkpoint => HeapCleanup::PressuredDurable,
-                        };
-                        LocalCleanupPhase::Rows(RowCleanup::new(
-                            RowCleanupTask::HeapRows(selection),
-                            cleanup.source.target(),
-                        ))
-                    }
-                    _ => LocalCleanupPhase::Rows(cleanup.source.entries()),
-                }
+                LocalCleanupPhase::Rows(cleanup.source.entries())
             }
             LocalCleanupPhase::Finish => {
                 self.local_cleanup = None;
@@ -9243,15 +9269,103 @@ impl Engine {
         Ok(MaintenanceStep::Advanced)
     }
 
-    fn retry_local_cleanup(&mut self) -> Result<(), SqlError> {
-        if self.local_cleanup.is_some() {
-            if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
-                self.finish_local_cleanup()?;
-            } else {
-                self.local_cleanup_step(MaintenanceMode::Background)?;
+    pub(crate) fn cache_capacity_generation(&self) -> u64 {
+        self.cache_capacity_generation
+    }
+
+    pub(crate) fn statement_wait_generation(&self, wait: StatementWait) -> u64 {
+        match wait {
+            StatementWait::Lock | StatementWait::ObjectIo => self.lock_generation(),
+            StatementWait::CacheCapacity => self.cache_capacity_generation(),
+        }
+    }
+
+    fn wait_for_cache_capacity(
+        &self,
+        statement: &Stmt<'_>,
+        txn: &mut TxnState,
+        sqlprep: &SqlPreparedPool,
+        arena: &Arena,
+        guc: &GucState,
+        context: exec::PlpgsqlTransactionContext,
+    ) -> Result<bool, SqlError> {
+        if let Some(wait) = &txn.cache_capacity_wait {
+            query::restore_statement_deadline(wait.deadline);
+            query::check_timeout()?;
+            if let Some((epoch, error)) = &self.cache_capacity_failure
+                && Some(*epoch) != wait.failure_epoch
+            {
+                return Err(SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                });
             }
         }
-        Ok(())
+        if txn.failed
+            || txn.staged_commit().is_some()
+            || !txn.touched().is_empty()
+            || !txn.ddl().is_empty()
+            || matches!(
+                statement,
+                Stmt::Checkpoint
+                    | Stmt::Vacuum { .. }
+                    | Stmt::CommitPrepared(_)
+                    | Stmt::RollbackPrepared(_)
+            )
+        {
+            return Ok(false);
+        }
+        let temporary_cleanup = self.local_cleanup.is_some_and(|cleanup| {
+            matches!(cleanup.source, LocalCleanupSource::TemporaryTable { .. })
+        });
+        let pressure = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85
+            || self.storage.temporary_map_pressure()
+            || temporary_cleanup;
+        if !pressure {
+            return Ok(false);
+        }
+        let mut command = statement;
+        while let Stmt::Explain { options, statement } = command {
+            if !options.analyze {
+                return Ok(false);
+            }
+            command = statement;
+        }
+        let command = if let Stmt::ExecutePrepared { name, args } = command {
+            self.prepared_statement(name, args.len(), sqlprep, arena)?
+        } else {
+            command
+        };
+        if !statement_writes(command) {
+            return Ok(false);
+        }
+        // Existing pending writes can pin the very space they would wait for.
+        // They keep the normal named capacity error, as does an unreclaimable
+        // working set after the current maintenance task has completed.
+        let active = self.local_cleanup.is_some()
+            || self.ckpt.as_ref().is_some_and(|checkpointer| {
+                checkpointer.sweep_active() || checkpointer.manifest_publication_pending()
+            });
+        if active && txn.cache_capacity_wait.is_none() {
+            if let Some(deadline) = txn.suspended_statement_deadline() {
+                query::restore_statement_deadline(deadline);
+            } else {
+                query::arm_timeout(guc.statement_timeout_ms());
+            }
+            query::check_timeout()?;
+            // Old maintenance failures belong to their original requests. A
+            // new waiter observes only failures raised after it starts waiting.
+            txn.cache_capacity_wait = Some(txn::CacheCapacityWait {
+                failure_epoch: self
+                    .cache_capacity_failure
+                    .as_ref()
+                    .map(|(epoch, _)| *epoch),
+                clock: datetime::statement_clock(),
+                deadline: query::statement_deadline(),
+                context: txn.suspended_statement_context().unwrap_or(context),
+            });
+        }
+        Ok(active)
     }
 
     /// The COPY FROM the last statement started, if any; the connection
@@ -9321,8 +9435,8 @@ impl Engine {
             .finish_backend_statement(pid, txn.is_active(), txn.failed, backend_xid);
     }
 
-    pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
-        self.storage.park_backend_statement(pid, object_io);
+    pub(crate) fn park_backend_statement(&self, pid: i32, wait: StatementWait) {
+        self.storage.park_backend_statement(pid, wait);
     }
 
     pub(crate) fn cancel_backend_wait(&self, pid: i32) {
@@ -9659,10 +9773,15 @@ impl Engine {
         !self.checkpoint_beat().failed()
     }
 
-    /// Snapshot cleanup visits at most 64 stable slots alongside a heap step.
-    /// Critical pressure, heap remapping and other maintenance still
-    /// have whole turns. Publication and merge wait for owned reads to finish.
     fn remember_checkpoint_failure(&mut self, error: &SqlError) {
+        self.cache_capacity_generation = self.cache_capacity_generation.wrapping_add(1);
+        self.cache_capacity_failure = Some((
+            self.cache_capacity_generation,
+            SqlError {
+                sqlstate: error.sqlstate,
+                message: error.message,
+            },
+        ));
         if let Some(checkpointer) = self.ckpt.as_ref() {
             self.checkpoint_failure = Some((
                 checkpointer.requested_checkpoint_epoch(),
@@ -9797,12 +9916,7 @@ impl Engine {
             crate::storage::HistoryReclamation::Idle
         };
         if self.local_cleanup.is_some() {
-            let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
-                self.finish_local_cleanup()
-                    .map(|()| MaintenanceStep::Complete)
-            } else {
-                self.local_cleanup_step(MaintenanceMode::Background)
-            };
+            let cleanup = self.local_cleanup_step(MaintenanceMode::Background);
             return match cleanup {
                 Ok(MaintenanceStep::WaitingForOwner) if !retried_upload => {
                     CheckpointBeat::WaitingForOwner
@@ -9884,6 +9998,7 @@ impl Engine {
                     generation: self.storage.table(slot).generation(),
                 },
                 phase: LocalCleanupPhase::Prepare,
+                heap_changed: false,
             });
             return if retried_upload {
                 CheckpointBeat::Durable
@@ -9912,31 +10027,17 @@ impl Engine {
         // after yielding. Its block reads therefore own the store
         // synchronously, just as an explicit CHECKPOINT does.
         let atomic_reads = ckpt.atomic_block_read_scope();
-        // A wide sweep can lose headroom faster than one beat reclaims it.
-        // Complete publication under critical pressure before dispatch resumes.
-        let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
-        let checkpoint = if critical {
-            ckpt.checkpoint(&mut self.storage).map(|published| {
-                published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
-                    lsn,
-                })
-            })
-        } else {
-            ckpt.checkpoint_step(&mut self.storage)
-        };
+        let checkpoint = ckpt.checkpoint_step(&mut self.storage);
         drop(atomic_reads);
         let remote_maintenance_finished =
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
                 self.begin_checkpoint_cleanup(lsn);
-                let cleanup = if critical {
-                    self.finish_local_cleanup()
-                } else {
-                    self.local_cleanup_step(MaintenanceMode::Background)
-                        .map(|_| ())
-                };
+                let cleanup = self
+                    .local_cleanup_step(MaintenanceMode::Background)
+                    .map(|_| ());
                 if let Err(e) = cleanup {
                     self.remember_checkpoint_failure(&e);
                     let message = stack_format!(
@@ -10066,7 +10167,7 @@ impl Engine {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: resume_statement,
                     output_mark: responder.buffer.mark(),
-                    io_wait: true,
+                    wait: crate::sql::StatementWait::ObjectIo,
                 });
             }
             responder.error(error.sqlstate, error.message.as_str())?;
@@ -10148,13 +10249,6 @@ impl Engine {
             .skip(resume_statement)
         {
             let statement = statement.as_ref().expect("parsed query statement");
-            if self.local_cleanup.is_some()
-                && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
-                && let Err(error) = self.retry_local_cleanup()
-            {
-                responder.error(error.sqlstate, error.message.as_str())?;
-                return Ok(ExecutionStatus::Complete);
-            }
             if self.pending_copy.take().is_some() {
                 // COPY FROM STDIN takes over the connection; a
                 // statement after it in the same string has nowhere
@@ -10175,11 +10269,38 @@ impl Engine {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_index,
                         output_mark: responder.buffer.mark(),
-                        io_wait: true,
+                        wait: crate::sql::StatementWait::ObjectIo,
                     });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
+            }
+            match self.wait_for_cache_capacity(
+                statement,
+                txn,
+                sqlprep,
+                arena,
+                guc,
+                routine_transaction_context,
+            ) {
+                Ok(true) => {
+                    return Ok(ExecutionStatus::Blocked {
+                        completed_statements: statement_index,
+                        output_mark: responder.buffer.mark(),
+                        wait: StatementWait::CacheCapacity,
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    txn.release_suspended_statement();
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    return Ok(ExecutionStatus::Complete);
+                }
             }
             executed_any = true;
             let output_mark = responder.buffer.mark();
@@ -10233,7 +10354,7 @@ impl Engine {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            io_wait: true,
+                            wait: crate::sql::StatementWait::ObjectIo,
                         });
                     }
                     if txn.owns_statement_mark(statement_mark) {
@@ -10243,7 +10364,11 @@ impl Engine {
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark,
-                                io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
                             });
                         }
                         self.storage
@@ -10279,7 +10404,7 @@ impl Engine {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            io_wait: true,
+                            wait: crate::sql::StatementWait::ObjectIo,
                         });
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -10288,7 +10413,7 @@ impl Engine {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: statement_index,
                     output_mark,
-                    io_wait: false,
+                    wait: crate::sql::StatementWait::Lock,
                 });
             }
             txn.compact_completed_constraints();
@@ -10306,7 +10431,7 @@ impl Engine {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: statement_count,
                     output_mark: responder.buffer.mark(),
-                    io_wait: true,
+                    wait: crate::sql::StatementWait::ObjectIo,
                 });
             }
             responder.error(e.sqlstate, e.message.as_str())?;
@@ -10375,7 +10500,9 @@ impl Engine {
             && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
         {
             if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
-                return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                return Ok(ExtendedExecutionStatus::Blocked {
+                    wait: crate::sql::StatementWait::ObjectIo,
+                });
             }
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
@@ -10406,13 +10533,6 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
-        if self.local_cleanup.is_some()
-            && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
-            && let Err(error) = self.retry_local_cleanup()
-        {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
@@ -10438,6 +10558,31 @@ impl Engine {
             datetime::transaction_micros(),
             backend_xid,
         );
+        match self.wait_for_cache_capacity(
+            &statement,
+            txn,
+            sqlprep,
+            arena,
+            guc,
+            routine_transaction_context,
+        ) {
+            Ok(true) => {
+                return Ok(ExtendedExecutionStatus::Blocked {
+                    wait: StatementWait::CacheCapacity,
+                });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                txn.release_suspended_statement();
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.error(error.sqlstate, error.message.as_str())?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+        }
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;
@@ -10491,12 +10636,16 @@ impl Engine {
                         if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                             && txn.staged_commit().is_some()
                         {
-                            return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                            return Ok(ExtendedExecutionStatus::Blocked {
+                                wait: crate::sql::StatementWait::ObjectIo,
+                            });
                         }
                         responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
-                    return Ok(ExtendedExecutionStatus::Blocked { io_wait: false });
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: crate::sql::StatementWait::Lock,
+                    });
                 }
                 txn.compact_completed_constraints();
                 Ok(ExtendedExecutionStatus::Complete(true))
@@ -10514,14 +10663,20 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.staged_commit().is_some() {
-                        return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                        return Ok(ExtendedExecutionStatus::Blocked {
+                            wait: crate::sql::StatementWait::ObjectIo,
+                        });
                     }
                     if txn.owns_statement_mark(statement_mark) {
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
                         if !lock_timeout_expired {
                             return Ok(ExtendedExecutionStatus::Blocked {
-                                io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
                             });
                         }
                         self.storage
@@ -10635,7 +10790,9 @@ impl Engine {
             && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
             if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
-                return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                return Ok(ExtendedExecutionStatus::Blocked {
+                    wait: crate::sql::StatementWait::ObjectIo,
+                });
             }
             responder.buffer.truncate_to(response_mark);
             responder.error(error.sqlstate, error.message.as_str())?;
@@ -14280,10 +14437,9 @@ impl Engine {
         result
     }
 
-    /// Parses the stored SQL for EXPLAIN without evaluating EXECUTE arguments.
-    /// `GENERIC_PLAN` deliberately reaches this boundary before values exist;
-    /// the prepared pool supplies the declared parameter shape.
-    fn prepared_statement_for_explain<'a>(
+    /// Parses stored SQL without evaluating EXECUTE arguments. Admission and
+    /// EXPLAIN can inspect the command before expressions have effects.
+    fn prepared_statement<'a>(
         &self,
         name: &str,
         argument_count: usize,
@@ -14412,6 +14568,7 @@ impl Engine {
             true,
             None,
         );
+        txn.cache_capacity_wait = None;
         txn.leave_ddl_origin(prior_origin);
         if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
@@ -14641,6 +14798,19 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if reset_workspace {
+            if txn.staged_commit().is_some() {
+                query::arm_timeout(0);
+            } else if let Some(deadline) = txn.suspended_statement_deadline() {
+                query::restore_statement_deadline(deadline);
+            } else {
+                query::arm_timeout(guc.statement_timeout_ms());
+            }
+        }
+        // Nested SQL shares its caller's deadline, including after a wait.
+        if let Err(error) = query::check_timeout() {
+            return Ok(Err(error));
+        }
         if !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
             && txn.staged_commit().is_none()
             && let Err(error) = self.check_writer_fence()
@@ -14706,13 +14876,6 @@ impl Engine {
         };
         if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
             return Ok(Err(error));
-        }
-        if txn.staged_commit().is_some() {
-            query::arm_timeout(0);
-        } else if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
         }
         let statement_clock = datetime::statement_clock();
         let statement_deadline = query::statement_deadline();
@@ -14931,8 +15094,7 @@ impl Engine {
                 };
                 let planned_statement = match statement {
                     Stmt::ExecutePrepared { name, args } => {
-                        match self.prepared_statement_for_explain(name, args.len(), sqlprep, arena)
-                        {
+                        match self.prepared_statement(name, args.len(), sqlprep, arena) {
                             Ok(statement) => statement,
                             Err(error) => return Ok(Err(error)),
                         }

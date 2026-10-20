@@ -85686,7 +85686,7 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let lsn = engine.storage.lsn();
     start_sliced_cleanup(&mut engine, lsn);
     crate::mem::guard::forbid_alloc(|| engine.finish_local_cleanup())
-        .expect("initial setup can reclaim the unretained active buffer in place");
+        .expect("initial setup has a spare buffer for its single heap move");
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
         for _ in 0..4 {
@@ -85722,6 +85722,11 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     assert!(!engine.compact_scratch.active());
     drop(older);
     finish_sliced_cleanup(&mut engine);
+    assert_eq!(
+        engine.storage.heap.used(),
+        0,
+        "saved rows are evicted before the remaining heap is moved once"
+    );
     assert_eq!(
         data_rows(&run_with_fixed_memory(
             &mut engine,

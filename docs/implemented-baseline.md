@@ -836,6 +836,11 @@ routine invoked from SELECT resumable midway through its effects. Explicit
 CHECKPOINT and shutdown finish cleanup synchronously and may reclaim an
 unretained active heap in place.
 
+Cleanup releases history and evicts eligible saved rows before moving the
+remaining heap once. Permanent cleanup selects saved heap rows at 50% allocated
+heap use; below that it selects pressured row maps. Temporary cleanup also
+compacts when history pruning alone released heap references.
+
 Post-checkpoint history release, heap-row eviction and redundant-entry removal
 also use at most 64 stable row slots per turn. Busy tables are skipped and
 retried; partial acquisition releases all earlier owners. A pressured table

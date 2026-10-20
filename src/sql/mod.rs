@@ -411,6 +411,7 @@ struct LocalCleanup {
     lsn: u64,
     source: LocalCleanupSource,
     phase: LocalCleanupPhase,
+    heap_changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -424,7 +425,6 @@ enum LocalCleanupPhase {
     Prepare,
     Rows(RowCleanup),
     Compact,
-    CompactAfterEviction,
     Finish,
 }
 
@@ -9133,6 +9133,7 @@ impl Engine {
             lsn,
             source: LocalCleanupSource::Checkpoint,
             phase: LocalCleanupPhase::Prepare,
+            heap_changed: false,
         });
     }
 
@@ -9169,7 +9170,7 @@ impl Engine {
 
     fn advance_local_cleanup(
         &mut self,
-        cleanup: LocalCleanup,
+        mut cleanup: LocalCleanup,
         mode: MaintenanceMode,
     ) -> Result<MaintenanceStep, SqlError> {
         let next = match cleanup.phase {
@@ -9203,17 +9204,40 @@ impl Engine {
                         return Ok(pending);
                     }
                 }
+                if matches!(
+                    rows.task(),
+                    RowCleanupTask::DurableHistory
+                        | RowCleanupTask::SnapshotHistory
+                        | RowCleanupTask::HeapRows(_)
+                ) {
+                    cleanup.heap_changed |= rows.changed();
+                }
                 match rows.task() {
                     RowCleanupTask::SavedMarkers { .. } => LocalCleanupPhase::Rows(
                         RowCleanup::new(RowCleanupTask::SnapshotHistory, cleanup.source.target()),
                     ),
-                    RowCleanupTask::DurableHistory => LocalCleanupPhase::Compact,
+                    RowCleanupTask::DurableHistory => {
+                        let selection = if self.storage.heap.used() * 100
+                            >= self.storage.heap.capacity() * 50
+                        {
+                            HeapCleanup::Durable
+                        } else {
+                            HeapCleanup::PressuredDurable
+                        };
+                        LocalCleanupPhase::Rows(RowCleanup::new(
+                            RowCleanupTask::HeapRows(selection),
+                            cleanup.source.target(),
+                        ))
+                    }
                     RowCleanupTask::SnapshotHistory => LocalCleanupPhase::Rows(RowCleanup::new(
                         RowCleanupTask::HeapRows(HeapCleanup::AllSaved),
                         cleanup.source.target(),
                     )),
-                    RowCleanupTask::HeapRows(_) if rows.changed() => {
-                        LocalCleanupPhase::CompactAfterEviction
+                    RowCleanupTask::HeapRows(_)
+                        if cleanup.heap_changed
+                            || matches!(cleanup.source, LocalCleanupSource::Checkpoint) =>
+                    {
+                        LocalCleanupPhase::Compact
                     }
                     RowCleanupTask::HeapRows(_) => {
                         LocalCleanupPhase::Rows(cleanup.source.entries())
@@ -9221,7 +9245,7 @@ impl Engine {
                     RowCleanupTask::SavedEntries(_) => LocalCleanupPhase::Finish,
                 }
             }
-            LocalCleanupPhase::Compact | LocalCleanupPhase::CompactAfterEviction => {
+            LocalCleanupPhase::Compact => {
                 match self.compact_scratch.compact_step(
                     &mut self.storage,
                     core::num::NonZeroUsize::new(64).unwrap(),
@@ -9231,25 +9255,7 @@ impl Engine {
                     MaintenanceStep::Complete => {}
                     pending => return Ok(pending),
                 }
-                match cleanup.phase {
-                    LocalCleanupPhase::Compact => {
-                        let selection = match cleanup.source {
-                            LocalCleanupSource::TemporaryTable { .. } => HeapCleanup::AllSaved,
-                            LocalCleanupSource::Checkpoint
-                                if self.storage.heap.used() * 100
-                                    >= self.storage.heap.capacity() * 50 =>
-                            {
-                                HeapCleanup::Durable
-                            }
-                            LocalCleanupSource::Checkpoint => HeapCleanup::PressuredDurable,
-                        };
-                        LocalCleanupPhase::Rows(RowCleanup::new(
-                            RowCleanupTask::HeapRows(selection),
-                            cleanup.source.target(),
-                        ))
-                    }
-                    _ => LocalCleanupPhase::Rows(cleanup.source.entries()),
-                }
+                LocalCleanupPhase::Rows(cleanup.source.entries())
             }
             LocalCleanupPhase::Finish => {
                 self.local_cleanup = None;
@@ -9961,6 +9967,7 @@ impl Engine {
                     generation: self.storage.table(slot).generation(),
                 },
                 phase: LocalCleanupPhase::Prepare,
+                heap_changed: false,
             });
             return if retried_upload {
                 CheckpointBeat::Durable

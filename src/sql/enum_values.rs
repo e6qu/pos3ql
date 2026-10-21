@@ -32,7 +32,14 @@ pub(crate) fn resolve<'a>(
     if usize::from(slot) >= storage.enum_count() {
         return Err(corrupt());
     }
-    let definition = storage.enum_for(usize::from(slot), txid);
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            txid,
+        )?
+        .ok_or_else(corrupt)?;
     if !definition.visible_to(txid) {
         return Err(corrupt());
     }
@@ -88,7 +95,14 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     if usize::from(slot) >= storage.enum_count() {
         return Err(corrupt());
     }
-    let definition = storage.enum_for(usize::from(slot), txid);
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            txid,
+        )?
+        .ok_or_else(corrupt)?;
     let member = match member {
         Some(index) => definition.members().nth(index.ordinal() as usize),
         None => definition.members().find(|member| {
@@ -244,7 +258,16 @@ pub(crate) fn bind_query<const N: usize>(
                 .contains(&oid)
             {
                 let slot = (oid - super::types::oid::FIRST_ENUM) as usize;
-                let definition = storage.enum_for(slot, txid);
+                let definition = storage
+                    .read_enum_definition(
+                        crate::storage::TypeDefinitionTarget::Slot(
+                            crate::storage::NamedTypeSlot::Enum(slot),
+                        ),
+                        txid,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist")
+                    })?;
                 let member = definition
                     .members()
                     .position(|member| {
@@ -389,7 +412,16 @@ pub(crate) fn resolve_query<const N: usize>(
                         "stored enum binding has no type dependency"
                     )
                 })?;
-            let definition = storage.enum_for(usize::from(dependency.slot), txid);
+            let crate::storage::StoredDependencyIdentity::Type(reference) = dependency.identity
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored enum binding has no captured type source"
+                ));
+            };
+            let definition = storage
+                .read_enum_definition(crate::storage::TypeDefinitionTarget::Bound(reference), txid)?
+                .expect("a bound type read reports absence as an error");
             let member = definition.members().nth(member).ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -420,7 +452,12 @@ pub(crate) fn resolve_query<const N: usize>(
     Ok(output)
 }
 
-pub(crate) fn legacy_identity(slot: u16, label: &str, storage: &Storage) -> Result<u32, SqlError> {
+pub(crate) fn legacy_identity(
+    slot: u16,
+    label: &str,
+    storage: &Storage,
+    txid: u32,
+) -> Result<u32, SqlError> {
     let corrupt = || {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -431,7 +468,13 @@ pub(crate) fn legacy_identity(slot: u16, label: &str, storage: &Storage) -> Resu
         return Err(corrupt());
     }
     storage
-        .enum_for(usize::from(slot), 0)
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            txid,
+        )?
+        .ok_or_else(corrupt)?
         .members()
         .position(|member| {
             member

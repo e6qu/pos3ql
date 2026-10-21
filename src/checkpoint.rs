@@ -13319,6 +13319,7 @@ impl Checkpointer {
             compare_posting_sort_entries(left, right)
         } else {
             storage.compare_value_binding_keys(
+                0,
                 slot,
                 binding,
                 navigation,
@@ -14286,8 +14287,14 @@ impl Checkpointer {
                 }
                 let mut comparison_error = None;
                 let mut compare_keys = |left: &[u8], right: &[u8]| match storage
-                    .compare_value_binding_keys(job.slot, job.binding, job.navigation, left, right)
-                {
+                    .compare_value_binding_keys(
+                        0,
+                        job.slot,
+                        job.binding,
+                        job.navigation,
+                        left,
+                        right,
+                    ) {
                     Ok(ordering) => ordering,
                     Err(error) => {
                         comparison_error = Some(error);

@@ -8,6 +8,7 @@
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+mod definition_pool;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
@@ -19,6 +20,8 @@ mod table_definitions;
 mod table_edits;
 mod table_names;
 mod type_contracts;
+mod type_definitions;
+pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
 mod type_names;
 mod type_reference_moves;
 mod type_references;
@@ -65,10 +68,10 @@ use snapshot_leases::{
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
 pub(crate) use spill_generations::SpillGenerationId;
-pub(crate) use spill_generations::StatementFileScope;
 pub(crate) use spill_generations::{
     SpillGenerationReservation, SpillInstallation, SpillPublication,
 };
+pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -9494,6 +9497,7 @@ impl PendingEnumMemberSlot {
 pub struct EnumDefinition {
     image: EnumImageRead,
     member_count: usize,
+    safe_member_count: usize,
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
@@ -9503,6 +9507,12 @@ pub struct EnumDefinition {
 }
 
 impl EnumDefinition {
+    pub(crate) fn label_is_uncommitted(&self, label: &str) -> bool {
+        self.members()
+            .position(|member| member.label.as_str() == label)
+            .is_some_and(|index| index >= self.safe_member_count)
+    }
+
     pub fn members(&self) -> EnumMemberIter {
         EnumMemberIter {
             image: Some(self.image.clone()),
@@ -9576,6 +9586,15 @@ impl std::ops::DerefMut for EnumReplayMembers<'_> {
 }
 
 impl EnumDef {
+    fn safe_member_count_for(&self, txid: u32) -> usize {
+        if self.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
+            return self.definition_for(txid).member_count as usize;
+        }
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.member_count, |pending| pending.safe_member_count) as usize
+    }
+
     pub(crate) const EMPTY: Self = EnumDef {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -13888,6 +13907,7 @@ pub struct Storage {
     matviews: std::sync::Mutex<FixedVec<MatviewDef>>,
     sequence_catalog: std::sync::Mutex<SequenceCatalog>,
     type_catalog: std::sync::Mutex<TypeCatalog>,
+    type_definition_images: type_definitions::TypeDefinitionImagePools,
     enum_members_per_image: usize,
     enum_member_images: std::sync::Arc<std::sync::Mutex<EnumMemberImages>>,
     domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
@@ -17966,6 +17986,10 @@ impl Storage {
         definition_images::TableDefinitionImagePool::budget_bytes(config)
     }
 
+    pub(crate) fn type_definition_image_budget_bytes(config: &Config) -> usize {
+        type_definitions::TypeDefinitionImagePools::budget_bytes(config)
+    }
+
     pub(crate) fn retained_spill_root_capacity(config: &Config) -> usize {
         SpillRootRegistry::capacity(config)
     }
@@ -18037,6 +18061,7 @@ impl Storage {
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::TypePublication::budget_bytes(config)
+            + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::TypeOrigin>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
@@ -18175,6 +18200,8 @@ impl Storage {
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let type_publication = type_reference_moves::TypePublication::new(config, budget)?;
+        let type_definition_images =
+            type_definitions::TypeDefinitionImagePools::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
@@ -19004,6 +19031,7 @@ impl Storage {
                 pending_enum_members,
                 composites,
             }),
+            type_definition_images,
             enum_members_per_image,
             enum_member_images,
             domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
@@ -31199,7 +31227,7 @@ impl Storage {
                 let index = [column as u16];
                 add_distinct(
                     &mut registers[column],
-                    hash_key_catalog(self, values, &index)?,
+                    hash_key_catalog(self, txid, values, &index)?,
                 );
             }
             Ok(())
@@ -32412,6 +32440,7 @@ impl Storage {
                         binding,
                         hash_key_collated_catalog(
                             self,
+                            enforcer.evaluation_txid,
                             key,
                             &compact[..enforcer.n_cols],
                             &enforcer.collations[..enforcer.n_cols],
@@ -34028,6 +34057,7 @@ impl Storage {
             payload_len,
             hash_key_collated_catalog(
                 self,
+                enforcer.evaluation_txid,
                 key,
                 &compact[..enforcer.n_cols],
                 &enforcer.collations[..enforcer.n_cols],
@@ -34040,6 +34070,7 @@ impl Storage {
     /// boundary so byte encoding can never accidentally become SQL order.
     pub(crate) fn compare_value_binding_keys(
         &self,
+        txid: u32,
         table_index: usize,
         binding: usize,
         navigation: Option<crate::store::NavigationSpec>,
@@ -34141,6 +34172,7 @@ impl Storage {
                 (_, Datum::Null) => core::cmp::Ordering::Greater,
                 (left, right) => crate::sql::eval::compare_datums_collated(
                     self,
+                    txid,
                     collations[position],
                     &left,
                     &right,
@@ -38759,11 +38791,12 @@ impl Storage {
             catalog.bind_domain_spec(&mut spec, txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        let Some(new) = catalog
-            .domains
-            .iter()
-            .position(|d| d.ddl_state == CatalogDdlState::Absent)
-        else {
+        let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
+            d.ddl_state == CatalogDdlState::Absent
+                && !self
+                    .type_definition_images
+                    .retains(NamedTypeSlot::Domain(slot))
+        }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many domains (limit {})",
@@ -39389,18 +39422,23 @@ impl Storage {
     }
 
     pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition {
-        let (definition, image) = {
+        let (definition, image, safe_member_count) = {
             let catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
             let definition = catalog.enums[slot].definition_for(txid);
             let image = EnumImageRead::capture(&self.enum_member_images, definition.member_image);
-            (definition, image)
+            (
+                definition,
+                image,
+                catalog.enums[slot].safe_member_count_for(txid),
+            )
         };
         EnumDefinition {
             image,
             member_count: definition.member_count as usize,
+            safe_member_count,
             database: definition.database,
             created_at: definition.created_at,
             schema: definition.schema,
@@ -39442,30 +39480,6 @@ impl Storage {
     /// PostgreSQL makes such labels visible in the catalog but rejects their
     /// use until commit; labels of a type created in the same transaction and
     /// renamed committed labels are immediately safe.
-    pub(crate) fn enum_label_is_uncommitted(&self, slot: usize, label: &str, txid: u32) -> bool {
-        let catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        let enumeration = &catalog.enums[slot];
-        if enumeration.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
-            return false;
-        }
-        let Some(pending) = enumeration
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-        else {
-            return false;
-        };
-        self.enum_member_images
-            .lock()
-            .expect("enum member-image lock poisoned")
-            .image_members(pending.image, pending.member_count as usize)
-            .iter()
-            .position(|member| member.label.as_str() == label)
-            .is_some_and(|index| index >= pending.safe_member_count as usize)
-    }
-
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {
@@ -39575,11 +39589,12 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned");
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        let Some(new) = catalog
-            .enums
-            .iter()
-            .position(|e| e.ddl_state == CatalogDdlState::Absent)
-        else {
+        let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
+            e.ddl_state == CatalogDdlState::Absent
+                && !self
+                    .type_definition_images
+                    .retains(NamedTypeSlot::Enum(slot))
+        }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many enum types (limit {})",
@@ -40282,7 +40297,13 @@ impl Storage {
         let Some(slot) = catalog
             .composites
             .iter()
-            .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
+            .enumerate()
+            .position(|(slot, definition)| {
+                definition.ddl_state == CatalogDdlState::Absent
+                    && !self
+                        .type_definition_images
+                        .retains(NamedTypeSlot::Composite(slot))
+            })
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -40332,6 +40353,9 @@ impl Storage {
         catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
+            || self
+                .type_definition_images
+                .retains(NamedTypeSlot::Composite(slot))
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

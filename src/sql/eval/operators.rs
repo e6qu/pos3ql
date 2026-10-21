@@ -549,13 +549,14 @@ fn local_timestamp_for_compare(timestamp: i64) -> Result<i64, SqlError> {
 /// share the database comparator; every other type retains its native order.
 pub fn compare_datums_collated(
     storage: &crate::storage::Storage,
+    txid: u32,
     collation: Collation,
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
     if matches!((left, right), (Datum::Enum { .. }, Datum::Enum { .. })) {
-        return Ok(super::super::enum_values::sort(*left, storage, 0)?
-            .total_cmp(&super::super::enum_values::sort(*right, storage, 0)?));
+        return Ok(super::super::enum_values::sort(*left, storage, txid)?
+            .total_cmp(&super::super::enum_values::sort(*right, storage, txid)?));
     }
     let (left, right) = match (left, right) {
         (Datum::Text(left), Datum::Text(right)) => (*left, *right),
@@ -647,25 +648,28 @@ pub fn hash_key_collated(values: &[Datum], columns: &[u16], collations: &[Collat
 
 pub(crate) fn hash_key_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
 ) -> Result<u64, SqlError> {
-    hash_catalog(storage, values, columns, None)
+    hash_catalog(storage, txid, values, columns, None)
 }
 
 pub(crate) fn hash_key_collated_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
     collations: &[Collation],
 ) -> Result<u64, SqlError> {
-    hash_catalog(storage, values, columns, Some(collations))
+    hash_catalog(storage, txid, values, columns, Some(collations))
 }
 
 /// Stable identities retain selective hashes across label and ordering edits.
 /// Only legacy scalar keys need a catalog lookup; current keys need no copying.
 fn hash_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
     collations: Option<&[Collation]>,
@@ -683,7 +687,7 @@ fn hash_catalog(
         {
             let member = match member {
                 Some(member) => member.ordinal(),
-                None => super::super::enum_values::legacy_identity(*slot, label, storage)?,
+                None => super::super::enum_values::legacy_identity(*slot, label, storage, txid)?,
             };
             hasher.write(&[31]);
             hasher.write(&member.to_le_bytes());

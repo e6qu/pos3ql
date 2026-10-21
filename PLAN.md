@@ -38,18 +38,16 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Type-name publication owns affected definitions and dependent catalogs together,
-releases earlier owners before waiting, and uses startup-reserved space. Captured
-type references, typed-table membership and saved-query type dependencies preserve
-their source lifetime across rename, recovery and deliberate database cloning.
-Table creation and alteration, routine signatures/dependencies, casts, operators
-and source type links validate under their installation owners. Views, rewrite
-rules, materialized views and row-security policies now install saved definitions
-and type dependencies together. Operations on a table recheck its lifetime after
-waiting; rule renames preserve changes made while waiting. Source waits release
-every earlier owner, and failed edits preserve existing definitions and roles.
-Complete shared engine publication across type retirement and commit boundaries
-before removing the exclusive type commits and transaction barrier.
+Tables, routines and saved queries publish their definitions and type references
+together, preserving source identities across rename and recovery. Readers now
+retain selected domain, enum and composite definitions in startup memory. Table
+reads and scalar function contracts capture nested types before execution waits;
+nested statements select their own visible definitions and share identical images.
+
+Complete shared engine publication across type retirement, transaction commit
+and remaining metadata preparation before removing exclusive type commits and
+the transaction barrier. Connect all remaining preparation and rewrite paths to
+retained sources before running those paths concurrently.
 
 Finish protection for engine-wide publication and remaining table rewrites.
 Retain historical row, index and backup references before publishing replacements.

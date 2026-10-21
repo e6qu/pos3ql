@@ -529,17 +529,20 @@ struct PinnedRoot<Root> {
     garbage_retained: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StatementFileIdentity {
     slot: usize,
     serial: NonZeroU64,
 }
 
-#[derive(Clone, Copy)]
 struct StatementFileOwner {
     serial: NonZeroU64,
     references: NonZeroUsize,
     has_roots: bool,
+    type_definitions: Option<super::TypeDefinitionImages>,
+    definition_parent: Option<StatementFileIdentity>,
+    definition_transaction: Option<u32>,
+    definition_database: Option<super::DatabaseOid>,
 }
 
 struct RetainedRootPool<Root> {
@@ -736,6 +739,7 @@ struct RetainedRootState {
     index_roots: RetainedRootPool<IndexFileRoot>,
     statements: FixedVec<Option<StatementFileOwner>>,
     next_statement: u64,
+    type_selections: Box<[core::mem::MaybeUninit<usize>]>,
 }
 
 impl Deref for RetainedRootState {
@@ -765,6 +769,7 @@ impl RetainedRootState {
 struct SelectedStatementFiles {
     registry: usize,
     identity: StatementFileIdentity,
+    selection_identity: StatementFileIdentity,
 }
 
 thread_local! {
@@ -773,9 +778,41 @@ thread_local! {
 }
 
 #[must_use = "the statement must retain its selected files until execution ends"]
-pub(super) struct StatementFileLease {
+pub(crate) struct StatementFileLease {
     registry: Arc<SpillRootRegistry>,
     identity: StatementFileIdentity,
+}
+
+/// Only a validated statement selection can name a cached definition image.
+pub(super) struct StatementDefinitionIndex<'lease, Definition> {
+    index: usize,
+    owner: &'lease super::TypeDefinitionImages,
+    _lease: core::marker::PhantomData<&'lease StatementFileLease>,
+    _definition: core::marker::PhantomData<fn() -> Definition>,
+}
+
+impl<'lease, Definition> StatementDefinitionIndex<'lease, Definition> {
+    fn new(
+        _lease: &'lease StatementFileLease,
+        owner: &'lease super::TypeDefinitionImages,
+        index: usize,
+    ) -> Self {
+        Self {
+            index,
+            owner,
+            _lease: core::marker::PhantomData,
+            _definition: core::marker::PhantomData,
+        }
+    }
+    pub(super) fn index(self, owner: &super::TypeDefinitionImages) -> Result<usize, SqlError> {
+        if !core::ptr::eq(self.owner, owner) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected type image belongs to a different statement root"
+            ));
+        }
+        Ok(self.index)
+    }
 }
 
 /// A nested execution adds its selected files to the outer statement owner.
@@ -784,13 +821,175 @@ pub(super) struct StatementFileLease {
 #[must_use = "file selection must stay scoped to the executing statement"]
 pub(crate) struct StatementFileScope {
     _lease: StatementFileLease,
+    _definition_lease: Option<StatementFileLease>,
     previous: Option<SelectedStatementFiles>,
     depth: usize,
     thread: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl StatementFileLease {
-    pub(super) fn enter(&self) -> Result<StatementFileScope, SqlError> {
+    pub(super) fn type_definition<Definition: 'static>(
+        &self,
+        storage: &Storage,
+        target: super::type_definitions::TypeDefinitionTarget,
+        transaction: u32,
+        select: impl for<'images, 'selection> FnOnce(
+            &'images super::TypeDefinitionImages,
+            Option<StatementDefinitionIndex<'selection, Definition>>,
+        ) -> Result<
+            Option<
+                super::definition_pool::DefinitionImageHandle<
+                    super::type_definitions::TypeImageKey,
+                    Definition,
+                >,
+            >,
+            SqlError,
+        >,
+    ) -> Result<Option<super::type_definitions::TypeDefinitionRead<Definition>>, SqlError> {
+        if !Arc::ptr_eq(&self.registry, &storage.spill_roots) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "type definition lease belongs to different storage"
+            ));
+        }
+        let source_slot = self
+            .registry
+            .type_source_index(target.slot())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "selected type source is outside its catalog"
+                )
+            })?;
+        let image = {
+            let mut state = self
+                .registry
+                .roots
+                .lock()
+                .expect("retained file root lock poisoned");
+            let database = super::current_database();
+            if state
+                .statement_mut(self.identity)
+                .definition_database
+                .is_some_and(|owner| owner != database)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "statement type definitions belong to a different database"
+                ));
+            }
+            let root = self.definition_root(&mut state, storage)?;
+            let width = self.registry.type_offsets[3];
+            let start = self.identity.slot * width;
+            if state.statement_mut(self.identity).definition_transaction != Some(transaction) {
+                for selection in &mut state.type_selections[start..start + width] {
+                    selection.write(usize::MAX);
+                }
+                let owner = state.statement_mut(self.identity);
+                owner.definition_transaction = Some(transaction);
+                owner.definition_database = Some(database);
+            }
+            let position = start + source_slot;
+            // SAFETY: the transaction flag is set only after the complete
+            // selection slice is initialized. Registry ownership serializes it.
+            let previous = unsafe { state.type_selections[position].assume_init() };
+            if previous == usize::MAX - 1 {
+                return match target {
+                    super::type_definitions::TypeDefinitionTarget::Slot(_) => Ok(None),
+                    super::type_definitions::TypeDefinitionTarget::Bound(_) => Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured type source is absent from the statement"
+                    )),
+                };
+            }
+            let images = state
+                .statement_mut(root)
+                .type_definitions
+                .as_ref()
+                .expect("type retention root owns its image chains");
+            let selected = (previous != usize::MAX)
+                .then(|| StatementDefinitionIndex::new(self, images, previous));
+            let Some(image) = select(images, selected)? else {
+                state.type_selections[position].write(usize::MAX - 1);
+                return Ok(None);
+            };
+            state.type_selections[position].write(image.index());
+            image
+        };
+        let lease = self.try_clone()?;
+        // SAFETY: the original statement reference retains either its own
+        // immutable chains or a counted direct parent. Cached indices come
+        // only from the same root's correctly typed source image selector.
+        Ok(Some(unsafe {
+            super::type_definitions::TypeDefinitionRead::new(lease, image)
+        }))
+    }
+
+    fn definition_root(
+        &self,
+        state: &mut RetainedRootState,
+        storage: &Storage,
+    ) -> Result<StatementFileIdentity, SqlError> {
+        let owner = state.statement_mut(self.identity);
+        if let Some(root) = owner.definition_parent {
+            return Ok(root);
+        }
+        if owner.type_definitions.is_some() {
+            return Ok(self.identity);
+        }
+        let selected = SELECTED_STATEMENT_FILES
+            .with(Cell::get)
+            .filter(|selected| selected.registry == Arc::as_ptr(&self.registry) as usize)
+            .map_or(self.identity, |selected| selected.identity);
+        let root = state
+            .statement_mut(selected)
+            .definition_parent
+            .unwrap_or(selected);
+        let root_owner = state.statement_mut(root);
+        assert!(
+            root_owner.definition_parent.is_none(),
+            "type definition parents are direct roots"
+        );
+        let references = if root != self.identity {
+            Some(root_owner.references.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement definition references exhausted"
+                )
+            })?)
+        } else {
+            None
+        };
+        root_owner
+            .type_definitions
+            .get_or_insert_with(|| storage.type_definition_images());
+        if let Some(references) = references {
+            root_owner.references = references;
+            state.statement_mut(self.identity).definition_parent = Some(root);
+        }
+        Ok(root)
+    }
+
+    pub(super) fn try_clone(&self) -> Result<Self, SqlError> {
+        let mut state = self
+            .registry
+            .roots
+            .lock()
+            .expect("retained file root lock poisoned");
+        let owner = state.statement_mut(self.identity);
+        owner.references = owner.references.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement file references exhausted"
+            )
+        })?;
+        Ok(Self {
+            registry: Arc::clone(&self.registry),
+            identity: self.identity,
+        })
+    }
+
+    pub(crate) fn enter(&self) -> Result<StatementFileScope, SqlError> {
         let previous = SELECTED_STATEMENT_FILES.with(Cell::get);
         let depth = STATEMENT_FILE_SCOPE_DEPTH
             .with(Cell::get)
@@ -810,16 +1009,43 @@ impl StatementFileLease {
             .roots
             .lock()
             .expect("retained SST root lock poisoned");
-        let owner = state.statement_mut(identity);
-        owner.references = owner.references.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "statement file references exhausted"
+        let references = state
+            .statement_mut(identity)
+            .references
+            .checked_add(1)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file references exhausted"
+                )
+            })?;
+        let definition_references = if identity != self.identity {
+            Some(
+                state
+                    .statement_mut(self.identity)
+                    .references
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement definition references exhausted"
+                        )
+                    })?,
             )
-        })?;
+        } else {
+            None
+        };
+        state.statement_mut(identity).references = references;
+        if let Some(references) = definition_references {
+            state.statement_mut(self.identity).references = references;
+        }
         drop(state);
         SELECTED_STATEMENT_FILES.with(|selected| {
-            selected.set(Some(SelectedStatementFiles { registry, identity }));
+            selected.set(Some(SelectedStatementFiles {
+                registry,
+                identity,
+                selection_identity: self.identity,
+            }));
         });
         STATEMENT_FILE_SCOPE_DEPTH.with(|current| current.set(depth));
         Ok(StatementFileScope {
@@ -827,6 +1053,10 @@ impl StatementFileLease {
                 registry: Arc::clone(&self.registry),
                 identity,
             },
+            _definition_lease: definition_references.map(|_| Self {
+                registry: Arc::clone(&self.registry),
+                identity: self.identity,
+            }),
             previous,
             depth,
             thread: core::marker::PhantomData,
@@ -876,9 +1106,21 @@ impl Drop for RetainedIndexFile {
 pub(super) struct SpillRootRegistry {
     roots: Mutex<RetainedRootState>,
     reclamation_pending: AtomicBool,
+    type_offsets: [usize; 4],
 }
 
 impl SpillRootRegistry {
+    fn type_offsets(config: &Config) -> [usize; 4] {
+        let enums = config.max_domains;
+        let composites = enums.saturating_add(config.max_enums);
+        [
+            0,
+            enums,
+            composites,
+            composites.saturating_add(config.max_composites),
+        ]
+    }
+
     pub(super) fn capacity(config: &Config) -> usize {
         table_slot_capacity(config)
             .saturating_mul(config.max_spill_generations_per_table)
@@ -893,6 +1135,11 @@ impl SpillRootRegistry {
         let statements = super::statement_snapshot_capacity(config);
         (size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>())
             .saturating_add(statements.saturating_mul(size_of::<Option<StatementFileOwner>>()))
+            .saturating_add(
+                statements
+                    .saturating_mul(Self::type_offsets(config)[3])
+                    .saturating_mul(size_of::<usize>()),
+            )
             .saturating_add(RetainedRootPool::<RowFileRoot>::budget_bytes(
                 Self::capacity(config),
                 statements,
@@ -909,6 +1156,14 @@ impl SpillRootRegistry {
             "retained file root owner",
         )?;
         let statement_capacity = super::statement_snapshot_capacity(config);
+        let type_offsets = Self::type_offsets(config);
+        let type_selection_count = statement_capacity.saturating_mul(type_offsets[3]);
+        budget.draw_array(
+            type_selection_count,
+            size_of::<usize>(),
+            "statement type definition selections",
+        )?;
+        let type_selections = Box::<[usize]>::new_uninit_slice(type_selection_count);
         let roots = RetainedRootPool::new(budget, Self::capacity(config), statement_capacity)?;
         let index_roots =
             RetainedRootPool::new(budget, Self::index_capacity(config), statement_capacity)?;
@@ -924,8 +1179,10 @@ impl SpillRootRegistry {
                 index_roots,
                 statements,
                 next_statement: 0,
+                type_selections,
             }),
             reclamation_pending: AtomicBool::new(false),
+            type_offsets,
         }))
     }
 
@@ -956,6 +1213,10 @@ impl SpillRootRegistry {
             serial,
             references: NonZeroUsize::new(1).expect("nonzero"),
             has_roots: false,
+            type_definitions: None,
+            definition_parent: None,
+            definition_transaction: None,
+            definition_database: None,
         });
         state.next_statement = serial.get();
         Ok(StatementFileLease {
@@ -966,19 +1227,64 @@ impl SpillRootRegistry {
 
     fn release_statement(&self, identity: StatementFileIdentity) {
         let mut state = self.roots.lock().expect("retained file root lock poisoned");
-        let owner = state.statement_mut(identity);
-        if let Some(remaining) = NonZeroUsize::new(owner.references.get() - 1) {
-            owner.references = remaining;
-            return;
-        }
-        if owner.has_roots {
-            let rows = state.roots.release_statement(identity);
-            let indexes = state.index_roots.release_statement(identity);
-            if rows || indexes {
-                self.reclamation_pending.store(true, Ordering::Release);
+        let mut next = Some(identity);
+        while let Some(identity) = next.take() {
+            let owner = state.statement_mut(identity);
+            if let Some(remaining) = NonZeroUsize::new(owner.references.get() - 1) {
+                owner.references = remaining;
+                break;
             }
+            let has_roots = owner.has_roots;
+            next = owner.definition_parent;
+            if has_roots {
+                let rows = state.roots.release_statement(identity);
+                let indexes = state.index_roots.release_statement(identity);
+                if rows || indexes {
+                    self.reclamation_pending.store(true, Ordering::Release);
+                }
+            }
+            state.statements[identity.slot] = None;
         }
-        state.statements[identity.slot] = None;
+    }
+
+    /// Nested readers join the active statement; a standalone callback owns a
+    /// separate statement reference for exactly the callback's duration.
+    pub(super) fn type_definition_reader(self: &Arc<Self>) -> Result<StatementFileLease, SqlError> {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        let selected = SELECTED_STATEMENT_FILES
+            .with(Cell::get)
+            .filter(|selected| selected.registry == Arc::as_ptr(self) as usize)
+            .map(|selected| selected.selection_identity);
+        let Some(identity) = selected else {
+            drop(state);
+            return self.retain_statement();
+        };
+        let owner = state.statement_mut(identity);
+        owner.references = owner
+            .references
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file references exhausted"
+                )
+            })?;
+        Ok(StatementFileLease {
+            registry: Arc::clone(self),
+            identity,
+        })
+    }
+
+    fn type_source_index(&self, source: super::NamedTypeSlot) -> Option<usize> {
+        let (kind, index) = match source {
+            super::NamedTypeSlot::Domain(index) => (0, index),
+            super::NamedTypeSlot::Enum(index) => (1, index),
+            super::NamedTypeSlot::Composite(index) => (2, index),
+        };
+        (index < self.type_offsets[kind + 1] - self.type_offsets[kind])
+            .then(|| self.type_offsets[kind] + index)
     }
 
     fn selected_statement(&self, state: &mut RetainedRootState) -> Option<StatementFileIdentity> {
@@ -2123,6 +2429,43 @@ mod tests {
             assert!(state.roots.is_empty());
             assert!(state.index_roots.is_empty());
             assert!(state.index_roots.members.iter().all(|word| *word == 0));
+        });
+    }
+
+    #[test]
+    fn statement_files_miri_definition_children_keep_parent_owners_until_final_release() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut roots = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let parent = registry.retain_statement().unwrap();
+            let child = registry.retain_statement().unwrap();
+            let scope = parent.enter().unwrap();
+            registry.pin(&[handle(1)], true).unwrap();
+            registry.release(&[handle(1)], true);
+            {
+                let mut state = registry.roots.lock().unwrap();
+                let owner = state.statement_mut(parent.identity);
+                owner.references = owner.references.checked_add(1).unwrap();
+                state.statement_mut(child.identity).definition_parent = Some(parent.identity);
+            }
+            let child_scope = child.enter().unwrap();
+            let selected = registry.type_definition_reader().unwrap();
+            assert_eq!(selected.identity, child.identity);
+            drop(child_scope);
+            drop(scope);
+            drop(child);
+            drop(parent);
+            assert!(!registry.take_reclamation_pending());
+            assert_eq!(registry.roots.lock().unwrap().roots.len(), 1);
+            registry.copy_roots(true, &mut roots).unwrap();
+            assert_eq!(roots, [handle(1)]);
+            drop(selected);
+            assert!(registry.take_reclamation_pending());
+            let state = registry.roots.lock().unwrap();
+            assert!(state.roots.is_empty());
+            assert!(state.statements.iter().all(Option::is_none));
         });
     }
 

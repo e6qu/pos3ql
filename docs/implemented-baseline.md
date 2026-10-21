@@ -41,6 +41,7 @@ next statement.
 | Journal positions | Checked shared reservations and observations that never move backward; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
 | Catalogs and table definitions | Readers retain selected definitions and identities; tables have separate cleanup owners. Table and routine submission validate type lifetimes under installation owners. Typed tables and saved queries retain source lifetimes through recovery and database cloning. | Engine-wide publication, rewrites, and maintenance integration |
+| Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Complete shared commit, retirement and remaining metadata preparation before removing the SQL barrier |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
@@ -198,6 +199,32 @@ version allocator or comment catalog. Rule history and pending shapes check all
 transaction owners under the same definition guard. Capacity or comment-ownership
 failure leaves the prior shape and comment names intact. Comment text publication
 preserves name changes owned by another transaction.
+
+Table reads and scalar function contracts capture the complete type chain before
+waiting for row data or running the function body. For
+example, a shipment column can contain a composite whose status field uses a
+domain over an enum. The query saves that composite layout, the domain's rules
+and the enum's labels together with their source lifetimes. Resuming the same
+statement uses its selected definitions. A later nested statement selects its
+own visible definitions. Identical images are shared within the outer statement;
+repeating an unchanged nested query does not consume another image.
+
+Domain checks, composite input/output, enum value resolution and comparisons use
+retained readers. Comparisons receive the actual transaction explicitly, and
+enum readers retain which new labels are safe to use before commit. Rollback or
+source retirement cannot change a selected image. A retained source slot cannot
+be reused or assigned a different creation identity until its readers release it.
+The readers and their buffers can outlive the storage owner.
+
+Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
+query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
+and `max_composites`). Statement selection maps and ownership controls are also
+charged at startup. No image allocation grows the runtime heap. A full pool
+returns `54000` naming the domain, enum or composite definition image pool and
+its capacity; releasing retained readers permits retry. Graph traversal uses
+temporary statement-arena space and reports `54000` if it cannot fit. This
+protection does not enable parallel SQL execution: shared engine commit,
+retirement and remaining metadata preparation stay in [PLAN.md](../PLAN.md).
 
 **User example:** after moving a table to another schema and rolling back to a
 savepoint, its constraint comments remain attached under the original name. A

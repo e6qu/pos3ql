@@ -321,6 +321,7 @@ fn range_offset_negative(v: &Datum) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn frame_range<'a>(
     storage: &Storage,
+    txid: u32,
     frame: &WindowFrame<'a>,
     ord: &[OrderBy<'a>],
     scope: &QueryScope<'a>,
@@ -347,6 +348,7 @@ fn frame_range<'a>(
                         (true, false) | (false, true) => false,
                         (false, false) => compare_datums_collated(
                             storage,
+                            txid,
                             scope.expression_collation(o.expression)?,
                             &va,
                             &vb,
@@ -431,6 +433,7 @@ fn frame_range<'a>(
             }
             let c = compare_datums_collated(
                 storage,
+                txid,
                 scope.expression_collation(o.expression)?,
                 &k,
                 &edge,
@@ -450,6 +453,7 @@ fn frame_range<'a>(
                 }
                 let c = compare_datums_collated(
                     storage,
+                    txid,
                     scope.expression_collation(o.expression)?,
                     &k,
                     &edge,
@@ -476,6 +480,7 @@ fn frame_range<'a>(
                 }
                 let c = compare_datums_collated(
                     storage,
+                    txid,
                     scope.expression_collation(o.expression)?,
                     &k,
                     &edge,
@@ -649,6 +654,7 @@ fn frame_range<'a>(
 #[allow(clippy::too_many_arguments)]
 fn window_keys_equal<'a>(
     storage: &Storage,
+    txid: u32,
     expressions: &[&Expr<'a>],
     scope: &QueryScope<'a>,
     rows: &[&'a [Datum<'a>]],
@@ -669,6 +675,7 @@ fn window_keys_equal<'a>(
                 || right_value.is_null()
                 || !compare_datums_collated(
                     storage,
+                    txid,
                     scope.expression_collation(expression)?,
                     &left_value,
                     &right_value,
@@ -686,6 +693,7 @@ fn window_keys_equal<'a>(
 #[allow(clippy::too_many_arguments)]
 fn peer_bounds<'a>(
     storage: &Storage,
+    txid: u32,
     ord: &[OrderBy<'a>],
     scope: &QueryScope<'a>,
     rows: &[&'a [Datum<'a>]],
@@ -713,6 +721,7 @@ fn peer_bounds<'a>(
                         (true, false) | (false, true) => false,
                         (false, false) => compare_datums_collated(
                             storage,
+                            txid,
                             scope.expression_collation(o.expression)?,
                             &va,
                             &vb,
@@ -792,6 +801,7 @@ fn compute_window<'a>(
         for g in 0..n_groups {
             if window_keys_equal(
                 storage,
+                txid,
                 spec.partition_by,
                 scope,
                 rows,
@@ -852,6 +862,7 @@ fn compute_window<'a>(
                         params,
                         hooks,
                         storage,
+                        txid,
                     )?;
                     if c == core::cmp::Ordering::Greater {
                         part.swap(y - 1, y);
@@ -885,6 +896,7 @@ fn compute_window<'a>(
                                 (true, false) | (false, true) => false,
                                 (false, false) => compare_datums_collated(
                                     storage,
+                                    txid,
                                     scope.expression_collation(o.expression)?,
                                     &va,
                                     &vb,
@@ -956,6 +968,7 @@ fn compute_window<'a>(
             for j in 0..m {
                 let range = frame_range(
                     storage,
+                    txid,
                     frame,
                     spec.order_by,
                     scope,
@@ -972,6 +985,7 @@ fn compute_window<'a>(
                 } else {
                     peer_bounds(
                         storage,
+                        txid,
                         spec.order_by,
                         scope,
                         rows,
@@ -1048,6 +1062,7 @@ fn compute_window<'a>(
                                     (true, false) | (false, true) => false,
                                     (false, false) => compare_datums_collated(
                                         storage,
+                                        txid,
                                         scope.expression_collation(o.expression)?,
                                         &va,
                                         &vb,
@@ -1151,6 +1166,7 @@ fn compute_window<'a>(
                     for j in 0..m {
                         let range = frame_range(
                             storage,
+                            txid,
                             frame,
                             spec.order_by,
                             scope,
@@ -1233,6 +1249,7 @@ fn compute_window<'a>(
             for j in 0..m {
                 let range = frame_range(
                     storage,
+                    txid,
                     frame,
                     spec.order_by,
                     scope,
@@ -1249,6 +1266,7 @@ fn compute_window<'a>(
                 } else {
                     peer_bounds(
                         storage,
+                        txid,
                         spec.order_by,
                         scope,
                         rows,
@@ -1309,6 +1327,7 @@ fn compute_window<'a>(
                                         (true, false) | (false, true) => false,
                                         (false, false) => compare_datums_collated(
                                             storage,
+                                            txid,
                                             scope.expression_collation(o.expression)?,
                                             &va,
                                             &vb,
@@ -1346,6 +1365,7 @@ fn compute_window<'a>(
 /// Resolves one ORDER BY key's direction given both decoded values.
 fn order_by_key<'a>(
     storage: &Storage,
+    txid: u32,
     collation: Collation,
     va: &Datum<'a>,
     vb: &Datum<'a>,
@@ -1368,7 +1388,7 @@ fn order_by_key<'a>(
                 Ordering::Less
             }
         }
-        (false, false) => compare_datums_collated(storage, collation, va, vb)?,
+        (false, false) => compare_datums_collated(storage, txid, collation, va, vb)?,
     };
     Ok(if o.descending && !va.is_null() && !vb.is_null() {
         base.reverse()
@@ -1390,6 +1410,7 @@ fn cmp_order<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     storage: &Storage,
+    txid: u32,
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for o in ord {
@@ -1399,6 +1420,7 @@ fn cmp_order<'a>(
         let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
         let c = order_by_key(
             storage,
+            txid,
             scope.expression_collation(o.expression)?,
             &va,
             &vb,
@@ -1652,6 +1674,7 @@ pub(crate) fn project_window_rows<'a>(
 /// NULLs first — the same semantics `keys_equal` uses to partition rows.
 fn compare_encoded_keys(
     storage: &Storage,
+    txid: u32,
     collations: &[Collation],
     a: &[u8],
     b: &[u8],
@@ -1666,7 +1689,7 @@ fn compare_encoded_keys(
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
-            (false, false) => compare_datums_collated(storage, collation, &va, &vb)?,
+            (false, false) => compare_datums_collated(storage, txid, collation, &va, &vb)?,
         };
         if c != Ordering::Equal {
             return Ok(c);
@@ -1679,6 +1702,7 @@ fn compare_encoded_keys(
 /// ASC/DESC + NULLS placement), mirroring `cmp_order` for the external runs.
 fn compare_encoded_order<'a>(
     storage: &Storage,
+    txid: u32,
     collations: &[Collation],
     a: &[u8],
     b: &[u8],
@@ -1689,7 +1713,7 @@ fn compare_encoded_order<'a>(
     for (k, o) in ord.iter().enumerate() {
         let va = crate::sql::exec::decode_projected_pub(a, at + k);
         let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = order_by_key(storage, collations[k], &va, &vb, o)?;
+        let c = order_by_key(storage, txid, collations[k], &va, &vb, o)?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1829,6 +1853,7 @@ pub(crate) fn external_window_into<'a>(
             |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
                 let by_partition = compare_encoded_keys(
                     storage,
+                    txid,
                     &partition_collations[..n_partition],
                     left,
                     right,
@@ -1840,6 +1865,7 @@ pub(crate) fn external_window_into<'a>(
                 }
                 compare_encoded_order(
                     storage,
+                    txid,
                     &order_collations[..spec.order_by.len()],
                     left,
                     right,
@@ -1981,6 +2007,7 @@ pub(crate) fn external_window_into<'a>(
                         None => true,
                         Some(prior) => !compare_encoded_keys(
                             storage,
+                            txid,
                             &partition_collations[..n_partition],
                             prior,
                             row,
@@ -2068,6 +2095,7 @@ pub(crate) fn external_window_into<'a>(
     let mut out_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
         let by_order = compare_encoded_order(
             storage,
+            txid,
             &statement_order_collations[..statement.order_by.len()],
             left,
             right,

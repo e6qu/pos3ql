@@ -1568,6 +1568,20 @@ impl StorageCatalog<'_, '_, '_, '_> {
             _ => unreachable!("routine call resolution returns functions only"),
         };
         let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
+        let _type_sources = self.storage.select_type_definition_graph(
+            routine
+                .arguments()
+                .iter()
+                .filter_map(|argument| argument.user_type)
+                .chain(result_contract.and_then(|result| result.user_type))
+                .chain(
+                    routine.result_columns[..routine.result_column_count]
+                        .iter()
+                        .filter_map(|column| column.user_type),
+                ),
+            self.txid,
+            arena,
+        )?;
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             if let Some(invocations) = self.invocations {
                 return invocations.resolve(
@@ -2306,7 +2320,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         slot: u16,
         label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
-        let definition = self.storage.enum_for(usize::from(slot), self.txid);
+        let Some(definition) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         Ok(definition
             .members()
             .position(|member| member.label.as_str() == label)
@@ -3782,7 +3804,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3794,7 +3824,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn enum_label_sort(&self, slot: u16, label: &str) -> Result<Option<f64>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3811,7 +3849,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         slot: u16,
         arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -6929,6 +6975,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     (false, false) => {
                         let c = crate::sql::eval::compare_datums_collated(
                             storage,
+                            txid,
                             order_collations[j],
                             &ka,
                             &kb,
@@ -6952,6 +6999,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     if statement.with_ties && limit > 0 {
         end = match materialize::extend_ties(
             storage,
+            txid,
             &order_collations[..statement.order_by.len()],
             out_rows,
             width,
@@ -7079,7 +7127,14 @@ fn select_into_rows_mode<'a>(
             let rows_mut = arena
                 .alloc_slice_with(rows.len(), |i| rows[i])
                 .map_err(|_| arena_full())?;
-            setops::sort_set_rows(storage, arena, rows_mut, statement.order_by, &cols[..n])?;
+            setops::sort_set_rows(
+                storage,
+                txid,
+                arena,
+                rows_mut,
+                statement.order_by,
+                &cols[..n],
+            )?;
             rows = rows_mut;
         }
         let start = (offset as usize).min(rows.len());
@@ -7094,6 +7149,7 @@ fn select_into_rows_mode<'a>(
             while end < rows.len()
                 && setops::set_rows_tie(
                     storage,
+                    txid,
                     boundary,
                     rows[end],
                     statement.order_by,

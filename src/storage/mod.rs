@@ -27,7 +27,7 @@ pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) use type_names::NamedTypeSlot;
 pub(crate) use type_references::StorageSetupError;
-pub use type_references::TypeReference;
+pub(crate) use type_references::TypeReference;
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
@@ -39032,26 +39032,6 @@ impl Storage {
             }
         }
         Ok(())
-    }
-
-    /// Rebind persisted declarations after their complete catalog exists.
-    /// Checkpoint type codes deliberately omit runtime slots; a user-type name
-    /// is the durable witness that selects the current enum, composite, or
-    /// domain representation.
-    fn rebind_declared_user_type(
-        &self,
-        ctype: ColType,
-        identity: UserTypeName,
-        txid: u32,
-    ) -> Result<ColType, SqlError> {
-        self.bind_routine_result(
-            RoutineResult {
-                ctype,
-                user_type: Some(identity),
-            },
-            txid,
-        )
-        .map(|result| result.ctype)
     }
 
     /// Completes checkpoint-time binding for every table and composite field.

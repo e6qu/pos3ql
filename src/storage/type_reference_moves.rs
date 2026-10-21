@@ -688,6 +688,58 @@ mod tests {
     }
 
     #[test]
+    fn catalog_submission_rejects_retired_operator_destinations() {
+        use super::super::{OperatorDefinition, OperatorFamilyDefinition, OperatorSignature};
+        let (storage, _, _, _) = fixture(TypeReferenceKind::Domain);
+        let owner = storage.role(storage.current_role_slot(0).unwrap()).oid;
+        let definition = OperatorDefinition {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("#@#").unwrap(),
+            owner,
+            signature: OperatorSignature {
+                left: None,
+                right: Some(RoutineResult::builtin(ColType::Int4)),
+            },
+            ..OperatorDefinition::EMPTY
+        };
+        let operator = storage.create_operator(definition, 0).unwrap();
+        storage.commit_operator_create(operator);
+        let family_definition = OperatorFamilyDefinition {
+            schema: definition.schema,
+            name: SqlName::parse("retired_family").unwrap(),
+            owner,
+            ..OperatorFamilyDefinition::EMPTY
+        };
+        let family = storage
+            .create_operator_family(family_definition, 0)
+            .unwrap();
+        storage.commit_operator_family_create(family);
+        storage.drop_operator(operator, 0);
+        storage.commit_operator_drop(operator);
+        storage.drop_operator_family(family, 0);
+        storage.commit_operator_family_drop(family);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .stage_operator_definition(operator, definition, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+            );
+            assert_eq!(
+                storage
+                    .stage_operator_family_definition(family, family_definition, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+            );
+            let catalog = storage.operator_catalog.lock().unwrap();
+            assert!(catalog.operators[operator].pending.is_none());
+            assert!(catalog.families[family].pending.is_none());
+        });
+    }
+
+    #[test]
     fn table_submission_releases_all_owners_before_source_wait() {
         for kind in KINDS {
             for create in [false, true] {

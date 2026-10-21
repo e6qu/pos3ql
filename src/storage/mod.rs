@@ -51428,12 +51428,29 @@ impl Storage {
         mut definition: OperatorDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorDefinition>, SqlError> {
+        let selected = self.operator(slot);
+        if selected.database != current_database() || !selected.visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator no longer exists"
+            ));
+        }
         definition = self.bind_catalog_definition(definition, txid)?;
-        let oid = self.operator(slot).oid();
+        let oid = selected.oid();
         self.validate_operator_definition(definition, txid, Some(oid))?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, txid)?;
         let catalog = &mut owners.catalog;
+        let current = &catalog.operators[slot];
+        if current.database != selected.database
+            || current.created_at != selected.created_at
+            || !current.visible_to(txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator changed before publication"
+            ));
+        }
         let prior = catalog.operators[slot].pending;
         if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
             drop(owners);
@@ -51818,11 +51835,28 @@ impl Storage {
         mut definition: OperatorFamilyDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorFamilyDefinition>, SqlError> {
+        let selected = self.operator_family(slot);
+        if selected.database != current_database() || !selected.visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator family no longer exists"
+            ));
+        }
         definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_family_definition(definition, txid)?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, txid)?;
         let catalog = &mut owners.catalog;
+        let current = &catalog.families[slot];
+        if current.database != selected.database
+            || current.created_at != selected.created_at
+            || !current.visible_to(txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator family changed before publication"
+            ));
+        }
         let prior = catalog.families[slot].pending;
         if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
             drop(owners);
@@ -52320,11 +52354,28 @@ impl Storage {
         mut definition: OperatorClassDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorClassDefinition>, SqlError> {
+        let selected = self.operator_class(slot);
+        if selected.database != current_database() || !selected.visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator class no longer exists"
+            ));
+        }
         definition = self.bind_catalog_definition(definition, txid)?;
         self.validate_operator_class_definition(definition, txid)?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, txid)?;
         let catalog = &mut owners.catalog;
+        let current = &catalog.classes[slot];
+        if current.database != selected.database
+            || current.created_at != selected.created_at
+            || !current.visible_to(txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator class changed before publication"
+            ));
+        }
         let prior = catalog.classes[slot].pending;
         if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
             drop(owners);

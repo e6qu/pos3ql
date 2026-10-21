@@ -1028,8 +1028,18 @@ impl super::Storage {
             return self.composite_source_in_schema(SqlName::parse(schema)?, name, transaction);
         }
         for entry in self.path().entries() {
-            let super::PathEntry::Schema(slot) = entry else {
-                continue;
+            let slot = match entry {
+                super::PathEntry::Schema(slot) => slot,
+                super::PathEntry::Catalog => {
+                    if ColType::from_sql_name(name.as_str()).is_some() {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "type {} is not a composite type",
+                            name.as_str()
+                        ));
+                    }
+                    continue;
+                }
             };
             let schema = self.schema_def(usize::from(*slot)).name;
             if let Some(source) = self.composite_source_in_schema(schema, name, transaction)? {
@@ -1050,9 +1060,6 @@ impl super::Storage {
             .lock()
             .expect("type catalog lock poisoned");
         let slot = catalog.name_reservations().find_map(|entry| {
-            let NamedTypeSlot::Composite(slot) = entry.slot else {
-                return None;
-            };
             if entry.database != super::current_database() || !entry.state.visible_to(transaction) {
                 return None;
             }
@@ -1060,10 +1067,35 @@ impl super::Storage {
                 .pending
                 .filter(|(owner, _)| *owner == transaction)
                 .map_or(entry.current, |(_, identity)| identity);
-            (identity.schema == schema && identity.name == name).then_some(slot)
+            (identity.schema == schema && identity.name == name).then_some(entry.slot)
         });
         let Some(slot) = slot else {
+            drop(catalog);
+            if (schema.as_str() == "pg_catalog" && ColType::from_sql_name(name.as_str()).is_some())
+                || self
+                    .find_visible(schema.as_str(), name.as_str(), transaction)
+                    .is_some()
+                || self
+                    .view_slot(schema.as_str(), name.as_str(), transaction)
+                    .is_some()
+                || self
+                    .matview_slot(schema.as_str(), name.as_str(), transaction)
+                    .is_some()
+            {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "type {} is not a stand-alone composite type",
+                    name.as_str()
+                ));
+            }
             return Ok(None);
+        };
+        let NamedTypeSlot::Composite(slot) = slot else {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "type {} is not a composite type",
+                name.as_str()
+            ));
         };
         let snapshot = catalog
             .type_snapshot(NamedTypeSlot::Composite(slot), transaction)?

@@ -65731,7 +65731,7 @@ fn typed_table_membership_uses_the_resolved_composite_identity() {
          CREATE TABLE invalid_typed_table OF typed_table_enum",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42704"),
+        String::from_utf8_lossy(&output).contains("42809"),
         "{}",
         String::from_utf8_lossy(&output)
     );

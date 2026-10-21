@@ -12862,6 +12862,42 @@ mod tests {
                 .unwrap(),
             dependencies
         );
+        assert_eq!(
+            encoded.readable().len(),
+            WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
+        );
+        for (class, key) in [
+            (DependencyClass::Domain, "d:1:41"),
+            (DependencyClass::Enum, "e:2:42"),
+            (DependencyClass::Composite, "c:3:43"),
+        ] {
+            let mut dependencies = StoredQueryDependencies::EMPTY;
+            dependencies
+                .serialized_push(SerializedStoredQueryDependency {
+                    class,
+                    identity: StoredDependencyIdentity::from_storage(class, key).unwrap(),
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("current_type").unwrap(),
+                    referenced_schema: SqlName::parse("").unwrap(),
+                    referenced_name: SqlName::parse("original_type").unwrap(),
+                    referenced_columns: ColumnSet::EMPTY,
+                })
+                .unwrap();
+            encoded.clear();
+            assert!(WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut encoded));
+            assert_eq!(
+                encoded.readable().len(),
+                WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
+            );
+            assert_eq!(
+                decode_stored_query_dependencies(encoded.readable()).unwrap(),
+                dependencies
+            );
+            let mut wrong_kind = encoded.readable().to_vec();
+            wrong_kind[4] = b'x';
+            assert!(!validate_stored_query_dependencies(&wrong_kind));
+            assert!(StoredDependencyIdentity::from_storage(class, "0").is_none());
+        }
     }
 
     #[test]

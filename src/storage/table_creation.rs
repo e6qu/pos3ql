@@ -31,13 +31,12 @@ pub(super) fn allocate(
                 def.name.as_str()
             ));
         }
-        if let Some(txid) = transaction {
-            if let Some(other) =
+        if let Some(txid) = transaction
+            && let Some(other) =
                 storage.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
-            {
-                drop(names);
-                return Err(storage.catalog_ddl_wait_error(txid, other, def.name.as_str()));
-            }
+        {
+            drop(names);
+            return Err(storage.catalog_ddl_wait_error(txid, other, def.name.as_str()));
         }
         let Some((slot, lifecycle)) = storage
             .tables

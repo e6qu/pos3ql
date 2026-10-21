@@ -20053,6 +20053,29 @@ mod stored_dependency_tests {
             parse_stored_query_dependencies(&mut words).unwrap(),
             dependencies
         );
+        for (class, key) in [
+            (DependencyClass::Domain, "d:1:41"),
+            (DependencyClass::Enum, "e:2:42"),
+            (DependencyClass::Composite, "c:3:43"),
+        ] {
+            let mut dependencies = StoredQueryDependencies::EMPTY;
+            dependencies
+                .serialized_push(SerializedStoredQueryDependency {
+                    class,
+                    identity: StoredDependencyIdentity::from_storage(class, key).unwrap(),
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("current_type").unwrap(),
+                    referenced_schema: SqlName::parse("").unwrap(),
+                    referenced_name: SqlName::parse("original_type").unwrap(),
+                    referenced_columns: crate::storage::ColumnSet::EMPTY,
+                })
+                .unwrap();
+            let encoded = format!("{}", ManifestDependencies(dependencies.view()));
+            assert_eq!(
+                parse_stored_query_dependencies(&mut encoded.split(' ')).unwrap(),
+                dependencies
+            );
+        }
     }
 
     #[test]

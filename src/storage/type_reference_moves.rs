@@ -817,9 +817,36 @@ mod tests {
                 assert_eq!(bound.entries()[0].referenced_name, movement.prior.name);
             }
             match kind {
-                TypeReferenceKind::Domain => storage.commit_domain_drop(slot),
-                TypeReferenceKind::Enum => storage.commit_enum_drop(slot),
-                TypeReferenceKind::Composite => storage.commit_composite_drop(slot),
+                TypeReferenceKind::Domain => {
+                    storage
+                        .drop_domain(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_domain_drop(slot);
+                }
+                TypeReferenceKind::Enum => {
+                    storage
+                        .drop_enum(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_enum_drop(slot);
+                }
+                TypeReferenceKind::Composite => {
+                    storage
+                        .drop_composite(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_composite_drop(slot);
+                }
             }
             assert_eq!(create_kind(&mut storage, kind, movement.current).0, slot);
             for dependencies in [captured, saved] {

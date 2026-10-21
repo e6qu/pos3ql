@@ -197,23 +197,57 @@ impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
     }
 }
 
-pub(super) enum TypeSourceSelection<'input> {
-    Required,
-    Dependencies(super::StoredQueryDependencyView<'input>),
+pub(super) enum CatalogPublicationInput<'input> {
+    RoutineContract,
+    QueryDefinition(super::StoredQueryDependencyView<'input>),
+    RuleMetadataEdit,
 }
 
-impl TypeSourceSelection<'_> {
+#[derive(Clone, Copy)]
+pub(super) struct QueryTableTarget {
+    slot: usize,
+    identity: super::table_definitions::TableIdentity,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QueryRuleTarget {
+    Table(QueryTableTarget),
+    View {
+        slot: u16,
+        database: super::DatabaseOid,
+        created_at: u64,
+    },
+}
+
+impl QueryRuleTarget {
+    pub(super) fn table(self) -> Option<QueryTableTarget> {
+        match self {
+            Self::Table(target) => Some(target),
+            Self::View { .. } => None,
+        }
+    }
+}
+
+struct QueryTableOwners<'storage> {
+    definition: std::sync::RwLockReadGuard<'storage, super::table_definitions::DefinitionState>,
+    _lifecycle: MutexGuard<'storage, ()>,
+    selected: QueryTableTarget,
+}
+
+impl CatalogPublicationInput<'_> {
     fn requires_catalog(&self) -> bool {
         match self {
-            Self::Required => true,
-            Self::Dependencies(dependencies) => dependencies.entries().iter().any(|dependency| {
-                matches!(
-                    dependency.class,
-                    super::DependencyClass::Domain
-                        | super::DependencyClass::Enum
-                        | super::DependencyClass::Composite
-                )
-            }),
+            Self::RoutineContract | Self::RuleMetadataEdit => true,
+            Self::QueryDefinition(dependencies) => {
+                dependencies.entries().iter().any(|dependency| {
+                    matches!(
+                        dependency.class,
+                        super::DependencyClass::Domain
+                            | super::DependencyClass::Enum
+                            | super::DependencyClass::Composite
+                    )
+                })
+            }
         }
     }
 }
@@ -222,9 +256,60 @@ pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogTypeDestinat
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
     types: Option<MutexGuard<'storage, TypeCatalog>>,
+    target: Option<QueryTableOwners<'storage>>,
+    pub(super) comments: Option<MutexGuard<'storage, super::CommentCatalog>>,
 }
 
 impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
+    pub(super) fn allocate_preserved_query_image(
+        &mut self,
+        storage: &Storage,
+        owner: super::StoredQueryDependencyOwner,
+        previous: Option<u32>,
+        transaction: u32,
+    ) -> Result<u32, SqlError> {
+        let image = previous.map_or(storage.committed_dependency_image(owner), |slot| {
+            storage.stored_query_dependency_pending_base + slot as usize
+        });
+        let count = self.dependencies.image_count(image);
+        self.validate_dependencies(
+            super::StoredQueryDependencyView::new(self.dependencies.image(
+                image,
+                count,
+                storage.stored_query_dependencies_per_image,
+            )),
+            transaction,
+        )?;
+        let slot = storage.allocate_pending_stored_query_dependencies_from_current_in(
+            &mut self.dependencies,
+            owner,
+            previous,
+        )?;
+        self.refresh_dependencies(
+            storage.stored_query_dependency_pending_base + slot as usize,
+            self.dependencies.pending[slot as usize].count,
+            storage.stored_query_dependencies_per_image,
+            transaction,
+        );
+        Ok(slot)
+    }
+
+    pub(super) fn validate_target(&self, transaction: u32) -> Result<(), SqlError> {
+        if let Some(target) = &self.target {
+            let current = target.definition.identity;
+            if current.database != target.selected.identity.database
+                || current.created_at != target.selected.identity.created_at
+                || !current.existence.visible_to(transaction)
+            {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                    "saved-query target relation changed before publication"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn write_query_image(
         &mut self,
         storage: &Storage,
@@ -338,6 +423,41 @@ impl CatalogDependencyOwners<'_, crate::mem::fixed_vec::FixedVec<RoutineDef>> {
     }
 }
 
+impl CatalogDependencyOwners<'_, super::ViewRuleCatalog> {
+    pub(super) fn validate_rule_target(
+        &self,
+        selected: QueryRuleTarget,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        match selected {
+            QueryRuleTarget::Table(_) => self.validate_target(transaction),
+            QueryRuleTarget::View {
+                slot,
+                database,
+                created_at,
+            } => {
+                if self
+                    .catalog
+                    .views
+                    .get(usize::from(slot))
+                    .is_some_and(|view| {
+                        view.database == database
+                            && view.created_at == created_at
+                            && view.visible_to(transaction)
+                    })
+                {
+                    Ok(())
+                } else {
+                    Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                        "rewrite-rule target view changed before publication"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 impl TypeCatalog {
     fn bind_definition<T: CatalogTypeDefinition>(
         &self,
@@ -352,14 +472,98 @@ impl TypeCatalog {
 }
 
 impl Storage {
+    pub(super) fn query_rule_target(
+        &self,
+        target: super::RuleTarget,
+        transaction: u32,
+    ) -> Result<QueryRuleTarget, SqlError> {
+        match target {
+            super::RuleTarget::Table(slot) => self
+                .query_table_target(usize::from(slot), transaction)
+                .map(QueryRuleTarget::Table),
+            super::RuleTarget::View(slot) => {
+                let catalog = self.view_rule_catalog();
+                let view = catalog
+                    .views
+                    .get(usize::from(slot))
+                    .filter(|view| {
+                        view.database == super::current_database() && view.visible_to(transaction)
+                    })
+                    .ok_or_else(|| {
+                        crate::sql_err!(
+                            crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                            "rewrite-rule target view does not exist"
+                        )
+                    })?;
+                Ok(QueryRuleTarget::View {
+                    slot,
+                    database: view.database,
+                    created_at: view.created_at,
+                })
+            }
+        }
+    }
+
+    pub(super) fn query_table_target(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<QueryTableTarget, SqlError> {
+        let table = self.tables.get(slot).ok_or_else(|| {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                "saved-query target relation does not exist"
+            )
+        })?;
+        let state = table.definition.read();
+        if state.identity.database != super::current_database()
+            || !state.identity.existence.visible_to(transaction)
+        {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::UNDEFINED_TABLE,
+                "saved-query target relation does not exist"
+            ));
+        }
+        Ok(QueryTableTarget {
+            slot,
+            identity: state.identity,
+        })
+    }
+
     pub(super) fn catalog_dependency_owners<'storage, Catalog: CatalogTypeDestination>(
         &'storage self,
         destination: &'storage Mutex<Catalog>,
-        sources: TypeSourceSelection<'_>,
+        input: CatalogPublicationInput<'_>,
+        target: Option<QueryTableTarget>,
     ) -> CatalogDependencyOwners<'storage, Catalog> {
-        let requires_types = sources.requires_catalog();
+        let requires_types = input.requires_catalog();
+        let requires_comments = matches!(input, CatalogPublicationInput::RuleMetadataEdit);
         loop {
             let attempt: Result<_, super::row_ownership::LockWait<'storage>> = (|| {
+                let target = match target {
+                    Some(selected) => {
+                        let table = &self.tables[selected.slot];
+                        let lifecycle = super::row_ownership::try_mutex(
+                            &table.lifecycle,
+                            "table lifecycle lock poisoned",
+                        )?;
+                        let definition = table.definition.try_read_for_batch()?;
+                        Some(QueryTableOwners {
+                            definition,
+                            _lifecycle: lifecycle,
+                            selected,
+                        })
+                    }
+                    None => None,
+                };
+                let comments = if requires_comments {
+                    Some(super::row_ownership::try_mutex(
+                        &self.comments,
+                        "comment catalog lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
                 let catalog = super::row_ownership::try_mutex(
                     destination,
                     "dependent catalog publication lock poisoned",
@@ -380,6 +584,8 @@ impl Storage {
                     catalog,
                     types,
                     dependencies,
+                    target,
+                    comments,
                 })
             })();
             match attempt {

@@ -691,65 +691,104 @@ mod tests {
     fn saved_query_publication_releases_owners_and_refreshes_type_sources() {
         use super::super::tests::test_view_definition;
         use super::super::{
-            ColumnSet, RuleDefinition, RuleTarget, StoredQueryDependencies, StoredQueryDependency,
+            ColumnSet, PUBLIC_ROLE, PolicyCommandKind, PolicyDefinition, PolicySpec,
+            RuleDefinition, RuleTarget, StoredQueryDependencies, StoredQueryDependency,
             StoredQueryDependencyOwner,
         };
         for kind in KINDS {
-            for view in [false, true] {
+            for publication in 0..4 {
                 let (storage, related, _, movement) = fixture(kind);
                 let database = storage.current_database_oid();
-                let mut dependencies = StoredQueryDependencies::EMPTY;
                 let identity = storage
                     .capture_type_dependency(movement.class(), movement.identity.slot().index(), 0)
                     .unwrap();
-                dependencies
-                    .push(StoredQueryDependency {
-                        class: movement.class(),
-                        slot: movement.identity.slot().index() as u16,
-                        identity,
-                        referenced_columns: ColumnSet::EMPTY,
-                        schema: movement.prior.schema,
-                        name: movement.prior.name,
-                        referenced_schema: movement.prior.schema,
-                        referenced_name: movement.prior.name,
-                    })
-                    .unwrap();
-                let definition = test_view_definition(dependencies);
+                let dependency = StoredQueryDependency {
+                    class: movement.class(),
+                    slot: movement.identity.slot().index() as u16,
+                    identity,
+                    referenced_columns: ColumnSet::EMPTY,
+                    schema: movement.prior.schema,
+                    name: movement.prior.name,
+                    referenced_schema: movement.prior.schema,
+                    referenced_name: movement.prior.name,
+                };
                 let mut source = storage.type_catalog.lock().unwrap();
                 std::thread::scope(|scope| {
                     let storage = &storage;
-                    let writer = scope.spawn(move || {
-                        crate::sql::set_execution_database_oid(database);
-                        crate::mem::guard::forbid_alloc(|| {
-                            if view {
-                                let (slot, _) = storage.create_view(
-                                    SqlName::parse("public").unwrap(),
-                                    SqlName::parse("typed_submission").unwrap(),
-                                    definition,
-                                    false,
-                                    7,
-                                )?;
-                                Ok(StoredQueryDependencyOwner::Rule(
-                                    storage.view(slot).return_rule,
-                                ))
-                            } else {
-                                let (slot, _) = storage.create_rule(
-                                    RuleDefinition {
-                                        name: SqlName::parse("typed_submission").unwrap(),
-                                        target: RuleTarget::Table(related as u16),
-                                        ..RuleDefinition::EMPTY
-                                    },
-                                    definition.query.dependencies.view(),
-                                    false,
-                                    7,
-                                )?;
-                                Ok(StoredQueryDependencyOwner::Rule(slot as u16))
-                            }
-                        })
-                    });
+                    let writer =
+                        scope.spawn(move || -> Result<usize, crate::sql::eval::SqlError> {
+                            crate::sql::set_execution_database_oid(database);
+                            crate::mem::guard::forbid_alloc(|| {
+                                let mut dependencies = StoredQueryDependencies::EMPTY;
+                                dependencies.push(dependency)?;
+                                let definition = test_view_definition(dependencies);
+                                match publication {
+                                    0 => {
+                                        let (slot, _) = storage.create_view(
+                                            SqlName::parse("public").unwrap(),
+                                            SqlName::parse("typed_submission").unwrap(),
+                                            definition,
+                                            false,
+                                            7,
+                                        )?;
+                                        Ok(storage.committed_dependency_image(
+                                            StoredQueryDependencyOwner::Rule(
+                                                storage.view(slot).return_rule,
+                                            ),
+                                        ))
+                                    }
+                                    1 => {
+                                        let (slot, _) = storage.create_rule(
+                                            RuleDefinition {
+                                                name: SqlName::parse("typed_submission").unwrap(),
+                                                target: RuleTarget::Table(related as u16),
+                                                ..RuleDefinition::EMPTY
+                                            },
+                                            definition.query.dependencies.view(),
+                                            false,
+                                            7,
+                                        )?;
+                                        Ok(storage.committed_dependency_image(
+                                            StoredQueryDependencyOwner::Rule(slot as u16),
+                                        ))
+                                    }
+                                    2 => storage
+                                        .create_matview(related, definition.query, false, 7)
+                                        .map(|slot| storage.matview_dependency_image(slot)),
+                                    3 => storage
+                                        .create_policy(
+                                            PolicySpec {
+                                                name: SqlName::parse("typed_submission").unwrap(),
+                                                table: related,
+                                                command: PolicyCommandKind::All,
+                                                permissive: true,
+                                                definition: PolicyDefinition {
+                                                    using: Some(crate::util::StackStr::from_str(
+                                                        "true",
+                                                    )),
+                                                    with_check: None,
+                                                },
+                                                roles: &[PUBLIC_ROLE],
+                                            },
+                                            &definition.query.dependencies,
+                                            7,
+                                        )
+                                        .map(|slot| {
+                                            storage.committed_dependency_image(
+                                                StoredQueryDependencyOwner::Policy(slot as u16),
+                                            )
+                                        }),
+                                    _ => unreachable!(),
+                                }
+                            })
+                        });
                     let waiting = wait_until_contended(storage);
                     let available = storage.view_rule_catalog.try_lock().is_ok()
-                        && storage.stored_query_dependencies.try_lock().is_ok();
+                        && storage.matviews.try_lock().is_ok()
+                        && storage.policy_catalog.try_lock().is_ok()
+                        && storage.stored_query_dependencies.try_lock().is_ok()
+                        && storage.tables[related].lifecycle.try_lock().is_ok()
+                        && storage.tables[related].definition.test_write().is_ok();
                     let unrelated = crate::mem::guard::forbid_alloc(|| {
                         storage.create_view(
                             SqlName::parse("public").unwrap(),
@@ -771,17 +810,22 @@ mod tests {
                         }
                     }
                     drop(source);
-                    let owner = writer.join().unwrap().unwrap();
+                    let image = writer.join().unwrap().unwrap();
                     assert!(waiting, "submission did not reach the source wait");
                     assert!(
                         available,
                         "source wait retained a destination or dependency owner"
                     );
                     unrelated.unwrap();
-                    let submitted = storage.committed_dependencies(owner);
-                    assert_eq!(submitted.entries()[0].identity, identity);
-                    assert_eq!(submitted.entries()[0].name, movement.current.name);
-                    assert_eq!(submitted.entries()[0].referenced_name, movement.prior.name);
+                    let submitted = storage.stored_query_dependencies.lock().unwrap();
+                    let entries = submitted.image(
+                        image,
+                        submitted.image_count(image),
+                        storage.stored_query_dependencies_per_image,
+                    );
+                    assert_eq!(entries[0].identity, identity);
+                    assert_eq!(entries[0].name, movement.current.name);
+                    assert_eq!(entries[0].referenced_name, movement.prior.name);
                 });
             }
         }

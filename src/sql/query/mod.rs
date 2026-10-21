@@ -2306,7 +2306,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         slot: u16,
         label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
-        let definition = self.storage.enum_for(usize::from(slot), self.txid);
+        let Some(definition) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
+        )? else { return Ok(None); };
         Ok(definition
             .members()
             .position(|member| member.label.as_str() == label)
@@ -3782,7 +3784,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
+        )? else { return Ok(None); };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3794,7 +3798,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn enum_label_sort(&self, slot: u16, label: &str) -> Result<Option<f64>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
+        )? else { return Ok(None); };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3811,7 +3817,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         slot: u16,
         arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
-        let def = self.storage.enum_for(slot as usize, self.txid);
+        let Some(def) = self.storage.read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
+        )? else { return Ok(None); };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }

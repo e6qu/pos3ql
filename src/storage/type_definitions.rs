@@ -1,6 +1,7 @@
 //! Readers retain complete type definitions independently of live catalog slots.
 
 use std::sync::Arc;
+use super::spill_generations::StatementDefinitionIndex;
 
 use super::definition_pool::{
     DefinitionImageHandle, DefinitionImagePool, DefinitionImages, DefinitionKey,
@@ -40,9 +41,9 @@ impl TypeDefinitionTarget {
         }
     }
 
-    fn reference(self, storage: &Storage, transaction: u32) -> Result<TypeReference, SqlError> {
+    fn reference(self, storage: &Storage, transaction: u32) -> Result<Option<TypeReference>, SqlError> {
         if let Self::Bound(reference) = self {
-            return Ok(reference);
+            return Ok(Some(reference));
         }
         let catalog = storage
             .type_catalog
@@ -50,9 +51,8 @@ impl TypeDefinitionTarget {
             .expect("type catalog lock poisoned");
         let snapshot = catalog
             .type_snapshot(self.slot(), transaction)?
-            .filter(|snapshot| snapshot.identity.database() == super::current_database())
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type source no longer exists"))?;
-        TypeReference::from_bound_name(snapshot.name)
+            .filter(|snapshot| snapshot.identity.database() == super::current_database());
+        snapshot.map(|snapshot| TypeReference::from_bound_name(snapshot.name)).transpose()
     }
 
     pub(super) fn validate(
@@ -289,8 +289,8 @@ impl TypeDefinitionImages {
         storage: &Storage,
         target: TypeDefinitionTarget,
         transaction: u32,
-        selected: Option<usize>,
-    ) -> Result<DefinitionImageHandle<TypeImageKey, DomainDef>, SqlError> {
+        selected: Option<StatementDefinitionIndex<'_, DomainDef>>,
+    ) -> Result<Option<DefinitionImageHandle<TypeImageKey, DomainDef>>, SqlError> {
         self.validate_storage(storage)?;
         if !matches!(target.slot(), NamedTypeSlot::Domain(_)) {
             return Err(sql_err!(
@@ -299,15 +299,15 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.domains.handle_at(index)
+            self.domains.handle_at(index.index())
         } else {
-            let reference = target.reference(storage, transaction)?;
+            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.domains
                 .handle(self.domain(storage, reference, transaction)?)
         };
         // SAFETY: the caller's statement retains this chain, including cache hits.
         target.validate(unsafe { image.key().source() }, self.database)?;
-        Ok(image)
+        Ok(Some(image))
     }
 
     pub(super) fn enum_image(
@@ -315,8 +315,8 @@ impl TypeDefinitionImages {
         storage: &Storage,
         target: TypeDefinitionTarget,
         transaction: u32,
-        selected: Option<usize>,
-    ) -> Result<DefinitionImageHandle<TypeImageKey, EnumDefinition>, SqlError> {
+        selected: Option<StatementDefinitionIndex<'_, EnumDefinition>>,
+    ) -> Result<Option<DefinitionImageHandle<TypeImageKey, EnumDefinition>>, SqlError> {
         self.validate_storage(storage)?;
         if !matches!(target.slot(), NamedTypeSlot::Enum(_)) {
             return Err(sql_err!(
@@ -325,15 +325,15 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.enums.handle_at(index)
+            self.enums.handle_at(index.index())
         } else {
-            let reference = target.reference(storage, transaction)?;
+            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.enums
                 .handle(self.enumeration(storage, reference, transaction)?)
         };
         // SAFETY: the caller's statement retains this chain, including cache hits.
         target.validate(unsafe { image.key().source() }, self.database)?;
-        Ok(image)
+        Ok(Some(image))
     }
 
     pub(super) fn composite_image(
@@ -341,8 +341,8 @@ impl TypeDefinitionImages {
         storage: &Storage,
         target: TypeDefinitionTarget,
         transaction: u32,
-        selected: Option<usize>,
-    ) -> Result<DefinitionImageHandle<TypeImageKey, CompositeDef>, SqlError> {
+        selected: Option<StatementDefinitionIndex<'_, CompositeDef>>,
+    ) -> Result<Option<DefinitionImageHandle<TypeImageKey, CompositeDef>>, SqlError> {
         self.validate_storage(storage)?;
         if !matches!(target.slot(), NamedTypeSlot::Composite(_)) {
             return Err(sql_err!(
@@ -351,15 +351,15 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.composites.handle_at(index)
+            self.composites.handle_at(index.index())
         } else {
-            let reference = target.reference(storage, transaction)?;
+            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.composites
                 .handle(self.composite(storage, reference, transaction)?)
         };
         // SAFETY: the caller's statement retains this chain, including cache hits.
         target.validate(unsafe { image.key().source() }, self.database)?;
-        Ok(image)
+        Ok(Some(image))
     }
 
     pub(super) fn new(pools: &TypeDefinitionImagePools, database: super::DatabaseOid) -> Self {
@@ -518,6 +518,30 @@ impl TypeDefinitionImages {
 }
 
 impl Storage {
+    pub(crate) fn read_domain_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<DomainDef>>, SqlError> {
+        if !matches!(target.slot(), NamedTypeSlot::Domain(_)) {
+            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not a domain"));
+        }
+        let reader = self.spill_roots.type_definition_reader()?;
+        reader.type_definition(self, target, transaction, |images, selected| images.domain_image(self, target, transaction, selected))
+    }
+
+    pub(crate) fn read_enum_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<EnumDefinition>>, SqlError> {
+        if !matches!(target.slot(), NamedTypeSlot::Enum(_)) {
+            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not an enum"));
+        }
+        let reader = self.spill_roots.type_definition_reader()?;
+        reader.type_definition(self, target, transaction, |images, selected| images.enum_image(self, target, transaction, selected))
+    }
+
+    pub(crate) fn read_composite_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<CompositeDef>>, SqlError> {
+        if !matches!(target.slot(), NamedTypeSlot::Composite(_)) {
+            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not a composite"));
+        }
+        let reader = self.spill_roots.type_definition_reader()?;
+        reader.type_definition(self, target, transaction, |images, selected| images.composite_image(self, target, transaction, selected))
+    }
+
     pub(crate) fn type_definition_images(&self) -> TypeDefinitionImages {
         TypeDefinitionImages::new(&self.type_definition_images, super::current_database())
     }
@@ -782,5 +806,79 @@ mod tests {
                 assert_retained(&selected);
             });
         }
+    }
+
+    #[test]
+    fn statement_type_readers_keep_selected_versions_and_nested_readers_select_current_values() {
+        let mut storage = fixture();
+        create(&mut storage, NamedTypeSlot::Composite(0)).unwrap();
+        let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Composite(0));
+        let outer = storage.spill_roots.retain_statement().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = outer.enter().unwrap();
+            let old = storage.read_composite_definition(target, 0).unwrap().unwrap();
+            assert_eq!(old.fields()[0].name.as_str(), "before");
+            drop(scope);
+            let mut altered = storage.composite_for(0, 0);
+            altered.fields[0].name = SqlName::parse("after").unwrap();
+            storage.stage_composite_alter(0, altered, 7).unwrap();
+            storage.commit_composite_alter(0, 7);
+
+            let scope = outer.enter().unwrap();
+            assert_eq!(storage.read_composite_definition(target, 0).unwrap().unwrap().fields()[0].name.as_str(), "before");
+            for _ in 0..100 {
+                let child = storage.spill_roots.retain_statement().unwrap();
+                let child_scope = child.enter().unwrap();
+                let current = storage.read_composite_definition(target, 0).unwrap().unwrap();
+                assert_eq!(current.fields()[0].name.as_str(), "after");
+                assert_eq!(old.fields()[0].name.as_str(), "before");
+                drop(child_scope);
+            }
+            drop(scope);
+            drop(outer);
+            drop(storage);
+            assert_eq!(old.fields()[0].name.as_str(), "before");
+        });
+    }
+
+    #[test]
+    fn child_type_reader_retains_its_parent_after_scopes_and_storage_are_removed() {
+        let mut storage = fixture();
+        create(&mut storage, NamedTypeSlot::Domain(0)).unwrap();
+        let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Domain(0));
+        let outer = storage.spill_roots.retain_statement().unwrap();
+        let child = storage.spill_roots.retain_statement().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let outer_scope = outer.enter().unwrap();
+            let child_scope = child.enter().unwrap();
+            let read = storage.read_domain_definition(target, 0).unwrap().unwrap();
+            drop(child_scope);
+            drop(outer_scope);
+            drop(outer);
+            drop(child);
+            drop(storage);
+            assert!(read.not_null);
+            assert_eq!(read.checks()[0].expression.as_str(), "VALUE > 0");
+        });
+    }
+
+    #[test]
+    fn statement_type_absence_is_stable_and_a_new_transaction_reselects() {
+        let mut storage = fixture();
+        let statement = storage.spill_roots.retain_statement().unwrap();
+        let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Domain(0));
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = statement.enter().unwrap();
+            assert!(storage.read_domain_definition(target, 0).unwrap().is_none());
+            drop(scope);
+            create(&mut storage, NamedTypeSlot::Domain(0)).unwrap();
+            let bound = TypeDefinitionTarget::Bound(reference(&storage, NamedTypeSlot::Domain(0)));
+            let scope = statement.enter().unwrap();
+            assert!(storage.read_domain_definition(target, 0).unwrap().is_none());
+            assert_eq!(storage.read_domain_definition(bound, 0).err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            assert_eq!(storage.read_enum_definition(target, 0).err().unwrap().sqlstate, sqlstate::DATATYPE_MISMATCH);
+            assert!(storage.read_domain_definition(bound, 7).unwrap().unwrap().not_null);
+            drop(scope);
+        });
     }
 }

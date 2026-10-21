@@ -68,7 +68,7 @@ use snapshot_leases::{
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
 pub(crate) use spill_generations::SpillGenerationId;
-pub(crate) use spill_generations::StatementFileScope;
+pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 pub(crate) use spill_generations::{
     SpillGenerationReservation, SpillInstallation, SpillPublication,
 };
@@ -39469,30 +39469,6 @@ impl Storage {
     /// PostgreSQL makes such labels visible in the catalog but rejects their
     /// use until commit; labels of a type created in the same transaction and
     /// renamed committed labels are immediately safe.
-    pub(crate) fn enum_label_is_uncommitted(&self, slot: usize, label: &str, txid: u32) -> bool {
-        let catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        let enumeration = &catalog.enums[slot];
-        if enumeration.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
-            return false;
-        }
-        let Some(pending) = enumeration
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-        else {
-            return false;
-        };
-        self.enum_member_images
-            .lock()
-            .expect("enum member-image lock poisoned")
-            .image_members(pending.image, pending.member_count as usize)
-            .iter()
-            .position(|member| member.label.as_str() == label)
-            .is_some_and(|index| index >= pending.safe_member_count as usize)
-    }
-
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {

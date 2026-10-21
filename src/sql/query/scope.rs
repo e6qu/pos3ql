@@ -205,6 +205,7 @@ pub struct QueryScope<'d> {
     storage: &'d Storage,
     txid: u32,
     arena: &'d Arena,
+    type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
     returning_aliases: &'d [&'d str],
     pub(crate) defs: QueryDefinitions<'d>,
@@ -425,6 +426,7 @@ impl<'d> QueryScope<'d> {
             storage,
             txid,
             arena,
+            type_sources: None,
             names,
             returning_aliases: &[],
             defs: QueryDefinitions {
@@ -1153,6 +1155,12 @@ impl<'d> QueryScope<'d> {
             });
         };
         let stored_def = self.defs.retain(storage, slot)?;
+        let source_scope = self.type_sources.as_ref().map(|owner| owner.enter()).transpose()?;
+        let selected = storage.select_type_definition_graph(
+            stored_def.columns().iter().filter_map(|column| column.user_type), txid, arena,
+        )?;
+        if self.type_sources.is_none() { self.type_sources = selected; }
+        drop(source_scope);
         let exposed = match tref.alias {
             Some(alias) => alias,
             None => arena

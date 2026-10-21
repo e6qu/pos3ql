@@ -778,7 +778,7 @@ thread_local! {
 }
 
 #[must_use = "the statement must retain its selected files until execution ends"]
-pub(super) struct StatementFileLease {
+pub(crate) struct StatementFileLease {
     registry: Arc<SpillRootRegistry>,
     identity: StatementFileIdentity,
 }
@@ -908,7 +908,7 @@ impl StatementFileLease {
         Ok(Self { registry: Arc::clone(&self.registry), identity: self.identity })
     }
 
-    pub(super) fn enter(&self) -> Result<StatementFileScope, SqlError> {
+    pub(crate) fn enter(&self) -> Result<StatementFileScope, SqlError> {
         let previous = SELECTED_STATEMENT_FILES.with(Cell::get);
         let depth = STATEMENT_FILE_SCOPE_DEPTH
             .with(Cell::get)

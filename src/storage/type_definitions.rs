@@ -521,6 +521,88 @@ impl TypeDefinitionImages {
 }
 
 impl Storage {
+    /// Capture the complete referenced type graph before rows can wait for I/O.
+    /// The returned statement reference keeps all selected definitions alive.
+    pub(crate) fn select_type_definition_graph(
+        &self,
+        mut roots: impl Iterator<Item = super::UserTypeName>,
+        transaction: u32,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<Option<super::StatementFileLease>, SqlError> {
+        let Some(first) = roots.next() else { return Ok(None); };
+        let owner = self.spill_roots.type_definition_reader()?;
+        let scope = owner.enter()?;
+        let mark = arena.mark();
+        let result = (|| {
+            let capacity = self.domain_count().saturating_add(self.enum_count()).saturating_add(self.composite_count());
+            let queue = arena.alloc_slice_with(capacity, |_| None).map_err(|_| sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED, "type definition graph exceeds the statement arena"))?;
+            let mut count = 0;
+            for name in core::iter::once(first).chain(roots) {
+                self.queue_type_definition(queue, &mut count, name, transaction)?;
+            }
+            let mut position = 0;
+            while position < count {
+                let reference = queue[position].expect("queued type reference is initialized");
+                let target = TypeDefinitionTarget::Bound(reference);
+                match reference.slot() {
+                    NamedTypeSlot::Domain(_) => {
+                        let source = self.read_domain_definition(target, transaction)?.expect("a bound type read reports absence as an error");
+                        for child in [source.base_domain, source.base_user_type].into_iter().flatten() {
+                            self.queue_type_definition(queue, &mut count, child, transaction)?;
+                        }
+                    }
+                    NamedTypeSlot::Enum(_) => {
+                        self.read_enum_definition(target, transaction)?;
+                    }
+                    NamedTypeSlot::Composite(_) => {
+                        let source = self.read_composite_definition(target, transaction)?.expect("a bound type read reports absence as an error");
+                        for child in source.active_fields().filter_map(|field| field.user_type) {
+                            self.queue_type_definition(queue, &mut count, child, transaction)?;
+                        }
+                    }
+                }
+                position += 1;
+            }
+            Ok::<(), SqlError>(())
+        })();
+        // SAFETY: only the temporary queue borrows this scratch. Definition
+        // images and the returned statement owner reside in startup pools.
+        unsafe { arena.rewind_to(mark); }
+        result?;
+        drop(scope);
+        Ok(Some(owner))
+    }
+
+    fn queue_type_definition(
+        &self,
+        queue: &mut [Option<TypeReference>],
+        count: &mut usize,
+        name: super::UserTypeName,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let reference = TypeReference::from_bound_name(name)?;
+        if let Some(previous) = queue[..*count].iter().flatten().find(|entry| entry.slot() == reference.slot()) {
+            if *previous != reference {
+                // Captured and recovered spellings can name the same source.
+                // Validate either spelling against the selected lifetime.
+                let target = TypeDefinitionTarget::Bound(reference);
+                match reference.slot() {
+                    NamedTypeSlot::Domain(_) => { self.read_domain_definition(target, transaction)?; }
+                    NamedTypeSlot::Enum(_) => { self.read_enum_definition(target, transaction)?; }
+                    NamedTypeSlot::Composite(_) => { self.read_composite_definition(target, transaction)?; }
+                }
+            }
+            return Ok(());
+        }
+        let Some(entry) = queue.get_mut(*count) else {
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "type definition graph exceeds its configured source slots"));
+        };
+        *entry = Some(reference);
+        *count += 1;
+        Ok(())
+    }
+
     pub(crate) fn read_domain_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<DomainDef>>, SqlError> {
         if !matches!(target.slot(), NamedTypeSlot::Domain(_)) {
             return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not a domain"));
@@ -947,6 +1029,45 @@ mod tests {
             drop(old);
             drop(outer);
             assert_eq!(storage.read_composite_definition(target, 0).unwrap().unwrap().fields()[0].name.as_str(), "third");
+        });
+    }
+
+    #[test]
+    fn type_graph_capture_retains_nested_sources_before_any_value_is_decoded() {
+        let mut storage = fixture();
+        let schema = SqlName::parse("public").unwrap();
+        create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
+        storage.create_domain(schema, SqlName::parse("wrapped_reader").unwrap(), DomainSpec {
+            base_domain: None,
+            base_user_type: Some(super::super::UserTypeName::declaration(schema, SqlName::parse("reader_source").unwrap())),
+            base: ColType::Enum(0), base_type_mod: -1, not_null: false, default_expr: None,
+            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+        }, 0).unwrap();
+        let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
+        fields[0] = CompositeFieldDef {
+            name: SqlName::parse("status").unwrap(), attribute_number: 1, ctype: ColType::Enum(0),
+            user_type: Some(super::super::UserTypeName::declaration(schema, SqlName::parse("wrapped_reader").unwrap())),
+            ..CompositeFieldDef::EMPTY
+        };
+        storage.create_composite(schema, SqlName::parse("record_reader").unwrap(), CompositeSpec { fields, n_fields: 1 }, 0).unwrap();
+        let bound = storage.type_catalog.lock().unwrap().type_snapshot(NamedTypeSlot::Composite(0), 0).unwrap().unwrap().name;
+        let enumeration = reference(&storage, NamedTypeSlot::Enum(0));
+        let mut budget = Budget::new(1025);
+        let tiny = crate::mem::arena::Arena::new(&mut budget, "tiny type graph", 1).unwrap();
+        let arena = crate::mem::arena::Arena::new(&mut budget, "type graph", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.select_type_definition_graph(core::iter::once(bound), 0, &tiny).err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let graph = storage.select_type_definition_graph(core::iter::once(bound), 0, &arena).unwrap().unwrap();
+            retire(&mut storage, NamedTypeSlot::Enum(0));
+            assert_eq!(create(&mut storage, NamedTypeSlot::Enum(0)).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let scope = graph.enter().unwrap();
+            let selected = storage.read_enum_definition(TypeDefinitionTarget::Bound(enumeration), 0).unwrap().unwrap();
+            assert_eq!(selected.members().next().unwrap().label.as_str(), "before");
+            drop(scope);
+            drop(graph);
+            assert_eq!(selected.members().next().unwrap().label.as_str(), "before");
+            drop(selected);
+            create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         });
     }
 }

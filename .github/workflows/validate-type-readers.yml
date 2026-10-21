@@ -47,8 +47,8 @@ jobs:
           storage::type_reference_moves::tests
           storage::tests::table_state_row_map_controls_are_charged_at_startup
           config::tests
-           sql::tests::enum_value_identity_
-           sql::tests::enums_order_and_enforce
+          sql::tests::enum_value_identity_
+          sql::tests::enums_order_and_enforce
           --test-threads=1
       - run: cargo clippy --all-targets --locked -- -D warnings
   image-memory-safety:

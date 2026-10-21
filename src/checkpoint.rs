@@ -19878,7 +19878,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v13",
                 "pos3ql-manifest-v14",
                 "pos3ql-manifest-v15",
-                "pos3ql-manifest-v19",
+                "pos3ql-manifest-v18",
+                "pos3ql-manifest-v20",
                 "pos3ql-manifest-v19 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
@@ -19906,6 +19907,11 @@ mod stored_dependency_tests {
                     "latest_transaction_id ",
                     "manifest lacks transaction identity allocator",
                     "duplicate transaction identity allocator",
+                ),
+                (
+                    "role_sequence ",
+                    "manifest lacks role identity allocator",
+                    "duplicate role identity allocator",
                 ),
                 (
                     "next_lo_oid ",
@@ -20210,7 +20216,8 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v13",
             "pos3ql-manifest-v14",
             "pos3ql-manifest-v15",
-            "pos3ql-manifest-v19",
+            "pos3ql-manifest-v18",
+            "pos3ql-manifest-v20",
         ] {
             let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());

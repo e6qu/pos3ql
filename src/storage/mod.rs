@@ -26440,7 +26440,7 @@ impl Storage {
     }
 
     /// Committed role install used by WAL and manifest recovery.
-    pub fn install_role(
+    pub(crate) fn install_role(
         &self,
         name: SqlName,
         attributes: RoleAttributes,

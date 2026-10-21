@@ -200,7 +200,8 @@ transaction owners under the same definition guard. Capacity or comment-ownershi
 failure leaves the prior shape and comment names intact. Comment text publication
 preserves name changes owned by another transaction.
 
-Table reads capture the complete type chain before waiting for row data. For
+Table reads and scalar function contracts capture the complete type chain before
+waiting for row data or running the function body. For
 example, a shipment column can contain a composite whose status field uses a
 domain over an enum. The query saves that composite layout, the domain's rules
 and the enum's labels together with their source lifetimes. Resuming the same

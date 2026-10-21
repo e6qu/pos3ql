@@ -412,7 +412,8 @@ pub(crate) fn resolve_query<const N: usize>(
                         "stored enum binding has no type dependency"
                     )
                 })?;
-            let crate::storage::StoredDependencyIdentity::Type(reference) = dependency.identity else {
+            let crate::storage::StoredDependencyIdentity::Type(reference) = dependency.identity
+            else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "stored enum binding has no captured type source"

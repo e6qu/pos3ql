@@ -41,8 +41,8 @@ its rows or definitions. Cleanup should let ordinary queries run between turns.
 Tables, routines and saved queries publish their definitions and type references
 together, preserving source identities across rename and recovery. Readers now
 retain selected domain, enum and composite definitions in startup memory. Table
-reads capture nested type dependencies before storage waits; nested statements
-select their own visible definitions and share identical retained images.
+reads and scalar function contracts capture nested types before execution waits;
+nested statements select their own visible definitions and share identical images.
 
 Complete shared engine publication across type retirement, transaction commit
 and remaining metadata preparation before removing exclusive type commits and

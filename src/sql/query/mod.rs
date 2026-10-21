@@ -1568,6 +1568,20 @@ impl StorageCatalog<'_, '_, '_, '_> {
             _ => unreachable!("routine call resolution returns functions only"),
         };
         let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
+        let _type_sources = self.storage.select_type_definition_graph(
+            routine
+                .arguments()
+                .iter()
+                .filter_map(|argument| argument.user_type)
+                .chain(result_contract.and_then(|result| result.user_type))
+                .chain(
+                    routine.result_columns[..routine.result_column_count]
+                        .iter()
+                        .filter_map(|column| column.user_type),
+                ),
+            self.txid,
+            arena,
+        )?;
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             if let Some(invocations) = self.invocations {
                 return invocations.resolve(

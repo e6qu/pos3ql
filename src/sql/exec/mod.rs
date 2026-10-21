@@ -47629,8 +47629,12 @@ pub(crate) fn analyze_extended_statistics(
                         )?,
                     );
                 }
-                let full_hash =
-                    crate::sql::eval::hash_key_catalog(storage, transaction, values, &indices[..n_keys])?;
+                let full_hash = crate::sql::eval::hash_key_catalog(
+                    storage,
+                    transaction,
+                    values,
+                    &indices[..n_keys],
+                )?;
                 if all_non_null {
                     non_null_rows = non_null_rows.saturating_add(1);
                     add_distinct(&mut full_registers, full_hash);
@@ -47645,7 +47649,12 @@ pub(crate) fn analyze_extended_statistics(
                             let pair = [determinant as u16, dependent as u16];
                             add_distinct(
                                 registers,
-                                crate::sql::eval::hash_key_catalog(storage, transaction, values, &pair)?,
+                                crate::sql::eval::hash_key_catalog(
+                                    storage,
+                                    transaction,
+                                    values,
+                                    &pair,
+                                )?,
                             );
                         }
                     }
@@ -47721,8 +47730,12 @@ pub(crate) fn analyze_extended_statistics(
                 None,
                 None,
                 &mut |values| {
-                    let hash =
-                        crate::sql::eval::hash_key_catalog(storage, transaction, values, &indices[..n_keys])?;
+                    let hash = crate::sql::eval::hash_key_catalog(
+                        storage,
+                        transaction,
+                        values,
+                        &indices[..n_keys],
+                    )?;
                     let mut rendered_keys = [None; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
                     for (rendered, value) in
                         rendered_keys[..n_keys].iter_mut().zip(&values[..n_keys])

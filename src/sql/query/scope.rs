@@ -623,9 +623,9 @@ impl<'d> QueryScope<'d> {
                         "TABLESAMPLE is not supported for foreign tables"
                     ));
                 }
-                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena)?;
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
+                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena)?;
                 self.derived[source] = Some(rows);
                 return Ok(());
             }

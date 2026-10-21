@@ -4,6 +4,7 @@
 //! materializes sort keys into the per-statement arena (bounded by the
 //! arena size, loudly). No allocation anywhere.
 
+use crate::mem::mutex::Mutex;
 use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::fixed_vec::FixedVec;
@@ -51534,7 +51535,7 @@ pub fn cluster(
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 pub struct CopySetup {
-    snapshot_lease: std::sync::Mutex<Option<crate::storage::StatementSnapshotLease>>,
+    snapshot_lease: Mutex<Option<crate::storage::StatementSnapshotLease>>,
     definitions: crate::storage::TableDefinitionImages,
     pub table_index: usize,
     pub txid: u32,
@@ -52100,7 +52101,7 @@ pub fn copy_begin(
     let definitions = storage.table_definition_images();
     definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
-        snapshot_lease: std::sync::Mutex::new(None),
+        snapshot_lease: Mutex::new(None),
         definitions,
         table_index,
         txid,
@@ -52250,7 +52251,7 @@ pub(crate) fn subscription_copy_setup(
     let definitions = storage.table_definition_images();
     definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
-        snapshot_lease: std::sync::Mutex::new(None),
+        snapshot_lease: Mutex::new(None),
         definitions,
         table_index,
         txid,

@@ -2,7 +2,7 @@
 
 use core::mem::size_of;
 use core::ops::Deref;
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use {crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard};
 
 use super::table_names::{
     CommittedDefinitionWrite, DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope,

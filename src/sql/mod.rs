@@ -61,6 +61,7 @@ pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
 
+use crate::mem::mutex::Mutex;
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
 use crate::mem::arena::{Arena, ArenaList};
@@ -678,7 +679,7 @@ struct ActiveSystemSetting {
 }
 
 struct ActiveSystemSettings {
-    image: std::sync::Mutex<ActiveSystemSettingsImage>,
+    image: Mutex<ActiveSystemSettingsImage>,
 }
 
 struct ActiveSystemSettingsImage {
@@ -689,7 +690,7 @@ struct ActiveSystemSettingsImage {
 impl ActiveSystemSettings {
     fn new(entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) -> Self {
         Self {
-            image: std::sync::Mutex::new(ActiveSystemSettingsImage {
+            image: Mutex::new(ActiveSystemSettingsImage {
                 entries,
                 reloaded: false,
             }),

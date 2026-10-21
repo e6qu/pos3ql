@@ -17,6 +17,7 @@ Differential checks must preserve every query result and error code without
 mistaking multiline diagnostic text for returned rows.
 Publication must recheck its prepared source after waiting and include newly
 submitted dependents before changing any definition or publication counter.
+First use or replacement of a runtime lock must not allocate hidden native state.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Publication, recovery and capacity failures follow the same rule.

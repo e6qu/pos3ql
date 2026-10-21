@@ -5,7 +5,7 @@ use core::mem::size_of;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use {std::sync::Arc, crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard};
 
 use super::{ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity};
 use crate::config::Config;

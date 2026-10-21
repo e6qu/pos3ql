@@ -429,7 +429,9 @@ impl super::TypeCatalog {
     }
 
     pub(super) fn has_pending_type_change(&self, source: NamedTypeSlot) -> bool {
-        self.type_change_owners(source).into_iter().any(|owner| owner.is_some())
+        self.type_change_owners(source)
+            .into_iter()
+            .any(|owner| owner.is_some())
     }
 
     pub(super) fn conflicting_type_owner(
@@ -442,7 +444,6 @@ impl super::TypeCatalog {
             .flatten()
             .find(|&owner| owner != transaction)
     }
-
 }
 
 impl super::Storage {

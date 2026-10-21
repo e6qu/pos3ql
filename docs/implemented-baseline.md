@@ -26,7 +26,16 @@ error rather than quietly giving a different answer.
 
 This section explains the recent concurrency preparation. “Ownership” means
 keeping data and buffers valid until the operation using them has finished.
-It does not mean that SQL statements already execute in parallel.
+SQL statements still use one CPU worker.
+
+Core mutexes keep their native state inline, including on macOS using
+[Apple's native lock](https://developer.apple.com/documentation/os/os_unfair_lock).
+First use, replacement, movement, contention and unwinding are checked with
+allocation guards and a memory-safety interpreter. Read/write locks retain
+concurrent readers.
+
+**User example:** a connection's first query and a newly created materialized
+view can use their lock state without requesting additional heap memory.
 
 **User example:** transaction A reads an order, transaction B updates it, and
 A reads again. Under repeatable-read isolation, A still needs its earlier

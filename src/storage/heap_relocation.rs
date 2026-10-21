@@ -2,7 +2,7 @@
 
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, TryLockError};
+use {std::sync::Arc, crate::mem::mutex::Mutex, std::sync::TryLockError};
 
 mod sort;
 use sort::RelocationSort;

@@ -1,7 +1,7 @@
 //! Bound history maintenance by stable row slots; active readers keep their versions.
 
 use core::num::NonZeroUsize;
-use std::sync::{Mutex, TryLockError};
+use {crate::mem::mutex::Mutex, std::sync::TryLockError};
 
 use super::{Storage, prune_committed_history};
 use crate::mem::budget::{Budget, BudgetError};
@@ -74,7 +74,7 @@ impl SnapshotReclamation {
 }
 
 struct SnapshotRowOwners<'storage> {
-    snapshots: std::sync::MutexGuard<'storage, super::SnapshotState>,
+    snapshots: crate::mem::mutex::MutexGuard<'storage, super::SnapshotState>,
     generations:
         std::sync::RwLockReadGuard<'storage, super::spill_generations::SpillGenerationList>,
     versions: std::sync::RwLockWriteGuard<'storage, super::row_versions::RowVersionState>,

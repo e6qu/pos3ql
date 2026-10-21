@@ -1,7 +1,7 @@
 //! A type move updates only references belonging to its owning database.
 
 use core::mem::{align_of, size_of};
-use std::sync::{Mutex, MutexGuard};
+use {crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard};
 
 #[cfg(test)]
 use super::DatabaseOid;
@@ -23,21 +23,43 @@ use crate::sql::eval::{SqlError, sqlstate};
 #[derive(Clone, Copy)]
 pub(super) enum TypePublicationSource {
     Pending(TypeEditTarget),
-    Committed { identity: TypeIdentity, revision: u64 },
+    Committed {
+        identity: TypeIdentity,
+        revision: u64,
+    },
 }
 
 impl TypePublicationSource {
-    pub(super) fn committed(catalog: &TypeCatalog, source: NamedTypeSlot) -> Result<Self, SqlError> {
-        let snapshot = catalog.type_snapshot(source, 0)?
+    pub(super) fn committed(
+        catalog: &TypeCatalog,
+        source: NamedTypeSlot,
+    ) -> Result<Self, SqlError> {
+        let snapshot = catalog
+            .type_snapshot(source, 0)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database())
-            .ok_or_else(|| crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "type publication source no longer exists"))?;
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type publication source no longer exists"
+                )
+            })?;
         if catalog.has_pending_type_change(source) {
-            return Err(crate::sql_err!(sqlstate::SERIALIZATION_FAILURE, "type publication requires a committed source"));
+            return Err(crate::sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "type publication requires a committed source"
+            ));
         }
-        Ok(Self::Committed { identity: snapshot.identity, revision: catalog.versions.get(source) })
+        Ok(Self::Committed {
+            identity: snapshot.identity,
+            revision: catalog.versions.get(source),
+        })
     }
 
-    fn validate(self, catalog: &TypeCatalog, movement: TypeReferenceMove) -> Result<bool, SqlError> {
+    fn validate(
+        self,
+        catalog: &TypeCatalog,
+        movement: TypeReferenceMove,
+    ) -> Result<bool, SqlError> {
         match self {
             Self::Pending(target) => Ok(target.identity_move(catalog).is_some_and(|current| {
                 current.identity == movement.identity
@@ -47,10 +69,17 @@ impl TypePublicationSource {
                     && current.current.name == movement.current.name
             })),
             Self::Committed { identity, revision } => {
-                if identity.database() != super::current_database() || !catalog.contains_type_source(identity) {
-                    return Err(crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "type publication source has been replaced"));
+                if identity.database() != super::current_database()
+                    || !catalog.contains_type_source(identity)
+                {
+                    return Err(crate::sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "type publication source has been replaced"
+                    ));
                 }
-                if catalog.versions.get(identity.slot()) != revision || catalog.has_pending_type_change(identity.slot()) {
+                if catalog.versions.get(identity.slot()) != revision
+                    || catalog.has_pending_type_change(identity.slot())
+                {
                     return Err(crate::sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
                         "type publication source changed after preparation"
@@ -63,9 +92,10 @@ impl TypePublicationSource {
                     NamedTypeSlot::Enum(slot) => {
                         (catalog.enums[slot].schema, catalog.enums[slot].name)
                     }
-                    NamedTypeSlot::Composite(slot) => {
-                        (catalog.composites[slot].schema, catalog.composites[slot].name)
-                    }
+                    NamedTypeSlot::Composite(slot) => (
+                        catalog.composites[slot].schema,
+                        catalog.composites[slot].name,
+                    ),
                 };
                 if identity != movement.identity
                     || schema != movement.prior.schema
@@ -366,11 +396,16 @@ impl TypePublication {
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_tables(storage, movement, &mut owners)?;
                 #[cfg(test)]
-                if self.scan_pause.compare_exchange(
-                    1, 2,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                ).is_ok() {
+                if self
+                    .scan_pause
+                    .compare_exchange(
+                        1,
+                        2,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     while self.scan_pause.load(std::sync::atomic::Ordering::Acquire) == 2 {
                         std::thread::yield_now();
                     }
@@ -382,7 +417,8 @@ impl TypePublication {
                 Err(wait) => {
                     drop(owners);
                     #[cfg(test)]
-                    self.waits.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    self.waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
                     wait.wait();
                     continue;
                 }
@@ -407,14 +443,7 @@ impl TypePublication {
                     &storage.stored_query_dependencies,
                     "stored-query dependency catalog lock poisoned",
                 )?;
-                Ok((
-                    members,
-                    comments,
-                    routines,
-                    operators,
-                    casts,
-                    dependencies,
-                ))
+                Ok((members, comments, routines, operators, casts, dependencies))
             })();
             match attempt {
                 Err(wait) => {
@@ -626,27 +655,50 @@ mod tests {
         transaction: u32,
     ) -> MoveUndo {
         match kind {
-            TypeReferenceKind::Domain => MoveUndo::Domain(storage.stage_domain_identity(
-                storage.prepare_domain_edit(slot, transaction).unwrap().1,
-                destination.schema, destination.name, transaction,
-            ).unwrap()),
+            TypeReferenceKind::Domain => MoveUndo::Domain(
+                storage
+                    .stage_domain_identity(
+                        storage.prepare_domain_edit(slot, transaction).unwrap().1,
+                        destination.schema,
+                        destination.name,
+                        transaction,
+                    )
+                    .unwrap(),
+            ),
             TypeReferenceKind::Enum => {
                 let (definition, target) = storage.prepare_enum_edit(slot, transaction).unwrap();
                 let members = [definition.members().next().unwrap()];
-                MoveUndo::Enum(storage.stage_enum_alter(
-                    target, destination.schema, destination.name, &members, transaction,
-                ).unwrap())
+                MoveUndo::Enum(
+                    storage
+                        .stage_enum_alter(
+                            target,
+                            destination.schema,
+                            destination.name,
+                            &members,
+                            transaction,
+                        )
+                        .unwrap(),
+                )
             }
             TypeReferenceKind::Composite => {
-                let (mut definition, target) = storage.prepare_composite_edit(slot, transaction).unwrap();
+                let (mut definition, target) =
+                    storage.prepare_composite_edit(slot, transaction).unwrap();
                 definition.schema = destination.schema;
                 definition.name = destination.name;
-                MoveUndo::Composite(storage.stage_composite_alter(target, definition, transaction).unwrap())
+                MoveUndo::Composite(
+                    storage
+                        .stage_composite_alter(target, definition, transaction)
+                        .unwrap(),
+                )
             }
         }
     }
 
-    fn commit_move(storage: &Storage, kind: TypeReferenceKind, target: TypeEditTarget) -> Result<(), SqlError> {
+    fn commit_move(
+        storage: &Storage,
+        kind: TypeReferenceKind,
+        target: TypeEditTarget,
+    ) -> Result<(), SqlError> {
         match kind {
             TypeReferenceKind::Domain => storage.commit_domain_alter(target),
             TypeReferenceKind::Enum => storage.commit_enum_alter(target),
@@ -669,11 +721,25 @@ mod tests {
             for submission in 0..3 {
                 let (storage, related, unrelated, movement) = fixture(kind);
                 let database = storage.current_database_oid();
-                let undo = stage_move(&storage, kind, movement.identity.slot().index(), movement.current, 7);
+                let undo = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.current,
+                    7,
+                );
                 let target = undo.target();
                 let mut definition = *storage.table_def(related, 0);
-                definition.name = SqlName::parse(if submission == 0 { "arrived_late" } else { "unrelated" }).unwrap();
-                storage.type_publication.scan_pause.store(1, Ordering::Release);
+                definition.name = SqlName::parse(if submission == 0 {
+                    "arrived_late"
+                } else {
+                    "unrelated"
+                })
+                .unwrap();
+                storage
+                    .type_publication
+                    .scan_pause
+                    .store(1, Ordering::Release);
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
                         crate::sql::set_execution_database_oid(database);
@@ -682,13 +748,17 @@ mod tests {
                     let resume = ResumeScan(&storage.type_publication.scan_pause);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while storage.type_publication.scan_pause.load(Ordering::Acquire) != 2 {
-                        assert!(Instant::now() < deadline, "type publication did not reach its scan boundary");
+                        assert!(
+                            Instant::now() < deadline,
+                            "type publication did not reach its scan boundary"
+                        );
                         std::thread::yield_now();
                     }
                     let submitted = if submission == 0 {
                         storage.create_table_in(definition, 11)
                     } else {
-                        storage.write_table_def(unrelated, 11, definition, &mapping("id"), false)
+                        storage
+                            .write_table_def(unrelated, 11, definition, &mapping("id"), false)
                             .map(|()| unrelated)
                     };
                     if submission == 2 {
@@ -698,12 +768,20 @@ mod tests {
                     let result = writer.join().unwrap();
                     let dependent = submitted.unwrap();
                     if submission == 2 {
-                        assert_eq!(result.unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                        assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.prior);
+                        assert_eq!(
+                            result.unwrap_err().sqlstate,
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED
+                        );
+                        assert_eq!(
+                            source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                            movement.prior
+                        );
                         assert_identity(&storage, related, 0, movement.prior);
                         assert_identity(&storage, dependent, 11, movement.prior);
                         storage.tables[dependent].publication().generation = 0;
-                        crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target).unwrap());
+                        crate::mem::guard::forbid_alloc(|| {
+                            commit_move(&storage, kind, target).unwrap()
+                        });
                     } else {
                         result.unwrap();
                     }
@@ -719,29 +797,53 @@ mod tests {
     #[test]
     fn shared_type_commit_revalidates_superseded_and_rolled_back_edits_after_waiting() {
         #[derive(Clone, Copy)]
-        enum Outcome { Rollback, NewRevision, RenameAgain }
+        enum Outcome {
+            Rollback,
+            NewRevision,
+            RenameAgain,
+        }
         for kind in KINDS {
-            for outcome in [Outcome::Rollback, Outcome::NewRevision, Outcome::RenameAgain] {
+            for outcome in [
+                Outcome::Rollback,
+                Outcome::NewRevision,
+                Outcome::RenameAgain,
+            ] {
                 let (storage, related, _, movement) = fixture(kind);
                 let database = storage.current_database_oid();
-                let undo = stage_move(&storage, kind, movement.identity.slot().index(), movement.current, 7);
+                let undo = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.current,
+                    7,
+                );
                 let target = undo.target();
                 let selected = storage.table_def(related, 0);
                 let next_name = match outcome {
-                    Outcome::RenameAgain => UserTypeName::declaration(movement.current.schema, SqlName::parse("newest_type").unwrap()),
+                    Outcome::RenameAgain => UserTypeName::declaration(
+                        movement.current.schema,
+                        SqlName::parse("newest_type").unwrap(),
+                    ),
                     Outcome::Rollback | Outcome::NewRevision => movement.current,
                 };
                 let (finished, received) = mpsc::sync_channel(1);
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
                         crate::sql::set_execution_database_oid(database);
-                        let result = crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target));
+                        let result =
+                            crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target));
                         finished.send(()).unwrap();
                         result
                     });
                     let waiting = wait_until_contended(&storage);
                     let next = match outcome {
-                        Outcome::NewRevision | Outcome::RenameAgain => Some(stage_move(&storage, kind, movement.identity.slot().index(), next_name, 7)),
+                        Outcome::NewRevision | Outcome::RenameAgain => Some(stage_move(
+                            &storage,
+                            kind,
+                            movement.identity.slot().index(),
+                            next_name,
+                            7,
+                        )),
                         Outcome::Rollback => {
                             undo.rollback(&storage);
                             None
@@ -752,12 +854,23 @@ mod tests {
                     let completed = received.recv_timeout(Duration::from_secs(5));
                     drop(unrelated_metadata);
                     writer.join().unwrap().unwrap();
-                    assert!(completed.is_ok(), "an obsolete edit waited on unrelated metadata");
-                    assert!(waiting, "type publication did not wait for the selected table");
-                    assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.prior);
+                    assert!(
+                        completed.is_ok(),
+                        "an obsolete edit waited on unrelated metadata"
+                    );
+                    assert!(
+                        waiting,
+                        "type publication did not wait for the selected table"
+                    );
+                    assert_eq!(
+                        source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                        movement.prior
+                    );
                     assert_identity(&storage, related, 0, movement.prior);
                     if let Some(next) = next {
-                        crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, next.target()).unwrap());
+                        crate::mem::guard::forbid_alloc(|| {
+                            commit_move(&storage, kind, next.target()).unwrap()
+                        });
                         assert_identity(&storage, related, 0, next_name);
                     }
                     assert!(storage.type_catalog.try_lock().is_ok());
@@ -772,39 +885,79 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         for kind in KINDS {
             for commit_update in [false, true] {
-            let (storage, related, _, movement) = fixture(kind);
-            let database = storage.current_database_oid();
-            let source = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot()).unwrap();
-            let selected = storage.table_def(related, 0);
-            let installed = AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                let writer = scope.spawn(|| {
-                    crate::sql::set_execution_database_oid(database);
-                    crate::mem::guard::forbid_alloc(|| storage.publish_type_move(
-                        movement, source, |_catalog, _members| {
-                            installed.store(true, Ordering::Release);
-                        },
-                    ))
+                let (storage, related, _, movement) = fixture(kind);
+                let database = storage.current_database_oid();
+                let source = TypePublicationSource::committed(
+                    &storage.type_catalog.lock().unwrap(),
+                    movement.identity.slot(),
+                )
+                .unwrap();
+                let selected = storage.table_def(related, 0);
+                let installed = AtomicBool::new(false);
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        crate::sql::set_execution_database_oid(database);
+                        crate::mem::guard::forbid_alloc(|| {
+                            storage.publish_type_move(movement, source, |_catalog, _members| {
+                                installed.store(true, Ordering::Release);
+                            })
+                        })
+                    });
+                    let waiting = wait_until_contended(&storage);
+                    let update = stage_move(
+                        &storage,
+                        kind,
+                        movement.identity.slot().index(),
+                        movement.prior,
+                        7,
+                    );
+                    let changed = commit_update.then(|| {
+                        crate::mem::guard::forbid_alloc(|| {
+                            commit_move(&storage, kind, update.target())
+                        })
+                    });
+                    if !commit_update {
+                        let captured = TypePublicationSource::committed(
+                            &storage.type_catalog.lock().unwrap(),
+                            movement.identity.slot(),
+                        );
+                        assert!(
+                            matches!(captured, Err(error) if error.sqlstate == sqlstate::SERIALIZATION_FAILURE)
+                        );
+                    }
+                    drop(selected);
+                    let result = writer.join().unwrap();
+                    if let Some(changed) = changed {
+                        changed.unwrap();
+                    } else {
+                        update.rollback(&storage);
+                    }
+                    assert!(
+                        waiting,
+                        "type publication did not wait for the selected table"
+                    );
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::SERIALIZATION_FAILURE
+                    );
+                    assert!(!installed.load(Ordering::Acquire));
+                    assert_identity(&storage, related, 0, movement.prior);
+                    assert_eq!(
+                        source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                        movement.prior
+                    );
+                    let next = stage_move(
+                        &storage,
+                        kind,
+                        movement.identity.slot().index(),
+                        movement.current,
+                        8,
+                    );
+                    crate::mem::guard::forbid_alloc(|| {
+                        commit_move(&storage, kind, next.target()).unwrap()
+                    });
+                    assert_identity(&storage, related, 0, movement.current);
                 });
-                let waiting = wait_until_contended(&storage);
-                let update = stage_move(&storage, kind, movement.identity.slot().index(), movement.prior, 7);
-                let changed = commit_update.then(|| crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, update.target())));
-                if !commit_update {
-                    let captured = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot());
-                    assert!(matches!(captured, Err(error) if error.sqlstate == sqlstate::SERIALIZATION_FAILURE));
-                }
-                drop(selected);
-                let result = writer.join().unwrap();
-                if let Some(changed) = changed { changed.unwrap(); } else { update.rollback(&storage); }
-                assert!(waiting, "type publication did not wait for the selected table");
-                assert_eq!(result.unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-                assert!(!installed.load(Ordering::Acquire));
-                assert_identity(&storage, related, 0, movement.prior);
-                assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.prior);
-                let next = stage_move(&storage, kind, movement.identity.slot().index(), movement.current, 8);
-                crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, next.target()).unwrap());
-                assert_identity(&storage, related, 0, movement.current);
-            });
             }
         }
     }
@@ -954,7 +1107,7 @@ mod tests {
     fn type_publication_exhaustion_leaves_source_and_all_dependents_unchanged() {
         use crate::storage::TypeCommitChange;
         for kind in KINDS {
-            let (mut storage, related, unrelated, movement) = fixture(kind);
+            let (storage, related, unrelated, movement) = fixture(kind);
             let source = movement.identity.slot().index();
             let target = match kind {
                 TypeReferenceKind::Domain => storage
@@ -2308,11 +2461,18 @@ mod tests {
     }
 
     fn publish_move(storage: &Storage, movement: TypeReferenceMove) {
-        let source = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot()).unwrap();
+        let source = TypePublicationSource::committed(
+            &storage.type_catalog.lock().unwrap(),
+            movement.identity.slot(),
+        )
+        .unwrap();
         storage
             .type_publication
-            .publish(storage, movement, source, |catalog, _members| {
-                match movement.identity.slot() {
+            .publish(
+                storage,
+                movement,
+                source,
+                |catalog, _members| match movement.identity.slot() {
                     NamedTypeSlot::Domain(_) => {
                         catalog.domains[movement.identity.slot().index()].schema =
                             movement.current.schema;
@@ -2331,8 +2491,8 @@ mod tests {
                         catalog.composites[movement.identity.slot().index()].name =
                             movement.current.name;
                     }
-                }
-            })
+                },
+            )
             .unwrap();
     }
 

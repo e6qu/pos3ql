@@ -1,6 +1,6 @@
 //! Selected enum labels remain immutable until their last reader releases them.
 
-use std::sync::{Arc, Mutex};
+use {std::sync::Arc, crate::mem::mutex::Mutex};
 
 use super::EnumMember;
 use crate::mem::budget::{Budget, BudgetError};
@@ -546,7 +546,9 @@ mod tests {
             let slot = create(&mut storage, "state");
             let before = storage.enum_for(slot, 0);
             alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
-            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1).unwrap();
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                .unwrap();
             let members = [
                 member("new", 1.0),
                 member("paid", 2.0),
@@ -643,7 +645,9 @@ mod tests {
             );
             crate::mem::guard::forbid_alloc(|| {
                 alter(storage, slot, &[member("renamed", 1.0)]).unwrap();
-                storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1).unwrap();
+                storage
+                    .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                    .unwrap();
                 let location = storage.heap.append_row(&[Datum::Int4(42)]).unwrap();
                 storage
                     .write_pending(unrelated, 1, 91, 1, Some(location))
@@ -687,7 +691,9 @@ mod tests {
                 )
                 .unwrap();
             let selected = storage.enum_for(slot, 77);
-            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 88).unwrap().1).unwrap();
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 88).unwrap().1)
+                .unwrap();
             assert_eq!(storage.enum_for(slot, 0).name, before.name);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 1);
             assert_eq!(storage.enum_for(slot, 77).name, after.name);

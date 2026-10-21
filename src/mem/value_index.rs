@@ -11,6 +11,7 @@
 //! or below one half; inserting past the requested capacity is a loud error
 //! naming the index — never growth.
 
+use crate::mem::mutex::Mutex;
 use core::fmt;
 
 use super::budget::{Budget, BudgetError};
@@ -216,7 +217,7 @@ impl ValueIndex {
 /// The pool's sole reference means a slot is free; issued handles prevent reuse.
 pub struct ValueIndexPool {
     indexes: Box<[std::sync::Arc<std::sync::RwLock<ValueIndex>>]>,
-    allocation: std::sync::Mutex<()>,
+    allocation: Mutex<()>,
 }
 
 /// An issued handle keeps its cache alive independently of the pool. Returned
@@ -270,7 +271,7 @@ impl ValueIndexPool {
         }
         Ok(Self {
             indexes: indexes.into_boxed_slice(),
-            allocation: std::sync::Mutex::new(()),
+            allocation: Mutex::new(()),
         })
     }
 

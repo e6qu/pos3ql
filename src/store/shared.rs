@@ -1,7 +1,7 @@
 //! Borrow a shared store for each operation; reader callbacks own no store guard.
 
 use std::os::fd::RawFd;
-use std::sync::{Mutex, MutexGuard};
+use {crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard};
 use std::time::Instant;
 
 use super::{BlockId, BlockIoStats, BlockStore, BlockType, PrefetchState, StoreError};

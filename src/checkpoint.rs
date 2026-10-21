@@ -1,5 +1,6 @@
 //! Immutable SST publication and cold recovery through the manifest CAS.
 
+use crate::mem::mutex::Mutex;
 use core::cmp::Ordering;
 
 mod probe;
@@ -856,7 +857,7 @@ fn garbage_index_root_capacity(config: &Config) -> usize {
 }
 
 pub(crate) struct TemporarySpiller {
-    blocks: std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
+    blocks: std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>,
     handles: Vec<SstHandle>,
     sst_arena: Arena,
     writer: SstWriter,
@@ -890,7 +891,7 @@ impl TemporarySpiller {
             )
             .map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
-            blocks: std::sync::Arc::new(std::sync::Mutex::new(blocks)),
+            blocks: std::sync::Arc::new(Mutex::new(blocks)),
             handles: Vec::with_capacity(garbage_sst_root_capacity(config)),
             sst_arena: Arena::new(budget, "temporary spill sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -900,7 +901,7 @@ impl TemporarySpiller {
 
     pub(crate) fn block_store(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>> {
+    ) -> std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>> {
         std::sync::Arc::clone(&self.blocks)
     }
 
@@ -1116,7 +1117,7 @@ enum CommitPruneProgress {
 /// Restores the caller's mode after errors and nested atomic execution.
 #[must_use]
 pub(crate) struct AtomicBlockReadScope {
-    blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
+    blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     active: core::cell::Cell<bool>,
 }
 
@@ -1235,7 +1236,7 @@ pub(crate) struct Checkpointer {
     /// start warms what a later read wants. Shared with the storage layer's
     /// spilled-row reader. The engine has one owner today, and the mutex keeps
     /// that ownership transferable to a worker without aliasing the stack.
-    blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
+    blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
     /// Spill-list updates computed during a checkpoint, applied to storage
@@ -2095,7 +2096,7 @@ impl Checkpointer {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("create data_dir: {e}")))?;
         let cache_dir = std::path::Path::new(&config.data_dir);
-        let blocks = std::sync::Arc::new(std::sync::Mutex::new(
+        let blocks = std::sync::Arc::new(Mutex::new(
             crate::store::build_tiers(budget, base, plan, cache_dir).map_err(|e| {
                 CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}"))
             })?,
@@ -2330,7 +2331,7 @@ impl Checkpointer {
     /// The shared block stack, for the storage layer's spilled-row reader.
     pub(crate) fn block_stack(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>> {
+    ) -> std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>> {
         std::sync::Arc::clone(&self.blocks)
     }
 
@@ -14926,7 +14927,7 @@ fn retain_block(keep: &mut BlockKeepSet<'_>, id: BlockId) -> Result<(), SqlError
 }
 
 fn retain_manifest_blocks(
-    blocks: &std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
+    blocks: &std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     keep: &mut BlockKeepSet<'_>,
     scratch: &mut [u8],
     bytes: &[u8],

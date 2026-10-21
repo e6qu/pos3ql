@@ -12,6 +12,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  mutex-model:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Inline native mutex ownership
+        run: cargo miri test --lib --locked mem::mutex::tests -- --test-threads=1
+
   validate:
     runs-on: macos-latest
     timeout-minutes: 15
@@ -42,7 +54,7 @@ jobs:
             ${{ runner.temp }}/type-publication-format.patch
       - name: Type publication, retained readers and rollback
         run: >-
-          cargo test --lib --locked -- type_ domain_ enum_ composite_
+          cargo test --lib --locked -- mem::mutex::tests type_ domain_ enum_ composite_
           --test-threads=1 --nocapture
       - name: Clippy
         run: cargo clippy --lib --bins -- -D warnings

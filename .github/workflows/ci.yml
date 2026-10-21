@@ -27,9 +27,27 @@ jobs:
             ~/.cargo/git
           key: macOS-reactor-dependencies-${{ hashFiles('Cargo.lock') }}
 
-      - name: Socket readiness, cancellation and descriptor reuse
+      - name: Socket readiness and allocation-free catalog publication
         run: >-
-          cargo test --lib --locked io:: -- --test-threads=1
+          cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_
+          --test-threads=1
+
+      - name: macOS allocation-free mutex boundary
+        run: cargo clippy --lib --bins -- -D warnings
+
+  macos-lock-ownership:
+    name: macOS mutex ownership
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Native mutex movement, contention and unwinding
+        run: >-
+          cargo miri test --lib --locked mem::mutex::tests -- --test-threads=1
 
   heap-aliasing:
     runs-on: ubuntu-latest
@@ -60,6 +78,7 @@ jobs:
             stable_spill_generation_exhaustion
             type_publication_workspace_exact_startup_budget
             bound_type_origin_never_reuses_an_exhausted_identifier
+            mem::mutex::tests
           )
           # All libtest filters share one interpreter startup.
           cargo miri test --lib --locked -- "${filters[@]}" --test-threads=1 --color=never --format=pretty \

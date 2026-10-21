@@ -4,6 +4,7 @@
 //! they cover parsing, execution, transactions and the wire encoding together
 //! rather than any one of them alone.
 
+use crate::mem::mutex::Mutex;
 use super::*;
 
 #[test]
@@ -75837,7 +75838,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SERIAL: Mutex<()> = Mutex::new(());
     let _serial = SERIAL.lock().expect("external-run test mutex poisoned");
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("external-runs-{sequence}"));

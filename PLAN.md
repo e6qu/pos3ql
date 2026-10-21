@@ -52,6 +52,9 @@ wait for their owner, including a transaction's pending rename.
 Storage publication rechecks a type's lifetime and edit revision after waits,
 then includes tables created or changed while it was acquiring owners. Enum
 label edits and name moves now use one shared commit API.
+Core macOS mutexes keep their native state inline, including when a command
+constructs a new lock value. Native and interpreter checks cover first use,
+movement, contention and unwinding within the startup memory boundary.
 PostgreSQL comparisons keep result rows and error codes separate from multiline
 diagnostic wording; the dedicated message checks still compare error text.
 

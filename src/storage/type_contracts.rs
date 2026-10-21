@@ -8,7 +8,7 @@ use super::{
 };
 use crate::sql::eval::SqlError;
 use core::convert::Infallible;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use {crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard, std::sync::TryLockError};
 
 pub(crate) enum CatalogTypes<'a> {
     Routine(&'a mut RoutineDef),

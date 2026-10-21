@@ -1,0 +1,4 @@
+disallowed-types = [
+  { path = "std::sync::Mutex", reason = "Use crate::mem::mutex::Mutex so macOS locking never allocates after startup." },
+  { path = "std::sync::MutexGuard", reason = "Use the guard for the core allocation-free mutex." },
+]

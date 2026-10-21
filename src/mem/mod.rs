@@ -13,6 +13,7 @@ pub mod buffer;
 pub mod fixed_map;
 pub mod fixed_vec;
 pub mod guard;
+pub(crate) mod mutex;
 pub mod pool;
 pub mod value_index;
 

@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-use std::sync::MutexGuard;
+use crate::mem::mutex::MutexGuard;
 
 use crate::config::Config;
 use crate::mem::arena::Arena;

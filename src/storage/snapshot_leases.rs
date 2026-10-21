@@ -3,7 +3,7 @@
 use super::SnapshotCleanup;
 use core::mem::size_of;
 use core::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use {std::sync::Arc, crate::mem::mutex::Mutex};
 
 use super::{DatabaseOid, LockState, SnapshotState, Storage};
 use crate::config::Config;

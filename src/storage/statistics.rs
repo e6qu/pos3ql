@@ -1,7 +1,7 @@
 //! Statistics visibility and saved-image acknowledgements have separate ownership.
 
 use core::mem::size_of;
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use {std::sync::Arc, crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard};
 
 use super::{
     PendingTableStatisticsSlot, RelationPersistence, SqlName, Storage, TableStatistics,

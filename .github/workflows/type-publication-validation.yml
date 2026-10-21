@@ -26,6 +26,8 @@ jobs:
             target
           key: macOS-type-publication-${{ hashFiles('Cargo.lock') }}
           restore-keys: macOS-type-publication-
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
       - name: Prepare formatting evidence
         run: |
           git rev-parse HEAD > "$RUNNER_TEMP/type-publication-head.txt"

@@ -707,14 +707,19 @@ mod tests {
 
     #[test]
     fn shared_type_commit_revalidates_superseded_and_rolled_back_edits_after_waiting() {
+        #[derive(Clone, Copy)]
+        enum Outcome { Rollback, NewRevision, RenameAgain }
         for kind in KINDS {
-            for supersede in [false, true] {
+            for outcome in [Outcome::Rollback, Outcome::NewRevision, Outcome::RenameAgain] {
                 let (storage, related, _, movement) = fixture(kind);
                 let database = storage.current_database_oid();
                 let undo = stage_move(&storage, kind, movement.identity.slot().index(), movement.current, 7);
                 let target = undo.target();
                 let selected = storage.table_def(related, 0);
-                let next_name = UserTypeName::declaration(movement.current.schema, SqlName::parse("newest_type").unwrap());
+                let next_name = match outcome {
+                    Outcome::RenameAgain => UserTypeName::declaration(movement.current.schema, SqlName::parse("newest_type").unwrap()),
+                    Outcome::Rollback | Outcome::NewRevision => movement.current,
+                };
                 let (finished, received) = mpsc::sync_channel(1);
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
@@ -724,11 +729,12 @@ mod tests {
                         result
                     });
                     let waiting = wait_until_contended(&storage);
-                    let next = if supersede {
-                        Some(stage_move(&storage, kind, movement.identity.slot().index(), next_name, 7))
-                    } else {
-                        undo.rollback(&storage);
-                        None
+                    let next = match outcome {
+                        Outcome::NewRevision | Outcome::RenameAgain => Some(stage_move(&storage, kind, movement.identity.slot().index(), next_name, 7)),
+                        Outcome::Rollback => {
+                            undo.rollback(&storage);
+                            None
+                        }
                     };
                     let unrelated_metadata = storage.stored_query_dependencies.lock().unwrap();
                     drop(selected);

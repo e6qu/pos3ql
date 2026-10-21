@@ -17986,6 +17986,10 @@ impl Storage {
         definition_images::TableDefinitionImagePool::budget_bytes(config)
     }
 
+    pub(crate) fn type_definition_image_budget_bytes(config: &Config) -> usize {
+        type_definitions::TypeDefinitionImagePools::budget_bytes(config)
+    }
+
     pub(crate) fn retained_spill_root_capacity(config: &Config) -> usize {
         SpillRootRegistry::capacity(config)
     }
@@ -18057,7 +18061,7 @@ impl Storage {
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::TypePublication::budget_bytes(config)
-            + type_definitions::TypeDefinitionImagePools::budget_bytes(config)
+            + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::TypeOrigin>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
@@ -31223,7 +31227,7 @@ impl Storage {
                 let index = [column as u16];
                 add_distinct(
                     &mut registers[column],
-                    hash_key_catalog(self, values, &index)?,
+                    hash_key_catalog(self, txid, values, &index)?,
                 );
             }
             Ok(())
@@ -32436,6 +32440,7 @@ impl Storage {
                         binding,
                         hash_key_collated_catalog(
                             self,
+                            enforcer.evaluation_txid,
                             key,
                             &compact[..enforcer.n_cols],
                             &enforcer.collations[..enforcer.n_cols],
@@ -34052,6 +34057,7 @@ impl Storage {
             payload_len,
             hash_key_collated_catalog(
                 self,
+                enforcer.evaluation_txid,
                 key,
                 &compact[..enforcer.n_cols],
                 &enforcer.collations[..enforcer.n_cols],

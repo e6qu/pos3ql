@@ -648,25 +648,28 @@ pub fn hash_key_collated(values: &[Datum], columns: &[u16], collations: &[Collat
 
 pub(crate) fn hash_key_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
 ) -> Result<u64, SqlError> {
-    hash_catalog(storage, values, columns, None)
+    hash_catalog(storage, txid, values, columns, None)
 }
 
 pub(crate) fn hash_key_collated_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
     collations: &[Collation],
 ) -> Result<u64, SqlError> {
-    hash_catalog(storage, values, columns, Some(collations))
+    hash_catalog(storage, txid, values, columns, Some(collations))
 }
 
 /// Stable identities retain selective hashes across label and ordering edits.
 /// Only legacy scalar keys need a catalog lookup; current keys need no copying.
 fn hash_catalog(
     storage: &crate::storage::Storage,
+    txid: u32,
     values: &[Datum],
     columns: &[u16],
     collations: Option<&[Collation]>,
@@ -684,7 +687,7 @@ fn hash_catalog(
         {
             let member = match member {
                 Some(member) => member.ordinal(),
-                None => super::super::enum_values::legacy_identity(*slot, label, storage)?,
+                None => super::super::enum_values::legacy_identity(*slot, label, storage, txid)?,
             };
             hasher.write(&[31]);
             hasher.write(&member.to_le_bytes());

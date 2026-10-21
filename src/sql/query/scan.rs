@@ -3510,6 +3510,7 @@ fn indexed_candidates_for_plan<'a>(
         .then(|| {
             hash_key_collated_catalog(
                 storage,
+                txid,
                 &values[0][..plan.n_columns],
                 &compact_columns[..plan.n_columns],
                 &collations[..plan.n_columns],
@@ -5619,6 +5620,7 @@ fn scan_source_mode<'a>(
                         }
                         let hash = hash_key_collated_catalog(
                             storage,
+                            txid,
                             &key_vals[..nkeys],
                             &hash_cols[..nkeys],
                             &key_collations[..nkeys],
@@ -5712,6 +5714,7 @@ fn scan_source_mode<'a>(
                     }
                     let hash = hash_key_collated_catalog(
                         storage,
+                        txid,
                         &key_vals[..nkeys],
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],
@@ -5774,6 +5777,7 @@ fn scan_source_mode<'a>(
                         if !any_null {
                             let hash = hash_key_collated_catalog(
                                 storage,
+                                txid,
                                 &key_vals[..nkeys],
                                 &hash_cols[..nkeys],
                                 &key_collations[..nkeys],
@@ -5911,6 +5915,7 @@ fn scan_source_mode<'a>(
                 if !any_null {
                     let hash = hash_key_collated_catalog(
                         storage,
+                        txid,
                         &key_vals[..nkeys],
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],

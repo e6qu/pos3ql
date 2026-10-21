@@ -52351,6 +52351,7 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::hash_key_catalog(
                 &engine.storage,
+                0,
                 &[Datum::Enum {
                     slot,
                     member: member.map(|ordinal| {

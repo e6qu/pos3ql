@@ -2437,6 +2437,7 @@ mod tests {
         let config = test_config();
         let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
         let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut roots = Vec::with_capacity(1);
         crate::mem::guard::forbid_alloc(|| {
             let parent = registry.retain_statement().unwrap();
             let child = registry.retain_statement().unwrap();
@@ -2458,6 +2459,8 @@ mod tests {
             drop(parent);
             assert!(!registry.take_reclamation_pending());
             assert_eq!(registry.roots.lock().unwrap().roots.len(), 1);
+            registry.copy_roots(true, &mut roots).unwrap();
+            assert_eq!(roots, [handle(1)]);
             drop(selected);
             assert!(registry.take_reclamation_pending());
             let state = registry.roots.lock().unwrap();

@@ -1080,7 +1080,7 @@ mod tests {
         let members = [
             EnumMember {
                 label: SqlName::parse("before").unwrap(),
-                legacy_label: None,
+                legacy_label: Some(SqlName::parse("before").unwrap()),
                 sort: 1.0,
             },
             EnumMember {
@@ -1121,6 +1121,17 @@ mod tests {
                 )
                 .unwrap()
                 .is_lt()
+            );
+            let identified = value(0, "before");
+            let legacy = Datum::Enum {
+                slot: 0,
+                member: None,
+                sort: 0.0,
+                label: "before",
+            };
+            assert_eq!(
+                crate::sql::eval::hash_key_catalog(&storage, 7, &[legacy], &[0]).unwrap(),
+                crate::sql::eval::hash_key_catalog(&storage, 7, &[identified], &[0]).unwrap()
             );
             drop(scope);
             storage.commit_enum_alter(0, 7);

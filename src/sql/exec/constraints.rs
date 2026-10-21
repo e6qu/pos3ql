@@ -774,7 +774,7 @@ fn enforce_key_uniqueness(
             collations[index] = def.columns()[*column as usize].collation;
         }
         let hash =
-            hash_key_collated_catalog(storage, values, columns, &collations[..columns.len()])?;
+            hash_key_collated_catalog(storage, txid, values, columns, &collations[..columns.len()])?;
         let physical_columns =
             super::remap_columns(&storage.table_def(table_index, txid), def, columns)?;
         storage.probe_value(

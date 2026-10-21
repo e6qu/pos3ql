@@ -23220,6 +23220,7 @@ fn validate_recovered_enabled_subscription(
 pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
     Budget::new(
         base + Storage::table_definition_image_budget_bytes(config)
+            + Storage::type_definition_image_budget_bytes(config)
             + crate::storage::enum_member_budget_bytes(config)
             + Storage::retained_row_walk_budget_bytes(config)
             + Storage::retained_row_metadata_budget_bytes(config)

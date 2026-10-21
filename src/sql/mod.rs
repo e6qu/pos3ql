@@ -254,10 +254,10 @@ impl From<crate::storage::StorageSetupError> for EngineSetupError {
     fn from(error: crate::storage::StorageSetupError) -> Self {
         match error {
             crate::storage::StorageSetupError::Budget(error) => Self::Budget(error),
-            crate::storage::StorageSetupError::TypeIdentitySpaceExhausted => {
+            crate::storage::StorageSetupError::CatalogIdentitySpaceExhausted => {
                 Self::Storage(sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "type catalog identity space exhausted"
+                    "catalog reference identity space exhausted"
                 ))
             }
         }
@@ -16547,7 +16547,7 @@ impl Engine {
                 if_not_exists,
                 elements,
             } => {
-                let resolved = match resolve_create_schema(*name, *authorization, guc) {
+                let resolved = match resolve_create_schema(*name, *authorization, eval::funcs::system::current_identity(), eval::funcs::system::session_identity()) {
                     Ok(resolved) => resolved,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -19481,14 +19481,15 @@ pub(crate) struct ResolvedCreateSchema {
 pub(crate) fn resolve_create_schema(
     name: ast::SchemaName<'_>,
     authorization: Option<ast::SchemaAuthorization<'_>>,
-    guc: &guc::GucState,
+    current: crate::storage::SessionIdentity,
+    session: crate::storage::SessionIdentity,
 ) -> Result<ResolvedCreateSchema, SqlError> {
     let authorization = match authorization {
         Some(ast::SchemaAuthorization::Name(role)) => Some(crate::util::StackStr::from_str(role)),
         Some(ast::SchemaAuthorization::CurrentRole | ast::SchemaAuthorization::CurrentUser) => {
-            Some(guc.current_role())
+            Some(current.require_name()?)
         }
-        Some(ast::SchemaAuthorization::SessionUser) => Some(guc.session_user()),
+        Some(ast::SchemaAuthorization::SessionUser) => Some(session.require_name()?),
         None => None,
     };
     let name = match name {

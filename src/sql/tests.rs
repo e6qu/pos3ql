@@ -19201,6 +19201,22 @@ fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
 }
 
 #[test]
+fn catalog_creation_schema_authorization_uses_the_function_owner() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget,
+        "CREATE ROLE source_schema_owner SUPERUSER;
+         CREATE FUNCTION source_create_schema() RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+           AS $$ BEGIN EXECUTE 'CREATE SCHEMA AUTHORIZATION CURRENT_USER'; END $$;
+         ALTER FUNCTION source_create_schema() OWNER TO source_schema_owner;
+         SELECT source_create_schema();
+         SELECT namespace.nspname::text, owner.rolname::text
+           FROM pg_namespace namespace JOIN pg_roles owner ON owner.oid = namespace.nspowner
+          WHERE namespace.nspname = 'source_schema_owner';");
+    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+    assert!(data_rows(&output).iter().any(|row| row == "source_schema_owner|source_schema_owner"));
+}
+
+#[test]
 fn catalog_creation_connection_limits_follow_role_lifetimes() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
@@ -19212,7 +19228,9 @@ fn catalog_creation_connection_limits_follow_role_lifetimes() {
     assert!(!message_types(&output).contains(&b'E'));
     let renamed = engine.role_login("renamed_login").unwrap();
     assert!(!engine.reserve_role_connection(renamed));
-    let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_login; CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_login");
+    assert!(!message_types(&output).contains(&b'E'));
+    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
     assert!(!message_types(&output).contains(&b'E'));
     let replacement = engine.role_login("source_login").unwrap();
     assert_eq!(original.slot, replacement.slot);
@@ -19234,7 +19252,9 @@ fn catalog_creation_backend_ownership_rejects_replacement_roles() {
     assert!(!message_types(&output).contains(&b'E'));
     let original = engine.role_login("source_backend").unwrap();
     engine.register_backend(2001, crate::storage::DatabaseOid::POSTGRES, original.identity, "source_backend", None, -1, 1, false, None, None, None).unwrap();
-    let output = run_with(&mut engine, &mut budget, "DROP ROLE source_backend; CREATE ROLE source_backend LOGIN");
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE source_backend");
+    assert!(!message_types(&output).contains(&b'E'));
+    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_backend LOGIN");
     assert!(!message_types(&output).contains(&b'E'));
     let replacement = engine.role_login("source_backend").unwrap();
     assert_eq!(original.slot, replacement.slot);

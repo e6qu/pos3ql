@@ -21222,8 +21222,8 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
     } = query.statement
     {
         let resolved = match &context.host {
-            PlpgsqlExecHost::Routine { guc, .. } => {
-                super::resolve_create_schema(*name, *authorization, guc)?
+            PlpgsqlExecHost::Routine { .. } => {
+                super::resolve_create_schema(*name, *authorization, super::eval::funcs::system::current_identity(), super::eval::funcs::system::session_identity())?
             }
             PlpgsqlExecHost::Atomic { .. } => {
                 return Err(sql_err!(

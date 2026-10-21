@@ -45,7 +45,7 @@ Creating objects returns `42501`; recreating either name does not restore the
 deleted account's permissions. A replacement account cannot inspect or cancel
 the old connection's queries.
 
-Connection identities are reserved at startup and distinguish catalog slot reuse.
+Memory for connection identities is reserved at startup. The identities distinguish catalog slot reuse.
 Creation without a valid acting account fails before allocating identifiers or
 changing catalogs. Recovery supplies an explicit owner instead of substituting
 the bootstrap administrator for an absent user.

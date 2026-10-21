@@ -12,6 +12,7 @@ OLD = "actor_source_old"
 RENAMED = "actor_source_renamed"
 TARGET = "actor_target_old"
 TARGET_RENAMED = "actor_target_renamed"
+FUNCTION = "actor_create_schema"
 TABLES = ("actor_source_owned", "actor_source_stale", "actor_source_fresh")
 
 
@@ -66,6 +67,11 @@ def exercise(host, port, administrator):
                 observe("commit_role_transaction", "COMMIT")
                 observe("return_to_login_role", f"SET ROLE {RENAMED}")
                 observe("login_role_identity", "SELECT current_user::text, session_user::text")
+                admin.execute(f"GRANT CREATE ON DATABASE postgres TO {TARGET_RENAMED}")
+                admin.execute(f"CREATE FUNCTION public.{FUNCTION}() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN EXECUTE 'CREATE SCHEMA AUTHORIZATION CURRENT_USER'; END $$")
+                admin.execute(f"ALTER FUNCTION public.{FUNCTION}() OWNER TO {TARGET_RENAMED}")
+                observe("schema_as_function_owner", f"SELECT public.{FUNCTION}()")
+                observations.append(["created_schema_owner", result(admin, f"SELECT namespace.nspname::text, owner.rolname::text FROM pg_namespace namespace JOIN pg_roles owner ON owner.oid = namespace.nspowner WHERE namespace.nspname = '{TARGET_RENAMED}'")])
                 observe("create_as_original", f"CREATE TABLE public.{TABLES[0]} (id integer)")
                 observations.append([
                     "created_owner",
@@ -97,6 +103,8 @@ def exercise(host, port, administrator):
                     observations.append(["replacement_cannot_read_old_query", result(fresh, f"SELECT query = '<insufficient privilege>' FROM pg_stat_activity WHERE pid = {actor_pid}")])
                     observations.append(["replacement_cannot_cancel_old_connection", result(fresh, f"SELECT pg_cancel_backend({actor_pid})")])
         finally:
+            admin.execute(f"DROP FUNCTION IF EXISTS public.{FUNCTION}()")
+            admin.execute(f"DROP SCHEMA IF EXISTS {TARGET_RENAMED}")
             for table in TABLES:
                 admin.execute(f"DROP TABLE IF EXISTS public.{table}")
             for role in (OLD, RENAMED):
@@ -106,6 +114,8 @@ def exercise(host, port, administrator):
                         admin.execute(f"REVOKE {TARGET_RENAMED} FROM {role}")
                     admin.execute(f"DROP ROLE {role}")
             for role in (TARGET, TARGET_RENAMED):
+                if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone():
+                    admin.execute(f"REVOKE ALL ON DATABASE postgres FROM {role}")
                 admin.execute(f"DROP ROLE IF EXISTS {role}")
     return observations
 

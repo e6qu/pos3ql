@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub(crate) enum StorageSetupError {
     Budget(BudgetError),
-    TypeIdentitySpaceExhausted,
+    CatalogIdentitySpaceExhausted,
 }
 
 impl From<BudgetError> for StorageSetupError {
@@ -26,8 +26,8 @@ impl std::fmt::Display for StorageSetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::TypeIdentitySpaceExhausted => {
-                formatter.write_str("type catalog identity space exhausted")
+            Self::CatalogIdentitySpaceExhausted => {
+                formatter.write_str("catalog reference identity space exhausted")
             }
         }
     }
@@ -37,7 +37,7 @@ impl std::error::Error for StorageSetupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Budget(error) => Some(error),
-            Self::TypeIdentitySpaceExhausted => None,
+            Self::CatalogIdentitySpaceExhausted => None,
         }
     }
 }
@@ -56,7 +56,7 @@ impl CatalogOrigin {
         loop {
             let next = current
                 .checked_add(1)
-                .ok_or(StorageSetupError::TypeIdentitySpaceExhausted)?;
+                .ok_or(StorageSetupError::CatalogIdentitySpaceExhausted)?;
             match sequence.compare_exchange_weak(
                 current,
                 next,
@@ -479,7 +479,7 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(
                 CatalogOrigin::reserve(&sequence),
-                Err(StorageSetupError::TypeIdentitySpaceExhausted)
+                Err(StorageSetupError::CatalogIdentitySpaceExhausted)
             ));
             assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
         }

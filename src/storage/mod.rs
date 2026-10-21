@@ -18184,7 +18184,7 @@ impl Storage {
         let catalog_origin = type_references::CatalogOrigin::new()?;
         budget.draw(
             size_of::<type_references::CatalogOrigin>(),
-            "type reference origin",
+            "catalog reference origin",
         )?;
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
@@ -53629,6 +53629,20 @@ mod tests {
                 assert_eq!(storage.tables[reused].enforcer_count(), 1);
                 storage.rollback_create(reused);
             }
+        });
+    }
+
+    #[test]
+    fn catalog_creation_known_name_requires_an_authenticated_identity() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let actor = SessionIdentity::unauthenticated("postgres");
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.current_role_slot(7).is_none());
+            assert_missing_creation_actor(storage.initial_ownership(7));
+            assert_eq!(actor.require_name().unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
         });
     }
 

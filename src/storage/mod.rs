@@ -18015,6 +18015,7 @@ impl Storage {
         INDEX_ARENA_BYTES
             + log_positions::LogPositions::budget_bytes()
             + size_of::<CatalogSequence>()
+            + size_of::<usize>()
             + size_of::<std::sync::Mutex<()>>()
             + snapshot_owner_bytes()
             + config.max_connections as usize * size_of::<ExportedSnapshot>()
@@ -18161,6 +18162,7 @@ impl Storage {
         )?;
         budget.draw(size_of::<std::sync::Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
+        budget.draw(size_of::<usize>(), "routine catalog capacity")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let foreign = foreign::ForeignCatalog::new(config, budget)?;

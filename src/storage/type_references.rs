@@ -206,6 +206,16 @@ enum ReferenceIdentity {
 pub struct TypeReference(ReferenceIdentity);
 
 impl TypeReference {
+    pub(super) fn refers_to(self, source: TypeIdentity, database: DatabaseOid) -> bool {
+        source.database() == database
+            && match self.0 {
+                ReferenceIdentity::Captured(key) => key == source,
+                ReferenceIdentity::Stored(key) => {
+                    key.slot() == source.slot() && key.created_at() == source.created_at()
+                }
+            }
+    }
+
     pub(crate) fn from_bound_name(name: UserTypeName) -> Result<Self, SqlError> {
         match name.binding {
             TypeBinding::Captured(key) if key.created_at() != 0 => {

@@ -8,6 +8,7 @@
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+mod definition_pool;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
@@ -19,6 +20,8 @@ mod table_definitions;
 mod table_edits;
 mod table_names;
 mod type_contracts;
+mod type_definitions;
+pub(crate) use type_definitions::TypeDefinitionImages;
 mod type_names;
 mod type_reference_moves;
 mod type_references;
@@ -13888,6 +13891,7 @@ pub struct Storage {
     matviews: std::sync::Mutex<FixedVec<MatviewDef>>,
     sequence_catalog: std::sync::Mutex<SequenceCatalog>,
     type_catalog: std::sync::Mutex<TypeCatalog>,
+    type_definition_images: type_definitions::TypeDefinitionImagePools,
     enum_members_per_image: usize,
     enum_member_images: std::sync::Arc<std::sync::Mutex<EnumMemberImages>>,
     domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
@@ -18037,6 +18041,7 @@ impl Storage {
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::TypePublication::budget_bytes(config)
+            + type_definitions::TypeDefinitionImagePools::budget_bytes(config)
             + size_of::<type_references::TypeOrigin>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
@@ -18175,6 +18180,8 @@ impl Storage {
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let type_publication = type_reference_moves::TypePublication::new(config, budget)?;
+        let type_definition_images =
+            type_definitions::TypeDefinitionImagePools::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
@@ -19004,6 +19011,7 @@ impl Storage {
                 pending_enum_members,
                 composites,
             }),
+            type_definition_images,
             enum_members_per_image,
             enum_member_images,
             domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
@@ -38759,11 +38767,12 @@ impl Storage {
             catalog.bind_domain_spec(&mut spec, txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        let Some(new) = catalog
-            .domains
-            .iter()
-            .position(|d| d.ddl_state == CatalogDdlState::Absent)
-        else {
+        let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
+            d.ddl_state == CatalogDdlState::Absent
+                && !self
+                    .type_definition_images
+                    .retains(NamedTypeSlot::Domain(slot))
+        }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many domains (limit {})",
@@ -39575,11 +39584,12 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned");
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        let Some(new) = catalog
-            .enums
-            .iter()
-            .position(|e| e.ddl_state == CatalogDdlState::Absent)
-        else {
+        let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
+            e.ddl_state == CatalogDdlState::Absent
+                && !self
+                    .type_definition_images
+                    .retains(NamedTypeSlot::Enum(slot))
+        }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many enum types (limit {})",
@@ -40282,7 +40292,13 @@ impl Storage {
         let Some(slot) = catalog
             .composites
             .iter()
-            .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
+            .enumerate()
+            .position(|(slot, definition)| {
+                definition.ddl_state == CatalogDdlState::Absent
+                    && !self
+                        .type_definition_images
+                        .retains(NamedTypeSlot::Composite(slot))
+            })
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -40332,6 +40348,9 @@ impl Storage {
         catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
+            || self
+                .type_definition_images
+                .retains(NamedTypeSlot::Composite(slot))
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

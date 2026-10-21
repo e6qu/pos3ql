@@ -34,6 +34,7 @@ def exercise(host, port, administrator):
             admin.execute(f"GRANT CREATE ON SCHEMA public TO {OLD}")
             with psycopg.connect(**settings, user=OLD) as actor:
                 actor.execute("SET statement_timeout = '5s'")
+                actor_pid = actor.execute("SELECT pg_backend_pid()").fetchone()[0]
 
                 def observe(label, statement):
                     value = result(actor, statement)
@@ -44,6 +45,7 @@ def exercise(host, port, administrator):
                 admin.execute(f"ALTER ROLE {OLD} RENAME TO {RENAMED}")
                 admin.execute(f"CREATE ROLE {OLD} LOGIN")
                 observe("renamed_login", "SELECT current_user::text, session_user::text")
+                observations.append(["renamed_activity_user", result(admin, f"SELECT usename::text FROM pg_stat_activity WHERE pid = {actor_pid}")])
                 observe("reset_role", "RESET ROLE")
                 observe("role_after_reset", "SELECT current_user::text, session_user::text")
                 observe("reset_authorization", "RESET SESSION AUTHORIZATION")
@@ -77,6 +79,7 @@ def exercise(host, port, administrator):
                 admin.execute(f"GRANT CREATE ON SCHEMA public TO {OLD}, {RENAMED}")
                 admin.execute(f"GRANT {TARGET_RENAMED} TO {OLD}, {RENAMED}")
                 observe("constant_after_replacement", "SELECT 1")
+                observations.append(["replaced_activity_user", result(admin, f"SELECT usename::text FROM pg_stat_activity WHERE pid = {actor_pid}")])
                 observe("user_after_replacement", "SELECT current_user::text")
                 observe("session_after_replacement", "SELECT session_user::text")
                 observe("create_after_replacement", f"CREATE TABLE public.{TABLES[1]} (id integer)")
@@ -91,6 +94,8 @@ def exercise(host, port, administrator):
                     fresh.execute("SET statement_timeout = '5s'")
                     observations.append(["fresh_user", result(fresh, "SELECT current_user::text, session_user::text")])
                     observations.append(["fresh_create", result(fresh, f"CREATE TABLE public.{TABLES[2]} (id integer)")])
+                    observations.append(["replacement_cannot_read_old_query", result(fresh, f"SELECT query = '<insufficient privilege>' FROM pg_stat_activity WHERE pid = {actor_pid}")])
+                    observations.append(["replacement_cannot_cancel_old_connection", result(fresh, f"SELECT pg_cancel_backend({actor_pid})")])
         finally:
             for table in TABLES:
                 admin.execute(f"DROP TABLE IF EXISTS public.{table}")

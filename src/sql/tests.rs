@@ -13819,7 +13819,7 @@ fn configured_role_authorization_capacity_survives_object_cold_recovery() {
     assert!(login.slot as usize > 64);
     assert!(engine.reserve_role_connection(login));
     assert!(!engine.reserve_role_connection(login));
-    engine.release_role_connection(login.slot);
+    engine.release_role_connection(login);
     let guc = GucState::new();
     engine.apply_role_settings(login.slot, &guc).unwrap();
     assert_eq!(
@@ -14168,9 +14168,9 @@ fn role_connection_limit_is_reserved_and_released_exactly() {
     assert!(login.can_login && login.valid);
     assert!(engine.reserve_role_connection(login));
     assert!(!engine.reserve_role_connection(login));
-    engine.release_role_connection(login.slot);
+    engine.release_role_connection(login);
     assert!(engine.reserve_role_connection(login));
-    engine.release_role_connection(login.slot);
+    engine.release_role_connection(login);
 }
 
 #[test]
@@ -19225,6 +19225,29 @@ fn catalog_creation_connection_limits_follow_role_lifetimes() {
     engine.release_role_connection(replacement);
     assert!(engine.reserve_role_connection(replacement));
     engine.release_role_connection(replacement);
+}
+
+#[test]
+fn catalog_creation_backend_ownership_rejects_replacement_roles() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_backend LOGIN");
+    assert!(!message_types(&output).contains(&b'E'));
+    let original = engine.role_login("source_backend").unwrap();
+    engine.register_backend(2001, crate::storage::DatabaseOid::POSTGRES, original.identity, "source_backend", None, -1, 1, false, None, None, None).unwrap();
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE source_backend; CREATE ROLE source_backend LOGIN");
+    assert!(!message_types(&output).contains(&b'E'));
+    let replacement = engine.role_login("source_backend").unwrap();
+    assert_eq!(original.slot, replacement.slot);
+    let _source = eval::funcs::system::enter_current_user(replacement.identity);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(engine.storage.request_backend_signal(2001, false, 0).unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert_eq!(engine.storage.request_backend_signal(2001, true, 0).unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert!(engine.storage.take_backend_signal().is_none());
+        engine.storage.with_backend_activities(|activities| {
+            assert_eq!(activities.len(), 1);
+            assert_ne!(activities[0].role.source(), replacement.identity.source());
+        });
+    });
 }
 
 #[test]

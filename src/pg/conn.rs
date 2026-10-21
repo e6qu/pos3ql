@@ -1536,7 +1536,7 @@ impl Conn {
         if let Err(error) = engine.register_backend(
             id,
             database.oid,
-            self.authenticated_role.expect("role was reserved").slot,
+            self.authenticated_role.expect("role was reserved").identity,
             application_name.as_str(),
             client_addr,
             client_port,
@@ -5837,7 +5837,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
@@ -6036,7 +6036,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
@@ -6302,7 +6302,7 @@ mod tests {
             server.set_nonblocking(true).unwrap();
             conn.open(server, 72);
             conn.phase = Phase::Ready;
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             engine
                 .register_backend(
                     72,

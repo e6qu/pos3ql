@@ -56,7 +56,7 @@ pub(crate) struct RoleIdentity {
     lifetime: NonZeroU64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RoleReference {
     identity: RoleIdentity,
     name: SqlName,
@@ -64,6 +64,8 @@ pub(crate) struct RoleReference {
 
 impl RoleReference {
     pub(crate) fn slot(self) -> u16 { self.identity.slot }
+    pub(crate) fn source(self) -> SessionRole { SessionRole::Bound(self.identity) }
+    pub(crate) fn name(self) -> SqlName { self.name }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

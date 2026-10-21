@@ -37,13 +37,15 @@ See the [current contract and examples](docs/implemented-baseline.md).
 
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
-A connection must remain attached to the same user after a rename; a new account
-with the old name must not inherit that connection.
 
 Readers retain selected table, routine and named-type definitions. Type changes
 recheck the selected edit after waits and include newly submitted dependent
 tables before changing their references together. The
 [current behavior guide](docs/implemented-baseline.md) owns the detailed contracts.
+Connections retain their authenticated and selected accounts through renames,
+savepoints and account replacement. Object creation rejects a missing account
+before changing catalogs; connection limits and query permissions distinguish
+the account that originally logged in from a replacement.
 
 When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running

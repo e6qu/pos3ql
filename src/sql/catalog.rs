@@ -26983,8 +26983,7 @@ fn pg_stat_activity<'a>(
         let rows = arena
             .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
             .map_err(|_| arena_full())?;
-        let current_name = crate::sql::eval::funcs::system::current_user_owned();
-        let current_role = storage.find_role_visible(current_name.as_str(), txid);
+        let current_role = storage.current_role_slot(txid);
         let see_all =
             current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
         let mut count = 0usize;
@@ -26996,10 +26995,12 @@ fn pg_stat_activity<'a>(
             let database_name = storage
                 .database_slot_by_oid(activity.database, txid)
                 .map(|slot| storage.database_definition(slot, txid).name);
-            let role_name = storage.role_name(usize::from(activity.role), txid);
+            let role = storage.resolve_session_role(activity.role.source(), txid).ok();
+            let activity_role = role.map(|role| usize::from(role.slot()));
+            let role_name = role.map(|role| role.name());
             let visible = activity.pid == storage.current_connection_id()
                 || see_all
-                || current_role == Some(usize::from(activity.role));
+                || (current_role.is_some() && current_role == activity_role);
             let query = if visible {
                 activity.query.as_str()
             } else {
@@ -27014,8 +27015,8 @@ fn pg_stat_activity<'a>(
                     },
                     Datum::Int4(activity.pid),
                     Datum::Null,
-                    Datum::Oid(Storage::role_oid(usize::from(activity.role)) as u32),
-                    text(role_name.as_str(), arena)?,
+                    Datum::Oid(Storage::role_oid(usize::from(activity.role.slot())) as u32),
+                    match role_name { Some(name) => text(name.as_str(), arena)?, None => Datum::Null },
                     text(activity.application_name.as_str(), arena)?,
                     activity.client_addr.map_or(Datum::Null, Datum::Inet),
                     Datum::Null,

@@ -9429,7 +9429,7 @@ impl Engine {
         &self,
         pid: i32,
         database: crate::storage::DatabaseOid,
-        role: u16,
+        role: crate::storage::SessionIdentity,
         application_name: &str,
         client_addr: Option<crate::sql::net::NetAddr>,
         client_port: i32,

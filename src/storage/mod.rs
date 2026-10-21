@@ -13399,7 +13399,7 @@ impl BackendActivityState {
 pub(crate) struct BackendActivity {
     pub(crate) pid: i32,
     pub(crate) database: DatabaseOid,
-    pub(crate) role: u16,
+    pub(crate) role: catalog_sources::RoleReference,
     pub(crate) application_name: StackStr<64>,
     pub(crate) client_addr: Option<crate::sql::net::NetAddr>,
     pub(crate) client_port: i32,
@@ -16088,7 +16088,7 @@ impl Storage {
         &self,
         pid: i32,
         database: DatabaseOid,
-        role: u16,
+        role: SessionIdentity,
         application_name: &str,
         client_addr: Option<crate::sql::net::NetAddr>,
         client_port: i32,
@@ -16098,6 +16098,7 @@ impl Storage {
         ssl_cipher: Option<&'static str>,
         ssl_bits: Option<i32>,
     ) -> Result<(), SqlError> {
+        let role = self.resolve_session_role(role.source(), 0)?;
         let now = crate::sql::datetime::now_micros();
         let activity = BackendActivity {
             pid,
@@ -16335,16 +16336,15 @@ impl Storage {
         else {
             return Ok(false);
         };
-        let current_name = crate::sql::eval::funcs::system::current_user_owned();
         let current_role = self
-            .find_role_visible(current_name.as_str(), txid)
+            .current_role_slot(txid)
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
         let current_superuser = self.role(current_role).attributes_to(txid).superuser;
-        let target_role = usize::from(target.role);
-        let target_superuser = self.role(target_role).attributes_to(txid).superuser;
+        let target_role = self.session_role_slot(target.role.source(), txid);
+        let target_superuser = target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
         if target.pid != self.current_connection_id()
             && !current_superuser
-            && (target_superuser || !self.role_is_member_of(current_role, target_role, txid))
+            && (target_superuser || !target_role.is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
         {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,

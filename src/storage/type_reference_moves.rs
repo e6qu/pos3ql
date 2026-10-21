@@ -2887,7 +2887,7 @@ mod tests {
         ] {
             let movement = TypeReferenceMove::new(
                 TypeIdentity::new(
-                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    super::super::type_references::CatalogOrigin::new().unwrap(),
                     DatabaseOid::POSTGRES,
                     named_slot(kind, 0),
                     1,
@@ -2925,7 +2925,7 @@ mod tests {
         ] {
             let movement = TypeReferenceMove::new(
                 TypeIdentity::new(
-                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    super::super::type_references::CatalogOrigin::new().unwrap(),
                     DatabaseOid::POSTGRES,
                     named_slot(kind, 0),
                     1,

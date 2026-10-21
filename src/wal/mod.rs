@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 2;
+pub(crate) const RECORD_VERSION: u8 = 3;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1102,6 +1102,7 @@ pub(crate) enum WalOp<'a> {
         new_name: &'a str,
     },
     CreateSubscription {
+        created_at: u64,
         name: &'a str,
         owner: u16,
         connection: &'a str,
@@ -3096,7 +3097,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             slot,
             ..
         } => {
-            1 + name.len()
+            8 + 1 + name.len()
                 + 2
                 + 2
                 + connection.len()
@@ -4931,6 +4932,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::CreateSubscription {
+            created_at,
             name,
             owner,
             connection,
@@ -4941,8 +4943,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             behavior,
             bootstrap,
         } => {
-            connection.len() <= u16::MAX as usize
+            *created_at != 0
+                && connection.len() <= u16::MAX as usize
                 && *publication_count <= crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS
+                && buffer.append(&created_at.to_le_bytes())
                 && name_bytes(buffer, name)
                 && buffer.append(&owner.to_le_bytes())
                 && buffer.append(&(connection.len() as u16).to_le_bytes())
@@ -8339,6 +8343,9 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::RenamePublication { name, new_name })
         }),
         KIND_CREATE_SUBSCRIPTION => decode_large_op(|| {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            if created_at == 0 { return None; }
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -8379,6 +8386,7 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             (at == payload.len()).then_some(WalOp::CreateSubscription {
+                created_at,
                 name,
                 owner,
                 connection,
@@ -12943,6 +12951,34 @@ mod tests {
                     Some(Some(OwnedDatum::Bool(valid == 1)))
                 );
             }
+        });
+    }
+
+    #[test]
+    fn subscription_creation_codec_requires_its_durable_source_identity() {
+        let publications = [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+        let operation = |created_at| WalOp::CreateSubscription {
+            created_at, name: "saved_subscription", owner: 0,
+            connection: "host=127.0.0.1", publications, publication_count: 0,
+            enabled: false, slot: crate::storage::SubscriptionSlot::Absent,
+            behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+            bootstrap: crate::storage::SubscriptionBootstrap::Deferred,
+        };
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "subscription creation payload", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(&mut buffer, &operation(41)));
+            assert_eq!(buffer.len(), encoded_payload_len(&operation(41)));
+            assert!(matches!(decode_op(KIND_CREATE_SUBSCRIPTION, buffer.readable()),
+                Some(WalOp::CreateSubscription { created_at: 41, .. })));
+            for length in 0..buffer.len() {
+                assert!(decode_op(KIND_CREATE_SUBSCRIPTION, &buffer.readable()[..length]).is_none());
+            }
+            buffer.filled_mut()[..8].fill(0);
+            assert!(decode_op(KIND_CREATE_SUBSCRIPTION, buffer.readable()).is_none());
+            buffer.clear();
+            assert!(!append_payload(&mut buffer, &operation(0)));
+            assert!(buffer.is_empty());
         });
     }
 

@@ -19,6 +19,31 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
+    pub(super) fn identity_move(self, catalog: &super::TypeCatalog) -> Option<super::type_reference_moves::TypeReferenceMove> {
+        if !catalog.matches_type_edit(self) { return None; }
+        let (schema, name, next_schema, next_name) = match self.source.slot() {
+            NamedTypeSlot::Domain(slot) => {
+                let definition = &catalog.domains[slot];
+                let pending = definition.pending_definition.as_ref()?.identity?;
+                (definition.schema, definition.name, pending.schema, pending.name)
+            }
+            NamedTypeSlot::Enum(slot) => {
+                let definition = &catalog.enums[slot];
+                let pending = definition.pending_definition.as_ref()?;
+                (definition.schema, definition.name, pending.schema, pending.name)
+            }
+            NamedTypeSlot::Composite(slot) => {
+                let definition = &catalog.composites[slot];
+                let pending = definition.pending_definition.as_ref()?;
+                (definition.schema, definition.name, pending.schema, pending.name)
+            }
+        };
+        if (schema, name) == (next_schema, next_name) { return None; }
+        Some(super::type_reference_moves::TypeReferenceMove::new(self.source,
+            super::UserTypeName::declaration(schema, name),
+            super::UserTypeName::declaration(next_schema, next_name)))
+    }
+
     pub(crate) fn matches_reference(self, name: super::UserTypeName) -> Result<bool, SqlError> {
         let reference = super::TypeReference::from_bound_name(name)?;
         Ok(reference.refers_to(self.source, self.source.database()))
@@ -110,6 +135,7 @@ pub(crate) type CompositeAlterUndo = TypeAlterUndo<PendingCompositeDefinition>;
 
 #[derive(Debug)]
 pub(super) struct TypeRevisions {
+    sequence: u64,
     domains: FixedVec<TypeRevision>,
     enums: FixedVec<TypeRevision>,
     composites: FixedVec<TypeRevision>,
@@ -150,6 +176,7 @@ impl TypeRevisions {
             Ok(values)
         }
         Ok(Self {
+            sequence: 0,
             domains: reserve(budget, config.max_domains)?,
             enums: reserve(budget, config.max_enums)?,
             composites: reserve(budget, config.max_composites)?,
@@ -173,8 +200,22 @@ impl TypeRevisions {
     }
 
     pub(super) fn initialize(&mut self, source: NamedTypeSlot, version: u64) {
+        self.sequence = self.sequence.max(version);
         self.set(source, version);
         self.set_ddl(source, version);
+    }
+
+    pub(super) fn next(&mut self) -> Result<u64, SqlError> {
+        let next = self.sequence.checked_add(1).ok_or_else(|| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "type change revisions exhausted")
+        })?;
+        self.sequence = next;
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_sequence_for_test(&mut self, sequence: u64) -> u64 {
+        core::mem::replace(&mut self.sequence, sequence)
     }
 
     fn ddl(&self, source: NamedTypeSlot) -> u64 {
@@ -448,7 +489,7 @@ impl super::Storage {
     pub(crate) fn validate_type_commit(
         &self,
         transaction: u32,
-        changes: impl Iterator<Item = TypeCommitChange>,
+        changes: impl Iterator<Item = TypeCommitChange> + Clone,
     ) -> Result<(), SqlError> {
         let mut changes = changes.peekable();
         if changes.peek().is_none() {
@@ -458,7 +499,8 @@ impl super::Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        for change in changes {
+        let mut has_identity_moves = false;
+        for change in changes.clone() {
             let (source, owner) = match change {
                 TypeCommitChange::Definition(target) => (target.source, target.transaction),
                 TypeCommitChange::Lifecycle(undo) => (undo.source, undo.transaction),
@@ -483,6 +525,7 @@ impl super::Storage {
             }
             let valid = match change {
                 TypeCommitChange::Definition(target) => {
+                    has_identity_moves |= target.identity_move(&catalog).is_some();
                     let current = catalog.type_definition_version(source.slot(), transaction);
                     let pending = match source.slot() {
                         NamedTypeSlot::Domain(slot) => catalog.domains[slot]
@@ -529,6 +572,10 @@ impl super::Storage {
                     "type change no longer belongs to its transaction"
                 ));
             }
+        }
+        drop(catalog);
+        if has_identity_moves {
+            super::type_reference_moves::TypePublication::validate_generations(self, changes)?;
         }
         Ok(())
     }
@@ -732,7 +779,7 @@ impl super::Storage {
             .type_snapshot(source, transaction)?
             .expect("a visible type selected for deletion has an identity")
             .identity;
-        let version = self.catalog_sequence.next()?;
+        let version = catalog.versions.next()?;
         let prior_version = catalog.versions.ddl(source);
         catalog.versions.set_ddl(source, version);
         let state = state.drop_by(transaction);

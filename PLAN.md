@@ -45,7 +45,9 @@ reads and scalar function contracts capture nested types before execution waits;
 nested statements select their own visible definitions and share identical images.
 Type edits capture their source and definition revision together. Creation,
 deletion, commit and rollback carry the source lifetime and transaction owner;
-commit checks this ownership before durability. Conflicting edits and deletion
+commit checks this ownership and dependent publication counters before durability.
+Subscription creation saves its stream identity instead of reconstructing it
+from allocation order during replay. Conflicting edits and deletion
 wait for their owner, including a transaction's pending rename.
 
 Complete shared engine publication across transaction commit, remaining type

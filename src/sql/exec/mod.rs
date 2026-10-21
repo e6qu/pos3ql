@@ -14022,17 +14022,17 @@ pub fn create_subscription(
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
-    let owner = storage
+    let definition = storage
         .subscription(name.as_str(), txn.txid)
         .expect("new subscription is visible to its creating transaction")
-        .1
-        .ownership
-        .owner_to(txn.txid);
+        .1;
+    let owner = definition.ownership.owner_to(txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateSubscription {
+            created_at: definition.created_at,
             name: name.as_str(),
             owner,
             connection: connection.as_str(),
@@ -41403,9 +41403,9 @@ fn drop_domain_selection(
                 continue;
             }
             let mut has_child = false;
-            for child in 0..storage.domain_count() {
+            for (child, &child_selected) in selected.iter().enumerate().take(storage.domain_count()) {
                 if child != candidate
-                    && selected[child]
+                    && child_selected
                     && !ordered[..ordered_count].contains(&child)
                     && storage.domain_depends_on(child, candidate, txn.txid)?
                 {

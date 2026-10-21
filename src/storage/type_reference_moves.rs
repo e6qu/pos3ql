@@ -174,6 +174,36 @@ impl Drop for TableAttempt<'_, '_> {
 }
 
 impl TypePublication {
+    pub(super) fn validate_generations(
+        storage: &Storage,
+        changes: impl Iterator<Item = super::TypeCommitChange> + Clone,
+    ) -> Result<(), crate::sql::eval::SqlError> {
+        for table in storage.tables.iter() {
+            loop {
+                let attempt: Result<_, LockWait<'_>> = (|| {
+                    let state = table.definition.try_read_for_batch()?;
+                    let publication = try_mutex(&table.publication, "table publication lock poisoned")?;
+                    let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
+                    let count = changes.clone().filter_map(|change| match change {
+                        super::TypeCommitChange::Definition(target) => target.identity_move(&types),
+                        super::TypeCommitChange::Lifecycle(_) => None,
+                    }).filter(|movement| movement.applies_to(state.identity)
+                        && storage.pending_table_defs.references_type(&state, *movement)).count();
+                    Ok(publication.generation.checked_add(count as u64).is_some())
+                })();
+                match attempt {
+                    Err(wait) => wait.wait(),
+                    Ok(true) => break,
+                    Ok(false) => return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "type change exhausts a dependent table publication generation"
+                    )),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn scratch_bytes(config: &Config) -> usize {
         super::table_slot_capacity(config)
             .saturating_mul(size_of::<Option<TableOwner<'static>>>())
@@ -239,7 +269,7 @@ impl TypePublication {
         storage: &Storage,
         movement: TypeReferenceMove,
         install_source: impl FnOnce(&mut TypeCatalog, &mut EnumMemberImages),
-    ) {
+    ) -> Result<(), crate::sql::eval::SqlError> {
         let mut scratch = self
             .scratch
             .lock()
@@ -298,11 +328,10 @@ impl TypePublication {
                     // Preflight every fallible counter before changing any
                     // source, pending version or dependent definition.
                     for owner in owners.slots.iter().flatten() {
-                        owner
-                            .publication
-                            .generation
-                            .checked_add(1)
-                            .expect("table publication generation exhausted");
+                        owner.publication.generation.checked_add(1).ok_or_else(|| {
+                            crate::sql_err!(crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "type change exhausts a dependent table publication generation")
+                        })?;
                     }
                     install_source(&mut types, &mut members);
                     for owner in owners.slots.iter_mut().flatten() {
@@ -336,7 +365,7 @@ impl TypePublication {
                         movement.current.schema,
                         movement.current.name,
                     );
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -348,9 +377,9 @@ impl Storage {
         &mut self,
         movement: TypeReferenceMove,
         install_source: impl FnOnce(&mut TypeCatalog, &mut EnumMemberImages),
-    ) {
+    ) -> Result<(), crate::sql::eval::SqlError> {
         self.type_publication
-            .publish(self, movement, install_source);
+            .publish(self, movement, install_source)
     }
 }
 
@@ -593,6 +622,57 @@ mod tests {
         result[0] = Some(SqlName::parse(name).unwrap());
         result[1] = Some(SqlName::parse("items").unwrap());
         result
+    }
+
+    #[test]
+    fn type_publication_exhaustion_leaves_source_and_all_dependents_unchanged() {
+        use crate::storage::TypeCommitChange;
+        for kind in KINDS {
+            let (mut storage, related, unrelated, movement) = fixture(kind);
+            let source = movement.identity.slot().index();
+            let target = match kind {
+                TypeReferenceKind::Domain => storage.stage_domain_identity(
+                    storage.prepare_domain_edit(source, 7).unwrap().1,
+                    movement.current.schema, movement.current.name, 7,
+                ).unwrap().target(),
+                TypeReferenceKind::Enum => {
+                    let (definition, target) = storage.prepare_enum_edit(source, 7).unwrap();
+                    let members = [definition.members().next().unwrap()];
+                    storage.stage_enum_alter(target, movement.current.schema, movement.current.name, &members, 7).unwrap().target()
+                }
+                TypeReferenceKind::Composite => {
+                    let (mut definition, target) = storage.prepare_composite_edit(source, 7).unwrap();
+                    definition.schema = movement.current.schema;
+                    definition.name = movement.current.name;
+                    storage.stage_composite_alter(target, definition, 7).unwrap().target()
+                }
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                storage.tables[unrelated].publication().generation = u64::MAX;
+                storage.tables[related].publication().generation = u64::MAX - 1;
+                storage.validate_type_commit(7, [TypeCommitChange::Definition(target)].into_iter()).unwrap();
+                storage.tables[related].publication().generation = u64::MAX;
+                assert_eq!(storage.validate_type_commit(7, [TypeCommitChange::Definition(target)].into_iter()).unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                let error = match kind {
+                    TypeReferenceKind::Domain => storage.commit_domain_alter(target),
+                    TypeReferenceKind::Enum => storage.commit_enum_alter(target),
+                    TypeReferenceKind::Composite => storage.commit_composite_alter(target),
+                }.unwrap_err();
+                assert_eq!(error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.prior);
+                assert!(storage.table_def(related, 0).columns()[0].user_type.unwrap().is_named(movement.prior.schema, movement.prior.name));
+                assert!(storage.type_catalog.try_lock().is_ok());
+                assert!(storage.tables[related].publication.try_lock().is_ok());
+                storage.tables[related].publication().generation = 0;
+                match kind {
+                    TypeReferenceKind::Domain => storage.commit_domain_alter(target),
+                    TypeReferenceKind::Enum => storage.commit_enum_alter(target),
+                    TypeReferenceKind::Composite => storage.commit_composite_alter(target),
+                }.unwrap();
+                assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.current);
+            });
+        }
     }
 
     fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
@@ -1884,7 +1964,7 @@ mod tests {
                             movement.current.name;
                     }
                 }
-            });
+            }).unwrap();
     }
 
     fn assert_identity(storage: &Storage, table: usize, transaction: u32, expected: UserTypeName) {

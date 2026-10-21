@@ -39172,10 +39172,10 @@ impl Storage {
         }
         catalog.validate_type_edit(target, txid)?;
         catalog.bind_domain_spec(&mut spec, txid)?;
+        let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
         let prior = domain.pending_definition;
-        let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -39222,10 +39222,10 @@ impl Storage {
             txid,
             Some(NamedTypeSlot::Domain(slot)),
         )?;
+        let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
         let prior = domain.pending_definition;
-        let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -39259,7 +39259,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) {
+    pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Domain)
             .expect("domain publication identifies its source kind");
@@ -39270,7 +39270,7 @@ impl Storage {
                 .lock()
                 .expect("type catalog lock poisoned");
             if !catalog.matches_type_edit(target) {
-                return;
+                return Ok(());
             }
             let domain = catalog.domains[slot];
             if domain
@@ -39278,14 +39278,14 @@ impl Storage {
                 .filter(|pending| pending.txid == txid)
                 .is_none()
             {
-                return;
+                return Ok(());
             }
             let definition = domain.definition_for(txid);
             if definition.schema == domain.schema && definition.name == domain.name {
                 let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
                 catalog.versions.set(NamedTypeSlot::Domain(slot), version);
                 catalog.domains[slot] = definition;
-                return;
+                return Ok(());
             }
             type_reference_moves::TypeReferenceMove::new(
                 type_references::TypeIdentity::new(
@@ -39302,7 +39302,7 @@ impl Storage {
             let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
             catalog.versions.set(NamedTypeSlot::Domain(slot), version);
             catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
-        });
+        })
     }
 
     pub(crate) fn rollback_domain_alter(&self, undo: DomainAlterUndo) {
@@ -39566,7 +39566,7 @@ impl Storage {
                 self.enum_members_per_image
             ));
         }
-        let version = self.catalog_sequence.next()?;
+        let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.next()?;
         let slot = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
             slot
         } else {
@@ -39705,7 +39705,7 @@ impl Storage {
         let depth = previous.map_or(1, |previous| {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
-        let version = self.catalog_sequence.next()?;
+        let version = catalog.versions.next()?;
         let image = EnumImageReservation::write(&self.enum_member_images, members)?;
         let member_count = image.count();
         let image = image.publish();
@@ -39822,13 +39822,13 @@ impl Storage {
         catalog.enums[slot].member_count = 0;
     }
 
-    pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) {
+    pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Enum)
             .expect("enum publication identifies its source kind");
         let txid = target.transaction();
         match self.commit_enum_members(target) {
-            EnumMemberPublication::Complete => return,
+            EnumMemberPublication::Complete => return Ok(()),
             EnumMemberPublication::IdentityMoveRequired => {}
         }
         let movement = {
@@ -39837,7 +39837,7 @@ impl Storage {
                 .lock()
                 .expect("type catalog lock poisoned");
             if !catalog.matches_type_edit(target) {
-                return;
+                return Ok(());
             }
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
@@ -39854,7 +39854,7 @@ impl Storage {
         };
         self.publish_type_move(movement, |catalog, members| {
             Self::install_enum_alter_locked(catalog, members, slot, txid);
-        });
+        })
     }
 
     fn install_enum_alter_locked(
@@ -39923,13 +39923,12 @@ impl Storage {
                 UserTypeName::declaration(schema, name),
             )
         };
-        let version = self.catalog_sequence.next()?;
+        let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.next()?;
         self.publish_type_move(movement, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
             catalog.versions.set(NamedTypeSlot::Enum(slot), version);
-        });
-        Ok(())
+        })
     }
 
     pub(crate) fn rollback_enum_alter(&self, undo: EnumAlterUndo) {
@@ -40143,10 +40142,10 @@ impl Storage {
             txid,
             Some(NamedTypeSlot::Composite(slot)),
         )?;
+        let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let composite = &mut catalog.composites[slot];
         let prior = composite.pending_definition;
-        let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
             origin,
             composite.database,
@@ -40169,7 +40168,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_composite_alter(&mut self, target: TypeEditTarget) {
+    pub(crate) fn commit_composite_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Composite)
             .expect("composite publication identifies its source kind");
@@ -40180,18 +40179,18 @@ impl Storage {
                 .lock()
                 .expect("type catalog lock poisoned");
             if !catalog.matches_type_edit(target) {
-                return;
+                return Ok(());
             }
             let composite = catalog.composites[slot];
             let Some(pending) = composite
                 .pending_definition
                 .filter(|pending| pending.txid == txid)
             else {
-                return;
+                return Ok(());
             };
             if pending.schema == composite.schema && pending.name == composite.name {
                 Self::install_composite_alter_locked(&mut catalog, slot, txid);
-                return;
+                return Ok(());
             }
             type_reference_moves::TypeReferenceMove::new(
                 type_references::TypeIdentity::new(
@@ -40206,7 +40205,7 @@ impl Storage {
         };
         self.publish_type_move(movement, |catalog, _members| {
             Self::install_composite_alter_locked(catalog, slot, txid);
-        });
+        })
     }
 
     fn install_composite_alter_locked(catalog: &mut TypeCatalog, slot: usize, txid: u32) {

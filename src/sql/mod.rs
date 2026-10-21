@@ -6967,7 +6967,7 @@ impl Engine {
                 DdlUndo::DomainDropped(undo) => self
                     .storage
                     .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
-                DdlUndo::DomainAltered(prior) => self.storage.commit_domain_alter(prior.target()),
+                DdlUndo::DomainAltered(prior) => self.storage.commit_domain_alter(prior.target())?,
                 DdlUndo::EnumCreated(undo) => {
                     self.storage
                         .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
@@ -6980,12 +6980,12 @@ impl Engine {
                         .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
                 DdlUndo::CompositeAltered(prior) => {
-                    self.storage.commit_composite_alter(prior.target())
+                    self.storage.commit_composite_alter(prior.target())?
                 }
                 DdlUndo::CompositeDropped(undo) => self
                     .storage
                     .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
-                DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target()),
+                DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target())?,
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_create(slot);
@@ -20512,7 +20512,7 @@ fn apply_composite_wal_definition(
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
         let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-        storage.commit_composite_alter(prior.target());
+        storage.commit_composite_alter(prior.target())?;
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
         storage.restore_type_identity(
@@ -21597,6 +21597,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.commit_publication_rename(slot, 0);
         }
         WalOp::CreateSubscription {
+            created_at,
             name,
             owner,
             connection,
@@ -21626,6 +21627,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
+            storage.restore_subscription_stream_identity(slot, created_at, 1)?;
             storage.restore_subscription_owner(slot, owner);
             storage.commit_subscription_create(slot);
         }
@@ -22038,7 +22040,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 }
                 let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
-                storage.commit_domain_alter(prior.target());
+                storage.commit_domain_alter(prior.target())?;
             } else {
                 let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
                 storage.restore_type_identity(
@@ -22217,7 +22219,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
             let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-            storage.commit_composite_alter(prior.target());
+            storage.commit_composite_alter(prior.target())?;
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -22239,7 +22241,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(prior.target());
+            storage.commit_domain_alter(prior.target())?;
         }
         WalOp::Comment {
             class,

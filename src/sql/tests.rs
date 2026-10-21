@@ -67894,7 +67894,8 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
     run_with(
         &mut engine,
         &mut budget,
-        "BEGIN; \
+        "BEGIN; CREATE DOMAIN aborted_subscription_identity AS integer; ROLLBACK; \
+         BEGIN; \
          CREATE SUBSCRIPTION archived_changes CONNECTION \
          'host=publisher port=5432' \
          PUBLICATION sales, inventory \
@@ -67914,6 +67915,7 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
         engine.subscription_endpoint("archived_changes").is_none(),
         "a disabled subscription keeps its PostgreSQL conninfo without claiming a local client endpoint"
     );
+    let created_at = engine.storage.subscription("archived_changes", 0).unwrap().1.created_at;
     run_with(
         &mut engine,
         &mut budget,
@@ -67930,6 +67932,8 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
     drop(engine);
     let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(replayed.storage.subscription("archived_changes", 0).unwrap().1.created_at, created_at,
+        "subscription identity is restored from its record despite aborted catalog allocations");
     assert_eq!(
         data_rows(&run_with(
             &mut replayed,

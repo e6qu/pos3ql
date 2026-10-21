@@ -505,7 +505,7 @@ mod tests {
             let mut labels = before.members();
             drop(before);
             alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
-            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1);
+            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1).unwrap();
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
             let dropped = storage
@@ -708,7 +708,7 @@ mod tests {
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
         });
         crate::mem::guard::forbid_alloc(|| {
-            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1);
+            storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1).unwrap();
             assert_eq!(storage.enum_for(slot, 0).name, after.name);
             assert!(
                 storage.table_def(table, 0).columns()[0]
@@ -778,14 +778,14 @@ mod tests {
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
         let before = storage.enum_for(slot, 0);
-        let previous = storage.replace_catalog_sequence_for_test(u64::MAX);
+        let previous = storage.type_catalog.lock().unwrap().versions.replace_sequence_for_test(u64::MAX);
         crate::mem::guard::forbid_alloc(|| {
             let error = alter(&storage, slot, &[member("changed", 1.0)]).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(storage.enum_for(slot, 77).sort_of("new"), Some(1.0));
             assert_eq!(before.sort_of("new"), Some(1.0));
         });
-        storage.replace_catalog_sequence_for_test(previous);
+        storage.type_catalog.lock().unwrap().versions.replace_sequence_for_test(previous);
         crate::mem::guard::forbid_alloc(|| {
             let undo = alter(&storage, slot, &[member("changed", 1.0)]).unwrap();
             storage.rollback_enum_alter(undo);
@@ -820,7 +820,7 @@ mod tests {
             });
             let result = crate::mem::guard::forbid_alloc(|| {
                 alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)])?;
-                storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1);
+                storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1).unwrap();
                 Ok::<(), SqlError>(())
             });
             published.store(true, Ordering::Release);

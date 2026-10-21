@@ -225,12 +225,16 @@ lock is released before the statement waits. A transaction uses its own pending
 name when dropping a renamed type.
 
 Creation and deletion records retain their source identity, transaction and
-change revision. Commit validates type ownership before durability; publication
-and rollback use the captured records. A superseded record cannot overwrite a
+change revision. Commit validates type ownership and dependent table publication
+counters before durability; publication and rollback use the captured records.
+Counter exhaustion returns `54000` before a type move changes its source or dependents.
+A superseded record cannot overwrite a
 newer edit, revive a replacement type, remove its comment or release its enum
 labels. Domain, enum and composite revision counters reserve 16 bytes per type
-slot plus their vector controls at startup. These counters are local ownership
-checks; durable type identities and file formats are unchanged.
+slot plus their controls at startup. These counters are local ownership checks
+and do not advance the durable catalog identity allocator. Durable type identities
+are unchanged. Subscription creation records now save their source identity
+explicitly; see the [journal format](durable-format.md).
 
 **User example:** `BEGIN; ALTER DOMAIN price RENAME TO order_price; DROP DOMAIN
 order_price; ROLLBACK;` leaves the original `price` domain available. Rolling

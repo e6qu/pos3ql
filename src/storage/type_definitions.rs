@@ -1007,7 +1007,7 @@ mod tests {
             storage
                 .stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7)
                 .unwrap();
-            storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
+            storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1).unwrap();
 
             let scope = outer.enter().unwrap();
             assert_eq!(
@@ -1161,7 +1161,7 @@ mod tests {
                 crate::sql::eval::hash_key_catalog(&storage, 7, &[identified], &[0]).unwrap()
             );
             drop(scope);
-            storage.commit_enum_alter(storage.prepare_enum_edit(0, 7).unwrap().1);
+            storage.commit_enum_alter(storage.prepare_enum_edit(0, 7).unwrap().1).unwrap();
             assert!(selected.label_is_uncommitted("after"));
             let scope = statement.enter().unwrap();
             let child = storage.spill_roots.retain_statement().unwrap();
@@ -1201,7 +1201,7 @@ mod tests {
                         7,
                     )
                     .unwrap();
-                storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
+                storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1).unwrap();
                 let scope = outer.enter().unwrap();
                 let child = storage.spill_roots.retain_statement().unwrap();
                 let child_scope = child.enter().unwrap();
@@ -1498,6 +1498,7 @@ mod tests {
         other.begin_transaction_identity(9).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let original = select(&first, 7);
+            let catalog_sequence = first.catalog_identity_sequence();
             assert_eq!(
                 stage(&first, select(&first, 0), "11")
                     .err()
@@ -1515,6 +1516,7 @@ mod tests {
                 sqlstate::UNDEFINED_OBJECT
             );
             let latest = stage(&first, select(&first, 7), "22").unwrap();
+            assert_eq!(first.catalog_identity_sequence(), catalog_sequence);
             commit(&mut first, earlier);
             assert_eq!(label(&first).as_str(), "22");
             let foreign = stage(&other, select(&other, 7), "11").unwrap();
@@ -1592,7 +1594,7 @@ mod tests {
                     7,
                 )
             },
-            |storage, undo| storage.commit_domain_alter(undo.target()),
+            |storage, undo| storage.commit_domain_alter(undo.target()).unwrap(),
             |storage, undo| storage.rollback_domain_alter(undo),
             |storage| match storage.domain_for(0, 7).default_expr {
                 Some(expression) => SqlName::parse(expression.as_str()).unwrap(),
@@ -1615,7 +1617,7 @@ mod tests {
                     7,
                 )
             },
-            |storage, undo| storage.commit_enum_alter(undo.target()),
+            |storage, undo| storage.commit_enum_alter(undo.target()).unwrap(),
             |storage, undo| storage.rollback_enum_alter(undo),
             |storage| storage.enum_for(0, 7).members().next().unwrap().label,
         );
@@ -1627,7 +1629,7 @@ mod tests {
                 definition.fields[0].name = SqlName::parse(marker).unwrap();
                 storage.stage_composite_alter(target, definition, 7)
             },
-            |storage, undo| storage.commit_composite_alter(undo.target()),
+            |storage, undo| storage.commit_composite_alter(undo.target()).unwrap(),
             |storage, undo| storage.rollback_composite_alter(undo),
             |storage| storage.composite_for(0, 7).fields()[0].name,
         );

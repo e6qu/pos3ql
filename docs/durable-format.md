@@ -21,7 +21,7 @@ they never select a guessed decoder.
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v18` | yes | yes | Requires durable type slots/lifetimes, a catalog identity counter and a completed type-loading boundary; retains typed blocks and enum member identities. |
-| Journal record | Version `2` at header byte 17; bytes 18–23 are zero | yes | yes | Older framing is rejected even when its checksum is valid. |
+| Journal record | Version `3` at header byte 17; bytes 18–23 are zero | yes | yes | Subscription creation carries its durable source identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -273,11 +273,20 @@ composites, routine signatures/results, aggregate types, casts and operator
 contracts share this encoding. Table definition payloads use version 6.
 
 Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
-0–15; byte 16 selects the operation; byte 17 is version 2; bytes 18–23 are zero.
+0–15; byte 16 selects the operation; byte 17 is version 3; bytes 18–23 are zero.
 A checksum-valid unsupported version stops local replay without truncating the
 journal. Uploaded records validate the same version before decoding. Update all
 recovery candidates together and use a fresh prefix or verified logical transfer
 from an incompatible binary; no automatic conversion is provided.
+
+Subscription creation payloads begin with the nonzero creation identity as an
+eight-byte little-endian integer, followed by the existing name, owner,
+connection, publications and transport settings. Replay restores this identity
+before applying stream progress or relation-refresh records. It never derives
+the identity from replay allocation order. For example, a rolled-back domain
+creation before a subscription must not change which subscription its saved
+replication progress belongs to after restart. The added eight bytes are charged
+by the common journal payload sizing function; no new runtime buffer is needed.
 
 ## Composite type name changes
 

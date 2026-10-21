@@ -261,20 +261,10 @@ fn privilege_object_name<'a>(
 }
 
 std::thread_local! {
-    /// The session's startup user, published per statement (like the session
-    /// time zone) so `current_user` and friends reflect the connection.
-    static SESSION_USER: core::cell::RefCell<crate::util::StackStr<64>> =
-        core::cell::RefCell::new({
-            let mut s = crate::util::StackStr::new();
-            let _ = core::fmt::Write::write_str(&mut s, "postgres");
-            s
-        });
-    static CURRENT_USER: core::cell::RefCell<crate::util::StackStr<64>> =
-        core::cell::RefCell::new({
-            let mut s = crate::util::StackStr::new();
-            let _ = core::fmt::Write::write_str(&mut s, "postgres");
-            s
-        });
+    static SESSION_USER: core::cell::Cell<crate::storage::SessionIdentity> =
+        core::cell::Cell::new(crate::storage::SessionIdentity::bootstrap());
+    static CURRENT_USER: core::cell::Cell<crate::storage::SessionIdentity> =
+        core::cell::Cell::new(crate::storage::SessionIdentity::bootstrap());
     static CURRENT_DATABASE: core::cell::RefCell<crate::util::StackStr<64>> =
         core::cell::RefCell::new({
             let mut s = crate::util::StackStr::new();
@@ -397,8 +387,8 @@ std::thread_local! {
 pub(crate) struct SessionEvaluationScope {
     settings: SessionSettings,
     schemas: SessionSchemas,
-    session_user: crate::util::StackStr<64>,
-    current_user: crate::util::StackStr<64>,
+    session_user: crate::storage::SessionIdentity,
+    current_user: crate::storage::SessionIdentity,
     database: crate::util::StackStr<64>,
     timezone: crate::sql::timezone::Timezone,
 }
@@ -407,8 +397,8 @@ pub(crate) fn retain_session_evaluation() -> SessionEvaluationScope {
     SessionEvaluationScope {
         settings: SESSION_SETTINGS.with(|value| *value.borrow()),
         schemas: session_schemas(),
-        session_user: session_user_owned(),
-        current_user: current_user_owned(),
+        session_user: session_identity(),
+        current_user: current_identity(),
         database: CURRENT_DATABASE.with(|value| *value.borrow()),
         timezone: crate::sql::timezone::session(),
     }
@@ -418,8 +408,8 @@ impl Drop for SessionEvaluationScope {
     fn drop(&mut self) {
         SESSION_SETTINGS.with(|value| *value.borrow_mut() = self.settings);
         set_session_schemas(self.schemas);
-        set_session_user(self.session_user.as_str());
-        set_current_user(self.current_user.as_str());
+        set_session_user(self.session_user);
+        set_current_user(self.current_user);
         set_current_database(self.database.as_str());
         crate::sql::timezone::set_session(self.timezone);
     }
@@ -501,55 +491,54 @@ pub(crate) fn update_session_setting(
     });
 }
 
-pub fn set_session_user(user: &str) {
-    SESSION_USER.with(|u| {
-        let mut u = u.borrow_mut();
-        *u = crate::util::StackStr::new();
-        let _ = core::fmt::Write::write_str(&mut *u, user);
-    });
-    CURRENT_USER.with(|current| {
-        let mut current = current.borrow_mut();
-        *current = crate::util::StackStr::from_str(user);
-    });
+pub(crate) fn set_session_user(user: crate::storage::SessionIdentity) {
+    SESSION_USER.with(|active| active.set(user));
+    set_current_user(user);
 }
 
-pub fn set_current_user(user: &str) {
-    CURRENT_USER.with(|current| {
-        *current.borrow_mut() = crate::util::StackStr::from_str(user);
-    });
+pub(crate) fn set_current_user(user: crate::storage::SessionIdentity) {
+    CURRENT_USER.with(|active| active.set(user));
 }
 
 pub(crate) struct CurrentUserScope {
-    prior: crate::util::StackStr<64>,
+    prior: crate::storage::SessionIdentity,
 }
 
 impl Drop for CurrentUserScope {
     fn drop(&mut self) {
-        set_current_user(self.prior.as_str());
+        set_current_user(self.prior);
     }
 }
 
-pub(crate) fn enter_current_user(user: &str) -> CurrentUserScope {
-    let prior = current_user_owned();
+pub(crate) fn enter_current_user(user: crate::storage::SessionIdentity) -> CurrentUserScope {
+    let prior = current_identity();
     set_current_user(user);
     CurrentUserScope { prior }
 }
 
+pub(crate) fn session_identity() -> crate::storage::SessionIdentity {
+    SESSION_USER.with(core::cell::Cell::get)
+}
+
+pub(crate) fn current_identity() -> crate::storage::SessionIdentity {
+    CURRENT_USER.with(core::cell::Cell::get)
+}
+
 pub fn session_user_owned() -> crate::util::StackStr<64> {
-    SESSION_USER.with(|u| *u.borrow())
+    session_identity().name()
 }
 
 pub fn current_user_owned() -> crate::util::StackStr<64> {
-    CURRENT_USER.with(|user| *user.borrow())
+    current_identity().name()
 }
 
 fn session_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
-    let user = session_user_owned();
+    let user = session_identity().require_name()?;
     arena.alloc_str(user.as_str()).map_err(|_| arena_full())
 }
 
 fn current_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
-    let user = current_user_owned();
+    let user = current_identity().require_name()?;
     arena.alloc_str(user.as_str()).map_err(|_| arena_full())
 }
 

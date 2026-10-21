@@ -5,6 +5,8 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
+mod catalog_sources;
+pub(crate) use catalog_sources::{RoleReference, SessionIdentity, SessionRole};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -7279,7 +7281,7 @@ struct OperatorClassIter<'a> {
 
 #[derive(Debug)]
 struct TypeCatalog {
-    origin: type_references::TypeOrigin,
+    origin: type_references::CatalogOrigin,
     versions: type_edits::TypeRevisions,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
@@ -12281,6 +12283,7 @@ pub struct PendingRole {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RoleDef {
+    lifetime: Option<core::num::NonZeroU64>,
     pub name: SqlName,
     pub attributes: RoleAttributes,
     pub live: bool,
@@ -13947,6 +13950,7 @@ pub struct Storage {
     comments: Mutex<CommentCatalog>,
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
+    catalog_sources: catalog_sources::CatalogSources,
     next_rowid: row_identities::RowIdentities,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
@@ -18059,7 +18063,8 @@ impl Storage {
             + type_reference_moves::TypePublication::budget_bytes(config)
             + type_edits::TypeRevisions::budget_bytes(config)
             + Self::type_definition_image_budget_bytes(config)
-            + size_of::<type_references::TypeOrigin>()
+            + size_of::<type_references::CatalogOrigin>()
+            + size_of::<catalog_sources::CatalogSources>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -18176,11 +18181,12 @@ impl Storage {
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
-        let type_origin = type_references::TypeOrigin::new()?;
+        let catalog_origin = type_references::CatalogOrigin::new()?;
         budget.draw(
-            size_of::<type_references::TypeOrigin>(),
+            size_of::<type_references::CatalogOrigin>(),
             "type reference origin",
         )?;
+        let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         budget.draw(size_of::<usize>(), "routine catalog capacity")?;
@@ -18665,6 +18671,7 @@ impl Storage {
         for slot in 0..config.max_roles {
             roles
                 .push(RoleDef {
+                    lifetime: if slot == 0 { Some(core::num::NonZeroU64::MIN) } else { None },
                     name: if slot == 0 {
                         SqlName::parse("postgres").expect("bootstrap role name fits")
                     } else {
@@ -19022,7 +19029,7 @@ impl Storage {
                 values: sequence_values,
             }),
             type_catalog: Mutex::new(TypeCatalog {
-                origin: type_origin,
+                origin: catalog_origin,
                 versions: type_definition_versions,
                 domains,
                 enums,
@@ -19090,6 +19097,7 @@ impl Storage {
             }),
             comments: Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
+            catalog_sources,
             transaction_mode: config.transaction_mode,
             snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
@@ -22649,9 +22657,8 @@ impl Storage {
         if txid == 0 {
             return Ok(Ownership::BOOTSTRAP);
         }
-        let role_name = crate::sql::eval::funcs::system::current_user_owned();
         let owner = self
-            .find_role_visible(role_name.as_str(), txid)
+            .current_role_slot(txid)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -22691,8 +22698,7 @@ impl Storage {
     }
 
     pub(crate) fn current_role_slot(&self, txid: u32) -> Option<usize> {
-        let role = crate::sql::eval::funcs::system::current_user_owned();
-        self.find_role_visible(role.as_str(), txid)
+        self.session_role_slot(crate::sql::eval::funcs::system::current_identity().source(), txid)
     }
 
     pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
@@ -26162,7 +26168,9 @@ impl Storage {
     }
 
     pub(crate) fn initial_catalog_owner(&self, txid: u32) -> Result<i32, SqlError> {
-        Ok(Self::role_oid(usize::from(self.initial_ownership(txid)?.owner_to(txid))))
+        Ok(Self::role_oid(usize::from(
+            self.initial_ownership(txid)?.owner_to(txid),
+        )))
     }
 
     pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -26258,7 +26266,9 @@ impl Storage {
             ));
         };
         let prior = catalog.roles[slot].pending;
+        let lifetime = self.catalog_sources.next_role()?;
         catalog.roles[slot] = RoleDef {
+            lifetime: Some(lifetime),
             name,
             attributes: RoleAttributes::ORDINARY,
             live: false,
@@ -26446,6 +26456,7 @@ impl Storage {
             ));
         };
         catalog.roles[slot] = RoleDef {
+            lifetime: Some(self.catalog_sources.next_role()?),
             name,
             attributes,
             live: true,
@@ -26504,6 +26515,7 @@ impl Storage {
             }
             drop(catalog);
             roles.roles[slot] = RoleDef {
+                lifetime: None,
                 name: SqlName::EMPTY,
                 attributes: RoleAttributes::ORDINARY,
                 live: false,
@@ -27654,7 +27666,11 @@ impl Storage {
                 database.name.as_str()
             ));
         }
-        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid }, self.initial_ownership(txid)?)
+        self.alloc_schema(
+            name,
+            CatalogDdlState::PendingCreate { txid },
+            self.initial_ownership(txid)?,
+        )
     }
 
     fn alloc_schema(
@@ -53622,7 +53638,10 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
-        assert_eq!(error.message.as_str(), "current role is not present in the role catalog");
+        assert_eq!(
+            error.message.as_str(),
+            "current role is not present in the role catalog"
+        );
     }
 
     #[test]
@@ -53630,47 +53649,72 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let wrapper = storage.create_foreign_wrapper(foreign::ForeignDataWrapperDefinition {
-            name: SqlName::parse("base_wrapper").unwrap(),
-            handler: foreign::ForeignDataHandler::None,
-            validator: foreign::ForeignDataValidator::None,
-            options: foreign::ForeignOptions::EMPTY,
-        }, 0).unwrap();
-        let server = storage.create_foreign_server(foreign::ForeignServerDefinition {
-            name: SqlName::parse("base_server").unwrap(),
-            wrapper: wrapper as u16,
-            server_type: None,
-            version: None,
-            options: foreign::ForeignOptions::EMPTY,
-        }, 0).unwrap();
-        let table = storage.create_table(make_def("base_table", &[("id", ColType::Int4, false)])).unwrap();
+        let wrapper = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("base_wrapper").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                0,
+            )
+            .unwrap();
+        let server = storage
+            .create_foreign_server(
+                foreign::ForeignServerDefinition {
+                    name: SqlName::parse("base_server").unwrap(),
+                    wrapper: wrapper as u16,
+                    server_type: None,
+                    version: None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                0,
+            )
+            .unwrap();
+        let table = storage
+            .create_table(make_def("base_table", &[("id", ColType::Int4, false)]))
+            .unwrap();
         let sequence = storage.catalog_sequence.current();
         let next_oid = storage.large_objects.lock().unwrap().next_oid;
-        let actor = crate::sql::eval::funcs::system::enter_current_user("missing_creator");
+        let actor = crate::sql::eval::funcs::system::enter_current_user(SessionIdentity::unauthenticated("missing_creator"));
         crate::mem::guard::forbid_alloc(|| {
             assert_missing_creation_actor(storage.initial_ownership(7));
             assert_missing_creation_actor(storage.initial_catalog_owner(7));
-            assert_missing_creation_actor(storage.create_foreign_wrapper(foreign::ForeignDataWrapperDefinition {
-                name: SqlName::parse("unowned_wrapper").unwrap(),
-                handler: foreign::ForeignDataHandler::None,
-                validator: foreign::ForeignDataValidator::None,
-                options: foreign::ForeignOptions::EMPTY,
-            }, 7));
-            assert_missing_creation_actor(storage.create_foreign_server(foreign::ForeignServerDefinition {
-                name: SqlName::parse("unowned_server").unwrap(),
-                wrapper: wrapper as u16,
-                server_type: None,
-                version: None,
-                options: foreign::ForeignOptions::EMPTY,
-            }, 7));
-            assert_missing_creation_actor(storage.create_foreign_table_binding(foreign::ForeignTableDefinition {
-                table: table as u16,
-                server: server as u16,
-                options: foreign::ForeignOptions::EMPTY,
-                column_options: foreign::ForeignColumnOptions::EMPTY,
-            }, 7));
+            assert_missing_creation_actor(storage.create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("unowned_wrapper").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                7,
+            ));
+            assert_missing_creation_actor(storage.create_foreign_server(
+                foreign::ForeignServerDefinition {
+                    name: SqlName::parse("unowned_server").unwrap(),
+                    wrapper: wrapper as u16,
+                    server_type: None,
+                    version: None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                7,
+            ));
+            assert_missing_creation_actor(storage.create_foreign_table_binding(
+                foreign::ForeignTableDefinition {
+                    table: table as u16,
+                    server: server as u16,
+                    options: foreign::ForeignOptions::EMPTY,
+                    column_options: foreign::ForeignColumnOptions::EMPTY,
+                },
+                7,
+            ));
             assert_missing_creation_actor(storage.create_large_object(None, 7));
-            assert_missing_creation_actor(table_creation::allocate(&storage, make_def("unowned_table", &[("id", ColType::Int4, false)]), Some(7)));
+            assert_missing_creation_actor(table_creation::allocate(
+                &storage,
+                make_def("unowned_table", &[("id", ColType::Int4, false)]),
+                Some(7),
+            ));
             assert_eq!(storage.catalog_sequence.current(), sequence);
             assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
             assert!(storage.find_table("public", "unowned_table").is_none());
@@ -53686,10 +53730,16 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
-        let _actor = crate::sql::eval::funcs::system::enter_current_user("missing_creator");
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(SessionIdentity::unauthenticated("missing_creator"));
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.initial_ownership(0).unwrap().owner, BOOTSTRAP_ROLE);
-            let slot = storage.alloc_schema(SqlName::parse("replayed_schema").unwrap(), CatalogDdlState::Present, Ownership::BOOTSTRAP).unwrap();
+            let slot = storage
+                .alloc_schema(
+                    SqlName::parse("replayed_schema").unwrap(),
+                    CatalogDdlState::Present,
+                    Ownership::BOOTSTRAP,
+                )
+                .unwrap();
             let schemas = storage.schemas.lock().unwrap();
             assert_eq!(schemas[slot].ownership.owner, BOOTSTRAP_ROLE);
             assert!(schemas[slot].ownership.pending.is_none());

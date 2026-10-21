@@ -1463,6 +1463,7 @@ impl Conn {
                 let _ = responder.error(sqlstate::TOO_MANY_CONNECTIONS, message);
                 return Step::Close;
             }
+            self.guc.bind_session_user(login.identity);
             self.authenticated_role = Some(login.slot);
             self.authenticated_database = Some(database.slot);
         }
@@ -8044,6 +8045,7 @@ mod tests {
     #[test]
     fn login_verifier_makes_bootstrap_and_role_credentials_disjoint() {
         let login = crate::sql::RoleLogin {
+            identity: crate::storage::SessionIdentity::bootstrap(),
             slot: 0,
             can_login: true,
             valid: true,
@@ -8110,6 +8112,7 @@ mod tests {
     #[test]
     fn replication_requires_a_replication_role_or_superuser() {
         let login = crate::sql::RoleLogin {
+            identity: crate::storage::SessionIdentity::bootstrap(),
             slot: 0,
             can_login: true,
             valid: true,

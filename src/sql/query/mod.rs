@@ -1546,13 +1546,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
-        let owner = self
-            .storage
-            .role_name(routine.ownership.owner_to(self.txid).into(), self.txid);
+        let owner = crate::storage::SessionIdentity::bound(self.storage.capture_role_slot(routine.ownership.owner_to(self.txid).into(), self.txid)?);
         let _security = routine
             .attributes
             .security_definer
-            .then(|| super::eval::funcs::system::enter_current_user(owner.as_str()));
+            .then(|| super::eval::funcs::system::enter_current_user(owner));
         let _config = (!routine.configs().is_empty())
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;

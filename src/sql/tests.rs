@@ -17824,7 +17824,7 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
     );
     let role = engine.role_login("configured_login").unwrap();
     let mut guc = GucState::new();
-    guc.set_session_user("configured_login");
+    guc.bind_session_user(engine.role_login("configured_login").unwrap().identity);
     engine.apply_role_settings(role.slot, &guc).unwrap();
     assert_eq!(
         guc.get_owned("application_name").unwrap().as_str(),
@@ -17862,7 +17862,7 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let role = recovered.role_login("configured_login").unwrap();
     let mut recovered_guc = GucState::new();
-    recovered_guc.set_session_user("configured_login");
+    recovered_guc.bind_session_user(recovered.role_login("configured_login").unwrap().identity);
     recovered
         .apply_role_settings(role.slot, &recovered_guc)
         .unwrap();
@@ -18623,7 +18623,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
         String::from_utf8_lossy(&output)
     );
     let mut operator = GucState::new();
-    operator.set_role("parameter_operator", false);
+    operator.set_role(engine.role_login("parameter_operator").unwrap().identity, false);
     let output = run_session(
         &mut engine,
         &mut budget,
@@ -18729,7 +18729,7 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     let mut delegate = GucState::new();
-    delegate.set_role("parameter_delegate", false);
+    delegate.set_role(engine.role_login("parameter_delegate").unwrap().identity, false);
     let output = run_session(
         &mut engine,
         &mut budget,
@@ -19212,7 +19212,7 @@ fn reset_session_authorization_survives_a_dropped_authenticated_role() {
     assert!(!message_types(&setup).contains(&b'E'));
 
     let mut guc = GucState::new();
-    guc.set_session_user("authenticated_super");
+    guc.bind_session_user(engine.role_login("authenticated_super").unwrap().identity);
     let output = run_with_guc(
         &mut engine,
         &mut budget,
@@ -70175,7 +70175,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
          CREATE TABLE other_publication_table (id integer)",
     );
     let mut owner_guc = GucState::new();
-    owner_guc.set_session_user("publication_owner");
+    owner_guc.bind_session_user(engine.role_login("publication_owner").unwrap().identity);
     run_with_guc(
         &mut engine,
         &mut budget,
@@ -70185,7 +70185,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         &mut owner_guc,
     );
     let mut other_guc = GucState::new();
-    other_guc.set_session_user("publication_other");
+    other_guc.bind_session_user(engine.role_login("publication_other").unwrap().identity);
     let not_owner = run_with_guc(
         &mut engine,
         &mut budget,
@@ -70226,7 +70226,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
          CREATE SCHEMA publication_scope",
     );
     let mut limited = GucState::new();
-    limited.set_session_user("publication_limited");
+    limited.bind_session_user(engine.role_login("publication_limited").unwrap().identity);
     run_with_guc(
         &mut engine,
         &mut budget,
@@ -70335,7 +70335,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
          GRANT CREATE ON DATABASE postgres TO publication_first_owner",
     );
     let mut first_owner = GucState::new();
-    first_owner.set_session_user("publication_first_owner");
+    first_owner.bind_session_user(engine.role_login("publication_first_owner").unwrap().identity);
     run_with_guc(
         &mut engine,
         &mut budget,
@@ -70365,7 +70365,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         "ALTER PUBLICATION publication_owner_changes OWNER TO publication_second_owner",
     );
     let mut second_owner = GucState::new();
-    second_owner.set_session_user("publication_second_owner");
+    second_owner.bind_session_user(engine.role_login("publication_second_owner").unwrap().identity);
     let altered = run_with_guc(
         &mut engine,
         &mut budget,

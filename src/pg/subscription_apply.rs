@@ -360,7 +360,7 @@ impl SubscriptionApply {
         engine.select_database(self.stream.database_oid())?;
         if !self.txn.is_active() {
             let owner = engine.subscription_session_user(self.stream, self.txn.txid)?;
-            self.guc.set_session_user(owner.as_str());
+            self.guc.bind_session_user(owner);
         }
         // The worker's GUC and transaction fields stay in place throughout
         // this private callback, including bootstrap and failure cleanup.

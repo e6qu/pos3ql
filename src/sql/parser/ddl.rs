@@ -7045,7 +7045,7 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_ident("domain")? {
-            return self.drop_domain();
+            return self.stage_type_drop(crate::storage::NamedTypeKind::Domain, );
         }
         if self.eat_ident("aggregate")? {
             return self.drop_aggregate();

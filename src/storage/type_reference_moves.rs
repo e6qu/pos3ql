@@ -1381,7 +1381,7 @@ mod tests {
             match kind {
                 TypeReferenceKind::Domain => {
                     storage
-                        .drop_domain(
+                        .stage_type_drop(crate::storage::NamedTypeKind::Domain, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
@@ -1391,7 +1391,7 @@ mod tests {
                 }
                 TypeReferenceKind::Enum => {
                     storage
-                        .drop_enum(
+                        .stage_type_drop(crate::storage::NamedTypeKind::Enum, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
@@ -1401,7 +1401,7 @@ mod tests {
                 }
                 TypeReferenceKind::Composite => {
                     storage
-                        .drop_composite(
+                        .stage_type_drop(crate::storage::NamedTypeKind::Composite, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
@@ -1431,15 +1431,15 @@ mod tests {
             let key = movement.identity;
             match kind {
                 TypeReferenceKind::Domain => {
-                    storage.drop_domain("public", "prior_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "prior_type", 0).unwrap();
                     storage.commit_domain_drop(key.slot().index());
                 }
                 TypeReferenceKind::Enum => {
-                    storage.drop_enum("public", "prior_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "prior_type", 0).unwrap();
                     storage.commit_enum_drop(key.slot().index());
                 }
                 TypeReferenceKind::Composite => {
-                    storage.drop_composite("public", "prior_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "prior_type", 0).unwrap();
                     storage.commit_composite_drop(key.slot().index());
                 }
             }
@@ -1577,15 +1577,15 @@ mod tests {
             });
             match kind {
                 TypeReferenceKind::Domain => {
-                    storage.drop_domain("public", "current_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "current_type", 0).unwrap();
                     storage.commit_domain_drop(movement.identity.slot().index());
                 }
                 TypeReferenceKind::Enum => {
-                    storage.drop_enum("public", "current_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "current_type", 0).unwrap();
                     storage.commit_enum_drop(movement.identity.slot().index());
                 }
                 TypeReferenceKind::Composite => {
-                    storage.drop_composite("public", "current_type", 0).unwrap();
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "current_type", 0).unwrap();
                     storage.commit_composite_drop(movement.identity.slot().index());
                 }
             }

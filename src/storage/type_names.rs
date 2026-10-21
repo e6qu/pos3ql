@@ -7,6 +7,13 @@ use super::{
 use crate::sql_err;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamedTypeKind {
+    Domain,
+    Enum,
+    Composite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NamedTypeSlot {
     Domain(usize),
     Enum(usize),
@@ -14,6 +21,14 @@ pub(crate) enum NamedTypeSlot {
 }
 
 impl NamedTypeSlot {
+    pub(super) fn kind(self) -> NamedTypeKind {
+        match self {
+            Self::Domain(_) => NamedTypeKind::Domain,
+            Self::Enum(_) => NamedTypeKind::Enum,
+            Self::Composite(_) => NamedTypeKind::Composite,
+        }
+    }
+
     pub(super) fn index(self) -> usize {
         match self {
             Self::Domain(slot) | Self::Enum(slot) | Self::Composite(slot) => slot,
@@ -434,19 +449,19 @@ mod tests {
                 match slot {
                     NamedTypeSlot::Domain(slot) => {
                         assert_eq!(
-                            storage.drop_domain("public", "occupied", 7).unwrap(),
+                            storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "occupied", 7).unwrap(),
                             Some(slot)
                         );
                     }
                     NamedTypeSlot::Enum(slot) => {
                         assert_eq!(
-                            storage.drop_enum("public", "occupied", 7).unwrap(),
+                            storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "occupied", 7).unwrap(),
                             Some(slot)
                         );
                     }
                     NamedTypeSlot::Composite(slot) => {
                         assert_eq!(
-                            storage.drop_composite("public", "occupied", 7).unwrap(),
+                            storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "occupied", 7).unwrap(),
                             Some(slot)
                         );
                     }

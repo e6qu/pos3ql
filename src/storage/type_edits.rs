@@ -90,10 +90,9 @@ impl super::TypeCatalog {
     }
 
     pub(super) fn contains_type_source(&self, source: TypeIdentity) -> bool {
-        if self.origin != source.origin() { return false; }
         let matches = |database, created_at, state| {
-            database == source.database() && created_at == source.created_at()
-                && state != super::CatalogDdlState::Absent
+            state != super::CatalogDdlState::Absent
+                && TypeIdentity::new(self.origin, database, source.slot(), created_at) == source
         };
         match source.slot() {
             NamedTypeSlot::Domain(slot) => self.domains.get(slot)
@@ -103,5 +102,70 @@ impl super::TypeCatalog {
             NamedTypeSlot::Composite(slot) => self.composites.get(slot)
                 .is_some_and(|definition| matches(definition.database, definition.created_at, definition.ddl_state)),
         }
+    }
+
+    pub(super) fn conflicting_type_owner(&self, source: NamedTypeSlot, transaction: u32) -> Option<u32> {
+        let owners = match source {
+            NamedTypeSlot::Domain(slot) => [
+                self.domains[slot].ddl_state.pending_txid(),
+                self.domains[slot].pending_definition.as_ref().map(|pending| pending.txid),
+            ],
+            NamedTypeSlot::Enum(slot) => [
+                self.enums[slot].ddl_state.pending_txid(),
+                self.enums[slot].pending_definition.as_ref().map(|pending| pending.txid),
+            ],
+            NamedTypeSlot::Composite(slot) => [
+                self.composites[slot].ddl_state.pending_txid(),
+                self.composites[slot].pending_definition.as_ref().map(|pending| pending.txid),
+            ],
+        };
+        owners.into_iter().flatten().find(|&owner| owner != transaction)
+    }
+}
+
+impl super::Storage {
+    pub(crate) fn stage_type_drop(
+        &self,
+        kind: super::NamedTypeKind,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Result<Option<usize>, crate::sql::eval::SqlError> {
+        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let mut selected = None;
+        let mut blocked = None;
+        let matches = |candidate: super::UserTypeName| {
+            candidate.schema.as_str() == schema && candidate.name.as_str() == name
+        };
+        for reservation in catalog.name_reservations() {
+            if reservation.slot.kind() != kind
+                || reservation.database != super::current_database()
+                || reservation.state == super::CatalogDdlState::Absent
+            { continue; }
+            if (matches(reservation.current)
+                || reservation.pending.is_some_and(|(_, pending)| matches(pending)))
+                && let Some(owner) = catalog.conflicting_type_owner(reservation.slot, transaction)
+            {
+                blocked = Some(owner);
+                break;
+            }
+            let visible = reservation.pending.filter(|&(owner, _)| owner == transaction)
+                .map_or(reservation.current, |(_, pending)| pending);
+            if reservation.state.visible_to(transaction) && matches(visible) {
+                selected = Some((reservation.slot, reservation.state));
+            }
+        }
+        if let Some(owner) = blocked {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, name));
+        }
+        let Some((source, state)) = selected else { return Ok(None); };
+        let state = state.drop_by(transaction);
+        match source {
+            NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state = state,
+            NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state = state,
+            NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = state,
+        }
+        Ok(Some(source.index()))
     }
 }

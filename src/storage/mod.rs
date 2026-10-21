@@ -30,7 +30,7 @@ mod type_references;
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
-pub(crate) use type_names::NamedTypeSlot;
+pub(crate) use type_names::{NamedTypeKind, NamedTypeSlot};
 pub(crate) use type_references::StorageSetupError;
 pub(crate) use type_references::TypeReference;
 pub(crate) mod foreign;
@@ -39122,18 +39122,14 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Domain(slot), txid) {
+            let name = catalog.domains[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
         catalog.bind_domain_spec(&mut spec, txid)?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
-        if let Some(pending) = domain.pending_definition
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "domain \"{}\" is being altered by another transaction",
-                domain.name.as_str()
-            ));
-        }
         let prior = domain.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
@@ -39159,6 +39155,11 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Domain(slot), txid) {
+            let name = catalog.domains[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
         self.require_named_type_name(
             &catalog,
             schema,
@@ -39168,15 +39169,6 @@ impl Storage {
         )?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
-        if let Some(pending) = domain.pending_definition
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "domain \"{}\" is being altered by another transaction",
-                domain.name.as_str()
-            ));
-        }
         let prior = domain.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
@@ -39268,38 +39260,6 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned")
             .domains[slot] = prior;
-    }
-
-    pub fn drop_domain(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
-            (d.database == current_database()
-                && d.schema.as_str() == schema
-                && d.name.as_str() == name)
-                .then_some(d.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(i) = catalog.domains.iter().position(|d| {
-            d.database == current_database()
-                && d.visible_to(txid)
-                && d.schema.as_str() == schema
-                && d.name.as_str() == name
-        }) else {
-            return Ok(None);
-        };
-        let d = &mut catalog.domains[i];
-        d.ddl_state = d.ddl_state.drop_by(txid);
-        Ok(Some(i))
     }
 
     pub fn commit_domain_create(&mut self, slot: usize) {
@@ -39667,6 +39627,11 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Enum(slot), txid) {
+            let name = catalog.enums[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
         self.require_named_type_name(
             &catalog,
             schema,
@@ -39674,15 +39639,6 @@ impl Storage {
             txid,
             Some(NamedTypeSlot::Enum(slot)),
         )?;
-        if let Some(pending) = catalog.enums[slot].pending_definition
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "type \"{}\" is being altered by another transaction",
-                catalog.enums[slot].name.as_str()
-            ));
-        }
         let prior = catalog.enums[slot].pending_definition;
         let previous = prior.map(|pending| pending.member_slot);
         if previous.is_some_and(|previous| {
@@ -39945,51 +39901,6 @@ impl Storage {
         catalog.enums[slot].pending_definition = undo.prior;
     }
 
-    pub fn drop_enum(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        let database = current_database();
-        let mut scoped = catalog
-            .enums
-            .iter()
-            .enumerate()
-            .filter(|(_, enumeration)| enumeration.database == database);
-        if let Some(blocker) = scoped.clone().find_map(|(_, e)| {
-            let same_name = e.schema.as_str() == schema
-                && (e.name.as_str() == name
-                    || e.pending_definition
-                        .is_some_and(|pending| pending.name.as_str() == name));
-            same_name
-                .then(|| {
-                    e.pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| e.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some((i, _)) = scoped.find(|(_, enumeration)| {
-            let visible = enumeration.definition_for(txid);
-            enumeration.visible_to(txid)
-                && visible.schema.as_str() == schema
-                && visible.name.as_str() == name
-        }) else {
-            return Ok(None);
-        };
-        let e = &mut catalog.enums[i];
-        e.ddl_state = e.ddl_state.drop_by(txid);
-        Ok(Some(i))
-    }
-
     pub fn commit_enum_create(&mut self, slot: usize) {
         let mut catalog = self
             .type_catalog
@@ -40209,6 +40120,11 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Composite(slot), txid) {
+            let name = catalog.composites[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
         catalog.bind_composite_fields(&mut definition.fields[..definition.n_fields], txid)?;
         self.require_named_type_name(
             &catalog,
@@ -40217,15 +40133,8 @@ impl Storage {
             txid,
             Some(NamedTypeSlot::Composite(slot)),
         )?;
-        let name = catalog.composites[slot].name;
         let origin = catalog.origin;
         let composite = &mut catalog.composites[slot];
-        if let Some(pending) = composite.pending_definition
-            && pending.txid != txid
-        {
-            drop(catalog);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
-        }
         let prior = composite.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
@@ -40447,46 +40356,6 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned");
         catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.commit_create();
-    }
-
-    pub fn drop_composite(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.composites.iter().find_map(|definition| {
-            (definition.database == current_database()
-                && definition.schema.as_str() == schema
-                && (definition.name.as_str() == name
-                    || definition
-                        .pending_definition
-                        .is_some_and(|pending| pending.name.as_str() == name)))
-            .then(|| {
-                definition
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| definition.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(slot) = catalog.composites.iter().position(|definition| {
-            definition.database == current_database()
-                && definition.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.definition_for(txid).name.as_str() == name
-        }) else {
-            return Ok(None);
-        };
-        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.drop_by(txid);
-        Ok(Some(slot))
     }
 
     pub fn commit_composite_drop(&mut self, slot: usize) {

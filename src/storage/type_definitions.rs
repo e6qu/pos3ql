@@ -823,14 +823,14 @@ mod tests {
         match source {
             NamedTypeSlot::Domain(slot) => {
                 assert_eq!(
-                    storage.drop_domain("public", "reader_source", 0).unwrap(),
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "reader_source", 0).unwrap(),
                     Some(slot)
                 );
                 storage.commit_domain_drop(slot);
             }
             NamedTypeSlot::Enum(slot) => {
                 assert_eq!(
-                    storage.drop_enum("public", "reader_source", 0).unwrap(),
+                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "reader_source", 0).unwrap(),
                     Some(slot)
                 );
                 storage.commit_enum_drop(slot);
@@ -838,7 +838,7 @@ mod tests {
             NamedTypeSlot::Composite(slot) => {
                 assert_eq!(
                     storage
-                        .drop_composite("public", "reader_source", 0)
+                        .stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "reader_source", 0)
                         .unwrap(),
                     Some(slot)
                 );
@@ -1448,7 +1448,7 @@ mod tests {
 
     fn check_type_undo_lifetimes<Undo: Copy>(
         source: NamedTypeSlot,
-        stage: impl Fn(&mut Storage, &str) -> Undo,
+        stage: impl Fn(&mut Storage, &str) -> Result<Undo, SqlError>,
         rollback: impl Fn(&Storage, Undo),
         label: impl Fn(&Storage) -> SqlName,
     ) {
@@ -1456,13 +1456,27 @@ mod tests {
         let mut other = fixture(2);
         create(&mut first, source).unwrap();
         create(&mut other, source).unwrap();
+        other.begin_transaction_identity(7).unwrap();
+        other.begin_transaction_identity(9).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let earlier = stage(&mut first, "11");
-            let latest = stage(&mut first, "22");
-            let foreign = stage(&mut other, "11");
+            let earlier = stage(&mut first, "11").unwrap();
+            let latest = stage(&mut first, "22").unwrap();
+            let foreign = stage(&mut other, "11").unwrap();
+            assert_eq!(other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap_err().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert!(other.type_catalog.try_lock().is_ok());
             rollback(&other, earlier);
             assert_eq!(label(&other).as_str(), "11");
             rollback(&other, foreign);
+            other.wake_transaction_waiters(7);
+            assert_eq!(label(&other).as_str(), "before");
+            assert_eq!(other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap(), Some(0));
+            assert_eq!(stage(&mut other, "22").err().unwrap().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert!(other.type_catalog.try_lock().is_ok());
+            match source {
+                NamedTypeSlot::Domain(slot) => other.rollback_domain_drop(slot, 9),
+                NamedTypeSlot::Enum(slot) => other.rollback_enum_drop(slot, 9),
+                NamedTypeSlot::Composite(slot) => other.rollback_composite_drop(slot, 9),
+            }
             assert_eq!(label(&other).as_str(), "before");
 
             rollback(&first, earlier);
@@ -1474,7 +1488,7 @@ mod tests {
 
             retire(&mut first, source);
             create(&mut first, source).unwrap();
-            let replacement = stage(&mut first, "22");
+            let replacement = stage(&mut first, "22").unwrap();
             rollback(&first, earlier);
             assert_eq!(label(&first).as_str(), "22");
             rollback(&first, replacement);
@@ -1491,7 +1505,7 @@ mod tests {
                 base_type_mod: -1, not_null: false,
                 default_expr: Some(crate::util::StackStr::from_str(marker)),
                 checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
-            }, 7).unwrap(),
+            }, 7),
             |storage, undo| storage.rollback_domain_alter(undo),
             |storage| match storage.domain_for(0, 7).default_expr {
                 Some(expression) => SqlName::parse(expression.as_str()).unwrap(),
@@ -1503,7 +1517,7 @@ mod tests {
             |storage, marker| storage.stage_enum_alter(
                 0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(),
                 &[EnumMember { label: SqlName::parse(marker).unwrap(), legacy_label: None, sort: 1.0 }], 7,
-            ).unwrap(),
+            ),
             |storage, undo| storage.rollback_enum_alter(undo),
             |storage| storage.enum_for(0, 7).members().next().unwrap().label,
         );
@@ -1512,7 +1526,7 @@ mod tests {
             |storage, marker| {
                 let mut definition = storage.composite_for(0, 7);
                 definition.fields[0].name = SqlName::parse(marker).unwrap();
-                storage.stage_composite_alter(0, definition, 7).unwrap()
+                storage.stage_composite_alter(0, definition, 7)
             },
             |storage, undo| storage.rollback_composite_alter(undo),
             |storage| storage.composite_for(0, 7).fields()[0].name,

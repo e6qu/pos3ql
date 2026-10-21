@@ -13320,7 +13320,7 @@ pub(crate) fn drop_schema(
                 ) {
                     return sql_fail(error);
                 }
-                match storage.drop_domain(schema.as_str(), name.as_str(), txn.txid) {
+                match storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
                         if let Err(error) =
                             txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))
@@ -13346,7 +13346,7 @@ pub(crate) fn drop_schema(
                 ) {
                     return sql_fail(error);
                 }
-                match storage.drop_enum(schema.as_str(), name.as_str(), txn.txid) {
+                match storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
                         if let Err(error) =
                             txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32))
@@ -41387,7 +41387,7 @@ fn drop_domain_selection(
                 name: dname.as_str(),
             },
         )?;
-        match storage.drop_domain(schema.as_str(), dname.as_str(), txn.txid) {
+        match storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema.as_str(), dname.as_str(), txn.txid) {
             Ok(Some(slot)) => {
                 txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))?;
             }
@@ -42507,7 +42507,7 @@ pub(crate) fn drop_type(
         ) {
             return sql_fail(e);
         }
-        match storage.drop_enum(schema.as_str(), ename.as_str(), txn.txid) {
+        match storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema.as_str(), ename.as_str(), txn.txid) {
             Ok(Some(slot)) => {
                 if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32)) {
                     return sql_fail(e);
@@ -42794,7 +42794,7 @@ fn drop_composite_type(
         },
     )?;
     let dropped = storage
-        .drop_composite(
+        .stage_type_drop(crate::storage::NamedTypeKind::Composite, 
             definition.schema.as_str(),
             definition.name.as_str(),
             txn.txid,

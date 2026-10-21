@@ -508,7 +508,7 @@ mod tests {
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
             assert_eq!(
-                storage.drop_enum("public", "state", 77).unwrap(),
+                storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap(),
                 Some(slot)
             );
             storage.commit_enum_drop(slot);
@@ -752,7 +752,7 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
-                storage.drop_enum("public", "state", 77).unwrap(),
+                storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap(),
                 Some(slot)
             );
             storage.commit_enum_drop(slot);

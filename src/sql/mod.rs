@@ -22049,7 +22049,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             ));
         }
         WalOp::DropDomain { schema, name } => {
-            if let Some(slot) = storage.drop_domain(schema, name, 0)? {
+            if let Some(slot) = storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema, name, 0)? {
                 storage.commit_domain_drop(slot);
             }
         }
@@ -22138,12 +22138,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             wide_fields,
         } => apply_composite_wal_payload(storage, payload, wide_fields)?,
         WalOp::DropComposite { schema, name } => {
-            if let Some(slot) = storage.drop_composite(schema, name, 0)? {
+            if let Some(slot) = storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, schema, name, 0)? {
                 storage.commit_composite_drop(slot);
             }
         }
         WalOp::DropEnum { schema, name } => {
-            if let Some(slot) = storage.drop_enum(schema, name, 0)? {
+            if let Some(slot) = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema, name, 0)? {
                 storage.commit_enum_drop(slot);
             }
         }

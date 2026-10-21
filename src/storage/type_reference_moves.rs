@@ -364,7 +364,22 @@ impl TypePublication {
                         std::thread::yield_now();
                     }
                 }
-                let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
+                try_mutex(&storage.type_catalog, "type catalog lock poisoned")
+            })();
+            let mut types = match attempt {
+                Ok(types) => types,
+                Err(wait) => {
+                    drop(owners);
+                    #[cfg(test)]
+                    self.waits.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    continue;
+                }
+            };
+            if !source.validate(&types, movement)? {
+                return Ok(());
+            }
+            let attempt: Result<_, LockWait<'_>> = (|| {
                 // Dependent creation and edits bind while owning this catalog.
                 // Catch submissions that arrived after the first table scan.
                 Self::acquire_tables(storage, movement, &mut owners)?;
@@ -382,7 +397,6 @@ impl TypePublication {
                     "stored-query dependency catalog lock poisoned",
                 )?;
                 Ok((
-                    types,
                     members,
                     comments,
                     routines,
@@ -393,6 +407,7 @@ impl TypePublication {
             })();
             match attempt {
                 Err(wait) => {
+                    drop(types);
                     drop(owners);
                     #[cfg(test)]
                     self.waits
@@ -400,7 +415,6 @@ impl TypePublication {
                     wait.wait();
                 }
                 Ok((
-                    mut types,
                     mut members,
                     mut comments,
                     mut routines,
@@ -408,9 +422,6 @@ impl TypePublication {
                     mut casts,
                     mut dependencies,
                 )) => {
-                    if !source.validate(&types, movement)? {
-                        return Ok(());
-                    }
                     // Preflight every fallible counter before changing any
                     // source, pending version or dependent definition.
                     for owner in owners.slots.iter().flatten() {
@@ -704,10 +715,13 @@ mod tests {
                 let target = undo.target();
                 let selected = storage.table_def(related, 0);
                 let next_name = UserTypeName::declaration(movement.current.schema, SqlName::parse("newest_type").unwrap());
+                let (finished, received) = mpsc::sync_channel(1);
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
                         crate::sql::set_execution_database_oid(database);
-                        crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target))
+                        let result = crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target));
+                        finished.send(()).unwrap();
+                        result
                     });
                     let waiting = wait_until_contended(&storage);
                     let next = if supersede {
@@ -716,8 +730,12 @@ mod tests {
                         undo.rollback(&storage);
                         None
                     };
+                    let unrelated_metadata = storage.stored_query_dependencies.lock().unwrap();
                     drop(selected);
+                    let completed = received.recv_timeout(Duration::from_secs(5));
+                    drop(unrelated_metadata);
                     writer.join().unwrap().unwrap();
+                    assert!(completed.is_ok(), "an obsolete edit waited on unrelated metadata");
                     assert!(waiting, "type publication did not wait for the selected table");
                     assert_eq!(source_identity(&storage.type_catalog.lock().unwrap(), movement), movement.prior);
                     assert_identity(&storage, related, 0, movement.prior);

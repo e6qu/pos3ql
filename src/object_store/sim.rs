@@ -26,7 +26,9 @@
 //! This module allocates freely (a growing map of objects is the point);
 //! it exists for simulation tests, and `main` refuses `object_store = sim`.
 
-use std::sync::{Arc, LockResult, Mutex, MutexGuard};
+use {
+    crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard, std::sync::Arc, std::sync::LockResult,
+};
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};

@@ -57,6 +57,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pos3ql-mutex-model"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

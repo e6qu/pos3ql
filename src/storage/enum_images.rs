@@ -1,6 +1,6 @@
 //! Selected enum labels remain immutable until their last reader releases them.
 
-use std::sync::{Arc, Mutex};
+use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use super::EnumMember;
 use crate::mem::budget::{Budget, BudgetError};
@@ -315,7 +315,7 @@ mod tests {
     use super::*;
     use crate::storage::SqlName;
     use crate::storage::tests::{test_budget, test_config, test_database_definition};
-    use crate::storage::{DatabaseOid, EnumMemberPublication, EnumSpec, Storage};
+    use crate::storage::{DatabaseOid, EnumSpec, Storage};
 
     fn storage(enum_capacity: usize) -> Storage {
         let mut config = test_config();
@@ -546,10 +546,9 @@ mod tests {
             let slot = create(&mut storage, "state");
             let before = storage.enum_for(slot, 0);
             alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
-            assert_eq!(
-                storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
-                EnumMemberPublication::Complete
-            );
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                .unwrap();
             let members = [
                 member("new", 1.0),
                 member("paid", 2.0),
@@ -646,10 +645,9 @@ mod tests {
             );
             crate::mem::guard::forbid_alloc(|| {
                 alter(storage, slot, &[member("renamed", 1.0)]).unwrap();
-                assert_eq!(
-                    storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
-                    EnumMemberPublication::Complete
-                );
+                storage
+                    .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                    .unwrap();
                 let location = storage.heap.append_row(&[Datum::Int4(42)]).unwrap();
                 storage
                     .write_pending(unrelated, 1, 91, 1, Some(location))
@@ -663,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_enum_publication_identity_move_preserves_pending_state_and_references() {
+    fn shared_enum_publication_identity_move_waits_for_its_transaction_owner() {
         use crate::sql::types::ColType;
         use crate::storage::UserTypeName;
         use crate::storage::tests::make_def;
@@ -693,20 +691,15 @@ mod tests {
                 )
                 .unwrap();
             let selected = storage.enum_for(slot, 77);
-            assert_eq!(
-                storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
-                EnumMemberPublication::IdentityMoveRequired
-            );
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 88).unwrap().1)
+                .unwrap();
             assert_eq!(storage.enum_for(slot, 0).name, before.name);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 1);
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
             assert_eq!(storage.enum_for(slot, 77).members().len(), 2);
             assert_eq!(selected.sort_of("paid"), Some(2.0));
             assert_eq!(storage.table_def(table, 0).columns()[0].user_type, captured);
-            assert_eq!(
-                storage.commit_enum_members(storage.prepare_enum_edit(slot, 88).unwrap().1),
-                EnumMemberPublication::Complete
-            );
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
         });
         crate::mem::guard::forbid_alloc(|| {

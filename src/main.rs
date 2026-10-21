@@ -1,3 +1,6 @@
+#![cfg_attr(target_os = "macos", deny(clippy::disallowed_types))]
+#![cfg_attr(not(target_os = "macos"), allow(clippy::disallowed_types))]
+
 use std::process::ExitCode;
 
 use pos3ql::config::{Config, FmtBytes, LogFormat};

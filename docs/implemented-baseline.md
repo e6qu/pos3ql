@@ -26,7 +26,17 @@ error rather than quietly giving a different answer.
 
 This section explains the recent concurrency preparation. “Ownership” means
 keeping data and buffers valid until the operation using them has finished.
-It does not mean that SQL statements already execute in parallel.
+SQL statements still use one CPU worker.
+
+A mutex protects one shared value from simultaneous changes. Core mutexes
+keep their native state inline, including on macOS using
+[Apple's native lock](https://developer.apple.com/documentation/os/os_unfair_lock).
+First use, replacement, movement, contention and recovery after a panic are
+checked with allocation guards and an interpreter that detects invalid memory access.
+Read/write locks allow several readers together or one writer.
+
+**User example:** a connection's first query and a newly created materialized
+view can use their lock state without requesting additional heap memory.
 
 **User example:** transaction A reads an order, transaction B updates it, and
 A reads again. Under repeatable-read isolation, A still needs its earlier
@@ -270,10 +280,13 @@ transaction-private and rolled-back names follow the same visibility rules as
 the definitions. Replay, database cloning and exclusive schema changes update
 the view through scoped writes. The views and pending name fields are inline in
 the table slots and included in startup memory; lookups allocate nothing.
+Creation also checks both committed and pending names through this view. If a
+matching table slot is reused during a wait, the conflict check selects it again.
 
 **User example:** checking an order's customer reference can find the customers
 table while an unrelated table definition is being changed. Looking for a table
-that does not exist also avoids waiting for unrelated definitions. SQL execution
+that does not exist, or creating a table with a different name, also avoids
+waiting for unrelated definitions. SQL execution
 is still serial; this removes a storage-level dependency before workers are added.
 Committed definition changes, table renames, rewrites and maintenance coordination
 remain in [PLAN.md](../PLAN.md).
@@ -470,8 +483,11 @@ that domain after it is renamed. Dropping it and creating a different domain
 with the old name cannot redirect a waiting view definition to the replacement.
 A failed policy edit keeps the previous expression and allowed roles intact.
 
-Complete type-name changes still require exclusive storage access. Saved journal
-references retain their source lifetime even when a rename commits
+Domain, enum and composite commits now use shared storage access. A name move
+rechecks its source and edit revision after waiting, and includes tables created
+or changed while it was acquiring locks. Source installation and dependent
+updates share those locks; exhausted publication counters leave everything intact.
+Saved journal references retain their source lifetime even when a rename commits
 before an older dependent definition. Checkpoints preserve the same identities
 and resolve type definitions before their dependents. Some schema changes still
 wait for retained snapshots. Removing the remaining restrictions requires shared
@@ -1114,14 +1130,14 @@ removed while a selected reader still owns it. For example, a reader that
 selected the status labels `new` and `paid` keeps those labels while an ALTER
 adds `shipped`; another lookup sees the new definition.
 
-Enum label edits stage, publish and roll back through shared storage access.
+Enum label edits and name moves use one shared storage commit API.
 An active storage reader can retain both its table definition and selected labels
-while a label-only update completes. A pending type-name or schema move is routed
-to exclusive publication before any definition or reference is changed.
+while a label-only update completes. A name or schema move additionally acquires
+the dependent definitions before changing the type and its references together.
 Undo records identify the transaction, the specific creation of the type, and
 its pending revision number. An older undo cannot release a newer edit's label
-buffer, including after a slot is reused. Revision numbers use the existing
-checked catalog counter, and all storage is still reserved at startup.
+buffer, including after a slot is reused. Revisions use a separate checked
+type-change counter, preserving durable object identities. All storage is reserved at startup.
 Server statements still execute serially.
 
 Committed definitions, pending changes and retained readers share the existing
@@ -1130,7 +1146,8 @@ Image counters and controls are charged at startup. Exhaustion returns 54000,
 "enum member-image pool is exhausted", without changing the published
 definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
-different image when readers retain the old one. Other type publication remains exclusive.
+different image when readers retain the old one. Type creation and some engine
+metadata preparation still require exclusive access.
 
 Transaction-wide catalog coordination, remaining table rewrites and SQL execution
 workers remain open.

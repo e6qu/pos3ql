@@ -402,12 +402,8 @@ impl super::TypeCatalog {
         }
     }
 
-    pub(super) fn conflicting_type_owner(
-        &self,
-        source: NamedTypeSlot,
-        transaction: u32,
-    ) -> Option<u32> {
-        let owners = match source {
+    fn type_change_owners(&self, source: NamedTypeSlot) -> [Option<u32>; 2] {
+        match source {
             NamedTypeSlot::Domain(slot) => [
                 self.domains[slot].ddl_state.pending_txid(),
                 self.domains[slot]
@@ -429,8 +425,21 @@ impl super::TypeCatalog {
                     .as_ref()
                     .map(|pending| pending.txid),
             ],
-        };
-        owners
+        }
+    }
+
+    pub(super) fn has_pending_type_change(&self, source: NamedTypeSlot) -> bool {
+        self.type_change_owners(source)
+            .into_iter()
+            .any(|owner| owner.is_some())
+    }
+
+    pub(super) fn conflicting_type_owner(
+        &self,
+        source: NamedTypeSlot,
+        transaction: u32,
+    ) -> Option<u32> {
+        self.type_change_owners(source)
             .into_iter()
             .flatten()
             .find(|&owner| owner != transaction)

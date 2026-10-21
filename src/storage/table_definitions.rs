@@ -2,7 +2,7 @@
 
 use core::mem::size_of;
 use core::ops::Deref;
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use {crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard};
 
 use super::table_names::{
     CommittedDefinitionWrite, DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope,
@@ -105,6 +105,18 @@ impl TableDefinition {
         &self,
     ) -> Result<RwLockReadGuard<'_, DefinitionState>, super::row_ownership::LockWait<'_>> {
         super::row_ownership::try_read(&self.state, "table definition lock poisoned")
+    }
+
+    pub(super) fn name_reservation_candidate(
+        &self,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+    ) -> Option<NameIdentity> {
+        self.names
+            .read()
+            .expect("table name lock poisoned")
+            .reservation_candidate(database, schema, name)
     }
 
     pub(super) fn try_write_for_batch(

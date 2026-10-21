@@ -67,6 +67,7 @@ use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::mem::mutex::Mutex;
 use crate::pg::pgoutput;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -678,7 +679,7 @@ struct ActiveSystemSetting {
 }
 
 struct ActiveSystemSettings {
-    image: std::sync::Mutex<ActiveSystemSettingsImage>,
+    image: Mutex<ActiveSystemSettingsImage>,
 }
 
 struct ActiveSystemSettingsImage {
@@ -689,7 +690,7 @@ struct ActiveSystemSettingsImage {
 impl ActiveSystemSettings {
     fn new(entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) -> Self {
         Self {
-            image: std::sync::Mutex::new(ActiveSystemSettingsImage {
+            image: Mutex::new(ActiveSystemSettingsImage {
                 entries,
                 reloaded: false,
             }),

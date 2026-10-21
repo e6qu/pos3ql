@@ -38,31 +38,17 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Tables, routines and saved queries publish their definitions and type references
-together, preserving source identities across rename and recovery. Readers now
-retain selected domain, enum and composite definitions in startup memory. Table
-reads and scalar function contracts capture nested types before execution waits;
-nested statements select their own visible definitions and share identical images.
-Type edits capture their source and definition revision together. Creation,
-deletion, commit and rollback carry the source lifetime and transaction owner;
-commit checks this ownership and dependent publication counters before durability.
-Subscription creation saves its stream identity instead of reconstructing it
-from allocation order during replay. Conflicting edits and deletion
-wait for their owner, including a transaction's pending rename.
-PostgreSQL comparisons keep result rows and error codes separate from multiline
-diagnostic wording; the dedicated message checks still compare error text.
+Readers retain selected table, routine and named-type definitions. Type changes
+recheck the selected edit after waits and include newly submitted dependent
+tables before changing their references together. The
+[current behavior guide](docs/implemented-baseline.md) owns the detailed contracts.
 
-Complete shared engine publication across transaction commit, remaining type
-retirement paths and metadata preparation before removing exclusive type commits and
-the transaction barrier. Connect all remaining preparation and rewrite paths to
-retained sources before running those paths concurrently.
-
-Finish protection for engine-wide publication and remaining table rewrites.
-Retain historical row, index and backup references before publishing replacements.
-Heap maintenance, pressure waits, capture and
-reader-history cleanup already use bounded turns. Metadata capture and some
-maintenance reads remain synchronous. Raising memory limits is not a completion
-criterion.
+When a transaction commits, publish its related changes together. Protect the
+remaining metadata creation, deletion and table-rewrite paths before running
+statements on several CPU workers. Preserve the definitions selected before a
+wait, and keep old row, index and backup data until their readers have finished.
+Some metadata capture and maintenance reads still block the worker. Raising
+memory limits is not a completion criterion.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

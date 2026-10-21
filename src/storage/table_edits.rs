@@ -1,6 +1,6 @@
 //! Transaction-private table shapes and their comment identities share one edit owner.
 
-use std::sync::MutexGuard;
+use crate::mem::mutex::MutexGuard;
 
 use super::table_names::DefinitionWrite;
 use super::{

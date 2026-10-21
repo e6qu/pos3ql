@@ -3,7 +3,7 @@
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};

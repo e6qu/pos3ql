@@ -8,13 +8,11 @@ Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 No defects currently meet this blocked-only boundary.
 
 A configured capacity limit may reject work explicitly. Partial changes, lost
-reader data or leaked ownership after that rejection are defects to fix here.
-Stale type edits and commit or rollback records must not alter a replacement
-type or release its saved labels. Lock waits must leave the prior definition intact.
-Recovery must restore subscription identities from saved records, including
-when aborted work left gaps in catalog allocation.
-Differential checks must preserve every query result and error code without
-mistaking multiline diagnostic text for returned rows.
+reader data, hidden runtime allocation or leaked ownership are defects. Waiting,
+rollback, recovery and slot reuse must preserve valid data and selected source
+identities. Keep detailed contracts in the
+[current behavior guide](docs/implemented-baseline.md) and regression evidence in
+the implementing PR.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Publication, recovery and capacity failures follow the same rule.

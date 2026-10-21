@@ -6,6 +6,8 @@
 // everything behind it. `unreachable_pub` keeps that surface from drifting back
 // open; `dead_code` (on by default) then does its job for the rest.
 #![warn(unreachable_pub)]
+#![cfg_attr(target_os = "macos", deny(clippy::disallowed_types))]
+#![cfg_attr(not(target_os = "macos"), allow(clippy::disallowed_types))]
 // SQL errors own a fixed protocol-sized message so post-startup error paths
 // allocate nothing. Boxing them to satisfy Clippy would violate that invariant.
 #![allow(clippy::result_large_err)]

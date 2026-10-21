@@ -12,8 +12,6 @@ mod definition_pool;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
-mod enum_publication;
-pub(crate) use enum_publication::EnumMemberPublication;
 mod type_edits;
 pub(crate) use statistics::CheckpointStatistics;
 pub(crate) use type_edits::{
@@ -30,6 +28,7 @@ pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
 mod type_names;
 mod type_reference_moves;
 mod type_references;
+use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
@@ -2644,11 +2643,11 @@ struct TablePublication {
 
 pub struct Table {
     /// Excludes overlapping existence changes and cleanup of this table.
-    lifecycle: std::sync::Mutex<()>,
+    lifecycle: Mutex<()>,
     definition: TableDefinition,
     pub rows: RowMap,
     /// Changed since the last checkpoint (drives delta checkpoints).
-    publication: std::sync::Mutex<TablePublication>,
+    publication: Mutex<TablePublication>,
     /// Captured unpublished rows need deletion markers until their roots install.
     checkpoint_deletions: std::sync::Arc<()>,
     /// Planner estimates, transaction-private column versions, and save markers.
@@ -2658,7 +2657,7 @@ pub struct Table {
     /// scan — explicit inserts do not advance it, deletes and TRUNCATE
     /// (without RESTART IDENTITY) do not rewind it, and a rolled-back insert
     /// still consumes its number.
-    serial: std::sync::Mutex<TableSerialState>,
+    serial: Mutex<TableSerialState>,
     /// Ordered immutable row generations and their eviction boundaries.
     /// Capture and replacement share ownership until reader roots are retained.
     spill_generations: SpillGenerationRoster,
@@ -3906,7 +3905,7 @@ struct PendingTableDefSlot {
 }
 
 impl Table {
-    fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+    fn lifecycle(&self) -> MutexGuard<'_, ()> {
         self.lifecycle
             .lock()
             .expect("table lifecycle lock poisoned")
@@ -3964,7 +3963,7 @@ impl Table {
     /// The one place `dirty` is set: every committed change advances the
     /// generation with it, so the sliced checkpoint can tell "dirty since
     /// the last publish" from "dirty since my slice of this sweep".
-    fn publication(&self) -> std::sync::MutexGuard<'_, TablePublication> {
+    fn publication(&self) -> MutexGuard<'_, TablePublication> {
         self.publication
             .lock()
             .expect("table publication lock poisoned")
@@ -4349,7 +4348,7 @@ impl<'a> StoredQueryDependencyView<'a> {
 }
 
 pub(crate) struct StoredQueryDependencyImage<'a> {
-    catalog: std::sync::MutexGuard<'a, StoredQueryDependencyCatalog>,
+    catalog: MutexGuard<'a, StoredQueryDependencyCatalog>,
     image: usize,
     count: u8,
     entries_per_image: usize,
@@ -7223,7 +7222,7 @@ struct OperatorCatalog {
 }
 
 struct AccessMethodIter<'a> {
-    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    catalog: &'a Mutex<OperatorCatalog>,
     next_slot: usize,
 }
 
@@ -7240,7 +7239,7 @@ impl Iterator for AccessMethodIter<'_> {
 }
 
 struct OperatorIter<'a> {
-    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    catalog: &'a Mutex<OperatorCatalog>,
     next_slot: usize,
 }
 
@@ -7257,7 +7256,7 @@ impl Iterator for OperatorIter<'_> {
 }
 
 struct OperatorFamilyIter<'a> {
-    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    catalog: &'a Mutex<OperatorCatalog>,
     next_slot: usize,
 }
 
@@ -7274,7 +7273,7 @@ impl Iterator for OperatorFamilyIter<'_> {
 }
 
 struct OperatorClassIter<'a> {
-    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    catalog: &'a Mutex<OperatorCatalog>,
     next_slot: usize,
 }
 
@@ -7296,7 +7295,7 @@ struct TextCatalog {
 }
 
 struct CollationIter<'a> {
-    catalog: &'a std::sync::Mutex<TextCatalog>,
+    catalog: &'a Mutex<TextCatalog>,
     next_slot: usize,
 }
 
@@ -7313,7 +7312,7 @@ impl Iterator for CollationIter<'_> {
 }
 
 struct ConversionIter<'a> {
-    catalog: &'a std::sync::Mutex<TextCatalog>,
+    catalog: &'a Mutex<TextCatalog>,
     next_slot: usize,
 }
 
@@ -7330,7 +7329,7 @@ impl Iterator for ConversionIter<'_> {
 }
 
 struct TextSearchIter<'a> {
-    catalog: &'a std::sync::Mutex<TextCatalog>,
+    catalog: &'a Mutex<TextCatalog>,
     next_slot: usize,
 }
 
@@ -7353,18 +7352,18 @@ impl RoutineLookup<'_> {
 }
 
 struct RoutineIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<RoutineDef>>,
+    catalog: &'a Mutex<FixedVec<RoutineDef>>,
     next_slot: usize,
     lookup: Option<RoutineLookup<'a>>,
 }
 
 struct CastIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<CastDef>>,
+    catalog: &'a Mutex<FixedVec<CastDef>>,
     next_slot: usize,
 }
 
 struct EventTriggerIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<EventTriggerDef>>,
+    catalog: &'a Mutex<FixedVec<EventTriggerDef>>,
     next_slot: usize,
 }
 
@@ -7382,7 +7381,7 @@ struct PolicyCatalog {
 }
 
 struct PolicyIter<'a> {
-    catalog: &'a std::sync::Mutex<PolicyCatalog>,
+    catalog: &'a Mutex<PolicyCatalog>,
     next_slot: usize,
 }
 
@@ -7399,7 +7398,7 @@ impl Iterator for PolicyIter<'_> {
 }
 
 pub(crate) struct PolicyRoleImage<'a> {
-    catalog: std::sync::MutexGuard<'a, PolicyCatalog>,
+    catalog: MutexGuard<'a, PolicyCatalog>,
     start: usize,
     count: usize,
 }
@@ -7419,17 +7418,17 @@ struct ExtendedStatisticsCatalog {
 }
 
 struct ExtendedStatisticsIter<'a> {
-    catalog: &'a std::sync::Mutex<ExtendedStatisticsCatalog>,
+    catalog: &'a Mutex<ExtendedStatisticsCatalog>,
     next_slot: usize,
 }
 
 struct PublicationIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<PublicationDef>>,
+    catalog: &'a Mutex<FixedVec<PublicationDef>>,
     next_slot: usize,
 }
 
 struct ReplicationSlotIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
+    catalog: &'a Mutex<FixedVec<ReplicationSlotDef>>,
     next_slot: usize,
 }
 
@@ -7441,7 +7440,7 @@ struct SubscriptionCatalog {
 }
 
 struct SubscriptionIter<'a> {
-    catalog: &'a std::sync::Mutex<SubscriptionCatalog>,
+    catalog: &'a Mutex<SubscriptionCatalog>,
     next_slot: usize,
 }
 
@@ -7461,7 +7460,7 @@ impl Iterator for SubscriptionIter<'_> {
 }
 
 struct SubscriptionRelationIter<'a> {
-    catalog: &'a std::sync::Mutex<SubscriptionCatalog>,
+    catalog: &'a Mutex<SubscriptionCatalog>,
     next_slot: usize,
 }
 
@@ -7525,12 +7524,12 @@ impl Iterator for ExtendedStatisticsIter<'_> {
 }
 
 struct SequenceIter<'a> {
-    catalog: &'a std::sync::Mutex<SequenceCatalog>,
+    catalog: &'a Mutex<SequenceCatalog>,
     next_slot: usize,
 }
 
 struct SequenceCheckpointIter<'a> {
-    catalog: &'a std::sync::Mutex<SequenceCatalog>,
+    catalog: &'a Mutex<SequenceCatalog>,
     next_slot: usize,
 }
 
@@ -7566,7 +7565,7 @@ impl Iterator for SequenceIter<'_> {
 }
 
 struct TriggerIter<'a> {
-    catalog: &'a std::sync::Mutex<TriggerCatalog>,
+    catalog: &'a Mutex<TriggerCatalog>,
     next_slot: usize,
 }
 
@@ -7583,7 +7582,7 @@ impl Iterator for TriggerIter<'_> {
 }
 
 struct PartitionTriggerStateIter<'a> {
-    catalog: &'a std::sync::Mutex<TriggerCatalog>,
+    catalog: &'a Mutex<TriggerCatalog>,
     next_slot: usize,
 }
 
@@ -7661,7 +7660,7 @@ impl Iterator for TextSearchIter<'_> {
 }
 
 struct DomainIter<'a> {
-    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    catalog: &'a Mutex<TypeCatalog>,
     next_slot: usize,
 }
 
@@ -7678,7 +7677,7 @@ impl Iterator for DomainIter<'_> {
 }
 
 struct EnumIter<'a> {
-    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    catalog: &'a Mutex<TypeCatalog>,
     next_slot: usize,
 }
 
@@ -7695,7 +7694,7 @@ impl Iterator for EnumIter<'_> {
 }
 
 struct CompositeIter<'a> {
-    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    catalog: &'a Mutex<TypeCatalog>,
     next_slot: usize,
 }
 
@@ -9574,7 +9573,7 @@ impl Iterator for EnumMemberIter {
 impl ExactSizeIterator for EnumMemberIter {}
 
 pub(crate) struct EnumReplayMembers<'a> {
-    images: std::sync::MutexGuard<'a, EnumMemberImages>,
+    images: MutexGuard<'a, EnumMemberImages>,
     count: usize,
 }
 
@@ -10565,7 +10564,7 @@ impl TablespaceDef {
 }
 
 struct TablespaceIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<TablespaceDef>>,
+    catalog: &'a Mutex<FixedVec<TablespaceDef>>,
     next_slot: usize,
 }
 
@@ -11073,7 +11072,7 @@ struct ExtensionCatalog {
 }
 
 struct ExtensionIter<'a> {
-    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    catalog: &'a Mutex<ExtensionCatalog>,
     next_slot: usize,
 }
 
@@ -11093,7 +11092,7 @@ impl Iterator for ExtensionIter<'_> {
 }
 
 struct ExtensionDependencyIter<'a> {
-    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    catalog: &'a Mutex<ExtensionCatalog>,
     next_slot: usize,
 }
 
@@ -11113,7 +11112,7 @@ impl Iterator for ExtensionDependencyIter<'_> {
 }
 
 struct ExtensionConfigIter<'a> {
-    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    catalog: &'a Mutex<ExtensionCatalog>,
     next_slot: usize,
 }
 
@@ -11505,7 +11504,7 @@ impl SchemaDef {
 }
 
 struct SchemaIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<SchemaDef>>,
+    catalog: &'a Mutex<FixedVec<SchemaDef>>,
     next_slot: usize,
 }
 
@@ -11674,7 +11673,7 @@ enum LargeObjectFilter {
 }
 
 struct LargeObjectIter<'a> {
-    catalog: &'a std::sync::Mutex<LargeObjectCatalog>,
+    catalog: &'a Mutex<LargeObjectCatalog>,
     filter: LargeObjectFilter,
     next_slot: usize,
 }
@@ -12131,7 +12130,7 @@ impl Iterator for ColumnAclIter<'_> {
 }
 
 struct DefaultAclIter<'a> {
-    catalog: &'a std::sync::Mutex<AclCatalog>,
+    catalog: &'a Mutex<AclCatalog>,
     database: Option<DatabaseOid>,
     next_slot: usize,
 }
@@ -12162,7 +12161,7 @@ enum ParameterAclIterMode {
 }
 
 struct ParameterAclIter<'a> {
-    catalog: &'a std::sync::Mutex<AclCatalog>,
+    catalog: &'a Mutex<AclCatalog>,
     next_slot: usize,
     mode: ParameterAclIterMode,
 }
@@ -12439,7 +12438,7 @@ struct RoleCatalog {
 }
 
 struct RoleIter<'a> {
-    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    catalog: &'a Mutex<RoleCatalog>,
     next_slot: usize,
     live_only: bool,
 }
@@ -12464,7 +12463,7 @@ impl Iterator for RoleIter<'_> {
 }
 
 struct RoleMembershipIter<'a> {
-    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    catalog: &'a Mutex<RoleCatalog>,
     next_slot: usize,
     live_only: bool,
 }
@@ -12489,7 +12488,7 @@ impl Iterator for RoleMembershipIter<'_> {
 }
 
 struct RoleSettingIter<'a> {
-    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    catalog: &'a Mutex<RoleCatalog>,
     next_slot: usize,
 }
 
@@ -12740,13 +12739,13 @@ impl CommentCatalog {
 }
 
 struct LiveCommentIter<'a> {
-    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    catalog: &'a Mutex<CommentCatalog>,
     database: DatabaseOid,
     next_slot: usize,
 }
 
 struct CheckpointCommentIter<'a> {
-    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    catalog: &'a Mutex<CommentCatalog>,
     next_slot: usize,
 }
 
@@ -12793,7 +12792,7 @@ impl Iterator for LiveCommentIter<'_> {
 }
 
 struct VisibleCommentIter<'a> {
-    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    catalog: &'a Mutex<CommentCatalog>,
     database: DatabaseOid,
     txid: u32,
     next_slot: usize,
@@ -13176,12 +13175,12 @@ struct ForeignSessionSlot {
 struct ForeignSessionPool {
     /// Serializes slot assignment so a transaction and endpoint cannot be
     /// installed in two slots while another slot is being released.
-    assignment: std::sync::Mutex<()>,
-    slots: FixedVec<std::sync::Mutex<ForeignSessionSlot>>,
+    assignment: Mutex<()>,
+    slots: FixedVec<Mutex<ForeignSessionSlot>>,
 }
 
 pub(crate) struct ForeignClientGuard<'a> {
-    slot: std::sync::MutexGuard<'a, ForeignSessionSlot>,
+    slot: MutexGuard<'a, ForeignSessionSlot>,
 }
 
 impl core::ops::Deref for ForeignClientGuard<'_> {
@@ -13211,7 +13210,7 @@ impl ForeignClientGuard<'_> {
 }
 
 pub(crate) const fn foreign_session_slot_bytes() -> usize {
-    size_of::<std::sync::Mutex<ForeignSessionSlot>>()
+    size_of::<Mutex<ForeignSessionSlot>>()
 }
 
 struct ForeignStatementContext {
@@ -13221,7 +13220,7 @@ struct ForeignStatementContext {
 }
 
 pub(crate) struct ForeignStatementContextGuard<'a> {
-    context: std::sync::MutexGuard<'a, ForeignStatementContext>,
+    context: MutexGuard<'a, ForeignStatementContext>,
     transaction_id: u32,
 }
 
@@ -13240,7 +13239,7 @@ impl ForeignStatementContextGuard<'_> {
 }
 
 pub(crate) fn foreign_statement_context_workspace_bytes(config: &Config) -> usize {
-    size_of::<std::sync::Mutex<ForeignStatementContext>>()
+    size_of::<Mutex<ForeignStatementContext>>()
         + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
 }
 
@@ -13696,7 +13695,7 @@ impl CatalogSequence {
 }
 
 struct ForeignCatalogIter<'a, D: Copy> {
-    catalog: &'a std::sync::Mutex<foreign::ForeignCatalog>,
+    catalog: &'a Mutex<foreign::ForeignCatalog>,
     next_slot: usize,
     database: Option<DatabaseOid>,
     txid: u32,
@@ -13736,7 +13735,7 @@ struct DatabaseCatalog {
 }
 
 struct DatabaseIter<'a> {
-    catalog: &'a std::sync::Mutex<DatabaseCatalog>,
+    catalog: &'a Mutex<DatabaseCatalog>,
     next_slot: usize,
     txid: u32,
 }
@@ -13757,7 +13756,7 @@ impl Iterator for DatabaseIter<'_> {
 }
 
 struct IndexIter<'a, F = fn(&IndexDef) -> bool> {
-    catalog: &'a std::sync::Mutex<FixedVec<IndexDef>>,
+    catalog: &'a Mutex<FixedVec<IndexDef>>,
     next_slot: usize,
     accept: F,
 }
@@ -13799,7 +13798,7 @@ impl ViewRuleCatalog {
 }
 
 struct ViewRuleIter<'a, T> {
-    catalog: &'a std::sync::Mutex<ViewRuleCatalog>,
+    catalog: &'a Mutex<ViewRuleCatalog>,
     entries: fn(&ViewRuleCatalog) -> &FixedVec<T>,
     next_slot: usize,
     txid: u32,
@@ -13835,7 +13834,7 @@ impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
 }
 
 struct MatviewIter<'a> {
-    catalog: &'a std::sync::Mutex<FixedVec<MatviewDef>>,
+    catalog: &'a Mutex<FixedVec<MatviewDef>>,
     next_slot: usize,
     database: Option<DatabaseOid>,
     txid: u32,
@@ -13872,7 +13871,7 @@ pub struct Storage {
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     /// Serializes table-name checks and empty-slot initialization, never row I/O.
-    table_creation: std::sync::Mutex<()>,
+    table_creation: Mutex<()>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
@@ -13882,83 +13881,83 @@ pub struct Storage {
     type_publication: type_reference_moves::TypePublication,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
-    large_objects: std::sync::Mutex<LargeObjectCatalog>,
+    large_objects: Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
     pending_table_defs: DefinitionVersions,
     pending_table_statistics: StatisticsVersions,
-    view_rule_catalog: std::sync::Mutex<ViewRuleCatalog>,
+    view_rule_catalog: Mutex<ViewRuleCatalog>,
     view_catalog_capacity: usize,
     rule_catalog_capacity: usize,
     routine_catalog_capacity: usize,
-    routines: std::sync::Mutex<FixedVec<RoutineDef>>,
-    casts: std::sync::Mutex<FixedVec<CastDef>>,
-    operator_catalog: std::sync::Mutex<OperatorCatalog>,
-    text_catalog: std::sync::Mutex<TextCatalog>,
-    event_triggers: std::sync::Mutex<FixedVec<EventTriggerDef>>,
-    stored_query_dependencies: std::sync::Mutex<StoredQueryDependencyCatalog>,
+    routines: Mutex<FixedVec<RoutineDef>>,
+    casts: Mutex<FixedVec<CastDef>>,
+    operator_catalog: Mutex<OperatorCatalog>,
+    text_catalog: Mutex<TextCatalog>,
+    event_triggers: Mutex<FixedVec<EventTriggerDef>>,
+    stored_query_dependencies: Mutex<StoredQueryDependencyCatalog>,
     stored_query_dependencies_per_image: usize,
     stored_query_dependency_pending_base: usize,
-    trigger_catalog: std::sync::Mutex<TriggerCatalog>,
-    policy_catalog: std::sync::Mutex<PolicyCatalog>,
+    trigger_catalog: Mutex<TriggerCatalog>,
+    policy_catalog: Mutex<PolicyCatalog>,
     policy_catalog_capacity: usize,
     policy_roles_per_image: usize,
     policy_role_pending_base: usize,
     policy_role_replay_image: usize,
-    extended_statistics_catalog: std::sync::Mutex<ExtendedStatisticsCatalog>,
-    publications: std::sync::Mutex<FixedVec<PublicationDef>>,
-    replication_slots: std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
-    subscription_catalog: std::sync::Mutex<SubscriptionCatalog>,
-    foreign: std::sync::Mutex<foreign::ForeignCatalog>,
+    extended_statistics_catalog: Mutex<ExtendedStatisticsCatalog>,
+    publications: Mutex<FixedVec<PublicationDef>>,
+    replication_slots: Mutex<FixedVec<ReplicationSlotDef>>,
+    subscription_catalog: Mutex<SubscriptionCatalog>,
+    foreign: Mutex<foreign::ForeignCatalog>,
     foreign_sessions: ForeignSessionPool,
-    foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
-    matviews: std::sync::Mutex<FixedVec<MatviewDef>>,
-    sequence_catalog: std::sync::Mutex<SequenceCatalog>,
-    type_catalog: std::sync::Mutex<TypeCatalog>,
+    foreign_statement_contexts: FixedVec<Mutex<ForeignStatementContext>>,
+    matviews: Mutex<FixedVec<MatviewDef>>,
+    sequence_catalog: Mutex<SequenceCatalog>,
+    type_catalog: Mutex<TypeCatalog>,
     type_definition_images: type_definitions::TypeDefinitionImagePools,
     enum_members_per_image: usize,
-    enum_member_images: std::sync::Arc<std::sync::Mutex<EnumMemberImages>>,
-    domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
-    index_catalog: std::sync::Mutex<FixedVec<IndexDef>>,
+    enum_member_images: std::sync::Arc<Mutex<EnumMemberImages>>,
+    domain_graph_scratch: Mutex<FixedVec<u8>>,
+    index_catalog: Mutex<FixedVec<IndexDef>>,
     index_catalog_capacity: usize,
-    brin_maintenance: std::sync::Mutex<BrinMaintenance>,
+    brin_maintenance: Mutex<BrinMaintenance>,
     brin_unsummarized_ranges_per_index: usize,
-    database_catalog: std::sync::Mutex<DatabaseCatalog>,
+    database_catalog: Mutex<DatabaseCatalog>,
     database_catalog_capacity: usize,
-    backend_state: std::sync::Mutex<BackendState>,
-    cumulative_statistics: std::sync::Mutex<CumulativeStatistics>,
+    backend_state: Mutex<BackendState>,
+    cumulative_statistics: Mutex<CumulativeStatistics>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
-    temporary_transactions: std::sync::Mutex<TemporaryTransactionState>,
-    tablespaces: std::sync::Mutex<FixedVec<TablespaceDef>>,
-    schemas: std::sync::Mutex<FixedVec<SchemaDef>>,
-    extension_catalog: std::sync::Mutex<ExtensionCatalog>,
+    temporary_transactions: Mutex<TemporaryTransactionState>,
+    tablespaces: Mutex<FixedVec<TablespaceDef>>,
+    schemas: Mutex<FixedVec<SchemaDef>>,
+    extension_catalog: Mutex<ExtensionCatalog>,
     extension_packages: FixedVec<ExtensionPackage>,
     extension_scripts: FixedVec<ExtensionScript>,
     extension_script_source: FixedBuf,
     extension_package_source: ExtensionPackageSource,
-    role_catalog: std::sync::Mutex<RoleCatalog>,
+    role_catalog: Mutex<RoleCatalog>,
     /// One mutex-protected authorization bitmap per fixed query workspace.
-    role_graph_scratch: FixedVec<std::sync::Mutex<FixedVec<bool>>>,
-    system_settings: std::sync::Mutex<FixedVec<SystemSetting>>,
-    prepared_transactions: std::sync::Mutex<PreparedTransactionCatalog>,
-    acl_catalog: std::sync::Mutex<AclCatalog>,
+    role_graph_scratch: FixedVec<Mutex<FixedVec<bool>>>,
+    system_settings: Mutex<FixedVec<SystemSetting>>,
+    prepared_transactions: Mutex<PreparedTransactionCatalog>,
+    acl_catalog: Mutex<AclCatalog>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
-    comments: std::sync::Mutex<CommentCatalog>,
+    comments: Mutex<CommentCatalog>,
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
     next_rowid: row_identities::RowIdentities,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
-    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotState>>,
+    snapshots: std::sync::Arc<Mutex<SnapshotState>>,
     /// Assigned top-level transaction identities visible to SQL snapshots.
     /// The registry includes prepared transactions and is startup-bounded by
     /// the same connection/prepared-transaction capacity as MVCC snapshots.
-    transaction_identities: std::sync::Mutex<TransactionIdentityState>,
+    transaction_identities: Mutex<TransactionIdentityState>,
     /// Relation, row, and advisory locks share one wait graph and acquisition
     /// sequence. One boundary keeps cross-registry transitions atomic.
-    locks: std::sync::Arc<std::sync::Mutex<LockState>>,
+    locks: std::sync::Arc<Mutex<LockState>>,
     /// Shared provisional record positions; commit ordering is coordinated by WAL.
     lsn: log_positions::LogPositions,
     /// ALTER TABLE replay is encoded as a compact identity/mapping marker
@@ -13974,7 +13973,7 @@ pub struct Storage {
     /// Parser/evaluator scratch for durable expression and partial-index keys.
     /// The lock retains one allocation frontier through nested evaluation;
     /// every use rewinds to its entry mark.
-    index_arena: std::sync::Mutex<Arena>,
+    index_arena: Mutex<Arena>,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
@@ -13990,7 +13989,7 @@ struct CollationRuntime {
     locale: OwnedLocale,
     name: StackStr<128>,
     scratch_capacity: usize,
-    scratch: std::sync::Mutex<CollationScratch>,
+    scratch: Mutex<CollationScratch>,
 }
 
 struct OwnedLocale(libc::locale_t);
@@ -14077,7 +14076,7 @@ impl CollationRuntime {
             locale: OwnedLocale(locale),
             name: StackStr::from_str(config.database_collation_locale.as_str()),
             scratch_capacity: config.collation_scratch_bytes,
-            scratch: std::sync::Mutex::new(scratch),
+            scratch: Mutex::new(scratch),
         })
     }
 
@@ -14136,34 +14135,33 @@ unsafe extern "C" {
 /// The block stacks are shared with checkpoint and spill writers through the
 /// same synchronization boundary.
 pub(crate) struct SpillReader {
-    blocks: Option<
-        std::sync::Arc<std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
-    >,
-    temporary_blocks: Option<std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>>,
+    blocks:
+        Option<std::sync::Arc<Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>>,
+    temporary_blocks: Option<std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>>,
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
-    scratch: [std::sync::Mutex<SpillScratch>; 2],
+    scratch: [Mutex<SpillScratch>; 2],
     /// Merged walks share startup-owned frames keyed by immutable source and
     /// block position. Nested callbacks release the context lock; frame reuse
     /// invalidates a cursor's residency claim, never its logical position.
-    scan_contexts: Box<[std::sync::Mutex<ScanContext>]>,
+    scan_contexts: Box<[Mutex<ScanContext>]>,
     /// Logical cursor state remains leased across row callbacks while block
     /// buffers are released for nested scans. The parser's query-list bound
     /// is also the maximum possible nested row-source depth.
-    cursor_contexts: Box<[std::sync::Mutex<Box<[MemberCursor]>>]>,
-    next_walk_id: std::sync::Mutex<u64>,
+    cursor_contexts: Box<[Mutex<Box<[MemberCursor]>>]>,
+    next_walk_id: Mutex<u64>,
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
-    value_scratch: Option<[std::sync::Mutex<ValueIndexScratch>; 2]>,
+    value_scratch: Option<[Mutex<ValueIndexScratch>; 2]>,
     /// Nested materializers lease independent external-run producers. Their
     /// buffers and merge fan-in are fixed at startup; run blocks travel
     /// through `blocks`, never a provider-specific path.
-    external_sorters: Box<[std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>]>,
+    external_sorters: Box<[Mutex<Box<crate::sql::external::ExternalSorter>>]>,
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
-    external_readers: std::sync::Arc<[std::sync::Mutex<crate::sql::external::ExternalRunReader>]>,
+    external_readers: std::sync::Arc<[Mutex<crate::sql::external::ExternalRunReader>]>,
 }
 
 /// Copyable access to immutable external runs.
@@ -14176,17 +14174,15 @@ pub(crate) struct SpillReader {
 /// were reserved during startup.
 #[derive(Clone, Copy)]
 pub(crate) struct ExternalRunAccess {
-    blocks: *const std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
-    readers: *const [std::sync::Mutex<crate::sql::external::ExternalRunReader>],
+    blocks: *const Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+    readers: *const [Mutex<crate::sql::external::ExternalRunReader>],
 }
 
 impl ExternalRunAccess {
     pub(crate) fn reader(
         &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, crate::sql::external::ExternalRunReader>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, crate::sql::external::ExternalRunReader>, crate::sql::eval::SqlError>
+    {
         // SAFETY: both allocations are pinned by `SpillReader`'s `Arc`s for
         // the engine lifetime; the crate-private handle is only installed in
         // executor state that cannot outlive that engine.
@@ -14271,7 +14267,7 @@ impl ScanContext {
                 * (2 * size_of::<Box<[u8]>>()
                     + size_of::<Option<ScanBlockImage>>()
                     + size_of::<ScanColumnExtents>())
-            + size_of::<std::sync::Mutex<Self>>()
+            + size_of::<Mutex<Self>>()
     }
 
     fn new(capacity: usize) -> Self {
@@ -14535,10 +14531,10 @@ impl ReadScratch for ValueIndexScratch {
 /// Prefer the source's existing bytes, then an unused context. Taking the first
 /// free context on every retry would overwrite one source while another sits idle.
 fn try_source_scratch<'a, T: ReadScratch>(
-    pool: &'a [std::sync::Mutex<T>],
+    pool: &'a [Mutex<T>],
     name: &str,
     source: Option<crate::store::BlockId>,
-) -> Option<std::sync::MutexGuard<'a, T>> {
+) -> Option<MutexGuard<'a, T>> {
     for preference in 0..3 {
         for candidate in pool {
             match candidate.try_lock() {
@@ -14563,10 +14559,7 @@ fn try_source_scratch<'a, T: ReadScratch>(
     None
 }
 
-fn try_mutex_pool<'a, T>(
-    pool: &'a [std::sync::Mutex<T>],
-    name: &str,
-) -> Option<std::sync::MutexGuard<'a, T>> {
+fn try_mutex_pool<'a, T>(pool: &'a [Mutex<T>], name: &str) -> Option<MutexGuard<'a, T>> {
     for candidate in pool {
         match candidate.try_lock() {
             Ok(lease) => return Some(lease),
@@ -14585,13 +14578,9 @@ impl SpillReader {
         budget: &mut Budget,
         max_spill_generations: usize,
         blocks: Option<
-            std::sync::Arc<
-                std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
-            >,
+            std::sync::Arc<Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
         >,
-        temporary_blocks: Option<
-            std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
-        >,
+        temporary_blocks: Option<std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>>,
     ) -> Result<std::sync::Arc<Self>, BudgetError> {
         let durable = blocks.is_some();
         budget.draw(Self::owner_bytes(), "shared spill reader owner")?;
@@ -14610,7 +14599,7 @@ impl SpillReader {
         )?;
         budget.draw_array(
             MAX_ROW_WALK_NESTING,
-            core::mem::size_of::<std::sync::Mutex<Box<[MemberCursor]>>>(),
+            core::mem::size_of::<Mutex<Box<[MemberCursor]>>>(),
             "row-state walk cursor slots",
         )?;
         let mut external_sorters = Vec::new();
@@ -14621,12 +14610,12 @@ impl SpillReader {
             )?;
             budget.draw_array(
                 EXTERNAL_RUN_CONTEXTS,
-                core::mem::size_of::<std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>>(),
+                core::mem::size_of::<Mutex<Box<crate::sql::external::ExternalSorter>>>(),
                 "external query run producer slots",
             )?;
             external_sorters.reserve_exact(EXTERNAL_RUN_CONTEXTS);
             for _ in 0..EXTERNAL_RUN_CONTEXTS {
-                external_sorters.push(std::sync::Mutex::new(Box::new(
+                external_sorters.push(Mutex::new(Box::new(
                     crate::sql::external::ExternalSorter::new(budget)?,
                 )));
             }
@@ -14635,7 +14624,7 @@ impl SpillReader {
                 "external query run readers",
             )?;
             (0..EXTERNAL_RUN_CONTEXTS)
-                .map(|_| std::sync::Mutex::new(crate::sql::external::ExternalRunReader::new()))
+                .map(|_| Mutex::new(crate::sql::external::ExternalRunReader::new()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
                 .into()
@@ -14643,7 +14632,7 @@ impl SpillReader {
             Vec::new().into_boxed_slice().into()
         };
         let fresh = || {
-            std::sync::Mutex::new(SpillScratch {
+            Mutex::new(SpillScratch {
                 source: None,
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -14656,9 +14645,9 @@ impl SpillReader {
                 index_leaf: None,
             })
         };
-        let context = || std::sync::Mutex::new(ScanContext::new(max_spill_generations));
+        let context = || Mutex::new(ScanContext::new(max_spill_generations));
         let value = || {
-            std::sync::Mutex::new(ValueIndexScratch {
+            Mutex::new(ValueIndexScratch {
                 source: None,
                 roster: crate::store::RetainedBlockBuffer::new(),
                 data: crate::store::RetainedBlockBuffer::new(),
@@ -14670,9 +14659,7 @@ impl SpillReader {
         }
         let cursor_contexts = (0..MAX_ROW_WALK_NESTING)
             .map(|_| {
-                std::sync::Mutex::new(
-                    vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
-                )
+                Mutex::new(vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice())
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -14682,7 +14669,7 @@ impl SpillReader {
             scratch: [fresh(), fresh()],
             scan_contexts: scan_contexts.into_boxed_slice(),
             cursor_contexts,
-            next_walk_id: std::sync::Mutex::new(1),
+            next_walk_id: Mutex::new(1),
             value_scratch: durable.then(|| [value(), value()]),
             external_sorters: external_sorters.into_boxed_slice(),
             external_readers,
@@ -14696,15 +14683,13 @@ impl SpillReader {
             + SCAN_CONTEXTS * ScanContext::budget_bytes(max_spill_generations)
             + MAX_ROW_WALK_NESTING
                 * (max_spill_generations * core::mem::size_of::<MemberCursor>()
-                    + core::mem::size_of::<std::sync::Mutex<Box<[MemberCursor]>>>());
+                    + core::mem::size_of::<Mutex<Box<[MemberCursor]>>>());
         if durable {
             row_reader
                 + 4 * crate::store::MAX_PAYLOAD
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
                 + EXTERNAL_RUN_CONTEXTS
-                    * core::mem::size_of::<
-                        std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>,
-                    >()
+                    * core::mem::size_of::<Mutex<Box<crate::sql::external::ExternalSorter>>>()
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
         } else {
             row_reader
@@ -14918,8 +14903,8 @@ impl SpillReader {
 }
 
 enum RelationBlockStore<'a> {
-    Durable(std::sync::MutexGuard<'a, crate::store::TieredStore<crate::store::OwnedObjectStore>>),
-    Temporary(std::sync::MutexGuard<'a, crate::store::EphemeralBlockStore>),
+    Durable(MutexGuard<'a, crate::store::TieredStore<crate::store::OwnedObjectStore>>),
+    Temporary(MutexGuard<'a, crate::store::EphemeralBlockStore>),
 }
 
 impl core::ops::Deref for RelationBlockStore<'_> {
@@ -15291,7 +15276,7 @@ impl Storage {
         Some(state)
     }
 
-    fn cumulative_statistics(&self) -> std::sync::MutexGuard<'_, CumulativeStatistics> {
+    fn cumulative_statistics(&self) -> MutexGuard<'_, CumulativeStatistics> {
         self.cumulative_statistics
             .lock()
             .expect("cumulative statistics lock poisoned")
@@ -16088,7 +16073,7 @@ impl Storage {
         crate::sql::execution_connection_id()
     }
 
-    fn backend_state(&self) -> std::sync::MutexGuard<'_, BackendState> {
+    fn backend_state(&self) -> MutexGuard<'_, BackendState> {
         self.backend_state
             .lock()
             .expect("backend state lock poisoned")
@@ -16749,7 +16734,7 @@ impl Storage {
         }
     }
 
-    fn foreign_catalog(&self) -> std::sync::MutexGuard<'_, foreign::ForeignCatalog> {
+    fn foreign_catalog(&self) -> MutexGuard<'_, foreign::ForeignCatalog> {
         self.foreign.lock().expect("foreign catalog lock poisoned")
     }
 
@@ -18048,7 +18033,7 @@ impl Storage {
             + log_positions::LogPositions::budget_bytes()
             + size_of::<CatalogSequence>()
             + size_of::<usize>()
-            + size_of::<std::sync::Mutex<()>>()
+            + size_of::<Mutex<()>>()
             + snapshot_owner_bytes()
             + config.max_connections as usize * size_of::<ExportedSnapshot>()
             + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
@@ -18126,8 +18111,7 @@ impl Storage {
             + config.max_role_memberships * size_of::<RoleMembership>()
             + config.max_role_settings * size_of::<RoleSetting>()
             + config.query_workspace_slots
-                * (size_of::<std::sync::Mutex<FixedVec<bool>>>()
-                    + config.max_roles * size_of::<bool>())
+                * (size_of::<Mutex<FixedVec<bool>>>() + config.max_roles * size_of::<bool>())
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
@@ -18194,7 +18178,7 @@ impl Storage {
             size_of::<type_references::TypeOrigin>(),
             "type reference origin",
         )?;
-        budget.draw(size_of::<std::sync::Mutex<()>>(), "table creation controls")?;
+        budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         budget.draw(size_of::<usize>(), "routine catalog capacity")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
@@ -18224,7 +18208,7 @@ impl Storage {
         for slot in 0..table_capacity {
             tables
                 .push(Table {
-                    lifecycle: std::sync::Mutex::new(()),
+                    lifecycle: Mutex::new(()),
                     definition: TableDefinition::new(TableDef {
                         name: SqlName::parse("").expect("empty name fits"),
                         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
@@ -18240,7 +18224,7 @@ impl Storage {
                             config.table_rows
                         },
                     )?,
-                    publication: std::sync::Mutex::new(TablePublication {
+                    publication: Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
                         rewrite_generation: 0,
@@ -18249,7 +18233,7 @@ impl Storage {
                     }),
                     checkpoint_deletions: std::sync::Arc::new(()),
                     statistics: TableStatisticsOwner::new(budget)?,
-                    serial: std::sync::Mutex::new(TableSerialState::EMPTY),
+                    serial: Mutex::new(TableSerialState::EMPTY),
                     spill_generations: SpillGenerationRoster::new(
                         budget,
                         config.max_spill_generations_per_table,
@@ -18724,7 +18708,7 @@ impl Storage {
                 scratch.push(false).expect("sized to max_roles");
             }
             role_graph_scratch
-                .push(std::sync::Mutex::new(scratch))
+                .push(Mutex::new(scratch))
                 .expect("sized to query_workspace_slots");
         }
         let mut foreign_statement_contexts = FixedVec::new(
@@ -18734,7 +18718,7 @@ impl Storage {
         )?;
         for _ in 0..config.query_workspace_slots {
             foreign_statement_contexts
-                .push(std::sync::Mutex::new(ForeignStatementContext {
+                .push(Mutex::new(ForeignStatementContext {
                     transaction_id: 0,
                     serializable: false,
                     savepoints: FixedVec::new(
@@ -18890,7 +18874,7 @@ impl Storage {
             "recent_transaction_statuses",
             transaction_capacity.saturating_mul(8).max(64),
         )?;
-        let temporary_transactions = std::sync::Mutex::new(TemporaryTransactionState {
+        let temporary_transactions = Mutex::new(TemporaryTransactionState {
             transactions: FixedVec::new(budget, "temporary_transactions", transaction_capacity)?,
         });
         let backends = FixedVec::new(budget, "backend_activity", config.max_connections as usize)?;
@@ -18958,7 +18942,7 @@ impl Storage {
         let storage = Self {
             heap,
             tables,
-            table_creation: std::sync::Mutex::new(()),
+            table_creation: Mutex::new(()),
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
@@ -18968,7 +18952,7 @@ impl Storage {
             type_publication,
             spill_roots,
             query_roots,
-            large_objects: std::sync::Mutex::new(LargeObjectCatalog {
+            large_objects: Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
             }),
@@ -18976,36 +18960,36 @@ impl Storage {
             max_catalog_versions_per_object: config.max_catalog_versions_per_object as u32,
             pending_table_defs,
             pending_table_statistics,
-            view_rule_catalog: std::sync::Mutex::new(ViewRuleCatalog { views, rules }),
+            view_rule_catalog: Mutex::new(ViewRuleCatalog { views, rules }),
             view_catalog_capacity: config.max_views,
             rule_catalog_capacity: config.max_rules,
             routine_catalog_capacity: config.max_routines,
-            routines: std::sync::Mutex::new(routines),
-            casts: std::sync::Mutex::new(casts),
-            operator_catalog: std::sync::Mutex::new(OperatorCatalog {
+            routines: Mutex::new(routines),
+            casts: Mutex::new(casts),
+            operator_catalog: Mutex::new(OperatorCatalog {
                 access_methods,
                 operators,
                 families: operator_families,
                 classes: operator_classes,
             }),
-            text_catalog: std::sync::Mutex::new(TextCatalog {
+            text_catalog: Mutex::new(TextCatalog {
                 collations,
                 conversions,
                 text_search_objects,
             }),
-            event_triggers: std::sync::Mutex::new(event_triggers),
-            stored_query_dependencies: std::sync::Mutex::new(StoredQueryDependencyCatalog {
+            event_triggers: Mutex::new(event_triggers),
+            stored_query_dependencies: Mutex::new(StoredQueryDependencyCatalog {
                 entries: stored_query_dependencies,
                 counts: stored_query_dependency_counts,
                 pending: pending_stored_query_dependencies,
             }),
             stored_query_dependencies_per_image: config.max_stored_query_dependencies_per_object,
             stored_query_dependency_pending_base: committed_dependency_images,
-            trigger_catalog: std::sync::Mutex::new(TriggerCatalog {
+            trigger_catalog: Mutex::new(TriggerCatalog {
                 definitions: triggers,
                 partition_states: partition_trigger_states,
             }),
-            policy_catalog: std::sync::Mutex::new(PolicyCatalog {
+            policy_catalog: Mutex::new(PolicyCatalog {
                 definitions: policies,
                 roles: policy_roles,
             }),
@@ -19013,28 +18997,28 @@ impl Storage {
             policy_roles_per_image,
             policy_role_pending_base,
             policy_role_replay_image,
-            extended_statistics_catalog: std::sync::Mutex::new(ExtendedStatisticsCatalog {
+            extended_statistics_catalog: Mutex::new(ExtendedStatisticsCatalog {
                 definitions: extended_statistics,
                 pending_data: pending_extended_statistics_data,
             }),
-            publications: std::sync::Mutex::new(publications),
-            replication_slots: std::sync::Mutex::new(replication_slots),
-            subscription_catalog: std::sync::Mutex::new(SubscriptionCatalog {
+            publications: Mutex::new(publications),
+            replication_slots: Mutex::new(replication_slots),
+            subscription_catalog: Mutex::new(SubscriptionCatalog {
                 definitions: subscriptions,
                 relations: subscription_relations,
             }),
-            foreign: std::sync::Mutex::new(foreign),
+            foreign: Mutex::new(foreign),
             foreign_sessions: ForeignSessionPool {
-                assignment: std::sync::Mutex::new(()),
+                assignment: Mutex::new(()),
                 slots: FixedVec::new(budget, "foreign_sessions", config.max_foreign_sessions)?,
             },
             foreign_statement_contexts,
-            matviews: std::sync::Mutex::new(matviews),
-            sequence_catalog: std::sync::Mutex::new(SequenceCatalog {
+            matviews: Mutex::new(matviews),
+            sequence_catalog: Mutex::new(SequenceCatalog {
                 definitions: sequences,
                 values: sequence_values,
             }),
-            type_catalog: std::sync::Mutex::new(TypeCatalog {
+            type_catalog: Mutex::new(TypeCatalog {
                 origin: type_origin,
                 versions: type_definition_versions,
                 domains,
@@ -19045,24 +19029,24 @@ impl Storage {
             type_definition_images,
             enum_members_per_image,
             enum_member_images,
-            domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
-            index_catalog: std::sync::Mutex::new(indexes),
+            domain_graph_scratch: Mutex::new(domain_graph_scratch),
+            index_catalog: Mutex::new(indexes),
             index_catalog_capacity: config.max_indexes,
-            brin_maintenance: std::sync::Mutex::new(BrinMaintenance {
+            brin_maintenance: Mutex::new(BrinMaintenance {
                 states: brin_maintenance,
                 unsummarized_ranges: brin_unsummarized_ranges,
             }),
             brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
-            database_catalog: std::sync::Mutex::new(DatabaseCatalog {
+            database_catalog: Mutex::new(DatabaseCatalog {
                 definitions: databases,
                 allocated_oid: DatabaseOid(USER_DATABASE_OID_BASE),
             }),
             database_catalog_capacity: config.max_databases,
-            backend_state: std::sync::Mutex::new(BackendState {
+            backend_state: Mutex::new(BackendState {
                 activities: backends,
                 signals: backend_signals,
             }),
-            cumulative_statistics: std::sync::Mutex::new(CumulativeStatistics {
+            cumulative_statistics: Mutex::new(CumulativeStatistics {
                 relations: relation_cumulative_statistics,
                 relation_transactions: relation_transaction_statistics,
                 transaction_nesting: cumulative_transaction_nesting,
@@ -19073,9 +19057,9 @@ impl Storage {
                 reset_times: SharedStatisticsResetTimes::new(),
             }),
             temporary_transactions,
-            tablespaces: std::sync::Mutex::new(tablespaces),
-            schemas: std::sync::Mutex::new(schemas),
-            extension_catalog: std::sync::Mutex::new(ExtensionCatalog {
+            tablespaces: Mutex::new(tablespaces),
+            schemas: Mutex::new(schemas),
+            extension_catalog: Mutex::new(ExtensionCatalog {
                 definitions: extensions,
                 dependencies: extension_dependencies,
                 configs: extension_configs,
@@ -19084,27 +19068,27 @@ impl Storage {
             extension_scripts,
             extension_script_source,
             extension_package_source: ExtensionPackageSource::Durable,
-            role_catalog: std::sync::Mutex::new(RoleCatalog {
+            role_catalog: Mutex::new(RoleCatalog {
                 roles,
                 memberships: role_memberships,
                 settings: role_settings,
             }),
             role_graph_scratch,
-            system_settings: std::sync::Mutex::new(system_settings),
-            prepared_transactions: std::sync::Mutex::new(PreparedTransactionCatalog {
+            system_settings: Mutex::new(system_settings),
+            prepared_transactions: Mutex::new(PreparedTransactionCatalog {
                 entries: prepared_transactions,
                 candidate: prepared_transaction_candidate,
             }),
-            acl_catalog: std::sync::Mutex::new(AclCatalog {
+            acl_catalog: Mutex::new(AclCatalog {
                 objects: acl_entries,
                 columns: column_acl_entries,
                 defaults: default_acl_entries,
                 parameters: parameter_acl_entries,
             }),
-            comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
+            comments: Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
             transaction_mode: config.transaction_mode,
-            snapshots: std::sync::Arc::new(std::sync::Mutex::new(SnapshotState {
+            snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
                 exported: exported_snapshots,
                 active: active_snapshots,
@@ -19113,13 +19097,13 @@ impl Storage {
                 next_statement: 0,
                 statement_reclamation_pending: false,
             })),
-            transaction_identities: std::sync::Mutex::new(TransactionIdentityState {
+            transaction_identities: Mutex::new(TransactionIdentityState {
                 active: transaction_identities,
                 recent: recent_transaction_statuses,
                 recent_cursor: 0,
                 latest: 0,
             }),
-            locks: std::sync::Arc::new(std::sync::Mutex::new(LockState {
+            locks: std::sync::Arc::new(Mutex::new(LockState {
                 table: table_locks,
                 row: row_locks,
                 advisory: advisory_locks,
@@ -19130,7 +19114,7 @@ impl Storage {
             replay_table_rewrite: None,
             spill: None,
             value_indexes,
-            index_arena: std::sync::Mutex::new(index_arena),
+            index_arena: Mutex::new(index_arena),
             collation: None,
         };
         crate::sql::reset_execution_query_workspace();
@@ -19176,7 +19160,7 @@ impl Storage {
     ) {
         self.foreign_sessions
             .slots
-            .push(std::sync::Mutex::new(ForeignSessionSlot {
+            .push(Mutex::new(ForeignSessionSlot {
                 client,
                 session: None,
             }))
@@ -19342,7 +19326,7 @@ impl Storage {
         }
     }
 
-    fn foreign_statement_context(&self) -> std::sync::MutexGuard<'_, ForeignStatementContext> {
+    fn foreign_statement_context(&self) -> MutexGuard<'_, ForeignStatementContext> {
         self.foreign_statement_contexts[crate::sql::execution_query_workspace().index()]
             .lock()
             .expect("foreign statement context lock poisoned")
@@ -20068,7 +20052,7 @@ impl Storage {
             .len()
     }
 
-    fn database_catalog(&self) -> std::sync::MutexGuard<'_, DatabaseCatalog> {
+    fn database_catalog(&self) -> MutexGuard<'_, DatabaseCatalog> {
         self.database_catalog
             .lock()
             .expect("database catalog lock poisoned")
@@ -25746,7 +25730,7 @@ impl Storage {
         }
     }
 
-    fn role_graph_scratch(&self) -> std::sync::MutexGuard<'_, FixedVec<bool>> {
+    fn role_graph_scratch(&self) -> MutexGuard<'_, FixedVec<bool>> {
         let workspace = crate::sql::execution_query_workspace().index();
         self.role_graph_scratch[workspace]
             .lock()
@@ -26940,7 +26924,7 @@ impl Storage {
         Ok(())
     }
 
-    fn system_settings_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<SystemSetting>> {
+    fn system_settings_catalog(&self) -> MutexGuard<'_, FixedVec<SystemSetting>> {
         self.system_settings
             .lock()
             .expect("system settings catalog lock poisoned")
@@ -27218,7 +27202,7 @@ impl Storage {
         )
     }
 
-    fn comment_catalog(&self) -> std::sync::MutexGuard<'_, CommentCatalog> {
+    fn comment_catalog(&self) -> MutexGuard<'_, CommentCatalog> {
         self.comments.lock().expect("comment catalog lock poisoned")
     }
 
@@ -28269,7 +28253,7 @@ impl Storage {
         Ok(prior)
     }
 
-    fn extension_catalog(&self) -> std::sync::MutexGuard<'_, ExtensionCatalog> {
+    fn extension_catalog(&self) -> MutexGuard<'_, ExtensionCatalog> {
         self.extension_catalog
             .lock()
             .expect("extension catalog lock poisoned")
@@ -29358,10 +29342,8 @@ impl Storage {
     /// gets a distinct producer instead of resetting an outer run in progress.
     pub(crate) fn external_sorter(
         &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, Box<crate::sql::external::ExternalSorter>>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, Box<crate::sql::external::ExternalSorter>>, crate::sql::eval::SqlError>
+    {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -29382,10 +29364,8 @@ impl Storage {
     /// of aliasing scratch across nested materializers.
     pub(crate) fn external_run_reader(
         &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, crate::sql::external::ExternalRunReader>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, crate::sql::external::ExternalRunReader>, crate::sql::eval::SqlError>
+    {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -32842,7 +32822,7 @@ impl Storage {
         Ok(((rows as u64).div_ceil(128), created_at, pages_per_range))
     }
 
-    fn brin_maintenance(&self) -> std::sync::MutexGuard<'_, BrinMaintenance> {
+    fn brin_maintenance(&self) -> MutexGuard<'_, BrinMaintenance> {
         self.brin_maintenance
             .lock()
             .expect("BRIN maintenance lock poisoned")
@@ -35119,17 +35099,35 @@ impl Storage {
 
     /// The txid of another transaction holding uncommitted DDL for `name`.
     fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
-        self.tables.iter().find_map(|table| {
-            let definition =
-                TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
-            if definition.identity().database != current_database() {
+        let database = current_database();
+        loop {
+            let mut changed = false;
+            for table in self.tables.iter() {
+                let Some(expected) = table
+                    .definition
+                    .name_reservation_candidate(database, schema, name)
+                else {
+                    continue;
+                };
+                // Only a matching name can require this definition owner.
+                let definition =
+                    TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
+                if !expected.matches(definition.identity()) {
+                    changed = true;
+                    continue;
+                }
+                let committed = definition.committed_definition();
+                let matches = (committed.schema.as_str() == schema
+                    && committed.name.as_str() == name)
+                    || (definition.schema.as_str() == schema && definition.name.as_str() == name);
+                if matches && let Some(owner) = definition.locked_by_other(txid) {
+                    return Some(owner);
+                }
+            }
+            if !changed {
                 return None;
             }
-            let committed = definition.committed_definition();
-            let matches = (committed.schema.as_str() == schema && committed.name.as_str() == name)
-                || (definition.schema.as_str() == schema && definition.name.as_str() == name);
-            matches.then(|| definition.locked_by_other(txid)).flatten()
-        })
+        }
     }
 
     /// Committed drop (journal replay): rows are retained until checkpoint.
@@ -35273,7 +35271,7 @@ impl Storage {
         })
     }
 
-    fn view_rule_catalog(&self) -> std::sync::MutexGuard<'_, ViewRuleCatalog> {
+    fn view_rule_catalog(&self) -> MutexGuard<'_, ViewRuleCatalog> {
         self.view_rule_catalog
             .lock()
             .expect("view and rule catalog lock poisoned")
@@ -37425,7 +37423,7 @@ impl Storage {
     // same-named backing Table, so these hold only the defining query). ---
 
     /// Committed materialized views, for checkpoint serialization.
-    fn matview_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<MatviewDef>> {
+    fn matview_catalog(&self) -> MutexGuard<'_, FixedVec<MatviewDef>> {
         self.matviews
             .lock()
             .expect("materialized-view catalog lock poisoned")
@@ -37686,7 +37684,7 @@ impl Storage {
             .definitions[slot]
     }
 
-    fn sequence_catalog(&self) -> std::sync::MutexGuard<'_, SequenceCatalog> {
+    fn sequence_catalog(&self) -> MutexGuard<'_, SequenceCatalog> {
         self.sequence_catalog
             .lock()
             .expect("sequence catalog lock poisoned")
@@ -39259,7 +39257,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
+    pub(crate) fn commit_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Domain)
             .expect("domain publication identifies its source kind");
@@ -39298,11 +39296,15 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(movement, |catalog, _members| {
-            let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
-            catalog.versions.set(NamedTypeSlot::Domain(slot), version);
-            catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
-        })
+        self.publish_type_move(
+            movement,
+            type_reference_moves::TypePublicationSource::Pending(target),
+            |catalog, _members| {
+                let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
+                catalog.versions.set(NamedTypeSlot::Domain(slot), version);
+                catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
+            },
+        )
     }
 
     pub(crate) fn rollback_domain_alter(&self, undo: DomainAlterUndo) {
@@ -39827,17 +39829,13 @@ impl Storage {
         catalog.enums[slot].member_count = 0;
     }
 
-    pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
+    pub(crate) fn commit_enum_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Enum)
             .expect("enum publication identifies its source kind");
         let txid = target.transaction();
-        match self.commit_enum_members(target) {
-            EnumMemberPublication::Complete => return Ok(()),
-            EnumMemberPublication::IdentityMoveRequired => {}
-        }
         let movement = {
-            let catalog = self
+            let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
@@ -39846,6 +39844,14 @@ impl Storage {
             }
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
+            if definition.schema == previous.schema && definition.name == previous.name {
+                let mut members = self
+                    .enum_member_images
+                    .lock()
+                    .expect("enum member-image lock poisoned");
+                Self::install_enum_alter_locked(&mut catalog, &mut members, slot, txid);
+                return Ok(());
+            }
             type_reference_moves::TypeReferenceMove::new(
                 type_references::TypeIdentity::new(
                     catalog.origin,
@@ -39857,9 +39863,13 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(movement, |catalog, members| {
-            Self::install_enum_alter_locked(catalog, members, slot, txid);
-        })
+        self.publish_type_move(
+            movement,
+            type_reference_moves::TypePublicationSource::Pending(target),
+            |catalog, members| {
+                Self::install_enum_alter_locked(catalog, members, slot, txid);
+            },
+        )
     }
 
     fn install_enum_alter_locked(
@@ -39867,12 +39877,12 @@ impl Storage {
         images: &mut EnumMemberImages,
         slot: usize,
         txid: u32,
-    ) -> bool {
+    ) {
         let Some(pending) = catalog.enums[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
         else {
-            return false;
+            return;
         };
         let definition = catalog.enums[slot].definition_for(txid);
         let previous = catalog.enums[slot];
@@ -39892,7 +39902,6 @@ impl Storage {
         if let Some(image) = previous.member_image {
             images.release(image);
         }
-        definition.schema != previous.schema || definition.name != previous.name
     }
 
     pub(crate) fn replay_enum_identity(
@@ -39901,7 +39910,7 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        let movement = {
+        let (movement, source) = {
             let catalog = self
                 .type_catalog
                 .lock()
@@ -39913,19 +39922,26 @@ impl Storage {
                 0,
                 Some(NamedTypeSlot::Enum(slot)),
             )?;
+            let source = type_reference_moves::TypePublicationSource::committed(
+                &catalog,
+                NamedTypeSlot::Enum(slot),
+            )?;
             let previous = catalog.enums[slot];
             if schema == previous.schema && name == previous.name {
                 return Ok(());
             }
-            type_reference_moves::TypeReferenceMove::new(
-                type_references::TypeIdentity::new(
-                    catalog.origin,
-                    previous.database,
-                    NamedTypeSlot::Enum(slot),
-                    previous.created_at,
+            (
+                type_reference_moves::TypeReferenceMove::new(
+                    type_references::TypeIdentity::new(
+                        catalog.origin,
+                        previous.database,
+                        NamedTypeSlot::Enum(slot),
+                        previous.created_at,
+                    ),
+                    UserTypeName::declaration(previous.schema, previous.name),
+                    UserTypeName::declaration(schema, name),
                 ),
-                UserTypeName::declaration(previous.schema, previous.name),
-                UserTypeName::declaration(schema, name),
+                source,
             )
         };
         let version = self
@@ -39934,7 +39950,7 @@ impl Storage {
             .expect("type catalog lock poisoned")
             .versions
             .next()?;
-        self.publish_type_move(movement, |catalog, _members| {
+        self.publish_type_move(movement, source, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
             catalog.versions.set(NamedTypeSlot::Enum(slot), version);
@@ -40178,10 +40194,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_composite_alter(
-        &mut self,
-        target: TypeEditTarget,
-    ) -> Result<(), SqlError> {
+    pub(crate) fn commit_composite_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Composite)
             .expect("composite publication identifies its source kind");
@@ -40216,9 +40229,13 @@ impl Storage {
                 UserTypeName::declaration(pending.schema, pending.name),
             )
         };
-        self.publish_type_move(movement, |catalog, _members| {
-            Self::install_composite_alter_locked(catalog, slot, txid);
-        })
+        self.publish_type_move(
+            movement,
+            type_reference_moves::TypePublicationSource::Pending(target),
+            |catalog, _members| {
+                Self::install_composite_alter_locked(catalog, slot, txid);
+            },
+        )
     }
 
     fn install_composite_alter_locked(catalog: &mut TypeCatalog, slot: usize, txid: u32) {
@@ -46144,7 +46161,7 @@ impl Storage {
         self.index_catalog_capacity
     }
 
-    fn index_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<IndexDef>> {
+    fn index_catalog(&self) -> MutexGuard<'_, FixedVec<IndexDef>> {
         self.index_catalog
             .lock()
             .expect("index catalog lock poisoned")
@@ -47234,17 +47251,17 @@ impl Storage {
         replace_execution_visibility(visibility);
     }
 
-    fn transaction_identity_state(&self) -> std::sync::MutexGuard<'_, TransactionIdentityState> {
+    fn transaction_identity_state(&self) -> MutexGuard<'_, TransactionIdentityState> {
         self.transaction_identities
             .lock()
             .expect("transaction identity lock poisoned")
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, LockState> {
+    fn lock_state(&self) -> MutexGuard<'_, LockState> {
         self.locks.lock().expect("lock state lock poisoned")
     }
 
-    fn snapshot_state(&self) -> std::sync::MutexGuard<'_, SnapshotState> {
+    fn snapshot_state(&self) -> MutexGuard<'_, SnapshotState> {
         self.snapshots.lock().expect("snapshot state lock poisoned")
     }
 
@@ -53303,7 +53320,7 @@ mod tests {
     #[test]
     fn cluster_metadata_system_settings_publish_owned_bounded_images() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<SystemSetting>>>();
+        assert_send_sync::<Mutex<FixedVec<SystemSetting>>>();
         let config = test_config();
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
@@ -53953,7 +53970,7 @@ mod tests {
     fn database_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DatabaseDef>();
-        assert_send_sync::<std::sync::Mutex<DatabaseCatalog>>();
+        assert_send_sync::<Mutex<DatabaseCatalog>>();
         assert_send_sync::<DatabaseIter<'_>>();
         const WORKERS: usize = 4;
         let names = ["database_a", "database_b", "database_c", "database_d"];
@@ -54390,7 +54407,7 @@ mod tests {
     fn index_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<IndexDef>();
-        assert_send_sync::<std::sync::Mutex<FixedVec<IndexDef>>>();
+        assert_send_sync::<Mutex<FixedVec<IndexDef>>>();
         assert_send_sync::<IndexIter<'_>>();
         const WORKERS: usize = 4;
         let names = ["index_a", "index_b", "index_c", "index_d"];
@@ -54637,7 +54654,7 @@ mod tests {
     fn view_rule_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ViewRuleCatalog>();
-        assert_send_sync::<std::sync::Mutex<ViewRuleCatalog>>();
+        assert_send_sync::<Mutex<ViewRuleCatalog>>();
         assert_send_sync::<ViewRuleIter<'_, ViewDef>>();
 
         const WORKERS: usize = 4;
@@ -56721,7 +56738,7 @@ mod tests {
     #[test]
     fn role_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<RoleCatalog>>();
+        assert_send_sync::<Mutex<RoleCatalog>>();
         assert_send_sync::<RoleIter<'_>>();
         assert_send_sync::<RoleMembershipIter<'_>>();
         assert_send_sync::<RoleSettingIter<'_>>();
@@ -56848,7 +56865,7 @@ mod tests {
     #[test]
     fn operator_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<OperatorCatalog>>();
+        assert_send_sync::<Mutex<OperatorCatalog>>();
         assert_send_sync::<AccessMethodIter<'_>>();
         assert_send_sync::<OperatorIter<'_>>();
         assert_send_sync::<OperatorFamilyIter<'_>>();
@@ -56981,7 +56998,7 @@ mod tests {
     #[test]
     fn type_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<TypeCatalog>>();
+        assert_send_sync::<Mutex<TypeCatalog>>();
         assert_send_sync::<DomainIter<'_>>();
         assert_send_sync::<EnumIter<'_>>();
         assert_send_sync::<EnumMemberIter>();
@@ -57163,7 +57180,7 @@ mod tests {
     #[test]
     fn routine_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<RoutineDef>>>();
+        assert_send_sync::<Mutex<FixedVec<RoutineDef>>>();
         assert_send_sync::<RoutineIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57247,7 +57264,7 @@ mod tests {
     #[test]
     fn cast_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<CastDef>>>();
+        assert_send_sync::<Mutex<FixedVec<CastDef>>>();
         assert_send_sync::<CastIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57317,7 +57334,7 @@ mod tests {
     #[test]
     fn event_trigger_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<EventTriggerDef>>>();
+        assert_send_sync::<Mutex<FixedVec<EventTriggerDef>>>();
         assert_send_sync::<EventTriggerIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57421,7 +57438,7 @@ mod tests {
     #[test]
     fn trigger_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<TriggerCatalog>>();
+        assert_send_sync::<Mutex<TriggerCatalog>>();
         assert_send_sync::<TriggerIter<'_>>();
         assert_send_sync::<PartitionTriggerStateIter<'_>>();
 
@@ -57526,7 +57543,7 @@ mod tests {
     #[test]
     fn extended_statistics_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<ExtendedStatisticsCatalog>>();
+        assert_send_sync::<Mutex<ExtendedStatisticsCatalog>>();
         assert_send_sync::<ExtendedStatisticsIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57685,7 +57702,7 @@ mod tests {
     #[test]
     fn publication_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<PublicationDef>>>();
+        assert_send_sync::<Mutex<FixedVec<PublicationDef>>>();
         assert_send_sync::<PublicationIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57797,7 +57814,7 @@ mod tests {
     #[test]
     fn replication_slot_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<ReplicationSlotDef>>>();
+        assert_send_sync::<Mutex<FixedVec<ReplicationSlotDef>>>();
         assert_send_sync::<ReplicationSlotIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -57899,7 +57916,7 @@ mod tests {
     #[test]
     fn subscription_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<SubscriptionCatalog>>();
+        assert_send_sync::<Mutex<SubscriptionCatalog>>();
         assert_send_sync::<SubscriptionIter<'_>>();
         assert_send_sync::<SubscriptionRelationIter<'_>>();
 
@@ -58068,7 +58085,7 @@ mod tests {
     #[test]
     fn text_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<TextCatalog>>();
+        assert_send_sync::<Mutex<TextCatalog>>();
         assert_send_sync::<CollationIter<'_>>();
         assert_send_sync::<ConversionIter<'_>>();
         assert_send_sync::<TextSearchIter<'_>>();
@@ -58166,7 +58183,7 @@ mod tests {
     #[test]
     fn large_object_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<LargeObjectCatalog>>();
+        assert_send_sync::<Mutex<LargeObjectCatalog>>();
         assert_send_sync::<LargeObjectIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -58243,7 +58260,7 @@ mod tests {
     #[test]
     fn acl_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<AclCatalog>>();
+        assert_send_sync::<Mutex<AclCatalog>>();
         assert_send_sync::<ObjectAclIter<'_>>();
         assert_send_sync::<ColumnAclIter<'_>>();
         assert_send_sync::<DefaultAclIter<'_>>();
@@ -58370,7 +58387,7 @@ mod tests {
     #[test]
     fn comment_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<CommentCatalog>>();
+        assert_send_sync::<Mutex<CommentCatalog>>();
         assert_send_sync::<LiveCommentIter<'_>>();
         assert_send_sync::<CheckpointCommentIter<'_>>();
         assert_send_sync::<VisibleCommentIter<'_>>();
@@ -58439,8 +58456,8 @@ mod tests {
     #[test]
     fn catalog_graph_scratch_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<FixedVec<bool>>>();
-        assert_send_sync::<std::sync::Mutex<FixedVec<u8>>>();
+        assert_send_sync::<Mutex<FixedVec<bool>>>();
+        assert_send_sync::<Mutex<FixedVec<u8>>>();
 
         let mut config = test_config();
         config.max_domains = 4;
@@ -58800,7 +58817,7 @@ mod tests {
     #[test]
     fn index_expression_scratch_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<std::sync::Mutex<Arena>>();
+        assert_send_sync::<Mutex<Arena>>();
         assert_send_sync::<Storage>();
 
         let config = test_config();
@@ -58940,7 +58957,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SequenceDef>();
         assert_send_sync::<SequenceValues>();
-        assert_send_sync::<std::sync::Mutex<SequenceCatalog>>();
+        assert_send_sync::<Mutex<SequenceCatalog>>();
         assert_send_sync::<SequenceIter<'_>>();
 
         let config = test_config();
@@ -59007,7 +59024,7 @@ mod tests {
     fn tablespace_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TablespaceDef>();
-        assert_send_sync::<std::sync::Mutex<FixedVec<TablespaceDef>>>();
+        assert_send_sync::<Mutex<FixedVec<TablespaceDef>>>();
         assert_send_sync::<TablespaceIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -59167,7 +59184,7 @@ mod tests {
     fn schema_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SchemaDef>();
-        assert_send_sync::<std::sync::Mutex<FixedVec<SchemaDef>>>();
+        assert_send_sync::<Mutex<FixedVec<SchemaDef>>>();
         assert_send_sync::<SchemaIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -59317,7 +59334,7 @@ mod tests {
         assert_send_sync::<ExtensionDef>();
         assert_send_sync::<ExtensionDependency>();
         assert_send_sync::<ExtensionConfig>();
-        assert_send_sync::<std::sync::Mutex<ExtensionCatalog>>();
+        assert_send_sync::<Mutex<ExtensionCatalog>>();
         assert_send_sync::<ExtensionIter<'_>>();
         assert_send_sync::<ExtensionDependencyIter<'_>>();
         assert_send_sync::<ExtensionConfigIter<'_>>();
@@ -59567,7 +59584,7 @@ mod tests {
     fn foreign_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<foreign::ForeignCatalog>();
-        assert_send_sync::<std::sync::Mutex<foreign::ForeignCatalog>>();
+        assert_send_sync::<Mutex<foreign::ForeignCatalog>>();
         assert_send_sync::<ForeignCatalogIter<'_, foreign::ForeignDataWrapperDefinition>>();
 
         const WORKERS: usize = 4;
@@ -59843,7 +59860,7 @@ mod tests {
     fn stored_query_dependency_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<StoredQueryDependencyCatalog>();
-        assert_send_sync::<std::sync::Mutex<StoredQueryDependencyCatalog>>();
+        assert_send_sync::<Mutex<StoredQueryDependencyCatalog>>();
 
         const WORKERS: usize = 4;
         let mut config = test_config();
@@ -59957,7 +59974,7 @@ mod tests {
     fn policy_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PolicyCatalog>();
-        assert_send_sync::<std::sync::Mutex<PolicyCatalog>>();
+        assert_send_sync::<Mutex<PolicyCatalog>>();
         assert_send_sync::<PolicyIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -60074,7 +60091,7 @@ mod tests {
     fn materialized_view_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MatviewDef>();
-        assert_send_sync::<std::sync::Mutex<FixedVec<MatviewDef>>>();
+        assert_send_sync::<Mutex<FixedVec<MatviewDef>>>();
         assert_send_sync::<MatviewIter<'_>>();
 
         const WORKERS: usize = 4;

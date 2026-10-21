@@ -5,6 +5,7 @@
 //! rather than any one of them alone.
 
 use super::*;
+use crate::mem::mutex::Mutex;
 
 #[test]
 fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
@@ -75837,7 +75838,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SERIAL: Mutex<()> = Mutex::new(());
     let _serial = SERIAL.lock().expect("external-run test mutex poisoned");
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("external-runs-{sequence}"));

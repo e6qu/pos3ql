@@ -54885,6 +54885,139 @@ mod tests {
     }
 
     #[test]
+    fn failed_policy_edits_preserve_roles_definitions_and_pending_capacity() {
+        let mut config = test_config();
+        config.max_catalog_versions_per_object = 1;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("policy_target", &[]))
+            .unwrap();
+        let definition = PolicyDefinition {
+            using: Some(StackStr::from_str("true")),
+            with_check: None,
+        };
+        let spec = PolicySpec {
+            name: SqlName::parse("bounded_policy").unwrap(),
+            table,
+            command: PolicyCommandKind::All,
+            permissive: true,
+            definition,
+            roles: &[PUBLIC_ROLE],
+        };
+        let empty = StoredQueryDependencies::EMPTY;
+        let oversized = oversized_test_dependencies();
+        let changed = PolicyDefinition {
+            using: Some(StackStr::from_str("false")),
+            with_check: None,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .create_policy(spec, &oversized, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert!(
+                storage
+                    .policy_catalog
+                    .lock()
+                    .unwrap()
+                    .definitions
+                    .iter()
+                    .all(|policy| policy.ddl_state == CatalogDdlState::Absent)
+            );
+            let slot = storage.create_policy(spec, &empty, 7).unwrap();
+            storage.commit_policy_create(slot);
+            for (roles, dependencies) in [(&[][..], &empty), (&[PUBLIC_ROLE][..], &oversized)] {
+                assert_eq!(
+                    storage
+                        .alter_policy(slot, changed, roles, dependencies, 8)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert!(storage.policy(slot).pending_definition.is_none());
+                assert_eq!(storage.policy(slot).definition.using, definition.using);
+                assert_eq!(&*storage.policy_roles(slot, 8), &[PUBLIC_ROLE]);
+                assert!(
+                    storage
+                        .stored_query_dependencies
+                        .lock()
+                        .unwrap()
+                        .pending
+                        .iter()
+                        .all(|image| !image.used)
+                );
+            }
+            let prior = storage
+                .alter_policy(slot, changed, &[PUBLIC_ROLE, 0], &empty, 8)
+                .unwrap();
+            assert!(prior.is_none());
+            let pending_slot = storage
+                .policy(slot)
+                .pending_definition
+                .unwrap()
+                .dependency_slot;
+            assert_eq!(
+                storage
+                    .alter_policy(slot, definition, &[PUBLIC_ROLE], &empty, 8)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .policy(slot)
+                    .pending_definition
+                    .unwrap()
+                    .dependency_slot,
+                pending_slot
+            );
+            assert_eq!(&*storage.policy_roles(slot, 8), &[PUBLIC_ROLE, 0]);
+            assert_eq!(&*storage.policy_roles(slot, 0), &[PUBLIC_ROLE]);
+            assert_eq!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .filter(|image| image.used)
+                    .count(),
+                1
+            );
+            storage.rollback_policy_alter(slot, prior);
+            assert!(storage.policy(slot).pending_definition.is_none());
+            assert!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .all(|image| !image.used)
+            );
+            storage
+                .alter_policy(slot, changed, &[PUBLIC_ROLE], &empty, 9)
+                .unwrap();
+            storage.commit_policy_alter(slot, 9);
+            assert_eq!(storage.policy(slot).definition.using, changed.using);
+            assert!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .all(|image| !image.used)
+            );
+        });
+    }
+
+    #[test]
     fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
         let mut config = test_config();
         config.max_views = 3;

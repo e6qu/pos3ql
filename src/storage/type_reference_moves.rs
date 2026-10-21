@@ -687,31 +687,118 @@ mod tests {
         }
     }
 
-    #[test]
-    fn saved_query_publication_releases_owners_and_refreshes_type_sources() {
+    #[derive(Clone, Copy, Debug)]
+    enum SavedQueryKind {
+        View,
+        Rule,
+        MaterializedView,
+        Policy,
+    }
+
+    const SAVED_QUERIES: [SavedQueryKind; 4] = [
+        SavedQueryKind::View,
+        SavedQueryKind::Rule,
+        SavedQueryKind::MaterializedView,
+        SavedQueryKind::Policy,
+    ];
+
+    fn query_dependency(
+        storage: &Storage,
+        movement: TypeReferenceMove,
+    ) -> super::super::StoredQueryDependency {
+        super::super::StoredQueryDependency {
+            class: movement.class(),
+            slot: movement.identity.slot().index() as u16,
+            identity: storage
+                .capture_type_dependency(movement.class(), movement.identity.slot().index(), 0)
+                .unwrap(),
+            referenced_columns: super::super::ColumnSet::EMPTY,
+            schema: movement.prior.schema,
+            name: movement.prior.name,
+            referenced_schema: movement.prior.schema,
+            referenced_name: movement.prior.name,
+        }
+    }
+
+    fn publish_saved_query(
+        storage: &Storage,
+        publication: SavedQueryKind,
+        related: usize,
+        dependency: super::super::StoredQueryDependency,
+    ) -> Result<usize, crate::sql::eval::SqlError> {
         use super::super::tests::test_view_definition;
         use super::super::{
-            ColumnSet, PUBLIC_ROLE, PolicyCommandKind, PolicyDefinition, PolicySpec,
-            RuleDefinition, RuleTarget, StoredQueryDependencies, StoredQueryDependency,
-            StoredQueryDependencyOwner,
+            PUBLIC_ROLE, PolicyCommandKind, PolicyDefinition, PolicySpec, RuleDefinition,
+            RuleTarget, StoredQueryDependencies, StoredQueryDependencyOwner,
         };
+        let mut dependencies = StoredQueryDependencies::EMPTY;
+        dependencies.push(dependency)?;
+        let definition = test_view_definition(dependencies);
+        match publication {
+            SavedQueryKind::View => {
+                let (slot, _) = storage.create_view(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("typed_submission").unwrap(),
+                    definition,
+                    false,
+                    7,
+                )?;
+                Ok(
+                    storage.committed_dependency_image(StoredQueryDependencyOwner::Rule(
+                        storage.view(slot).return_rule,
+                    )),
+                )
+            }
+            SavedQueryKind::Rule => {
+                let (slot, _) = storage.create_rule(
+                    RuleDefinition {
+                        name: SqlName::parse("typed_submission").unwrap(),
+                        target: RuleTarget::Table(related as u16),
+                        ..RuleDefinition::EMPTY
+                    },
+                    definition.query.dependencies.view(),
+                    false,
+                    7,
+                )?;
+                Ok(storage
+                    .committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)))
+            }
+            SavedQueryKind::MaterializedView => storage
+                .create_matview(related, definition.query, false, 7)
+                .map(|slot| storage.matview_dependency_image(slot)),
+            SavedQueryKind::Policy => storage
+                .create_policy(
+                    PolicySpec {
+                        name: SqlName::parse("typed_submission").unwrap(),
+                        table: related,
+                        command: PolicyCommandKind::All,
+                        permissive: true,
+                        definition: PolicyDefinition {
+                            using: Some(crate::util::StackStr::from_str("true")),
+                            with_check: None,
+                        },
+                        roles: &[PUBLIC_ROLE],
+                    },
+                    &definition.query.dependencies,
+                    7,
+                )
+                .map(|slot| {
+                    storage
+                        .committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16))
+                }),
+        }
+    }
+
+    #[test]
+    fn saved_query_publication_releases_owners_and_refreshes_type_sources() {
+        use super::super::StoredQueryDependencies;
+        use super::super::tests::test_view_definition;
         for kind in KINDS {
-            for publication in 0..4 {
+            for publication in SAVED_QUERIES {
                 let (storage, related, _, movement) = fixture(kind);
                 let database = storage.current_database_oid();
-                let identity = storage
-                    .capture_type_dependency(movement.class(), movement.identity.slot().index(), 0)
-                    .unwrap();
-                let dependency = StoredQueryDependency {
-                    class: movement.class(),
-                    slot: movement.identity.slot().index() as u16,
-                    identity,
-                    referenced_columns: ColumnSet::EMPTY,
-                    schema: movement.prior.schema,
-                    name: movement.prior.name,
-                    referenced_schema: movement.prior.schema,
-                    referenced_name: movement.prior.name,
-                };
+                let dependency = query_dependency(&storage, movement);
+                let identity = dependency.identity;
                 let mut source = storage.type_catalog.lock().unwrap();
                 std::thread::scope(|scope| {
                     let storage = &storage;
@@ -719,67 +806,7 @@ mod tests {
                         scope.spawn(move || -> Result<usize, crate::sql::eval::SqlError> {
                             crate::sql::set_execution_database_oid(database);
                             crate::mem::guard::forbid_alloc(|| {
-                                let mut dependencies = StoredQueryDependencies::EMPTY;
-                                dependencies.push(dependency)?;
-                                let definition = test_view_definition(dependencies);
-                                match publication {
-                                    0 => {
-                                        let (slot, _) = storage.create_view(
-                                            SqlName::parse("public").unwrap(),
-                                            SqlName::parse("typed_submission").unwrap(),
-                                            definition,
-                                            false,
-                                            7,
-                                        )?;
-                                        Ok(storage.committed_dependency_image(
-                                            StoredQueryDependencyOwner::Rule(
-                                                storage.view(slot).return_rule,
-                                            ),
-                                        ))
-                                    }
-                                    1 => {
-                                        let (slot, _) = storage.create_rule(
-                                            RuleDefinition {
-                                                name: SqlName::parse("typed_submission").unwrap(),
-                                                target: RuleTarget::Table(related as u16),
-                                                ..RuleDefinition::EMPTY
-                                            },
-                                            definition.query.dependencies.view(),
-                                            false,
-                                            7,
-                                        )?;
-                                        Ok(storage.committed_dependency_image(
-                                            StoredQueryDependencyOwner::Rule(slot as u16),
-                                        ))
-                                    }
-                                    2 => storage
-                                        .create_matview(related, definition.query, false, 7)
-                                        .map(|slot| storage.matview_dependency_image(slot)),
-                                    3 => storage
-                                        .create_policy(
-                                            PolicySpec {
-                                                name: SqlName::parse("typed_submission").unwrap(),
-                                                table: related,
-                                                command: PolicyCommandKind::All,
-                                                permissive: true,
-                                                definition: PolicyDefinition {
-                                                    using: Some(crate::util::StackStr::from_str(
-                                                        "true",
-                                                    )),
-                                                    with_check: None,
-                                                },
-                                                roles: &[PUBLIC_ROLE],
-                                            },
-                                            &definition.query.dependencies,
-                                            7,
-                                        )
-                                        .map(|slot| {
-                                            storage.committed_dependency_image(
-                                                StoredQueryDependencyOwner::Policy(slot as u16),
-                                            )
-                                        }),
-                                    _ => unreachable!(),
-                                }
+                                publish_saved_query(storage, publication, related, dependency)
                             })
                         });
                     let waiting = wait_until_contended(storage);
@@ -828,6 +855,203 @@ mod tests {
                     assert_eq!(entries[0].referenced_name, movement.prior.name);
                 });
             }
+        }
+    }
+
+    #[test]
+    fn saved_query_publication_rejects_reused_sources_and_targets_without_partial_state() {
+        use crate::sql::eval::sqlstate;
+        for kind in KINDS {
+            for publication in SAVED_QUERIES {
+                for replace_source in [false, true] {
+                    if !replace_source && matches!(publication, SavedQueryKind::View) {
+                        continue;
+                    }
+                    let (storage, related, _, movement) = fixture(kind);
+                    let database = storage.current_database_oid();
+                    let dependency = query_dependency(&storage, movement);
+                    let mut source = storage.type_catalog.lock().unwrap();
+                    std::thread::scope(|scope| {
+                        let storage = &storage;
+                        let writer = scope.spawn(move || {
+                            crate::sql::set_execution_database_oid(database);
+                            crate::mem::guard::forbid_alloc(|| {
+                                publish_saved_query(storage, publication, related, dependency)
+                            })
+                        });
+                        let waiting = wait_until_contended(storage);
+                        crate::mem::guard::forbid_alloc(|| {
+                            let replacement = storage.catalog_sequence.next().unwrap();
+                            if replace_source {
+                                // Simulate retirement and slot reuse while every earlier owner is free.
+                                match movement.identity.slot() {
+                                    NamedTypeSlot::Domain(slot) => {
+                                        source.domains[slot].created_at = replacement
+                                    }
+                                    NamedTypeSlot::Enum(slot) => {
+                                        source.enums[slot].created_at = replacement
+                                    }
+                                    NamedTypeSlot::Composite(slot) => {
+                                        source.composites[slot].created_at = replacement
+                                    }
+                                }
+                            } else {
+                                let _lifecycle =
+                                    storage.tables[related].lifecycle.try_lock().unwrap();
+                                let mut definition =
+                                    storage.tables[related].definition.test_write().unwrap();
+                                definition.identity.created_at = replacement;
+                            }
+                        });
+                        drop(source);
+                        let error = writer.join().unwrap().unwrap_err();
+                        assert!(waiting, "{publication:?} did not reach the source wait");
+                        assert_eq!(
+                            error.sqlstate,
+                            if replace_source {
+                                sqlstate::UNDEFINED_OBJECT
+                            } else {
+                                sqlstate::SERIALIZATION_FAILURE
+                            }
+                        );
+                    });
+                    let queries = storage.view_rule_catalog.lock().unwrap();
+                    assert!(
+                        queries
+                            .rules
+                            .iter()
+                            .all(|rule| rule.ddl_state == CatalogDdlState::Absent)
+                    );
+                    assert!(
+                        queries
+                            .views
+                            .iter()
+                            .all(|view| view.ddl_state == CatalogDdlState::Absent)
+                    );
+                    assert!(
+                        storage
+                            .matviews
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|view| view.ddl_state == CatalogDdlState::Absent)
+                    );
+                    assert!(
+                        storage
+                            .policy_catalog
+                            .lock()
+                            .unwrap()
+                            .definitions
+                            .iter()
+                            .all(|policy| policy.ddl_state == CatalogDdlState::Absent)
+                    );
+                    let dependencies = storage.stored_query_dependencies.lock().unwrap();
+                    assert!(dependencies.counts.iter().all(|count| *count == 0));
+                    assert!(dependencies.pending.iter().all(|image| !image.used));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn waiting_rule_rename_preserves_current_definition_and_releases_pending_image() {
+        use super::super::{
+            RuleDefinition, RuleEnabled, RuleMetadataChange, RuleTarget, StoredQueryDependencies,
+            StoredQueryDependencyOwner,
+        };
+        for kind in KINDS {
+            let (mut storage, related, _, movement) = fixture(kind);
+            let database = storage.current_database_oid();
+            let mut dependencies = StoredQueryDependencies::EMPTY;
+            dependencies
+                .push(query_dependency(&storage, movement))
+                .unwrap();
+            let name = SqlName::parse("original_rule").unwrap();
+            let renamed = SqlName::parse("renamed_rule").unwrap();
+            let target = RuleTarget::Table(related as u16);
+            let (slot, _) = storage
+                .create_rule(
+                    RuleDefinition {
+                        name,
+                        target,
+                        ..RuleDefinition::EMPTY
+                    },
+                    dependencies.view(),
+                    false,
+                    0,
+                )
+                .unwrap();
+            storage.commit_rule_create(slot);
+            storage
+                .apply_comment(
+                    CommentClass::Rule,
+                    SqlName::EMPTY,
+                    name,
+                    target.comment_subid(),
+                    Some(comment_stackstr("keep this comment").unwrap()),
+                )
+                .unwrap();
+            let mut source = storage.type_catalog.lock().unwrap();
+            std::thread::scope(|scope| {
+                let storage = &storage;
+                let writer = scope.spawn(move || {
+                    crate::sql::set_execution_database_oid(database);
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.alter_rule(slot, RuleMetadataChange::Rename(renamed), 7)
+                    })
+                });
+                let waiting = wait_until_contended(storage);
+                let available = storage.comments.try_lock().is_ok()
+                    && storage.stored_query_dependencies.try_lock().is_ok()
+                    && storage.tables[related].lifecycle.try_lock().is_ok()
+                    && storage.tables[related].definition.test_write().is_ok();
+                storage.view_rule_catalog.lock().unwrap().rules[slot]
+                    .definition
+                    .enabled = RuleEnabled::Always;
+                match movement.identity.slot() {
+                    NamedTypeSlot::Domain(slot) => {
+                        source.domains[slot].name = movement.current.name
+                    }
+                    NamedTypeSlot::Enum(slot) => source.enums[slot].name = movement.current.name,
+                    NamedTypeSlot::Composite(slot) => {
+                        source.composites[slot].name = movement.current.name
+                    }
+                }
+                drop(source);
+                let (prior, installed) = writer.join().unwrap().unwrap();
+                assert!(waiting && available);
+                assert!(prior.is_none());
+                assert_eq!(installed.name, renamed);
+                assert_eq!(installed.enabled, RuleEnabled::Always);
+                let pending = storage.rule(slot).pending.unwrap();
+                assert_eq!(pending.definition.name, installed.name);
+                assert_eq!(pending.definition.enabled, installed.enabled);
+                let image =
+                    storage.stored_query_dependency_pending_base + pending.dependency_slot as usize;
+                let catalog = storage.stored_query_dependencies.lock().unwrap();
+                let entries = catalog.image(
+                    image,
+                    catalog.image_count(image),
+                    storage.stored_query_dependencies_per_image,
+                );
+                assert_eq!(entries[0].name, movement.current.name);
+                assert_eq!(entries[0].referenced_name, movement.prior.name);
+            });
+            crate::mem::guard::forbid_alloc(|| storage.rollback_rule_alter(slot, None));
+            assert!(storage.rule(slot).pending.is_none());
+            assert!(
+                storage
+                    .comment_catalog()
+                    .entries
+                    .iter()
+                    .filter(|comment| comment.used && comment.class == CommentClass::Rule)
+                    .all(|comment| comment.name == name && comment.pending_identity.is_none())
+            );
+            let catalog = storage.stored_query_dependencies.lock().unwrap();
+            assert!(catalog.pending.iter().all(|image| !image.used));
+            let image =
+                storage.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16));
+            assert_eq!(catalog.image_count(image), 1);
         }
     }
 

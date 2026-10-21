@@ -34,6 +34,7 @@ jobs:
           storage::type_reference_moves::tests
           storage::tests::view_rule_catalog
           storage::tests::failed_rule
+          storage::tests::failed_policy
           sql::tests::captured_type_references
           sql::tests::materialized_view
           row_security

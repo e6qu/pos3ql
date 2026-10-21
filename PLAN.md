@@ -47,7 +47,7 @@ savepoints and account replacement. Object creation rejects a missing account
 before changing catalogs; connection limits and query permissions distinguish
 the account that originally logged in from a replacement. Durable role
 identifiers keep prepared transaction ownership distinct through recovery.
-Role changes wait for unfinished ownership and permission changes. Dependency
+Role deletion waits for unfinished ownership and permission changes. Dependency
 checks cover every database, and recovery preserves role catalog positions so
 saved owners cannot become a different account after an aborted creation.
 

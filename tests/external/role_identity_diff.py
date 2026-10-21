@@ -77,6 +77,7 @@ def exercise(host, port, administrator):
                             observations.append([label + "_result", future.result(timeout=5)])
 
                 observe("login", "SELECT current_user::text, session_user::text")
+                change_with_pending_creation("alter_pending_creator", f"ALTER ROLE {OLD} CONNECTION LIMIT 8", False)
                 change_with_pending_creation("rename_pending_creator", f"ALTER ROLE {OLD} RENAME TO {RENAMED}", False)
                 admin.execute(f"CREATE ROLE {OLD} LOGIN")
                 observe("renamed_login", "SELECT current_user::text, session_user::text")

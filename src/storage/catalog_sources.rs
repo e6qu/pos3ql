@@ -198,6 +198,7 @@ impl Storage {
             })?;
         if let Some(pending) = role.pending
             && pending.txid != transaction
+            && !pending.exists
         {
             let owner = pending.txid;
             drop(catalog);

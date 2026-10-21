@@ -1,4 +1,4 @@
-//! Role changes wait for references in every database before changing identity.
+//! Role deletion checks unfinished references and dependencies in every database.
 
 use super::{
     AccessClass, AccessObject, CollationIter, ConversionIter, OperatorClassIter,

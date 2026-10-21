@@ -26233,7 +26233,6 @@ impl Storage {
         attributes: RoleAttributes,
         txid: u32,
     ) -> Result<Option<PendingRole>, SqlError> {
-        let _ = self.role_object_dependency(slot, txid)?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -26267,7 +26266,6 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingRole>, SqlError> {
-        let _ = self.role_object_dependency(slot, txid)?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -53634,7 +53632,10 @@ mod tests {
         let (role, _) = storage
             .create_role(
                 SqlName::parse("pending_owner").unwrap(),
-                RoleAttributes::ORDINARY,
+                RoleAttributes {
+                    superuser: true,
+                    ..RoleAttributes::ORDINARY
+                },
                 7,
             )
             .unwrap();
@@ -53655,13 +53656,20 @@ mod tests {
                     .sqlstate,
                 sqlstate::INTERNAL_LOCK_WAIT
             );
-            assert_eq!(
-                storage
-                    .rename_role(role, SqlName::parse("pending_renamed_owner").unwrap(), 8)
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::INTERNAL_LOCK_WAIT
-            );
+            let renamed = storage
+                .rename_role(role, SqlName::parse("pending_renamed_owner").unwrap(), 8)
+                .unwrap();
+            let during_rename = storage
+                .create_table_in(
+                    make_def(
+                        "create_during_owner_rename",
+                        &[("id", ColType::Int4, false)],
+                    ),
+                    9,
+                )
+                .unwrap();
+            storage.rollback_create(during_rename);
+            storage.rollback_role_change(role, renamed);
             storage.rollback_create(table);
             assert_eq!(storage.role_object_dependency(role, 8).unwrap(), None);
             let prior = storage.drop_role_in(role, 8).unwrap();
@@ -58660,19 +58668,27 @@ mod tests {
         const WORKERS: usize = 4;
         let parameters = ["acl.a", "acl.b", "acl.c", "acl.d"];
         let mut config = test_config();
+        config.max_roles = WORKERS + 2;
         config.max_acl_entries = 3 + WORKERS;
         config.max_column_acl_entries = WORKERS;
         config.max_default_acl_entries = WORKERS;
         config.max_parameter_acl_entries = WORKERS;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
+        let grantees = ["acl_a", "acl_b", "acl_c", "acl_d", "acl_e"].map(|name| {
+            let (slot, _) = storage
+                .create_role(SqlName::parse(name).unwrap(), RoleAttributes::ORDINARY, 1)
+                .unwrap();
+            storage.commit_role_change(slot);
+            slot as u16
+        });
 
         std::thread::scope(|scope| {
             for (worker, parameter) in parameters.iter().copied().enumerate() {
                 let storage = &storage;
+                let grantee = grantees[worker];
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
-                    let grantee = worker as u16 + 1;
                     let object = AccessObject {
                         class: AccessClass::Database,
                         slot: 0,
@@ -58761,17 +58777,19 @@ mod tests {
         assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_parameter_acls().count(), WORKERS);
-        assert!(
+        assert_eq!(
             storage
                 .change_parameter_acl(
                     crate::sql::ast::ParameterName::parse("acl.e").unwrap(),
-                    5,
+                    grantees[WORKERS],
                     BOOTSTRAP_ROLE,
                     crate::sql::ast::ParameterPrivileges::SET,
                     crate::sql::ast::ParameterPrivileges::NONE,
                     0,
                 )
-                .is_err()
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
     }
 

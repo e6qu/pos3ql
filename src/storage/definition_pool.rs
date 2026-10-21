@@ -85,13 +85,46 @@ impl<Key: DefinitionKey, Definition> DefinitionImagePool<Key, Definition> {
     }
 
     pub(super) fn retains(&self, index: usize) -> bool {
-        self.retained[index].load(Ordering::Acquire) != 0
+        self.retained
+            .get(index)
+            .is_some_and(|readers| readers.load(Ordering::Acquire) != 0)
     }
 }
 
 pub(super) struct DefinitionImages<Key: DefinitionKey, Definition> {
     pool: Arc<DefinitionImagePool<Key, Definition>>,
     head: Cell<Option<usize>>,
+}
+
+/// An addressable image. Reading it requires a separate owner that keeps its
+/// immutable chain alive; retaining the pool alone does not retain a cell.
+pub(super) struct DefinitionImageHandle<Key: DefinitionKey, Definition> {
+    pool: Arc<DefinitionImagePool<Key, Definition>>,
+    index: usize,
+}
+
+impl<Key: DefinitionKey, Definition> DefinitionImageHandle<Key, Definition> {
+    pub(super) fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The caller must retain the chain that owns this initialized cell.
+    pub(super) unsafe fn definition(&self) -> &Definition {
+        assert!(self.pool.occupied[self.index].load(Ordering::Acquire));
+        // SAFETY: the caller retains the immutable occupied image.
+        unsafe {
+            &(*self.pool.cells[self.index].0.get())
+                .assume_init_ref()
+                .definition
+        }
+    }
+
+    /// The caller must retain the chain that owns this initialized cell.
+    pub(super) unsafe fn key(&self) -> Key {
+        assert!(self.pool.occupied[self.index].load(Ordering::Acquire));
+        // SAFETY: the caller retains the immutable occupied image.
+        unsafe { (*self.pool.cells[self.index].0.get()).assume_init_ref().key }
+    }
 }
 
 impl<Key: DefinitionKey, Definition> DefinitionImages<Key, Definition> {
@@ -108,18 +141,33 @@ impl<Key: DefinitionKey, Definition> DefinitionImages<Key, Definition> {
 
     pub(super) fn find(
         &self,
-        mut matches: impl FnMut(&Key) -> bool,
-    ) -> Option<(&Key, &Definition)> {
+        mut matches: impl FnMut(&Key, &Definition) -> bool,
+    ) -> Option<(usize, &Key, &Definition)> {
         let mut slot = self.head.get();
         while let Some(index) = slot {
             // SAFETY: this owner's immutable chain stays occupied until Drop.
             let image = unsafe { (*self.pool.cells[index].0.get()).assume_init_ref() };
-            if matches(&image.key) {
-                return Some((&image.key, &image.definition));
+            if matches(&image.key, &image.definition) {
+                return Some((index, &image.key, &image.definition));
             }
             slot = image.next;
         }
         None
+    }
+
+    pub(super) fn handle(&self, definition: &Definition) -> DefinitionImageHandle<Key, Definition> {
+        let index = self
+            .find(|_, value| core::ptr::eq(value, definition))
+            .expect("definition belongs to its immutable chain")
+            .0;
+        self.handle_at(index)
+    }
+
+    pub(super) fn handle_at(&self, index: usize) -> DefinitionImageHandle<Key, Definition> {
+        DefinitionImageHandle {
+            pool: Arc::clone(&self.pool),
+            index,
+        }
     }
 
     fn insert_with(
@@ -293,9 +341,9 @@ mod tests {
             assert_eq!(drops.load(Ordering::Relaxed), 0);
             assert_eq!(
                 images
-                    .find(|key| key.0 == 0)
+                    .find(|key, _| key.0 == 0)
                     .unwrap()
-                    .1
+                    .2
                     .0
                     .load(Ordering::Relaxed),
                 0

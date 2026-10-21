@@ -26,6 +26,19 @@ jobs:
           key: ${{ runner.os }}-cargo-type-readers-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-library-tests-
       - run: cargo clean -p pos3ql
+      - name: Record formatting changes without changing the tested tree
+        run: |
+          cargo fmt --all
+          git diff --binary > "$RUNNER_TEMP/type-readers-format.patch"
+          git rev-parse HEAD > "$RUNNER_TEMP/type-readers-format-head.txt"
+          git restore -- .
+          git diff --exit-code
+      - uses: actions/upload-artifact@v6
+        with:
+          name: type-reader-formatting
+          path: |
+            ${{ runner.temp }}/type-readers-format.patch
+            ${{ runner.temp }}/type-readers-format-head.txt
       - name: Retained source definitions and exact startup reservations
         run: >-
           cargo test --lib --locked --

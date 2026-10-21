@@ -1348,6 +1348,14 @@ impl super::Storage {
             .expect("type catalog lock poisoned");
         let old = allocated.index();
         let new = target.index();
+        let retained = self.type_definition_images.retains(allocated)
+            || self.type_definition_images.retains(target);
+        let retained_error = || {
+            sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "stored type catalog slot is retained by an executing statement"
+            )
+        };
         match (allocated, target) {
             (NamedTypeSlot::Domain(_), NamedTypeSlot::Domain(_)) => {
                 if new >= catalog.domains.len()
@@ -1356,6 +1364,9 @@ impl super::Storage {
                         && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
                 {
                     return Err(invalid());
+                }
+                if retained && (old != new || catalog.domains[old].created_at != created_at) {
+                    return Err(retained_error());
                 }
                 catalog.domains.swap(old, new);
                 catalog.domains[new].created_at = created_at;
@@ -1367,6 +1378,9 @@ impl super::Storage {
                 {
                     return Err(invalid());
                 }
+                if retained && (old != new || catalog.enums[old].created_at != created_at) {
+                    return Err(retained_error());
+                }
                 catalog.enums.swap(old, new);
                 catalog.enums[new].created_at = created_at;
             }
@@ -1377,6 +1391,9 @@ impl super::Storage {
                         && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
                 {
                     return Err(invalid());
+                }
+                if retained && (old != new || catalog.composites[old].created_at != created_at) {
+                    return Err(retained_error());
                 }
                 catalog.composites.swap(old, new);
                 catalog.composites[new].created_at = created_at;

@@ -535,11 +535,11 @@ struct StatementFileIdentity {
     serial: NonZeroU64,
 }
 
-#[derive(Clone, Copy)]
 struct StatementFileOwner {
     serial: NonZeroU64,
     references: NonZeroUsize,
     has_roots: bool,
+    type_definitions: Option<super::TypeDefinitionImages>,
 }
 
 struct RetainedRootPool<Root> {
@@ -790,6 +790,39 @@ pub(crate) struct StatementFileScope {
 }
 
 impl StatementFileLease {
+    /// Returned images borrow this lease, which keeps their statement owner
+    /// alive after the registry lock releases. Capture never invokes evaluation.
+    pub(super) fn type_definition<'lease, Definition: 'static>(
+        &'lease self,
+        storage: &Storage,
+        select: impl for<'images> FnOnce(
+            &'images super::TypeDefinitionImages,
+        ) -> Result<&'images Definition, SqlError>,
+    ) -> Result<&'lease Definition, SqlError> {
+        if !Arc::ptr_eq(&self.registry, &storage.spill_roots) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "type definition lease belongs to different storage"
+            ));
+        }
+        let definition = {
+            let mut state = self
+                .registry
+                .roots
+                .lock()
+                .expect("retained file root lock poisoned");
+            let owner = state.statement_mut(self.identity);
+            let images = owner
+                .type_definitions
+                .get_or_insert_with(|| storage.type_definition_images());
+            select(images)? as *const Definition
+        };
+        // SAFETY: this lease owns a reference to the statement. Its immutable
+        // image chain cannot be destroyed until every lease and scope releases.
+        // Evaluation runs after all live catalog/registry guards have released.
+        Ok(unsafe { &*definition })
+    }
+
     pub(super) fn enter(&self) -> Result<StatementFileScope, SqlError> {
         let previous = SELECTED_STATEMENT_FILES.with(Cell::get);
         let depth = STATEMENT_FILE_SCOPE_DEPTH
@@ -956,6 +989,7 @@ impl SpillRootRegistry {
             serial,
             references: NonZeroUsize::new(1).expect("nonzero"),
             has_roots: false,
+            type_definitions: None,
         });
         state.next_statement = serial.get();
         Ok(StatementFileLease {
@@ -979,6 +1013,32 @@ impl SpillRootRegistry {
             }
         }
         state.statements[identity.slot] = None;
+    }
+
+    /// Nested readers join the active statement; a standalone callback owns a
+    /// separate statement reference for exactly the callback's duration.
+    pub(super) fn type_definition_reader(self: &Arc<Self>) -> Result<StatementFileLease, SqlError> {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        let Some(identity) = self.selected_statement(&mut state) else {
+            drop(state);
+            return self.retain_statement();
+        };
+        let owner = state.statement_mut(identity);
+        owner.references = owner
+            .references
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file references exhausted"
+                )
+            })?;
+        Ok(StatementFileLease {
+            registry: Arc::clone(self),
+            identity,
+        })
     }
 
     fn selected_statement(&self, state: &mut RetainedRootState) -> Option<StatementFileIdentity> {

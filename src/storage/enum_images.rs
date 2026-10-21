@@ -261,6 +261,10 @@ pub(super) struct EnumImageRead {
 }
 
 impl EnumImageRead {
+    pub(super) fn selects(&self, image: Option<u32>) -> bool {
+        self.image == image
+    }
+
     pub(super) fn capture(images: &Arc<Mutex<EnumMemberImages>>, image: Option<u32>) -> Self {
         if let Some(image) = image {
             let mut state = images.lock().expect("enum member-image lock poisoned");

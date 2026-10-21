@@ -45,6 +45,12 @@ Creating objects returns `42501`; recreating either name does not restore the
 deleted account's permissions. A replacement account cannot inspect or cancel
 the old connection's queries.
 
+Role identifiers also survive journal and checkpoint recovery. Renaming the
+owner of a prepared transaction changes the displayed owner name. Deleting
+that owner leaves the transaction available to superusers; a replacement
+account cannot commit or roll it back. Reusing a catalog slot does not reuse
+the deleted account's identifier.
+
 Memory for connection identities is reserved at startup. The identities distinguish catalog slot reuse.
 Creation without a valid acting account fails before allocating identifiers or
 changing catalogs. Recovery supplies an explicit owner instead of substituting

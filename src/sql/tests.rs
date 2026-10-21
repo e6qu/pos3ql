@@ -19201,6 +19201,44 @@ fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
 }
 
 #[test]
+fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
+    let mut config = test_config("relocated-role-owner");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("relocated-role-owner-{}", std::process::id());
+    config.max_prepared_transactions = 2;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(&mut engine, &mut budget,
+        "CREATE ROLE unused_source_role; CREATE ROLE retained_source_role");
+    assert!(!message_types(&output).contains(&b'E'));
+    let prior_slot = engine.storage.find_role("retained_source_role").unwrap();
+    let oid = engine.storage.role_oid(prior_slot);
+    let output = run_with(&mut engine, &mut budget,
+        "SET ROLE retained_source_role; BEGIN; SELECT 1; PREPARE TRANSACTION 'retained-owner'");
+    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE unused_source_role");
+    assert!(!message_types(&output).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let slot = recovered.storage.find_role("retained_source_role").unwrap();
+    assert_ne!(slot, prior_slot);
+    assert_eq!(recovered.storage.role_oid(slot), oid);
+    let mut actor = GucState::new();
+    actor.bind_session_user(recovered.role_login("retained_source_role").unwrap().identity);
+    let output = run_with_guc(&mut recovered, &mut recovered_budget,
+        "COMMIT PREPARED 'retained-owner'", 1 << 18, &mut actor);
+    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
     for checkpoint in [false, true] {
         let mut config = test_config(if checkpoint { "role-owner-checkpoint" } else { "role-owner-journal" });
@@ -19233,10 +19271,12 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
         let output = run_with(&mut engine, &mut budget,
             "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
         assert_eq!(data_rows(&output), ["t"]);
+        let mut actor = GucState::new();
+        actor.bind_session_user(engine.role_login("source_prepared_owner").unwrap().identity);
         for command in ["COMMIT", "ROLLBACK"] {
-            let output = run_with(&mut engine, &mut budget,
-                &format!("SET ROLE source_prepared_owner; {command} PREPARED 'source-owner'"));
-            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"));
+            let output = run_with_guc(&mut engine, &mut budget,
+                &format!("{command} PREPARED 'source-owner'"), 1 << 18, &mut actor);
+            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"), "{}", String::from_utf8_lossy(&output));
         }
         if checkpoint { assert!(engine.checkpoint().unwrap()); }
         drop(engine);
@@ -19248,13 +19288,16 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
         let output = run_with(&mut recovered, &mut recovered_budget,
             "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
         assert_eq!(data_rows(&output), ["t"]);
+        let mut actor = GucState::new();
+        actor.bind_session_user(recovered.role_login("source_prepared_owner").unwrap().identity);
         for command in ["COMMIT", "ROLLBACK"] {
-            let output = run_with(&mut recovered, &mut recovered_budget,
-                &format!("SET ROLE source_prepared_owner; {command} PREPARED 'source-owner'"));
-            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"));
+            let output = run_with_guc(&mut recovered, &mut recovered_budget,
+                &format!("{command} PREPARED 'source-owner'"), 1 << 18, &mut actor);
+            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"), "{}", String::from_utf8_lossy(&output));
         }
-        let output = run_with(&mut recovered, &mut recovered_budget,
-            "ROLLBACK PREPARED 'source-owner'; CREATE ROLE next_source_owner");
+        let output = run_with(&mut recovered, &mut recovered_budget, "ROLLBACK PREPARED 'source-owner'");
+        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+        let output = run_with(&mut recovered, &mut recovered_budget, "CREATE ROLE next_source_owner");
         assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
         let next = recovered.storage.find_role("next_source_owner").unwrap();
         assert!(recovered.storage.role_oid(next) > replacement_oid);
@@ -76526,6 +76569,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
     for (field, message) in [
         ("writer ", "manifest writer identity missing"),
         ("lsn ", "manifest LSN missing"),
+        ("role_sequence ", "manifest lacks role identity allocator"),
     ] {
         rejected_roots.push((
             current_text

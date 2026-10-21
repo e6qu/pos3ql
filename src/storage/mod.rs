@@ -53631,6 +53631,26 @@ mod tests {
     }
 
     #[test]
+    fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        storage.restore_role_identity_sequence(i32::MAX as u64).unwrap();
+        let sequence = storage.catalog_identity_sequence();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..2 {
+                let error = storage.create_role(SqlName::parse("exhausted_actor").unwrap(), RoleAttributes::ORDINARY, 7).unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(error.message.as_str(), "role identity space exhausted");
+                assert!(storage.find_role_visible("exhausted_actor", 7).is_none());
+                assert_eq!(storage.role_identity_sequence(), i32::MAX as u64);
+                assert_eq!(storage.catalog_identity_sequence(), sequence);
+                assert_eq!(storage.role_oid(0), 10);
+            }
+        });
+    }
+
+    #[test]
     fn catalog_creation_known_name_requires_an_authenticated_identity() {
         let config = test_config();
         let mut budget = test_budget(&config);

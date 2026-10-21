@@ -32,6 +32,7 @@ def exercise(host, port, administrator):
         admin.execute("SET statement_timeout = '5s'")
         try:
             admin.execute(f"CREATE ROLE {OLD} LOGIN")
+            original_oid = admin.execute("SELECT oid FROM pg_roles WHERE rolname = %s", (OLD,)).fetchone()[0]
             admin.execute(f"GRANT CREATE ON SCHEMA public TO {OLD}")
             with psycopg.connect(**settings, user=OLD) as actor:
                 actor.execute("SET statement_timeout = '5s'")
@@ -47,6 +48,7 @@ def exercise(host, port, administrator):
                 admin.execute(f"CREATE ROLE {OLD} LOGIN")
                 observe("renamed_login", "SELECT current_user::text, session_user::text")
                 observations.append(["renamed_activity_user", result(admin, f"SELECT usename::text FROM pg_stat_activity WHERE pid = {actor_pid}")])
+                observations.append(["renamed_activity_identity", result(admin, f"SELECT usesysid = {original_oid} FROM pg_stat_activity WHERE pid = {actor_pid}")])
                 observe("reset_role", "RESET ROLE")
                 observe("role_after_reset", "SELECT current_user::text, session_user::text")
                 observe("reset_authorization", "RESET SESSION AUTHORIZATION")
@@ -86,6 +88,7 @@ def exercise(host, port, administrator):
                 admin.execute(f"GRANT {TARGET_RENAMED} TO {OLD}, {RENAMED}")
                 observe("constant_after_replacement", "SELECT 1")
                 observations.append(["replaced_activity_user", result(admin, f"SELECT usename::text FROM pg_stat_activity WHERE pid = {actor_pid}")])
+                observations.append(["replacement_has_different_identity", result(admin, f"SELECT activity.usesysid <> role.oid FROM pg_stat_activity activity JOIN pg_roles role ON role.rolname = '{RENAMED}' WHERE activity.pid = {actor_pid}")])
                 observe("user_after_replacement", "SELECT current_user::text")
                 observe("session_after_replacement", "SELECT session_user::text")
                 observe("create_after_replacement", f"CREATE TABLE public.{TABLES[1]} (id integer)")

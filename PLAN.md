@@ -45,7 +45,8 @@ tables before changing their references together. The
 Connections retain their authenticated and selected accounts through renames,
 savepoints and account replacement. Object creation rejects a missing account
 before changing catalogs; connection limits and query permissions distinguish
-the account that originally logged in from a replacement.
+the account that originally logged in from a replacement. Durable role
+identifiers keep prepared transaction ownership distinct through recovery.
 
 When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running

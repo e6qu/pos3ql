@@ -236,6 +236,11 @@ checks; durable type identities and file formats are unchanged.
 order_price; ROLLBACK;` leaves the original `price` domain available. Rolling
 back a savepoint after a type rename and deletion restores both the earlier
 name and definition. A later edit in the same transaction can still commit.
+Checks and cascading deletion follow captured domain parents and columns across
+pending name changes. For example, renaming a parent domain before adding a
+check still validates rows declared with its child domain. Moving a domain to
+another schema before deleting the old schema preserves outside table columns
+that use the moved domain.
 
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`

@@ -19,6 +19,11 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
+    pub(crate) fn matches_reference(self, name: super::UserTypeName) -> Result<bool, SqlError> {
+        let reference = super::TypeReference::from_bound_name(name)?;
+        Ok(reference.refers_to(self.source, self.source.database()))
+    }
+
     pub(super) fn transaction(self) -> u32 {
         self.transaction
     }
@@ -205,7 +210,6 @@ impl super::TypeCatalog {
     }
 
     pub(super) fn validate_type_edit(&self, target: TypeEditTarget, transaction: u32) -> Result<(), SqlError> {
-        self.validate_type_edit_source(target)?;
         let current = self.select_type_edit(target.source.slot(), transaction)?;
         if current.source != target.source {
             return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source has been replaced"));
@@ -263,20 +267,57 @@ impl super::TypeCatalog {
 }
 
 impl super::Storage {
+    pub(crate) fn domain_reference_slot(&self, name: super::UserTypeName, transaction: u32) -> Result<Option<usize>, SqlError> {
+        let reference = super::TypeReference::from_bound_name(name)?;
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let source = catalog.resolve_source_reference(reference, super::current_database(), transaction)?
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain dependency source no longer exists"))?;
+        Ok(match source.identity.slot() {
+            NamedTypeSlot::Domain(slot) => Some(slot),
+            NamedTypeSlot::Enum(_) | NamedTypeSlot::Composite(_) => None,
+        })
+    }
+
+    pub(crate) fn domain_depends_on(&self, mut slot: usize, target: usize, transaction: u32) -> Result<bool, SqlError> {
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let selected = catalog.select_type_edit(NamedTypeSlot::Domain(target), transaction)?;
+        for _ in 0..catalog.domains.len() {
+            let current = catalog.select_type_edit(NamedTypeSlot::Domain(slot), transaction)?;
+            if current.source == selected.source { return Ok(true); }
+            let definition = &catalog.domains[slot];
+            let parent = definition.pending_definition.as_ref()
+                .filter(|pending| pending.txid == transaction)
+                .map_or(definition.base_domain, |pending| pending.spec.base_domain);
+            let Some(parent) = parent else { return Ok(false); };
+            let parent = catalog.resolve_source_reference(super::TypeReference::from_bound_name(parent)?,
+                super::current_database(), transaction)?
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain parent source no longer exists"))?;
+            let NamedTypeSlot::Domain(parent) = parent.identity.slot() else {
+                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "domain parent source is not a domain"));
+            };
+            slot = parent;
+        }
+        Err(sql_err!(sqlstate::INTERNAL_ERROR, "domain dependency cycle detected"))
+    }
+
     pub(crate) fn validate_type_commit(
         &self,
+        transaction: u32,
         changes: impl Iterator<Item = TypeCommitChange>,
     ) -> Result<(), SqlError> {
         let mut changes = changes.peekable();
         if changes.peek().is_none() { return Ok(()); }
         let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
         for change in changes {
-            let (source, transaction) = match change {
+            let (source, owner) = match change {
                 TypeCommitChange::Definition(target) => (target.source, target.transaction),
                 TypeCommitChange::Lifecycle(undo) => (undo.source, undo.transaction),
             };
             if source.database() != super::current_database() || !catalog.contains_type_source(source) {
                 return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "transaction type source has been replaced"));
+            }
+            if owner != transaction || catalog.conflicting_type_owner(source.slot(), transaction).is_some() {
+                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type change no longer belongs to its transaction"));
             }
             let valid = match change {
                 TypeCommitChange::Definition(target) => {
@@ -516,7 +557,7 @@ mod tests {
                     assert_eq!(state(&foreign, foreign_created), PendingCreate { txid: 7 });
                     assert_eq!(state(&storage, created), PendingCreate { txid: 7 });
                 }
-                assert_eq!(foreign.validate_type_commit([TypeCommitChange::Lifecycle(created)].into_iter()).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(foreign.validate_type_commit(7, [TypeCommitChange::Lifecycle(created)].into_iter()).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
                 storage.finish_type_ddl(created, Commit);
                 storage.finish_type_ddl(created, Rollback);
                 assert_eq!(state(&storage, created), Present);
@@ -527,8 +568,8 @@ mod tests {
                     storage.finish_type_ddl(earlier, decision);
                     assert_eq!(state(&storage, latest), PendingDrop { txid: 7 });
                 }
-                assert_eq!(storage.validate_type_commit([TypeCommitChange::Lifecycle(earlier)].into_iter()).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-                storage.validate_type_commit([TypeCommitChange::Lifecycle(latest)].into_iter()).unwrap();
+                assert_eq!(storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(earlier)].into_iter()).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(latest)].into_iter()).unwrap();
                 storage.finish_type_ddl(latest, Commit);
                 assert_eq!(state(&storage, latest), Absent);
                 let replacement = create(&mut storage, kind);
@@ -556,7 +597,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let created = create(&mut storage, kind);
                 let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
-                storage.validate_type_commit([TypeCommitChange::Lifecycle(created), TypeCommitChange::Lifecycle(dropped)].into_iter()).unwrap();
+                storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(created), TypeCommitChange::Lifecycle(dropped)].into_iter()).unwrap();
                 storage.finish_type_ddl(created, Commit);
                 storage.finish_type_ddl(dropped, Commit);
                 assert_eq!(state(&storage, dropped), CatalogDdlState::Absent);

@@ -5400,7 +5400,7 @@ impl Engine {
                 _ => return None,
             })
         });
-        if let Err(error) = self.storage.validate_type_commit(type_changes) {
+        if let Err(error) = self.storage.validate_type_commit(txn.txid, type_changes) {
             self.rollback_txn(txn, guc);
             return Err(error);
         }

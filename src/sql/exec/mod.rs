@@ -12051,8 +12051,8 @@ pub(crate) fn drop_schema(
         .enumerate()
         .take(storage.domain_count())
     {
-        if storage.domain(domain).visible_to(txn.txid)
-            && in_listed(storage, storage.domain(domain).schema.as_str())
+        if storage.domain_slot_visible_to(domain, txn.txid)
+            && in_listed(storage, storage.domain_for(domain, txn.txid).schema.as_str())
         {
             *selected = true;
             if let Err(e) = push(SchemaObject::Domain(domain), &mut n_objects) {
@@ -12061,7 +12061,7 @@ pub(crate) fn drop_schema(
         }
     }
     for enumeration in 0..storage.enum_count() {
-        if storage.enum_for(enumeration, txn.txid).visible_to(txn.txid)
+        if storage.enum_slot_visible_to(enumeration, txn.txid)
             && in_listed(
                 storage,
                 storage.enum_for(enumeration, txn.txid).schema.as_str(),
@@ -12073,7 +12073,7 @@ pub(crate) fn drop_schema(
     }
     for composite in 0..storage.composite_count() {
         let definition = storage.composite_for(composite, txn.txid);
-        if definition.visible_to(txn.txid)
+        if storage.composite_slot_visible_to(composite, txn.txid)
             && in_listed(storage, definition.schema.as_str())
             && let Err(error) = push(SchemaObject::Composite(composite), &mut n_objects)
         {
@@ -12114,13 +12114,14 @@ pub(crate) fn drop_schema(
         // They are catalog-only dependents, so include their entire bounded
         // closure rather than leaving a dangling base type.
         for domain_slot in 0..storage.domain_count() {
-            let domain = storage.domain(domain_slot);
-            if !domain.visible_to(txn.txid) || schema_domains[domain_slot] {
+            let domain = storage.domain_for(domain_slot, txn.txid);
+            if !storage.domain_slot_visible_to(domain_slot, txn.txid) || schema_domains[domain_slot] {
                 continue;
             }
-            let parent_in_schema = (0..storage.domain_count()).any(|parent| {
-                schema_domains[parent] && domain_depends_on(storage, domain_slot, parent, txn.txid)
-            });
+            let parent_in_schema = match selected_domain_dependency(storage, domain_slot, schema_domains, txn.txid) {
+                Ok(parent) => parent.is_some(),
+                Err(error) => return sql_fail(error),
+            };
             let enum_in_schema = match domain.base {
                 ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
                     in_listed(
@@ -12146,40 +12147,31 @@ pub(crate) fn drop_schema(
                 if in_listed(storage, def.schema.as_str()) {
                     continue;
                 }
-                if !def.columns().iter().any(|column| {
-                    if column
-                        .user_type
-                        .is_some_and(|identity| in_listed(storage, identity.schema.as_str()))
-                    {
-                        return true;
-                    }
-                    let Some(identity) = column.user_type else {
-                        return false;
+                let mut uses_schema_type = false;
+                for column in def.columns() {
+                    let result = match storage.bind_routine_result(crate::storage::RoutineResult { ctype: column.ctype, user_type: column.user_type }, txn.txid) {
+                        Ok(result) => result,
+                        Err(error) => return sql_fail(error),
                     };
-                    let Some(domain_slot) = storage.domain_slot(
-                        identity.schema.as_str(),
-                        identity.name.as_str(),
-                        txn.txid,
-                    ) else {
-                        return false;
+                    let Some(identity) = result.user_type else { continue; };
+                    if in_listed(storage, identity.schema.as_str()) { uses_schema_type = true; break; }
+                    let domain_slot = match storage.domain_reference_slot(identity, txn.txid) {
+                        Ok(Some(slot)) => slot,
+                        Ok(None) => continue,
+                        Err(error) => return sql_fail(error),
                     };
-                    let parent_domain_in_schema = (0..storage.domain_count()).any(|parent| {
-                        schema_domains[parent]
-                            && domain_depends_on(storage, domain_slot, parent, txn.txid)
-                    });
-                    let base_enum_in_schema = match storage.domain(domain_slot).base {
-                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                            in_listed(
-                                storage,
-                                storage.enum_for(slot as usize, txn.txid).schema.as_str(),
-                            )
-                        }
+                    let parent_in_schema = match selected_domain_dependency(storage, domain_slot, schema_domains, txn.txid) {
+                        Ok(parent) => parent.is_some(),
+                        Err(error) => return sql_fail(error),
+                    };
+                    let enum_in_schema = match storage.domain_for(domain_slot, txn.txid).base {
+                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) =>
+                            in_listed(storage, storage.enum_for(slot as usize, txn.txid).schema.as_str()),
                         _ => false,
                     };
-                    parent_domain_in_schema || base_enum_in_schema
-                }) {
-                    continue;
+                    if parent_in_schema || enum_in_schema { uses_schema_type = true; break; }
                 }
+                if !uses_schema_type { continue; }
                 dependent = Some(table);
                 break;
             }
@@ -12191,36 +12183,29 @@ pub(crate) fn drop_schema(
             let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
             let mut column_count = 0;
             for column in def.columns() {
-                let directly_in_schema = column
+                let result = match storage.bind_routine_result(crate::storage::RoutineResult { ctype: column.ctype, user_type: column.user_type }, txn.txid) {
+                    Ok(result) => result,
+                    Err(error) => return sql_fail(error),
+                };
+                let directly_in_schema = result
                     .user_type
                     .is_some_and(|identity| in_listed(storage, identity.schema.as_str()));
-                let through_domain = column
-                    .user_type
-                    .and_then(|identity| {
-                        storage
-                            .domain_slot(identity.schema.as_str(), identity.name.as_str(), txn.txid)
-                            .map(|domain_slot| {
-                                let parent_in_schema = (0..storage.domain_count()).any(|parent| {
-                                    schema_domains[parent]
-                                        && domain_depends_on(storage, domain_slot, parent, txn.txid)
-                                });
-                                let enum_in_schema = match storage.domain(domain_slot).base {
-                                    ColType::Enum(slot)
-                                    | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                                        in_listed(
-                                            storage,
-                                            storage
-                                                .enum_for(slot as usize, txn.txid)
-                                                .schema
-                                                .as_str(),
-                                        )
-                                    }
-                                    _ => false,
-                                };
-                                parent_in_schema || enum_in_schema
-                            })
-                    })
-                    .unwrap_or(false);
+                let domain_slot = match result.user_type.map(|identity| storage.domain_reference_slot(identity, txn.txid)).transpose() {
+                    Ok(slot) => slot.flatten(),
+                    Err(error) => return sql_fail(error),
+                };
+                let through_domain = if let Some(domain_slot) = domain_slot {
+                    let parent_in_schema = match selected_domain_dependency(storage, domain_slot, schema_domains, txn.txid) {
+                        Ok(parent) => parent.is_some(),
+                        Err(error) => return sql_fail(error),
+                    };
+                    let enum_in_schema = match storage.domain_for(domain_slot, txn.txid).base {
+                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) =>
+                            in_listed(storage, storage.enum_for(slot as usize, txn.txid).schema.as_str()),
+                        _ => false,
+                    };
+                    parent_in_schema || enum_in_schema
+                } else { false };
                 if directly_in_schema || through_domain {
                     columns[column_count] = column.name;
                     column_count += 1;
@@ -12510,7 +12495,7 @@ pub(crate) fn drop_schema(
                 )
             }
             SchemaObject::Domain(domain) => {
-                let domain = storage.domain(*domain);
+                let domain = storage.domain_for(*domain, txn.txid);
                 (
                     schema_rank(storage, domain.schema.as_str()),
                     domain.created_at,
@@ -12668,7 +12653,7 @@ pub(crate) fn drop_schema(
                 write_rel(out, &sequence.schema, &sequence.name);
             }
             SchemaObject::Domain(domain) => {
-                let domain = storage.domain(*domain);
+                let domain = storage.domain_for(*domain, txn.txid);
                 let _ = write!(out, "type ");
                 write_rel(out, &domain.schema, &domain.name);
             }
@@ -12789,7 +12774,7 @@ pub(crate) fn drop_schema(
                 SchemaObject::Sequence(sequence) => {
                     storage.sequence_for(*sequence, txn.txid).schema
                 }
-                SchemaObject::Domain(domain) => storage.domain(*domain).schema,
+                SchemaObject::Domain(domain) => storage.domain_for(*domain, txn.txid).schema,
                 SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
                 SchemaObject::Composite(composite) => {
                     storage.composite_for(*composite, txn.txid).schema
@@ -12850,7 +12835,7 @@ pub(crate) fn drop_schema(
                         write_rel(&mut dependency, &sequence.schema, &sequence.name);
                     }
                     crate::storage::DependencyClass::Domain => {
-                        let domain = storage.domain(*root_slot);
+                        let domain = storage.domain_for(*root_slot, txn.txid);
                         let _ = write!(dependency, "type ");
                         write_rel(&mut dependency, &domain.schema, &domain.name);
                     }
@@ -13307,7 +13292,7 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::Domain(domain) => {
-                let domain = storage.domain(*domain);
+                let domain = storage.domain_for(*domain, txn.txid);
                 let (schema, name) = (domain.schema, domain.name);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
@@ -41200,25 +41185,19 @@ pub(crate) fn drop_domain(
     // mutating any catalog entry, so CASCADE drops descendant domains too and
     // a failure cannot leave a dangling base-domain reference.
     for candidate in 0..storage.domain_count() {
-        if !storage.domain(candidate).visible_to(txn.txid) || selected[candidate] {
+        if !storage.domain_slot_visible_to(candidate, txn.txid) || selected[candidate] {
             continue;
         }
-        let depends_on_selected = (0..storage.domain_count()).any(|target| {
-            selected[target] && domain_depends_on(storage, candidate, target, txn.txid)
-        });
-        if !depends_on_selected {
-            continue;
-        }
+        let dependency = match selected_domain_dependency(storage, candidate, selected, txn.txid) {
+            Ok(dependency) => dependency,
+            Err(error) => return sql_fail(error),
+        };
+        let Some(target) = dependency else { continue; };
         if !cascade {
-            let target = (0..storage.domain_count())
-                .find(|target| {
-                    selected[*target] && domain_depends_on(storage, candidate, *target, txn.txid)
-                })
-                .expect("dependency target");
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "cannot drop type {} because other objects depend on it",
-                storage.domain(target).name.as_str()
+                storage.domain_for(target, txn.txid).name.as_str()
             ));
         }
         selected[candidate] = true;
@@ -41284,10 +41263,9 @@ fn drop_domain_selection(
         if !*is_selected {
             continue;
         }
-        while let Some((table_schema, table, _)) = domain_column_in_use(storage, slot, txn.txid) {
+        while let Some((table_schema, table, _)) = domain_column_in_use(storage, slot, txn.txid)? {
             if cascade {
-                let domain = storage.domain(slot);
-                let (domain_schema, domain_name) = (domain.schema, domain.name);
+                let (_, target) = storage.prepare_domain_edit(slot, txn.txid)?;
                 let table_slot = storage
                     .find_visible(table_schema.as_str(), table.as_str(), txn.txid)
                     .expect("dependent table remains visible");
@@ -41295,9 +41273,8 @@ fn drop_domain_selection(
                 let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
                 let mut column_count = 0;
                 for column in def.columns() {
-                    if column
-                        .user_type
-                        .is_some_and(|identity| identity.is_named(domain_schema, domain_name))
+                    if let Some(identity) = column.user_type
+                        && target.matches_reference(identity)?
                     {
                         columns[column_count] = column.name;
                         column_count += 1;
@@ -41321,23 +41298,20 @@ fn drop_domain_selection(
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "cannot drop type {} because other objects depend on it",
-                storage.domain(slot).name.as_str()
+                storage.domain_for(slot, txn.txid).name.as_str()
             ));
         }
-        while let Some(composite_slot) = composite_field_uses_domain(storage, slot, txn.txid) {
+        while let Some(composite_slot) = composite_field_uses_domain(storage, slot, txn.txid)? {
             if !cascade {
                 return Err(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                     "cannot drop type {} because other objects depend on it",
-                    storage.domain(slot).name.as_str()
+                    storage.domain_for(slot, txn.txid).name.as_str()
                 ));
             }
-            let domain = storage.domain(slot);
-            let identity = crate::storage::UserTypeName::declaration(domain.schema, domain.name);
+            let (_, target) = storage.prepare_domain_edit(slot, txn.txid)?;
             cascade_drop_composite_fields(storage, wal, txn, composite_slot, |field| {
-                field
-                    .user_type
-                    .is_some_and(|field_type| field_type.is_named(identity.schema, identity.name))
+                field.user_type.map_or(Ok(false), |identity| target.matches_reference(identity))
             })?;
         }
     }
@@ -41358,16 +41332,19 @@ fn drop_domain_selection(
         .map_err(|_| arena_full())?;
     let mut ordered_count = 0;
     while ordered_count < selected_count {
-        let Some(leaf) = (0..storage.domain_count()).find(|candidate| {
-            selected[*candidate]
-                && !ordered[..ordered_count].contains(candidate)
-                && !(0..storage.domain_count()).any(|child| {
-                    child != *candidate
-                        && selected[child]
-                        && !ordered[..ordered_count].contains(&child)
-                        && domain_depends_on(storage, child, *candidate, txn.txid)
-                })
-        }) else {
+        let mut leaf = None;
+        for candidate in 0..storage.domain_count() {
+            if !selected[candidate] || ordered[..ordered_count].contains(&candidate) { continue; }
+            let mut has_child = false;
+            for child in 0..storage.domain_count() {
+                if child != candidate && selected[child]
+                    && !ordered[..ordered_count].contains(&child)
+                    && storage.domain_depends_on(child, candidate, txn.txid)?
+                { has_child = true; break; }
+            }
+            if !has_child { leaf = Some(candidate); break; }
+        }
+        let Some(leaf) = leaf else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "domain dependency cycle detected"
@@ -41379,7 +41356,7 @@ fn drop_domain_selection(
 
     for slot in ordered[..ordered_count].iter().copied() {
         let (schema, dname) = {
-            let domain = storage.domain(slot);
+            let domain = storage.domain_for(slot, txn.txid);
             (domain.schema, domain.name)
         };
         let lsn = storage.bump_lsn();
@@ -41409,8 +41386,8 @@ fn domain_column_in_use(
     storage: &Storage,
     domain_slot: usize,
     txid: u32,
-) -> Option<(SqlName, SqlName, SqlName)> {
-    let domain = storage.domain(domain_slot);
+) -> Result<Option<(SqlName, SqlName, SqlName)>, SqlError> {
+    let (_, target) = storage.prepare_domain_edit(domain_slot, txid)?;
     for table_index in 0..storage.table_count() {
         let table = storage.table(table_index);
         if !table.visible_to(txid) {
@@ -41418,15 +41395,14 @@ fn domain_column_in_use(
         }
         let def = storage.table_def(table_index, txid);
         for column in def.columns() {
-            if column
-                .user_type
-                .is_some_and(|identity| identity.is_named(domain.schema, domain.name))
+            if let Some(identity) = column.user_type
+                && target.matches_reference(identity)?
             {
-                return Some((def.schema, def.name, column.name));
+                return Ok(Some((def.schema, def.name, column.name)));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41868,12 +41844,8 @@ fn validate_domain_rows(
             let Some(identity) = column.user_type else {
                 continue;
             };
-            let Some(domain_slot) =
-                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-            else {
-                continue;
-            };
-            if domain_depends_on(storage, domain_slot, target, txid) {
+            let Some(domain_slot) = storage.domain_reference_slot(identity, txid)? else { continue; };
+            if storage.domain_depends_on(domain_slot, target, txid)? {
                 affected[column_index] = true;
                 any = true;
             }
@@ -41901,9 +41873,8 @@ fn validate_domain_rows(
                         let identity = def.columns()[column_index]
                             .user_type
                             .expect("affected domain");
-                        let leaf = storage
-                            .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                            .expect("affected domain remains visible");
+                        let leaf = storage.domain_reference_slot(identity, txid)?
+                            .ok_or_else(|| sql_err!(sqlstate::WRONG_OBJECT_TYPE, "validated source is not a domain"))?;
                         validate_stored_domain_value(
                             storage,
                             leaf,
@@ -41990,22 +41961,15 @@ fn validate_stored_domain_value(
     Ok(())
 }
 
-fn domain_depends_on(storage: &Storage, mut slot: usize, target: usize, txid: u32) -> bool {
-    for _ in 0..storage.domain_count() {
-        if slot == target {
-            return true;
+fn selected_domain_dependency(
+    storage: &Storage, child: usize, selected: &[bool], transaction: u32,
+) -> Result<Option<usize>, SqlError> {
+    for (parent, selected) in selected.iter().copied().enumerate() {
+        if selected && storage.domain_depends_on(child, parent, transaction)? {
+            return Ok(Some(parent));
         }
-        let Some(parent) = storage.domain(slot).base_domain else {
-            return false;
-        };
-        let Some(parent_slot) =
-            storage.domain_slot(parent.schema.as_str(), parent.name.as_str(), txid)
-        else {
-            return false;
-        };
-        slot = parent_slot;
     }
-    false
+    Ok(None)
 }
 
 /// Builds an [`EnumSpec`] from a `CREATE TYPE ... AS ENUM` label list: rejects
@@ -42451,12 +42415,12 @@ pub(crate) fn drop_type(
             }
             if let Err(error) =
                 cascade_drop_composite_fields(storage, wal, txn, composite_slot, |field| {
-                    matches!(
+                    Ok(matches!(
                         field.ctype,
                         ColType::Enum(candidate)
                             | ColType::Array(super::types::ArrElem::Enum(candidate))
                             if candidate as usize == slot
-                    )
+                    ))
                 })
             {
                 return sql_fail(error);
@@ -42549,20 +42513,18 @@ fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> 
     })
 }
 
-fn composite_field_uses_domain(storage: &Storage, domain_slot: usize, txid: u32) -> Option<usize> {
-    let domain = storage.domain(domain_slot);
-    let identity = crate::storage::UserTypeName::declaration(domain.schema, domain.name);
-    (0..storage.composite_count()).find(|&composite_slot| {
-        storage.composite(composite_slot).visible_to(txid)
-            && storage
-                .composite_for(composite_slot, txid)
-                .active_fields()
-                .any(|field| {
-                    field.user_type.is_some_and(|field_type| {
-                        field_type.is_named(identity.schema, identity.name)
-                    })
-                })
-    })
+fn composite_field_uses_domain(storage: &Storage, domain_slot: usize, txid: u32) -> Result<Option<usize>, SqlError> {
+    let (_, target) = storage.prepare_domain_edit(domain_slot, txid)?;
+    for composite_slot in 0..storage.composite_count() {
+        if !storage.composite_slot_visible_to(composite_slot, txid) { continue; }
+        let definition = storage.composite_for(composite_slot, txid);
+        for field in definition.active_fields() {
+            if let Some(identity) = field.user_type
+                && target.matches_reference(identity)?
+            { return Ok(Some(composite_slot)); }
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -42672,7 +42634,7 @@ fn drop_composite_type(
             ));
         }
         cascade_drop_composite_fields(storage, wal, txn, dependent, |field| {
-            field.attribute_number == attribute_number
+            Ok(field.attribute_number == attribute_number)
         })?;
     }
 
@@ -43036,13 +42998,13 @@ fn cascade_drop_composite_fields(
     wal: &mut Wal,
     txn: &mut TxnState,
     composite_slot: usize,
-    mut matches: impl FnMut(&crate::storage::CompositeFieldDef) -> bool,
+    mut matches: impl FnMut(&crate::storage::CompositeFieldDef) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let (mut altered, edit_target) = storage.prepare_composite_edit(composite_slot, txn.txid)?;
     let mut dropped = [SqlName::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS];
     let mut dropped_count = 0;
     for field in altered.fields[..altered.n_fields].iter_mut() {
-        if !field.dropped && matches(field) {
+        if !field.dropped && matches(field)? {
             dropped[dropped_count] = field.name;
             dropped_count += 1;
             field.dropped = true;

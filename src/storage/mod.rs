@@ -9407,7 +9407,7 @@ impl DomainDef {
 /// The validated parameters of a `CREATE DOMAIN` / `ALTER DOMAIN`, computed by
 /// the executor and handed to storage (apart from the `live`/`pending` state).
 #[derive(Debug, Clone, Copy)]
-pub struct DomainSpec {
+pub(crate) struct DomainSpec {
     pub base_domain: Option<UserTypeName>,
     pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
@@ -9632,7 +9632,7 @@ impl EnumDef {
 /// The validated parameters of a `CREATE TYPE ... AS ENUM` / `ALTER TYPE`,
 /// computed by the executor and handed to storage (apart from `live`/`pending`).
 #[derive(Clone, Copy)]
-pub struct EnumSpec<'a> {
+pub(crate) struct EnumSpec<'a> {
     pub members: &'a [EnumMember],
 }
 
@@ -9764,7 +9764,7 @@ impl CompositeDef {
 }
 
 #[derive(Clone, Copy)]
-pub struct CompositeSpec {
+pub(crate) struct CompositeSpec {
     pub fields: [CompositeFieldDef; MAX_COMPOSITE_FIELDS],
     pub n_fields: usize,
 }
@@ -39523,12 +39523,12 @@ impl Storage {
                 self.enum_members_per_image
             ));
         }
+        let version = self.catalog_sequence.next()?;
         let slot = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
             slot
         } else {
             self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?.slot()
         };
-        let version = self.catalog_sequence.next()?;
         let mut catalog = self
             .type_catalog
             .lock()

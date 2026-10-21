@@ -398,12 +398,28 @@ one field walk for binding and renames. Checkpoint declarations bind after their
 type catalogs exist. A database template copy explicitly binds copied references
 to the new database's types.
 
-Complete type-name changes still require exclusive storage access. Saved journal references retain their source lifetime even when a rename commits
+Views, rewrite rules, materialized views and row-security policies install their
+definitions and saved type dependencies under the same catalog locks. A table's
+definition and lifetime stay protected through installation. Waiting releases
+earlier locks, then rechecks the selected table and source types. Reusing the
+target table slot fails with `40001`; reusing a source type fails with `42704`.
+Dependency capacity and policy roles are validated before changing live entries.
+Rule renames and enable-mode edits apply to the current definition and journal
+that installed definition. They preserve intervening edits and update comments
+and saved dependencies together. Recovery follows the same validation boundary.
+
+**User example:** a report view bound to `app.customer_id` keeps referring to
+that domain after it is renamed. Dropping it and creating a different domain
+with the old name cannot redirect a waiting view definition to the replacement.
+A failed policy edit keeps the previous expression and allowed roles intact.
+
+Complete type-name changes still require exclusive storage access. Saved journal
+references retain their source lifetime even when a rename commits
 before an older dependent definition. Checkpoints preserve the same identities
 and resolve type definitions before their dependents. Some schema changes still
-wait for retained snapshots. Removing the remaining restrictions requires
-ownership across final source validation and dependent publication; SQL CPU
-workers remain planned work.
+wait for retained snapshots. Removing the remaining restrictions requires shared
+protection for engine-wide commits, type retirement and remaining table rewrites;
+SQL CPU workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade

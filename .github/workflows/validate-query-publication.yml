@@ -37,5 +37,10 @@ jobs:
           storage::tests::failed_policy
           sql::tests::captured_type_references
           sql::tests::materialized_view
+          sql::tests::rewrite_rule
+          sql::tests::replacing_view
+          sql::tests::policy_
+          storage::tests::database_removal_clears_view_rules
+          storage::tests::stored_query_dependency_catalog
           row_security
           --test-threads=1

@@ -42917,20 +42917,12 @@ impl Storage {
                 (created_at, ownership)
             }
         };
-        self.write_dependency_image_in(
-            &mut owners.dependencies,
+        owners.write_query_image(
+            self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
             dependencies.view(),
-        )?;
-        let dependency_image =
-            self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16));
-        let dependency_count = owners.dependencies.counts[dependency_image];
-        owners.refresh_dependencies(
-            dependency_image,
-            dependency_count,
-            self.stored_query_dependencies_per_image,
             txid,
-        );
+        )?;
         owners.catalog[slot] = RoutineDef {
             database: current_database(),
             created_at,
@@ -43027,21 +43019,13 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
         let previous = prior.map(|pending| pending.dependency_slot);
-        owners.validate_dependencies(dependencies, definition.txid)?;
-        definition.dependency_slot = self.allocate_pending_stored_query_dependencies_in(
-            &mut owners.dependencies,
+        definition.dependency_slot = owners.allocate_query_image(
+            self,
             StoredQueryDependencyOwner::Routine(slot as u16),
             previous,
             dependencies,
-        )?;
-        let dependency_count =
-            owners.dependencies.pending[definition.dependency_slot as usize].count;
-        owners.refresh_dependencies(
-            self.stored_query_dependency_pending_base + definition.dependency_slot as usize,
-            dependency_count,
-            self.stored_query_dependencies_per_image,
             definition.txid,
-        );
+        )?;
         owners.catalog[slot].pending_definition = Some(definition);
         Ok(prior)
     }
@@ -43095,32 +43079,12 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
         let previous = prior.map(|pending| pending.dependency_slot);
-        let source_image = previous.map_or(
-            self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
-            |slot| self.stored_query_dependency_pending_base + slot as usize,
-        );
-        let count = owners.dependencies.image_count(source_image);
-        owners.validate_dependencies(
-            StoredQueryDependencyView::new(owners.dependencies.image(
-                source_image,
-                count,
-                self.stored_query_dependencies_per_image,
-            )),
+        definition.dependency_slot = owners.allocate_preserved_query_image(
+            self,
+            StoredQueryDependencyOwner::Routine(slot as u16),
+            previous,
             definition.txid,
         )?;
-        definition.dependency_slot = self
-            .allocate_pending_stored_query_dependencies_from_current_in(
-                &mut owners.dependencies,
-                StoredQueryDependencyOwner::Routine(slot as u16),
-                previous,
-            )?;
-        let count = owners.dependencies.pending[definition.dependency_slot as usize].count;
-        owners.refresh_dependencies(
-            self.stored_query_dependency_pending_base + definition.dependency_slot as usize,
-            count,
-            self.stored_query_dependencies_per_image,
-            definition.txid,
-        );
         owners.catalog[slot].pending_definition = Some(definition);
         Ok(prior)
     }

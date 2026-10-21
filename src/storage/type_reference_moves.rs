@@ -859,6 +859,148 @@ mod tests {
     }
 
     #[test]
+    fn saved_query_dependency_wait_releases_source_and_destination_owners() {
+        for publication in SAVED_QUERIES {
+            let (storage, related, _, movement) = fixture(TypeReferenceKind::Domain);
+            let database = storage.current_database_oid();
+            let dependency = query_dependency(&storage, movement);
+            let dependencies = storage.stored_query_dependencies.lock().unwrap();
+            std::thread::scope(|scope| {
+                let storage = &storage;
+                let writer = scope.spawn(move || {
+                    crate::sql::set_execution_database_oid(database);
+                    crate::mem::guard::forbid_alloc(|| {
+                        publish_saved_query(storage, publication, related, dependency)
+                    })
+                });
+                let waiting = wait_until_contended(storage);
+                let available = storage.type_catalog.try_lock().is_ok()
+                    && storage.view_rule_catalog.try_lock().is_ok()
+                    && storage.matviews.try_lock().is_ok()
+                    && storage.policy_catalog.try_lock().is_ok()
+                    && storage.tables[related].lifecycle.try_lock().is_ok()
+                    && storage.tables[related].definition.test_write().is_ok();
+                drop(dependencies);
+                writer.join().unwrap().unwrap();
+                assert!(
+                    waiting && available,
+                    "{publication:?} retained earlier owners during dependency wait"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn saved_query_recovery_rejects_reused_type_before_changing_live_entries() {
+        use super::super::{
+            PUBLIC_ROLE, PolicyCommandKind, PolicyDefinition, PolicySpec, RecoveredPolicySpec,
+            RuleDefinition, RuleEnabled, RuleTarget, StoredQueryDependencies,
+        };
+        for kind in KINDS {
+            let (mut storage, related, _, movement) = fixture(kind);
+            let dependency = query_dependency(&storage, movement);
+            let mut dependencies = StoredQueryDependencies::EMPTY;
+            dependencies.push(dependency).unwrap();
+            let rule = RuleDefinition {
+                name: SqlName::parse("recovered_rule").unwrap(),
+                target: RuleTarget::Table(related as u16),
+                ..RuleDefinition::EMPTY
+            };
+            let (rule_slot, _) = storage
+                .create_rule(rule, dependencies.view(), false, 0)
+                .unwrap();
+            storage.commit_rule_create(rule_slot);
+            let policy = PolicySpec {
+                name: SqlName::parse("recovered_policy").unwrap(),
+                table: related,
+                command: PolicyCommandKind::All,
+                permissive: true,
+                definition: PolicyDefinition {
+                    using: Some(crate::util::StackStr::from_str("true")),
+                    with_check: None,
+                },
+                roles: &[PUBLIC_ROLE],
+            };
+            let policy_slot = storage.create_policy(policy, &dependencies, 0).unwrap();
+            storage.commit_policy_create(policy_slot);
+            let replacement = storage.catalog_sequence.next().unwrap();
+            {
+                let mut source = storage.type_catalog.lock().unwrap();
+                match movement.identity.slot() {
+                    NamedTypeSlot::Domain(slot) => source.domains[slot].created_at = replacement,
+                    NamedTypeSlot::Enum(slot) => source.enums[slot].created_at = replacement,
+                    NamedTypeSlot::Composite(slot) => {
+                        source.composites[slot].created_at = replacement
+                    }
+                }
+            }
+            let created_at = storage.rule(rule_slot).created_at;
+            crate::mem::guard::forbid_alloc(|| {
+                let mut recovered_dependencies = StoredQueryDependencies::EMPTY;
+                recovered_dependencies.push(dependency).unwrap();
+                assert_eq!(
+                    storage
+                        .replay_rule(
+                            rule_slot,
+                            created_at,
+                            RuleDefinition {
+                                enabled: RuleEnabled::Always,
+                                ..rule
+                            },
+                            recovered_dependencies
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                );
+                assert_eq!(storage.rule(rule_slot).definition.enabled, rule.enabled);
+                assert_eq!(
+                    storage
+                        .replay_set_policy(
+                            RecoveredPolicySpec {
+                                name: policy.name,
+                                table: related,
+                                command: PolicyCommandKind::All,
+                                permissive: true,
+                                definition: PolicyDefinition {
+                                    using: Some(crate::util::StackStr::from_str("false")),
+                                    with_check: None
+                                },
+                            },
+                            ["public", "public"].into_iter(),
+                            dependencies
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                );
+                assert_eq!(
+                    storage.policy(policy_slot).definition.using,
+                    policy.definition.using
+                );
+                assert_eq!(&*storage.policy_roles(policy_slot, 0), &[PUBLIC_ROLE]);
+                assert_eq!(
+                    storage.rule_dependencies(rule_slot, 0).entries(),
+                    &[dependency]
+                );
+                assert_eq!(
+                    storage.policy_dependencies(policy_slot, 0).entries(),
+                    &[dependency]
+                );
+                assert!(
+                    storage
+                        .stored_query_dependencies
+                        .lock()
+                        .unwrap()
+                        .pending
+                        .iter()
+                        .all(|image| !image.used)
+                );
+            });
+        }
+    }
+
+    #[test]
     fn saved_query_publication_rejects_reused_sources_and_targets_without_partial_state() {
         use crate::sql::eval::sqlstate;
         for kind in KINDS {

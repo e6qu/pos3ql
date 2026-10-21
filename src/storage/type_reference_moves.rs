@@ -23,10 +23,20 @@ use crate::sql::eval::{SqlError, sqlstate};
 #[derive(Clone, Copy)]
 pub(super) enum TypePublicationSource {
     Pending(TypeEditTarget),
-    Committed(TypeEditTarget),
+    Committed { identity: TypeIdentity, revision: u64 },
 }
 
 impl TypePublicationSource {
+    pub(super) fn committed(catalog: &TypeCatalog, source: NamedTypeSlot) -> Result<Self, SqlError> {
+        let snapshot = catalog.type_snapshot(source, 0)?
+            .filter(|snapshot| snapshot.identity.database() == super::current_database())
+            .ok_or_else(|| crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "type publication source no longer exists"))?;
+        if catalog.has_pending_type_change(source) {
+            return Err(crate::sql_err!(sqlstate::SERIALIZATION_FAILURE, "type publication requires a committed source"));
+        }
+        Ok(Self::Committed { identity: snapshot.identity, revision: catalog.versions.get(source) })
+    }
+
     fn validate(self, catalog: &TypeCatalog, movement: TypeReferenceMove) -> Result<bool, SqlError> {
         match self {
             Self::Pending(target) => Ok(target.identity_move(catalog).is_some_and(|current| {
@@ -36,16 +46,17 @@ impl TypePublicationSource {
                     && current.current.schema == movement.current.schema
                     && current.current.name == movement.current.name
             })),
-            Self::Committed(target) => {
-                catalog.validate_type_edit_source(target)?;
-                catalog.validate_type_edit(target, target.transaction())?;
-                if catalog.conflicting_type_owner(target.source().slot(), target.transaction()).is_some() {
+            Self::Committed { identity, revision } => {
+                if identity.database() != super::current_database() || !catalog.contains_type_source(identity) {
+                    return Err(crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "type publication source has been replaced"));
+                }
+                if catalog.versions.get(identity.slot()) != revision || catalog.has_pending_type_change(identity.slot()) {
                     return Err(crate::sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
-                        "type publication conflicts with a pending change"
+                        "type publication source changed after preparation"
                     ));
                 }
-                let (schema, name) = match target.source().slot() {
+                let (schema, name) = match identity.slot() {
                     NamedTypeSlot::Domain(slot) => {
                         (catalog.domains[slot].schema, catalog.domains[slot].name)
                     }
@@ -56,7 +67,7 @@ impl TypePublicationSource {
                         (catalog.composites[slot].schema, catalog.composites[slot].name)
                     }
                 };
-                if target.source() != movement.identity
+                if identity != movement.identity
                     || schema != movement.prior.schema
                     || name != movement.prior.name
                 {
@@ -763,18 +774,14 @@ mod tests {
             for commit_update in [false, true] {
             let (storage, related, _, movement) = fixture(kind);
             let database = storage.current_database_oid();
-            let target = match kind {
-                TypeReferenceKind::Domain => storage.prepare_domain_edit(movement.identity.slot().index(), 0).unwrap().1,
-                TypeReferenceKind::Enum => storage.prepare_enum_edit(movement.identity.slot().index(), 0).unwrap().1,
-                TypeReferenceKind::Composite => storage.prepare_composite_edit(movement.identity.slot().index(), 0).unwrap().1,
-            };
+            let source = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot()).unwrap();
             let selected = storage.table_def(related, 0);
             let installed = AtomicBool::new(false);
             std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
                     crate::sql::set_execution_database_oid(database);
                     crate::mem::guard::forbid_alloc(|| storage.publish_type_move(
-                        movement, TypePublicationSource::Committed(target), |_catalog, _members| {
+                        movement, source, |_catalog, _members| {
                             installed.store(true, Ordering::Release);
                         },
                     ))
@@ -782,6 +789,10 @@ mod tests {
                 let waiting = wait_until_contended(&storage);
                 let update = stage_move(&storage, kind, movement.identity.slot().index(), movement.prior, 7);
                 let changed = commit_update.then(|| crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, update.target())));
+                if !commit_update {
+                    let captured = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot());
+                    assert!(matches!(captured, Err(error) if error.sqlstate == sqlstate::SERIALIZATION_FAILURE));
+                }
                 drop(selected);
                 let result = writer.join().unwrap();
                 if let Some(changed) = changed { changed.unwrap(); } else { update.rollback(&storage); }
@@ -2297,11 +2308,10 @@ mod tests {
     }
 
     fn publish_move(storage: &Storage, movement: TypeReferenceMove) {
-        let source = storage.type_catalog.lock().unwrap()
-            .select_type_edit(movement.identity.slot(), 0).unwrap();
+        let source = TypePublicationSource::committed(&storage.type_catalog.lock().unwrap(), movement.identity.slot()).unwrap();
         storage
             .type_publication
-            .publish(storage, movement, TypePublicationSource::Committed(source), |catalog, _members| {
+            .publish(storage, movement, source, |catalog, _members| {
                 match movement.identity.slot() {
                     NamedTypeSlot::Domain(_) => {
                         catalog.domains[movement.identity.slot().index()].schema =

@@ -19,10 +19,6 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
-    pub(super) fn source(self) -> TypeIdentity {
-        self.source
-    }
-
     pub(super) fn identity_move(
         self,
         catalog: &super::TypeCatalog,
@@ -301,7 +297,7 @@ impl super::TypeCatalog {
         pending == Some((target.transaction, target.version))
     }
 
-    pub(super) fn select_type_edit(
+    fn select_type_edit(
         &self,
         source: NamedTypeSlot,
         transaction: u32,
@@ -406,12 +402,8 @@ impl super::TypeCatalog {
         }
     }
 
-    pub(super) fn conflicting_type_owner(
-        &self,
-        source: NamedTypeSlot,
-        transaction: u32,
-    ) -> Option<u32> {
-        let owners = match source {
+    fn type_change_owners(&self, source: NamedTypeSlot) -> [Option<u32>; 2] {
+        match source {
             NamedTypeSlot::Domain(slot) => [
                 self.domains[slot].ddl_state.pending_txid(),
                 self.domains[slot]
@@ -433,12 +425,24 @@ impl super::TypeCatalog {
                     .as_ref()
                     .map(|pending| pending.txid),
             ],
-        };
-        owners
+        }
+    }
+
+    pub(super) fn has_pending_type_change(&self, source: NamedTypeSlot) -> bool {
+        self.type_change_owners(source).into_iter().any(|owner| owner.is_some())
+    }
+
+    pub(super) fn conflicting_type_owner(
+        &self,
+        source: NamedTypeSlot,
+        transaction: u32,
+    ) -> Option<u32> {
+        self.type_change_owners(source)
             .into_iter()
             .flatten()
             .find(|&owner| owner != transaction)
     }
+
 }
 
 impl super::Storage {

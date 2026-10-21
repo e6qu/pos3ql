@@ -39900,7 +39900,7 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        let (movement, target) = {
+        let (movement, source) = {
             let catalog = self
                 .type_catalog
                 .lock()
@@ -39912,7 +39912,7 @@ impl Storage {
                 0,
                 Some(NamedTypeSlot::Enum(slot)),
             )?;
-            let target = catalog.select_type_edit(NamedTypeSlot::Enum(slot), 0)?;
+            let source = type_reference_moves::TypePublicationSource::committed(&catalog, NamedTypeSlot::Enum(slot))?;
             let previous = catalog.enums[slot];
             if schema == previous.schema && name == previous.name {
                 return Ok(());
@@ -39926,7 +39926,7 @@ impl Storage {
                 ),
                 UserTypeName::declaration(previous.schema, previous.name),
                 UserTypeName::declaration(schema, name),
-            ), target)
+            ), source)
         };
         let version = self
             .type_catalog
@@ -39934,7 +39934,7 @@ impl Storage {
             .expect("type catalog lock poisoned")
             .versions
             .next()?;
-        self.publish_type_move(movement, type_reference_moves::TypePublicationSource::Committed(target), |catalog, _members| {
+        self.publish_type_move(movement, source, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
             catalog.versions.set(NamedTypeSlot::Enum(slot), version);

@@ -6967,7 +6967,9 @@ impl Engine {
                 DdlUndo::DomainDropped(undo) => self
                     .storage
                     .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
-                DdlUndo::DomainAltered(prior) => self.storage.commit_domain_alter(prior.target())?,
+                DdlUndo::DomainAltered(prior) => {
+                    self.storage.commit_domain_alter(prior.target())?
+                }
                 DdlUndo::EnumCreated(undo) => {
                     self.storage
                         .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);

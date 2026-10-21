@@ -13,6 +13,8 @@ Stale type edits and commit or rollback records must not alter a replacement
 type or release its saved labels. Lock waits must leave the prior definition intact.
 Recovery must restore subscription identities from saved records, including
 when aborted work left gaps in catalog allocation.
+Differential checks must preserve every query result and error code without
+mistaking multiline diagnostic text for returned rows.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Publication, recovery and capacity failures follow the same rule.

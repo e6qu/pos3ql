@@ -49,6 +49,8 @@ commit checks this ownership and dependent publication counters before durabilit
 Subscription creation saves its stream identity instead of reconstructing it
 from allocation order during replay. Conflicting edits and deletion
 wait for their owner, including a transaction's pending rename.
+PostgreSQL comparisons keep result rows and error codes separate from multiline
+diagnostic wording; the dedicated message checks still compare error text.
 
 Complete shared engine publication across transaction commit, remaining type
 retirement paths and metadata preparation before removing exclusive type commits and

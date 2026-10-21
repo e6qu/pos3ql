@@ -3097,7 +3097,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             slot,
             ..
         } => {
-            8 + 1 + name.len()
+            8 + 1
+                + name.len()
                 + 2
                 + 2
                 + connection.len()
@@ -8345,7 +8346,9 @@ fn decode_op_inner<'a>(
         KIND_CREATE_SUBSCRIPTION => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
-            if created_at == 0 { return None; }
+            if created_at == 0 {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -12956,11 +12959,17 @@ mod tests {
 
     #[test]
     fn subscription_creation_codec_requires_its_durable_source_identity() {
-        let publications = [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+        let publications =
+            [crate::storage::SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
         let operation = |created_at| WalOp::CreateSubscription {
-            created_at, name: "saved_subscription", owner: 0,
-            connection: "host=127.0.0.1", publications, publication_count: 0,
-            enabled: false, slot: crate::storage::SubscriptionSlot::Absent,
+            created_at,
+            name: "saved_subscription",
+            owner: 0,
+            connection: "host=127.0.0.1",
+            publications,
+            publication_count: 0,
+            enabled: false,
+            slot: crate::storage::SubscriptionSlot::Absent,
             behavior: crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
             bootstrap: crate::storage::SubscriptionBootstrap::Deferred,
         };
@@ -12969,10 +12978,14 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert!(append_payload(&mut buffer, &operation(41)));
             assert_eq!(buffer.len(), encoded_payload_len(&operation(41)));
-            assert!(matches!(decode_op(KIND_CREATE_SUBSCRIPTION, buffer.readable()),
-                Some(WalOp::CreateSubscription { created_at: 41, .. })));
+            assert!(matches!(
+                decode_op(KIND_CREATE_SUBSCRIPTION, buffer.readable()),
+                Some(WalOp::CreateSubscription { created_at: 41, .. })
+            ));
             for length in 0..buffer.len() {
-                assert!(decode_op(KIND_CREATE_SUBSCRIPTION, &buffer.readable()[..length]).is_none());
+                assert!(
+                    decode_op(KIND_CREATE_SUBSCRIPTION, &buffer.readable()[..length]).is_none()
+                );
             }
             buffer.filled_mut()[..8].fill(0);
             assert!(decode_op(KIND_CREATE_SUBSCRIPTION, buffer.readable()).is_none());

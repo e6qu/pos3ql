@@ -39566,7 +39566,12 @@ impl Storage {
                 self.enum_members_per_image
             ));
         }
-        let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.next()?;
+        let version = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .versions
+            .next()?;
         let slot = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
             slot
         } else {
@@ -39923,7 +39928,12 @@ impl Storage {
                 UserTypeName::declaration(schema, name),
             )
         };
-        let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.next()?;
+        let version = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .versions
+            .next()?;
         self.publish_type_move(movement, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
@@ -40168,7 +40178,10 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_composite_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
+    pub(crate) fn commit_composite_alter(
+        &mut self,
+        target: TypeEditTarget,
+    ) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Composite)
             .expect("composite publication identifies its source kind");

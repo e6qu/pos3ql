@@ -41403,7 +41403,8 @@ fn drop_domain_selection(
                 continue;
             }
             let mut has_child = false;
-            for (child, &child_selected) in selected.iter().enumerate().take(storage.domain_count()) {
+            for (child, &child_selected) in selected.iter().enumerate().take(storage.domain_count())
+            {
                 if child != candidate
                     && child_selected
                     && !ordered[..ordered_count].contains(&child)

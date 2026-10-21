@@ -231,26 +231,12 @@ if [[ $P3_READY -ne 1 ]] || ! server_alive "$P3_PID"; then
   exit 1
 fi
 
-# Normalizer: error wording differs between implementations; SQLSTATEs and
-# result rows must not.
+# SQLSTATE-only psql diagnostics keep multiline DETAIL out of result rows.
 normalize() {
   sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
-    -e '/^LINE [0-9]+:/d' \
-    -e '/^ *\^ *$/d' \
-    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
-    -e '/^HINT:/d' \
-    -e '/^DETAIL:/d' \
-    -e '/^LOCATION:/d' \
-    -e '/^CONTEXT:/d' \
-    -e '/^SCHEMA NAME:/d' \
-    -e '/^TABLE NAME:/d' \
-    -e '/^COLUMN NAME:/d' \
-    -e '/^CONSTRAINT NAME:/d' \
-    -e '/^DATATYPE NAME:/d' \
-    -e '/^NOTICE:/d' \
-    -e '/^WARNING:/d'
+    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
+    -e 's/^ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
+    -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
 }
 
 run_corpus() { # port name file
@@ -258,10 +244,10 @@ run_corpus() { # port name file
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
-        -v VERBOSITY=verbose -f "$3" 2>&1
+        -v VERBOSITY=sqlstate -f "$3" 2>&1
   else
     stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
-      -v VERBOSITY=verbose -f "$3" 2>&1
+      -v VERBOSITY=sqlstate -f "$3" 2>&1
   fi | normalize > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"

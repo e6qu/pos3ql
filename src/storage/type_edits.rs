@@ -19,29 +19,53 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
-    pub(super) fn identity_move(self, catalog: &super::TypeCatalog) -> Option<super::type_reference_moves::TypeReferenceMove> {
-        if !catalog.matches_type_edit(self) { return None; }
+    pub(super) fn identity_move(
+        self,
+        catalog: &super::TypeCatalog,
+    ) -> Option<super::type_reference_moves::TypeReferenceMove> {
+        if !catalog.matches_type_edit(self) {
+            return None;
+        }
         let (schema, name, next_schema, next_name) = match self.source.slot() {
             NamedTypeSlot::Domain(slot) => {
                 let definition = &catalog.domains[slot];
                 let pending = definition.pending_definition.as_ref()?.identity?;
-                (definition.schema, definition.name, pending.schema, pending.name)
+                (
+                    definition.schema,
+                    definition.name,
+                    pending.schema,
+                    pending.name,
+                )
             }
             NamedTypeSlot::Enum(slot) => {
                 let definition = &catalog.enums[slot];
                 let pending = definition.pending_definition.as_ref()?;
-                (definition.schema, definition.name, pending.schema, pending.name)
+                (
+                    definition.schema,
+                    definition.name,
+                    pending.schema,
+                    pending.name,
+                )
             }
             NamedTypeSlot::Composite(slot) => {
                 let definition = &catalog.composites[slot];
                 let pending = definition.pending_definition.as_ref()?;
-                (definition.schema, definition.name, pending.schema, pending.name)
+                (
+                    definition.schema,
+                    definition.name,
+                    pending.schema,
+                    pending.name,
+                )
             }
         };
-        if (schema, name) == (next_schema, next_name) { return None; }
-        Some(super::type_reference_moves::TypeReferenceMove::new(self.source,
+        if (schema, name) == (next_schema, next_name) {
+            return None;
+        }
+        Some(super::type_reference_moves::TypeReferenceMove::new(
+            self.source,
             super::UserTypeName::declaration(schema, name),
-            super::UserTypeName::declaration(next_schema, next_name)))
+            super::UserTypeName::declaration(next_schema, next_name),
+        ))
     }
 
     pub(crate) fn matches_reference(self, name: super::UserTypeName) -> Result<bool, SqlError> {
@@ -207,7 +231,10 @@ impl TypeRevisions {
 
     pub(super) fn next(&mut self) -> Result<u64, SqlError> {
         let next = self.sequence.checked_add(1).ok_or_else(|| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "type change revisions exhausted")
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "type change revisions exhausted"
+            )
         })?;
         self.sequence = next;
         Ok(next)

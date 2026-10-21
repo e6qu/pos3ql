@@ -1013,9 +1013,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
         DdlUndo::MatviewCreated(slot) => (AccessClass::MaterializedView, slot),
         DdlUndo::RoutineCreated(slot) => (AccessClass::Routine, slot),
         DdlUndo::SequenceCreated(slot) => (AccessClass::Sequence, slot),
-        DdlUndo::DomainCreated(slot) => (AccessClass::Domain, slot),
-        DdlUndo::EnumCreated(slot) => (AccessClass::Enum, slot),
-        DdlUndo::CompositeCreated(slot) => (AccessClass::Composite, slot),
+        DdlUndo::DomainCreated(undo) => (AccessClass::Domain, undo.slot() as u32),
+        DdlUndo::EnumCreated(undo) => (AccessClass::Enum, undo.slot() as u32),
+        DdlUndo::CompositeCreated(undo) => (AccessClass::Composite, undo.slot() as u32),
         DdlUndo::IndexCreated(slot) => (AccessClass::Index, slot),
         DdlUndo::StatisticsCreated(slot) => (AccessClass::Statistics, slot),
         DdlUndo::SchemaCreated(slot) => (AccessClass::Schema, slot),
@@ -5388,6 +5388,25 @@ impl Engine {
                 "commit reached durability before queued constraint triggers fired"
             ));
         }
+        let type_changes = txn.ddl().iter().filter_map(|undo| {
+            use crate::storage::TypeCommitChange;
+            Some(match undo {
+                DdlUndo::DomainCreated(undo)
+                | DdlUndo::DomainDropped(undo)
+                | DdlUndo::EnumCreated(undo)
+                | DdlUndo::EnumDropped(undo)
+                | DdlUndo::CompositeCreated(undo)
+                | DdlUndo::CompositeDropped(undo) => TypeCommitChange::Lifecycle(*undo),
+                DdlUndo::DomainAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::EnumAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::CompositeAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                _ => return None,
+            })
+        });
+        if let Err(error) = self.storage.validate_type_commit(txn.txid, type_changes) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         self.work.reset();
         if let Err(error) =
             exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
@@ -5894,17 +5913,17 @@ impl Engine {
                     class: crate::storage::AccessClass::Sequence,
                     slot: slot as u16,
                 }),
-                DdlUndo::DomainCreated(slot) => Some(crate::storage::AccessObject {
+                DdlUndo::DomainCreated(undo) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Domain,
-                    slot: slot as u16,
+                    slot: undo.slot() as u16,
                 }),
-                DdlUndo::EnumCreated(slot) => Some(crate::storage::AccessObject {
+                DdlUndo::EnumCreated(undo) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Enum,
-                    slot: slot as u16,
+                    slot: undo.slot() as u16,
                 }),
-                DdlUndo::CompositeCreated(slot) => Some(crate::storage::AccessObject {
+                DdlUndo::CompositeCreated(undo) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Composite,
-                    slot: slot as u16,
+                    slot: undo.slot() as u16,
                 }),
                 DdlUndo::IndexCreated(slot) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Index,
@@ -6941,50 +6960,34 @@ impl Engine {
                 DdlUndo::SequenceAltered { slot, .. } => {
                     self.storage.commit_sequence_alter(*slot as usize, txn.txid)
                 }
-                DdlUndo::DomainCreated(slot) => {
-                    self.storage.commit_domain_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::Domain,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
+                DdlUndo::DomainCreated(undo) => {
+                    self.storage
+                        .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
-                DdlUndo::DomainDropped(slot) => self.storage.commit_domain_drop(*slot as usize),
-                DdlUndo::DomainAltered { slot, .. } => {
-                    self.storage.commit_domain_alter(*slot as usize, txn.txid)
-                }
-                DdlUndo::EnumCreated(slot) => {
-                    self.storage.commit_enum_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::Enum,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
-                }
-                DdlUndo::EnumDropped(slot) => self.storage.commit_enum_drop(*slot as usize),
-                DdlUndo::CompositeCreated(slot) => {
-                    self.storage.commit_composite_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::Composite,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
-                }
-                DdlUndo::CompositeAltered { slot, .. } => self
+                DdlUndo::DomainDropped(undo) => self
                     .storage
-                    .commit_composite_alter(*slot as usize, txn.txid),
-                DdlUndo::CompositeDropped(slot) => {
-                    self.storage.commit_composite_drop(*slot as usize)
+                    .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
+                DdlUndo::DomainAltered(prior) => {
+                    self.storage.commit_domain_alter(prior.target())?
                 }
-                DdlUndo::EnumAltered { slot, .. } => {
-                    self.storage.commit_enum_alter(*slot as usize, txn.txid)
+                DdlUndo::EnumCreated(undo) => {
+                    self.storage
+                        .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
+                DdlUndo::EnumDropped(undo) => self
+                    .storage
+                    .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
+                DdlUndo::CompositeCreated(undo) => {
+                    self.storage
+                        .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
+                }
+                DdlUndo::CompositeAltered(prior) => {
+                    self.storage.commit_composite_alter(prior.target())?
+                }
+                DdlUndo::CompositeDropped(undo) => self
+                    .storage
+                    .finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
+                DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target())?,
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_create(slot);
@@ -19795,24 +19798,28 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::LargeObjectDropped(slot) => {
             storage.rollback_large_object_drop(slot as usize, txid)
         }
-        DdlUndo::DomainCreated(slot) => storage.rollback_domain_create(slot as usize),
-        DdlUndo::DomainDropped(slot) => {
-            storage.rollback_domain_drop(slot as usize, txid);
+        DdlUndo::DomainCreated(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
         }
-        DdlUndo::DomainAltered { slot, prior } => {
-            storage.rollback_domain_alter(slot as usize, prior)
+        DdlUndo::DomainDropped(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
         }
-        DdlUndo::EnumCreated(slot) => storage.rollback_enum_create(slot as usize),
-        DdlUndo::CompositeCreated(slot) => storage.rollback_composite_create(slot as usize),
-        DdlUndo::CompositeAltered { slot, prior } => {
-            storage.rollback_composite_alter(slot as usize, prior)
+        DdlUndo::DomainAltered(prior) => storage.rollback_domain_alter(prior),
+        DdlUndo::EnumCreated(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
         }
-        DdlUndo::CompositeDropped(slot) => storage.rollback_composite_drop(slot as usize, txid),
-        DdlUndo::EnumDropped(slot) => {
-            storage.rollback_enum_drop(slot as usize, txid);
+        DdlUndo::CompositeCreated(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
         }
-        DdlUndo::EnumAltered { slot, prior } => {
-            storage.rollback_enum_alter(slot as usize, prior);
+        DdlUndo::CompositeAltered(prior) => storage.rollback_composite_alter(prior),
+        DdlUndo::CompositeDropped(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
+        }
+        DdlUndo::EnumDropped(undo) => {
+            storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback)
+        }
+        DdlUndo::EnumAltered(prior) => {
+            storage.rollback_enum_alter(prior);
         }
         DdlUndo::IndexCreated(slot) => {
             let slot = slot as usize;
@@ -20493,7 +20500,7 @@ fn apply_composite_wal_definition(
         n_fields: def.n_fields,
     };
     if storage.composite(slot).visible_to(0) {
-        let mut definition = storage.composite_for(slot, 0);
+        let (mut definition, edit_target) = storage.prepare_composite_edit(slot, 0)?;
         if definition.database != storage.current_database_oid()
             || definition.created_at != def.created_at
         {
@@ -20506,8 +20513,8 @@ fn apply_composite_wal_definition(
         definition.name = def.name;
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
-        storage.stage_composite_alter(slot, definition, 0)?;
-        storage.commit_composite_alter(slot, 0);
+        let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
+        storage.commit_composite_alter(prior.target())?;
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
         storage.restore_type_identity(
@@ -21592,6 +21599,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.commit_publication_rename(slot, 0);
         }
         WalOp::CreateSubscription {
+            created_at,
             name,
             owner,
             connection,
@@ -21621,6 +21629,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
+            storage.restore_subscription_stream_identity(slot, created_at, 1)?;
             storage.restore_subscription_owner(slot, owner);
             storage.commit_subscription_create(slot);
         }
@@ -22031,10 +22040,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         "journal domain lifetime does not match its source"
                     ));
                 }
-                storage.stage_domain_alter(slot, spec, 0)?;
-                storage.commit_domain_alter(slot, 0);
+                let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
+                let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
+                storage.commit_domain_alter(prior.target())?;
             } else {
-                let allocated = storage.create_domain(def.schema, def.name, spec, 0)?;
+                let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
                 storage.restore_type_identity(
                     crate::storage::NamedTypeSlot::Domain(allocated),
                     crate::storage::NamedTypeSlot::Domain(slot),
@@ -22049,8 +22059,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             ));
         }
         WalOp::DropDomain { schema, name } => {
-            if let Some(slot) = storage.drop_domain(schema, name, 0)? {
-                storage.commit_domain_drop(slot);
+            if let Some(slot) =
+                storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema, name, 0)?
+            {
+                storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Commit);
             }
         }
         WalOp::RestoreRoutine {
@@ -22138,13 +22150,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             wide_fields,
         } => apply_composite_wal_payload(storage, payload, wide_fields)?,
         WalOp::DropComposite { schema, name } => {
-            if let Some(slot) = storage.drop_composite(schema, name, 0)? {
-                storage.commit_composite_drop(slot);
+            if let Some(slot) = storage.stage_type_drop(
+                crate::storage::NamedTypeKind::Composite,
+                schema,
+                name,
+                0,
+            )? {
+                storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Commit);
             }
         }
         WalOp::DropEnum { schema, name } => {
-            if let Some(slot) = storage.drop_enum(schema, name, 0)? {
-                storage.commit_enum_drop(slot);
+            if let Some(slot) =
+                storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema, name, 0)?
+            {
+                storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Commit);
             }
         }
         WalOp::RenameEnum {
@@ -22198,11 +22217,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
-            let mut definition = storage.composite_for(slot, 0);
+            let (mut definition, edit_target) = storage.prepare_composite_edit(slot, 0)?;
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
-            storage.stage_composite_alter(slot, definition, 0)?;
-            storage.commit_composite_alter(slot, 0);
+            let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
+            storage.commit_composite_alter(prior.target())?;
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -22217,13 +22236,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
-            storage.stage_domain_identity(
-                slot,
+            let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
+            let prior = storage.stage_domain_identity(
+                edit_target,
                 crate::storage::SqlName::parse(new_schema)?,
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(slot, 0);
+            storage.commit_domain_alter(prior.target())?;
         }
         WalOp::Comment {
             class,

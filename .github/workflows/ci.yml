@@ -87,6 +87,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Formatting
+        run: cargo fmt --check
+
       - name: Build release executable
         run: cargo build --release --locked
 
@@ -153,6 +156,7 @@ jobs:
           tools/tests/test_coverage_script.py
           tools/tests/test_check_dups.py
           tools/tests/test_postgres_regress_diff.py
+          tools/tests/test_differential_diagnostics.py
           tools/tests/test_benchmark.py
           tools/tests/test_benchmark_environment.py
           tools/tests/test_benchmark_matrix_report.py
@@ -168,9 +172,6 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets --locked
-
-      - name: Formatting
-        run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy --lib --bins -- -D warnings

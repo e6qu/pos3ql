@@ -1434,22 +1434,21 @@ fi
 fi
 
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
+# Ask psql for SQLSTATE-only diagnostics so multiline DETAIL cannot become rows.
 normalize() {
   sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
-    -e '/^LINE [0-9]+:/d' -e '/^ *\^ *$/d' \
-    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
-    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
+    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
+    -e 's/^ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
+    -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
 }
 run_corpus() { # host port outfile file
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-        -v VERBOSITY=verbose -f "$4" 2>&1
+        -v VERBOSITY=sqlstate -f "$4" 2>&1
   else
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-      -v VERBOSITY=verbose -f "$4" 2>&1
+      -v VERBOSITY=sqlstate -f "$4" 2>&1
   fi | normalize > "$3"
   if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"

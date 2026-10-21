@@ -339,6 +339,7 @@ mod tests {
                 0,
             )
             .unwrap()
+            .slot()
     }
 
     fn alter(
@@ -347,7 +348,7 @@ mod tests {
         members: &[EnumMember],
     ) -> Result<super::super::EnumAlterUndo, SqlError> {
         storage.stage_enum_alter(
-            slot,
+            storage.prepare_enum_edit(slot, 77).unwrap().1,
             SqlName::parse("public").unwrap(),
             SqlName::parse("state").unwrap(),
             members,
@@ -504,14 +505,17 @@ mod tests {
             let mut labels = before.members();
             drop(before);
             alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
-            storage.commit_enum_alter(slot, 77);
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                .unwrap();
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
-            assert_eq!(
-                storage.drop_enum("public", "state", 77).unwrap(),
-                Some(slot)
-            );
-            storage.commit_enum_drop(slot);
+            let dropped = storage
+                .stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77)
+                .unwrap()
+                .unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = storage
                 .create_enum(
                     SqlName::parse("public").unwrap(),
@@ -521,7 +525,8 @@ mod tests {
                     },
                     0,
                 )
-                .unwrap();
+                .unwrap()
+                .slot();
             assert_eq!(replacement, slot);
             assert_ne!(
                 selected.created_at,
@@ -542,7 +547,7 @@ mod tests {
             let before = storage.enum_for(slot, 0);
             alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
             assert_eq!(
-                storage.commit_enum_members(slot, 77),
+                storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
                 EnumMemberPublication::Complete
             );
             let members = [
@@ -560,12 +565,12 @@ mod tests {
             drop(before);
             let prior = alter(&storage, slot, &members).unwrap();
             let pending = storage.enum_for(slot, 77);
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
             assert_eq!(pending.sort_of("shipped"), Some(3.0));
             assert!(alter(&storage, slot, &members).is_err());
             drop(pending);
             let prior = alter(&storage, slot, &members).unwrap();
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
         });
     }
@@ -642,7 +647,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 alter(storage, slot, &[member("renamed", 1.0)]).unwrap();
                 assert_eq!(
-                    storage.commit_enum_members(slot, 77),
+                    storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
                     EnumMemberPublication::Complete
                 );
                 let location = storage.heap.append_row(&[Datum::Int4(42)]).unwrap();
@@ -680,7 +685,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .stage_enum_alter(
-                    slot,
+                    storage.prepare_enum_edit(slot, 77).unwrap().1,
                     after.schema,
                     after.name,
                     &[member("new", 1.0), member("paid", 2.0)],
@@ -689,7 +694,7 @@ mod tests {
                 .unwrap();
             let selected = storage.enum_for(slot, 77);
             assert_eq!(
-                storage.commit_enum_members(slot, 77),
+                storage.commit_enum_members(storage.prepare_enum_edit(slot, 77).unwrap().1),
                 EnumMemberPublication::IdentityMoveRequired
             );
             assert_eq!(storage.enum_for(slot, 0).name, before.name);
@@ -699,13 +704,15 @@ mod tests {
             assert_eq!(selected.sort_of("paid"), Some(2.0));
             assert_eq!(storage.table_def(table, 0).columns()[0].user_type, captured);
             assert_eq!(
-                storage.commit_enum_members(slot, 88),
+                storage.commit_enum_members(storage.prepare_enum_edit(slot, 88).unwrap().1),
                 EnumMemberPublication::Complete
             );
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
         });
         crate::mem::guard::forbid_alloc(|| {
-            storage.commit_enum_alter(slot, 77);
+            storage
+                .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                .unwrap();
             assert_eq!(storage.enum_for(slot, 0).name, after.name);
             assert!(
                 storage.table_def(table, 0).columns()[0]
@@ -731,40 +738,41 @@ mod tests {
         let slot = create(&mut storage, "state");
         let old = crate::mem::guard::forbid_alloc(|| {
             let old = alter(&storage, slot, &[member("first", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             let later = alter(&storage, slot, &[member("second", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(storage.enum_for(slot, 77).sort_of("second"), Some(1.0));
-            storage.rollback_enum_alter(slot, later);
+            storage.rollback_enum_alter(later);
             let other = storage
                 .stage_enum_alter(
-                    slot,
+                    storage.prepare_enum_edit(slot, 88).unwrap().1,
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
                     &[member("other", 1.0)],
                     88,
                 )
                 .unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(storage.enum_for(slot, 88).sort_of("other"), Some(1.0));
-            storage.rollback_enum_alter(slot, other);
+            storage.rollback_enum_alter(other);
             old
         });
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(
-                storage.drop_enum("public", "state", 77).unwrap(),
-                Some(slot)
-            );
-            storage.commit_enum_drop(slot);
+            let dropped = storage
+                .stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77)
+                .unwrap()
+                .unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = create(&mut storage, "state");
             assert_eq!(replacement, slot);
             let later = alter(&storage, replacement, &[member("replacement", 1.0)]).unwrap();
-            storage.rollback_enum_alter(replacement, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(
                 storage.enum_for(replacement, 77).sort_of("replacement"),
                 Some(1.0)
             );
-            storage.rollback_enum_alter(replacement, later);
+            storage.rollback_enum_alter(later);
             assert_eq!(storage.enum_for(replacement, 0).sort_of("new"), Some(1.0));
         });
     }
@@ -774,17 +782,27 @@ mod tests {
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
         let before = storage.enum_for(slot, 0);
-        let previous = storage.replace_catalog_sequence_for_test(u64::MAX);
+        let previous = storage
+            .type_catalog
+            .lock()
+            .unwrap()
+            .versions
+            .replace_sequence_for_test(u64::MAX);
         crate::mem::guard::forbid_alloc(|| {
             let error = alter(&storage, slot, &[member("changed", 1.0)]).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(storage.enum_for(slot, 77).sort_of("new"), Some(1.0));
             assert_eq!(before.sort_of("new"), Some(1.0));
         });
-        storage.replace_catalog_sequence_for_test(previous);
+        storage
+            .type_catalog
+            .lock()
+            .unwrap()
+            .versions
+            .replace_sequence_for_test(previous);
         crate::mem::guard::forbid_alloc(|| {
             let undo = alter(&storage, slot, &[member("changed", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, undo);
+            storage.rollback_enum_alter(undo);
             assert_eq!(storage.enum_for(slot, 0).sort_of("new"), Some(1.0));
         });
     }
@@ -816,7 +834,9 @@ mod tests {
             });
             let result = crate::mem::guard::forbid_alloc(|| {
                 alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)])?;
-                storage.commit_enum_alter(slot, 77);
+                storage
+                    .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                    .unwrap();
                 Ok::<(), SqlError>(())
             });
             published.store(true, Ordering::Release);
@@ -834,7 +854,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
         });
     }
 

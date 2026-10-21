@@ -52073,6 +52073,144 @@ fn enum_value_identity_stored_view_follows_member_rename() {
 }
 
 #[test]
+fn type_definition_transactions_keep_final_edits_after_drop_savepoint_rollback() {
+    let config = test_config("type-definition-transactions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "BEGIN; CREATE DOMAIN type_edit_domain AS integer DEFAULT 1; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 2; SAVEPOINT keep_type; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 3; \
+         ALTER DOMAIN type_edit_domain RENAME TO type_edit_domain_pending; \
+         DROP DOMAIN type_edit_domain_pending",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_type WHERE typname = 'type_edit_domain_pending'",
+            true
+        )),
+        ["0"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO keep_type; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 4; COMMIT; \
+         CREATE TABLE type_edit_rows(value type_edit_domain); \
+         INSERT INTO type_edit_rows DEFAULT VALUES",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT value FROM type_edit_rows", true)),
+        ["4"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; CREATE TYPE type_edit_enum AS ENUM ('before'); \
+         ALTER TYPE type_edit_enum RENAME VALUE 'before' TO 'first'; SAVEPOINT keep_type; \
+         ALTER TYPE type_edit_enum RENAME VALUE 'first' TO 'discarded'; \
+         ALTER TYPE type_edit_enum RENAME TO type_edit_enum_pending; \
+         DROP TYPE type_edit_enum_pending",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_type WHERE typname = 'type_edit_enum_pending'",
+            true
+        )),
+        ["0"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO keep_type; \
+         ALTER TYPE type_edit_enum RENAME VALUE 'first' TO 'final'; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT 'final'::type_edit_enum::text", true)),
+        ["final"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; CREATE TYPE type_edit_record AS (before integer); \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE before TO first; SAVEPOINT keep_type; \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE first TO discarded; \
+         ALTER TYPE type_edit_record RENAME TO type_edit_record_pending; \
+         DROP TYPE type_edit_record_pending",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_type WHERE typname = 'type_edit_record_pending'",
+            true
+        )),
+        ["0"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO keep_type; \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE first TO final; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT (ROW(9)::type_edit_record).final", true)),
+        ["9"]
+    );
+}
+
+#[test]
+fn type_definition_transactions_follow_dependencies_after_pending_domain_moves() {
+    let config = test_config("type-definition-dependencies");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE DOMAIN type_dep_parent AS integer; CREATE DOMAIN type_dep_child AS type_dep_parent; \
+         CREATE TABLE type_dep_rows(value type_dep_child); INSERT INTO type_dep_rows VALUES (1); \
+         BEGIN; ALTER DOMAIN type_dep_parent RENAME TO type_dep_moved; SAVEPOINT before_check", true);
+    let rejected = session.execute(
+        &mut engine,
+        "ALTER DOMAIN type_dep_moved ADD CHECK (VALUE > 10)",
+        true,
+    );
+    assert_eq!(error_sqlstates(&rejected), ["23514"]);
+    session.success(
+        &mut engine,
+        "ROLLBACK TO before_check; SAVEPOINT before_drop",
+        true,
+    );
+    let rejected = session.execute(&mut engine, "DROP DOMAIN type_dep_moved", true);
+    assert_eq!(error_sqlstates(&rejected), ["2BP01"]);
+    session.success(
+        &mut engine,
+        "ROLLBACK TO before_drop; DROP DOMAIN type_dep_moved CASCADE",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT count(*) FROM pg_attribute WHERE attrelid = 'type_dep_rows'::regclass AND attnum > 0 AND NOT attisdropped", true)), ["0"]);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT value FROM type_dep_rows", true)),
+        ["1"]
+    );
+    session.success(&mut engine,
+        "CREATE SCHEMA type_dep_source; CREATE SCHEMA type_dep_target; \
+         CREATE DOMAIN type_dep_source.value AS integer; \
+         CREATE TABLE type_dep_outside(value type_dep_source.value); INSERT INTO type_dep_outside VALUES (5); \
+         BEGIN; ALTER DOMAIN type_dep_source.value SET SCHEMA type_dep_target; \
+         DROP SCHEMA type_dep_source CASCADE; COMMIT", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT value FROM type_dep_outside", true)),
+        ["5"]
+    );
+}
+
+#[test]
 fn enum_value_identity_domain_check_follows_member_rename() {
     let config = test_config("enum-identity-domain");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -52346,7 +52484,8 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
             crate::storage::EnumSpec { members: &members },
             0,
         )
-        .unwrap() as u16;
+        .unwrap()
+        .slot() as u16;
     let hash = |member: Option<u32>, sort, label| {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::hash_key_catalog(
@@ -52395,7 +52534,8 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
             crate::storage::EnumSpec { members: &members },
             0,
         )
-        .unwrap() as u16;
+        .unwrap()
+        .slot() as u16;
     let read_arena = Arena::new(&mut budget, "legacy enum reads", 1 << 20).unwrap();
     let legacy = Datum::Enum {
         slot,
@@ -67754,7 +67894,8 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
     run_with(
         &mut engine,
         &mut budget,
-        "BEGIN; \
+        "BEGIN; CREATE DOMAIN aborted_subscription_identity AS integer; ROLLBACK; \
+         BEGIN; \
          CREATE SUBSCRIPTION archived_changes CONNECTION \
          'host=publisher port=5432' \
          PUBLICATION sales, inventory \
@@ -67774,6 +67915,12 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
         engine.subscription_endpoint("archived_changes").is_none(),
         "a disabled subscription keeps its PostgreSQL conninfo without claiming a local client endpoint"
     );
+    let created_at = engine
+        .storage
+        .subscription("archived_changes", 0)
+        .unwrap()
+        .1
+        .created_at;
     run_with(
         &mut engine,
         &mut budget,
@@ -67790,6 +67937,16 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
     drop(engine);
     let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        replayed
+            .storage
+            .subscription("archived_changes", 0)
+            .unwrap()
+            .1
+            .created_at,
+        created_at,
+        "subscription identity is restored from its record despite aborted catalog allocations"
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut replayed,

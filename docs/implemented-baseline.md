@@ -206,7 +206,7 @@ example, a shipment column can contain a composite whose status field uses a
 domain over an enum. The query saves that composite layout, the domain's rules
 and the enum's labels together with their source lifetimes. Resuming the same
 statement uses its selected definitions. A later nested statement selects its
-own visible definitions. Identical images are shared within the outer statement;
+own visible definitions. Identical images of the same definition revision are shared within the outer statement;
 repeating an unchanged nested query does not consume another image.
 
 Domain checks, composite input/output, enum value resolution and comparisons use
@@ -216,6 +216,36 @@ source retirement cannot change a selected image. A retained source slot cannot
 be reused or assigned a different creation identity until its readers release it.
 The readers and their buffers can outlive the storage owner.
 
+Type edits capture the current definition and its revision together. Storage
+checks the source lifetime, database, transaction and revision before accepting
+the edit. A replaced source returns `42704`; a changed definition returns
+`40001`. An edit targeting the wrong type kind returns `42804`. Another
+transaction's pending edit or deletion waits on its owner. The type catalog
+lock is released before the statement waits. A transaction uses its own pending
+name when dropping a renamed type.
+
+Creation and deletion records retain their source identity, transaction and
+change revision. Commit validates type ownership and dependent table publication
+counters before durability; publication and rollback use the captured records.
+Counter exhaustion returns `54000` before a type move changes its source or dependents.
+A superseded record cannot overwrite a
+newer edit, revive a replacement type, remove its comment or release its enum
+labels. Domain, enum and composite revision counters reserve 16 bytes per type
+slot plus their controls at startup. These counters are local ownership checks
+and do not advance the durable catalog identity allocator. Durable type identities
+are unchanged. Subscription creation records now save their source identity
+explicitly; see the [journal format](durable-format.md).
+
+**User example:** `BEGIN; ALTER DOMAIN price RENAME TO order_price; DROP DOMAIN
+order_price; ROLLBACK;` leaves the original `price` domain available. Rolling
+back a savepoint after a type rename and deletion restores both the earlier
+name and definition. A later edit in the same transaction can still commit.
+Checks and cascading deletion follow captured domain parents and columns across
+pending name changes. For example, renaming a parent domain before adding a
+check still validates rows declared with its child domain. Moving a domain to
+another schema before deleting the old schema preserves outside table columns
+that use the moved domain.
+
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
 and `max_composites`). Statement selection maps and ownership controls are also
@@ -223,8 +253,8 @@ charged at startup. No image allocation grows the runtime heap. A full pool
 returns `54000` naming the domain, enum or composite definition image pool and
 its capacity; releasing retained readers permits retry. Graph traversal uses
 temporary statement-arena space and reports `54000` if it cannot fit. This
-protection does not enable parallel SQL execution: shared engine commit,
-retirement and remaining metadata preparation stay in [PLAN.md](../PLAN.md).
+protection does not enable parallel SQL execution: engine commit, remaining
+retirement paths and metadata preparation stay in [PLAN.md](../PLAN.md).
 
 **User example:** after moving a table to another schema and rolling back to a
 savepoint, its constraint comments remain attached under the original name. A

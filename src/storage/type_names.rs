@@ -7,6 +7,13 @@ use super::{
 use crate::sql_err;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamedTypeKind {
+    Domain,
+    Enum,
+    Composite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NamedTypeSlot {
     Domain(usize),
     Enum(usize),
@@ -14,6 +21,14 @@ pub(crate) enum NamedTypeSlot {
 }
 
 impl NamedTypeSlot {
+    pub(super) fn kind(self) -> NamedTypeKind {
+        match self {
+            Self::Domain(_) => NamedTypeKind::Domain,
+            Self::Enum(_) => NamedTypeKind::Enum,
+            Self::Composite(_) => NamedTypeKind::Composite,
+        }
+    }
+
     pub(super) fn index(self) -> usize {
         match self {
             Self::Domain(slot) | Self::Enum(slot) | Self::Composite(slot) => slot,
@@ -188,7 +203,7 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Domain),
+                .map(|created| NamedTypeSlot::Domain(created.slot())),
             NamedTypeSlot::Enum(_) => storage
                 .create_enum(
                     schema,
@@ -202,7 +217,7 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Enum),
+                .map(|created| NamedTypeSlot::Enum(created.slot())),
             NamedTypeSlot::Composite(_) => storage
                 .create_composite(
                     schema,
@@ -213,8 +228,15 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Composite),
+                .map(|created| NamedTypeSlot::Composite(created.slot())),
         }
+    }
+
+    #[derive(Debug)]
+    enum NameUndo {
+        Domain(super::super::DomainAlterUndo),
+        Enum(super::super::EnumAlterUndo),
+        Composite(super::super::CompositeAlterUndo),
     }
 
     fn rename(
@@ -222,53 +244,44 @@ mod tests {
         slot: NamedTypeSlot,
         name: &str,
         txid: u32,
-    ) -> Result<(), SqlError> {
+    ) -> Result<NameUndo, SqlError> {
         let UserTypeName { schema, name, .. } = identity(name);
-        match slot {
-            NamedTypeSlot::Domain(slot) => {
-                storage.stage_domain_identity(slot, schema, name, txid)?;
-            }
-            NamedTypeSlot::Enum(slot) => {
-                storage.stage_enum_alter(
-                    slot,
-                    schema,
-                    name,
-                    &[EnumMember {
-                        label: SqlName::parse("ready").unwrap(),
-                        legacy_label: None,
-                        sort: 1.0,
-                    }],
-                    txid,
-                )?;
-            }
+        Ok(match slot {
+            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(
+                storage.prepare_domain_edit(slot, txid).unwrap().1,
+                schema,
+                name,
+                txid,
+            )?),
+            NamedTypeSlot::Enum(slot) => NameUndo::Enum(storage.stage_enum_alter(
+                storage.prepare_enum_edit(slot, txid).unwrap().1,
+                schema,
+                name,
+                &[EnumMember {
+                    label: SqlName::parse("ready").unwrap(),
+                    legacy_label: None,
+                    sort: 1.0,
+                }],
+                txid,
+            )?),
             NamedTypeSlot::Composite(slot) => {
                 let mut definition = storage.composite_for(slot, txid);
                 definition.schema = schema;
                 definition.name = name;
-                storage.stage_composite_alter(slot, definition, txid)?;
+                NameUndo::Composite(storage.stage_composite_alter(
+                    storage.prepare_composite_edit(slot, txid).unwrap().1,
+                    definition,
+                    txid,
+                )?)
             }
-        }
-        Ok(())
+        })
     }
 
-    fn rollback(storage: &mut Storage, slot: NamedTypeSlot) {
-        match slot {
-            NamedTypeSlot::Domain(slot) => storage.rollback_domain_alter(slot, None),
-            NamedTypeSlot::Enum(slot) => {
-                let undo = {
-                    let catalog = storage.type_catalog.lock().unwrap();
-                    let definition = catalog.enums[slot];
-                    let pending = definition.pending_definition.unwrap();
-                    super::super::EnumAlterUndo {
-                        created_at: definition.created_at,
-                        transaction: pending.txid,
-                        version: pending.version,
-                        prior: None,
-                    }
-                };
-                storage.rollback_enum_alter(slot, undo);
-            }
-            NamedTypeSlot::Composite(slot) => storage.rollback_composite_alter(slot, None),
+    fn rollback(storage: &mut Storage, undo: NameUndo) {
+        match undo {
+            NameUndo::Domain(undo) => storage.rollback_domain_alter(undo),
+            NameUndo::Enum(undo) => storage.rollback_enum_alter(undo),
+            NameUndo::Composite(undo) => storage.rollback_composite_alter(undo),
         }
     }
 
@@ -317,8 +330,8 @@ mod tests {
                         sqlstate::DUPLICATE_OBJECT
                     );
                     // A failed attempt leaves no staged definition or label image.
-                    rename(&mut storage, source, "available", 7).unwrap();
-                    rollback(&mut storage, source);
+                    let undo = rename(&mut storage, source, "available", 7).unwrap();
+                    rollback(&mut storage, undo);
                 });
             }
         }
@@ -334,7 +347,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| {
                     let source = create(&mut storage, existing, "before", 0).unwrap();
                     let contender = create(&mut storage, requested, "contender", 0).unwrap();
-                    rename(&mut storage, source, "after", 7).unwrap();
+                    let undo = rename(&mut storage, source, "after", 7).unwrap();
                     for name in ["before", "after"] {
                         assert_eq!(
                             create(&mut storage, requested, name, 9)
@@ -349,7 +362,7 @@ mod tests {
                             sqlstate::INTERNAL_LOCK_WAIT
                         );
                     }
-                    rollback(&mut storage, source);
+                    rollback(&mut storage, undo);
                     create(&mut storage, requested, "after", 9).unwrap();
                     assert_eq!(
                         create(&mut storage, requested, "before", 9)
@@ -379,6 +392,44 @@ mod tests {
                     );
                 });
             }
+        }
+    }
+
+    #[test]
+    fn named_type_drop_uses_own_pending_name_and_rollback_restores_it() {
+        for kind in KINDS {
+            let mut storage = fixture();
+            crate::mem::guard::forbid_alloc(|| {
+                let source = create(&mut storage, kind, "before", 0).unwrap();
+                let undo = rename(&mut storage, source, "after", 7).unwrap();
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "before", 7)
+                        .unwrap(),
+                    None
+                );
+                let dropped = storage
+                    .stage_type_drop(kind.kind(), "public", "after", 7)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(dropped.slot(), source.index());
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
+                rollback(&mut storage, undo);
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "after", 7)
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "before", 7)
+                        .unwrap()
+                        .unwrap()
+                        .slot(),
+                    source.index()
+                );
+            });
         }
     }
 
@@ -440,26 +491,11 @@ mod tests {
             storage.begin_transaction_identity(9).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 let slot = create(&mut storage, kind, "occupied", 0).unwrap();
-                match slot {
-                    NamedTypeSlot::Domain(slot) => {
-                        assert_eq!(
-                            storage.drop_domain("public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                    NamedTypeSlot::Enum(slot) => {
-                        assert_eq!(
-                            storage.drop_enum("public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                    NamedTypeSlot::Composite(slot) => {
-                        assert_eq!(
-                            storage.drop_composite("public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                }
+                let dropped = storage
+                    .stage_type_drop(kind.kind(), "public", "occupied", 7)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(dropped.slot(), slot.index());
                 for requested in KINDS {
                     assert_eq!(
                         create(&mut storage, requested, "occupied", 9)
@@ -468,11 +504,7 @@ mod tests {
                         sqlstate::INTERNAL_LOCK_WAIT
                     );
                 }
-                match slot {
-                    NamedTypeSlot::Domain(slot) => storage.commit_domain_drop(slot),
-                    NamedTypeSlot::Enum(slot) => storage.commit_enum_drop(slot),
-                    NamedTypeSlot::Composite(slot) => storage.commit_composite_drop(slot),
-                }
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 let replacement = create(&mut storage, kind, "occupied", 0).unwrap();
                 assert_eq!(replacement, slot);
             });

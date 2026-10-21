@@ -1,14 +1,6 @@
 //! Publish member images without changing a type identity or its references.
 
-use super::{PendingEnumDefinition, Storage};
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EnumAlterUndo {
-    pub(super) created_at: u64,
-    pub(super) transaction: u32,
-    pub(super) version: u64,
-    pub(super) prior: Option<PendingEnumDefinition>,
-}
+use super::{NamedTypeKind, Storage, TypeEditTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "type identity moves require exclusive publication"]
@@ -18,11 +10,18 @@ pub(crate) enum EnumMemberPublication {
 }
 
 impl Storage {
-    pub(crate) fn commit_enum_members(&self, slot: usize, txid: u32) -> EnumMemberPublication {
+    pub(crate) fn commit_enum_members(&self, target: TypeEditTarget) -> EnumMemberPublication {
+        let slot = target
+            .slot(NamedTypeKind::Enum)
+            .expect("enum publication identifies an enum source");
+        let txid = target.transaction();
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if !catalog.matches_type_edit(target) {
+            return EnumMemberPublication::Complete;
+        }
         let current = &catalog.enums[slot];
         let Some(pending) = current
             .pending_definition

@@ -3053,13 +3053,8 @@ fn build_declared_table_def(
             "typed-table column options require a typed attribute alteration protocol"
         ));
     }
-    let slot = storage
-        .resolve_composite_slot(type_name.name, txid)
-        .filter(|slot| {
-            type_name
-                .schema
-                .is_none_or(|schema| storage.composite_for(*slot, txid).schema.as_str() == schema)
-        })
+    let (composite, reference) = storage
+        .composite_source(type_name.schema, type_name.name, txid)?
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -3067,14 +3062,9 @@ fn build_declared_table_def(
                 type_name.name
             )
         })?;
-    let composite = storage.composite_for(slot, txid);
     let mut definition = TableDef {
         name: SqlName::parse(statement.name.name)?,
-        type_membership: crate::storage::TableTypeMembership::Composite(
-            u16::try_from(slot).map_err(|_| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many composite types")
-            })?,
-        ),
+        type_membership: crate::storage::TableTypeMembership::Composite(reference),
         ..TableDef::empty()
     };
     let mut count = 0;
@@ -65463,22 +65453,21 @@ fn alter_table_relation(
                     def.name.as_str()
                 ));
             }
-            let slot = match type_name.schema {
-                Some(schema) => storage.composite_slot(schema, type_name.name, txn.txid),
-                None => storage.resolve_composite_slot(type_name.name, txn.txid),
-            }
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    type_name.name
-                )
-            });
-            let slot = match slot {
-                Ok(slot) => slot,
+            let source = storage
+                .composite_source(type_name.schema, type_name.name, txn.txid)
+                .and_then(|source| {
+                    source.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "type \"{}\" does not exist",
+                            type_name.name
+                        )
+                    })
+                });
+            let (composite, reference) = match source {
+                Ok(source) => source,
                 Err(error) => return sql_fail(error),
             };
-            let composite = storage.composite_for(slot, txn.txid);
             let fields = composite.fields_for(txn.txid);
             let matches = def.columns().len()
                 == fields.iter().filter(|field| !field.dropped).count()
@@ -65502,7 +65491,7 @@ fn alter_table_relation(
                     type_name.name
                 ));
             }
-            crate::storage::TableTypeMembership::Composite(slot as u16)
+            crate::storage::TableTypeMembership::Composite(reference)
         } else {
             if def.type_membership.composite_slot().is_none() {
                 return sql_fail(sql_err!(

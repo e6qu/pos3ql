@@ -2509,7 +2509,7 @@ fn collect_type(
         dependencies.push(StoredQueryDependency {
             class,
             slot: slot as u16,
-            identity: StoredDependencyIdentity::Name,
+            identity: storage.capture_type_dependency(class, slot, txid)?,
             referenced_columns: crate::storage::ColumnSet::EMPTY,
             schema,
             name,

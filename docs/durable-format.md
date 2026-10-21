@@ -20,8 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v17` | yes | yes | Requires durable type slots/lifetimes, a catalog identity counter and a completed type-loading boundary; retains typed blocks and enum member identities. |
-| Journal record | Version `1` at header byte 17; bytes 18–23 are zero | yes | yes | Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v18` | yes | yes | Requires durable type slots/lifetimes, a catalog identity counter and a completed type-loading boundary; retains typed blocks and enum member identities. |
+| Journal record | Version `2` at header byte 17; bytes 18–23 are zero | yes | yes | Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -38,7 +38,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v16 and older manifests are rejected before their references are used.
+Manifest v17 and older manifests are rejected before their references are used.
 
 ## Why the storage layout matters
 
@@ -138,8 +138,11 @@ Journal records version field-width changes with distinct kind bytes. Current
 writers use publication kinds 139/140, trigger kind 141, routine kind 142,
 composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
 counts. Readers retain the preceding publication, trigger, routine, composite,
-and view kinds. Stored-query dependencies use marker `0xfe` for the complete
-column set and retain the `0xff` and legacy readers. Table statistics use the
+and view kinds. Stored-query dependencies use marker `0xfd`, a length-prefixed
+identity and the complete column set. Type identities use `d:<slot>:<creation>`,
+`e:<slot>:<creation>` or `c:<slot>:<creation>`; other identities retain their
+decimal object identifiers or zero for name-based objects. Earlier dependency
+grammars are rejected. Table statistics use the
 v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
 The current manifest text represents sparse column sets and streams wide
 composite fields into the configured manifest buffer.
@@ -219,13 +222,26 @@ identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-current journal records or manifest v17. Kind 153 applies to ordinary row writes
+current journal records or manifest v18. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
-Journal routine type codes leave catalog slots unresolved until startup has
-replayed all definitions. Enum and composite name moves update those declarations
-by their exact saved name as well; a missing name or a different resolved slot
-cannot select a type. Startup then binds the moved name to its current slot.
+Journal routine type references identify their saved source lifetime. Replay
+refreshes the SQL spelling from that source; a missing lifetime cannot select a
+replacement with the same name.
+
+### Typed tables
+
+A typed table saves its composite source as `c:<slot>:<creation>`, without a
+duplicate SQL name. Recovery checks the source lifetime and column shape before
+installing the table. Dropping a type and creating an identical replacement in
+the same slot cannot make a saved definition select that replacement. Template
+copies deliberately bind this link to the new database’s cloned type.
+
+Saved queries use the same source keys for domain, enum and composite
+dependencies. A view recorded before a rename can commit afterward and recover
+the renamed source. Its original spelling cannot select a replacement. Routine
+publication validates these dependencies under the same owners as its signature
+and dependency image.
 
 ### Type lifetimes and saved references
 
@@ -235,7 +251,7 @@ first. The first connection can then commit. After restart, the cast still
 refers to that same type, now named `current_code`. Its saved name cannot select
 a replacement that reused `order_code`.
 
-Manifest v17 and current journal records preserve the physical slot and
+Manifest v18 and current journal records preserve the physical slot and
 `created_at` identity of each domain, enum and named composite. The required
 `catalog_sequence` manifest field remembers the highest creation number used,
 including objects deleted before checkpoint. Restore never assigns
@@ -254,10 +270,10 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 5.
+contracts share this encoding. Table definition payloads use version 6.
 
 Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
-0–15; byte 16 selects the operation; byte 17 is version 1; bytes 18–23 are zero.
+0–15; byte 16 selects the operation; byte 17 is version 2; bytes 18–23 are zero.
 A checksum-valid unsupported version stops local replay without truncating the
 journal. Uploaded records validate the same version before decoding. Update all
 recovery candidates together and use a fresh prefix or verified logical transfer
@@ -310,7 +326,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v17. Startup, backup retention, and
+The only accepted checkpoint manifest is v18. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

@@ -65606,6 +65606,92 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
 }
 
 #[test]
+fn typed_table_membership_resolves_qualified_and_quoted_names() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE SCHEMA typed_other",
+        "CREATE TYPE public.typed_shadow AS (wrong text)",
+        "CREATE TYPE typed_other.typed_shadow AS (id integer)",
+        "CREATE TABLE qualified_typed_rows OF typed_other.typed_shadow",
+        "CREATE TYPE public.\"typed.dot\" AS (id integer)",
+        "CREATE TABLE quoted_typed_rows OF \"typed.dot\"",
+        "CREATE TABLE altered_quoted_rows (id integer)",
+        "ALTER TABLE altered_quoted_rows OF \"typed.dot\"",
+        "INSERT INTO qualified_typed_rows VALUES (1)",
+        "INSERT INTO quoted_typed_rows VALUES (2)",
+        "INSERT INTO altered_quoted_rows VALUES (3)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM qualified_typed_rows UNION ALL SELECT id FROM quoted_typed_rows \
+         UNION ALL SELECT id FROM altered_quoted_rows ORDER BY id"
+        )),
+        ["1", "2", "3"]
+    );
+}
+
+#[test]
+fn typed_table_membership_rejects_a_reused_source_lifetime() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE retired_typed_source AS (id integer); \
+         CREATE TABLE saved_typed_rows OF retired_typed_source",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let slot = engine
+        .storage
+        .find_visible("public", "saved_typed_rows", 0)
+        .unwrap();
+    let mut saved = *engine.storage.table_def(slot, 0);
+    let source_slot = saved.type_membership.composite_slot().unwrap();
+    for statement in [
+        "DROP TYPE retired_typed_source CASCADE",
+        "CREATE TYPE retired_typed_source AS (id integer)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let (_, replacement) = engine
+        .storage
+        .composite_source(None, "retired_typed_source", 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replacement.composite_slot(),
+        Some(source_slot),
+        "exercise physical slot reuse"
+    );
+    saved.name = crate::storage::SqlName::parse("rejected_typed_rows").unwrap();
+    let error = engine.storage.create_table(saved).unwrap_err();
+    assert_eq!(error.sqlstate, crate::sql::eval::sqlstate::UNDEFINED_OBJECT);
+    assert!(
+        engine
+            .storage
+            .find_visible("public", "rejected_typed_rows", 0)
+            .is_none()
+    );
+}
+
+#[test]
 fn typed_table_membership_uses_the_resolved_composite_identity() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
@@ -65645,7 +65731,7 @@ fn typed_table_membership_uses_the_resolved_composite_identity() {
          CREATE TABLE invalid_typed_table OF typed_table_enum",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42704"),
+        String::from_utf8_lossy(&output).contains("42809"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -66474,6 +66560,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE SCHEMA template_app;
          CREATE TYPE template_app.state AS ENUM ('ready', 'done');
          CREATE DOMAIN template_app.positive AS integer CHECK (VALUE > 0);
+         CREATE TYPE template_app.typed_row AS (id template_app.positive, state template_app.state);
+         CREATE TABLE template_app.typed_rows OF template_app.typed_row;
+         INSERT INTO template_app.typed_rows VALUES (11, 'ready');
          CREATE COLLATION template_app.byte_order
            (PROVIDER = libc, LOCALE = 'C', VERSION = '1');
          CREATE DEFAULT CONVERSION template_app.latin1_to_utf8
@@ -66558,6 +66647,15 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         .map(|slot| engine.storage.database(slot).oid)
         .unwrap();
     engine.select_database(clone).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+         WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
+        )),
+        ["t", "11|ready"]
+    );
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -66766,6 +66864,15 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         .map(|slot| restarted.storage.database(slot).oid)
         .unwrap();
     restarted.select_database(clone).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+         WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
+        )),
+        ["t", "11|ready"]
+    );
     let reloaded_session = GucState::new();
     restarted.apply_system_settings(&reloaded_session).unwrap();
     assert_eq!(
@@ -76088,7 +76195,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v17\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v18\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -76117,7 +76224,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v13",
         "pos3ql-manifest-v14",
         "pos3ql-manifest-v15",
-        "pos3ql-manifest-v18",
+        "pos3ql-manifest-v19",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -76274,7 +76381,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v17\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v18\n"))
     );
     drop(recovered);
 
@@ -90125,7 +90232,8 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 ));
                 owner.success(
                     &mut engine,
-                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
+                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT; \
+                     CREATE VIEW captured_view AS SELECT NULL::captured_code AS value",
                     !checkpoint,
                 );
                 rename.success(&mut engine, rename_statement, !checkpoint);
@@ -90145,6 +90253,14 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 assert_eq!(
                     data_rows(&rename.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
+                );
+                assert_eq!(
+                    data_rows(&rename.success(
+                        &mut engine,
+                        "SELECT count(*) FROM captured_view WHERE value IS NULL",
+                        !checkpoint
+                    )),
+                    ["1"]
                 );
                 engine.commit_wal().unwrap();
             }
@@ -90167,6 +90283,14 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 assert_eq!(
                     data_rows(&session.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT count(*) FROM captured_view WHERE value IS NULL",
+                        !checkpoint
+                    )),
+                    ["1"]
                 );
             }
         }

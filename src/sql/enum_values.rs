@@ -195,7 +195,7 @@ pub(crate) fn bind_query<const N: usize>(
     arena: &Arena,
 ) -> Result<crate::util::StackStr<N>, SqlError> {
     use super::lexer::Tok;
-    use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependency};
+    use crate::storage::{DependencyClass, StoredQueryDependency};
     use core::fmt::Write;
     let tokens = query_tokens(source, arena)?;
     let count = tokens
@@ -276,7 +276,11 @@ pub(crate) fn bind_query<const N: usize>(
                         dependencies.push(StoredQueryDependency {
                             class: DependencyClass::Enum,
                             slot: slot as u16,
-                            identity: StoredDependencyIdentity::Name,
+                            identity: storage.capture_type_dependency(
+                                DependencyClass::Enum,
+                                slot,
+                                txid,
+                            )?,
                             referenced_columns: crate::storage::ColumnSet::EMPTY,
                             schema: definition.schema,
                             name: definition.name,

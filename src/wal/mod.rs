@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 1;
+pub(crate) const RECORD_VERSION: u8 = 2;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -250,7 +250,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 5;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 6;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -458,7 +458,8 @@ impl WalStoredQueryDependencies<'_> {
                     .entries()
                     .iter()
                     .map(|dependency| {
-                        1 + 4
+                        1 + 1
+                            + dependency.identity.storage_key().len()
                             + ColumnSet::ENCODED_BYTES
                             + 1
                             + dependency.schema.as_str().len()
@@ -478,10 +479,13 @@ impl WalStoredQueryDependencies<'_> {
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(dependencies) => {
-                let mut ok = buffer.append(&[0xfe, dependencies.entries().len() as u8]);
+                let mut ok = buffer.append(&[0xfd, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
-                        && buffer.append(&dependency.identity.encoded().to_le_bytes())
+                        && append_stored_dependency_name(
+                            buffer,
+                            dependency.identity.storage_key().as_str(),
+                        )
                         && append_column_set(buffer, dependency.referenced_columns)
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
@@ -2932,7 +2936,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n += 1 + def.inheritance.parents_ref().len() * 2;
             n += match def.type_membership {
                 crate::storage::TableTypeMembership::None => 1,
-                crate::storage::TableTypeMembership::Composite(_) => 3,
+                crate::storage::TableTypeMembership::Composite(reference) => {
+                    2 + reference.storage_key().len()
+                }
             };
             n += 1;
             n += 3;
@@ -4622,8 +4628,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             match def.type_membership {
                 crate::storage::TableTypeMembership::None => ok &= buffer.append(&[0]),
-                crate::storage::TableTypeMembership::Composite(slot) => {
-                    ok &= buffer.append(&[1]) && buffer.append(&slot.to_le_bytes());
+                crate::storage::TableTypeMembership::Composite(reference) => {
+                    ok &=
+                        buffer.append(&[1]) && name_bytes(buffer, reference.storage_key().as_str());
                 }
             }
             ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
@@ -6378,57 +6385,38 @@ fn stored_dependency_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a s
 }
 
 fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
-    let Some(&first) = payload.first() else {
-        return false;
-    };
-    let (count, mut at, column_bytes) = if matches!(first, 0xfe | 0xff) {
-        let Some(&count) = payload.get(1) else {
-            return false;
-        };
-        (
-            count,
-            2,
-            if first == 0xfe {
-                ColumnSet::ENCODED_BYTES
-            } else {
-                8
-            },
-        )
-    } else {
-        (first, 1, 0)
-    };
-    if count as usize > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
+    if payload.first() != Some(&0xfd) {
         return false;
     }
+    let Some(&count) = payload.get(1) else {
+        return false;
+    };
+    if usize::from(count) > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
+        return false;
+    }
+    let mut at = 2;
     for _ in 0..count {
-        let Some(&class) = payload.get(at) else {
+        let Some(class) = payload
+            .get(at)
+            .and_then(|code| DependencyClass::from_code(*code))
+        else {
             return false;
         };
-        if DependencyClass::from_code(class).is_none() {
-            return false;
-        }
         at += 1;
-        if payload.get(at..at + 4).is_none() {
+        let Some(key) = stored_dependency_name(payload, &mut at) else {
+            return false;
+        };
+        if StoredDependencyIdentity::from_storage(class, key).is_none() {
             return false;
         }
-        let identity = i32::from_le_bytes(payload[at..at + 4].try_into().expect("length checked"));
-        if StoredDependencyIdentity::decode(
-            DependencyClass::from_code(class).expect("validated class"),
-            identity,
-        )
-        .is_none()
-        {
+        if take_column_set(payload, &mut at).is_none() {
             return false;
-        }
-        at += 4;
-        if column_bytes != 0 {
-            if payload.get(at..at + column_bytes).is_none() {
-                return false;
-            }
-            at += column_bytes;
         }
         for _ in 0..4 {
-            if stored_dependency_name(payload, &mut at).is_none() {
+            if stored_dependency_name(payload, &mut at)
+                .and_then(|name| SqlName::parse(name).ok())
+                .is_none()
+            {
                 return false;
             }
         }
@@ -6441,40 +6429,29 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     if !validate_stored_query_dependencies(payload) {
         return None;
     }
-    let marker = payload[0];
-    let has_columns = matches!(marker, 0xfe | 0xff);
-    let count = payload[usize::from(has_columns)] as usize;
-    let mut at = if has_columns { 2 } else { 1 };
+    let count = usize::from(payload[1]);
+    let mut at = 2;
     let mut dependencies = StoredQueryDependencies::with_recovery_limit(count.max(1));
     for _ in 0..count {
         let class = DependencyClass::from_code(payload[at])?;
         at += 1;
-        let identity = StoredDependencyIdentity::decode(
+        let identity = StoredDependencyIdentity::from_storage(
             class,
-            i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+            stored_dependency_name(payload, &mut at)?,
         )?;
-        at += 4;
-        let referenced_columns = if marker == 0xfe {
-            take_column_set(payload, &mut at)?
-        } else if marker == 0xff {
-            let columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
-            ColumnSet::from_low_word(columns)
-        } else {
-            ColumnSet::EMPTY
-        };
-        let schema = stored_dependency_name(payload, &mut at)?;
-        let name = stored_dependency_name(payload, &mut at)?;
-        let referenced_schema = stored_dependency_name(payload, &mut at)?;
-        let referenced_name = stored_dependency_name(payload, &mut at)?;
+        let referenced_columns = take_column_set(payload, &mut at)?;
+        let schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
+        let name = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
+        let referenced_schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
+        let referenced_name = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class,
                 identity,
-                schema: SqlName::parse(schema).ok()?,
-                name: SqlName::parse(name).ok()?,
-                referenced_schema: SqlName::parse(referenced_schema).ok()?,
-                referenced_name: SqlName::parse(referenced_name).ok()?,
+                schema,
+                name,
+                referenced_schema,
+                referenced_name,
                 referenced_columns,
             })
             .ok()?;
@@ -7710,12 +7687,10 @@ fn decode_op_inner<'a>(
             def.type_membership = match membership_tag {
                 0 => crate::storage::TableTypeMembership::None,
                 1 => {
-                    let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                    at += 2;
-                    if usize::from(slot) >= crate::storage::MAX_COMPOSITE_CATALOG_SLOTS {
-                        return None;
-                    }
-                    crate::storage::TableTypeMembership::Composite(slot)
+                    let reference =
+                        crate::storage::TypeReference::from_storage(take_name(&mut at)?).ok()?;
+                    reference.composite_slot()?;
+                    crate::storage::TableTypeMembership::Composite(reference)
                 }
                 _ => return None,
             };
@@ -12885,6 +12860,42 @@ mod tests {
                 .unwrap(),
             dependencies
         );
+        assert_eq!(
+            encoded.readable().len(),
+            WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
+        );
+        for (class, key) in [
+            (DependencyClass::Domain, "d:1:41"),
+            (DependencyClass::Enum, "e:2:42"),
+            (DependencyClass::Composite, "c:3:43"),
+        ] {
+            let mut dependencies = StoredQueryDependencies::EMPTY;
+            dependencies
+                .serialized_push(SerializedStoredQueryDependency {
+                    class,
+                    identity: StoredDependencyIdentity::from_storage(class, key).unwrap(),
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("current_type").unwrap(),
+                    referenced_schema: SqlName::parse("").unwrap(),
+                    referenced_name: SqlName::parse("original_type").unwrap(),
+                    referenced_columns: ColumnSet::EMPTY,
+                })
+                .unwrap();
+            encoded.clear();
+            assert!(WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut encoded));
+            assert_eq!(
+                encoded.readable().len(),
+                WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
+            );
+            assert_eq!(
+                decode_stored_query_dependencies(encoded.readable()).unwrap(),
+                dependencies
+            );
+            let mut wrong_kind = encoded.readable().to_vec();
+            wrong_kind[4] = b'x';
+            assert!(!validate_stored_query_dependencies(&wrong_kind));
+            assert!(StoredDependencyIdentity::from_storage(class, "0").is_none());
+        }
     }
 
     #[test]
@@ -13897,7 +13908,9 @@ mod tests {
         definition.columns[0].not_null = crate::storage::NotNullOrigin::LocalAndInherited;
         definition.inheritance.append(3).unwrap();
         definition.inheritance.append(7).unwrap();
-        definition.type_membership = crate::storage::TableTypeMembership::Composite(11);
+        definition.type_membership = crate::storage::TableTypeMembership::Composite(
+            crate::storage::TypeReference::from_storage("c:11:41").unwrap(),
+        );
         definition.partition = PartitionDef::child(
             4,
             PartitionBound::Range {
@@ -13934,10 +13947,7 @@ mod tests {
         let restored = decode_table_payload(payload.readable())
             .expect("partition table definition did not decode");
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
-        assert_eq!(
-            restored.type_membership,
-            crate::storage::TableTypeMembership::Composite(11)
-        );
+        assert_eq!(restored.type_membership, definition.type_membership);
         let Some(crate::storage::PartitionAttachment {
             parent,
             state,
@@ -15771,7 +15781,7 @@ mod tests {
 
     #[test]
     fn unsupported_record_versions_leave_a_valid_journal_intact() {
-        for version in [0, RECORD_VERSION + 1] {
+        for version in [0, RECORD_VERSION - 1, RECORD_VERSION + 1] {
             let dir = temp_dir(&format!("record-version-{version}"));
             let config = test_config(&dir);
             let mut budget = Budget::new(1 << 20);

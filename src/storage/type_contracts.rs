@@ -3,10 +3,12 @@
 use super::{
     CastDef, ColType, OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition,
     OperatorFamilyFunction, OperatorFamilyOperator, OperatorImplementation, RoutineArgumentDef,
-    RoutineDef, RoutineKind, RoutineParameterDef, RoutineResult, Storage, UserTypeName,
+    RoutineDef, RoutineKind, RoutineParameterDef, RoutineResult, Storage, TypeCatalog,
+    UserTypeName,
 };
 use crate::sql::eval::SqlError;
 use core::convert::Infallible;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 pub(crate) enum CatalogTypes<'a> {
     Routine(&'a mut RoutineDef),
@@ -171,7 +173,165 @@ pub(super) fn routine_type_fields<E>(
     Ok(())
 }
 
+// Restrict destinations so the type catalog cannot be locked twice by one attempt.
+pub(super) trait CatalogTypeDestination {}
+impl CatalogTypeDestination for super::OperatorCatalog {}
+impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<RoutineDef> {}
+impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<CastDef> {}
+
+pub(super) struct CatalogTypeOwners<'storage, Catalog: CatalogTypeDestination> {
+    pub(super) catalog: MutexGuard<'storage, Catalog>,
+    types: MutexGuard<'storage, TypeCatalog>,
+}
+
+impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
+    pub(super) fn bind_definition<T: CatalogTypeDefinition>(
+        &self,
+        definition: &mut T,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.types.bind_definition(definition, transaction)
+    }
+}
+
+pub(super) struct RoutineTypeOwners<'storage> {
+    pub(super) catalog: MutexGuard<'storage, crate::mem::fixed_vec::FixedVec<RoutineDef>>,
+    pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
+    types: MutexGuard<'storage, TypeCatalog>,
+}
+
+impl RoutineTypeOwners<'_> {
+    pub(super) fn validate_dependencies(
+        &self,
+        dependencies: super::StoredQueryDependencyView<'_>,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for mut dependency in dependencies.entries().iter().copied() {
+            if matches!(
+                dependency.class,
+                super::DependencyClass::Domain
+                    | super::DependencyClass::Enum
+                    | super::DependencyClass::Composite
+            ) {
+                self.types
+                    .bind_query_type_dependency(&mut dependency, transaction)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn refresh_dependencies(
+        &mut self,
+        image: usize,
+        count: u8,
+        entries_per_image: usize,
+        transaction: u32,
+    ) {
+        for dependency in self.dependencies.image_mut(image, count, entries_per_image) {
+            if matches!(
+                dependency.class,
+                super::DependencyClass::Domain
+                    | super::DependencyClass::Enum
+                    | super::DependencyClass::Composite
+            ) {
+                self.types
+                    .bind_query_type_dependency(dependency, transaction)
+                    .expect("source owner preserves validated dependency lifetimes");
+            }
+        }
+    }
+
+    pub(super) fn bind_routine_contract(
+        &self,
+        arguments: &mut [RoutineArgumentDef],
+        parameters: &mut [RoutineParameterDef],
+        columns: &mut [RoutineArgumentDef],
+        kind: &mut RoutineKind,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        routine_type_fields(arguments, parameters, columns, kind, &mut |result| {
+            *result =
+                self.types
+                    .bind_type_reference(*result, super::current_database(), transaction)?;
+            Ok(())
+        })
+    }
+}
+
+impl TypeCatalog {
+    fn bind_definition<T: CatalogTypeDefinition>(
+        &self,
+        definition: &mut T,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        definition.catalog_types().try_for_each(|result| {
+            *result = self.bind_type_reference(*result, super::current_database(), transaction)?;
+            Ok::<(), SqlError>(())
+        })
+    }
+}
+
 impl Storage {
+    pub(super) fn routine_type_owners(&self) -> RoutineTypeOwners<'_> {
+        loop {
+            let owners = self.catalog_type_owners(&self.routines);
+            match self.stored_query_dependencies.try_lock() {
+                Ok(dependencies) => {
+                    return RoutineTypeOwners {
+                        catalog: owners.catalog,
+                        types: owners.types,
+                        dependencies,
+                    };
+                }
+                Err(TryLockError::WouldBlock) => {
+                    drop(owners);
+                    #[cfg(test)]
+                    self.type_publication
+                        .waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    drop(
+                        self.stored_query_dependencies
+                            .lock()
+                            .expect("stored-query dependency catalog lock poisoned"),
+                    );
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    panic!("stored-query dependency catalog lock poisoned");
+                }
+            }
+        }
+    }
+
+    /// Final validation and destination installation share these owners. A
+    /// source wait releases the destination, matching type-name publication's
+    /// rule that no earlier owner remains held while waiting for another one.
+    pub(super) fn catalog_type_owners<'storage, Catalog: CatalogTypeDestination>(
+        &'storage self,
+        destination: &'storage Mutex<Catalog>,
+    ) -> CatalogTypeOwners<'storage, Catalog> {
+        loop {
+            let catalog = destination
+                .lock()
+                .expect("dependent catalog publication lock poisoned");
+            match self.type_catalog.try_lock() {
+                Ok(types) => return CatalogTypeOwners { catalog, types },
+                Err(TryLockError::WouldBlock) => {
+                    drop(catalog);
+                    #[cfg(test)]
+                    self.type_publication
+                        .waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    drop(
+                        self.type_catalog
+                            .lock()
+                            .expect("type catalog lock poisoned"),
+                    );
+                }
+                Err(TryLockError::Poisoned(_)) => panic!("type catalog lock poisoned"),
+            }
+        }
+    }
+
     /// Validate every type field and refresh its name from the captured source.
     /// Journal images also use this walk before discarding process-local keys.
     pub(crate) fn bind_catalog_definition<T: CatalogTypeDefinition>(
@@ -183,10 +343,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        definition.catalog_types().try_for_each(|result| {
-            *result = catalog.bind_type_reference(*result, super::current_database(), txid)?;
-            Ok::<(), SqlError>(())
-        })?;
+        catalog.bind_definition(&mut definition, txid)?;
         Ok(definition)
     }
 }

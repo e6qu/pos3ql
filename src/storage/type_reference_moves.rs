@@ -152,7 +152,7 @@ impl TypeReferenceMove {
 pub(super) struct TypePublication {
     scratch: Mutex<Arena>,
     #[cfg(test)]
-    waits: std::sync::atomic::AtomicUsize,
+    pub(super) waits: std::sync::atomic::AtomicUsize,
 }
 
 struct TableOwner<'storage> {
@@ -627,6 +627,158 @@ mod tests {
     }
 
     #[test]
+    fn dependent_type_publication_releases_destination_before_source_wait() {
+        use crate::storage::{CastContext, CastDef, CastMethod, RoutineResult};
+        for kind in KINDS {
+            let (storage, related, _, movement) = fixture(kind);
+            let column = storage.table_def(related, 0).columns[0];
+            let database = storage.current_database_oid();
+            let mut definition = CastDef {
+                database,
+                created_at: 1,
+                source: RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                },
+                target: RoutineResult::builtin(ColType::Text),
+                method: CastMethod::InOut,
+                context: CastContext::Explicit,
+                ddl_state: CatalogDdlState::Present,
+            };
+            let mut source = storage.type_catalog.lock().unwrap();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    crate::sql::set_execution_database_oid(database);
+                    crate::mem::guard::forbid_alloc(|| {
+                        let mut owners = storage.catalog_type_owners(&storage.casts);
+                        owners.bind_definition(&mut definition, 0).unwrap();
+                        assert!(storage.type_catalog.try_lock().is_err());
+                        owners.catalog[0] = definition;
+                        assert!(storage.type_catalog.try_lock().is_err());
+                    });
+                });
+                let waiting = wait_until_contended(&storage);
+                let destination_free = storage.casts.try_lock().is_ok();
+                crate::mem::guard::forbid_alloc(|| match movement.identity.slot() {
+                    NamedTypeSlot::Domain(slot) => {
+                        source.domains[slot].schema = movement.current.schema;
+                        source.domains[slot].name = movement.current.name;
+                    }
+                    NamedTypeSlot::Enum(slot) => {
+                        source.enums[slot].schema = movement.current.schema;
+                        source.enums[slot].name = movement.current.name;
+                    }
+                    NamedTypeSlot::Composite(slot) => {
+                        source.composites[slot].schema = movement.current.schema;
+                        source.composites[slot].name = movement.current.name;
+                    }
+                });
+                drop(source);
+                writer.join().unwrap();
+                assert!(waiting, "writer did not reach the protected publication");
+                assert!(destination_free, "source wait retained the destination");
+            });
+            let submitted = storage.cast(0).source.user_type.unwrap();
+            assert_eq!(submitted, column.user_type.unwrap());
+            assert_eq!(submitted.schema, movement.current.schema);
+            assert_eq!(submitted.name, movement.current.name);
+            assert!(storage.type_catalog.try_lock().is_ok());
+            assert!(storage.casts.try_lock().is_ok());
+        }
+    }
+
+    #[test]
+    fn catalog_submission_rejects_retired_operator_destinations() {
+        use super::super::{OperatorDefinition, OperatorFamilyDefinition, OperatorSignature};
+        let (storage, _, _, _) = fixture(TypeReferenceKind::Domain);
+        let owner = Storage::role_oid(storage.current_role_slot(0).unwrap());
+        let definition = OperatorDefinition {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("#@#").unwrap(),
+            owner,
+            signature: OperatorSignature {
+                left: None,
+                right: Some(RoutineResult::builtin(ColType::Int4)),
+            },
+            ..OperatorDefinition::EMPTY
+        };
+        let operator = storage.create_operator(definition, 0).unwrap();
+        storage.commit_operator_create(operator);
+        let family_definition = OperatorFamilyDefinition {
+            schema: definition.schema,
+            name: SqlName::parse("retired_family").unwrap(),
+            owner,
+            ..OperatorFamilyDefinition::EMPTY
+        };
+        let family = storage
+            .create_operator_family(family_definition, 0)
+            .unwrap();
+        storage.commit_operator_family_create(family);
+        storage.drop_operator(operator, 0);
+        storage.commit_operator_drop(operator);
+        storage.drop_operator_family(family, 0);
+        storage.commit_operator_family_drop(family);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .stage_operator_definition(operator, definition, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+            );
+            assert_eq!(
+                storage
+                    .stage_operator_family_definition(family, family_definition, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+            );
+            let catalog = storage.operator_catalog.lock().unwrap();
+            assert!(catalog.operators[operator].pending.is_none());
+            assert!(catalog.families[family].pending.is_none());
+        });
+    }
+
+    #[test]
+    fn table_submission_releases_all_owners_before_source_wait() {
+        for kind in KINDS {
+            for create in [false, true] {
+                let (storage, related, _, movement) = fixture(kind);
+                let mut definition = *storage.table_def(related, 0);
+                definition.name = SqlName::parse("submitted_table").unwrap();
+                let database = storage.current_database_oid();
+                let source = storage.type_catalog.lock().unwrap();
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        crate::sql::set_execution_database_oid(database);
+                        crate::mem::guard::forbid_alloc(|| {
+                            if create {
+                                storage.create_table_in(definition, 7)
+                            } else {
+                                storage
+                                    .write_table_def(related, 7, definition, &mapping("id"), false)
+                                    .map(|()| related)
+                            }
+                        })
+                    });
+                    let waiting = wait_until_contended(&storage);
+                    let available = storage.table_creation.try_lock().is_ok()
+                        && storage.comments.try_lock().is_ok()
+                        && storage.tables.iter().all(|table| {
+                            table.lifecycle.try_lock().is_ok()
+                                && table.definition.test_write().is_ok()
+                        });
+                    drop(source);
+                    let slot = writer.join().unwrap().unwrap();
+                    assert!(waiting, "submission never reached the source wait");
+                    assert!(available, "source wait retained a table or catalog owner");
+                    assert_identity(&storage, slot, 7, movement.prior);
+                });
+            }
+        }
+    }
+
+    #[test]
     fn captured_type_references_follow_moves_before_late_table_publication() {
         for kind in KINDS {
             let (storage, table, _, movement) = fixture(kind);
@@ -660,6 +812,104 @@ mod tests {
                 storage.rollback_table_def(table, 9);
                 assert_identity(&storage, table, 0, movement.current);
             });
+        }
+    }
+
+    #[test]
+    fn captured_type_dependencies_bind_lifetimes_instead_of_reused_names() {
+        use super::super::{
+            ColumnSet, SerializedStoredQueryDependency, StoredDependencyIdentity,
+            StoredQueryDependencies, StoredQueryDependency,
+        };
+        for kind in KINDS {
+            let (mut storage, _, _, movement) = fixture(kind);
+            let class = movement.class();
+            let slot = movement.identity.slot().index();
+            let identity = storage.capture_type_dependency(class, slot, 0).unwrap();
+            let mut captured = StoredQueryDependencies::EMPTY;
+            captured
+                .push(StoredQueryDependency {
+                    class,
+                    slot: slot as u16,
+                    identity,
+                    referenced_columns: ColumnSet::EMPTY,
+                    schema: movement.prior.schema,
+                    name: movement.prior.name,
+                    referenced_schema: movement.prior.schema,
+                    referenced_name: movement.prior.name,
+                })
+                .unwrap();
+            let mut saved = StoredQueryDependencies::EMPTY;
+            saved
+                .serialized_push(SerializedStoredQueryDependency {
+                    class,
+                    identity: StoredDependencyIdentity::from_storage(
+                        class,
+                        identity.storage_key().as_str(),
+                    )
+                    .unwrap(),
+                    referenced_columns: ColumnSet::EMPTY,
+                    schema: movement.prior.schema,
+                    name: movement.prior.name,
+                    referenced_schema: movement.prior.schema,
+                    referenced_name: movement.prior.name,
+                })
+                .unwrap();
+            publish_move(&storage, movement);
+            // Reusing the original SQL spelling must not redirect either a
+            // captured dependency or its serialized form to the new object.
+            create_kind(&mut storage, kind, movement.prior);
+            for dependencies in [&captured, &saved] {
+                let bound = storage
+                    .rebind_stored_query_dependencies(dependencies.clone(), 0)
+                    .unwrap();
+                assert_eq!(bound.entries()[0].slot as usize, slot);
+                assert_eq!(bound.entries()[0].identity, identity);
+                assert_eq!(bound.entries()[0].name, movement.current.name);
+                assert_eq!(bound.entries()[0].referenced_name, movement.prior.name);
+            }
+            match kind {
+                TypeReferenceKind::Domain => {
+                    storage
+                        .drop_domain(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_domain_drop(slot);
+                }
+                TypeReferenceKind::Enum => {
+                    storage
+                        .drop_enum(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_enum_drop(slot);
+                }
+                TypeReferenceKind::Composite => {
+                    storage
+                        .drop_composite(
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                        )
+                        .unwrap();
+                    storage.commit_composite_drop(slot);
+                }
+            }
+            assert_eq!(create_kind(&mut storage, kind, movement.current).0, slot);
+            for dependencies in [captured, saved] {
+                assert_eq!(
+                    storage
+                        .rebind_stored_query_dependencies(dependencies, 0)
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                );
+            }
         }
     }
 

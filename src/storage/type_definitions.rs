@@ -791,7 +791,7 @@ mod tests {
                     0,
                 )
             }
-        }
+        }.map(super::super::TypeDdlUndo::slot)
     }
 
     fn reference(storage: &Storage, source: NamedTypeSlot) -> TypeReference {
@@ -822,27 +822,21 @@ mod tests {
     fn retire(storage: &mut Storage, source: NamedTypeSlot) {
         match source {
             NamedTypeSlot::Domain(slot) => {
-                assert_eq!(
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "reader_source", 0).unwrap(),
-                    Some(slot)
-                );
-                storage.commit_domain_drop(slot);
+                let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "reader_source", 0).unwrap().unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
             NamedTypeSlot::Enum(slot) => {
-                assert_eq!(
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "reader_source", 0).unwrap(),
-                    Some(slot)
-                );
-                storage.commit_enum_drop(slot);
+                let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "reader_source", 0).unwrap().unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
             NamedTypeSlot::Composite(slot) => {
-                assert_eq!(
-                    storage
+                let dropped = storage
                         .stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "reader_source", 0)
-                        .unwrap(),
-                    Some(slot)
-                );
-                storage.commit_composite_drop(slot);
+                        .unwrap().unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
         }
     }
@@ -1229,7 +1223,7 @@ mod tests {
                 },
                 0,
             )
-            .unwrap();
+            .unwrap().slot();
         let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
         fields[0] = CompositeFieldDef {
             name: SqlName::parse("status").unwrap(),
@@ -1252,7 +1246,7 @@ mod tests {
                 },
                 0,
             )
-            .unwrap();
+            .unwrap().slot();
         let bound = storage
             .type_catalog
             .lock()
@@ -1474,14 +1468,11 @@ mod tests {
             rollback(&other, foreign);
             other.wake_transaction_waiters(7);
             assert_eq!(label(&other).as_str(), "before");
-            assert_eq!(other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap(), Some(0));
+            let dropped = other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap().unwrap();
+            assert_eq!(dropped.slot(), 0);
             assert_eq!(stage(&other, select(&other, 7), "22").err().unwrap().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
             assert!(other.type_catalog.try_lock().is_ok());
-            match source {
-                NamedTypeSlot::Domain(slot) => other.rollback_domain_drop(slot, 9),
-                NamedTypeSlot::Enum(slot) => other.rollback_enum_drop(slot, 9),
-                NamedTypeSlot::Composite(slot) => other.rollback_composite_drop(slot, 9),
-            }
+            other.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
             assert_eq!(label(&other).as_str(), "before");
 
             rollback(&first, earlier);

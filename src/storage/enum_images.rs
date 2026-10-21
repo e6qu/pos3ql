@@ -338,7 +338,7 @@ mod tests {
                 },
                 0,
             )
-            .unwrap()
+            .unwrap().slot()
     }
 
     fn alter(
@@ -507,11 +507,9 @@ mod tests {
             storage.commit_enum_alter(slot, 77);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
-            assert_eq!(
-                storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap(),
-                Some(slot)
-            );
-            storage.commit_enum_drop(slot);
+            let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap().unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = storage
                 .create_enum(
                     SqlName::parse("public").unwrap(),
@@ -521,7 +519,7 @@ mod tests {
                     },
                     0,
                 )
-                .unwrap();
+                .unwrap().slot();
             assert_eq!(replacement, slot);
             assert_ne!(
                 selected.created_at,
@@ -751,11 +749,9 @@ mod tests {
             old
         });
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(
-                storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap(),
-                Some(slot)
-            );
-            storage.commit_enum_drop(slot);
+            let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap().unwrap();
+            assert_eq!(dropped.slot(), slot);
+            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = create(&mut storage, "state");
             assert_eq!(replacement, slot);
             let later = alter(&storage, replacement, &[member("replacement", 1.0)]).unwrap();

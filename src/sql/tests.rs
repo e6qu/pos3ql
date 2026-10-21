@@ -52346,7 +52346,7 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
             crate::storage::EnumSpec { members: &members },
             0,
         )
-        .unwrap() as u16;
+        .unwrap().slot() as u16;
     let hash = |member: Option<u32>, sort, label| {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::hash_key_catalog(
@@ -52395,7 +52395,7 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
             crate::storage::EnumSpec { members: &members },
             0,
         )
-        .unwrap() as u16;
+        .unwrap().slot() as u16;
     let read_arena = Arena::new(&mut budget, "legacy enum reads", 1 << 20).unwrap();
     let legacy = Datum::Enum {
         slot,

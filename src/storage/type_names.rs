@@ -203,7 +203,7 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Domain),
+                .map(|created| NamedTypeSlot::Domain(created.slot())),
             NamedTypeSlot::Enum(_) => storage
                 .create_enum(
                     schema,
@@ -217,7 +217,7 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Enum),
+                .map(|created| NamedTypeSlot::Enum(created.slot())),
             NamedTypeSlot::Composite(_) => storage
                 .create_composite(
                     schema,
@@ -228,7 +228,7 @@ mod tests {
                     },
                     txid,
                 )
-                .map(NamedTypeSlot::Composite),
+                .map(|created| NamedTypeSlot::Composite(created.slot())),
         }
     }
 
@@ -396,15 +396,12 @@ mod tests {
                 let source = create(&mut storage, kind, "before", 0).unwrap();
                 let undo = rename(&mut storage, source, "after", 7).unwrap();
                 assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap(), None);
-                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap(), Some(source.index()));
-                match source {
-                    NamedTypeSlot::Domain(slot) => storage.rollback_domain_drop(slot, 7),
-                    NamedTypeSlot::Enum(slot) => storage.rollback_enum_drop(slot, 7),
-                    NamedTypeSlot::Composite(slot) => storage.rollback_composite_drop(slot, 7),
-                }
+                let dropped = storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap().unwrap();
+                assert_eq!(dropped.slot(), source.index());
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
                 rollback(&mut storage, undo);
                 assert_eq!(storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap(), None);
-                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap(), Some(source.index()));
+                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap().unwrap().slot(), source.index());
             });
         }
     }
@@ -467,26 +464,8 @@ mod tests {
             storage.begin_transaction_identity(9).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 let slot = create(&mut storage, kind, "occupied", 0).unwrap();
-                match slot {
-                    NamedTypeSlot::Domain(slot) => {
-                        assert_eq!(
-                            storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                    NamedTypeSlot::Enum(slot) => {
-                        assert_eq!(
-                            storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                    NamedTypeSlot::Composite(slot) => {
-                        assert_eq!(
-                            storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "occupied", 7).unwrap(),
-                            Some(slot)
-                        );
-                    }
-                }
+                let dropped = storage.stage_type_drop(kind.kind(), "public", "occupied", 7).unwrap().unwrap();
+                assert_eq!(dropped.slot(), slot.index());
                 for requested in KINDS {
                     assert_eq!(
                         create(&mut storage, requested, "occupied", 9)
@@ -495,11 +474,7 @@ mod tests {
                         sqlstate::INTERNAL_LOCK_WAIT
                     );
                 }
-                match slot {
-                    NamedTypeSlot::Domain(slot) => storage.commit_domain_drop(slot),
-                    NamedTypeSlot::Enum(slot) => storage.commit_enum_drop(slot),
-                    NamedTypeSlot::Composite(slot) => storage.commit_composite_drop(slot),
-                }
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 let replacement = create(&mut storage, kind, "occupied", 0).unwrap();
                 assert_eq!(replacement, slot);
             });

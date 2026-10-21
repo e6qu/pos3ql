@@ -27,6 +27,38 @@ impl TypeEditTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeDdlOperation {
+    Create,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypeDdlUndo {
+    source: TypeIdentity,
+    transaction: u32,
+    operation: TypeDdlOperation,
+    version: u64,
+    prior_version: u64,
+}
+
+impl TypeDdlUndo {
+    pub(super) fn created(source: TypeIdentity, transaction: u32) -> Self {
+        Self { source, transaction, operation: TypeDdlOperation::Create,
+            version: source.created_at(), prior_version: 0 }
+    }
+
+    pub(crate) fn slot(self) -> usize {
+        self.source.slot().index()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeDdlDecision {
+    Commit,
+    Rollback,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TypeAlterUndo<Definition> {
     pub(super) source: TypeIdentity,
@@ -41,24 +73,30 @@ pub(crate) type CompositeAlterUndo = TypeAlterUndo<PendingCompositeDefinition>;
 
 #[derive(Debug)]
 pub(super) struct TypeDefinitionVersions {
-    domains: FixedVec<u64>,
-    enums: FixedVec<u64>,
-    composites: FixedVec<u64>,
+    domains: FixedVec<TypeRevision>,
+    enums: FixedVec<TypeRevision>,
+    composites: FixedVec<TypeRevision>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypeRevision {
+    definition: u64,
+    ddl: u64,
 }
 
 impl TypeDefinitionVersions {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>().saturating_add(
             config.max_domains.saturating_add(config.max_enums)
-                .saturating_add(config.max_composites).saturating_mul(size_of::<u64>()),
+                .saturating_add(config.max_composites).saturating_mul(size_of::<TypeRevision>()),
         )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "type definition revision controls")?;
-        fn reserve(budget: &mut Budget, count: usize) -> Result<FixedVec<u64>, BudgetError> {
+        fn reserve(budget: &mut Budget, count: usize) -> Result<FixedVec<TypeRevision>, BudgetError> {
             let mut values = FixedVec::new(budget, "type definition revisions", count)?;
-            for _ in 0..count { values.push(0).expect("reserved type revisions"); }
+            for _ in 0..count { values.push(TypeRevision { definition: 0, ddl: 0 }).expect("reserved type revisions"); }
             Ok(values)
         }
         Ok(Self {
@@ -70,17 +108,38 @@ impl TypeDefinitionVersions {
 
     pub(super) fn get(&self, source: NamedTypeSlot) -> u64 {
         match source {
-            NamedTypeSlot::Domain(slot) => self.domains[slot],
-            NamedTypeSlot::Enum(slot) => self.enums[slot],
-            NamedTypeSlot::Composite(slot) => self.composites[slot],
+            NamedTypeSlot::Domain(slot) => self.domains[slot].definition,
+            NamedTypeSlot::Enum(slot) => self.enums[slot].definition,
+            NamedTypeSlot::Composite(slot) => self.composites[slot].definition,
         }
     }
 
     pub(super) fn set(&mut self, source: NamedTypeSlot, version: u64) {
         match source {
-            NamedTypeSlot::Domain(slot) => self.domains[slot] = version,
-            NamedTypeSlot::Enum(slot) => self.enums[slot] = version,
-            NamedTypeSlot::Composite(slot) => self.composites[slot] = version,
+            NamedTypeSlot::Domain(slot) => self.domains[slot].definition = version,
+            NamedTypeSlot::Enum(slot) => self.enums[slot].definition = version,
+            NamedTypeSlot::Composite(slot) => self.composites[slot].definition = version,
+        }
+    }
+
+    pub(super) fn initialize(&mut self, source: NamedTypeSlot, version: u64) {
+        self.set(source, version);
+        self.set_ddl(source, version);
+    }
+
+    fn ddl(&self, source: NamedTypeSlot) -> u64 {
+        match source {
+            NamedTypeSlot::Domain(slot) => self.domains[slot].ddl,
+            NamedTypeSlot::Enum(slot) => self.enums[slot].ddl,
+            NamedTypeSlot::Composite(slot) => self.composites[slot].ddl,
+        }
+    }
+
+    fn set_ddl(&mut self, source: NamedTypeSlot, version: u64) {
+        match source {
+            NamedTypeSlot::Domain(slot) => self.domains[slot].ddl = version,
+            NamedTypeSlot::Enum(slot) => self.enums[slot].ddl = version,
+            NamedTypeSlot::Composite(slot) => self.composites[slot].ddl = version,
         }
     }
 
@@ -127,11 +186,11 @@ impl super::TypeCatalog {
 
     pub(super) fn type_definition_version(&self, source: NamedTypeSlot, transaction: u32) -> u64 {
         let pending = match source {
-            NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition
+            NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition.as_ref()
                 .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
-            NamedTypeSlot::Enum(slot) => self.enums[slot].pending_definition
+            NamedTypeSlot::Enum(slot) => self.enums[slot].pending_definition.as_ref()
                 .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
-            NamedTypeSlot::Composite(slot) => self.composites[slot].pending_definition
+            NamedTypeSlot::Composite(slot) => self.composites[slot].pending_definition.as_ref()
                 .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
         };
         pending.unwrap_or_else(|| self.versions.get(source))
@@ -172,6 +231,74 @@ impl super::TypeCatalog {
 }
 
 impl super::Storage {
+    pub(crate) fn finish_type_ddl(&self, undo: TypeDdlUndo, decision: TypeDdlDecision) {
+        use super::CatalogDdlState as State;
+        use TypeDdlDecision::{Commit, Rollback};
+        use TypeDdlOperation::{Create, Drop};
+
+        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        if !catalog.contains_type_source(undo.source)
+            || undo.source.database() != super::current_database()
+        { return; }
+        let (state, schema, name) = match undo.source.slot() {
+            NamedTypeSlot::Domain(slot) => {
+                let definition = &catalog.domains[slot];
+                (definition.ddl_state, definition.schema, definition.name)
+            }
+            NamedTypeSlot::Enum(slot) => {
+                let definition = &catalog.enums[slot];
+                (definition.ddl_state, definition.schema, definition.name)
+            }
+            NamedTypeSlot::Composite(slot) => {
+                let definition = &catalog.composites[slot];
+                (definition.ddl_state, definition.schema, definition.name)
+            }
+        };
+        if state.pending_txid() != Some(undo.transaction) { return; }
+        if catalog.versions.ddl(undo.source.slot()) != undo.version
+            && !matches!((undo.operation, decision, state), (Create, Commit, State::PendingCreateDrop { .. }))
+        { return; }
+        let next = match (undo.operation, decision, state) {
+            (Create, Commit, State::PendingCreate { .. } | State::PendingCreateDrop { .. }) => state.commit_create(),
+            (Create, Rollback, State::PendingCreate { .. }) => state.rollback_create(),
+            (Drop, Commit, State::PendingDrop { .. }) => state.commit_drop(),
+            (Drop, Rollback, State::PendingDrop { .. } | State::PendingCreateDrop { .. }) => state.rollback_drop(undo.transaction),
+            _ => return,
+        };
+        if undo.operation == Drop && decision == Rollback {
+            catalog.versions.set_ddl(undo.source.slot(), undo.prior_version);
+        }
+        // Keep the source owner until metadata removal and enum image release finish.
+        if undo.operation == Drop && decision == Commit {
+            self.drop_object_comments(super::CommentClass::Type, schema.as_str(), name.as_str());
+        }
+        if matches!(undo.source.slot(), NamedTypeSlot::Enum(_)) && next == State::Absent {
+            self.release_enum_definition_images(&mut catalog, undo.slot());
+        }
+        let ownership = match undo.source.slot() {
+            NamedTypeSlot::Domain(slot) => {
+                catalog.domains[slot].ddl_state = next;
+                if next == State::Absent { catalog.domains[slot].pending_definition = None; }
+                &mut catalog.domains[slot].ownership
+            }
+            NamedTypeSlot::Enum(slot) => {
+                catalog.enums[slot].ddl_state = next;
+                &mut catalog.enums[slot].ownership
+            }
+            NamedTypeSlot::Composite(slot) => {
+                catalog.composites[slot].ddl_state = next;
+                if next == State::Absent { catalog.composites[slot].pending_definition = None; }
+                &mut catalog.composites[slot].ownership
+            }
+        };
+        if undo.operation == Create && decision == Commit
+            && let Some(pending) = ownership.pending.filter(|pending| pending.txid == undo.transaction)
+        {
+            ownership.owner = pending.owner;
+            ownership.pending = None;
+        }
+    }
+
     pub(crate) fn prepare_domain_edit(&self, slot: usize, transaction: u32) -> Result<(super::DomainDef, TypeEditTarget), SqlError> {
         let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
         let target = catalog.select_type_edit(NamedTypeSlot::Domain(slot), transaction)?;
@@ -208,7 +335,7 @@ impl super::Storage {
         schema: &str,
         name: &str,
         transaction: u32,
-    ) -> Result<Option<usize>, crate::sql::eval::SqlError> {
+    ) -> Result<Option<TypeDdlUndo>, crate::sql::eval::SqlError> {
         let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
         let mut selected = None;
         let mut blocked = None;
@@ -238,12 +365,17 @@ impl super::Storage {
             return Err(self.catalog_ddl_wait_error(transaction, owner, name));
         }
         let Some((source, state)) = selected else { return Ok(None); };
+        let identity = catalog.type_snapshot(source, transaction)?
+            .expect("a visible type selected for deletion has an identity").identity;
+        let version = self.catalog_sequence.next()?;
+        let prior_version = catalog.versions.ddl(source);
+        catalog.versions.set_ddl(source, version);
         let state = state.drop_by(transaction);
         match source {
             NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state = state,
             NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state = state,
             NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = state,
         }
-        Ok(Some(source.index()))
+        Ok(Some(TypeDdlUndo { source: identity, transaction, operation: TypeDdlOperation::Drop, version, prior_version }))
     }
 }

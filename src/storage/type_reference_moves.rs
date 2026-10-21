@@ -485,7 +485,7 @@ mod tests {
                         },
                         0,
                     )
-                    .unwrap();
+                    .unwrap().slot();
                 (
                     slot,
                     ColType::Int4,
@@ -506,7 +506,7 @@ mod tests {
                         },
                         0,
                     )
-                    .unwrap();
+                    .unwrap().slot();
                 (
                     slot,
                     ColType::Enum(slot as u16),
@@ -532,7 +532,7 @@ mod tests {
                         },
                         0,
                     )
-                    .unwrap();
+                    .unwrap().slot();
                 (
                     slot,
                     ColType::Composite(slot as u16),
@@ -1380,34 +1380,34 @@ mod tests {
             }
             match kind {
                 TypeReferenceKind::Domain => {
-                    storage
+                    let dropped = storage
                         .stage_type_drop(crate::storage::NamedTypeKind::Domain, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
                         )
-                        .unwrap();
-                    storage.commit_domain_drop(slot);
+                        .unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Enum => {
-                    storage
+                    let dropped = storage
                         .stage_type_drop(crate::storage::NamedTypeKind::Enum, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
                         )
-                        .unwrap();
-                    storage.commit_enum_drop(slot);
+                        .unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Composite => {
-                    storage
+                    let dropped = storage
                         .stage_type_drop(crate::storage::NamedTypeKind::Composite, 
                             movement.current.schema.as_str(),
                             movement.current.name.as_str(),
                             0,
                         )
-                        .unwrap();
-                    storage.commit_composite_drop(slot);
+                        .unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
             }
             assert_eq!(create_kind(&mut storage, kind, movement.current).0, slot);
@@ -1431,16 +1431,16 @@ mod tests {
             let key = movement.identity;
             match kind {
                 TypeReferenceKind::Domain => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "prior_type", 0).unwrap();
-                    storage.commit_domain_drop(key.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "prior_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Enum => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "prior_type", 0).unwrap();
-                    storage.commit_enum_drop(key.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "prior_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Composite => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "prior_type", 0).unwrap();
-                    storage.commit_composite_drop(key.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "prior_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
             }
             for replace in [false, true] {
@@ -1577,16 +1577,16 @@ mod tests {
             });
             match kind {
                 TypeReferenceKind::Domain => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "current_type", 0).unwrap();
-                    storage.commit_domain_drop(movement.identity.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "current_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Enum => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "current_type", 0).unwrap();
-                    storage.commit_enum_drop(movement.identity.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "current_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
                 TypeReferenceKind::Composite => {
-                    storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "current_type", 0).unwrap();
-                    storage.commit_composite_drop(movement.identity.slot().index());
+                    let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "current_type", 0).unwrap().unwrap();
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
                 }
             }
             assert_eq!(

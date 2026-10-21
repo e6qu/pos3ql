@@ -572,27 +572,27 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingSequenceDefinition>,
     },
-    /// CREATE DOMAIN at this slot — undo by dropping it.
-    DomainCreated(u32),
-    /// DROP DOMAIN at this slot — undo by reviving it.
-    DomainDropped(u32),
+    /// CREATE DOMAIN retains its source identity and transaction owner.
+    DomainCreated(crate::storage::TypeDdlUndo),
+    /// DROP DOMAIN retains its source identity and transaction owner.
+    DomainDropped(crate::storage::TypeDdlUndo),
     DomainAltered {
         slot: u32,
         prior: crate::storage::DomainAlterUndo,
     },
-    /// CREATE TYPE (enum) at this slot — undo by dropping it.
-    EnumCreated(u32),
+    /// CREATE TYPE (enum) retains its source identity and transaction owner.
+    EnumCreated(crate::storage::TypeDdlUndo),
     /// CREATE TYPE (...): named composites are distinct from anonymous records.
-    CompositeCreated(u32),
+    CompositeCreated(crate::storage::TypeDdlUndo),
     /// ALTER TYPE on a named composite staged a private physical layout.
     CompositeAltered {
         slot: u32,
         prior: crate::storage::CompositeAlterUndo,
     },
-    /// DROP TYPE (...): revive the physical type slot on rollback.
-    CompositeDropped(u32),
-    /// DROP TYPE (enum) at this slot — undo by reviving it.
-    EnumDropped(u32),
+    /// DROP TYPE retains its source identity and transaction owner.
+    CompositeDropped(crate::storage::TypeDdlUndo),
+    /// DROP TYPE (enum) retains its source identity and transaction owner.
+    EnumDropped(crate::storage::TypeDdlUndo),
     /// ALTER TYPE staged a definition visible only to its transaction.
     EnumAltered {
         slot: u32,

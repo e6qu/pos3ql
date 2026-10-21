@@ -13323,7 +13323,7 @@ pub(crate) fn drop_schema(
                 match storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
                         if let Err(error) =
-                            txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))
+                            txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot))
                         {
                             return sql_fail(error);
                         }
@@ -13349,7 +13349,7 @@ pub(crate) fn drop_schema(
                 match storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
                         if let Err(error) =
-                            txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32))
+                            txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot))
                         {
                             return sql_fail(error);
                         }
@@ -40758,10 +40758,11 @@ pub fn create_domain(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let slot = match storage.create_domain(schema, sqlname, spec, txn.txid) {
+    let created = match storage.create_domain(schema, sqlname, spec, txn.txid) {
         Ok(slot) => slot,
         Err(e) => return sql_fail(e),
     };
+    let slot = created.slot();
     let lsn = storage.bump_lsn();
     let definition = storage.domain(slot);
     if let Err(e) = wal.stage_reserved(
@@ -40769,10 +40770,11 @@ pub fn create_domain(
         lsn,
         &WalOp::CreateDomain(slot as u16, &definition),
     ) {
-        storage.rollback_domain_create(slot);
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainCreated(slot as u32)) {
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainCreated(created)) {
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
     if let Err(error) = apply_default_privileges_to_new_object(
@@ -41392,7 +41394,7 @@ fn drop_domain_selection(
         )?;
         match storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema.as_str(), dname.as_str(), txn.txid) {
             Ok(Some(slot)) => {
-                txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot as u32))?;
+                txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot))?;
             }
             Ok(None) => {}
             Err(e) => return Err(e),
@@ -42088,10 +42090,11 @@ pub fn create_enum(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let slot = match storage.create_enum(schema, sqlname, spec, txn.txid) {
+    let created = match storage.create_enum(schema, sqlname, spec, txn.txid) {
         Ok(slot) => slot,
         Err(e) => return sql_fail(e),
     };
+    let slot = created.slot();
     let lsn = storage.bump_lsn();
     let definition = storage.enum_for(slot, txn.txid);
     if let Err(e) = wal.stage_reserved(
@@ -42105,10 +42108,11 @@ pub fn create_enum(
             members: spec.members,
         },
     ) {
-        storage.rollback_enum_create(slot);
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumCreated(slot as u32)) {
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumCreated(created)) {
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
     if let Err(error) = apply_default_privileges_to_new_object(
@@ -42278,10 +42282,11 @@ pub fn create_composite(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let slot = match storage.create_composite(schema, name, spec, txn.txid) {
+    let created = match storage.create_composite(schema, name, spec, txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
+    let slot = created.slot();
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -42291,11 +42296,11 @@ pub fn create_composite(
             definition: &storage.composite_for(slot, txn.txid),
         },
     ) {
-        storage.rollback_composite_create(slot);
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeCreated(slot as u32)) {
-        storage.rollback_composite_create(slot);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeCreated(created)) {
+        storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(error);
     }
     if let Err(error) = apply_default_privileges_to_new_object(
@@ -42518,7 +42523,7 @@ pub(crate) fn drop_type(
         }
         match storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema.as_str(), ename.as_str(), txn.txid) {
             Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot as u32)) {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot)) {
                     return sql_fail(e);
                 }
             }
@@ -42814,7 +42819,7 @@ fn drop_composite_type(
                 "composite type vanished during drop"
             )
         })?;
-    txn.record_ddl(super::txn::DdlUndo::CompositeDropped(dropped as u32))?;
+    txn.record_ddl(super::txn::DdlUndo::CompositeDropped(dropped))?;
     Ok(())
 }
 

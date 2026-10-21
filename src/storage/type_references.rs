@@ -1369,7 +1369,7 @@ impl super::Storage {
                     return Err(retained_error());
                 }
                 if catalog.domains[old].created_at != created_at {
-                    catalog.versions.set(allocated, created_at);
+                    catalog.versions.initialize(allocated, created_at);
                 }
                 catalog.versions.swap(allocated, target);
                 catalog.domains.swap(old, new);
@@ -1386,7 +1386,7 @@ impl super::Storage {
                     return Err(retained_error());
                 }
                 if catalog.enums[old].created_at != created_at {
-                    catalog.versions.set(allocated, created_at);
+                    catalog.versions.initialize(allocated, created_at);
                 }
                 catalog.versions.swap(allocated, target);
                 catalog.enums.swap(old, new);
@@ -1404,7 +1404,7 @@ impl super::Storage {
                     return Err(retained_error());
                 }
                 if catalog.composites[old].created_at != created_at {
-                    catalog.versions.set(allocated, created_at);
+                    catalog.versions.initialize(allocated, created_at);
                 }
                 catalog.versions.swap(allocated, target);
                 catalog.composites.swap(old, new);

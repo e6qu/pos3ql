@@ -35103,7 +35103,10 @@ impl Storage {
         loop {
             let mut changed = false;
             for table in self.tables.iter() {
-                let Some(expected) = table.definition.name_reservation_candidate(database, schema, name) else {
+                let Some(expected) = table
+                    .definition
+                    .name_reservation_candidate(database, schema, name)
+                else {
                     continue;
                 };
                 // Only a matching name can require this definition owner.
@@ -35114,7 +35117,8 @@ impl Storage {
                     continue;
                 }
                 let committed = definition.committed_definition();
-                let matches = (committed.schema.as_str() == schema && committed.name.as_str() == name)
+                let matches = (committed.schema.as_str() == schema
+                    && committed.name.as_str() == name)
                     || (definition.schema.as_str() == schema && definition.name.as_str() == name);
                 if matches && let Some(owner) = definition.locked_by_other(txid) {
                     return Some(owner);

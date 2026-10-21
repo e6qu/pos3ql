@@ -763,11 +763,19 @@ mod tests {
                                 submitting_storage.create_table_in(definition, 11)
                             } else {
                                 submitting_storage
-                                    .write_table_def(unrelated, 11, definition, &mapping("id"), false)
+                                    .write_table_def(
+                                        unrelated,
+                                        11,
+                                        definition,
+                                        &mapping("id"),
+                                        false,
+                                    )
                                     .map(|()| unrelated)
                             };
                             if submission == 2 {
-                                submitting_storage.tables[unrelated].publication().generation = u64::MAX;
+                                submitting_storage.tables[unrelated]
+                                    .publication()
+                                    .generation = u64::MAX;
                             }
                             result
                         });
@@ -779,7 +787,10 @@ mod tests {
                     drop(resume);
                     let result = writer.join().unwrap();
                     let dependent = submitter.join().unwrap().unwrap();
-                    assert!(progress.is_ok(), "late dependent submission waited on an unrelated definition");
+                    assert!(
+                        progress.is_ok(),
+                        "late dependent submission waited on an unrelated definition"
+                    );
                     if submission == 2 {
                         assert_eq!(
                             result.unwrap_err().sqlstate,
@@ -1908,6 +1919,11 @@ mod tests {
     fn captured_type_references_follow_moves_before_late_table_publication() {
         for kind in KINDS {
             let (storage, table, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let mut captured = *storage.table_def(table, 0);
             let originals = [captured.columns[0].user_type, captured.columns[1].user_type];
             let oids = captured
@@ -1920,7 +1936,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             crate::mem::guard::forbid_alloc(|| {
-                publish_move(&storage, movement);
+                publish_move(&storage, movement, source);
                 captured.name = SqlName::parse("late_create").unwrap();
                 let created = storage.create_table_in(captured, 7).unwrap();
                 assert_identity(&storage, created, 7, movement.current);
@@ -1949,6 +1965,11 @@ mod tests {
         };
         for kind in KINDS {
             let (mut storage, _, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let class = movement.class();
             let slot = movement.identity.slot().index();
             let identity = storage.capture_type_dependency(class, slot, 0).unwrap();
@@ -1981,7 +2002,7 @@ mod tests {
                     referenced_name: movement.prior.name,
                 })
                 .unwrap();
-            publish_move(&storage, movement);
+            publish_move(&storage, movement, source);
             // Reusing the original SQL spelling must not redirect either a
             // captured dependency or its serialized form to the new object.
             create_kind(&mut storage, kind, movement.prior);
@@ -2198,12 +2219,17 @@ mod tests {
     fn captured_type_references_keep_persisted_keys_through_moves_and_reuse() {
         for kind in KINDS {
             let (mut storage, table, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let column = storage.table_def(table, 0).columns()[0];
             let captured = column.user_type.unwrap();
             let encoded = captured.storage_name();
             let stored = UserTypeName::from_storage(captured.schema, encoded.as_str()).unwrap();
             crate::mem::guard::forbid_alloc(|| {
-                publish_move(&storage, movement);
+                publish_move(&storage, movement, source);
                 let rebound = storage
                     .bind_routine_result(
                         RoutineResult {
@@ -2316,6 +2342,11 @@ mod tests {
         for kind in KINDS {
             for blocked in 0..7 {
                 let (storage, related, _, movement) = fixture(kind);
+                let source = TypePublicationSource::committed(
+                    &storage.type_catalog.lock().unwrap(),
+                    movement.identity.slot(),
+                )
+                .unwrap();
                 let generation = storage.tables[related].generation();
                 let types = (blocked == 0).then(|| storage.type_catalog.lock().unwrap());
                 let members = (blocked == 1).then(|| storage.enum_member_images.lock().unwrap());
@@ -2328,7 +2359,7 @@ mod tests {
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
                         crate::mem::guard::forbid_alloc(|| {
-                            publish_move(&storage, movement);
+                            publish_move(&storage, movement, source);
                         })
                     });
                     let waiting = wait_until_contended(&storage);
@@ -2397,6 +2428,11 @@ mod tests {
     fn shared_type_move_later_table_wait_releases_earlier_definitions() {
         for kind in KINDS {
             let (mut storage, first, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let mut definition = *storage.table_def(first, 0);
             definition.name = SqlName::parse("last_dependency").unwrap();
             let last = storage.create_table(definition).unwrap();
@@ -2404,7 +2440,7 @@ mod tests {
             std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_move(&storage, movement);
+                        publish_move(&storage, movement, source);
                     })
                 });
                 let waiting = wait_until_contended(&storage);
@@ -2428,13 +2464,18 @@ mod tests {
     fn shared_type_move_catalog_wait_reselects_new_pending_references() {
         for kind in KINDS {
             let (storage, related, unrelated, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let mut pending = *storage.table_def(related, 0);
             pending.name = storage.table_def(unrelated, 0).name;
             let blocker = storage.casts.lock().unwrap();
             std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_move(&storage, movement);
+                        publish_move(&storage, movement, source);
                     })
                 });
                 let waiting = wait_until_contended(&storage);
@@ -2473,12 +2514,7 @@ mod tests {
         }
     }
 
-    fn publish_move(storage: &Storage, movement: TypeReferenceMove) {
-        let source = TypePublicationSource::committed(
-            &storage.type_catalog.lock().unwrap(),
-            movement.identity.slot(),
-        )
-        .unwrap();
+    fn publish_move(storage: &Storage, movement: TypeReferenceMove, source: TypePublicationSource) {
         storage
             .type_publication
             .publish(
@@ -2527,6 +2563,11 @@ mod tests {
     fn shared_type_move_skips_unrelated_retained_definitions() {
         for kind in KINDS {
             let (storage, related, unrelated, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let held = storage.table_def(unrelated, 0);
             let generation = storage.tables[unrelated].generation();
             let (send, receive) = mpsc::sync_channel(1);
@@ -2534,7 +2575,7 @@ mod tests {
                 let storage = &storage;
                 let writer = scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_move(storage, movement);
+                        publish_move(storage, movement, source);
                     });
                     send.send(()).unwrap();
                 });
@@ -2571,6 +2612,11 @@ mod tests {
         for kind in KINDS {
             for pending_reader in [false, true] {
                 let (storage, related, unrelated, movement) = fixture(kind);
+                let source = TypePublicationSource::committed(
+                    &storage.type_catalog.lock().unwrap(),
+                    movement.identity.slot(),
+                )
+                .unwrap();
                 for name in ["first_id", "second_id"] {
                     let mut definition = *storage.table_def(related, 7);
                     definition.columns[0].name = SqlName::parse(name).unwrap();
@@ -2585,7 +2631,7 @@ mod tests {
                     let storage = &storage;
                     let writer = scope.spawn(move || {
                         crate::mem::guard::forbid_alloc(|| {
-                            publish_move(storage, movement);
+                            publish_move(storage, movement, source);
                         });
                         done_send.send(()).unwrap();
                     });
@@ -2693,6 +2739,11 @@ mod tests {
     fn shared_type_move_updates_references_found_only_in_pending_versions() {
         for kind in KINDS {
             let (mut storage, related, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let pending = *storage.table_def(related, 0);
             {
                 let mut definition = storage.tables[related].definition_mut();
@@ -2706,7 +2757,7 @@ mod tests {
                 .write_table_def(related, 7, pending, &mapping("id"), false)
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
-                publish_move(&storage, movement);
+                publish_move(&storage, movement, source);
                 assert_identity(&storage, related, 7, movement.current);
                 assert!(
                     storage
@@ -2732,6 +2783,11 @@ mod tests {
     fn shared_type_move_skips_foreign_and_retired_slots_before_reuse() {
         for kind in KINDS {
             let (mut storage, related, _, movement) = fixture(kind);
+            let source = TypePublicationSource::committed(
+                &storage.type_catalog.lock().unwrap(),
+                movement.identity.slot(),
+            )
+            .unwrap();
             let retired = storage
                 .create_table({
                     let mut definition = *storage.table_def(related, 0);
@@ -2762,7 +2818,7 @@ mod tests {
                 let storage = &storage;
                 let writer = scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
-                        publish_move(storage, movement);
+                        publish_move(storage, movement, source);
                     });
                     send.send(()).unwrap();
                 });

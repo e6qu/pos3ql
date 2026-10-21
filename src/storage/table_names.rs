@@ -93,8 +93,10 @@ impl TableNames {
         };
         (self.identity.database == database
             && (matches(self.schema, self.name)
-                || self.pending.is_some_and(|(_, schema, name)| matches(schema, name))))
-            .then_some(self.identity)
+                || self
+                    .pending
+                    .is_some_and(|(_, schema, name)| matches(schema, name))))
+        .then_some(self.identity)
     }
 }
 

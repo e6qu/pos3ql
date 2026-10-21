@@ -1186,7 +1186,7 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
         let metadata = two_phase::PreparedTransactionMetadata {
             gid,
             transaction_id: 10,
-            owner: 0,
+            owner: crate::storage::RoleOid::BOOTSTRAP,
             database: crate::storage::DatabaseOid::POSTGRES,
             prepared_at: 0,
             first_lsn: 0,
@@ -6953,7 +6953,7 @@ fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() 
         transaction_id: 7,
         gid: crate::util::StackStr::from_str("reused-gid"),
         prepared_at: 123,
-        owner: 0,
+        owner: crate::storage::RoleOid::BOOTSTRAP,
         database: crate::storage::DatabaseOid::POSTGRES,
         first_lsn: 10,
         prepared_lsn: 11,
@@ -7037,7 +7037,7 @@ fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() 
             ..expected
         },
         crate::storage::PreparedTransactionCatalogEntry {
-            owner: 1,
+            owner: crate::storage::RoleOid::parse(16_385).unwrap(),
             ..expected
         },
         crate::storage::PreparedTransactionCatalogEntry {
@@ -76424,7 +76424,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v18\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v19\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -76453,7 +76453,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v13",
         "pos3ql-manifest-v14",
         "pos3ql-manifest-v15",
-        "pos3ql-manifest-v19",
+        "pos3ql-manifest-v18",
+        "pos3ql-manifest-v20",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -76610,7 +76611,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v18\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v19\n"))
     );
     drop(recovered);
 

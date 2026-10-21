@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 3;
+pub(crate) const RECORD_VERSION: u8 = 4;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1241,7 +1241,7 @@ pub(crate) enum WalOp<'a> {
     /// resolution record commits or rolls it back.
     PrepareTransaction {
         transaction_id: u32,
-        owner: u16,
+        owner: crate::storage::RoleOid,
         database: i32,
         prepared_at: i64,
         gid: &'a str,
@@ -1691,6 +1691,7 @@ pub(crate) enum WalOp<'a> {
     /// Absolute role definition, shared by CREATE and ALTER so replay is
     /// idempotent and a manifest/WAL handoff cannot expose a partial option set.
     UpsertRole {
+        oid: crate::storage::RoleOid,
         name: &'a str,
         attributes: RoleAttributes,
     },
@@ -3239,7 +3240,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
         } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
         WalOp::Commit { committed_at, .. } => 5 + usize::from(committed_at.is_some()) * 8,
-        WalOp::PrepareTransaction { gid, .. } => 4 + 2 + 4 + 8 + 1 + gid.len(),
+        WalOp::PrepareTransaction { gid, .. } => 4 + 4 + 4 + 8 + 1 + gid.len(),
         WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
         WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => 1 + gid.len(),
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8 + 1,
@@ -3877,7 +3878,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             statistics,
         } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
-        WalOp::UpsertRole { name, attributes } => {
+        WalOp::UpsertRole { name, attributes, .. } => {
             let credential_len = match attributes.password {
                 None => 0,
                 Some(crate::storage::RoleCredential::Scram(password)) => {
@@ -3885,7 +3886,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 }
                 Some(crate::storage::RoleCredential::Md5(_)) => 32,
             };
-            1 + name.len()
+            4 + 1 + name.len()
                 + 2
                 + 4
                 + 1
@@ -5080,7 +5081,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             gid,
         } => {
             buffer.append(&transaction_id.to_le_bytes())
-                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&owner.get().to_le_bytes())
                 && buffer.append(&database.to_le_bytes())
                 && buffer.append(&prepared_at.to_le_bytes())
                 && name_bytes(buffer, gid)
@@ -6046,7 +6047,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::UpsertRole { name, attributes } => {
+        WalOp::UpsertRole { name, attributes, oid } => {
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
                 | (u16::from(attributes.create_role) << 2)
@@ -6056,7 +6057,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u16::from(attributes.bypass_row_level_security) << 6)
                 | (u16::from(attributes.password.is_some()) << 7)
                 | (u16::from(attributes.valid_until.is_some()) << 8);
-            name_bytes(buffer, name)
+            buffer.append(&oid.get().to_le_bytes())
+                && name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
                 && match attributes.password {
@@ -8789,8 +8791,8 @@ fn decode_op_inner<'a>(
         KIND_PREPARE_TRANSACTION => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
-            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-            at += 2;
+            let owner = crate::storage::RoleOid::parse(i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?))?;
+            at += 4;
             let database = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let prepared_at = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -10981,6 +10983,8 @@ fn decode_op_inner<'a>(
             })
         }
         KIND_UPSERT_ROLE => decode_large_op(|| {
+            let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?))?;
+            at += 4;
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -11034,6 +11038,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             Some(WalOp::UpsertRole {
+                oid,
                 name,
                 attributes: RoleAttributes {
                     superuser: flags & 1 != 0,

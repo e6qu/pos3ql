@@ -7438,11 +7438,10 @@ impl Engine {
                 ),
             ));
         }
-        let current = eval::funcs::system::current_user_owned();
-        let owner = self
-            .storage
-            .find_role_visible(current.as_str(), txn.txid)
-            .expect("the current role is transaction-visible") as u16;
+        let Some(owner) = self.storage.current_role_slot(txn.txid) else {
+            return Err(fail(self, txn, cursors, sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "current role does not exist")));
+        };
+        let owner = self.storage.role(owner).oid();
         let metadata = two_phase::PreparedTransactionMetadata {
             gid,
             transaction_id: txn.txid,
@@ -7548,12 +7547,10 @@ impl Engine {
                 "prepared transaction belongs to another database"
             ));
         }
-        let current = eval::funcs::system::current_user_owned();
-        let current_role = self
-            .storage
-            .find_role_visible(current.as_str(), txn.txid)
-            .expect("the current role is transaction-visible");
-        if current_role != usize::from(metadata.owner)
+        let current_role = self.storage.current_role_slot(txn.txid).ok_or_else(|| {
+            sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "permission denied to finish prepared transaction")
+        })?;
+        if self.storage.role(current_role).oid() != metadata.owner
             && !self
                 .storage
                 .role(current_role)
@@ -9025,10 +9022,9 @@ impl Engine {
                 if let Err(error) = self.apply_system_settings(guc) {
                     return Ok(Err(error));
                 }
-                let Some(role) = self.storage.session_role_slot(guc.authenticated_identity().source(), 0) else {
-                    return Ok(Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "authenticated role no longer exists")));
-                };
-                if let Err(error) = self.apply_role_settings(role as u16, guc) {
+                if let Some(role) = self.storage.session_role_slot(guc.authenticated_identity().source(), 0)
+                    && let Err(error) = self.apply_role_settings(role as u16, guc)
+                {
                     return Ok(Err(error));
                 }
                 self.notify.drop_conn(self.work.connection_id());
@@ -20129,6 +20125,7 @@ fn replay_transaction_batches(
                         "prepared transaction WAL has an invalid database"
                     )
                 })?;
+                storage.observe_role_oid(owner);
                 let metadata = two_phase::PreparedTransactionMetadata {
                     gid,
                     transaction_id,
@@ -22781,8 +22778,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             let _ = storage.drop_fk(index, fk_name);
         }
-        WalOp::UpsertRole { name, attributes } => {
-            storage.install_role(crate::storage::SqlName::parse(name)?, attributes)?;
+        WalOp::UpsertRole { name, attributes, oid } => {
+            storage.install_role(crate::storage::SqlName::parse(name)?, attributes, oid)?;
         }
         WalOp::DropRole { name } => storage.remove_role(name),
         WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,

@@ -13,7 +13,7 @@ use crate::storage::DatabaseOid;
 pub(crate) struct PreparedTransactionMetadata {
     pub gid: PreparedTransactionId,
     pub transaction_id: u32,
-    pub owner: u16,
+    pub owner: crate::storage::RoleOid,
     pub database: DatabaseOid,
     pub prepared_at: i64,
     pub first_lsn: u64,

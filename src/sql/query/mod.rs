@@ -3053,7 +3053,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn role_oid(&self, name: &str) -> Option<i32> {
         self.storage
             .find_role_visible(name, self.txid)
-            .map(Storage::role_oid)
+            .map(|slot| self.storage.role_oid(slot))
             .or_else(|| super::catalog::predefined_role_oid(name))
     }
 

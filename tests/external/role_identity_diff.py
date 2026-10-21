@@ -139,7 +139,11 @@ def main():
         raise
     evidence["pos3ql"] = actual
     args.output.write_text(json.dumps(evidence, indent=2) + "\n")
-    assert actual == reference, "existing sessions changed role identity after rename or replacement"
+    if actual != reference:
+        for expected, observed in zip(reference, actual, strict=True):
+            if expected != observed:
+                print(f"MISMATCH: PostgreSQL {expected!r}; pos3ql {observed!r}", flush=True)
+        raise AssertionError("existing sessions changed role identity after rename or replacement")
     print("PASS: connection role identity, renames, resets, replacement and creation ownership")
 
 

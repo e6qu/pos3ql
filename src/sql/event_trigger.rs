@@ -1964,7 +1964,7 @@ fn primary_object(
             let role = storage.role(slot);
             base_object(
                 1260,
-                Storage::role_oid(slot),
+                storage.role_oid(slot),
                 "role",
                 None,
                 Some(role.name_to(txid).as_str()),

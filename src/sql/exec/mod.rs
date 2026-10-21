@@ -7198,6 +7198,7 @@ pub fn create_role(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
+            oid: storage.role(slot).oid(),
             name: name.as_str(),
             attributes,
         },
@@ -7446,6 +7447,7 @@ pub fn alter_role(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
+            oid: storage.role(slot).oid(),
             name: storage.role_name(slot, txn.txid).as_str(),
             attributes,
         },
@@ -9056,7 +9058,7 @@ pub fn reassign_owned(
     let source_owns_catalog = |owner: i32| {
         source_roles[..source_count]
             .iter()
-            .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+            .any(|role| storage.role_oid(usize::from(*role)) == owner)
     };
     changes += storage
         .operators_visible_to(txn.txid)
@@ -9150,7 +9152,7 @@ pub fn reassign_owned(
             }
         }
     }
-    let target_oid = Storage::role_oid(target);
+    let target_oid = storage.role_oid(target);
     loop {
         let found = storage
             .operators_visible_to(txn.txid)
@@ -9595,24 +9597,24 @@ pub(crate) fn drop_owned(
         if let Some(selected) = operators.get_mut(slot) {
             *selected = owned_roles
                 .iter()
-                .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
+                .any(|role| storage.role_oid(usize::from(*role)) == definition.owner);
         }
     }
     for (slot, definition) in storage.collations_visible_to(txn.txid) {
         collations[slot] = owned_roles
             .iter()
-            .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
+            .any(|role| storage.role_oid(usize::from(*role)) == definition.owner);
     }
     for (slot, definition) in storage.conversions_visible_to(txn.txid) {
         conversions[slot] = owned_roles
             .iter()
-            .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
+            .any(|role| storage.role_oid(usize::from(*role)) == definition.owner);
     }
     for (slot, definition) in storage.text_search_objects_visible_to(txn.txid) {
         text_search_objects[slot] = definition.owner().is_some_and(|owner| {
             owned_roles
                 .iter()
-                .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+                .any(|role| storage.role_oid(usize::from(*role)) == owner)
         });
     }
 
@@ -9807,7 +9809,7 @@ pub(crate) fn drop_owned(
     let owned_catalog = |owner: i32| {
         owned_roles
             .iter()
-            .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+            .any(|role| storage.role_oid(usize::from(*role)) == owner)
     };
     loop {
         let owned = storage
@@ -29405,7 +29407,7 @@ fn catalog_owner_slot(storage: &Storage, txid: u32, written: &str) -> Result<i32
             role.as_str()
         ));
     }
-    Ok(Storage::role_oid(slot))
+    Ok(storage.role_oid(slot))
 }
 
 fn fixed_catalog_text<const N: usize>(
@@ -29427,7 +29429,7 @@ fn fixed_catalog_text<const N: usize>(
 fn current_catalog_owner(storage: &Storage, txid: u32) -> Result<i32, SqlError> {
     storage
         .current_role_slot(txid)
-        .map(Storage::role_oid)
+        .map(|slot| storage.role_oid(slot))
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))
 }
 
@@ -29441,7 +29443,7 @@ fn require_definition_owner(
         .current_role_slot(txid)
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
     if storage.role(current).attributes_to(txid).superuser
-        || Storage::role_oid(current) == owner
+        || storage.role_oid(current) == owner
         || storage
             .role_slot_by_oid(owner, txid)
             .is_some_and(|owner| storage.role_can_set(current, owner, txid))
@@ -38410,7 +38412,7 @@ pub fn comment(
                 CommentClass::Role,
                 SqlName::EMPTY,
                 stored,
-                Storage::role_oid(role) as u32,
+                storage.role_oid(role) as u32,
             )
         }
         CommentTarget::AccessMethod(access_method_name) => {

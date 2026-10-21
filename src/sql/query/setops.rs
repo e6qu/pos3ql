@@ -109,7 +109,7 @@ pub fn set_query<'a>(
     };
 
     // ORDER BY (by output column position or name), then LIMIT/OFFSET.
-    if let Err(e) = sort_set_rows(storage, arena, rows, q.order_by, &columns[..n_cols]) {
+    if let Err(e) = sort_set_rows(storage, txid, arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
     let limit = match exec::eval_limit_pub(q.limit, arena, params) {
@@ -130,7 +130,7 @@ pub fn set_query<'a>(
     if q.with_ties && limit > 0 && end < rows.len() && end > start {
         let boundary = rows[end - 1];
         while end < rows.len() {
-            match set_rows_tie(storage, boundary, rows[end], q.order_by, &columns[..n_cols]) {
+            match set_rows_tie(storage, txid, boundary, rows[end], q.order_by, &columns[..n_cols]) {
                 Ok(true) => end += 1,
                 Ok(false) => break,
                 Err(error) => return sql_fail(error),
@@ -223,7 +223,7 @@ pub(crate) fn set_query_into_rows<'a>(
         &collations[..column_count],
     )?;
     sort_set_rows(
-        storage,
+        storage, txid,
         arena,
         rows,
         query.order_by,
@@ -237,7 +237,7 @@ pub(crate) fn set_query_into_rows<'a>(
         let boundary = rows[end - 1];
         while end < rows.len()
             && set_rows_tie(
-                storage,
+                storage, txid,
                 boundary,
                 rows[end],
                 query.order_by,
@@ -344,7 +344,7 @@ fn set_tree_requires_equality(tree: &SetTree<'_>) -> bool {
 }
 
 fn compare_set_order(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     columns: &[ColDesc],
     left: &[u8],
     right: &[u8],
@@ -361,7 +361,7 @@ fn compare_set_order(
             (false, true) => core::cmp::Ordering::Less,
             (false, false) => {
                 let ordering = compare_datums_collated(
-                    storage,
+                    storage, txid,
                     columns[index].collation,
                     &left_value,
                     &right_value,
@@ -690,7 +690,7 @@ pub(crate) fn external_set_body_into<'a>(
         sorter.reset();
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(
-                storage,
+                storage, txid,
                 &columns[..column_count],
                 left,
                 right,
@@ -716,7 +716,7 @@ pub(crate) fn external_set_body_into<'a>(
             && logical >= window
             && boundary_len > 0
             && set_rows_tie(
-                storage,
+                storage, txid,
                 &context.boundary[..boundary_len],
                 context.row,
                 order_by,
@@ -805,7 +805,7 @@ fn external_set_query<'a>(
         };
         sorter.reset();
         let mut compare = |left: &[u8], right: &[u8]| {
-            compare_set_order(storage, columns, left, right, &keys[..key_count])
+            compare_set_order(storage, txid, columns, left, right, &keys[..key_count])
         };
         if let Err(error) = push_run(storage, &mut reader, run, &mut sorter, &mut compare) {
             return sql_fail(error);
@@ -838,7 +838,7 @@ fn external_set_query<'a>(
             let context = reader.context().expect("current external set row");
             let tied = if query.with_ties && limit > 0 && logical >= window && boundary_len > 0 {
                 match set_rows_tie(
-                    storage,
+                    storage, txid,
                     &context.boundary[..boundary_len],
                     context.row,
                     query.order_by,
@@ -1299,7 +1299,7 @@ fn eval_set_tree<'a>(
             let r = eval_set_tree(
                 right, storage, txid, arena, params, sequences, target, collations,
             )?;
-            combine_sets(storage, collations, *operator, *all, l, r, arena)
+            combine_sets(storage, txid, collations, *operator, *all, l, r, arena)
         }
     }
 }
@@ -1552,7 +1552,7 @@ fn eval_set_leaf<'a>(
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are
 /// unordered until the final ORDER BY), then merged by equal runs.
 fn combine_sets<'a>(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     operator: SetOp,
     all: bool,
@@ -1565,7 +1565,7 @@ fn combine_sets<'a>(
     if !(operator == SetOp::Union && all) {
         let mut error = None;
         crate::mem::arena::stable_sort_via(arena, l, |left, right| {
-            match compare_set_rows(storage, collations, left, right) {
+            match compare_set_rows(storage, txid, collations, left, right) {
                 Ok(ordering) => ordering,
                 Err(value) => {
                     error = Some(value);
@@ -1578,7 +1578,7 @@ fn combine_sets<'a>(
             return Err(error);
         }
         crate::mem::arena::stable_sort_via(arena, r, |left, right| {
-            match compare_set_rows(storage, collations, left, right) {
+            match compare_set_rows(storage, txid, collations, left, right) {
                 Ok(ordering) => ordering,
                 Err(value) => {
                     error = Some(value);
@@ -1614,7 +1614,7 @@ fn combine_sets<'a>(
             let mut last: Option<&[u8]> = None;
             while i < l.len() || j < r.len() {
                 let take_l = j >= r.len()
-                    || (i < l.len() && compare_set_rows(storage, collations, l[i], r[j])?.is_le());
+                    || (i < l.len() && compare_set_rows(storage, txid, collations, l[i], r[j])?.is_le());
                 let row = if take_l {
                     i += 1;
                     l[i - 1]
@@ -1623,7 +1623,7 @@ fn combine_sets<'a>(
                     r[j - 1]
                 };
                 let distinct = match last {
-                    Some(prior) => !compare_set_rows(storage, collations, prior, row)?.is_eq(),
+                    Some(prior) => !compare_set_rows(storage, txid, collations, prior, row)?.is_eq(),
                     None => true,
                 };
                 if distinct {
@@ -1638,16 +1638,16 @@ fn combine_sets<'a>(
                 // One equal run in l.
                 let row = l[i];
                 let mut cl = 0;
-                while i < l.len() && compare_set_rows(storage, collations, l[i], row)?.is_eq() {
+                while i < l.len() && compare_set_rows(storage, txid, collations, l[i], row)?.is_eq() {
                     cl += 1;
                     i += 1;
                 }
                 // Advance r past smaller values, then count the matching run.
-                while j < r.len() && compare_set_rows(storage, collations, r[j], row)?.is_lt() {
+                while j < r.len() && compare_set_rows(storage, txid, collations, r[j], row)?.is_lt() {
                     j += 1;
                 }
                 let mut chained_row = 0;
-                while j < r.len() && compare_set_rows(storage, collations, r[j], row)?.is_eq() {
+                while j < r.len() && compare_set_rows(storage, txid, collations, r[j], row)?.is_eq() {
                     chained_row += 1;
                     j += 1;
                 }
@@ -1666,7 +1666,7 @@ fn combine_sets<'a>(
 }
 
 fn compare_set_rows(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     left: &[u8],
     right: &[u8],
@@ -1679,7 +1679,7 @@ fn compare_set_rows(
             (true, false) => core::cmp::Ordering::Less,
             (false, true) => core::cmp::Ordering::Greater,
             (false, false) => {
-                compare_datums_collated(storage, collation, &left_value, &right_value)?
+                compare_datums_collated(storage, txid, collation, &left_value, &right_value)?
             }
         };
         if !ordering.is_eq() {
@@ -1696,7 +1696,7 @@ fn compare_set_rows(
 /// `WITH TIES` peer test). The ORDER BY has already been validated by
 /// [`sort_set_rows`], so an unresolvable key conservatively counts as no tie.
 pub(crate) fn set_rows_tie(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     a: &[u8],
     b: &[u8],
     order_by: &[OrderBy],
@@ -1719,7 +1719,7 @@ pub(crate) fn set_rows_tie(
         let equal = match (va.is_null(), vb.is_null()) {
             (true, true) => true,
             (false, false) => {
-                compare_datums_collated(storage, columns[index].collation, &va, &vb)?.is_eq()
+                compare_datums_collated(storage, txid, columns[index].collation, &va, &vb)?.is_eq()
             }
             _ => false,
         };
@@ -1731,7 +1731,7 @@ pub(crate) fn set_rows_tie(
 }
 
 pub(crate) fn sort_set_rows(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     arena: &Arena,
     rows: &mut [&[u8]],
     order_by: &[OrderBy],
@@ -1802,7 +1802,7 @@ pub(crate) fn sort_set_rows(
                     }
                 }
                 (false, false) => {
-                    match compare_datums_collated(storage, columns[index].collation, &va, &vb) {
+                    match compare_datums_collated(storage, txid, columns[index].collation, &va, &vb) {
                         Ok(o) => {
                             if descending {
                                 o.reverse()

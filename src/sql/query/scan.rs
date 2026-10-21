@@ -3472,7 +3472,7 @@ fn indexed_candidates_for_plan<'a>(
                     }
                 }
                 let ordering = compare_datums_collated(
-                    storage,
+                    storage, txid,
                     collations[position],
                     &decoded[position],
                     &values[bound][position],
@@ -3765,7 +3765,7 @@ fn indexed_candidates_for_plan<'a>(
                 }
                 let left_key = &encoded[left.key_at..left.key_at + left.key_len];
                 let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-                match compare_ordered_index_keys(storage, &plan, &ordered, left_key, right_key) {
+                match compare_ordered_index_keys(storage, txid, &plan, &ordered, left_key, right_key) {
                     Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
                     Ok(ordering) => ordering,
                     Err(error) => {
@@ -3814,7 +3814,7 @@ fn indexed_candidates_for_plan<'a>(
 }
 
 fn compare_ordered_index_keys(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     access: &IndexAccessPlan<'_>,
     ordered: &OrderedIndexAccessPlan<'_>,
     left: &[u8],
@@ -3856,7 +3856,7 @@ fn compare_ordered_index_keys(
             }
             (false, false) => {
                 let ordering =
-                    compare_datums_collated(storage, access.collations[position], &left, &right)?;
+                    compare_datums_collated(storage, txid, access.collations[position], &left, &right)?;
                 if requested.descending {
                     ordering.reverse()
                 } else {
@@ -5784,7 +5784,7 @@ fn scan_source_mode<'a>(
                                     let mut keys_match = true;
                                     for key in 0..nkeys {
                                         if !compare_datums_collated(
-                                            storage,
+                                            storage, txid,
                                             key_collations[key],
                                             &build_values[keys[key].1],
                                             &key_vals[key],
@@ -5920,7 +5920,7 @@ fn scan_source_mode<'a>(
                             let mut matched = true;
                             for i in 0..nkeys {
                                 if !compare_datums_collated(
-                                    storage,
+                                    storage, txid,
                                     key_collations[i],
                                     &build_buf[keys[i].1],
                                     &key_vals[i],

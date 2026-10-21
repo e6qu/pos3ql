@@ -450,7 +450,7 @@ fn projected_collations<'a>(
 }
 
 fn sort_dedup_collated(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     rows: &mut [&[u8]],
     width: usize,
     collations: &[Collation],
@@ -466,7 +466,7 @@ fn sort_dedup_collated(
     rows.sort_unstable_by(|left, right| {
         for (index, &collation) in collations.iter().take(width).enumerate() {
             let ordering = compare_materialized_key(
-                storage,
+                storage, txid,
                 collation,
                 &crate::sql::exec::decode_projected_pub(left, index),
                 &crate::sql::exec::decode_projected_pub(right, index),
@@ -483,7 +483,7 @@ fn sort_dedup_collated(
         if index == 0
             || (0..width).any(|column| {
                 !compare_materialized_key(
-                    storage,
+                    storage, txid,
                     collations[column],
                     &crate::sql::exec::decode_projected_pub(rows[index - 1], column),
                     &crate::sql::exec::decode_projected_pub(rows[index], column),
@@ -870,7 +870,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        live = sort_dedup_collated(storage, rows, width, &visible_collations)?;
+        live = sort_dedup_collated(storage, txid, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
 
@@ -912,7 +912,7 @@ pub(crate) fn materialized_rows<'a>(
                         }
                     }
                     (false, false) => {
-                        let c = compare_materialized_key(storage, key_collations[k], &ka, &kb)
+                        let c = compare_materialized_key(storage, txid, key_collations[k], &ka, &kb)
                             .expect("validated materialized sort keys compare without error");
                         if ob.descending { c.reverse() } else { c }
                     }
@@ -929,7 +929,7 @@ pub(crate) fn materialized_rows<'a>(
                     (true, false) => core::cmp::Ordering::Greater,
                     (false, true) => core::cmp::Ordering::Less,
                     (false, false) => {
-                        compare_materialized_key(storage, key_collations[n_order + j], &ka, &kb)
+                        compare_materialized_key(storage, txid, key_collations[n_order + j], &ka, &kb)
                             .expect("validated materialized sort keys compare without error")
                     }
                 };
@@ -959,7 +959,7 @@ pub(crate) fn materialized_rows<'a>(
                     (true, true) => true,
                     (true, false) | (false, true) => false,
                     (false, false) => {
-                        compare_materialized_key(storage, key_collations[n_order + j], &ka, &kb)?
+                        compare_materialized_key(storage, txid, key_collations[n_order + j], &ka, &kb)?
                             .is_eq()
                     }
                 };
@@ -986,7 +986,7 @@ pub(crate) fn materialized_rows<'a>(
 }
 
 pub(crate) fn compare_materialized_key(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collation: Collation,
     left: &Datum<'_>,
     right: &Datum<'_>,
@@ -996,7 +996,7 @@ pub(crate) fn compare_materialized_key(
         (true, false) => Ok(core::cmp::Ordering::Greater),
         (false, true) => Ok(core::cmp::Ordering::Less),
         (false, false) => {
-            crate::sql::eval::compare_datums_collated(storage, collation, left, right)
+            crate::sql::eval::compare_datums_collated(storage, txid, collation, left, right)
         }
     }
 }
@@ -1005,7 +1005,7 @@ pub(crate) fn compare_materialized_key(
 /// (stored after `width`), with NULLs comparing equal — the `WITH TIES` peer
 /// test, independent of ASC/DESC.
 fn order_keys_equal_collated(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     a: &[u8],
     b: &[u8],
@@ -1017,7 +1017,7 @@ fn order_keys_equal_collated(
         let kb = crate::sql::exec::decode_projected_pub(b, width + k);
         let equal = match (ka.is_null(), kb.is_null()) {
             (true, true) => true,
-            (false, false) => compare_materialized_key(storage, collation, &ka, &kb)?.is_eq(),
+            (false, false) => compare_materialized_key(storage, txid, collation, &ka, &kb)?.is_eq(),
             _ => false,
         };
         if !equal {
@@ -1032,7 +1032,7 @@ fn order_keys_equal_collated(
     reason = "external sort comparator receives plan fields explicitly"
 )]
 fn compare_materialized_rows(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     key_collations: &[Collation],
     statement: &Select<'_>,
     width: usize,
@@ -1062,7 +1062,7 @@ fn compare_materialized_rows(
             }
             (false, false) => {
                 let compared =
-                    compare_materialized_key(storage, key_collations[key], &left, &right)?;
+                    compare_materialized_key(storage, txid, key_collations[key], &left, &right)?;
                 if order.descending {
                     compared.reverse()
                 } else {
@@ -1082,7 +1082,7 @@ fn compare_materialized_rows(
             (true, false) => core::cmp::Ordering::Greater,
             (false, true) => core::cmp::Ordering::Less,
             (false, false) => {
-                compare_materialized_key(storage, key_collations[n_order + index], &left, &right)?
+                compare_materialized_key(storage, txid, key_collations[n_order + index], &left, &right)?
             }
         };
         if !ordering.is_eq() {
@@ -1097,7 +1097,7 @@ fn compare_materialized_rows(
 }
 
 fn distinct_on_keys_equal(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     a: &[u8],
     b: &[u8],
@@ -1111,7 +1111,7 @@ fn distinct_on_keys_equal(
         let equal = match (left.is_null(), right.is_null()) {
             (true, true) => true,
             (false, false) => {
-                compare_materialized_key(storage, collations[n_order + index], &left, &right)?
+                compare_materialized_key(storage, txid, collations[n_order + index], &left, &right)?
                     .is_eq()
             }
             _ => false,
@@ -1183,7 +1183,7 @@ fn prelock_external_run(
                     crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
-                        storage,
+                        storage, txid,
                         &plan.key_collations[..plan.n_keys],
                         row,
                         prior,
@@ -1205,7 +1205,7 @@ fn prelock_external_run(
                     && logical_index >= window
                     && boundary_len > 0
                     && order_keys_equal_collated(
-                        storage,
+                        storage, txid,
                         &plan.key_collations[..plan.n_order],
                         &boundary[..boundary_len],
                         row,
@@ -1388,7 +1388,7 @@ pub(crate) fn external_materialized_into<'a>(
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
         compare_materialized_rows(
-            storage,
+            storage, txid,
             &plan.key_collations[..plan.n_keys],
             statement,
             plan.width,
@@ -1552,7 +1552,7 @@ pub(crate) fn external_materialized_into<'a>(
                     crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
-                        storage,
+                        storage, txid,
                         &plan.key_collations[..plan.n_keys],
                         row,
                         prior,
@@ -1575,7 +1575,7 @@ pub(crate) fn external_materialized_into<'a>(
                     && boundary_len > 0
                 {
                     order_keys_equal_collated(
-                        storage,
+                        storage, txid,
                         &plan.key_collations[..plan.n_order],
                         &boundary[..boundary_len],
                         row,
@@ -1719,7 +1719,7 @@ fn external_materialized_select<'a>(
 /// with `rows[window - 1]` on the ORDER BY keys (`FETCH FIRST ... WITH TIES`).
 /// A `window` at or past the end (or no ORDER BY) is returned clamped.
 pub(crate) fn extend_ties(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     rows: &[&[u8]],
     width: usize,
@@ -1732,7 +1732,7 @@ pub(crate) fn extend_ties(
     let boundary = rows[window - 1];
     let mut end = window;
     while end < rows.len()
-        && order_keys_equal_collated(storage, collations, boundary, rows[end], width, n_order)?
+        && order_keys_equal_collated(storage, txid, collations, boundary, rows[end], width, n_order)?
     {
         end += 1;
     }
@@ -1814,7 +1814,7 @@ pub(crate) fn materialized_select<'a>(
                     match preflight_boundary {
                         Some(boundary) => {
                             match order_keys_equal_collated(
-                                storage,
+                                storage, txid,
                                 &order_collations[..statement.order_by.len()],
                                 boundary,
                                 row,
@@ -1870,7 +1870,7 @@ pub(crate) fn materialized_select<'a>(
                     match boundary {
                         Some(boundary) => {
                             match order_keys_equal_collated(
-                                storage,
+                                storage, txid,
                                 &order_collations[..statement.order_by.len()],
                                 boundary,
                                 row,
@@ -1953,7 +1953,7 @@ pub(crate) fn materialized_select<'a>(
     // `width`). Only meaningful when a row was actually emitted (`limit > 0`).
     if statement.with_ties && limit > 0 {
         window = match extend_ties(
-            storage,
+            storage, txid,
             &order_collations[..statement.order_by.len()],
             rows,
             width,

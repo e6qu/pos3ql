@@ -6936,7 +6936,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     }
                     (false, false) => {
                         let c = crate::sql::eval::compare_datums_collated(
-                            storage,
+                            storage, txid,
                             order_collations[j],
                             &ka,
                             &kb,
@@ -6959,7 +6959,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // with the last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
         end = match materialize::extend_ties(
-            storage,
+            storage, txid,
             &order_collations[..statement.order_by.len()],
             out_rows,
             width,
@@ -7087,7 +7087,7 @@ fn select_into_rows_mode<'a>(
             let rows_mut = arena
                 .alloc_slice_with(rows.len(), |i| rows[i])
                 .map_err(|_| arena_full())?;
-            setops::sort_set_rows(storage, arena, rows_mut, statement.order_by, &cols[..n])?;
+            setops::sort_set_rows(storage, txid, arena, rows_mut, statement.order_by, &cols[..n])?;
             rows = rows_mut;
         }
         let start = (offset as usize).min(rows.len());
@@ -7101,7 +7101,7 @@ fn select_into_rows_mode<'a>(
             let boundary = rows[end - 1];
             while end < rows.len()
                 && setops::set_rows_tie(
-                    storage,
+                    storage, txid,
                     boundary,
                     rows[end],
                     statement.order_by,

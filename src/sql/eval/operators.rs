@@ -548,14 +548,14 @@ fn local_timestamp_for_compare(timestamp: i64) -> Result<i64, SqlError> {
 /// Compares values under a resolved SQL collation.  Text and blank-padded char
 /// share the database comparator; every other type retains its native order.
 pub fn compare_datums_collated(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::Storage, txid: u32,
     collation: Collation,
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
     if matches!((left, right), (Datum::Enum { .. }, Datum::Enum { .. })) {
-        return Ok(super::super::enum_values::sort(*left, storage, 0)?
-            .total_cmp(&super::super::enum_values::sort(*right, storage, 0)?));
+        return Ok(super::super::enum_values::sort(*left, storage, txid)?
+            .total_cmp(&super::super::enum_values::sort(*right, storage, txid)?));
     }
     let (left, right) = match (left, right) {
         (Datum::Text(left), Datum::Text(right)) => (*left, *right),

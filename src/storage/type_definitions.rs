@@ -248,12 +248,13 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         })
 }
 
-fn same_enum(image: &EnumDefinition, source: &super::EnumDef) -> bool {
+fn same_enum(image: &EnumDefinition, source: &super::EnumDef, safe_member_count: usize) -> bool {
     image.schema == source.schema
         && image.name == source.name
         && image.ownership == source.ownership
         && image.ddl_state == source.ddl_state
         && image.member_count == source.member_count as usize
+        && image.safe_member_count == safe_member_count
         && image.image.selects(source.member_image)
 }
 
@@ -299,7 +300,7 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.domains.handle_at(index.index())
+            self.domains.handle_at(index.index(self)?)
         } else {
             let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.domains
@@ -325,7 +326,7 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.enums.handle_at(index.index())
+            self.enums.handle_at(index.index(self)?)
         } else {
             let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.enums
@@ -351,7 +352,7 @@ impl TypeDefinitionImages {
             ));
         }
         let image = if let Some(index) = selected {
-            self.composites.handle_at(index.index())
+            self.composites.handle_at(index.index(self)?)
         } else {
             let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
             self.composites
@@ -457,8 +458,9 @@ impl TypeDefinitionImages {
             .expect("type catalog lock poisoned");
         let key = TypeImageKey::select(&catalog, reference, transaction)?;
         let source = catalog.enums[slot].definition_for(transaction);
+        let safe_member_count = catalog.enums[slot].safe_member_count_for(transaction);
         if let Some((_, _, definition)) = self.enums.find(|candidate, definition| {
-            candidate.source == key.source && same_enum(definition, &source)
+            candidate.source == key.source && same_enum(definition, &source, safe_member_count)
         }) {
             return Ok(definition);
         }
@@ -467,6 +469,7 @@ impl TypeDefinitionImages {
             EnumDefinition {
                 image: EnumImageRead::capture(&storage.enum_member_images, source.member_image),
                 member_count: source.member_count as usize,
+                safe_member_count,
                 database: source.database,
                 created_at: source.created_at,
                 schema: source.schema,

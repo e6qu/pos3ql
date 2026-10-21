@@ -29,7 +29,7 @@ use super::{
 use crate::storage::Storage;
 
 fn compare_group_rows(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[Collation],
     left: &[u8],
     right: &[u8],
@@ -41,7 +41,7 @@ fn compare_group_rows(
             (true, true) => core::cmp::Ordering::Equal,
             (true, false) => core::cmp::Ordering::Less,
             (false, true) => core::cmp::Ordering::Greater,
-            (false, false) => compare_datums_collated(storage, collation, &left, &right)?,
+            (false, false) => compare_datums_collated(storage, txid, collation, &left, &right)?,
         };
         if !ordering.is_eq() {
             return Ok(ordering);
@@ -161,7 +161,7 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
-        let mut compare = |a: &[u8], b: &[u8]| compare_group_rows(storage, group_collations, a, b);
+        let mut compare = |a: &[u8], b: &[u8]| compare_group_rows(storage, txid, group_collations, a, b);
         let mut at = 0u32;
         scan_source_recycling_with_pax_columns(
             storage,
@@ -265,7 +265,7 @@ pub(super) fn groups_for_mask<'a>(
                 let is_new = match context.previous {
                     None => true,
                     Some(prev) => {
-                        !compare_group_rows(storage, group_collations, prev, context.row)?.is_eq()
+                        !compare_group_rows(storage, txid, group_collations, prev, context.row)?.is_eq()
                     }
                 };
                 if is_new {
@@ -358,14 +358,14 @@ pub(super) fn groups_for_mask<'a>(
             )?;
         }
         keys.sort_unstable_by(|left, right| {
-            compare_group_rows(storage, group_collations, left.0, right.0)
+            compare_group_rows(storage, txid, group_collations, left.0, right.0)
                 .expect("validated group keys compare without error")
         });
         let ng = {
             let mut g = 0usize;
             for i in 0..keys.len() {
                 if i == 0
-                    || !compare_group_rows(storage, group_collations, keys[i].0, keys[i - 1].0)?
+                    || !compare_group_rows(storage, txid, group_collations, keys[i].0, keys[i - 1].0)?
                         .is_eq()
                 {
                     g += 1;
@@ -384,7 +384,7 @@ pub(super) fn groups_for_mask<'a>(
             let mut g = 0usize;
             for i in 0..keys.len() {
                 if i > 0
-                    && !compare_group_rows(storage, group_collations, keys[i].0, keys[i - 1].0)?
+                    && !compare_group_rows(storage, txid, group_collations, keys[i].0, keys[i - 1].0)?
                         .is_eq()
                 {
                     g += 1;
@@ -990,7 +990,7 @@ pub(super) fn grouped_rows<'a>(
                         }
                     }
                     (false, false) => {
-                        let c = compare_datums_collated(storage, order_collations[k], &ka, &kb)
+                        let c = compare_datums_collated(storage, txid, order_collations[k], &ka, &kb)
                             .expect("validated grouped ORDER BY keys compare without error");
                         if ob.descending { c.reverse() } else { c }
                     }
@@ -1048,7 +1048,7 @@ pub(super) fn grouped_select<'a>(
             };
         }
         end = match super::materialize::extend_ties(
-            storage,
+            storage, txid,
             &collations[..statement.order_by.len()],
             out_rows,
             width,

@@ -9497,6 +9497,7 @@ impl PendingEnumMemberSlot {
 pub struct EnumDefinition {
     image: EnumImageRead,
     member_count: usize,
+    safe_member_count: usize,
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
@@ -9506,6 +9507,12 @@ pub struct EnumDefinition {
 }
 
 impl EnumDefinition {
+    pub(crate) fn label_is_uncommitted(&self, label: &str) -> bool {
+        self.members()
+            .position(|member| member.label.as_str() == label)
+            .is_some_and(|index| index >= self.safe_member_count)
+    }
+
     pub fn members(&self) -> EnumMemberIter {
         EnumMemberIter {
             image: Some(self.image.clone()),
@@ -9579,6 +9586,14 @@ impl std::ops::DerefMut for EnumReplayMembers<'_> {
 }
 
 impl EnumDef {
+    fn safe_member_count_for(&self, txid: u32) -> usize {
+        if self.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
+            return self.definition_for(txid).member_count as usize;
+        }
+        self.pending_definition.filter(|pending| pending.txid == txid)
+            .map_or(self.member_count, |pending| pending.safe_member_count) as usize
+    }
+
     pub(crate) const EMPTY: Self = EnumDef {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -39398,18 +39413,19 @@ impl Storage {
     }
 
     pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition {
-        let (definition, image) = {
+        let (definition, image, safe_member_count) = {
             let catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
             let definition = catalog.enums[slot].definition_for(txid);
             let image = EnumImageRead::capture(&self.enum_member_images, definition.member_image);
-            (definition, image)
+            (definition, image, catalog.enums[slot].safe_member_count_for(txid))
         };
         EnumDefinition {
             image,
             member_count: definition.member_count as usize,
+            safe_member_count,
             database: definition.database,
             created_at: definition.created_at,
             schema: definition.schema,

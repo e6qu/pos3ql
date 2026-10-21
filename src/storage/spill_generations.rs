@@ -786,15 +786,21 @@ pub(super) struct StatementFileLease {
 /// Only a validated statement selection can name a cached definition image.
 pub(super) struct StatementDefinitionIndex<'lease, Definition> {
     index: usize,
+    owner: &'lease super::TypeDefinitionImages,
     _lease: core::marker::PhantomData<&'lease StatementFileLease>,
     _definition: core::marker::PhantomData<fn() -> Definition>,
 }
 
 impl<'lease, Definition> StatementDefinitionIndex<'lease, Definition> {
-    fn new(_lease: &'lease StatementFileLease, index: usize) -> Self {
-        Self { index, _lease: core::marker::PhantomData, _definition: core::marker::PhantomData }
+    fn new(_lease: &'lease StatementFileLease, owner: &'lease super::TypeDefinitionImages, index: usize) -> Self {
+        Self { index, owner, _lease: core::marker::PhantomData, _definition: core::marker::PhantomData }
     }
-    pub(super) fn index(self) -> usize { self.index }
+    pub(super) fn index(self, owner: &super::TypeDefinitionImages) -> Result<usize, SqlError> {
+        if !core::ptr::eq(self.owner, owner) {
+            return Err(sql_err!(sqlstate::INTERNAL_ERROR, "selected type image belongs to a different statement root"));
+        }
+        Ok(self.index)
+    }
 }
 
 /// A nested execution adds its selected files to the outer statement owner.
@@ -855,9 +861,9 @@ impl StatementFileLease {
                         "captured type source is absent from the statement")),
                 };
             }
-            let selected = (previous != usize::MAX).then(|| StatementDefinitionIndex::new(self, previous));
             let images = state.statement_mut(root).type_definitions.as_ref()
                 .expect("type retention root owns its image chains");
+            let selected = (previous != usize::MAX).then(|| StatementDefinitionIndex::new(self, images, previous));
             let Some(image) = select(images, selected)? else {
                 state.type_selections[position].write(usize::MAX - 1);
                 return Ok(None);

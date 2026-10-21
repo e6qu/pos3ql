@@ -116,10 +116,11 @@ pub(crate) fn coerce_domain_value<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<Datum<'a>, SqlError> {
-    let domain = storage.domain_for(slot, txid);
+    let domain = storage.read_domain_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
     let value = if let Some(parent_name) = domain.base_domain {
+        let reference = crate::storage::TypeReference::from_bound_name(parent_name)?;
         let parent = storage
-            .domain_identity_slot(parent_name.schema.as_str(), parent_name.name.as_str(), txid)
+            .read_domain_definition(crate::storage::TypeDefinitionTarget::Bound(reference), txid)?
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -128,7 +129,12 @@ pub(crate) fn coerce_domain_value<'a>(
                     parent_name.name.as_str()
                 )
             })?;
-        coerce_domain_value(storage, parent, value, txid, arena, params)?
+        let crate::storage::NamedTypeSlot::Domain(parent_slot) = reference.slot() else {
+            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "base domain reference is not a domain"));
+        };
+        let result = coerce_domain_value(storage, parent_slot, value, txid, arena, params)?;
+        drop(parent);
+        result
     } else {
         match domain.base {
             crate::sql::types::ColType::Enum(slot) => {
@@ -330,13 +336,13 @@ fn committed_key_matches(
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut other = [Datum::Null; MAX_COLUMNS];
         decoder.decode(bytes, &mut other)?;
-        key_equal(storage, def, columns, values, &other, nulls_not_distinct)
+        key_equal(storage, txid, def, columns, values, &other, nulls_not_distinct)
     })
 }
 
 /// Whether both keys are equal under the index's NULL-equality rule.
 fn key_equal(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     def: &TableDef,
     columns: &[u16],
     values: &[Datum],
@@ -352,7 +358,7 @@ fn key_equal(
             return Ok(false);
         }
         if !compare_datums_collated(
-            storage,
+            storage, txid,
             def.columns()[index].collation,
             &values[index],
             &other[index],
@@ -369,7 +375,7 @@ fn key_equal(
 /// Durable probes already carry this key, so uniqueness need not reenter the
 /// object-backed row reader while its value-index block is borrowed.
 fn encoded_key_equal(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     def: &TableDef,
     columns: &[u16],
     values: &[Datum],
@@ -396,7 +402,7 @@ fn encoded_key_equal(
             return Ok(false);
         }
         if !compare_datums_collated(
-            storage,
+            storage, txid,
             def.columns()[column as usize].collation,
             &value,
             &candidate,
@@ -410,7 +416,7 @@ fn encoded_key_equal(
 }
 
 pub(crate) fn key_values_equal(
-    storage: &Storage,
+    storage: &Storage, txid: u32,
     collations: &[crate::sql::ast::Collation],
     values: &[Datum],
     other: &[Datum],
@@ -423,7 +429,7 @@ pub(crate) fn key_values_equal(
             }
             return Ok(false);
         }
-        if !compare_datums_collated(storage, collations[index], value, other_value)?.is_eq() {
+        if !compare_datums_collated(storage, txid, collations[index], value, other_value)?.is_eq() {
             return Ok(false);
         }
     }
@@ -458,7 +464,7 @@ fn index_key_values_equal(
             | crate::storage::IndexOperatorClass::Gist(_)
             | crate::storage::IndexOperatorClass::Gin(_)
             | crate::storage::IndexOperatorClass::SpGist(_) => compare_datums_collated(
-                equality.storage,
+                equality.storage, equality.txid,
                 equality.collations[index],
                 value,
                 other_value,
@@ -762,7 +768,7 @@ fn enforce_key_uniqueness(
                 }
                 let matched = match encoded_key {
                     Some(encoded) => encoded_key_equal(
-                        storage,
+                        storage, txid,
                         def,
                         columns,
                         values,
@@ -849,7 +855,7 @@ fn committed_scan_uniqueness(
             let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut other = [Datum::Null; MAX_COLUMNS];
                 decoder.decode(bytes, &mut other)?;
-                key_equal(storage, def, columns, values, &other, nulls_not_distinct)
+                key_equal(storage, txid, def, columns, values, &other, nulls_not_distinct)
             })?;
             if matched {
                 return Err(unique_violation(def, name));
@@ -890,7 +896,7 @@ fn pending_scan_uniqueness(
         let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             decoder.decode(bytes, &mut other)?;
-            key_equal(storage, def, columns, values, &other, nulls_not_distinct)
+            key_equal(storage, txid, def, columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
             if pending.txid != txid {
@@ -940,7 +946,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         Ok(
             index_predicate_matches(storage, txid, def, other, predicate, arena)?
-                && key_equal(storage, def, columns, values, other, nulls_not_distinct)?,
+                && key_equal(storage, txid, def, columns, values, other, nulls_not_distinct)?,
         )
     };
     storage
@@ -2540,7 +2546,7 @@ fn parent_has_key(
                     let child = &child_values[child_column as usize];
                     if parent.is_null()
                         || !compare_datums_collated(
-                            storage,
+                            storage, txid,
                             parent_definition.columns()[parent_column as usize].collation,
                             child,
                             parent,
@@ -2643,7 +2649,7 @@ pub(crate) fn apply_fk_parent_actions(
                     let old = &old_parent[parent_column as usize];
                     let new = &new_parent[parent_column as usize];
                     if !compare_datums_collated(
-                        storage,
+                        storage, txn.txid,
                         cdef.columns()[child_column as usize].collation,
                         old,
                         new,
@@ -2676,7 +2682,7 @@ pub(crate) fn apply_fk_parent_actions(
                     if child.is_null()
                         || parent.is_null()
                         || !compare_datums_collated(
-                            storage,
+                            storage, txn.txid,
                             cdef.columns()[child_column as usize].collation,
                             child,
                             parent,
@@ -2993,7 +2999,7 @@ pub(crate) fn referenced_key_changed(
                 let i = pc as usize;
                 let (a, b) = (&old[i], &new[i]);
                 if !compare_datums_collated(
-                    storage,
+                    storage, txid,
                     cdef.columns()[child_column as usize].collation,
                     a,
                     b,

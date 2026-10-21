@@ -13857,6 +13857,7 @@ pub struct Storage {
     view_rule_catalog: std::sync::Mutex<ViewRuleCatalog>,
     view_catalog_capacity: usize,
     rule_catalog_capacity: usize,
+    routine_catalog_capacity: usize,
     routines: std::sync::Mutex<FixedVec<RoutineDef>>,
     casts: std::sync::Mutex<FixedVec<CastDef>>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
@@ -18988,6 +18989,7 @@ impl Storage {
             view_rule_catalog: std::sync::Mutex::new(ViewRuleCatalog { views, rules }),
             view_catalog_capacity: config.max_views,
             rule_catalog_capacity: config.max_rules,
+            routine_catalog_capacity: config.max_routines,
             routines: std::sync::Mutex::new(routines),
             casts: std::sync::Mutex::new(casts),
             operator_catalog: std::sync::Mutex::new(OperatorCatalog {
@@ -40498,7 +40500,11 @@ impl Storage {
             ));
         }
         let ownership = self.initial_ownership(txid);
-        let mut catalog = self.view_rule_catalog();
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            type_contracts::TypeSourceSelection::Dependencies(definition.query.dependencies.view()),
+        );
+        let catalog = &mut owners.catalog;
         if let Some(blocker) = catalog.views.iter().find_map(|v| {
             (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema.as_str()
@@ -40506,7 +40512,7 @@ impl Storage {
             .then_some(v.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
-            drop(catalog);
+            drop(owners);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let existing = catalog.views.iter().position(|v| {
@@ -40557,19 +40563,15 @@ impl Storage {
         // Reserve and populate the return rule before changing either view.
         // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(
-            &mut catalog,
+            &mut owners,
             rule_definition,
             definition.query.dependencies.view(),
             txid,
         )?;
         if let Some(old) = existing {
-            Self::pending_replace_view_in(&mut catalog, old, txid);
+            Self::pending_replace_view_in(&mut owners.catalog, old, txid);
         }
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::View,
-            slot: new as u16,
-        });
-        catalog.views[new] = ViewDef {
+        owners.catalog.views[new] = ViewDef {
             database: current_database(),
             created_at,
             schema,
@@ -40585,7 +40587,11 @@ impl Storage {
             pending_columns: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        drop(catalog);
+        drop(owners);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::View,
+            slot: new as u16,
+        });
         if definition.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -41116,10 +41122,7 @@ impl Storage {
     }
 
     pub(crate) fn routine_count(&self) -> usize {
-        self.routines
-            .lock()
-            .expect("routine catalog lock poisoned")
-            .len()
+        self.routine_catalog_capacity
     }
 
     fn routine_entries(&self) -> RoutineIter<'_> {
@@ -42878,7 +42881,10 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         let allocated_ownership =
             matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
-        let mut owners = self.routine_type_owners();
+        let mut owners = self.catalog_dependency_owners(
+            &self.routines,
+            type_contracts::TypeSourceSelection::Required,
+        );
         owners.bind_routine_contract(
             &mut arguments[..argument_count],
             &mut parameters[..parameter_count],
@@ -43030,7 +43036,10 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let mut owners = self.routine_type_owners();
+        let mut owners = self.catalog_dependency_owners(
+            &self.routines,
+            type_contracts::TypeSourceSelection::Required,
+        );
         if owners.catalog[slot].database != routine.database
             || owners.catalog[slot].created_at != routine.created_at
             || !owners.catalog[slot].visible_to(definition.txid)
@@ -43094,7 +43103,10 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let mut owners = self.routine_type_owners();
+        let mut owners = self.catalog_dependency_owners(
+            &self.routines,
+            type_contracts::TypeSourceSelection::Required,
+        );
         if owners.catalog[slot].database != routine.database
             || owners.catalog[slot].created_at != routine.created_at
             || !owners.catalog[slot].visible_to(definition.txid)
@@ -50247,8 +50259,12 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRuleDefinition>), SqlError> {
-        let mut catalog = self.view_rule_catalog();
-        self.validate_rule_target_in(&catalog, definition.target, txid)?;
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            type_contracts::TypeSourceSelection::Dependencies(dependencies),
+        );
+        self.validate_rule_target_in(&owners.catalog, definition.target, txid)?;
+        let catalog = &mut owners.catalog;
         if let Some(slot) = catalog.rules.iter().position(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
@@ -50264,7 +50280,7 @@ impl Storage {
             }
             let prior = catalog.rules[slot].pending;
             if prior.is_some_and(|pending| pending.txid != txid) {
-                drop(catalog);
+                drop(owners);
                 return Err(self.catalog_ddl_wait_error(
                     txid,
                     prior.expect("checked").txid,
@@ -50274,20 +50290,21 @@ impl Storage {
             let previous = prior
                 .filter(|pending| pending.txid == txid)
                 .map(|pending| pending.dependency_slot);
-            let dependency_slot = self.allocate_pending_stored_query_dependencies(
+            let dependency_slot = owners.allocate_query_image(
+                self,
                 StoredQueryDependencyOwner::Rule(slot as u16),
-                txid,
                 previous,
                 dependencies,
+                txid,
             )?;
-            catalog.rules[slot].pending = Some(PendingRuleDefinition {
+            owners.catalog.rules[slot].pending = Some(PendingRuleDefinition {
                 txid,
                 definition,
                 dependency_slot,
             });
             return Ok((slot, prior));
         }
-        self.create_new_rule_in(&mut catalog, definition, dependencies, txid)
+        self.create_new_rule_in(&mut owners, definition, dependencies, txid)
             .map(|slot| (slot, None))
     }
 
@@ -50295,12 +50312,13 @@ impl Storage {
     /// No definition is published until its dependency image fits.
     fn create_new_rule_in(
         &self,
-        catalog: &mut ViewRuleCatalog,
+        owners: &mut type_contracts::CatalogDependencyOwners<'_, ViewRuleCatalog>,
         definition: RuleDefinition,
         dependencies: StoredQueryDependencyView<'_>,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let slot = catalog
+        let slot = owners
+            .catalog
             .rules
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -50312,11 +50330,13 @@ impl Storage {
                 )
             })?;
         let created_at = self.catalog_sequence.next()?;
-        self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Rule(slot as u16),
+        owners.write_query_image(
+            self,
+            self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)),
             dependencies,
+            txid,
         )?;
-        catalog.rules[slot] = RuleDef {
+        owners.catalog.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
             definition,
@@ -53251,7 +53271,7 @@ mod tests {
         }
     }
 
-    fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
+    pub(super) fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
             columns: ViewColumns::EMPTY,

@@ -178,6 +178,9 @@ pub(super) trait CatalogTypeDestination {}
 impl CatalogTypeDestination for super::OperatorCatalog {}
 impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<RoutineDef> {}
 impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<CastDef> {}
+impl CatalogTypeDestination for super::ViewRuleCatalog {}
+impl CatalogTypeDestination for super::PolicyCatalog {}
+impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<super::MatviewDef> {}
 
 pub(super) struct CatalogTypeOwners<'storage, Catalog: CatalogTypeDestination> {
     pub(super) catalog: MutexGuard<'storage, Catalog>,
@@ -194,19 +197,88 @@ impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
     }
 }
 
-pub(super) struct RoutineTypeOwners<'storage> {
-    pub(super) catalog: MutexGuard<'storage, crate::mem::fixed_vec::FixedVec<RoutineDef>>,
-    pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
-    types: MutexGuard<'storage, TypeCatalog>,
+pub(super) enum TypeSourceSelection<'input> {
+    Required,
+    Dependencies(super::StoredQueryDependencyView<'input>),
 }
 
-impl RoutineTypeOwners<'_> {
+impl TypeSourceSelection<'_> {
+    fn requires_catalog(&self) -> bool {
+        match self {
+            Self::Required => true,
+            Self::Dependencies(dependencies) => dependencies.entries().iter().any(|dependency| {
+                matches!(
+                    dependency.class,
+                    super::DependencyClass::Domain
+                        | super::DependencyClass::Enum
+                        | super::DependencyClass::Composite
+                )
+            }),
+        }
+    }
+}
+
+pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogTypeDestination> {
+    pub(super) catalog: MutexGuard<'storage, Catalog>,
+    pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
+    types: Option<MutexGuard<'storage, TypeCatalog>>,
+}
+
+impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
+    pub(super) fn write_query_image(
+        &mut self,
+        storage: &Storage,
+        image: usize,
+        dependencies: super::StoredQueryDependencyView<'_>,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.validate_dependencies(dependencies, transaction)?;
+        storage.write_dependency_image_in(&mut self.dependencies, image, dependencies)?;
+        self.refresh_dependencies(
+            image,
+            self.dependencies.counts[image],
+            storage.stored_query_dependencies_per_image,
+            transaction,
+        );
+        Ok(())
+    }
+
+    pub(super) fn allocate_query_image(
+        &mut self,
+        storage: &Storage,
+        owner: super::StoredQueryDependencyOwner,
+        previous: Option<u32>,
+        dependencies: super::StoredQueryDependencyView<'_>,
+        transaction: u32,
+    ) -> Result<u32, SqlError> {
+        self.validate_dependencies(dependencies, transaction)?;
+        let slot = storage.allocate_pending_stored_query_dependencies_in(
+            &mut self.dependencies,
+            owner,
+            previous,
+            dependencies,
+        )?;
+        self.refresh_dependencies(
+            storage.stored_query_dependency_pending_base + slot as usize,
+            self.dependencies.pending[slot as usize].count,
+            storage.stored_query_dependencies_per_image,
+            transaction,
+        );
+        Ok(slot)
+    }
+
     pub(super) fn validate_dependencies(
         &self,
         dependencies: super::StoredQueryDependencyView<'_>,
         transaction: u32,
     ) -> Result<(), SqlError> {
         for mut dependency in dependencies.entries().iter().copied() {
+            if !dependency.identity.valid_for(dependency.class) {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                    "stored-query dependency has an invalid catalog identity"
+                ));
+            }
             if matches!(
                 dependency.class,
                 super::DependencyClass::Domain
@@ -214,6 +286,8 @@ impl RoutineTypeOwners<'_> {
                     | super::DependencyClass::Composite
             ) {
                 self.types
+                    .as_ref()
+                    .expect("type dependencies request source ownership")
                     .bind_query_type_dependency(&mut dependency, transaction)?;
             }
         }
@@ -235,12 +309,16 @@ impl RoutineTypeOwners<'_> {
                     | super::DependencyClass::Composite
             ) {
                 self.types
+                    .as_ref()
+                    .expect("type dependencies request source ownership")
                     .bind_query_type_dependency(dependency, transaction)
                     .expect("source owner preserves validated dependency lifetimes");
             }
         }
     }
+}
 
+impl CatalogDependencyOwners<'_, crate::mem::fixed_vec::FixedVec<RoutineDef>> {
     pub(super) fn bind_routine_contract(
         &self,
         arguments: &mut [RoutineArgumentDef],
@@ -250,9 +328,11 @@ impl RoutineTypeOwners<'_> {
         transaction: u32,
     ) -> Result<(), SqlError> {
         routine_type_fields(arguments, parameters, columns, kind, &mut |result| {
-            *result =
-                self.types
-                    .bind_type_reference(*result, super::current_database(), transaction)?;
+            *result = self
+                .types
+                .as_ref()
+                .expect("routine contracts request source ownership")
+                .bind_type_reference(*result, super::current_database(), transaction)?;
             Ok(())
         })
     }
@@ -272,31 +352,44 @@ impl TypeCatalog {
 }
 
 impl Storage {
-    pub(super) fn routine_type_owners(&self) -> RoutineTypeOwners<'_> {
+    pub(super) fn catalog_dependency_owners<'storage, Catalog: CatalogTypeDestination>(
+        &'storage self,
+        destination: &'storage Mutex<Catalog>,
+        sources: TypeSourceSelection<'_>,
+    ) -> CatalogDependencyOwners<'storage, Catalog> {
+        let requires_types = sources.requires_catalog();
         loop {
-            let owners = self.catalog_type_owners(&self.routines);
-            match self.stored_query_dependencies.try_lock() {
-                Ok(dependencies) => {
-                    return RoutineTypeOwners {
-                        catalog: owners.catalog,
-                        types: owners.types,
-                        dependencies,
-                    };
-                }
-                Err(TryLockError::WouldBlock) => {
-                    drop(owners);
+            let attempt: Result<_, super::row_ownership::LockWait<'storage>> = (|| {
+                let catalog = super::row_ownership::try_mutex(
+                    destination,
+                    "dependent catalog publication lock poisoned",
+                )?;
+                let types = if requires_types {
+                    Some(super::row_ownership::try_mutex(
+                        &self.type_catalog,
+                        "type catalog lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
+                let dependencies = super::row_ownership::try_mutex(
+                    &self.stored_query_dependencies,
+                    "stored-query dependency catalog lock poisoned",
+                )?;
+                Ok(CatalogDependencyOwners {
+                    catalog,
+                    types,
+                    dependencies,
+                })
+            })();
+            match attempt {
+                Ok(owners) => return owners,
+                Err(wait) => {
                     #[cfg(test)]
                     self.type_publication
                         .waits
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    drop(
-                        self.stored_query_dependencies
-                            .lock()
-                            .expect("stored-query dependency catalog lock poisoned"),
-                    );
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    panic!("stored-query dependency catalog lock poisoned");
+                    wait.wait();
                 }
             }
         }

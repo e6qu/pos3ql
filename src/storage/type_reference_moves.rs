@@ -688,6 +688,106 @@ mod tests {
     }
 
     #[test]
+    fn saved_query_publication_releases_owners_and_refreshes_type_sources() {
+        use super::super::tests::test_view_definition;
+        use super::super::{
+            ColumnSet, RuleDefinition, RuleTarget, StoredQueryDependencies, StoredQueryDependency,
+            StoredQueryDependencyOwner,
+        };
+        for kind in KINDS {
+            for view in [false, true] {
+                let (storage, related, _, movement) = fixture(kind);
+                let database = storage.current_database_oid();
+                let mut dependencies = StoredQueryDependencies::EMPTY;
+                let identity = storage
+                    .capture_type_dependency(movement.class(), movement.identity.slot().index(), 0)
+                    .unwrap();
+                dependencies
+                    .push(StoredQueryDependency {
+                        class: movement.class(),
+                        slot: movement.identity.slot().index() as u16,
+                        identity,
+                        referenced_columns: ColumnSet::EMPTY,
+                        schema: movement.prior.schema,
+                        name: movement.prior.name,
+                        referenced_schema: movement.prior.schema,
+                        referenced_name: movement.prior.name,
+                    })
+                    .unwrap();
+                let definition = test_view_definition(dependencies);
+                let mut source = storage.type_catalog.lock().unwrap();
+                std::thread::scope(|scope| {
+                    let storage = &storage;
+                    let writer = scope.spawn(move || {
+                        crate::sql::set_execution_database_oid(database);
+                        crate::mem::guard::forbid_alloc(|| {
+                            if view {
+                                let (slot, _) = storage.create_view(
+                                    SqlName::parse("public").unwrap(),
+                                    SqlName::parse("typed_submission").unwrap(),
+                                    definition,
+                                    false,
+                                    7,
+                                )?;
+                                Ok(StoredQueryDependencyOwner::Rule(
+                                    storage.view(slot).return_rule,
+                                ))
+                            } else {
+                                let (slot, _) = storage.create_rule(
+                                    RuleDefinition {
+                                        name: SqlName::parse("typed_submission").unwrap(),
+                                        target: RuleTarget::Table(related as u16),
+                                        ..RuleDefinition::EMPTY
+                                    },
+                                    definition.query.dependencies.view(),
+                                    false,
+                                    7,
+                                )?;
+                                Ok(StoredQueryDependencyOwner::Rule(slot as u16))
+                            }
+                        })
+                    });
+                    let waiting = wait_until_contended(storage);
+                    let available = storage.view_rule_catalog.try_lock().is_ok()
+                        && storage.stored_query_dependencies.try_lock().is_ok();
+                    let unrelated = crate::mem::guard::forbid_alloc(|| {
+                        storage.create_view(
+                            SqlName::parse("public").unwrap(),
+                            SqlName::parse("builtin_submission").unwrap(),
+                            test_view_definition(StoredQueryDependencies::EMPTY),
+                            false,
+                            9,
+                        )
+                    });
+                    match movement.identity.slot() {
+                        NamedTypeSlot::Domain(slot) => {
+                            source.domains[slot].name = movement.current.name
+                        }
+                        NamedTypeSlot::Enum(slot) => {
+                            source.enums[slot].name = movement.current.name
+                        }
+                        NamedTypeSlot::Composite(slot) => {
+                            source.composites[slot].name = movement.current.name
+                        }
+                    }
+                    drop(source);
+                    let owner = writer.join().unwrap().unwrap();
+                    assert!(waiting, "submission did not reach the source wait");
+                    assert!(
+                        available,
+                        "source wait retained a destination or dependency owner"
+                    );
+                    unrelated.unwrap();
+                    let submitted = storage.committed_dependencies(owner);
+                    assert_eq!(submitted.entries()[0].identity, identity);
+                    assert_eq!(submitted.entries()[0].name, movement.current.name);
+                    assert_eq!(submitted.entries()[0].referenced_name, movement.prior.name);
+                });
+            }
+        }
+    }
+
+    #[test]
     fn catalog_submission_rejects_retired_operator_destinations() {
         use super::super::{OperatorDefinition, OperatorFamilyDefinition, OperatorSignature};
         let (storage, _, _, _) = fixture(TypeReferenceKind::Domain);

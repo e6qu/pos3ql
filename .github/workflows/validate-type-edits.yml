@@ -43,6 +43,7 @@ jobs:
         run: >-
           cargo test --lib --locked --
           storage::type_
+          type_definition_transactions
           config::tests
           enum
           domain

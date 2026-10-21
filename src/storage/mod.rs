@@ -39265,7 +39265,7 @@ impl Storage {
         let mut catalog = self.type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
             return;
         }
         if catalog.domains[slot].pending_definition.is_some_and(|pending|
@@ -39880,7 +39880,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
             return;
         }
         let definition = &catalog.enums[slot];
@@ -40168,7 +40168,7 @@ impl Storage {
         let mut catalog = self.type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
             return;
         }
         if catalog.composites[slot].pending_definition.is_some_and(|pending|

@@ -267,6 +267,8 @@ impl super::Storage {
         &self,
         changes: impl Iterator<Item = TypeCommitChange>,
     ) -> Result<(), SqlError> {
+        let mut changes = changes.peekable();
+        if changes.peek().is_none() { return Ok(()); }
         let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
         for change in changes {
             let (source, transaction) = match change {

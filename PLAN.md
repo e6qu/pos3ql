@@ -40,11 +40,12 @@ its rows or definitions. Cleanup should let ordinary queries run between turns.
 
 Type-name publication owns affected definitions and dependent catalogs together,
 releases earlier owners before waiting, and uses startup-reserved space. Captured
-type references preserve their catalog, database and lifetime across rename and
-recovery. Finish common ownership from the final source check through installing
-each dependent definition and its dependency records. Typed-table membership
-must retain the source lifetime too. Public type commits and the transaction
-barrier remain exclusive until every affected path is protected.
+type references, typed-table membership and saved-query type dependencies preserve
+their source lifetime across rename, recovery and deliberate database cloning.
+Table creation and alteration, routine signatures/dependencies, casts, operators
+and source type links now validate under their installation owners. Complete
+shared engine publication across stored-query owners, type retirement and commit
+boundaries before removing the exclusive type commits and transaction barrier.
 
 Finish protection for engine-wide publication and remaining table rewrites.
 Retain historical row, index and backup references before publishing replacements.

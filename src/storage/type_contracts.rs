@@ -201,6 +201,46 @@ pub(super) struct RoutineTypeOwners<'storage> {
 }
 
 impl RoutineTypeOwners<'_> {
+    pub(super) fn validate_dependencies(
+        &self,
+        dependencies: super::StoredQueryDependencyView<'_>,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for mut dependency in dependencies.entries().iter().copied() {
+            if matches!(
+                dependency.class,
+                super::DependencyClass::Domain
+                    | super::DependencyClass::Enum
+                    | super::DependencyClass::Composite
+            ) {
+                self.types
+                    .bind_query_type_dependency(&mut dependency, transaction)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn refresh_dependencies(
+        &mut self,
+        image: usize,
+        count: u8,
+        entries_per_image: usize,
+        transaction: u32,
+    ) {
+        for dependency in self.dependencies.image_mut(image, count, entries_per_image) {
+            if matches!(
+                dependency.class,
+                super::DependencyClass::Domain
+                    | super::DependencyClass::Enum
+                    | super::DependencyClass::Composite
+            ) {
+                self.types
+                    .bind_query_type_dependency(dependency, transaction)
+                    .expect("source owner preserves validated dependency lifetimes");
+            }
+        }
+    }
+
     pub(super) fn bind_routine_contract(
         &self,
         arguments: &mut [RoutineArgumentDef],

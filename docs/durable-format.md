@@ -138,8 +138,11 @@ Journal records version field-width changes with distinct kind bytes. Current
 writers use publication kinds 139/140, trigger kind 141, routine kind 142,
 composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
 counts. Readers retain the preceding publication, trigger, routine, composite,
-and view kinds. Stored-query dependencies use marker `0xfe` for the complete
-column set and retain the `0xff` and legacy readers. Table statistics use the
+and view kinds. Stored-query dependencies use marker `0xfd`, a length-prefixed
+identity and the complete column set. Type identities use `d:<slot>:<creation>`,
+`e:<slot>:<creation>` or `c:<slot>:<creation>`; other identities retain their
+decimal object identifiers or zero for name-based objects. Earlier dependency
+grammars are rejected. Table statistics use the
 v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
 The current manifest text represents sparse column sets and streams wide
 composite fields into the configured manifest buffer.
@@ -222,10 +225,9 @@ valid. ANALYZE recreates these cached summaries. New summaries use journal kind 
 current journal records or manifest v18. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
-Journal routine type codes leave catalog slots unresolved until startup has
-replayed all definitions. Enum and composite name moves update those declarations
-by their exact saved name as well; a missing name or a different resolved slot
-cannot select a type. Startup then binds the moved name to its current slot.
+Journal routine type references identify their saved source lifetime. Replay
+refreshes the SQL spelling from that source; a missing lifetime cannot select a
+replacement with the same name.
 
 ### Typed tables
 
@@ -234,6 +236,12 @@ duplicate SQL name. Recovery checks the source lifetime and column shape before
 installing the table. Dropping a type and creating an identical replacement in
 the same slot cannot make a saved definition select that replacement. Template
 copies deliberately bind this link to the new database’s cloned type.
+
+Saved queries use the same source keys for domain, enum and composite
+dependencies. A view recorded before a rename can commit afterward and recover
+the renamed source. Its original spelling cannot select a replacement. Routine
+publication validates these dependencies under the same owners as its signature
+and dependency image.
 
 ### Type lifetimes and saved references
 

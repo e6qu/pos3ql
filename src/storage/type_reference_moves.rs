@@ -764,6 +764,77 @@ mod tests {
     }
 
     #[test]
+    fn captured_type_dependencies_bind_lifetimes_instead_of_reused_names() {
+        use super::super::{
+            ColumnSet, SerializedStoredQueryDependency, StoredDependencyIdentity,
+            StoredQueryDependencies, StoredQueryDependency,
+        };
+        for kind in KINDS {
+            let (mut storage, _, _, movement) = fixture(kind);
+            let class = movement.class();
+            let slot = movement.identity.slot().index();
+            let identity = storage.capture_type_dependency(class, slot, 0).unwrap();
+            let mut captured = StoredQueryDependencies::EMPTY;
+            captured
+                .push(StoredQueryDependency {
+                    class,
+                    slot: slot as u16,
+                    identity,
+                    referenced_columns: ColumnSet::EMPTY,
+                    schema: movement.prior.schema,
+                    name: movement.prior.name,
+                    referenced_schema: movement.prior.schema,
+                    referenced_name: movement.prior.name,
+                })
+                .unwrap();
+            let mut saved = StoredQueryDependencies::EMPTY;
+            saved
+                .serialized_push(SerializedStoredQueryDependency {
+                    class,
+                    identity: StoredDependencyIdentity::from_storage(
+                        class,
+                        identity.storage_key().as_str(),
+                    )
+                    .unwrap(),
+                    referenced_columns: ColumnSet::EMPTY,
+                    schema: movement.prior.schema,
+                    name: movement.prior.name,
+                    referenced_schema: movement.prior.schema,
+                    referenced_name: movement.prior.name,
+                })
+                .unwrap();
+            publish_move(&storage, movement);
+            // Reusing the original SQL spelling must not redirect either a
+            // captured dependency or its serialized form to the new object.
+            create_kind(&mut storage, kind, movement.prior);
+            for dependencies in [&captured, &saved] {
+                let bound = storage
+                    .rebind_stored_query_dependencies(dependencies.clone(), 0)
+                    .unwrap();
+                assert_eq!(bound.entries()[0].slot as usize, slot);
+                assert_eq!(bound.entries()[0].identity, identity);
+                assert_eq!(bound.entries()[0].name, movement.current.name);
+                assert_eq!(bound.entries()[0].referenced_name, movement.prior.name);
+            }
+            match kind {
+                TypeReferenceKind::Domain => storage.commit_domain_drop(slot),
+                TypeReferenceKind::Enum => storage.commit_enum_drop(slot),
+                TypeReferenceKind::Composite => storage.commit_composite_drop(slot),
+            }
+            assert_eq!(create_kind(&mut storage, kind, movement.current).0, slot);
+            for dependencies in [captured, saved] {
+                assert_eq!(
+                    storage
+                        .rebind_stored_query_dependencies(dependencies, 0)
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::UNDEFINED_OBJECT
+                );
+            }
+        }
+    }
+
+    #[test]
     fn captured_type_references_reject_retired_and_reused_source_lifetimes() {
         for kind in KINDS {
             let (mut storage, table, _, movement) = fixture(kind);

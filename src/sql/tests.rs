@@ -90284,8 +90284,14 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                     data_rows(&session.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
                 );
-                assert_eq!(data_rows(&session.success(&mut engine,
-                    "SELECT count(*) FROM captured_view WHERE value IS NULL", !checkpoint)), ["1"]);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT count(*) FROM captured_view WHERE value IS NULL",
+                        !checkpoint
+                    )),
+                    ["1"]
+                );
             }
         }
     }

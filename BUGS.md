@@ -5,7 +5,7 @@ belong here. Fix every other defect, including CI regressions, in the PR that
 finds it. Keep repaired defects and their evidence in the implementing PR.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
-No externally blocked defects are currently recorded.
+No defects currently meet this blocked-only boundary.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Remove repaired entries; preserve their evidence in the implementing

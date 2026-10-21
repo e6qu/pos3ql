@@ -37,17 +37,18 @@ jobs:
 
   macos-lock-ownership:
     name: macOS mutex ownership
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri setup
+      - run: cargo miri setup --target aarch64-apple-darwin
       - name: Native mutex movement, contention and unwinding
         run: >-
-          cargo miri test --lib --locked mem::mutex::tests -- --test-threads=1
+          cargo miri test --package pos3ql-mutex-model --lib --locked
+          --target aarch64-apple-darwin -- mem::mutex::tests --test-threads=1
 
   heap-aliasing:
     runs-on: ubuntu-latest

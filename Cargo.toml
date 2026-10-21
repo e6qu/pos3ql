@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[workspace]
+members = ["tools/mutex-model"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.dependencies]
+libc = "0.2"
+
 # Dependency policy: std + libc only. libc provides raw syscall bindings
 # (kqueue/epoll, sockets, low-level file I/O) that have no std equivalent.
 # Everything else — PG wire protocol, SQL parser, generic object-store HTTP client,
@@ -11,7 +19,7 @@ build = "build.rs"
 # that all memory is statically allocated at startup and the core stays
 # deterministic for simulation testing.
 [dependencies]
-libc = "0.2"
+libc = { workspace = true }
 # The single whitelisted exception to the libc-only policy (see AGENTS.md and
 # CONTRIBUTING.md): TLS is never hand-rolled. rustls runs isolated — every
 # call from the object-store client enters through `mem::guard::tls_scope`, whose

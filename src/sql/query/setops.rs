@@ -1565,6 +1565,10 @@ fn eval_set_leaf<'a>(
 
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are
 /// unordered until the final ORDER BY), then merged by equal runs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set comparison receives its transaction, collations and row buffers explicitly"
+)]
 fn combine_sets<'a>(
     storage: &Storage,
     txid: u32,

@@ -1115,6 +1115,10 @@ fn compare_materialized_rows(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct comparison receives its row layout and transaction explicitly"
+)]
 fn distinct_on_keys_equal(
     storage: &Storage,
     txid: u32,

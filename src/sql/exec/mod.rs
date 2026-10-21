@@ -9055,11 +9055,11 @@ pub fn reassign_owned(
             }
         }
     }
-    let source_owns_catalog = |owner: i32| {
-        source_roles[..source_count]
-            .iter()
-            .any(|role| storage.role_oid(usize::from(*role)) == owner)
+    let source_oids = match arena.alloc_slice_with(source_count, |index| storage.role_oid(usize::from(source_roles[index]))) {
+        Ok(oids) => oids,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
+    let source_owns_catalog = |owner: i32| source_oids.contains(&owner);
     changes += storage
         .operators_visible_to(txn.txid)
         .filter(|(_, definition)| source_owns_catalog(definition.owner))
@@ -9806,11 +9806,11 @@ pub(crate) fn drop_owned(
         }
     }
 
-    let owned_catalog = |owner: i32| {
-        owned_roles
-            .iter()
-            .any(|role| storage.role_oid(usize::from(*role)) == owner)
+    let owned_oids = match arena.alloc_slice_with(owned_roles.len(), |index| storage.role_oid(usize::from(owned_roles[index]))) {
+        Ok(oids) => oids,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
+    let owned_catalog = |owner: i32| owned_oids.contains(&owner);
     loop {
         let owned = storage
             .operator_classes_visible_to(txn.txid)

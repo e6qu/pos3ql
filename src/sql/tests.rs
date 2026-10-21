@@ -19201,6 +19201,70 @@ fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
 }
 
 #[test]
+fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
+    for checkpoint in [false, true] {
+        let mut config = test_config(if checkpoint { "role-owner-checkpoint" } else { "role-owner-journal" });
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("role-owner-{}-{}", checkpoint, std::process::id());
+        config.max_prepared_transactions = 2;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_prepared_owner");
+        assert!(!message_types(&output).contains(&b'E'));
+        let original_slot = engine.storage.find_role("source_prepared_owner").unwrap();
+        let original_oid = engine.storage.role_oid(original_slot);
+        let output = run_with(&mut engine, &mut budget,
+            "SET ROLE source_prepared_owner; BEGIN; SELECT 1; PREPARE TRANSACTION 'source-owner'");
+        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+        let output = run_with(&mut engine, &mut budget,
+            "ALTER ROLE source_prepared_owner RENAME TO renamed_prepared_owner;
+             SELECT owner FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+        assert_eq!(data_rows(&output), ["renamed_prepared_owner"]);
+        let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_prepared_owner");
+        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+        let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_prepared_owner");
+        assert!(!message_types(&output).contains(&b'E'));
+        let replacement_slot = engine.storage.find_role("source_prepared_owner").unwrap();
+        let replacement_oid = engine.storage.role_oid(replacement_slot);
+        assert_eq!(original_slot, replacement_slot);
+        assert_ne!(original_oid, replacement_oid);
+        let output = run_with(&mut engine, &mut budget,
+            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+        assert_eq!(data_rows(&output), ["t"]);
+        for command in ["COMMIT", "ROLLBACK"] {
+            let output = run_with(&mut engine, &mut budget,
+                &format!("SET ROLE source_prepared_owner; {command} PREPARED 'source-owner'"));
+            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"));
+        }
+        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        let replacement_slot = recovered.storage.find_role("source_prepared_owner").unwrap();
+        assert_eq!(recovered.storage.role_oid(replacement_slot), replacement_oid);
+        let output = run_with(&mut recovered, &mut recovered_budget,
+            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+        assert_eq!(data_rows(&output), ["t"]);
+        for command in ["COMMIT", "ROLLBACK"] {
+            let output = run_with(&mut recovered, &mut recovered_budget,
+                &format!("SET ROLE source_prepared_owner; {command} PREPARED 'source-owner'"));
+            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"));
+        }
+        let output = run_with(&mut recovered, &mut recovered_budget,
+            "ROLLBACK PREPARED 'source-owner'; CREATE ROLE next_source_owner");
+        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+        let next = recovered.storage.find_role("next_source_owner").unwrap();
+        assert!(recovered.storage.role_oid(next) > replacement_oid);
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
 fn catalog_creation_schema_authorization_uses_the_function_owner() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(&mut engine, &mut budget,

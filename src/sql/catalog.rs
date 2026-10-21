@@ -16034,7 +16034,7 @@ fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     }
 }
 
-fn policy_role_oids<'a>(roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn policy_role_oids<'a>(storage: &Storage, roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let values = arena
         .alloc_slice_with(roles.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
@@ -16802,7 +16802,7 @@ fn pg_policy<'a>(
                     arena,
                 )?,
                 Datum::Bool(policy.permissive),
-                policy_role_oids(&storage.policy_roles(slot, txid), arena)?,
+                policy_role_oids(storage, &storage.policy_roles(slot, txid), arena)?,
                 policy_definition
                     .using
                     .map(|source| text(source.as_str(), arena))

@@ -13100,7 +13100,7 @@ pub(crate) struct PreparedTransactionCatalogEntry {
     pub transaction_id: u32,
     pub gid: StackStr<199>,
     pub prepared_at: i64,
-    pub owner: u16,
+    pub owner: RoleOid,
     pub database: DatabaseOid,
     pub first_lsn: u64,
     pub prepared_lsn: u64,

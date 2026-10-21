@@ -37567,13 +37567,16 @@ pub fn alter_rule(
             table.name
         ));
     };
-    let mut definition = storage.rule(slot).definition_for(txn.txid);
-    definition.name = match SqlName::parse(new_name) {
+    let new_name = match SqlName::parse(new_name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let prior = match storage.alter_rule(slot, definition, txn.txid) {
-        Ok(prior) => prior,
+    let (prior, definition) = match storage.alter_rule(
+        slot,
+        crate::storage::RuleMetadataChange::Rename(new_name),
+        txn.txid,
+    ) {
+        Ok(changed) => changed,
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
@@ -37620,15 +37623,18 @@ fn alter_table_rule_enabled(
             relation
         ));
     };
-    let mut definition = storage.rule(slot).definition_for(txn.txid);
-    definition.enabled = match enabled {
+    let enabled = match enabled {
         crate::sql::ast::TriggerEnableMode::Origin => crate::storage::RuleEnabled::Origin,
         crate::sql::ast::TriggerEnableMode::Replica => crate::storage::RuleEnabled::Replica,
         crate::sql::ast::TriggerEnableMode::Always => crate::storage::RuleEnabled::Always,
         crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::RuleEnabled::Disabled,
     };
-    let prior = match storage.alter_rule(slot, definition, txn.txid) {
-        Ok(prior) => prior,
+    let (prior, definition) = match storage.alter_rule(
+        slot,
+        crate::storage::RuleMetadataChange::SetEnabled(enabled),
+        txn.txid,
+    ) {
+        Ok(changed) => changed,
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {

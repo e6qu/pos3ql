@@ -43,9 +43,13 @@ releases earlier owners before waiting, and uses startup-reserved space. Capture
 type references, typed-table membership and saved-query type dependencies preserve
 their source lifetime across rename, recovery and deliberate database cloning.
 Table creation and alteration, routine signatures/dependencies, casts, operators
-and source type links now validate under their installation owners. Complete
-shared engine publication across stored-query owners, type retirement and commit
-boundaries before removing the exclusive type commits and transaction barrier.
+and source type links validate under their installation owners. Views, rewrite
+rules, materialized views and row-security policies now install saved definitions
+and type dependencies together. Operations on a table recheck its lifetime after
+waiting; rule renames preserve changes made while waiting. Source waits release
+every earlier owner, and failed edits preserve existing definitions and roles.
+Complete shared engine publication across type retirement and commit boundaries
+before removing the exclusive type commits and transaction barrier.
 
 Finish protection for engine-wide publication and remaining table rewrites.
 Retain historical row, index and backup references before publishing replacements.

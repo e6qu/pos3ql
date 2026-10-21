@@ -17140,12 +17140,13 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )?;
         self.clear_object_acl_entries(AccessObject {
@@ -17160,12 +17161,13 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )?;
         self.clear_object_acl_entries(AccessObject {
@@ -17190,12 +17192,13 @@ impl Storage {
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         self.foreign_catalog().create_table(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )
     }
@@ -20341,7 +20344,7 @@ impl Storage {
                 self.alloc_schema(
                     source_schema.name,
                     CatalogDdlState::PendingCreate { txid },
-                    Some(source_schema.ownership.committed()),
+                    source_schema.ownership.committed(),
                 )?;
             }
 
@@ -22642,18 +22645,23 @@ impl Storage {
         }
     }
 
-    fn initial_ownership(&self, txid: u32) -> Ownership {
+    fn initial_ownership(&self, txid: u32) -> Result<Ownership, SqlError> {
         if txid == 0 {
-            return Ownership::BOOTSTRAP;
+            return Ok(Ownership::BOOTSTRAP);
         }
         let role_name = crate::sql::eval::funcs::system::current_user_owned();
         let owner = self
             .find_role_visible(role_name.as_str(), txid)
-            .unwrap_or(0) as u16;
-        Ownership {
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            })? as u16;
+        Ok(Ownership {
             owner: 0,
             pending: Some(PendingOwnership { txid, owner }),
-        }
+        })
     }
 
     pub(crate) fn object_owner(&self, object: AccessObject, txid: u32) -> usize {
@@ -22733,6 +22741,7 @@ impl Storage {
         requested: Option<LargeObjectOid>,
         txid: u32,
     ) -> Result<(usize, LargeObjectOid), SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let database = current_database();
         let (oid, allocated, blocker) = {
             let mut catalog = self
@@ -22789,7 +22798,6 @@ impl Storage {
             slot: slot as u16,
         });
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         self.large_objects
             .lock()
             .expect("large object catalog lock poisoned")
@@ -26153,8 +26161,8 @@ impl Storage {
         }
     }
 
-    pub(crate) fn initial_catalog_owner(&self, txid: u32) -> i32 {
-        Self::role_oid(usize::from(self.initial_ownership(txid).owner_to(txid)))
+    pub(crate) fn initial_catalog_owner(&self, txid: u32) -> Result<i32, SqlError> {
+        Ok(Self::role_oid(usize::from(self.initial_ownership(txid)?.owner_to(txid))))
     }
 
     pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -27627,7 +27635,7 @@ impl Storage {
     /// Committed create (journal replay): the schema is immediately part of
     /// the durable image.
     pub fn create_schema(&self, name: SqlName) -> Result<usize, SqlError> {
-        self.alloc_schema(name, CatalogDdlState::Present, None)
+        self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP)
     }
 
     /// Transactional create: the schema exists only for `txid` until commit.
@@ -27646,17 +27654,16 @@ impl Storage {
                 database.name.as_str()
             ));
         }
-        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid }, None)
+        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid }, self.initial_ownership(txid)?)
     }
 
     fn alloc_schema(
         &self,
         name: SqlName,
         ddl_state: CatalogDdlState,
-        ownership: Option<Ownership>,
+        ownership: Ownership,
     ) -> Result<usize, SqlError> {
         let txid = ddl_state.pending_txid().unwrap_or(0);
-        let ownership = ownership.unwrap_or_else(|| self.initial_ownership(txid));
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         if let Some(blocker) = schemas.iter().find_map(|schema| {
             (schema.database == current_database() && schema.name == name)
@@ -28306,7 +28313,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut catalog = self.extension_catalog();
         if catalog.definitions.iter().any(|extension| {
             extension.database == current_database()
@@ -37192,7 +37199,7 @@ impl Storage {
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_PUBLICATION_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut publications = self
             .publications
             .lock()
@@ -37529,7 +37536,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let target = self.query_table_target(backing_table, txid)?;
         let name = self.table_def(backing_table, txid).name;
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.matviews,
             type_contracts::CatalogPublicationInput::QueryDefinition(query.dependencies.view()),
@@ -37854,7 +37861,7 @@ impl Storage {
             persistence,
         } = create;
         self.require_schema_create(schema.as_str(), txid)?;
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let mut catalog = self.sequence_catalog();
         if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
@@ -38818,8 +38825,8 @@ impl Storage {
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -39606,8 +39613,8 @@ impl Storage {
         txid: u32,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40307,8 +40314,8 @@ impl Storage {
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40378,8 +40385,8 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40444,7 +40451,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(
@@ -42827,8 +42834,11 @@ impl Storage {
             },
         )?;
         self.require_schema_create(schema.as_str(), txid)?;
-        let allocated_ownership =
-            matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
+        let allocated_ownership = if matches!(identity, RoutineIdentity::Allocate) {
+            Some(self.initial_ownership(txid)?)
+        } else {
+            None
+        };
         let mut owners = self.catalog_dependency_owners(
             &self.routines,
             type_contracts::CatalogPublicationInput::RoutineContract,
@@ -44718,7 +44728,7 @@ impl Storage {
                 "invalid extended statistics key count"
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut catalog = self
             .extended_statistics_catalog
             .lock()
@@ -45684,7 +45694,7 @@ impl Storage {
         } else {
             0
         };
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         if self
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
@@ -53606,6 +53616,86 @@ mod tests {
         });
     }
 
+    fn assert_missing_creation_actor<T>(result: Result<T, SqlError>) {
+        let error = match result {
+            Ok(_) => panic!("a missing actor was accepted as an object owner"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert_eq!(error.message.as_str(), "current role is not present in the role catalog");
+    }
+
+    #[test]
+    fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let wrapper = storage.create_foreign_wrapper(foreign::ForeignDataWrapperDefinition {
+            name: SqlName::parse("base_wrapper").unwrap(),
+            handler: foreign::ForeignDataHandler::None,
+            validator: foreign::ForeignDataValidator::None,
+            options: foreign::ForeignOptions::EMPTY,
+        }, 0).unwrap();
+        let server = storage.create_foreign_server(foreign::ForeignServerDefinition {
+            name: SqlName::parse("base_server").unwrap(),
+            wrapper: wrapper as u16,
+            server_type: None,
+            version: None,
+            options: foreign::ForeignOptions::EMPTY,
+        }, 0).unwrap();
+        let table = storage.create_table(make_def("base_table", &[("id", ColType::Int4, false)])).unwrap();
+        let sequence = storage.catalog_sequence.current();
+        let next_oid = storage.large_objects.lock().unwrap().next_oid;
+        let actor = crate::sql::eval::funcs::system::enter_current_user("missing_creator");
+        crate::mem::guard::forbid_alloc(|| {
+            assert_missing_creation_actor(storage.initial_ownership(7));
+            assert_missing_creation_actor(storage.initial_catalog_owner(7));
+            assert_missing_creation_actor(storage.create_foreign_wrapper(foreign::ForeignDataWrapperDefinition {
+                name: SqlName::parse("unowned_wrapper").unwrap(),
+                handler: foreign::ForeignDataHandler::None,
+                validator: foreign::ForeignDataValidator::None,
+                options: foreign::ForeignOptions::EMPTY,
+            }, 7));
+            assert_missing_creation_actor(storage.create_foreign_server(foreign::ForeignServerDefinition {
+                name: SqlName::parse("unowned_server").unwrap(),
+                wrapper: wrapper as u16,
+                server_type: None,
+                version: None,
+                options: foreign::ForeignOptions::EMPTY,
+            }, 7));
+            assert_missing_creation_actor(storage.create_foreign_table_binding(foreign::ForeignTableDefinition {
+                table: table as u16,
+                server: server as u16,
+                options: foreign::ForeignOptions::EMPTY,
+                column_options: foreign::ForeignColumnOptions::EMPTY,
+            }, 7));
+            assert_missing_creation_actor(storage.create_large_object(None, 7));
+            assert_missing_creation_actor(table_creation::allocate(&storage, make_def("unowned_table", &[("id", ColType::Int4, false)]), Some(7)));
+            assert_eq!(storage.catalog_sequence.current(), sequence);
+            assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
+            assert!(storage.find_table("public", "unowned_table").is_none());
+        });
+        drop(actor);
+        let (_, oid) = storage.create_large_object(None, 7).unwrap();
+        assert_eq!(Some(oid), next_oid);
+        assert_eq!(storage.catalog_sequence.current(), sequence + 1);
+    }
+
+    #[test]
+    fn catalog_creation_replay_uses_its_explicit_owner_without_a_session_actor() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let _actor = crate::sql::eval::funcs::system::enter_current_user("missing_creator");
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.initial_ownership(0).unwrap().owner, BOOTSTRAP_ROLE);
+            let slot = storage.alloc_schema(SqlName::parse("replayed_schema").unwrap(), CatalogDdlState::Present, Ownership::BOOTSTRAP).unwrap();
+            let schemas = storage.schemas.lock().unwrap();
+            assert_eq!(schemas[slot].ownership.owner, BOOTSTRAP_ROLE);
+            assert!(schemas[slot].ownership.pending.is_none());
+        });
+    }
+
     #[test]
     fn cluster_metadata_table_names_reserve_only_within_their_database() {
         let config = test_config();
@@ -54359,7 +54449,7 @@ mod tests {
                 .alloc_schema(
                     SqlName::parse("clone_extra").unwrap(),
                     CatalogDdlState::Present,
-                    Some(Ownership::BOOTSTRAP),
+                    Ownership::BOOTSTRAP,
                 )
                 .unwrap();
             assert_eq!(
@@ -59255,13 +59345,13 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_reused").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 11 },
-                Some(Ownership {
+                Ownership {
                     owner: BOOTSTRAP_ROLE,
                     pending: Some(PendingOwnership {
                         txid: 11,
                         owner: BOOTSTRAP_ROLE,
                     }),
-                }),
+                },
             )
             .unwrap();
         assert_eq!(reused, reclaimed);
@@ -59274,13 +59364,13 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_committed").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 12 },
-                Some(Ownership {
+                Ownership {
                     owner: BOOTSTRAP_ROLE,
                     pending: Some(PendingOwnership {
                         txid: 12,
                         owner: BOOTSTRAP_ROLE,
                     }),
-                }),
+                },
             )
             .unwrap();
         storage.commit_schema_create(committed);
@@ -59293,7 +59383,7 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_pending").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 20 },
-                Some(Ownership::BOOTSTRAP),
+                Ownership::BOOTSTRAP,
             )
             .unwrap();
         assert_eq!(
@@ -59301,7 +59391,7 @@ mod tests {
                 .alloc_schema(
                     SqlName::parse("schema_pending").unwrap(),
                     CatalogDdlState::PendingCreate { txid: 21 },
-                    Some(Ownership::BOOTSTRAP),
+                    Ownership::BOOTSTRAP,
                 )
                 .unwrap_err()
                 .sqlstate,

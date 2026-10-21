@@ -1,0 +1,83 @@
+name: Catalog creation validation
+
+on:
+  push:
+    branches: [protect-shared-type-creation]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-creation-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-catalog-creation-${{ hashFiles('Cargo.lock') }}
+          restore-keys: Linux-cargo-
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+      - name: Prepare formatting evidence
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/catalog-creation-head.txt"
+          cargo fmt --all
+          git diff --binary > "$RUNNER_TEMP/catalog-creation-format.patch"
+      - name: Save formatting evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: catalog-creation-format
+          path: |
+            ${{ runner.temp }}/catalog-creation-head.txt
+            ${{ runner.temp }}/catalog-creation-format.patch
+      - name: Creation ownership regressions
+        run: cargo test --lib --locked catalog_creation_ -- --test-threads=1
+      - name: Build release executable
+        run: cargo build --release --locked
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: PostgreSQL source identity comparisons
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "0"
+          RUN_AUX: "1"
+          AUXILIARY_PHASE: types
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+        run: bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql"
+      - name: Clippy
+        run: cargo clippy --lib --bins -- -D warnings
+      - name: Save comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: catalog-creation-comparisons
+          path: /tmp/pos3ql-ci-diff.*/
+          if-no-files-found: ignore

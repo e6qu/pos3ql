@@ -1611,6 +1611,11 @@ if "$PY" "$EXT/type_database_isolation_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" -
 else
   bad "database-local type moves"; cat "$WORK/type-database-isolation.out"
 fi
+if "$PY" "$EXT/role_identity_diff.py" --host "$PGHOST" --pg "$PGPORT" --p3 "$P3_PORT" --user "$PGUSER" --output "$WORK/role-identities.json" > "$WORK/role-identities.out" 2>&1; then
+  ok "connection role identity ($(tail -1 "$WORK/role-identities.out"))"
+else
+  bad "connection role identity"; cat "$WORK/role-identities.out"
+fi
 if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
   ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
 else

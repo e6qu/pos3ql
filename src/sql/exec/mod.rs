@@ -6124,7 +6124,12 @@ pub fn create_schema(
                 role.as_str()
             ));
         };
-        let current = storage.current_role_slot(txn.txid).unwrap_or(0);
+        let Some(current) = storage.current_role_slot(txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        };
         if !storage.role(current).attributes_to(txn.txid).superuser
             && current != owner
             && !storage.role_can_set(current, owner, txn.txid)
@@ -29116,7 +29121,7 @@ fn operator_link_or_shell(
         negator: None,
         hashes: false,
         merges: false,
-        owner: storage.initial_catalog_owner(txn.txid),
+        owner: storage.initial_catalog_owner(txn.txid)?,
     };
     if matches!(request.kind, OperatorLinkKind::Commutator) {
         definition.commutator = Some(request.source_oid);
@@ -29152,6 +29157,10 @@ pub(crate) fn create_operator(
     operator: &crate::sql::ast::CreateOperator<'_>,
     responder: &mut Responder,
 ) -> Outcome {
+    let owner = match storage.initial_catalog_owner(txn.txid) {
+        Ok(owner) => owner,
+        Err(error) => return sql_fail(error),
+    };
     let schema = match storage.creation_schema(operator.name.schema, operator.name.name, txn.txid) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
@@ -29231,7 +29240,7 @@ pub(crate) fn create_operator(
         negator: None,
         hashes: operator.hashes,
         merges: operator.merges,
-        owner: storage.initial_catalog_owner(txn.txid),
+        owner,
     };
     let durable = match storage.bind_catalog_definition(definition, txn.txid) {
         Ok(definition) => definition,
@@ -31550,7 +31559,7 @@ fn empty_operator_family(
     let definition = crate::storage::OperatorFamilyDefinition {
         schema,
         name: SqlName::parse(name.name)?,
-        owner: storage.initial_catalog_owner(txn.txid),
+        owner: storage.initial_catalog_owner(txn.txid)?,
         operators: [crate::storage::OperatorFamilyOperator::EMPTY;
             crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
         functions: [crate::storage::OperatorFamilyFunction::EMPTY;
@@ -32172,6 +32181,10 @@ pub(crate) fn create_operator_class(
     if let Err(error) = require_catalog_superuser(storage, txn.txid) {
         return sql_fail(error);
     }
+    let owner = match storage.initial_catalog_owner(txn.txid) {
+        Ok(owner) => owner,
+        Err(error) => return sql_fail(error),
+    };
     let schema = match storage.creation_schema(class.name.schema, class.name.name, txn.txid) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
@@ -32348,7 +32361,7 @@ pub(crate) fn create_operator_class(
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         },
-        owner: storage.initial_catalog_owner(txn.txid),
+        owner,
         family: storage.operator_family(family).oid(),
         input,
         storage: storage_type,

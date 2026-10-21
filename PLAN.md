@@ -37,6 +37,8 @@ See the [current contract and examples](docs/implemented-baseline.md).
 
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
+A connection must remain attached to the same user after a rename; a new account
+with the old name must not inherit that connection.
 
 Readers retain selected table, routine and named-type definitions. Type changes
 recheck the selected edit after waits and include newly submitted dependent

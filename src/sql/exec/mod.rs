@@ -13325,6 +13325,7 @@ pub(crate) fn drop_schema(
                         if let Err(error) =
                             txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot))
                         {
+                            storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                             return sql_fail(error);
                         }
                     }
@@ -13351,6 +13352,7 @@ pub(crate) fn drop_schema(
                         if let Err(error) =
                             txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot))
                         {
+                            storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                             return sql_fail(error);
                         }
                     }
@@ -41391,7 +41393,10 @@ fn drop_domain_selection(
         )?;
         match storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, schema.as_str(), dname.as_str(), txn.txid) {
             Ok(Some(slot)) => {
-                txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot))?;
+                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot)) {
+                    storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
+                    return Err(error);
+                }
             }
             Ok(None) => {}
             Err(e) => return Err(e),
@@ -42515,6 +42520,7 @@ pub(crate) fn drop_type(
         match storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, schema.as_str(), ename.as_str(), txn.txid) {
             Ok(Some(slot)) => {
                 if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot)) {
+                    storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                     return sql_fail(e);
                 }
             }
@@ -42810,7 +42816,10 @@ fn drop_composite_type(
                 "composite type vanished during drop"
             )
         })?;
-    txn.record_ddl(super::txn::DdlUndo::CompositeDropped(dropped))?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeDropped(dropped)) {
+                    storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
+                    return Err(error);
+                }
     Ok(())
 }
 

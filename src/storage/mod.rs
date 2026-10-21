@@ -7278,7 +7278,7 @@ struct OperatorClassIter<'a> {
 #[derive(Debug)]
 struct TypeCatalog {
     origin: type_references::TypeOrigin,
-    versions: type_edits::TypeDefinitionVersions,
+    versions: type_edits::TypeRevisions,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
@@ -18066,7 +18066,7 @@ impl Storage {
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::TypePublication::budget_bytes(config)
-            + type_edits::TypeDefinitionVersions::budget_bytes(config)
+            + type_edits::TypeRevisions::budget_bytes(config)
             + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::TypeOrigin>()
             + SpillRootRegistry::budget_bytes(config)
@@ -18206,7 +18206,7 @@ impl Storage {
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let type_publication = type_reference_moves::TypePublication::new(config, budget)?;
-        let type_definition_versions = type_edits::TypeDefinitionVersions::new(config, budget)?;
+        let type_definition_versions = type_edits::TypeRevisions::new(config, budget)?;
         let type_definition_images =
             type_definitions::TypeDefinitionImagePools::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
@@ -20445,7 +20445,9 @@ impl Storage {
                 let target_slot = type_catalog
                     .domains
                     .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .enumerate()
+                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
+                        && !self.type_definition_images.retains(NamedTypeSlot::Domain(slot)))
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "domain catalog is full")
                     })?;
@@ -20453,6 +20455,7 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                type_catalog.versions.initialize(NamedTypeSlot::Domain(target_slot), definition.created_at);
                 type_catalog.domains[target_slot] = definition;
             }
             for source_slot in 0..type_catalog.enums.len() {
@@ -20464,7 +20467,9 @@ impl Storage {
                 let target_slot = type_catalog
                     .enums
                     .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .enumerate()
+                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
+                        && !self.type_definition_images.retains(NamedTypeSlot::Enum(slot)))
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "enum catalog is full")
                     })?;
@@ -20478,6 +20483,7 @@ impl Storage {
                 })?;
                 let image = EnumImageReservation::copy(&self.enum_member_images, source, count)?;
                 definition.member_image = Some(image.publish());
+                type_catalog.versions.initialize(NamedTypeSlot::Enum(target_slot), definition.created_at);
                 type_catalog.enums[target_slot] = definition;
             }
             for source_slot in 0..type_catalog.composites.len() {
@@ -20489,7 +20495,9 @@ impl Storage {
                 let target_slot = type_catalog
                     .composites
                     .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .enumerate()
+                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
+                        && !self.type_definition_images.retains(NamedTypeSlot::Composite(slot)))
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -20512,6 +20520,7 @@ impl Storage {
                         field.collation = Collation::Catalog(target);
                     }
                 }
+                type_catalog.versions.initialize(NamedTypeSlot::Composite(target_slot), definition.created_at);
                 type_catalog.composites[target_slot] = definition;
             }
             drop(type_catalog);
@@ -39266,12 +39275,7 @@ impl Storage {
         }
     }
 
-    pub fn restore_domain(&mut self, slot: usize, prior: DomainDef) {
-        self.type_catalog
-            .lock()
-            .expect("type catalog lock poisoned")
-            .domains[slot] = prior;
-    }
+
 
 
 
@@ -39524,6 +39528,7 @@ impl Storage {
         } else {
             self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?.slot()
         };
+        let version = self.catalog_sequence.next()?;
         let mut catalog = self
             .type_catalog
             .lock()
@@ -39535,6 +39540,7 @@ impl Storage {
             .replace_from_replay(catalog.enums[slot].member_image, count)?;
         catalog.enums[slot].member_image = Some(image);
         catalog.enums[slot].member_count = count;
+        catalog.versions.set(NamedTypeSlot::Enum(slot), version);
         Ok(slot)
     }
 
@@ -39857,9 +39863,11 @@ impl Storage {
                 UserTypeName::declaration(schema, name),
             )
         };
+        let version = self.catalog_sequence.next()?;
         self.publish_type_move(movement, |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
+            catalog.versions.set(NamedTypeSlot::Enum(slot), version);
         });
         Ok(())
     }

@@ -43,9 +43,13 @@ together, preserving source identities across rename and recovery. Readers now
 retain selected domain, enum and composite definitions in startup memory. Table
 reads and scalar function contracts capture nested types before execution waits;
 nested statements select their own visible definitions and share identical images.
+Type edits capture their source and definition revision together. Creation,
+deletion, commit and rollback carry the source lifetime and transaction owner;
+commit checks this ownership before durability. Conflicting edits and deletion
+wait for their owner, including a transaction's pending rename.
 
-Complete shared engine publication across type retirement, transaction commit
-and remaining metadata preparation before removing exclusive type commits and
+Complete shared engine publication across transaction commit, remaining type
+retirement paths and metadata preparation before removing exclusive type commits and
 the transaction barrier. Connect all remaining preparation and rewrite paths to
 retained sources before running those paths concurrently.
 

@@ -20489,8 +20489,8 @@ fn apply_composite_wal_definition(
         definition.name = def.name;
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
-        storage.stage_composite_alter(edit_target, definition, 0)?;
-        storage.commit_composite_alter(storage.prepare_composite_edit(slot, 0)?.1);
+        let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
+        storage.commit_composite_alter(prior.target());
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
         storage.restore_type_identity(
@@ -22015,8 +22015,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ));
                 }
                 let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
-                storage.stage_domain_alter(edit_target, spec, 0)?;
-                storage.commit_domain_alter(storage.prepare_domain_edit(slot, 0)?.1);
+                let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
+                storage.commit_domain_alter(prior.target());
             } else {
                 let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
                 storage.restore_type_identity(
@@ -22185,8 +22185,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let (mut definition, edit_target) = storage.prepare_composite_edit(slot, 0)?;
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
-            storage.stage_composite_alter(edit_target, definition, 0)?;
-            storage.commit_composite_alter(storage.prepare_composite_edit(slot, 0)?.1);
+            let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
+            storage.commit_composite_alter(prior.target());
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -22202,13 +22202,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 )
             })?;
             let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
-            storage.stage_domain_identity(
+            let prior = storage.stage_domain_identity(
                 edit_target,
                 crate::storage::SqlName::parse(new_schema)?,
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(storage.prepare_domain_edit(slot, 0)?.1);
+            storage.commit_domain_alter(prior.target());
         }
         WalOp::Comment {
             class,

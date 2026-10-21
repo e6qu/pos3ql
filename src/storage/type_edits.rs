@@ -92,7 +92,7 @@ pub(crate) type EnumAlterUndo = TypeAlterUndo<PendingEnumDefinition>;
 pub(crate) type CompositeAlterUndo = TypeAlterUndo<PendingCompositeDefinition>;
 
 #[derive(Debug)]
-pub(super) struct TypeDefinitionVersions {
+pub(super) struct TypeRevisions {
     domains: FixedVec<TypeRevision>,
     enums: FixedVec<TypeRevision>,
     composites: FixedVec<TypeRevision>,
@@ -104,7 +104,7 @@ struct TypeRevision {
     ddl: u64,
 }
 
-impl TypeDefinitionVersions {
+impl TypeRevisions {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>().saturating_add(
             config.max_domains.saturating_add(config.max_enums)
@@ -113,9 +113,9 @@ impl TypeDefinitionVersions {
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
-        budget.draw(size_of::<Self>(), "type definition revision controls")?;
+        budget.draw(size_of::<Self>(), "type revision controls")?;
         fn reserve(budget: &mut Budget, count: usize) -> Result<FixedVec<TypeRevision>, BudgetError> {
-            let mut values = FixedVec::new(budget, "type definition revisions", count)?;
+            let mut values = FixedVec::new(budget, "type revisions", count)?;
             for _ in 0..count { values.push(TypeRevision { definition: 0, ddl: 0 }).expect("reserved type revisions"); }
             Ok(values)
         }
@@ -455,5 +455,117 @@ impl super::Storage {
             NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = state,
         }
         Ok(Some(TypeDdlUndo { source: identity, transaction, operation: TypeDdlOperation::Drop, version, prior_version }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{CatalogDdlState, NamedTypeKind, SqlName, Storage};
+
+    fn fixture() -> Storage {
+        let config = crate::storage::tests::test_config();
+        let mut budget = crate::storage::tests::test_budget(&config);
+        Storage::new(&config, &mut budget).unwrap()
+    }
+
+    fn create(storage: &mut Storage, kind: NamedTypeKind) -> TypeDdlUndo {
+        use crate::storage::{ColType, CompositeSpec, CompositeFieldDef, DomainSpec, EnumSpec,
+            EnumMember, CheckConstraint, MAX_DOMAIN_CHECKS, MAX_COMPOSITE_FIELDS};
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("owned_type").unwrap();
+        match kind {
+            NamedTypeKind::Domain => storage.create_domain(schema, name, DomainSpec {
+                base_domain: None, base_user_type: None, base: ColType::Int4,
+                base_type_mod: -1, not_null: false, default_expr: None,
+                checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+            }, 7).unwrap(),
+            NamedTypeKind::Enum => storage.create_enum(schema, name, EnumSpec {
+                members: &[EnumMember { label: SqlName::parse("ready").unwrap(), legacy_label: None, sort: 1.0 }],
+            }, 7).unwrap(),
+            NamedTypeKind::Composite => storage.create_composite(schema, name, CompositeSpec {
+                fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS], n_fields: 0,
+            }, 7).unwrap(),
+        }
+    }
+
+    fn state(storage: &Storage, source: TypeDdlUndo) -> CatalogDdlState {
+        let catalog = storage.type_catalog.lock().unwrap();
+        match source.source.slot() {
+            NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state,
+            NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state,
+            NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state,
+        }
+    }
+
+    #[test]
+    fn type_ddl_finalization_rejects_foreign_replaced_repeated_and_wrong_owner_records() {
+        use CatalogDdlState::{Absent, PendingCreate, PendingDrop, Present};
+        use TypeDdlDecision::{Commit, Rollback};
+        for kind in [NamedTypeKind::Domain, NamedTypeKind::Enum, NamedTypeKind::Composite] {
+            let mut storage = fixture();
+            let mut foreign = fixture();
+            crate::mem::guard::forbid_alloc(|| {
+                let created = create(&mut storage, kind);
+                let foreign_created = create(&mut foreign, kind);
+                for decision in [Commit, Rollback] {
+                    foreign.finish_type_ddl(created, decision);
+                    storage.finish_type_ddl(TypeDdlUndo { transaction: 9, ..created }, decision);
+                    assert_eq!(state(&foreign, foreign_created), PendingCreate { txid: 7 });
+                    assert_eq!(state(&storage, created), PendingCreate { txid: 7 });
+                }
+                assert_eq!(foreign.validate_type_commit([TypeCommitChange::Lifecycle(created)].into_iter()).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+                storage.finish_type_ddl(created, Commit);
+                storage.finish_type_ddl(created, Rollback);
+                assert_eq!(state(&storage, created), Present);
+                let earlier = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                storage.finish_type_ddl(earlier, Rollback);
+                let latest = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                for decision in [Commit, Rollback] {
+                    storage.finish_type_ddl(earlier, decision);
+                    assert_eq!(state(&storage, latest), PendingDrop { txid: 7 });
+                }
+                assert_eq!(storage.validate_type_commit([TypeCommitChange::Lifecycle(earlier)].into_iter()).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                storage.validate_type_commit([TypeCommitChange::Lifecycle(latest)].into_iter()).unwrap();
+                storage.finish_type_ddl(latest, Commit);
+                assert_eq!(state(&storage, latest), Absent);
+                let replacement = create(&mut storage, kind);
+                assert_eq!(replacement.slot(), created.slot());
+                storage.finish_type_ddl(replacement, Commit);
+                storage.apply_comment(crate::storage::CommentClass::Type, SqlName::parse("public").unwrap(), SqlName::parse("owned_type").unwrap(), 0,
+                    Some(crate::storage::comment_stackstr("replacement comment").unwrap())).unwrap();
+                for obsolete in [created, earlier, latest] {
+                    for decision in [Commit, Rollback] { storage.finish_type_ddl(obsolete, decision); }
+                }
+                assert_eq!(state(&storage, replacement), Present);
+                assert_eq!(storage.comment_text(crate::storage::CommentClass::Type, "public", "owned_type", 0, 0).unwrap().as_str(), "replacement comment");
+                if kind == NamedTypeKind::Enum {
+                    assert_eq!(storage.enum_for(replacement.slot(), 0).members().next().unwrap().label.as_str(), "ready");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn type_create_then_drop_commits_or_rolls_back_in_record_order() {
+        use TypeDdlDecision::{Commit, Rollback};
+        for kind in [NamedTypeKind::Domain, NamedTypeKind::Enum, NamedTypeKind::Composite] {
+            let mut storage = fixture();
+            crate::mem::guard::forbid_alloc(|| {
+                let created = create(&mut storage, kind);
+                let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                storage.validate_type_commit([TypeCommitChange::Lifecycle(created), TypeCommitChange::Lifecycle(dropped)].into_iter()).unwrap();
+                storage.finish_type_ddl(created, Commit);
+                storage.finish_type_ddl(dropped, Commit);
+                assert_eq!(state(&storage, dropped), CatalogDdlState::Absent);
+                let created = create(&mut storage, kind);
+                let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                storage.finish_type_ddl(dropped, Rollback);
+                storage.finish_type_ddl(created, Rollback);
+                assert_eq!(state(&storage, created), CatalogDdlState::Absent);
+                // A new enum needs the image released by both paths above.
+                create(&mut storage, kind);
+            });
+        }
     }
 }

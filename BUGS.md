@@ -9,6 +9,8 @@ No defects currently meet this blocked-only boundary.
 
 A configured capacity limit may reject work explicitly. Partial changes, lost
 reader data or leaked ownership after that rejection are defects to fix here.
+Stale type edits and commit or rollback records must not alter a replacement
+type or release its saved labels. Lock waits must leave the prior definition intact.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Publication, recovery and capacity failures follow the same rule.

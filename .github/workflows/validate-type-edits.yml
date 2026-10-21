@@ -48,3 +48,5 @@ jobs:
           domain
           composite
           --test-threads=1
+      - name: Check runtime lints
+        run: cargo clippy --lib --bins -- -D warnings

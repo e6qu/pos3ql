@@ -1444,6 +1444,7 @@ mod tests {
         source: NamedTypeSlot,
         select: impl Fn(&Storage, u32) -> super::super::TypeEditTarget,
         stage: impl Fn(&Storage, super::super::TypeEditTarget, &str) -> Result<Undo, SqlError>,
+        commit: impl Fn(&mut Storage, Undo),
         rollback: impl Fn(&Storage, Undo),
         label: impl Fn(&Storage) -> SqlName,
     ) {
@@ -1460,7 +1461,11 @@ mod tests {
             assert_eq!(stage(&first, original, "22").err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert_eq!(stage(&other, original, "22").err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
             let latest = stage(&first, select(&first, 7), "22").unwrap();
+            commit(&mut first, earlier);
+            assert_eq!(label(&first).as_str(), "22");
             let foreign = stage(&other, select(&other, 7), "11").unwrap();
+            commit(&mut other, earlier);
+            assert_eq!(label(&other).as_str(), "11");
             assert_eq!(other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap_err().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
             assert!(other.type_catalog.try_lock().is_ok());
             rollback(&other, earlier);
@@ -1486,6 +1491,7 @@ mod tests {
             create(&mut first, source).unwrap();
             assert_eq!(stage(&first, original, "22").err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
             let replacement = stage(&first, select(&first, 7), "22").unwrap();
+            commit(&mut first, earlier);
             rollback(&first, earlier);
             assert_eq!(label(&first).as_str(), "22");
             rollback(&first, replacement);
@@ -1504,6 +1510,7 @@ mod tests {
                 default_expr: Some(crate::util::StackStr::from_str(marker)),
                 checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
             }, 7),
+            |storage, undo| storage.commit_domain_alter(undo.target()),
             |storage, undo| storage.rollback_domain_alter(undo),
             |storage| match storage.domain_for(0, 7).default_expr {
                 Some(expression) => SqlName::parse(expression.as_str()).unwrap(),
@@ -1517,6 +1524,7 @@ mod tests {
                 target, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(),
                 &[EnumMember { label: SqlName::parse(marker).unwrap(), legacy_label: None, sort: 1.0 }], 7,
             ),
+            |storage, undo| storage.commit_enum_alter(undo.target()),
             |storage, undo| storage.rollback_enum_alter(undo),
             |storage| storage.enum_for(0, 7).members().next().unwrap().label,
         );
@@ -1528,6 +1536,7 @@ mod tests {
                 definition.fields[0].name = SqlName::parse(marker).unwrap();
                 storage.stage_composite_alter(target, definition, 7)
             },
+            |storage, undo| storage.commit_composite_alter(undo.target()),
             |storage, undo| storage.rollback_composite_alter(undo),
             |storage| storage.composite_for(0, 7).fields()[0].name,
         );

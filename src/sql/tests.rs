@@ -52073,6 +52073,40 @@ fn enum_value_identity_stored_view_follows_member_rename() {
 }
 
 #[test]
+fn type_definition_transactions_keep_final_edits_after_drop_savepoint_rollback() {
+    let config = test_config("type-definition-transactions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "BEGIN; CREATE DOMAIN type_edit_domain AS integer DEFAULT 1; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 2; SAVEPOINT keep_type; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 3; \
+         ALTER DOMAIN type_edit_domain RENAME TO type_edit_domain_pending; \
+         DROP DOMAIN type_edit_domain_pending; ROLLBACK TO keep_type; \
+         ALTER DOMAIN type_edit_domain SET DEFAULT 4; COMMIT; \
+         CREATE TABLE type_edit_rows(value type_edit_domain); \
+         INSERT INTO type_edit_rows DEFAULT VALUES", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT value FROM type_edit_rows", true)), ["4"]);
+    session.success(&mut engine,
+        "BEGIN; CREATE TYPE type_edit_enum AS ENUM ('before'); \
+         ALTER TYPE type_edit_enum RENAME VALUE 'before' TO 'first'; SAVEPOINT keep_type; \
+         ALTER TYPE type_edit_enum RENAME VALUE 'first' TO 'discarded'; \
+         ALTER TYPE type_edit_enum RENAME TO type_edit_enum_pending; \
+         DROP TYPE type_edit_enum_pending; ROLLBACK TO keep_type; \
+         ALTER TYPE type_edit_enum RENAME VALUE 'first' TO 'final'; COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT 'final'::type_edit_enum::text", true)), ["final"]);
+    session.success(&mut engine,
+        "BEGIN; CREATE TYPE type_edit_record AS (before integer); \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE before TO first; SAVEPOINT keep_type; \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE first TO discarded; \
+         ALTER TYPE type_edit_record RENAME TO type_edit_record_pending; \
+         DROP TYPE type_edit_record_pending; ROLLBACK TO keep_type; \
+         ALTER TYPE type_edit_record RENAME ATTRIBUTE first TO final; COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT (ROW(9)::type_edit_record).final", true)), ["9"]);
+}
+
+#[test]
 fn enum_value_identity_domain_check_follows_member_rename() {
     let config = test_config("enum-identity-domain");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

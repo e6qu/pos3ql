@@ -201,7 +201,7 @@ mod tests {
         forbid_alloc(|| {
             let mutex = Mutex::new(1);
             {
-                let mut value = mutex.lock().unwrap();
+                let mut value: super::MutexGuard<'_, i32> = mutex.lock().unwrap();
                 *value += 1;
                 assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
             }
@@ -243,7 +243,8 @@ mod tests {
     fn core_mutex_poisoned_guards_release_native_ownership_on_unwind() {
         let mut mutex = Mutex::new(0);
         let failed = std::panic::catch_unwind(|| {
-            *mutex.lock().unwrap() = 9;
+            let mut guard = mutex.lock().unwrap();
+            *guard = 9;
             panic!("exercise mutex poisoning");
         });
         assert!(failed.is_err());

@@ -10,7 +10,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 
 /// A durable PostgreSQL role identifier, independent of catalog slot placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RoleOid(NonZeroU32);
+pub(crate) struct RoleOid(NonZeroU32);
 
 impl RoleOid {
     pub(crate) const BOOTSTRAP: Self = Self(NonZeroU32::new(10).unwrap());
@@ -21,7 +21,9 @@ impl RoleOid {
             .then(|| Self(NonZeroU32::new(value as u32).expect("a valid role OID is nonzero")))
     }
 
-    pub fn get(self) -> i32 { self.0.get() as i32 }
+    pub(crate) fn get(self) -> i32 {
+        self.0.get() as i32
+    }
 }
 
 pub(super) struct CatalogSources {
@@ -41,10 +43,18 @@ impl CatalogSources {
     fn reserve(counter: &AtomicU64, object: &str) -> Result<NonZeroU64, SqlError> {
         let mut current = counter.load(Ordering::Relaxed);
         loop {
-            let next = current.checked_add(1).filter(|next| *next <= i32::MAX as u64).ok_or_else(|| {
-                crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{} identity space exhausted", object)
-            })?;
-            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            let next = current
+                .checked_add(1)
+                .filter(|next| *next <= i32::MAX as u64)
+                .ok_or_else(|| {
+                    crate::sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "{} identity space exhausted",
+                        object
+                    )
+                })?;
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(NonZeroU64::new(next).expect("a checked increment is nonzero")),
                 Err(observed) => current = observed,
             }
@@ -63,7 +73,6 @@ impl CatalogSources {
             lifetime,
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,10 +89,18 @@ pub(crate) struct RoleReference {
 }
 
 impl RoleReference {
-    pub(crate) fn slot(self) -> u16 { self.identity.slot }
-    pub(crate) fn oid(self) -> RoleOid { self.identity.lifetime }
-    pub(crate) fn source(self) -> SessionRole { SessionRole::Bound(self.identity) }
-    pub(crate) fn name(self) -> SqlName { self.name }
+    pub(crate) fn slot(self) -> u16 {
+        self.identity.slot
+    }
+    pub(crate) fn oid(self) -> RoleOid {
+        self.identity.lifetime
+    }
+    pub(crate) fn source(self) -> SessionRole {
+        SessionRole::Bound(self.identity)
+    }
+    pub(crate) fn name(self) -> SqlName {
+        self.name
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,20 +118,35 @@ pub(crate) struct SessionIdentity {
 
 impl SessionIdentity {
     pub(crate) fn bootstrap() -> Self {
-        Self { source: SessionRole::Bootstrap, name: crate::util::StackStr::from_str("postgres") }
+        Self {
+            source: SessionRole::Bootstrap,
+            name: crate::util::StackStr::from_str("postgres"),
+        }
     }
 
     pub(crate) fn unauthenticated(name: &str) -> Self {
-        Self { source: SessionRole::Unauthenticated, name: crate::util::StackStr::from_str(name) }
+        Self {
+            source: SessionRole::Unauthenticated,
+            name: crate::util::StackStr::from_str(name),
+        }
     }
 
     pub(crate) fn bound(role: RoleReference) -> Self {
-        Self { source: SessionRole::Bound(role.identity), name: crate::util::StackStr::from_str(role.name.as_str()) }
+        Self {
+            source: SessionRole::Bound(role.identity),
+            name: crate::util::StackStr::from_str(role.name.as_str()),
+        }
     }
 
-    pub(crate) fn source(self) -> SessionRole { self.source }
-    pub(crate) fn name(self) -> crate::util::StackStr<64> { self.name }
-    pub(crate) fn as_str(&self) -> &str { self.name.as_str() }
+    pub(crate) fn source(self) -> SessionRole {
+        self.source
+    }
+    pub(crate) fn name(self) -> crate::util::StackStr<64> {
+        self.name
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        self.name.as_str()
+    }
 
     pub(crate) fn refresh(self, storage: &Storage, transaction: u32) -> Self {
         // An absent identity has no usable spelling. Never resolve its old
@@ -123,14 +155,26 @@ impl SessionIdentity {
             Ok(role) => crate::util::StackStr::from_str(role.name.as_str()),
             Err(_) => crate::util::StackStr::new(),
         };
-        Self { source: self.source, name }
+        Self {
+            source: self.source,
+            name,
+        }
     }
 
     pub(crate) fn require_name(self) -> Result<crate::util::StackStr<64>, SqlError> {
-        if self.source != SessionRole::Unauthenticated && !self.name.as_str().is_empty() { return Ok(self.name); }
+        if self.source != SessionRole::Unauthenticated && !self.name.as_str().is_empty() {
+            return Ok(self.name);
+        }
         match self.source {
-            SessionRole::Bound(identity) => Err(crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "invalid role OID: {}", identity.lifetime.get())),
-            SessionRole::Bootstrap | SessionRole::Unauthenticated => Err(crate::sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "session role is not authenticated")),
+            SessionRole::Bound(identity) => Err(crate::sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "invalid role OID: {}",
+                identity.lifetime.get()
+            )),
+            SessionRole::Bootstrap | SessionRole::Unauthenticated => Err(crate::sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "session role is not authenticated"
+            )),
         }
     }
 }
@@ -142,27 +186,71 @@ impl Storage {
 
     pub(crate) fn restore_role_identity_sequence(&self, sequence: u64) -> Result<(), SqlError> {
         if !(RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
-            return Err(crate::sql_err!(sqlstate::DATA_EXCEPTION, "invalid role identity allocator"));
+            return Err(crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid role identity allocator"
+            ));
         }
-        self.catalog_sources.roles.fetch_max(sequence, Ordering::Relaxed);
+        self.catalog_sources
+            .roles
+            .fetch_max(sequence, Ordering::Relaxed);
         Ok(())
     }
 
     pub(crate) fn observe_role_oid(&self, oid: RoleOid) {
-        self.catalog_sources.roles.fetch_max(oid.get() as u64, Ordering::Relaxed);
+        self.catalog_sources
+            .roles
+            .fetch_max(oid.get() as u64, Ordering::Relaxed);
     }
 
-    pub(crate) fn role_login_snapshot(&self, name: &str) -> Option<(RoleReference, super::RoleAttributes)> {
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        let (slot, role) = catalog.roles.iter().enumerate().find(|(_, role)| role.visible_to(0) && role.name_to(0).as_str() == name)?;
-        Some((RoleReference { identity: self.catalog_sources.role(slot, role.lifetime.expect("a visible role has a source lifetime")), name: role.name_to(0) }, role.attributes_to(0)))
+    pub(crate) fn role_login_snapshot(
+        &self,
+        name: &str,
+    ) -> Option<(RoleReference, super::RoleAttributes)> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let (slot, role) = catalog
+            .roles
+            .iter()
+            .enumerate()
+            .find(|(_, role)| role.visible_to(0) && role.name_to(0).as_str() == name)?;
+        Some((
+            RoleReference {
+                identity: self.catalog_sources.role(
+                    slot,
+                    role.lifetime.expect("a visible role has a source lifetime"),
+                ),
+                name: role.name_to(0),
+            },
+            role.attributes_to(0),
+        ))
     }
 
-    pub(crate) fn capture_role(&self, name: &str, transaction: u32) -> Result<RoleReference, SqlError> {
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        let (slot, role) = catalog.roles.iter().enumerate().find(|(_, role)| {
-            role.visible_to(transaction) && role.name_to(transaction).as_str() == name
-        }).ok_or_else(|| crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "role \"{}\" does not exist", name))?;
+    pub(crate) fn capture_role(
+        &self,
+        name: &str,
+        transaction: u32,
+    ) -> Result<RoleReference, SqlError> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let (slot, role) = catalog
+            .roles
+            .iter()
+            .enumerate()
+            .find(|(_, role)| {
+                role.visible_to(transaction) && role.name_to(transaction).as_str() == name
+            })
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    name
+                )
+            })?;
         let lifetime = role.lifetime.expect("a visible role has a source lifetime");
         Ok(RoleReference {
             identity: self.catalog_sources.role(slot, lifetime),
@@ -170,11 +258,25 @@ impl Storage {
         })
     }
 
-    pub(crate) fn capture_role_slot(&self, slot: usize, transaction: u32) -> Result<RoleReference, SqlError> {
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        let role = catalog.roles.get(slot).filter(|role| role.visible_to(transaction)).ok_or_else(|| {
-            crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "role is not visible in the role catalog")
-        })?;
+    pub(crate) fn capture_role_slot(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<RoleReference, SqlError> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let role = catalog
+            .roles
+            .get(slot)
+            .filter(|role| role.visible_to(transaction))
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role is not visible in the role catalog"
+                )
+            })?;
         let lifetime = role.lifetime.expect("a visible role has a source lifetime");
         Ok(RoleReference {
             identity: self.catalog_sources.role(slot, lifetime),
@@ -188,33 +290,62 @@ impl Storage {
             SessionRole::Unauthenticated => return None,
             SessionRole::Bound(identity) => identity,
         };
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
         let slot = usize::from(identity.slot);
-        catalog.roles.get(slot).filter(|role| {
-            role.visible_to(transaction)
-                && role.lifetime == Some(identity.lifetime)
-                && identity.origin == self.catalog_sources.origin
-        }).map(|_| slot)
+        catalog
+            .roles
+            .get(slot)
+            .filter(|role| {
+                role.visible_to(transaction)
+                    && role.lifetime == Some(identity.lifetime)
+                    && identity.origin == self.catalog_sources.origin
+            })
+            .map(|_| slot)
     }
 
-    pub(crate) fn resolve_session_role(&self, source: SessionRole, transaction: u32) -> Result<RoleReference, SqlError> {
+    pub(crate) fn resolve_session_role(
+        &self,
+        source: SessionRole,
+        transaction: u32,
+    ) -> Result<RoleReference, SqlError> {
         let identity = match source {
             SessionRole::Bootstrap => self.catalog_sources.role(0, RoleOid::BOOTSTRAP),
             SessionRole::Unauthenticated => {
-                return Err(crate::sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "session role is not authenticated"));
+                return Err(crate::sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "session role is not authenticated"
+                ));
             }
             SessionRole::Bound(identity) => identity,
         };
         let slot = usize::from(identity.slot);
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        let role = catalog.roles.get(slot).filter(|role| {
-            role.visible_to(transaction)
-                && role.lifetime == Some(identity.lifetime)
-                && identity.origin == self.catalog_sources.origin
-        }).ok_or_else(|| crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "invalid role OID: {}", identity.lifetime.get()))?;
-        Ok(RoleReference { identity, name: role.name_to(transaction) })
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let role = catalog
+            .roles
+            .get(slot)
+            .filter(|role| {
+                role.visible_to(transaction)
+                    && role.lifetime == Some(identity.lifetime)
+                    && identity.origin == self.catalog_sources.origin
+            })
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "invalid role OID: {}",
+                    identity.lifetime.get()
+                )
+            })?;
+        Ok(RoleReference {
+            identity,
+            name: role.name_to(transaction),
+        })
     }
-
 }
 
 #[cfg(test)]
@@ -235,7 +366,10 @@ mod tests {
     fn catalog_creation_role_lifetimes_reject_exhaustion_without_reuse() {
         let counter = AtomicU64::new(i32::MAX as u64 - 1);
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(CatalogSources::reserve(&counter, "role").unwrap().get(), i32::MAX as u64);
+            assert_eq!(
+                CatalogSources::reserve(&counter, "role").unwrap().get(),
+                i32::MAX as u64
+            );
             for _ in 0..2 {
                 let error = CatalogSources::reserve(&counter, "role").unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);

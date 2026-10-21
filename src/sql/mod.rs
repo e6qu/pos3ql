@@ -2885,7 +2885,9 @@ impl Engine {
                     "subscription session targets a replaced stream"
                 )
             })?;
-        self.storage.capture_role_slot(subscription.ownership.owner_to(txid) as usize, txid).map(crate::storage::SessionIdentity::bound)
+        self.storage
+            .capture_role_slot(subscription.ownership.owner_to(txid) as usize, txid)
+            .map(crate::storage::SessionIdentity::bound)
     }
 
     pub(crate) fn enter_subscription_session(
@@ -2899,7 +2901,9 @@ impl Engine {
         eval::funcs::system::set_current_database(
             self.storage.current_database_name(txn.txid).as_str(),
         );
-        eval::funcs::system::set_session_user(guc.session_identity().refresh(&self.storage, txn.txid));
+        eval::funcs::system::set_session_user(
+            guc.session_identity().refresh(&self.storage, txn.txid),
+        );
         let role = guc.current_identity().refresh(&self.storage, txn.txid);
         eval::funcs::system::set_current_user(role);
         timezone::set_session(guc.timezone());
@@ -3131,10 +3135,9 @@ impl Engine {
             arena,
             trigger_context,
         );
-        let result = result.and_then(|()| {
+        result.and_then(|()| {
             exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
-        });
-        result
+        })
     }
 
     pub(crate) fn apply_subscription_delete(
@@ -3157,10 +3160,9 @@ impl Engine {
             arena,
             trigger_context,
         );
-        let result = result.and_then(|()| {
+        result.and_then(|()| {
             exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
-        });
-        result
+        })
     }
 
     pub(crate) fn apply_subscription_update(
@@ -3183,10 +3185,9 @@ impl Engine {
             arena,
             trigger_context,
         );
-        let result = result.and_then(|()| {
+        result.and_then(|()| {
             exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
-        });
-        result
+        })
     }
 
     pub(crate) fn begin_subscription_subtransaction(
@@ -3330,7 +3331,9 @@ impl Engine {
             self.storage
                 .object_owner(self.storage.table_access_object(table_slot, txid), txid)
         };
-        self.storage.capture_role_slot(owner, txid).map(crate::storage::SessionIdentity::bound)
+        self.storage
+            .capture_role_slot(owner, txid)
+            .map(crate::storage::SessionIdentity::bound)
     }
 
     pub(crate) fn coerce_parameter_null<'a>(
@@ -3460,16 +3463,23 @@ impl Engine {
 
     pub(crate) fn role_can_connect(&self, login: RoleLogin) -> bool {
         self.storage.session_role_slot(login.identity.source(), 0) == Some(usize::from(login.slot))
-            && self.storage.has_current_database_connect_privilege(usize::from(login.slot), 0)
+            && self
+                .storage
+                .has_current_database_connect_privilege(usize::from(login.slot), 0)
     }
 
     pub(crate) fn reserve_role_connection(&mut self, login: RoleLogin) -> bool {
-        if self.storage.session_role_slot(login.identity.source(), 0) != Some(usize::from(login.slot)) {
+        if self.storage.session_role_slot(login.identity.source(), 0)
+            != Some(usize::from(login.slot))
+        {
             return false;
         }
         let connections = &mut self.role_connections[usize::from(login.slot)];
         if connections.source != login.identity.source() {
-            *connections = RoleConnections { source: login.identity.source(), count: 0 };
+            *connections = RoleConnections {
+                source: login.identity.source(),
+                count: 0,
+            };
         }
         let count = &mut connections.count;
         if !login.superuser
@@ -3849,7 +3859,12 @@ impl Engine {
         }
         let mut role_connections = FixedVec::new(budget, "role_connections", config.max_roles)?;
         for _ in 0..config.max_roles {
-            role_connections.push(RoleConnections { source: crate::storage::SessionRole::Unauthenticated, count: 0 }).expect("sized to max_roles");
+            role_connections
+                .push(RoleConnections {
+                    source: crate::storage::SessionRole::Unauthenticated,
+                    count: 0,
+                })
+                .expect("sized to max_roles");
         }
         let mut logical_decoding_truncates = FixedVec::new(
             budget,
@@ -7439,7 +7454,15 @@ impl Engine {
             ));
         }
         let Some(owner) = self.storage.current_role_slot(txn.txid) else {
-            return Err(fail(self, txn, cursors, sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "current role does not exist")));
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role does not exist"
+                ),
+            ));
         };
         let owner = self.storage.role(owner).oid();
         let metadata = two_phase::PreparedTransactionMetadata {
@@ -7548,7 +7571,10 @@ impl Engine {
             ));
         }
         let current_role = self.storage.current_role_slot(txn.txid).ok_or_else(|| {
-            sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "permission denied to finish prepared transaction")
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to finish prepared transaction"
+            )
         })?;
         if self.storage.role(current_role).oid() != metadata.owner
             && !self
@@ -9022,7 +9048,9 @@ impl Engine {
                 if let Err(error) = self.apply_system_settings(guc) {
                     return Ok(Err(error));
                 }
-                if let Some(role) = self.storage.session_role_slot(guc.authenticated_identity().source(), 0)
+                if let Some(role) = self
+                    .storage
+                    .session_role_slot(guc.authenticated_identity().source(), 0)
                     && let Err(error) = self.apply_role_settings(role as u16, guc)
                 {
                     return Ok(Err(error));
@@ -12871,7 +12899,10 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
-        let owner = match self.storage.capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid) {
+        let owner = match self
+            .storage
+            .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
+        {
             Ok(role) => crate::storage::SessionIdentity::bound(role),
             Err(error) => return Ok(Err(error)),
         };
@@ -13158,7 +13189,10 @@ impl Engine {
             if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
                 return Ok(Err(error));
             }
-            let owner = match self.storage.capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid) {
+            let owner = match self
+                .storage
+                .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
+            {
                 Ok(role) => crate::storage::SessionIdentity::bound(role),
                 Err(error) => return Ok(Err(error)),
             };
@@ -13255,7 +13289,10 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
             return Ok(Err(error));
         }
-        let owner = match self.storage.capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid) {
+        let owner = match self
+            .storage
+            .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
+        {
             Ok(role) => crate::storage::SessionIdentity::bound(role),
             Err(error) => return Ok(Err(error)),
         };
@@ -14049,7 +14086,10 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
         }
-        let owner = match self.storage.capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid) {
+        let owner = match self
+            .storage
+            .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
+        {
             Ok(role) => crate::storage::SessionIdentity::bound(role),
             Err(error) => return Ok(Err(error)),
         };
@@ -14382,7 +14422,11 @@ impl Engine {
             })
         {
             last_name = Some(definition.name);
-            let owner = crate::storage::SessionIdentity::bound(self.storage.capture_role_slot(usize::from(routine.ownership.owner_to(txn.txid)), txn.txid)?);
+            let owner =
+                crate::storage::SessionIdentity::bound(self.storage.capture_role_slot(
+                    usize::from(routine.ownership.owner_to(txn.txid)),
+                    txn.txid,
+                )?);
             let _security = routine
                 .attributes
                 .security_definer
@@ -16543,7 +16587,12 @@ impl Engine {
                 if_not_exists,
                 elements,
             } => {
-                let resolved = match resolve_create_schema(*name, *authorization, eval::funcs::system::current_identity(), eval::funcs::system::session_identity()) {
+                let resolved = match resolve_create_schema(
+                    *name,
+                    *authorization,
+                    eval::funcs::system::current_identity(),
+                    eval::funcs::system::session_identity(),
+                ) {
                     Ok(resolved) => resolved,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -22778,7 +22827,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             let _ = storage.drop_fk(index, fk_name);
         }
-        WalOp::UpsertRole { name, attributes, oid } => {
+        WalOp::UpsertRole {
+            name,
+            attributes,
+            oid,
+        } => {
             storage.install_role(crate::storage::SqlName::parse(name)?, attributes, oid)?;
         }
         WalOp::DropRole { name } => storage.remove_role(name),

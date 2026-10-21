@@ -259,8 +259,13 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 true
             }
             Some("role_sequence") => {
-                if role_sequence.is_some() { return Err("duplicate role identity allocator"); }
-                let sequence: u64 = words.next().and_then(|word| word.parse().ok()).ok_or("invalid role identity allocator")?;
+                if role_sequence.is_some() {
+                    return Err("duplicate role identity allocator");
+                }
+                let sequence: u64 = words
+                    .next()
+                    .and_then(|word| word.parse().ok())
+                    .ok_or("invalid role identity allocator")?;
                 if !(crate::storage::RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
                     return Err("invalid role identity allocator");
                 }
@@ -3688,7 +3693,9 @@ impl Checkpointer {
         let lsn = metadata.lsn;
         let next_rowid = metadata.next_rowid;
         storage.restore_catalog_identity_sequence(metadata.catalog_sequence);
-        storage.restore_role_identity_sequence(metadata.role_sequence).map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
+        storage
+            .restore_role_identity_sequence(metadata.role_sequence)
+            .map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
@@ -4443,7 +4450,9 @@ impl Checkpointer {
                 }
                 Some("rol") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let oid = crate::storage::RoleOid::parse(parse_field(words.next(), "rol OID")?).filter(|oid| oid.get() as u64 <= metadata.role_sequence).ok_or(CheckpointSetupError::Corrupt("invalid rol OID"))?;
+                    let oid = crate::storage::RoleOid::parse(parse_field(words.next(), "rol OID")?)
+                        .filter(|oid| oid.get() as u64 <= metadata.role_sequence)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid rol OID"))?;
                     let name = decode_hex_name(
                         words
                             .next()
@@ -4819,7 +4828,10 @@ impl Checkpointer {
                     if storage.database_slot_by_oid(database, 0).is_none() {
                         return Err(CheckpointSetupError::Corrupt("ptx database does not exist"));
                     }
-                    let owner = crate::storage::RoleOid::parse(parse_field(words.next(), "ptx owner")?).filter(|oid| oid.get() as u64 <= metadata.role_sequence).ok_or(CheckpointSetupError::Corrupt("invalid ptx owner"))?;
+                    let owner =
+                        crate::storage::RoleOid::parse(parse_field(words.next(), "ptx owner")?)
+                            .filter(|oid| oid.get() as u64 <= metadata.role_sequence)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid ptx owner"))?;
                     let gid = decode_hex_name(
                         words
                             .next()
@@ -9155,7 +9167,10 @@ impl Checkpointer {
             &mut self.manifest_output,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
-        write_manifest(&mut self.manifest_output, format_args!("role_sequence {}", storage.role_identity_sequence()))?;
+        write_manifest(
+            &mut self.manifest_output,
+            format_args!("role_sequence {}", storage.role_identity_sequence()),
+        )?;
         let mut identity_result = Ok(());
         storage.visit_transaction_identity_state(|record| {
             if identity_result.is_err() {

@@ -18623,7 +18623,10 @@ fn parameter_acls_are_typed_enforced_and_visible() {
         String::from_utf8_lossy(&output)
     );
     let mut operator = GucState::new();
-    operator.set_role(engine.role_login("parameter_operator").unwrap().identity, false);
+    operator.set_role(
+        engine.role_login("parameter_operator").unwrap().identity,
+        false,
+    );
     let output = run_session(
         &mut engine,
         &mut budget,
@@ -18729,7 +18732,10 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     let mut delegate = GucState::new();
-    delegate.set_role(engine.role_login("parameter_delegate").unwrap().identity, false);
+    delegate.set_role(
+        engine.role_login("parameter_delegate").unwrap().identity,
+        false,
+    );
     let output = run_session(
         &mut engine,
         &mut budget,
@@ -19212,14 +19218,24 @@ fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let output = run_with(&mut engine, &mut budget,
-        "CREATE ROLE unused_source_role; CREATE ROLE retained_source_role");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE unused_source_role; CREATE ROLE retained_source_role",
+    );
     assert!(!message_types(&output).contains(&b'E'));
     let prior_slot = engine.storage.find_role("retained_source_role").unwrap();
     let oid = engine.storage.role_oid(prior_slot);
-    let output = run_with(&mut engine, &mut budget,
-        "SET ROLE retained_source_role; BEGIN; SELECT 1; PREPARE TRANSACTION 'retained-owner'");
-    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE retained_source_role; BEGIN; SELECT 1; PREPARE TRANSACTION 'retained-owner'",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     let output = run_with(&mut engine, &mut budget, "DROP ROLE unused_source_role");
     assert!(!message_types(&output).contains(&b'E'));
     assert!(engine.checkpoint().unwrap());
@@ -19231,10 +19247,24 @@ fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
     assert_ne!(slot, prior_slot);
     assert_eq!(recovered.storage.role_oid(slot), oid);
     let mut actor = GucState::new();
-    actor.bind_session_user(recovered.role_login("retained_source_role").unwrap().identity);
-    let output = run_with_guc(&mut recovered, &mut recovered_budget,
-        "COMMIT PREPARED 'retained-owner'", 1 << 18, &mut actor);
-    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+    actor.bind_session_user(
+        recovered
+            .role_login("retained_source_role")
+            .unwrap()
+            .identity,
+    );
+    let output = run_with_guc(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'retained-owner'",
+        1 << 18,
+        &mut actor,
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -19243,66 +19273,147 @@ fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
 #[test]
 fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
     for checkpoint in [false, true] {
-        let mut config = test_config(if checkpoint { "role-owner-checkpoint" } else { "role-owner-journal" });
+        let mut config = test_config(if checkpoint {
+            "role-owner-checkpoint"
+        } else {
+            "role-owner-journal"
+        });
         config.object_store_on = true;
         config.object_store_sim = true;
-    config.wal_upload = true;
-    config.wal_upload_sync = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
         config.object_store_bucket = format!("role-owner-{}-{}", checkpoint, std::process::id());
         config.max_prepared_transactions = 2;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_prepared_owner");
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE source_prepared_owner",
+        );
         assert!(!message_types(&output).contains(&b'E'));
         let original_slot = engine.storage.find_role("source_prepared_owner").unwrap();
         let original_oid = engine.storage.role_oid(original_slot);
-        let output = run_with(&mut engine, &mut budget,
-            "SET ROLE source_prepared_owner; BEGIN; SELECT 1; PREPARE TRANSACTION 'source-owner'");
-        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
-        let output = run_with(&mut engine, &mut budget,
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE source_prepared_owner; BEGIN; SELECT 1; PREPARE TRANSACTION 'source-owner'",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let output = run_with(
+            &mut engine,
+            &mut budget,
             "ALTER ROLE source_prepared_owner RENAME TO renamed_prepared_owner;
-             SELECT owner FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+             SELECT owner FROM pg_prepared_xacts WHERE gid = 'source-owner'",
+        );
         assert_eq!(data_rows(&output), ["renamed_prepared_owner"]);
         let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_prepared_owner");
-        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
-        let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_prepared_owner");
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE source_prepared_owner",
+        );
         assert!(!message_types(&output).contains(&b'E'));
         let replacement_slot = engine.storage.find_role("source_prepared_owner").unwrap();
         let replacement_oid = engine.storage.role_oid(replacement_slot);
         assert_eq!(original_slot, replacement_slot);
         assert_ne!(original_oid, replacement_oid);
-        let output = run_with(&mut engine, &mut budget,
-            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'",
+        );
         assert_eq!(data_rows(&output), ["t"]);
         let mut actor = GucState::new();
         actor.bind_session_user(engine.role_login("source_prepared_owner").unwrap().identity);
         for command in ["COMMIT", "ROLLBACK"] {
-            let output = run_with_guc(&mut engine, &mut budget,
-                &format!("{command} PREPARED 'source-owner'"), 1 << 18, &mut actor);
-            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"), "{}", String::from_utf8_lossy(&output));
+            let output = run_with_guc(
+                &mut engine,
+                &mut budget,
+                &format!("{command} PREPARED 'source-owner'"),
+                1 << 18,
+                &mut actor,
+            );
+            assert!(
+                String::from_utf8_lossy(&output)
+                    .contains("permission denied to finish prepared transaction"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
         }
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
-        let replacement_slot = recovered.storage.find_role("source_prepared_owner").unwrap();
-        assert_eq!(recovered.storage.role_oid(replacement_slot), replacement_oid);
-        let output = run_with(&mut recovered, &mut recovered_budget,
-            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'");
+        let replacement_slot = recovered
+            .storage
+            .find_role("source_prepared_owner")
+            .unwrap();
+        assert_eq!(
+            recovered.storage.role_oid(replacement_slot),
+            replacement_oid
+        );
+        let output = run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'source-owner'",
+        );
         assert_eq!(data_rows(&output), ["t"]);
         let mut actor = GucState::new();
-        actor.bind_session_user(recovered.role_login("source_prepared_owner").unwrap().identity);
+        actor.bind_session_user(
+            recovered
+                .role_login("source_prepared_owner")
+                .unwrap()
+                .identity,
+        );
         for command in ["COMMIT", "ROLLBACK"] {
-            let output = run_with_guc(&mut recovered, &mut recovered_budget,
-                &format!("{command} PREPARED 'source-owner'"), 1 << 18, &mut actor);
-            assert!(String::from_utf8_lossy(&output).contains("permission denied to finish prepared transaction"), "{}", String::from_utf8_lossy(&output));
+            let output = run_with_guc(
+                &mut recovered,
+                &mut recovered_budget,
+                &format!("{command} PREPARED 'source-owner'"),
+                1 << 18,
+                &mut actor,
+            );
+            assert!(
+                String::from_utf8_lossy(&output)
+                    .contains("permission denied to finish prepared transaction"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
         }
-        let output = run_with(&mut recovered, &mut recovered_budget, "ROLLBACK PREPARED 'source-owner'");
-        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
-        let output = run_with(&mut recovered, &mut recovered_budget, "CREATE ROLE next_source_owner");
-        assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
+        let output = run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "ROLLBACK PREPARED 'source-owner'",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let output = run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "CREATE ROLE next_source_owner",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
         let next = recovered.storage.find_role("next_source_owner").unwrap();
         assert!(recovered.storage.role_oid(next) > replacement_oid);
         drop(recovered);
@@ -19314,7 +19425,9 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
 #[test]
 fn catalog_creation_schema_authorization_uses_the_function_owner() {
     let (mut engine, mut budget) = test_engine();
-    let output = run_with(&mut engine, &mut budget,
+    let output = run_with(
+        &mut engine,
+        &mut budget,
         "CREATE ROLE source_schema_owner SUPERUSER;
          CREATE FUNCTION source_create_schema() RETURNS void LANGUAGE plpgsql SECURITY DEFINER
            AS $$ BEGIN EXECUTE 'CREATE SCHEMA AUTHORIZATION CURRENT_USER'; END $$;
@@ -19322,26 +19435,47 @@ fn catalog_creation_schema_authorization_uses_the_function_owner() {
          SELECT source_create_schema();
          SELECT namespace.nspname::text, owner.rolname::text
            FROM pg_namespace namespace JOIN pg_roles owner ON owner.oid = namespace.nspowner
-          WHERE namespace.nspname = 'source_schema_owner';");
-    assert!(!message_types(&output).contains(&b'E'), "{}", String::from_utf8_lossy(&output));
-    assert!(data_rows(&output).iter().any(|row| row == "source_schema_owner|source_schema_owner"));
+          WHERE namespace.nspname = 'source_schema_owner';",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row == "source_schema_owner|source_schema_owner")
+    );
 }
 
 #[test]
 fn catalog_creation_connection_limits_follow_role_lifetimes() {
     let (mut engine, mut budget) = test_engine();
-    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1",
+    );
     assert!(!message_types(&output).contains(&b'E'));
     let original = engine.role_login("source_login").unwrap();
     assert!(engine.reserve_role_connection(original));
     assert!(!engine.reserve_role_connection(original));
-    let output = run_with(&mut engine, &mut budget, "ALTER ROLE source_login RENAME TO renamed_login");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER ROLE source_login RENAME TO renamed_login",
+    );
     assert!(!message_types(&output).contains(&b'E'));
     let renamed = engine.role_login("renamed_login").unwrap();
     assert!(!engine.reserve_role_connection(renamed));
     let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_login");
     assert!(!message_types(&output).contains(&b'E'));
-    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1",
+    );
     assert!(!message_types(&output).contains(&b'E'));
     let replacement = engine.role_login("source_login").unwrap();
     assert_eq!(original.slot, replacement.slot);
@@ -19362,7 +19496,21 @@ fn catalog_creation_backend_ownership_rejects_replacement_roles() {
     let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_backend LOGIN");
     assert!(!message_types(&output).contains(&b'E'));
     let original = engine.role_login("source_backend").unwrap();
-    engine.register_backend(2001, crate::storage::DatabaseOid::POSTGRES, original.identity, "source_backend", None, -1, 1, false, None, None, None).unwrap();
+    engine
+        .register_backend(
+            2001,
+            crate::storage::DatabaseOid::POSTGRES,
+            original.identity,
+            "source_backend",
+            None,
+            -1,
+            1,
+            false,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     let output = run_with(&mut engine, &mut budget, "DROP ROLE source_backend");
     assert!(!message_types(&output).contains(&b'E'));
     let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_backend LOGIN");
@@ -19371,8 +19519,22 @@ fn catalog_creation_backend_ownership_rejects_replacement_roles() {
     assert_eq!(original.slot, replacement.slot);
     let _source = eval::funcs::system::enter_current_user(replacement.identity);
     crate::mem::guard::forbid_alloc(|| {
-        assert_eq!(engine.storage.request_backend_signal(2001, false, 0).unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
-        assert_eq!(engine.storage.request_backend_signal(2001, true, 0).unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert_eq!(
+            engine
+                .storage
+                .request_backend_signal(2001, false, 0)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INSUFFICIENT_PRIVILEGE
+        );
+        assert_eq!(
+            engine
+                .storage
+                .request_backend_signal(2001, true, 0)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INSUFFICIENT_PRIVILEGE
+        );
         assert!(engine.storage.take_backend_signal().is_none());
         engine.storage.with_backend_activities(|activities| {
             assert_eq!(activities.len(), 1);
@@ -70516,7 +70678,12 @@ fn publication_owner_changes_are_transactional_and_durable() {
          GRANT CREATE ON DATABASE postgres TO publication_first_owner",
     );
     let mut first_owner = GucState::new();
-    first_owner.bind_session_user(engine.role_login("publication_first_owner").unwrap().identity);
+    first_owner.bind_session_user(
+        engine
+            .role_login("publication_first_owner")
+            .unwrap()
+            .identity,
+    );
     run_with_guc(
         &mut engine,
         &mut budget,
@@ -70546,7 +70713,12 @@ fn publication_owner_changes_are_transactional_and_durable() {
         "ALTER PUBLICATION publication_owner_changes OWNER TO publication_second_owner",
     );
     let mut second_owner = GucState::new();
-    second_owner.bind_session_user(engine.role_login("publication_second_owner").unwrap().identity);
+    second_owner.bind_session_user(
+        engine
+            .role_login("publication_second_owner")
+            .unwrap()
+            .identity,
+    );
     let altered = run_with_guc(
         &mut engine,
         &mut budget,

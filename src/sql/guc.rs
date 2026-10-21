@@ -1425,7 +1425,11 @@ impl GucState {
         self.set_role(session_user, local);
     }
 
-    pub(crate) fn set_session_authorization(&self, role: crate::storage::SessionIdentity, local: bool) {
+    pub(crate) fn set_session_authorization(
+        &self,
+        role: crate::storage::SessionIdentity,
+        local: bool,
+    ) {
         let mut store = self.store.borrow_mut();
         store.current.session_authorization = role;
         store.current.current_role = role;
@@ -1452,11 +1456,18 @@ impl GucState {
         self.authenticated_user
     }
 
-    pub(crate) fn refresh_identities(&mut self, storage: &crate::storage::Storage, transaction: u32) {
+    pub(crate) fn refresh_identities(
+        &mut self,
+        storage: &crate::storage::Storage,
+        transaction: u32,
+    ) {
         self.authenticated_user = self.authenticated_user.refresh(storage, transaction);
         let mut store = self.store.borrow_mut();
         store.current.current_role = store.current.current_role.refresh(storage, transaction);
-        store.current.session_authorization = store.current.session_authorization.refresh(storage, transaction);
+        store.current.session_authorization = store
+            .current
+            .session_authorization
+            .refresh(storage, transaction);
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {

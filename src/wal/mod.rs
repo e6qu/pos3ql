@@ -3878,7 +3878,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             statistics,
         } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
-        WalOp::UpsertRole { name, attributes, .. } => {
+        WalOp::UpsertRole {
+            name, attributes, ..
+        } => {
             let credential_len = match attributes.password {
                 None => 0,
                 Some(crate::storage::RoleCredential::Scram(password)) => {
@@ -3886,7 +3888,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 }
                 Some(crate::storage::RoleCredential::Md5(_)) => 32,
             };
-            4 + 1 + name.len()
+            4 + 1
+                + name.len()
                 + 2
                 + 4
                 + 1
@@ -6047,7 +6050,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::UpsertRole { name, attributes, oid } => {
+        WalOp::UpsertRole {
+            name,
+            attributes,
+            oid,
+        } => {
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
                 | (u16::from(attributes.create_role) << 2)
@@ -8791,7 +8798,9 @@ fn decode_op_inner<'a>(
         KIND_PREPARE_TRANSACTION => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
-            let owner = crate::storage::RoleOid::parse(i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?))?;
+            let owner = crate::storage::RoleOid::parse(i32::from_le_bytes(
+                payload.get(at..at + 4)?.try_into().ok()?,
+            ))?;
             at += 4;
             let database = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
@@ -10983,7 +10992,9 @@ fn decode_op_inner<'a>(
             })
         }
         KIND_UPSERT_ROLE => decode_large_op(|| {
-            let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?))?;
+            let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
+                payload.get(at..at + 4)?.try_into().ok()?,
+            ))?;
             at += 4;
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);

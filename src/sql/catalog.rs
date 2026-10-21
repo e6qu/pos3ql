@@ -9684,14 +9684,17 @@ fn catalog_owner_name(storage: &Storage, owner: CatalogOwner, txid: u32) -> SqlN
 }
 
 fn owner_oid(storage: &Storage, class: crate::storage::AccessClass, slot: usize, txid: u32) -> i32 {
-    catalog_owner_oid(storage, catalog_owner(
+    catalog_owner_oid(
         storage,
-        crate::storage::AccessObject {
-            class,
-            slot: slot as u16,
-        },
-        txid,
-    ))
+        catalog_owner(
+            storage,
+            crate::storage::AccessObject {
+                class,
+                slot: slot as u16,
+            },
+            txid,
+        ),
+    )
 }
 
 fn owner_name<'a>(
@@ -16034,7 +16037,11 @@ fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     }
 }
 
-fn policy_role_oids<'a>(storage: &Storage, roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn policy_role_oids<'a>(
+    storage: &Storage,
+    roles: &[u16],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let values = arena
         .alloc_slice_with(roles.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
@@ -16885,9 +16892,7 @@ fn pg_publication<'a>(
                 Datum::Int4(6104),
                 Datum::Int4(publication_oid(slot)),
                 text(publication.name_for(txid).as_str(), arena)?,
-                Datum::Int4(storage.role_oid(
-                    publication.ownership.owner_to(txid) as usize
-                )),
+                Datum::Int4(storage.role_oid(publication.ownership.owner_to(txid) as usize)),
                 Datum::Bool(definition.all_tables),
                 Datum::Bool(definition.publish_insert),
                 Datum::Bool(definition.publish_update),
@@ -18183,9 +18188,7 @@ fn pg_subscription<'a>(
                 Datum::Int4(storage.current_database_oid().get()),
                 skip_lsn,
                 text(subscription.name.as_str(), arena)?,
-                Datum::Int4(storage.role_oid(
-                    subscription.ownership.owner_to(txid) as usize
-                )),
+                Datum::Int4(storage.role_oid(subscription.ownership.owner_to(txid) as usize)),
                 Datum::Bool(subscription.enabled_to(txid)),
                 Datum::Bool(definition.behavior.binary),
                 text(definition.behavior.streaming.pg_code(), arena)?,
@@ -25257,9 +25260,7 @@ fn pg_event_trigger<'a>(
                 Datum::Int4(storage.event_trigger(slot).oid()),
                 text(event_trigger.name.as_str(), arena)?,
                 text(event_trigger.event.name(), arena)?,
-                Datum::Int4(storage.role_oid(usize::from(
-                    event_trigger.ownership.owner_to(txid),
-                ))),
+                Datum::Int4(storage.role_oid(usize::from(event_trigger.ownership.owner_to(txid)))),
                 Datum::Int4(crate::storage::routine_oid(&routine)),
                 Datum::Bpchar(match event_trigger.enabled {
                     crate::storage::TriggerEnabled::Origin => "O",
@@ -26995,7 +26996,9 @@ fn pg_stat_activity<'a>(
             let database_name = storage
                 .database_slot_by_oid(activity.database, txid)
                 .map(|slot| storage.database_definition(slot, txid).name);
-            let role = storage.resolve_session_role(activity.role.source(), txid).ok();
+            let role = storage
+                .resolve_session_role(activity.role.source(), txid)
+                .ok();
             let activity_role = role.map(|role| usize::from(role.slot()));
             let role_name = role.map(|role| role.name());
             let visible = activity.pid == storage.current_connection_id()
@@ -27016,7 +27019,10 @@ fn pg_stat_activity<'a>(
                     Datum::Int4(activity.pid),
                     Datum::Null,
                     Datum::Oid(activity.role.oid().get() as u32),
-                    match role_name { Some(name) => text(name.as_str(), arena)?, None => Datum::Null },
+                    match role_name {
+                        Some(name) => text(name.as_str(), arena)?,
+                        None => Datum::Null,
+                    },
                     text(activity.application_name.as_str(), arena)?,
                     activity.client_addr.map_or(Datum::Null, Datum::Inet),
                     Datum::Null,
@@ -29997,9 +30003,7 @@ fn pg_database<'a>(
             &[
                 Datum::Int4(database.oid.get()),
                 text(database_definition.name.as_str(), arena)?,
-                Datum::Int4(storage.role_oid(usize::from(
-                    database.ownership.owner_to(txid),
-                ))),
+                Datum::Int4(storage.role_oid(usize::from(database.ownership.owner_to(txid)))),
                 Datum::Int4(database_definition.encoding.code()),
                 text(
                     core::str::from_utf8(&[database_definition.locale_provider.code()])

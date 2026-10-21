@@ -3464,7 +3464,10 @@ fn execute_row_trigger_body<'a>(
     let routine = context
         .storage()
         .routine_for(usize::from(trigger.function), context.txn.txid);
-    let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(routine.ownership.owner_to(context.txn.txid).into(), context.txn.txid)?);
+    let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(
+        routine.ownership.owner_to(context.txn.txid).into(),
+        context.txn.txid,
+    )?);
     let _security = routine
         .attributes
         .security_definer
@@ -7999,7 +8002,9 @@ pub fn set_role(
 ) -> Outcome {
     let Some(written) = role else {
         guc.reset_role(local);
-        super::eval::funcs::system::set_current_user(guc.current_identity().refresh(storage, txn.txid));
+        super::eval::funcs::system::set_current_user(
+            guc.current_identity().refresh(storage, txn.txid),
+        );
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     };
@@ -8012,8 +8017,8 @@ pub fn set_role(
         ));
     };
     let current_slot = storage.session_role_slot(guc.session_identity().source(), txn.txid);
-    let current_superuser = current_slot
-        .is_some_and(|slot| storage.role(slot).attributes_to(txn.txid).superuser);
+    let current_superuser =
+        current_slot.is_some_and(|slot| storage.role(slot).attributes_to(txn.txid).superuser);
     if !current_superuser
         && !current_slot.is_some_and(|member| storage.role_can_set(member, target, txn.txid))
     {
@@ -8044,12 +8049,18 @@ pub fn set_session_authorization(
 ) -> Outcome {
     if role.is_none() {
         guc.reset_session_authorization(local);
-        super::eval::funcs::system::set_session_user(guc.session_identity().refresh(storage, txn.txid));
-        super::eval::funcs::system::set_current_user(guc.current_identity().refresh(storage, txn.txid));
+        super::eval::funcs::system::set_session_user(
+            guc.session_identity().refresh(storage, txn.txid),
+        );
+        super::eval::funcs::system::set_current_user(
+            guc.current_identity().refresh(storage, txn.txid),
+        );
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     }
-    let Some(authenticated_slot) = storage.session_role_slot(guc.authenticated_identity().source(), txn.txid) else {
+    let Some(authenticated_slot) =
+        storage.session_role_slot(guc.authenticated_identity().source(), txn.txid)
+    else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
             "authenticated role \"{}\" no longer exists",
@@ -9055,7 +9066,9 @@ pub fn reassign_owned(
             }
         }
     }
-    let source_oids = match arena.alloc_slice_with(source_count, |index| storage.role_oid(usize::from(source_roles[index]))) {
+    let source_oids = match arena.alloc_slice_with(source_count, |index| {
+        storage.role_oid(usize::from(source_roles[index]))
+    }) {
         Ok(oids) => oids,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -9806,7 +9819,9 @@ pub(crate) fn drop_owned(
         }
     }
 
-    let owned_oids = match arena.alloc_slice_with(owned_roles.len(), |index| storage.role_oid(usize::from(owned_roles[index]))) {
+    let owned_oids = match arena.alloc_slice_with(owned_roles.len(), |index| {
+        storage.role_oid(usize::from(owned_roles[index]))
+    }) {
         Ok(oids) => oids,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -9946,10 +9961,10 @@ pub(crate) fn drop_owned(
                 txn.txid,
             );
             let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return sql_fail(error),
-        };
-        let outcome = run_as_role(owner, || {
+                Ok(role) => crate::storage::SessionIdentity::bound(role),
+                Err(error) => return sql_fail(error),
+            };
+            let outcome = run_as_role(owner, || {
                 responder.without_command_complete(|responder| {
                     drop_schema(
                         storage,
@@ -10075,10 +10090,10 @@ pub(crate) fn drop_owned(
                 name: name.as_str(),
             };
             let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return sql_fail(error),
-        };
-        let outcome = run_as_role(owner, || {
+                Ok(role) => crate::storage::SessionIdentity::bound(role),
+                Err(error) => return sql_fail(error),
+            };
+            let outcome = run_as_role(owner, || {
                 responder.without_command_complete(|responder| match class {
                     AccessClass::Sequence => drop_sequence(
                         storage,
@@ -10307,10 +10322,10 @@ pub(crate) fn drop_owned(
             let schema = storage.schema_def(slot).name;
             let owner = storage.role_name(storage.object_owner(object, txn.txid), txn.txid);
             let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return sql_fail(error),
-        };
-        let outcome = run_as_role(owner, || {
+                Ok(role) => crate::storage::SessionIdentity::bound(role),
+                Err(error) => return sql_fail(error),
+            };
+            let outcome = run_as_role(owner, || {
                 responder.without_command_complete(|responder| {
                     drop_schema(
                         storage,
@@ -13251,10 +13266,10 @@ pub(crate) fn drop_schema(
                     name: definition.name.as_str(),
                 };
                 let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return sql_fail(error),
-        };
-        let outcome = run_as_role(owner, || {
+                    Ok(role) => crate::storage::SessionIdentity::bound(role),
+                    Err(error) => return sql_fail(error),
+                };
+                let outcome = run_as_role(owner, || {
                     responder.without_command_complete(|responder| {
                         drop_collation(
                             storage,
@@ -13293,10 +13308,10 @@ pub(crate) fn drop_schema(
                     name: definition.name.as_str(),
                 };
                 let owner = match storage.capture_role(owner.as_str(), txn.txid) {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return sql_fail(error),
-        };
-        let outcome = run_as_role(owner, || {
+                    Ok(role) => crate::storage::SessionIdentity::bound(role),
+                    Err(error) => return sql_fail(error),
+                };
+                let outcome = run_as_role(owner, || {
                     responder.without_command_complete(|responder| {
                         drop_conversion(storage, &mut *wal, txn, &qualified, false, true, responder)
                     })
@@ -21224,9 +21239,12 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
     } = query.statement
     {
         let resolved = match &context.host {
-            PlpgsqlExecHost::Routine { .. } => {
-                super::resolve_create_schema(*name, *authorization, super::eval::funcs::system::current_identity(), super::eval::funcs::system::session_identity())?
-            }
+            PlpgsqlExecHost::Routine { .. } => super::resolve_create_schema(
+                *name,
+                *authorization,
+                super::eval::funcs::system::current_identity(),
+                super::eval::funcs::system::session_identity(),
+            )?,
             PlpgsqlExecHost::Atomic { .. } => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -21280,7 +21298,16 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         dynamic_utility_outcome(outcome)?;
 
         let prior_user = crate::sql::eval::funcs::system::current_identity();
-        let authorization_identity = resolved.authorization.as_ref().map(|owner| context.storage().capture_role(owner.as_str(), context.txn.txid).map(crate::storage::SessionIdentity::bound)).transpose()?;
+        let authorization_identity = resolved
+            .authorization
+            .as_ref()
+            .map(|owner| {
+                context
+                    .storage()
+                    .capture_role(owner.as_str(), context.txn.txid)
+                    .map(crate::storage::SessionIdentity::bound)
+            })
+            .transpose()?;
         let prior_role = {
             let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
                 unreachable!("schema creation requires a routine execution host")
@@ -26938,7 +26965,10 @@ fn fire_statement_triggers_with_rows<'a>(
         let routine = context
             .storage()
             .routine_for(usize::from(trigger.function), context.txn.txid);
-        let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(routine.ownership.owner_to(context.txn.txid).into(), context.txn.txid)?);
+        let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(
+            routine.ownership.owner_to(context.txn.txid).into(),
+            context.txn.txid,
+        )?);
         let _security = routine
             .attributes
             .security_definer

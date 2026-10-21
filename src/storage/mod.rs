@@ -6,8 +6,7 @@
 //! are fixed at startup.
 
 mod catalog_sources;
-pub use catalog_sources::RoleOid;
-pub(crate) use catalog_sources::{SessionIdentity, SessionRole};
+pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -12292,7 +12291,10 @@ pub struct RoleDef {
 }
 
 impl RoleDef {
-    pub(crate) fn oid(&self) -> RoleOid { self.lifetime.expect("a selected role has a durable identity") }
+    pub(crate) fn oid(&self) -> RoleOid {
+        self.lifetime
+            .expect("a selected role has a durable identity")
+    }
 
     pub fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
@@ -16344,10 +16346,13 @@ impl Storage {
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
         let current_superuser = self.role(current_role).attributes_to(txid).superuser;
         let target_role = self.session_role_slot(target.role.source(), txid);
-        let target_superuser = target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
+        let target_superuser =
+            target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
         if target.pid != self.current_connection_id()
             && !current_superuser
-            && (target_superuser || !target_role.is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
+            && (target_superuser
+                || !target_role
+                    .is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
         {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -18674,7 +18679,11 @@ impl Storage {
         for slot in 0..config.max_roles {
             roles
                 .push(RoleDef {
-                    lifetime: if slot == 0 { Some(RoleOid::BOOTSTRAP) } else { None },
+                    lifetime: if slot == 0 {
+                        Some(RoleOid::BOOTSTRAP)
+                    } else {
+                        None
+                    },
                     name: if slot == 0 {
                         SqlName::parse("postgres").expect("bootstrap role name fits")
                     } else {
@@ -22568,7 +22577,8 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, role)| {
-                (role.visible_to(txid) && role.lifetime.is_some_and(|source| source.get() == oid)).then_some(slot)
+                (role.visible_to(txid) && role.lifetime.is_some_and(|source| source.get() == oid))
+                    .then_some(slot)
             })
     }
 
@@ -22660,14 +22670,12 @@ impl Storage {
         if txid == 0 {
             return Ok(Ownership::BOOTSTRAP);
         }
-        let owner = self
-            .current_role_slot(txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "current role is not present in the role catalog"
-                )
-            })? as u16;
+        let owner = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })? as u16;
         Ok(Ownership {
             owner: 0,
             pending: Some(PendingOwnership { txid, owner }),
@@ -22701,7 +22709,10 @@ impl Storage {
     }
 
     pub(crate) fn current_role_slot(&self, txid: u32) -> Option<usize> {
-        self.session_role_slot(crate::sql::eval::funcs::system::current_identity().source(), txid)
+        self.session_role_slot(
+            crate::sql::eval::funcs::system::current_identity().source(),
+            txid,
+        )
     }
 
     pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
@@ -26172,9 +26183,7 @@ impl Storage {
     }
 
     pub(crate) fn initial_catalog_owner(&self, txid: u32) -> Result<i32, SqlError> {
-        Ok(self.role_oid(usize::from(
-            self.initial_ownership(txid)?.owner_to(txid),
-        )))
+        Ok(self.role_oid(usize::from(self.initial_ownership(txid)?.owner_to(txid))))
     }
 
     pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -26437,22 +26446,47 @@ impl Storage {
         attributes: RoleAttributes,
         oid: RoleOid,
     ) -> Result<usize, SqlError> {
-        let mut catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        if catalog.roles.iter().any(|role| role.pending.is_some_and(|pending| {
-            role.lifetime == Some(oid) || role.name == name || pending.name == name
-        })) {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "stored role replaces a pending role definition"));
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if catalog.roles.iter().any(|role| {
+            role.pending.is_some_and(|pending| {
+                role.lifetime == Some(oid) || role.name == name || pending.name == name
+            })
+        }) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "stored role replaces a pending role definition"
+            ));
         }
-        let named = catalog.roles.iter().position(|role| role.live && role.name == name);
-        let identified = catalog.roles.iter().position(|role| role.live && role.lifetime == Some(oid));
+        let named = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name == name);
+        let identified = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.lifetime == Some(oid));
         if named.is_some() && named != identified {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored role name identifies a different role"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role name identifies a different role"
+            ));
         }
         let slot = match identified {
             Some(slot) => slot,
-            None => catalog.roles.iter().position(|role| !role.live && role.pending.is_none()).ok_or_else(|| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many roles (limit {})", catalog.roles.len())
-            })?,
+            None => catalog
+                .roles
+                .iter()
+                .position(|role| !role.live && role.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many roles (limit {})",
+                        catalog.roles.len()
+                    )
+                })?,
         };
         self.observe_role_oid(oid);
         catalog.roles[slot] = RoleDef {
@@ -53638,22 +53672,46 @@ mod tests {
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
         let name = SqlName::parse("installed_actor").unwrap();
-        let (slot, _) = storage.create_role(name, RoleAttributes::ORDINARY, 7).unwrap();
+        let (slot, _) = storage
+            .create_role(name, RoleAttributes::ORDINARY, 7)
+            .unwrap();
         let oid = storage.role(slot).oid();
         let sequence = storage.role_identity_sequence();
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, oid).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, oid)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             assert!(storage.role(slot).visible_to(7));
             assert!(!storage.role(slot).visible_to(0));
             storage.commit_role_change(slot);
-            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, oid).unwrap(), slot);
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, oid)
+                    .unwrap(),
+                slot
+            );
             let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
             let other_oid = RoleOid::parse(16_400).unwrap();
-            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, other_oid).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, other_oid)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             assert_eq!(storage.role_identity_sequence(), sequence);
             assert_eq!(storage.role_oid(slot), oid.get());
             let renamed = SqlName::parse("installed_renamed_actor").unwrap();
-            assert_eq!(storage.install_role(renamed, RoleAttributes::ORDINARY, oid).unwrap(), slot);
+            assert_eq!(
+                storage
+                    .install_role(renamed, RoleAttributes::ORDINARY, oid)
+                    .unwrap(),
+                slot
+            );
             assert_eq!(actor.refresh(&storage, 0).name().as_str(), renamed.as_str());
         });
     }
@@ -53663,11 +53721,19 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
-        storage.restore_role_identity_sequence(i32::MAX as u64).unwrap();
+        storage
+            .restore_role_identity_sequence(i32::MAX as u64)
+            .unwrap();
         let sequence = storage.catalog_identity_sequence();
         crate::mem::guard::forbid_alloc(|| {
             for _ in 0..2 {
-                let error = storage.create_role(SqlName::parse("exhausted_actor").unwrap(), RoleAttributes::ORDINARY, 7).unwrap_err();
+                let error = storage
+                    .create_role(
+                        SqlName::parse("exhausted_actor").unwrap(),
+                        RoleAttributes::ORDINARY,
+                        7,
+                    )
+                    .unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 assert_eq!(error.message.as_str(), "role identity space exhausted");
                 assert!(storage.find_role_visible("exhausted_actor", 7).is_none());
@@ -53688,7 +53754,10 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert!(storage.current_role_slot(7).is_none());
             assert_missing_creation_actor(storage.initial_ownership(7));
-            assert_eq!(actor.require_name().unwrap_err().sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+            assert_eq!(
+                actor.require_name().unwrap_err().sqlstate,
+                sqlstate::INSUFFICIENT_PRIVILEGE
+            );
         });
     }
 
@@ -53699,7 +53768,13 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
         let name = SqlName::parse("source_actor").unwrap();
         let renamed = SqlName::parse("renamed_actor").unwrap();
-        let slot = storage.install_role(name, RoleAttributes::ORDINARY, storage.catalog_sources.next_role().unwrap()).unwrap();
+        let slot = storage
+            .install_role(
+                name,
+                RoleAttributes::ORDINARY,
+                storage.catalog_sources.next_role().unwrap(),
+            )
+            .unwrap();
         let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
         crate::mem::guard::forbid_alloc(|| {
             let prior = storage.rename_role(slot, renamed, 7).unwrap();
@@ -53713,13 +53788,32 @@ mod tests {
             storage.drop_role_in(slot, 8).unwrap();
             storage.commit_role_change(slot);
             assert!(storage.session_role_slot(actor.source(), 0).is_none());
-            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, storage.catalog_sources.next_role().unwrap()).unwrap(), slot);
-            assert_eq!(actor.refresh(&storage, 0).require_name().unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            assert_eq!(
+                storage
+                    .install_role(
+                        name,
+                        RoleAttributes::ORDINARY,
+                        storage.catalog_sources.next_role().unwrap()
+                    )
+                    .unwrap(),
+                slot
+            );
+            assert_eq!(
+                actor
+                    .refresh(&storage, 0)
+                    .require_name()
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
             let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
             assert_missing_creation_actor(storage.initial_ownership(9));
             let replacement = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
             assert_ne!(actor.source(), replacement.source());
-            assert_eq!(storage.session_role_slot(replacement.source(), 0), Some(slot));
+            assert_eq!(
+                storage.session_role_slot(replacement.source(), 0),
+                Some(slot)
+            );
         });
     }
 
@@ -53732,12 +53826,23 @@ mod tests {
         let other = Storage::new(&config, &mut other_budget).unwrap();
         let name = SqlName::parse("aborted_actor").unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let (slot, prior) = storage.create_role(name, RoleAttributes::ORDINARY, 7).unwrap();
+            let (slot, prior) = storage
+                .create_role(name, RoleAttributes::ORDINARY, 7)
+                .unwrap();
             let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 7).unwrap());
             assert_eq!(storage.session_role_slot(actor.source(), 7), Some(slot));
             assert!(storage.session_role_slot(actor.source(), 8).is_none());
             storage.rollback_role_change(slot, prior);
-            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, storage.catalog_sources.next_role().unwrap()).unwrap(), slot);
+            assert_eq!(
+                storage
+                    .install_role(
+                        name,
+                        RoleAttributes::ORDINARY,
+                        storage.catalog_sources.next_role().unwrap()
+                    )
+                    .unwrap(),
+                slot
+            );
             assert!(storage.session_role_slot(actor.source(), 7).is_none());
             let local = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
             assert!(other.session_role_slot(local.source(), 0).is_none());
@@ -53791,7 +53896,9 @@ mod tests {
             .unwrap();
         let sequence = storage.catalog_sequence.current();
         let next_oid = storage.large_objects.lock().unwrap().next_oid;
-        let actor = crate::sql::eval::funcs::system::enter_current_user(SessionIdentity::unauthenticated("missing_creator"));
+        let actor = crate::sql::eval::funcs::system::enter_current_user(
+            SessionIdentity::unauthenticated("missing_creator"),
+        );
         crate::mem::guard::forbid_alloc(|| {
             assert_missing_creation_actor(storage.initial_ownership(7));
             assert_missing_creation_actor(storage.initial_catalog_owner(7));
@@ -53844,7 +53951,9 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
-        let _actor = crate::sql::eval::funcs::system::enter_current_user(SessionIdentity::unauthenticated("missing_creator"));
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(
+            SessionIdentity::unauthenticated("missing_creator"),
+        );
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.initial_ownership(0).unwrap().owner, BOOTSTRAP_ROLE);
             let slot = storage

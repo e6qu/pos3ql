@@ -15,7 +15,7 @@ mod enum_images;
 mod enum_publication;
 pub(crate) use enum_publication::EnumMemberPublication;
 mod type_edits;
-pub(crate) use type_edits::{CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeEditTarget, TypeDdlUndo, TypeDdlDecision};
+pub(crate) use type_edits::{CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeEditTarget, TypeDdlUndo, TypeDdlDecision, TypeCommitChange};
 pub(crate) use statistics::CheckpointStatistics;
 mod table_creation;
 mod table_definitions;
@@ -39204,12 +39204,15 @@ impl Storage {
         Ok(DomainAlterUndo { source, transaction: txid, version, prior })
     }
 
-    pub(crate) fn commit_domain_alter(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) {
+        let slot = target.slot(NamedTypeKind::Domain).expect("domain publication identifies its source kind");
+        let txid = target.transaction();
         let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
+            if !catalog.matches_type_edit(target) { return; }
             let domain = catalog.domains[slot];
             if domain
                 .pending_definition
@@ -39759,8 +39762,10 @@ impl Storage {
         catalog.enums[slot].member_count = 0;
     }
 
-    pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
-        match self.commit_enum_members(slot, txid) {
+    pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) {
+        let slot = target.slot(NamedTypeKind::Enum).expect("enum publication identifies its source kind");
+        let txid = target.transaction();
+        match self.commit_enum_members(target) {
             EnumMemberPublication::Complete => return,
             EnumMemberPublication::IdentityMoveRequired => {}
         }
@@ -39769,6 +39774,7 @@ impl Storage {
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
+            if !catalog.matches_type_edit(target) { return; }
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
             type_reference_moves::TypeReferenceMove::new(
@@ -40093,12 +40099,15 @@ impl Storage {
         Ok(CompositeAlterUndo { source, transaction: txid, version, prior })
     }
 
-    pub(crate) fn commit_composite_alter(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_composite_alter(&mut self, target: TypeEditTarget) {
+        let slot = target.slot(NamedTypeKind::Composite).expect("composite publication identifies its source kind");
+        let txid = target.transaction();
         let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
+            if !catalog.matches_type_edit(target) { return; }
             let composite = catalog.composites[slot];
             let Some(pending) = composite
                 .pending_definition

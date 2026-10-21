@@ -979,7 +979,7 @@ mod tests {
             let mut altered = storage.composite_for(0, 0);
             altered.fields[0].name = SqlName::parse("after").unwrap();
             storage.stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7).unwrap();
-            storage.commit_composite_alter(0, 7);
+            storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
 
             let scope = outer.enter().unwrap();
             assert_eq!(
@@ -1133,7 +1133,7 @@ mod tests {
                 crate::sql::eval::hash_key_catalog(&storage, 7, &[identified], &[0]).unwrap()
             );
             drop(scope);
-            storage.commit_enum_alter(0, 7);
+            storage.commit_enum_alter(storage.prepare_enum_edit(0, 7).unwrap().1);
             assert!(selected.label_is_uncommitted("after"));
             let scope = statement.enter().unwrap();
             let child = storage.spill_roots.retain_statement().unwrap();
@@ -1167,7 +1167,7 @@ mod tests {
                 let mut altered = storage.composite_for(0, 0);
                 altered.fields[0].name = SqlName::parse(name).unwrap();
                 storage.stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7).unwrap();
-                storage.commit_composite_alter(0, 7);
+                storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
                 let scope = outer.enter().unwrap();
                 let child = storage.spill_roots.retain_statement().unwrap();
                 let child_scope = child.enter().unwrap();

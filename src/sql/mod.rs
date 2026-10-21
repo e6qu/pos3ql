@@ -5388,6 +5388,22 @@ impl Engine {
                 "commit reached durability before queued constraint triggers fired"
             ));
         }
+        let type_changes = txn.ddl().iter().filter_map(|undo| {
+            use crate::storage::TypeCommitChange;
+            Some(match undo {
+                DdlUndo::DomainCreated(undo) | DdlUndo::DomainDropped(undo)
+                | DdlUndo::EnumCreated(undo) | DdlUndo::EnumDropped(undo)
+                | DdlUndo::CompositeCreated(undo) | DdlUndo::CompositeDropped(undo) => TypeCommitChange::Lifecycle(*undo),
+                DdlUndo::DomainAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::EnumAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::CompositeAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                _ => return None,
+            })
+        });
+        if let Err(error) = self.storage.validate_type_commit(type_changes) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         self.work.reset();
         if let Err(error) =
             exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
@@ -6945,9 +6961,7 @@ impl Engine {
                     self.storage.finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
                 DdlUndo::DomainDropped(undo) => self.storage.finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
-                DdlUndo::DomainAltered { slot, .. } => {
-                    self.storage.commit_domain_alter(*slot as usize, txn.txid)
-                }
+                DdlUndo::DomainAltered(prior) => self.storage.commit_domain_alter(prior.target()),
                 DdlUndo::EnumCreated(undo) => {
                     self.storage.finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
@@ -6955,13 +6969,9 @@ impl Engine {
                 DdlUndo::CompositeCreated(undo) => {
                     self.storage.finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit);
                 }
-                DdlUndo::CompositeAltered { slot, .. } => self
-                    .storage
-                    .commit_composite_alter(*slot as usize, txn.txid),
+                DdlUndo::CompositeAltered(prior) => self.storage.commit_composite_alter(prior.target()),
                 DdlUndo::CompositeDropped(undo) => self.storage.finish_type_ddl(*undo, crate::storage::TypeDdlDecision::Commit),
-                DdlUndo::EnumAltered { slot, .. } => {
-                    self.storage.commit_enum_alter(*slot as usize, txn.txid)
-                }
+                DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target()),
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_create(slot);
@@ -19774,17 +19784,17 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         }
         DdlUndo::DomainCreated(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
         DdlUndo::DomainDropped(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
-        DdlUndo::DomainAltered { prior, .. } => {
+        DdlUndo::DomainAltered(prior) => {
             storage.rollback_domain_alter(prior)
         }
         DdlUndo::EnumCreated(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
         DdlUndo::CompositeCreated(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
-        DdlUndo::CompositeAltered { prior, .. } => {
+        DdlUndo::CompositeAltered(prior) => {
             storage.rollback_composite_alter(prior)
         }
         DdlUndo::CompositeDropped(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
         DdlUndo::EnumDropped(undo) => storage.finish_type_ddl(undo, crate::storage::TypeDdlDecision::Rollback),
-        DdlUndo::EnumAltered { prior, .. } => {
+        DdlUndo::EnumAltered(prior) => {
             storage.rollback_enum_alter(prior);
         }
         DdlUndo::IndexCreated(slot) => {
@@ -20480,7 +20490,7 @@ fn apply_composite_wal_definition(
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
         storage.stage_composite_alter(edit_target, definition, 0)?;
-        storage.commit_composite_alter(slot, 0);
+        storage.commit_composite_alter(storage.prepare_composite_edit(slot, 0)?.1);
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
         storage.restore_type_identity(
@@ -22006,7 +22016,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 }
                 let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
                 storage.stage_domain_alter(edit_target, spec, 0)?;
-                storage.commit_domain_alter(slot, 0);
+                storage.commit_domain_alter(storage.prepare_domain_edit(slot, 0)?.1);
             } else {
                 let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
                 storage.restore_type_identity(
@@ -22176,7 +22186,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
             storage.stage_composite_alter(edit_target, definition, 0)?;
-            storage.commit_composite_alter(slot, 0);
+            storage.commit_composite_alter(storage.prepare_composite_edit(slot, 0)?.1);
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -22198,7 +22208,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(slot, 0);
+            storage.commit_domain_alter(storage.prepare_domain_edit(slot, 0)?.1);
         }
         WalOp::Comment {
             class,

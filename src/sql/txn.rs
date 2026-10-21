@@ -576,28 +576,19 @@ pub(crate) enum DdlUndo {
     DomainCreated(crate::storage::TypeDdlUndo),
     /// DROP DOMAIN retains its source identity and transaction owner.
     DomainDropped(crate::storage::TypeDdlUndo),
-    DomainAltered {
-        slot: u32,
-        prior: crate::storage::DomainAlterUndo,
-    },
+    DomainAltered(crate::storage::DomainAlterUndo),
     /// CREATE TYPE (enum) retains its source identity and transaction owner.
     EnumCreated(crate::storage::TypeDdlUndo),
     /// CREATE TYPE (...): named composites are distinct from anonymous records.
     CompositeCreated(crate::storage::TypeDdlUndo),
     /// ALTER TYPE on a named composite staged a private physical layout.
-    CompositeAltered {
-        slot: u32,
-        prior: crate::storage::CompositeAlterUndo,
-    },
+    CompositeAltered(crate::storage::CompositeAlterUndo),
     /// DROP TYPE retains its source identity and transaction owner.
     CompositeDropped(crate::storage::TypeDdlUndo),
     /// DROP TYPE (enum) retains its source identity and transaction owner.
     EnumDropped(crate::storage::TypeDdlUndo),
     /// ALTER TYPE staged a definition visible only to its transaction.
-    EnumAltered {
-        slot: u32,
-        prior: crate::storage::EnumAlterUndo,
-    },
+    EnumAltered(crate::storage::EnumAlterUndo),
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),
     /// DROP INDEX at this slot — undo by reviving it.

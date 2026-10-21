@@ -30976,10 +30976,7 @@ pub(crate) fn drop_collation(
                 storage.rollback_composite_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered {
-                slot: composite_slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
                 storage.rollback_composite_alter(prior);
                 return sql_fail(error);
             }
@@ -41571,10 +41568,7 @@ pub fn alter_domain(
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
@@ -41831,10 +41825,7 @@ pub fn alter_domain(
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
@@ -43069,10 +43060,7 @@ fn cascade_drop_composite_fields(
         storage.rollback_composite_alter(prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered {
-        slot: composite_slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
         storage.rollback_composite_alter(prior);
         return Err(error);
     }
@@ -44972,10 +44960,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -45038,10 +45023,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -45118,10 +45100,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(error);
             }
@@ -45189,10 +45168,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -45479,10 +45455,7 @@ fn alter_composite_type(
         storage.rollback_composite_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
         storage.rollback_composite_alter(prior);
         return sql_fail(error);
     }
@@ -46120,10 +46093,7 @@ fn rewrite_composite_dependent_domains(
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered {
-            slot: domain_slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
             storage.rollback_domain_alter(prior);
             return Err(error);
         }

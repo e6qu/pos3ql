@@ -19,6 +19,10 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
+    pub(super) fn transaction(self) -> u32 {
+        self.transaction
+    }
+
     pub(super) fn slot(self, kind: super::NamedTypeKind) -> Result<usize, SqlError> {
         if self.source.slot().kind() != kind {
             return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "type edit has the wrong source kind"));
@@ -59,12 +63,28 @@ pub(crate) enum TypeDdlDecision {
     Rollback,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TypeCommitChange {
+    Definition(TypeEditTarget),
+    Lifecycle(TypeDdlUndo),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TypeAlterUndo<Definition> {
     pub(super) source: TypeIdentity,
     pub(super) transaction: u32,
     pub(super) version: u64,
     pub(super) prior: Option<Definition>,
+}
+
+impl<Definition> TypeAlterUndo<Definition> {
+    pub(crate) fn slot(&self) -> usize {
+        self.source.slot().index()
+    }
+
+    pub(crate) fn target(&self) -> TypeEditTarget {
+        TypeEditTarget { source: self.source, transaction: self.transaction, version: self.version }
+    }
 }
 
 pub(crate) type DomainAlterUndo = TypeAlterUndo<PendingDomainDefinition>;
@@ -154,6 +174,18 @@ impl TypeDefinitionVersions {
 }
 
 impl super::TypeCatalog {
+    pub(super) fn matches_type_edit(&self, target: TypeEditTarget) -> bool {
+        if !self.contains_type_source(target.source)
+            || target.source.database() != super::current_database()
+        { return false; }
+        let pending = match target.source.slot() {
+            NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
+            NamedTypeSlot::Enum(slot) => self.enums[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
+            NamedTypeSlot::Composite(slot) => self.composites[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
+        };
+        pending == Some((target.transaction, target.version))
+    }
+
     fn select_type_edit(&self, source: NamedTypeSlot, transaction: u32) -> Result<TypeEditTarget, SqlError> {
         let snapshot = self.type_snapshot(source, transaction)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database())
@@ -231,6 +263,52 @@ impl super::TypeCatalog {
 }
 
 impl super::Storage {
+    pub(crate) fn validate_type_commit(
+        &self,
+        changes: impl Iterator<Item = TypeCommitChange>,
+    ) -> Result<(), SqlError> {
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        for change in changes {
+            let (source, transaction) = match change {
+                TypeCommitChange::Definition(target) => (target.source, target.transaction),
+                TypeCommitChange::Lifecycle(undo) => (undo.source, undo.transaction),
+            };
+            if source.database() != super::current_database() || !catalog.contains_type_source(source) {
+                return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "transaction type source has been replaced"));
+            }
+            let valid = match change {
+                TypeCommitChange::Definition(target) => {
+                    let current = catalog.type_definition_version(source.slot(), transaction);
+                    let pending = match source.slot() {
+                        NamedTypeSlot::Domain(slot) => catalog.domains[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                        NamedTypeSlot::Enum(slot) => catalog.enums[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                        NamedTypeSlot::Composite(slot) => catalog.composites[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                    };
+                    // Earlier edits are superseded by this transaction's final edit.
+                    pending == Some(transaction) && current >= target.version
+                }
+                TypeCommitChange::Lifecycle(undo) => {
+                    let state = match source.slot() {
+                        NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state,
+                        NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state,
+                        NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state,
+                    };
+                    use super::CatalogDdlState as State;
+                    state.pending_txid() == Some(transaction)
+                        && match undo.operation {
+                            TypeDdlOperation::Create => matches!(state, State::PendingCreate { .. } | State::PendingCreateDrop { .. }),
+                            TypeDdlOperation::Drop => matches!(state, State::PendingDrop { .. } | State::PendingCreateDrop { .. })
+                                && catalog.versions.ddl(source.slot()) == undo.version,
+                        }
+                }
+            };
+            if !valid {
+                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type change no longer belongs to its transaction"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_type_ddl(&self, undo: TypeDdlUndo, decision: TypeDdlDecision) {
         use super::CatalogDdlState as State;
         use TypeDdlDecision::{Commit, Rollback};

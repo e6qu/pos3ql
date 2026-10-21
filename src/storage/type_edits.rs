@@ -19,6 +19,10 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
+    pub(super) fn source(self) -> TypeIdentity {
+        self.source
+    }
+
     pub(super) fn identity_move(
         self,
         catalog: &super::TypeCatalog,
@@ -297,7 +301,7 @@ impl super::TypeCatalog {
         pending == Some((target.transaction, target.version))
     }
 
-    fn select_type_edit(
+    pub(super) fn select_type_edit(
         &self,
         source: NamedTypeSlot,
         transaction: u32,

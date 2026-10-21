@@ -12,8 +12,6 @@ mod definition_pool;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
-mod enum_publication;
-pub(crate) use enum_publication::EnumMemberPublication;
 mod type_edits;
 pub(crate) use statistics::CheckpointStatistics;
 pub(crate) use type_edits::{
@@ -39259,7 +39257,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
+    pub(crate) fn commit_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Domain)
             .expect("domain publication identifies its source kind");
@@ -39298,7 +39296,7 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(movement, |catalog, _members| {
+        self.publish_type_move(movement, type_reference_moves::TypePublicationSource::Pending(target), |catalog, _members| {
             let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
             catalog.versions.set(NamedTypeSlot::Domain(slot), version);
             catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
@@ -39827,17 +39825,13 @@ impl Storage {
         catalog.enums[slot].member_count = 0;
     }
 
-    pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) -> Result<(), SqlError> {
+    pub(crate) fn commit_enum_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Enum)
             .expect("enum publication identifies its source kind");
         let txid = target.transaction();
-        match self.commit_enum_members(target) {
-            EnumMemberPublication::Complete => return Ok(()),
-            EnumMemberPublication::IdentityMoveRequired => {}
-        }
         let movement = {
-            let catalog = self
+            let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
@@ -39846,6 +39840,11 @@ impl Storage {
             }
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
+            if definition.schema == previous.schema && definition.name == previous.name {
+                let mut members = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+                Self::install_enum_alter_locked(&mut catalog, &mut members, slot, txid);
+                return Ok(());
+            }
             type_reference_moves::TypeReferenceMove::new(
                 type_references::TypeIdentity::new(
                     catalog.origin,
@@ -39857,7 +39856,7 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(movement, |catalog, members| {
+        self.publish_type_move(movement, type_reference_moves::TypePublicationSource::Pending(target), |catalog, members| {
             Self::install_enum_alter_locked(catalog, members, slot, txid);
         })
     }
@@ -39901,7 +39900,7 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        let movement = {
+        let (movement, target) = {
             let catalog = self
                 .type_catalog
                 .lock()
@@ -39913,11 +39912,12 @@ impl Storage {
                 0,
                 Some(NamedTypeSlot::Enum(slot)),
             )?;
+            let target = catalog.select_type_edit(NamedTypeSlot::Enum(slot), 0)?;
             let previous = catalog.enums[slot];
             if schema == previous.schema && name == previous.name {
                 return Ok(());
             }
-            type_reference_moves::TypeReferenceMove::new(
+            (type_reference_moves::TypeReferenceMove::new(
                 type_references::TypeIdentity::new(
                     catalog.origin,
                     previous.database,
@@ -39926,7 +39926,7 @@ impl Storage {
                 ),
                 UserTypeName::declaration(previous.schema, previous.name),
                 UserTypeName::declaration(schema, name),
-            )
+            ), target)
         };
         let version = self
             .type_catalog
@@ -39934,7 +39934,7 @@ impl Storage {
             .expect("type catalog lock poisoned")
             .versions
             .next()?;
-        self.publish_type_move(movement, |catalog, _members| {
+        self.publish_type_move(movement, type_reference_moves::TypePublicationSource::Committed(target), |catalog, _members| {
             catalog.enums[slot].schema = schema;
             catalog.enums[slot].name = name;
             catalog.versions.set(NamedTypeSlot::Enum(slot), version);
@@ -40179,7 +40179,7 @@ impl Storage {
     }
 
     pub(crate) fn commit_composite_alter(
-        &mut self,
+        &self,
         target: TypeEditTarget,
     ) -> Result<(), SqlError> {
         let slot = target
@@ -40216,7 +40216,7 @@ impl Storage {
                 UserTypeName::declaration(pending.schema, pending.name),
             )
         };
-        self.publish_type_move(movement, |catalog, _members| {
+        self.publish_type_move(movement, type_reference_moves::TypePublicationSource::Pending(target), |catalog, _members| {
             Self::install_composite_alter_locked(catalog, slot, txid);
         })
     }

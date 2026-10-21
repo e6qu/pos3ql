@@ -49,12 +49,15 @@ commit checks this ownership and dependent publication counters before durabilit
 Subscription creation saves its stream identity instead of reconstructing it
 from allocation order during replay. Conflicting edits and deletion
 wait for their owner, including a transaction's pending rename.
+Storage publication rechecks a type's lifetime and edit revision after waits,
+then includes tables created or changed while it was acquiring owners. Enum
+label edits and name moves now use one shared commit API.
 PostgreSQL comparisons keep result rows and error codes separate from multiline
 diagnostic wording; the dedicated message checks still compare error text.
 
 Complete shared engine publication across transaction commit, remaining type
-retirement paths and metadata preparation before removing exclusive type commits and
-the transaction barrier. Connect all remaining preparation and rewrite paths to
+retirement paths and metadata preparation before removing the transaction barrier.
+Connect all remaining preparation and rewrite paths to
 retained sources before running those paths concurrently.
 
 Finish protection for engine-wide publication and remaining table rewrites.

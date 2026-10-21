@@ -18262,7 +18262,7 @@ impl core::fmt::Display for ManifestDependencies<'_> {
         write!(output, "{}", self.0.entries().len())?;
         for dependency in self.0.entries() {
             write!(output, " {} ", dependency.class as u8)?;
-            write!(output, "{} ", dependency.identity.encoded())?;
+            write!(output, "{} ", dependency.identity.storage_key())?;
             for byte in dependency.schema.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
@@ -18300,9 +18300,11 @@ fn parse_stored_query_dependencies(
         let class = crate::storage::DependencyClass::from_code(code).ok_or(
             CheckpointSetupError::Corrupt("unknown stored-query dependency class"),
         )?;
-        let identity = crate::storage::StoredDependencyIdentity::decode(
+        let identity = crate::storage::StoredDependencyIdentity::from_storage(
             class,
-            parse_field(words.next(), "stored-query dependency identity")?,
+            words.next().ok_or(CheckpointSetupError::Corrupt(
+                "stored-query dependency identity missing",
+            ))?,
         )
         .ok_or(CheckpointSetupError::Corrupt(
             "invalid stored-query dependency identity",

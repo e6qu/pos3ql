@@ -564,6 +564,115 @@ impl TypeSnapshot {
 }
 
 impl TypeCatalog {
+    pub(super) fn bind_query_type_dependency(
+        &self,
+        dependency: &mut super::StoredQueryDependency,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let super::StoredDependencyIdentity::Type(reference) = dependency.identity else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type dependency has no source lifetime"
+            ));
+        };
+        if !dependency.identity.valid_for(dependency.class) {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "type dependency source kind is invalid"
+            ));
+        }
+        let snapshot = self
+            .resolve_source_reference(reference, super::current_database(), transaction)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "stored-query type source no longer exists"
+                )
+            })?;
+        dependency.slot = snapshot.identity.slot().index() as u16;
+        dependency.schema = snapshot.name.schema;
+        dependency.name = snapshot.name.name;
+        dependency.identity =
+            super::StoredDependencyIdentity::Type(TypeReference::from_bound_name(snapshot.name)?);
+        Ok(())
+    }
+
+    pub(super) fn clone_query_type_dependency(
+        &self,
+        dependency: &mut super::StoredQueryDependency,
+        source_database: DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let super::StoredDependencyIdentity::Type(reference) = dependency.identity else {
+            return Ok(());
+        };
+        let source = self
+            .resolve_source_reference(reference, source_database, 0)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "template query type source no longer exists"
+                )
+            })?;
+        let target = self
+            .lookup_reference_name(
+                UserTypeName::declaration(source.name.schema, source.name.name),
+                super::current_database(),
+                transaction,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "template query type source was not cloned"
+                )
+            })?;
+        dependency.identity =
+            super::StoredDependencyIdentity::Type(TypeReference::from_bound_name(target.name)?);
+        self.bind_query_type_dependency(dependency, transaction)
+    }
+
+    pub(super) fn bind_domain_spec(
+        &self,
+        spec: &mut super::DomainSpec,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for identity in [&mut spec.base_domain, &mut spec.base_user_type] {
+            if let Some(name) = *identity {
+                let result = self.bind_type_reference(
+                    RoutineResult {
+                        ctype: spec.base,
+                        user_type: Some(name),
+                    },
+                    super::current_database(),
+                    transaction,
+                )?;
+                spec.base = result.ctype;
+                *identity = result.user_type;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn bind_composite_fields(
+        &self,
+        fields: &mut [super::CompositeFieldDef],
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for field in fields.iter_mut().filter(|field| !field.dropped) {
+            let result = self.bind_type_reference(
+                RoutineResult {
+                    ctype: field.ctype,
+                    user_type: field.user_type,
+                },
+                super::current_database(),
+                transaction,
+            )?;
+            field.ctype = result.ctype;
+            field.user_type = result.user_type;
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_table_definition(
         &self,
         definition: &mut super::TableDef,
@@ -873,6 +982,41 @@ impl super::TableDef {
 }
 
 impl super::Storage {
+    pub(crate) fn capture_type_dependency(
+        &self,
+        class: super::DependencyClass,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<super::StoredDependencyIdentity, SqlError> {
+        let source = match class {
+            super::DependencyClass::Domain => NamedTypeSlot::Domain(slot),
+            super::DependencyClass::Enum => NamedTypeSlot::Enum(slot),
+            super::DependencyClass::Composite => NamedTypeSlot::Composite(slot),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "dependency is not a named type"
+                ));
+            }
+        };
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let snapshot = catalog
+            .type_snapshot(source, transaction)?
+            .filter(|snapshot| snapshot.identity.database() == super::current_database())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type dependency source no longer exists"
+                )
+            })?;
+        Ok(super::StoredDependencyIdentity::Type(
+            TypeReference::from_bound_name(snapshot.name)?,
+        ))
+    }
+
     pub(crate) fn composite_source(
         &self,
         qualifier: Option<&str>,

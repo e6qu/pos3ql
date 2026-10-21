@@ -4073,34 +4073,68 @@ pub enum StoredDependencyIdentity {
     Name,
     RoutineOid(i32),
     OperatorOid(i32),
+    Type(TypeReference),
 }
 
 impl StoredDependencyIdentity {
-    pub(crate) const fn encoded(self) -> i32 {
-        match self {
+    pub(crate) fn storage_key(self) -> StackStr<48> {
+        use core::fmt::Write;
+        if let Self::Type(source) = self {
+            return source.storage_key();
+        }
+        let mut key = StackStr::new();
+        let oid = match self {
             Self::Name => 0,
-            Self::RoutineOid(oid) => oid,
-            Self::OperatorOid(oid) => oid,
+            Self::RoutineOid(oid) | Self::OperatorOid(oid) => oid,
+            Self::Type(_) => unreachable!(),
+        };
+        write!(key, "{oid}").expect("bounded dependency identity");
+        key
+    }
+
+    pub(crate) fn valid_for(self, class: DependencyClass) -> bool {
+        match self {
+            Self::Type(source) => matches!(
+                (class, source.slot()),
+                (DependencyClass::Domain, NamedTypeSlot::Domain(_))
+                    | (DependencyClass::Enum, NamedTypeSlot::Enum(_))
+                    | (DependencyClass::Composite, NamedTypeSlot::Composite(_))
+            ),
+            Self::Name => !matches!(
+                class,
+                DependencyClass::Routine
+                    | DependencyClass::Operator
+                    | DependencyClass::Domain
+                    | DependencyClass::Enum
+                    | DependencyClass::Composite
+            ),
+            Self::RoutineOid(oid) => {
+                class == DependencyClass::Routine
+                    && (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid)
+            }
+            Self::OperatorOid(oid) => {
+                class == DependencyClass::Operator
+                    && (OPERATOR_OID_BASE..OPERATOR_FAMILY_OID_BASE).contains(&oid)
+            }
         }
     }
 
-    pub(crate) fn decode(class: DependencyClass, encoded: i32) -> Option<Self> {
-        match (class, encoded) {
-            (DependencyClass::Routine, oid)
-                if (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid) =>
-            {
-                Some(Self::RoutineOid(oid))
+    pub(crate) fn from_storage(class: DependencyClass, encoded: &str) -> Option<Self> {
+        let identity = if matches!(
+            class,
+            DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite
+        ) {
+            Self::Type(TypeReference::from_storage(encoded).ok()?)
+        } else {
+            let oid: i32 = encoded.parse().ok()?;
+            match class {
+                DependencyClass::Routine => Self::RoutineOid(oid),
+                DependencyClass::Operator => Self::OperatorOid(oid),
+                _ if oid == 0 => Self::Name,
+                _ => return None,
             }
-            (DependencyClass::Routine, _) => None,
-            (DependencyClass::Operator, oid)
-                if (OPERATOR_OID_BASE..OPERATOR_FAMILY_OID_BASE).contains(&oid) =>
-            {
-                Some(Self::OperatorOid(oid))
-            }
-            (DependencyClass::Operator, _) => None,
-            (_, 0) => Some(Self::Name),
-            _ => None,
-        }
+        };
+        identity.valid_for(class).then_some(identity)
     }
 }
 
@@ -4417,9 +4451,7 @@ impl StoredQueryDependencies {
     }
 
     pub fn push(&mut self, dependency: StoredQueryDependency) -> Result<(), SqlError> {
-        if StoredDependencyIdentity::decode(dependency.class, dependency.identity.encoded())
-            != Some(dependency.identity)
-        {
+        if !dependency.identity.valid_for(dependency.class) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "stored-query dependency has an invalid catalog identity"
@@ -4484,9 +4516,7 @@ impl StoredQueryDependencies {
         &mut self,
         dependency: SerializedStoredQueryDependency,
     ) -> Result<(), SqlError> {
-        if StoredDependencyIdentity::decode(dependency.class, dependency.identity.encoded())
-            != Some(dependency.identity)
-        {
+        if !dependency.identity.valid_for(dependency.class) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "stored-query dependency has an invalid catalog identity"
@@ -17697,9 +17727,19 @@ impl Storage {
 
     fn rebound_stored_query_dependency(
         &self,
-        dependency: StoredQueryDependency,
+        mut dependency: StoredQueryDependency,
         txid: u32,
     ) -> Result<StoredQueryDependency, SqlError> {
+        if matches!(
+            dependency.class,
+            DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite
+        ) {
+            self.type_catalog
+                .lock()
+                .expect("type catalog lock poisoned")
+                .bind_query_type_dependency(&mut dependency, txid)?;
+            return Ok(dependency);
+        }
         let schema = dependency.schema.as_str();
         let name = dependency.name.as_str();
         let slot = match dependency.class {
@@ -17710,17 +17750,21 @@ impl Storage {
                     && view.schema_for(txid).as_str() == schema
                     && view.name_for(txid).as_str() == name
             }),
-            DependencyClass::Domain => self.domain_slot(schema, name, txid),
-            DependencyClass::Enum => self.enum_slot(schema, name, txid),
+            DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite => {
+                unreachable!("type source handled above")
+            }
             DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
-            DependencyClass::Composite => self.composite_slot(schema, name, txid),
             DependencyClass::Routine => match dependency.identity {
                 StoredDependencyIdentity::RoutineOid(oid) => self.routine_slot_by_oid(oid, txid),
-                StoredDependencyIdentity::Name | StoredDependencyIdentity::OperatorOid(_) => None,
+                StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::OperatorOid(_)
+                | StoredDependencyIdentity::Type(_) => None,
             },
             DependencyClass::Operator => match dependency.identity {
                 StoredDependencyIdentity::OperatorOid(oid) => self.operator_slot_by_oid(oid, txid),
-                StoredDependencyIdentity::Name | StoredDependencyIdentity::RoutineOid(_) => None,
+                StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::RoutineOid(_)
+                | StoredDependencyIdentity::Type(_) => None,
             },
             DependencyClass::Collation => self.collation_slot(schema, name, txid).or_else(|| {
                 let slot = usize::from(dependency.slot);
@@ -17771,6 +17815,7 @@ impl Storage {
         &mut self,
         image: usize,
         txid: u32,
+        template_source: Option<DatabaseOid>,
     ) -> Result<(), SqlError> {
         // Resolve identities without retaining the dependency mutex: catalog
         // publication writes dependencies while holding its definition guard.
@@ -17790,6 +17835,12 @@ impl Storage {
         };
         let dependencies = &mut snapshot[..usize::from(count)];
         for dependency in dependencies.iter_mut() {
+            if let Some(source) = template_source {
+                self.type_catalog
+                    .lock()
+                    .expect("type catalog lock poisoned")
+                    .clone_query_type_dependency(dependency, source, txid)?;
+            }
             *dependency = self.rebound_stored_query_dependency(*dependency, txid)?;
         }
         let mut catalog = self
@@ -17803,16 +17854,21 @@ impl Storage {
     }
 
     pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
-        self.rebind_all_stored_query_dependencies_to(0)
+        self.rebind_all_stored_query_dependencies_to(0, None)
     }
 
-    fn rebind_all_stored_query_dependencies_to(&mut self, txid: u32) -> Result<(), SqlError> {
+    fn rebind_all_stored_query_dependencies_to(
+        &mut self,
+        txid: u32,
+        template_source: Option<DatabaseOid>,
+    ) -> Result<(), SqlError> {
         for slot in 0..self.rule_count() {
             if self.rule(slot).database == current_database() && self.rule(slot).visible_to(txid) {
                 let owner = StoredQueryDependencyOwner::Rule(slot as u16);
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
                     txid,
+                    template_source,
                 )?;
             }
         }
@@ -17820,7 +17876,7 @@ impl Storage {
             let definition = self.matview(slot);
             if definition.database == current_database() && definition.visible_to(txid) {
                 let image = self.matview_dependency_image(slot);
-                self.rebind_stored_query_dependency_image(image, txid)?;
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.policy_count() {
@@ -17830,6 +17886,7 @@ impl Storage {
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
                     txid,
+                    template_source,
                 )?;
             }
         }
@@ -17840,6 +17897,7 @@ impl Storage {
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
                     txid,
+                    template_source,
                 )?;
             }
         }
@@ -21521,7 +21579,7 @@ impl Storage {
             self.redeclare_template_contract_types(source, target)?;
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
-            self.rebind_all_stored_query_dependencies_to(txid)?;
+            self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
             Ok(())
         })();
         crate::sql::set_execution_database_oid(prior_database);
@@ -38726,170 +38784,6 @@ impl Storage {
         txid: u32,
         defer_manifest_binding: bool,
     ) -> Result<usize, SqlError> {
-        if !defer_manifest_binding
-            && let Some(identity) = spec.base_user_type
-            && matches!(identity.binding, type_references::TypeBinding::Captured(_))
-        {
-            let result = self.bind_routine_result(
-                RoutineResult {
-                    ctype: spec.base,
-                    user_type: Some(identity),
-                },
-                txid,
-            )?;
-            spec.base = result.ctype;
-            spec.base_user_type = result.user_type;
-        }
-        if let Some(identity) = spec.base_user_type
-            && matches!(identity.binding, type_references::TypeBinding::Declaration)
-        {
-            spec.base = match spec.base {
-                ColType::Enum(slot)
-                    if slot != ColType::ENUM_SLOT_UNRESOLVED
-                        && (slot as usize) < self.enum_count()
-                        && self.enum_for(slot as usize, txid).database == current_database()
-                        && self.enum_for(slot as usize, txid).visible_to(txid) =>
-                {
-                    // WAL preserves the catalog slot. Its spelling can be stale
-                    // after an older domain image is replayed over a moved type.
-                    let definition = self.enum_for(slot as usize, txid);
-                    spec.base_user_type = Some(UserTypeName::declaration(
-                        definition.schema,
-                        definition.name,
-                    ));
-                    ColType::Enum(slot)
-                }
-                ColType::Enum(_) => {
-                    match self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
-                        Some(slot) => ColType::Enum(slot as u16),
-                        None if defer_manifest_binding => {
-                            ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED)
-                        }
-                        None => {
-                            return Err(sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "domain base enum \"{}.{}\" does not exist",
-                                identity.schema.as_str(),
-                                identity.name.as_str()
-                            ));
-                        }
-                    }
-                }
-                ColType::Composite(slot)
-                    if slot != ColType::COMPOSITE_SLOT_UNRESOLVED
-                        && (slot as usize) < self.composite_count()
-                        && self.composite_for(slot as usize, txid).database
-                            == current_database()
-                        && self.composite_for(slot as usize, txid).visible_to(txid) =>
-                {
-                    // See the enum case: slot identity is durable; names are a
-                    // rebindable catalog projection.
-                    let definition = self.composite_for(slot as usize, txid);
-                    spec.base_user_type = Some(UserTypeName::declaration(
-                        definition.schema,
-                        definition.name,
-                    ));
-                    ColType::Composite(slot)
-                }
-                ColType::Composite(_) => match self.composite_slot(
-                    identity.schema.as_str(),
-                    identity.name.as_str(),
-                    txid,
-                ) {
-                    Some(slot) => ColType::Composite(slot as u16),
-                    None if defer_manifest_binding => {
-                        ColType::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED)
-                    }
-                    None => {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "domain base composite \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        ));
-                    }
-                },
-                ColType::Array(element) if element.user_type_slot().is_some() => {
-                    if defer_manifest_binding {
-                        spec.base
-                    } else {
-                        let slot =
-                            usize::from(element.user_type_slot().expect("user element checked"));
-                        let current = match element {
-                            ArrElem::Enum(_)
-                                if slot < self.enum_count()
-                                    && self.enum_for(slot, txid).database == current_database()
-                                    && self.enum_for(slot, txid).visible_to(txid) =>
-                            {
-                                let definition = self.enum_for(slot, txid);
-                                Some(UserTypeName::declaration(
-                                    definition.schema,
-                                    definition.name,
-                                ))
-                            }
-                            ArrElem::Composite(_)
-                                if slot < self.composite_count()
-                                    && self.composite_for(slot, txid).database
-                                        == current_database()
-                                    && self.composite_for(slot, txid).visible_to(txid) =>
-                            {
-                                let definition = self.composite_for(slot, txid);
-                                Some(UserTypeName::declaration(
-                                    definition.schema,
-                                    definition.name,
-                                ))
-                            }
-                            ArrElem::Domain { .. }
-                                if slot < self.domain_count()
-                                    && self.domain_for(slot, txid).database
-                                        == current_database()
-                                    && self.domain_for(slot, txid).visible_to(txid) =>
-                            {
-                                let definition = self.domain_for(slot, txid);
-                                Some(UserTypeName::declaration(
-                                    definition.schema,
-                                    definition.name,
-                                ))
-                            }
-                            _ => None,
-                        };
-                        let identity = current.unwrap_or(identity);
-                        spec.base_user_type = Some(identity);
-                        self.rebind_declared_user_type(spec.base, identity, txid)?
-                    }
-                }
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "domain base identity names a non-user-defined type"
-                    ));
-                }
-            };
-        }
-        if !defer_manifest_binding {
-            if let Some(parent) = spec.base_domain {
-                let result = self.bind_routine_result(
-                    RoutineResult {
-                        ctype: spec.base,
-                        user_type: Some(parent),
-                    },
-                    txid,
-                )?;
-                spec.base = result.ctype;
-                spec.base_domain = result.user_type;
-            }
-            if let Some(base) = spec.base_user_type {
-                let result = self.bind_routine_result(
-                    RoutineResult {
-                        ctype: spec.base,
-                        user_type: Some(base),
-                    },
-                    txid,
-                )?;
-                spec.base = result.ctype;
-                spec.base_user_type = result.user_type;
-            }
-        }
         self.require_schema_create(schema.as_str(), txid)?;
         let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
@@ -38897,6 +38791,9 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if !defer_manifest_binding {
+            catalog.bind_domain_spec(&mut spec, txid)?;
+        }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog
             .domains
@@ -39235,23 +39132,11 @@ impl Storage {
         mut spec: DomainSpec,
         txid: u32,
     ) -> Result<Option<PendingDomainDefinition>, SqlError> {
-        for identity in [&mut spec.base_domain, &mut spec.base_user_type] {
-            if let Some(name) = *identity {
-                let result = self.bind_routine_result(
-                    RoutineResult {
-                        ctype: spec.base,
-                        user_type: Some(name),
-                    },
-                    txid,
-                )?;
-                spec.base = result.ctype;
-                *identity = result.user_type;
-            }
-        }
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.bind_domain_spec(&mut spec, txid)?;
         let domain = &mut catalog.domains[slot];
         if let Some(pending) = domain.pending_definition
             && pending.txid != txid
@@ -40322,26 +40207,11 @@ impl Storage {
         mut definition: CompositeDef,
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
-        for field in definition
-            .fields
-            .iter_mut()
-            .take(definition.n_fields)
-            .filter(|field| !field.dropped)
-        {
-            let result = self.bind_routine_result(
-                RoutineResult {
-                    ctype: field.ctype,
-                    user_type: field.user_type,
-                },
-                txid,
-            )?;
-            field.ctype = result.ctype;
-            field.user_type = result.user_type;
-        }
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.bind_composite_fields(&mut definition.fields[..definition.n_fields], txid)?;
         self.require_named_type_name(
             &catalog,
             definition.schema,
@@ -40354,6 +40224,7 @@ impl Storage {
         if let Some(pending) = composite.pending_definition
             && pending.txid != txid
         {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
         }
         let prior = composite.pending_definition;
@@ -40454,30 +40325,15 @@ impl Storage {
         defer_manifest_binding: bool,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
-        if !defer_manifest_binding {
-            for field in spec
-                .fields
-                .iter_mut()
-                .take(spec.n_fields)
-                .filter(|field| !field.dropped)
-            {
-                let result = self.bind_routine_result(
-                    RoutineResult {
-                        ctype: field.ctype,
-                        user_type: field.user_type,
-                    },
-                    txid,
-                )?;
-                field.ctype = result.ctype;
-                field.user_type = result.user_type;
-            }
-        }
         let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        if !defer_manifest_binding {
+            catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
+        }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(slot) = catalog
             .composites
@@ -40523,28 +40379,13 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        for field in spec
-            .fields
-            .iter_mut()
-            .take(spec.n_fields)
-            .filter(|field| !field.dropped)
-        {
-            let result = self.bind_routine_result(
-                RoutineResult {
-                    ctype: field.ctype,
-                    user_type: field.user_type,
-                },
-                txid,
-            )?;
-            field.ctype = result.ctype;
-            field.user_type = result.user_type;
-        }
         let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
         {

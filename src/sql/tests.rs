@@ -90232,7 +90232,8 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 ));
                 owner.success(
                     &mut engine,
-                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT",
+                    "BEGIN; CREATE CAST (captured_code AS text) WITH INOUT; \
+                     CREATE VIEW captured_view AS SELECT NULL::captured_code AS value",
                     !checkpoint,
                 );
                 rename.success(&mut engine, rename_statement, !checkpoint);
@@ -90252,6 +90253,14 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                 assert_eq!(
                     data_rows(&rename.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
+                );
+                assert_eq!(
+                    data_rows(&rename.success(
+                        &mut engine,
+                        "SELECT count(*) FROM captured_view WHERE value IS NULL",
+                        !checkpoint
+                    )),
+                    ["1"]
                 );
                 engine.commit_wal().unwrap();
             }
@@ -90275,6 +90284,8 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
                     data_rows(&session.success(&mut engine, snapshot, !checkpoint)),
                     ["current_code"]
                 );
+                assert_eq!(data_rows(&session.success(&mut engine,
+                    "SELECT count(*) FROM captured_view WHERE value IS NULL", !checkpoint)), ["1"]);
             }
         }
     }

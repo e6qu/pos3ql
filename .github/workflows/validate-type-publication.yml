@@ -37,6 +37,9 @@ jobs:
           sql::tests::typed_table_membership
           sql::tests::database_template_catalogs
           sql::tests::alter_table_of_and_not_of
+          sql::tests::domain
+          sql::tests::composite
+          sql::tests::enum
           wal::tests
           durable_format
           --test-threads=1

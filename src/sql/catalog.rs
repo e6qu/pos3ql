@@ -20754,7 +20754,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
-                | crate::storage::StoredDependencyIdentity::OperatorOid(_) => return None,
+                | crate::storage::StoredDependencyIdentity::OperatorOid(_)
+                | crate::storage::StoredDependencyIdentity::Type(_) => return None,
             },
         )),
         crate::storage::DependencyClass::Operator => Some((
@@ -20762,7 +20763,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::OperatorOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
-                | crate::storage::StoredDependencyIdentity::RoutineOid(_) => return None,
+                | crate::storage::StoredDependencyIdentity::RoutineOid(_)
+                | crate::storage::StoredDependencyIdentity::Type(_) => return None,
             },
         )),
         crate::storage::DependencyClass::Collation => Some((

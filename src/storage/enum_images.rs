@@ -1,6 +1,6 @@
 //! Selected enum labels remain immutable until their last reader releases them.
 
-use {std::sync::Arc, crate::mem::mutex::Mutex};
+use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use super::EnumMember;
 use crate::mem::budget::{Budget, BudgetError};

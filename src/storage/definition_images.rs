@@ -3,7 +3,7 @@
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use {std::sync::Arc, crate::mem::mutex::Mutex};
+use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use super::table_definitions::TableIdentity;
 use super::{Storage, TableDef, table_slot_capacity};

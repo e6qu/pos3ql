@@ -4,7 +4,10 @@ use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use {std::sync::Arc, crate::mem::mutex::Mutex, std::sync::OnceLock, std::sync::RwLock, std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard, std::sync::TryLockError};
+use {
+    crate::mem::mutex::Mutex, std::sync::Arc, std::sync::OnceLock, std::sync::RwLock,
+    std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard, std::sync::TryLockError,
+};
 
 use super::heap_relocation::HeapRemap;
 use super::{MaintenanceMode, MaintenanceStep, RowLoc};

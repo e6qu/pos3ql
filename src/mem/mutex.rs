@@ -21,7 +21,7 @@ mod macos {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 
-    pub(crate) struct Mutex<T> {
+    pub(crate) struct Mutex<T: ?Sized> {
         raw: UnsafeCell<libc::os_unfair_lock>,
         location: AtomicUsize,
         held: AtomicBool,
@@ -31,10 +31,10 @@ mod macos {
 
     // Access requires native ownership. Location validation rejects a moved
     // mutex whose guard was forgotten; waiting calls still borrow the mutex.
-    unsafe impl<T: Send> Send for Mutex<T> {}
-    unsafe impl<T: Send> Sync for Mutex<T> {}
-    impl<T> std::panic::RefUnwindSafe for Mutex<T> {}
-    impl<T> std::panic::UnwindSafe for Mutex<T> {}
+    unsafe impl<T: Send + ?Sized> Send for Mutex<T> {}
+    unsafe impl<T: Send + ?Sized> Sync for Mutex<T> {}
+    impl<T: ?Sized> std::panic::RefUnwindSafe for Mutex<T> {}
+    impl<T: ?Sized> std::panic::UnwindSafe for Mutex<T> {}
 
     impl<T> Mutex<T> {
         pub(crate) const fn new(value: T) -> Self {
@@ -46,7 +46,9 @@ mod macos {
                 value: UnsafeCell::new(value),
             }
         }
+    }
 
+    impl<T: ?Sized> Mutex<T> {
         pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
             self.validate_location();
             // The shared borrow keeps the native address stable while waiting
@@ -94,7 +96,11 @@ mod macos {
                     std::thread::yield_now();
                     continue;
                 }
-                if self.location.compare_exchange(prior, INITIALIZING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                if self
+                    .location
+                    .compare_exchange(prior, INITIALIZING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     continue;
                 }
                 if self.held.load(Ordering::Acquire) {
@@ -104,7 +110,9 @@ mod macos {
                 // A move requires exclusive Rust ownership, so no native
                 // owner or waiter can survive at the former address. One
                 // initializer resets the copied opaque state before use.
-                unsafe { self.raw.get().write(libc::OS_UNFAIR_LOCK_INIT); }
+                unsafe {
+                    self.raw.get().write(libc::OS_UNFAIR_LOCK_INIT);
+                }
                 self.location.store(location, Ordering::Release);
                 return;
             }
@@ -132,20 +140,28 @@ mod macos {
         }
     }
 
-    impl<T: fmt::Debug> fmt::Debug for Mutex<T> {
+    impl<T: fmt::Debug + ?Sized> fmt::Debug for Mutex<T> {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             let mut output = formatter.debug_struct("Mutex");
             match self.try_lock() {
-                Ok(guard) => { output.field("value", &*guard); }
-                Err(TryLockError::Poisoned(error)) => { output.field("value", &*error.into_inner()); }
-                Err(TryLockError::WouldBlock) => { output.field("value", &"locked"); }
+                Ok(guard) => {
+                    output.field("value", &&*guard);
+                }
+                Err(TryLockError::Poisoned(error)) => {
+                    output.field("value", &&*error.into_inner());
+                }
+                Err(TryLockError::WouldBlock) => {
+                    output.field("value", &"locked");
+                }
             }
-            output.field("poisoned", &self.poisoned.load(Ordering::Acquire)).finish()
+            output
+                .field("poisoned", &self.poisoned.load(Ordering::Acquire))
+                .finish()
         }
     }
 
     #[must_use = "retain the guard while accessing the protected value"]
-    pub(crate) struct MutexGuard<'lock, T> {
+    pub(crate) struct MutexGuard<'lock, T: ?Sized> {
         mutex: &'lock Mutex<T>,
         entered_panicking: bool,
         _thread_affine: PhantomData<*mut ()>,
@@ -153,9 +169,9 @@ mod macos {
 
     // Sharing a guard only exposes shared access to T. Its marker prevents
     // moving ownership to a different thread, as required by the native API.
-    unsafe impl<T: Sync> Sync for MutexGuard<'_, T> {}
+    unsafe impl<T: Sync + ?Sized> Sync for MutexGuard<'_, T> {}
 
-    impl<T> Deref for MutexGuard<'_, T> {
+    impl<T: ?Sized> Deref for MutexGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
             // A live guard owns the native lock, including poisoned guards.
@@ -163,27 +179,29 @@ mod macos {
         }
     }
 
-    impl<T> DerefMut for MutexGuard<'_, T> {
+    impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             // Native ownership and the mutable guard borrow exclude aliases.
             unsafe { &mut *self.mutex.value.get() }
         }
     }
 
-    impl<T: fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
+    impl<T: fmt::Debug + ?Sized> fmt::Debug for MutexGuard<'_, T> {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             (**self).fmt(formatter)
         }
     }
 
-    impl<T> Drop for MutexGuard<'_, T> {
+    impl<T: ?Sized> Drop for MutexGuard<'_, T> {
         fn drop(&mut self) {
             if !self.entered_panicking && std::thread::panicking() {
                 self.mutex.poisoned.store(true, Ordering::Release);
             }
             self.mutex.held.store(false, Ordering::Release);
             // The guard cannot leave the thread that acquired ownership.
-            unsafe { libc::os_unfair_lock_unlock(self.mutex.raw.get()); }
+            unsafe {
+                libc::os_unfair_lock_unlock(self.mutex.raw.get());
+            }
         }
     }
 }
@@ -217,18 +235,36 @@ mod tests {
     }
 
     #[test]
+    fn core_mutex_unsized_values_keep_inline_ownership_without_allocation() {
+        forbid_alloc(|| {
+            let mut mutex = Mutex::new([1, 2]);
+            let erased: &mut Mutex<[i32]> = &mut mutex;
+            erased.get_mut().unwrap()[0] = 3;
+            {
+                let mut guard: super::MutexGuard<'_, [i32]> = erased.lock().unwrap();
+                guard[1] = 4;
+                assert_eq!(&*guard, &[3, 4]);
+                assert!(matches!(erased.try_lock(), Err(TryLockError::WouldBlock)));
+            }
+            assert_eq!(&*erased.try_lock().unwrap(), &[3, 4]);
+        });
+    }
+
+    #[test]
     fn core_mutex_concurrent_first_use_initializes_one_native_location() {
         let mutex = Mutex::new(0);
         let start = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let run = || forbid_alloc(|| {
-                while !start.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                for _ in 0..32 {
-                    *mutex.lock().unwrap() += 1;
-                }
-            });
+            let run = || {
+                forbid_alloc(|| {
+                    while !start.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    for _ in 0..32 {
+                        *mutex.lock().unwrap() += 1;
+                    }
+                })
+            };
             let first = scope.spawn(run);
             let second = scope.spawn(run);
             start.store(true, Ordering::Release);
@@ -244,11 +280,13 @@ mod tests {
         let locked = mutex.lock().unwrap();
         let waiting = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| forbid_alloc(|| {
-                assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
-                waiting.store(true, Ordering::Release);
-                *mutex.lock().unwrap() += 1;
-            }));
+            let writer = scope.spawn(|| {
+                forbid_alloc(|| {
+                    assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
+                    waiting.store(true, Ordering::Release);
+                    *mutex.lock().unwrap() += 1;
+                })
+            });
             let deadline = Instant::now() + Duration::from_secs(5);
             while !waiting.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
@@ -271,15 +309,20 @@ mod tests {
         });
         assert!(failed.is_err());
         std::thread::scope(|scope| {
-            scope.spawn(|| forbid_alloc(|| {
-                let mut guard = match mutex.try_lock() {
-                    Err(TryLockError::Poisoned(error)) => error.into_inner(),
-                    _ => panic!("an unwound mutex did not expose its poisoned guard"),
-                };
-                assert_eq!(*guard, 9);
-                *guard += 1;
-                assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
-            })).join().unwrap();
+            scope
+                .spawn(|| {
+                    forbid_alloc(|| {
+                        let mut guard = match mutex.try_lock() {
+                            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                            _ => panic!("an unwound mutex did not expose its poisoned guard"),
+                        };
+                        assert_eq!(*guard, 9);
+                        *guard += 1;
+                        assert!(matches!(mutex.try_lock(), Err(TryLockError::WouldBlock)));
+                    })
+                })
+                .join()
+                .unwrap();
         });
         forbid_alloc(|| assert_eq!(*mutex.get_mut().unwrap_err().into_inner(), 10));
     }
@@ -292,6 +335,9 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(std::panic::catch_unwind(|| drop(values[1].try_lock())).is_err());
         #[cfg(target_os = "linux")]
-        assert!(matches!(values[1].try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(matches!(
+            values[1].try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
     }
 }

@@ -899,9 +899,7 @@ impl TemporarySpiller {
         })
     }
 
-    pub(crate) fn block_store(
-        &self,
-    ) -> std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>> {
+    pub(crate) fn block_store(&self) -> std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>> {
         std::sync::Arc::clone(&self.blocks)
     }
 
@@ -2329,9 +2327,7 @@ impl Checkpointer {
     }
 
     /// The shared block stack, for the storage layer's spilled-row reader.
-    pub(crate) fn block_stack(
-        &self,
-    ) -> std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>> {
+    pub(crate) fn block_stack(&self) -> std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>> {
         std::sync::Arc::clone(&self.blocks)
     }
 

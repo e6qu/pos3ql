@@ -4,10 +4,10 @@
 //! materializes sort keys into the per-statement arena (bounded by the
 //! arena size, loudly). No allocation anywhere.
 
-use crate::mem::mutex::Mutex;
 use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::fixed_vec::FixedVec;
+use crate::mem::mutex::Mutex;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::pg::{

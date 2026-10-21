@@ -4,8 +4,8 @@
 //! they cover parsing, execution, transactions and the wire encoding together
 //! rather than any one of them alone.
 
-use crate::mem::mutex::Mutex;
 use super::*;
+use crate::mem::mutex::Mutex;
 
 #[test]
 fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {

@@ -14135,9 +14135,8 @@ unsafe extern "C" {
 /// The block stacks are shared with checkpoint and spill writers through the
 /// same synchronization boundary.
 pub(crate) struct SpillReader {
-    blocks: Option<
-        std::sync::Arc<Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
-    >,
+    blocks:
+        Option<std::sync::Arc<Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>>,
     temporary_blocks: Option<std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>>,
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
@@ -14182,10 +14181,8 @@ pub(crate) struct ExternalRunAccess {
 impl ExternalRunAccess {
     pub(crate) fn reader(
         &self,
-    ) -> Result<
-        MutexGuard<'_, crate::sql::external::ExternalRunReader>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, crate::sql::external::ExternalRunReader>, crate::sql::eval::SqlError>
+    {
         // SAFETY: both allocations are pinned by `SpillReader`'s `Arc`s for
         // the engine lifetime; the crate-private handle is only installed in
         // executor state that cannot outlive that engine.
@@ -14562,10 +14559,7 @@ fn try_source_scratch<'a, T: ReadScratch>(
     None
 }
 
-fn try_mutex_pool<'a, T>(
-    pool: &'a [Mutex<T>],
-    name: &str,
-) -> Option<MutexGuard<'a, T>> {
+fn try_mutex_pool<'a, T>(pool: &'a [Mutex<T>], name: &str) -> Option<MutexGuard<'a, T>> {
     for candidate in pool {
         match candidate.try_lock() {
             Ok(lease) => return Some(lease),
@@ -14584,13 +14578,9 @@ impl SpillReader {
         budget: &mut Budget,
         max_spill_generations: usize,
         blocks: Option<
-            std::sync::Arc<
-                Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
-            >,
+            std::sync::Arc<Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
         >,
-        temporary_blocks: Option<
-            std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>,
-        >,
+        temporary_blocks: Option<std::sync::Arc<Mutex<crate::store::EphemeralBlockStore>>>,
     ) -> Result<std::sync::Arc<Self>, BudgetError> {
         let durable = blocks.is_some();
         budget.draw(Self::owner_bytes(), "shared spill reader owner")?;
@@ -14669,9 +14659,7 @@ impl SpillReader {
         }
         let cursor_contexts = (0..MAX_ROW_WALK_NESTING)
             .map(|_| {
-                Mutex::new(
-                    vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
-                )
+                Mutex::new(vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice())
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -14701,9 +14689,7 @@ impl SpillReader {
                 + 4 * crate::store::MAX_PAYLOAD
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
                 + EXTERNAL_RUN_CONTEXTS
-                    * core::mem::size_of::<
-                        Mutex<Box<crate::sql::external::ExternalSorter>>,
-                    >()
+                    * core::mem::size_of::<Mutex<Box<crate::sql::external::ExternalSorter>>>()
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
         } else {
             row_reader
@@ -18125,8 +18111,7 @@ impl Storage {
             + config.max_role_memberships * size_of::<RoleMembership>()
             + config.max_role_settings * size_of::<RoleSetting>()
             + config.query_workspace_slots
-                * (size_of::<Mutex<FixedVec<bool>>>()
-                    + config.max_roles * size_of::<bool>())
+                * (size_of::<Mutex<FixedVec<bool>>>() + config.max_roles * size_of::<bool>())
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
@@ -29357,10 +29342,8 @@ impl Storage {
     /// gets a distinct producer instead of resetting an outer run in progress.
     pub(crate) fn external_sorter(
         &self,
-    ) -> Result<
-        MutexGuard<'_, Box<crate::sql::external::ExternalSorter>>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, Box<crate::sql::external::ExternalSorter>>, crate::sql::eval::SqlError>
+    {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -29381,10 +29364,8 @@ impl Storage {
     /// of aliasing scratch across nested materializers.
     pub(crate) fn external_run_reader(
         &self,
-    ) -> Result<
-        MutexGuard<'_, crate::sql::external::ExternalRunReader>,
-        crate::sql::eval::SqlError,
-    > {
+    ) -> Result<MutexGuard<'_, crate::sql::external::ExternalRunReader>, crate::sql::eval::SqlError>
+    {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -39878,12 +39859,12 @@ impl Storage {
         images: &mut EnumMemberImages,
         slot: usize,
         txid: u32,
-    ) -> bool {
+    ) {
         let Some(pending) = catalog.enums[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
         else {
-            return false;
+            return;
         };
         let definition = catalog.enums[slot].definition_for(txid);
         let previous = catalog.enums[slot];
@@ -39903,7 +39884,6 @@ impl Storage {
         if let Some(image) = previous.member_image {
             images.release(image);
         }
-        definition.schema != previous.schema || definition.name != previous.name
     }
 
     pub(crate) fn replay_enum_identity(

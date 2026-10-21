@@ -49,26 +49,21 @@ commit checks this ownership and dependent publication counters before durabilit
 Subscription creation saves its stream identity instead of reconstructing it
 from allocation order during replay. Conflicting edits and deletion
 wait for their owner, including a transaction's pending rename.
-Storage publication rechecks a type's lifetime and edit revision after waits,
-then includes tables created or changed while it was acquiring owners. Enum
-label edits and name moves now use one shared commit API.
-Core macOS mutexes keep their native state inline, including when a command
-constructs a new lock value. Native and interpreter checks cover first use,
-movement, contention and unwinding within the startup memory boundary.
+Before applying a type rename, storage checks again that the same edit still
+exists, including after a wait. It also updates tables created or changed during
+that wait. Enum label edits and name changes commit through one shared path.
+Core macOS locks keep their native state inline, including locks constructed by
+a running command. Native and memory-safety checks cover first use, movement,
+contention and recovery after a panic within the startup memory boundary.
 PostgreSQL comparisons keep result rows and error codes separate from multiline
 diagnostic wording; the dedicated message checks still compare error text.
 
-Complete shared engine publication across transaction commit, remaining type
-retirement paths and metadata preparation before removing the transaction barrier.
-Connect all remaining preparation and rewrite paths to
-retained sources before running those paths concurrently.
-
-Finish protection for engine-wide publication and remaining table rewrites.
-Retain historical row, index and backup references before publishing replacements.
-Heap maintenance, pressure waits, capture and
-reader-history cleanup already use bounded turns. Metadata capture and some
-maintenance reads remain synchronous. Raising memory limits is not a completion
-criterion.
+When a transaction commits, publish its related changes together. Protect the
+remaining metadata creation, deletion and table-rewrite paths before running
+statements on several CPU workers. Preserve the definitions selected before a
+wait, and keep old row, index and backup data until their readers have finished.
+Some metadata capture and maintenance reads still block the worker. Raising
+memory limits is not a completion criterion.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

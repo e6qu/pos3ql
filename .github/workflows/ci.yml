@@ -48,9 +48,13 @@ jobs:
           components: miri
       - run: cargo miri setup --target aarch64-apple-darwin
       - name: Native mutex movement, contention and unwinding
-        run: >-
-          cargo miri test --package pos3ql-mutex-model --lib --locked
-          --target aarch64-apple-darwin -- mem::mutex::tests --test-threads=1
+        shell: bash
+        run: |
+          cargo miri test --package pos3ql-mutex-model --lib --locked \
+            --target aarch64-apple-darwin -- mem::mutex::tests --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/macos-mutex.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
+            "$RUNNER_TEMP/macos-mutex.log"
 
   heap-aliasing:
     runs-on: ubuntu-latest

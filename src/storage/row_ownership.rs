@@ -1,7 +1,10 @@
 //! Acquire related owners without retaining a prefix while another lock waits.
 
 use core::mem::{align_of, size_of};
-use {crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard, std::sync::RwLock, std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard, std::sync::TryLockError};
+use {
+    crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard, std::sync::RwLock,
+    std::sync::RwLockReadGuard, std::sync::RwLockWriteGuard, std::sync::TryLockError,
+};
 
 use super::RowEntries;
 use super::row_map::RowMap;

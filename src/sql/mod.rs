@@ -61,13 +61,13 @@ pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
 
-use crate::mem::mutex::Mutex;
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
 use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::mem::mutex::Mutex;
 use crate::pg::pgoutput;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;

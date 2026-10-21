@@ -30937,7 +30937,10 @@ pub(crate) fn drop_collation(
             if !storage.composite_slot_visible_to(composite_slot, txn.txid) {
                 continue;
             }
-            let mut composite = storage.composite_for(composite_slot, txn.txid);
+            let (mut composite, edit_target) = match storage.prepare_composite_edit(composite_slot, txn.txid) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
+            };
             let mut changed = false;
             for field in composite.fields.iter_mut().take(composite.n_fields) {
                 if !field.dropped && field.collation == identity {
@@ -30957,7 +30960,7 @@ pub(crate) fn drop_collation(
             if !changed {
                 continue;
             }
-            let prior = match storage.stage_composite_alter(composite_slot, composite, txn.txid) {
+            let prior = match storage.stage_composite_alter(edit_target, composite, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -41510,7 +41513,10 @@ pub fn alter_domain(
         return sql_fail(error);
     }
     if matches!(action, A::Rename(_) | A::SetSchema(_)) {
-        let current = storage.domain_for(slot, txn.txid);
+        let (current, edit_target) = match storage.prepare_domain_edit(slot, txn.txid) {
+            Ok(selected) => selected,
+            Err(error) => return sql_fail(error),
+        };
         let (schema, domain_name) = match action {
             A::Rename(domain_name) => {
                 let domain_name = match SqlName::parse(domain_name) {
@@ -41545,7 +41551,7 @@ pub fn alter_domain(
                 domain_name.as_str()
             ));
         }
-        let prior = match storage.stage_domain_identity(slot, schema, domain_name, txn.txid) {
+        let prior = match storage.stage_domain_identity(edit_target, schema, domain_name, txn.txid) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -41574,7 +41580,10 @@ pub fn alter_domain(
         return sql_ok();
     }
     // Start from the current definition and apply the action.
-    let current = storage.domain_for(slot, txn.txid);
+    let (current, edit_target) = match storage.prepare_domain_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let mut spec = crate::storage::DomainSpec {
         base_domain: current.base_domain,
         base_user_type: current.base_user_type,
@@ -41801,7 +41810,7 @@ pub fn alter_domain(
         }
         A::Rename(_) | A::SetSchema(_) => unreachable!(),
     }
-    let prior = match storage.stage_domain_alter(slot, spec, txn.txid) {
+    let prior = match storage.stage_domain_alter(edit_target, spec, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -43024,7 +43033,7 @@ fn cascade_drop_composite_fields(
     composite_slot: usize,
     mut matches: impl FnMut(&crate::storage::CompositeFieldDef) -> bool,
 ) -> Result<(), SqlError> {
-    let mut altered = storage.composite_for(composite_slot, txn.txid);
+    let (mut altered, edit_target) = storage.prepare_composite_edit(composite_slot, txn.txid)?;
     let mut dropped = [SqlName::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS];
     let mut dropped_count = 0;
     for field in altered.fields[..altered.n_fields].iter_mut() {
@@ -43042,7 +43051,7 @@ fn cascade_drop_composite_fields(
     if dropped_count == 0 {
         return Ok(());
     }
-    let prior = storage.stage_composite_alter(composite_slot, altered, txn.txid)?;
+    let prior = storage.stage_composite_alter(edit_target, altered, txn.txid)?;
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -44862,7 +44871,10 @@ pub fn alter_type(
             before,
             after,
         } => {
-            let current = storage.enum_for(slot, txn.txid);
+            let (current, edit_target) = match storage.prepare_enum_edit(slot, txn.txid) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
+            };
             let current_schema = current.schema;
             let current_name = current.name;
             if current.sort_of(label).is_some() {
@@ -44927,7 +44939,7 @@ pub fn alter_type(
                 sort,
             };
             let prior = match storage.stage_enum_alter(
-                slot,
+                edit_target,
                 current_schema,
                 current_name,
                 altered,
@@ -44964,7 +44976,10 @@ pub fn alter_type(
             }
         }
         A::RenameTo(new_name) => {
-            let current = storage.enum_for(slot, txn.txid);
+            let (current, edit_target) = match storage.prepare_enum_edit(slot, txn.txid) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
+            };
             let current_schema = current.schema;
             let current_name = current.name;
             if current.name.as_str() == *new_name {
@@ -45001,7 +45016,7 @@ pub fn alter_type(
                 }
             };
             let prior =
-                match storage.stage_enum_alter(slot, current_schema, renamed, members, txn.txid) {
+                match storage.stage_enum_alter(edit_target, current_schema, renamed, members, txn.txid) {
                     Ok(prior) => prior,
                     Err(error) => return sql_fail(error),
                 };
@@ -45027,7 +45042,10 @@ pub fn alter_type(
             }
         }
         A::SetSchema(new_schema) => {
-            let current = storage.enum_for(slot, txn.txid);
+            let (current, edit_target) = match storage.prepare_enum_edit(slot, txn.txid) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
+            };
             let current_schema = current.schema;
             let current_name = current.name;
             if storage.find_schema_visible(new_schema, txn.txid).is_none() {
@@ -45077,7 +45095,7 @@ pub fn alter_type(
                 }
             };
             let prior =
-                match storage.stage_enum_alter(slot, schema, current_name, members, txn.txid) {
+                match storage.stage_enum_alter(edit_target, schema, current_name, members, txn.txid) {
                     Ok(prior) => prior,
                     Err(error) => return sql_fail(error),
                 };
@@ -45104,7 +45122,10 @@ pub fn alter_type(
             }
         }
         A::RenameValue { from, to } => {
-            let current = storage.enum_for(slot, txn.txid);
+            let (current, edit_target) = match storage.prepare_enum_edit(slot, txn.txid) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
+            };
             let current_schema = current.schema;
             let current_name = current.name;
             let Some(member_index) = current
@@ -45139,7 +45160,7 @@ pub fn alter_type(
             };
             altered[member_index].label = renamed;
             let prior = match storage.stage_enum_alter(
-                slot,
+                edit_target,
                 current_schema,
                 current_name,
                 altered,
@@ -45217,7 +45238,10 @@ fn alter_composite_type(
             storage.composite_for(slot, txn.txid).name.as_str()
         ));
     }
-    let mut altered = storage.composite_for(slot, txn.txid);
+    let (mut altered, edit_target) = match storage.prepare_composite_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let prior_names = (altered.schema, altered.name);
     let mut renamed_attribute = None;
     let wrong_type = || {
@@ -45428,7 +45452,7 @@ fn alter_composite_type(
             altered.fields[index] = replacement;
         }
     }
-    let prior = match storage.stage_composite_alter(slot, altered, txn.txid) {
+    let prior = match storage.stage_composite_alter(edit_target, altered, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -46043,6 +46067,7 @@ fn rewrite_composite_dependent_domains(
         {
             continue;
         }
+        let (current, edit_target) = storage.prepare_domain_edit(domain_slot, txn.txid)?;
         let mut spec = crate::storage::DomainSpec {
             base_domain: current.base_domain,
             base_user_type: current.base_user_type,
@@ -46071,7 +46096,7 @@ fn rewrite_composite_dependent_domains(
         if !changed {
             continue;
         }
-        let prior = storage.stage_domain_alter(domain_slot, spec, txn.txid)?;
+        let prior = storage.stage_domain_alter(edit_target, spec, txn.txid)?;
         if let Err(error) =
             validate_domain_rows(storage, domain_slot, DomainValidation::All, txn.txid, arena)
         {

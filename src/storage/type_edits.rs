@@ -8,6 +8,24 @@ use super::{PendingCompositeDefinition, PendingDomainDefinition, PendingEnumDefi
 use crate::config::Config;
 use crate::mem::FixedVec;
 use crate::mem::budget::{Budget, BudgetError};
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TypeEditTarget {
+    source: TypeIdentity,
+    transaction: u32,
+    version: u64,
+}
+
+impl TypeEditTarget {
+    pub(super) fn slot(self, kind: super::NamedTypeKind) -> Result<usize, SqlError> {
+        if self.source.slot().kind() != kind {
+            return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "type edit has the wrong source kind"));
+        }
+        Ok(self.source.slot().index())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TypeAlterUndo<Definition> {
@@ -77,6 +95,36 @@ impl TypeDefinitionVersions {
 }
 
 impl super::TypeCatalog {
+    fn select_type_edit(&self, source: NamedTypeSlot, transaction: u32) -> Result<TypeEditTarget, SqlError> {
+        let snapshot = self.type_snapshot(source, transaction)?
+            .filter(|snapshot| snapshot.identity.database() == super::current_database())
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source no longer exists"))?;
+        Ok(TypeEditTarget {
+            source: snapshot.identity,
+            transaction,
+            version: self.type_definition_version(source, transaction),
+        })
+    }
+
+    pub(super) fn validate_type_edit_source(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        if target.source.database() != super::current_database() || !self.contains_type_source(target.source) {
+            return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source has been replaced"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_type_edit(&self, target: TypeEditTarget, transaction: u32) -> Result<(), SqlError> {
+        self.validate_type_edit_source(target)?;
+        let current = self.select_type_edit(target.source.slot(), transaction)?;
+        if current.source != target.source {
+            return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source has been replaced"));
+        }
+        if target.transaction != transaction || current.version != target.version {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type definition changed after edit preparation"));
+        }
+        Ok(())
+    }
+
     pub(super) fn type_definition_version(&self, source: NamedTypeSlot, transaction: u32) -> u64 {
         let pending = match source {
             NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition
@@ -124,6 +172,36 @@ impl super::TypeCatalog {
 }
 
 impl super::Storage {
+    pub(crate) fn prepare_domain_edit(&self, slot: usize, transaction: u32) -> Result<(super::DomainDef, TypeEditTarget), SqlError> {
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let target = catalog.select_type_edit(NamedTypeSlot::Domain(slot), transaction)?;
+        Ok((catalog.domains[slot].definition_for(transaction), target))
+    }
+
+    pub(crate) fn prepare_enum_edit(&self, slot: usize, transaction: u32) -> Result<(super::EnumDefinition, TypeEditTarget), SqlError> {
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let target = catalog.select_type_edit(NamedTypeSlot::Enum(slot), transaction)?;
+        let definition = catalog.enums[slot].definition_for(transaction);
+        let image = super::EnumImageRead::capture(&self.enum_member_images, definition.member_image);
+        Ok((super::EnumDefinition {
+            image,
+            member_count: definition.member_count as usize,
+            safe_member_count: catalog.enums[slot].safe_member_count_for(transaction),
+            database: definition.database,
+            created_at: definition.created_at,
+            schema: definition.schema,
+            name: definition.name,
+            ownership: definition.ownership,
+            ddl_state: definition.ddl_state,
+        }, target))
+    }
+
+    pub(crate) fn prepare_composite_edit(&self, slot: usize, transaction: u32) -> Result<(super::CompositeDef, TypeEditTarget), SqlError> {
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let target = catalog.select_type_edit(NamedTypeSlot::Composite(slot), transaction)?;
+        Ok((catalog.composites[slot].definition_for(transaction), target))
+    }
+
     pub(crate) fn stage_type_drop(
         &self,
         kind: super::NamedTypeKind,

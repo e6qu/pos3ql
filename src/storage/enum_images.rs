@@ -347,7 +347,7 @@ mod tests {
         members: &[EnumMember],
     ) -> Result<super::super::EnumAlterUndo, SqlError> {
         storage.stage_enum_alter(
-            slot,
+            storage.prepare_enum_edit(slot, 77).unwrap().1,
             SqlName::parse("public").unwrap(),
             SqlName::parse("state").unwrap(),
             members,
@@ -680,7 +680,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .stage_enum_alter(
-                    slot,
+                    storage.prepare_enum_edit(slot, 77).unwrap().1,
                     after.schema,
                     after.name,
                     &[member("new", 1.0), member("paid", 2.0)],
@@ -738,7 +738,7 @@ mod tests {
             storage.rollback_enum_alter(later);
             let other = storage
                 .stage_enum_alter(
-                    slot,
+                    storage.prepare_enum_edit(slot, 88).unwrap().1,
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
                     &[member("other", 1.0)],

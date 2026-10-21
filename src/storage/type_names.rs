@@ -247,10 +247,10 @@ mod tests {
     ) -> Result<NameUndo, SqlError> {
         let UserTypeName { schema, name, .. } = identity(name);
         Ok(match slot {
-            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(slot, schema, name, txid)?),
+            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(storage.prepare_domain_edit(slot, txid).unwrap().1, schema, name, txid)?),
             NamedTypeSlot::Enum(slot) => {
                 NameUndo::Enum(storage.stage_enum_alter(
-                    slot,
+                    storage.prepare_enum_edit(slot, txid).unwrap().1,
                     schema,
                     name,
                     &[EnumMember {
@@ -265,7 +265,7 @@ mod tests {
                 let mut definition = storage.composite_for(slot, txid);
                 definition.schema = schema;
                 definition.name = name;
-                NameUndo::Composite(storage.stage_composite_alter(slot, definition, txid)?)
+                NameUndo::Composite(storage.stage_composite_alter(storage.prepare_composite_edit(slot, txid).unwrap().1, definition, txid)?)
             }
         })
     }
@@ -385,6 +385,27 @@ mod tests {
                     );
                 });
             }
+        }
+    }
+
+    #[test]
+    fn named_type_drop_uses_own_pending_name_and_rollback_restores_it() {
+        for kind in KINDS {
+            let mut storage = fixture();
+            crate::mem::guard::forbid_alloc(|| {
+                let source = create(&mut storage, kind, "before", 0).unwrap();
+                let undo = rename(&mut storage, source, "after", 7).unwrap();
+                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap(), None);
+                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap(), Some(source.index()));
+                match source {
+                    NamedTypeSlot::Domain(slot) => storage.rollback_domain_drop(slot, 7),
+                    NamedTypeSlot::Enum(slot) => storage.rollback_enum_drop(slot, 7),
+                    NamedTypeSlot::Composite(slot) => storage.rollback_composite_drop(slot, 7),
+                }
+                rollback(&mut storage, undo);
+                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap(), None);
+                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap(), Some(source.index()));
+            });
         }
     }
 

@@ -20493,7 +20493,7 @@ fn apply_composite_wal_definition(
         n_fields: def.n_fields,
     };
     if storage.composite(slot).visible_to(0) {
-        let mut definition = storage.composite_for(slot, 0);
+        let (mut definition, edit_target) = storage.prepare_composite_edit(slot, 0)?;
         if definition.database != storage.current_database_oid()
             || definition.created_at != def.created_at
         {
@@ -20506,7 +20506,7 @@ fn apply_composite_wal_definition(
         definition.name = def.name;
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
-        storage.stage_composite_alter(slot, definition, 0)?;
+        storage.stage_composite_alter(edit_target, definition, 0)?;
         storage.commit_composite_alter(slot, 0);
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
@@ -22031,7 +22031,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         "journal domain lifetime does not match its source"
                     ));
                 }
-                storage.stage_domain_alter(slot, spec, 0)?;
+                let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
+                storage.stage_domain_alter(edit_target, spec, 0)?;
                 storage.commit_domain_alter(slot, 0);
             } else {
                 let allocated = storage.create_domain(def.schema, def.name, spec, 0)?;
@@ -22198,10 +22199,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
-            let mut definition = storage.composite_for(slot, 0);
+            let (mut definition, edit_target) = storage.prepare_composite_edit(slot, 0)?;
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
-            storage.stage_composite_alter(slot, definition, 0)?;
+            storage.stage_composite_alter(edit_target, definition, 0)?;
             storage.commit_composite_alter(slot, 0);
         }
         WalOp::AlterDomainIdentity {
@@ -22217,8 +22218,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
+            let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
             storage.stage_domain_identity(
-                slot,
+                edit_target,
                 crate::storage::SqlName::parse(new_schema)?,
                 crate::storage::SqlName::parse(new_name)?,
                 0,

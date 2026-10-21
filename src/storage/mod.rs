@@ -15,7 +15,7 @@ mod enum_images;
 mod enum_publication;
 pub(crate) use enum_publication::EnumMemberPublication;
 mod type_edits;
-pub(crate) use type_edits::{CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo};
+pub(crate) use type_edits::{CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeEditTarget};
 pub(crate) use statistics::CheckpointStatistics;
 mod table_creation;
 mod table_definitions;
@@ -39113,20 +39113,23 @@ impl Storage {
     }
 
     pub(crate) fn stage_domain_alter(
-        &mut self,
-        slot: usize,
+        &self,
+        target: TypeEditTarget,
         mut spec: DomainSpec,
         txid: u32,
     ) -> Result<DomainAlterUndo, SqlError> {
+        let slot = target.slot(NamedTypeKind::Domain)?;
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.validate_type_edit_source(target)?;
         if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Domain(slot), txid) {
             let name = catalog.domains[slot].name;
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
+        catalog.validate_type_edit(target, txid)?;
         catalog.bind_domain_spec(&mut spec, txid)?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
@@ -39145,21 +39148,24 @@ impl Storage {
     }
 
     pub(crate) fn stage_domain_identity(
-        &mut self,
-        slot: usize,
+        &self,
+        target: TypeEditTarget,
         schema: SqlName,
         name: SqlName,
         txid: u32,
     ) -> Result<DomainAlterUndo, SqlError> {
+        let slot = target.slot(NamedTypeKind::Domain)?;
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.validate_type_edit_source(target)?;
         if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Domain(slot), txid) {
             let name = catalog.domains[slot].name;
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
+        catalog.validate_type_edit(target, txid)?;
         self.require_named_type_name(
             &catalog,
             schema,
@@ -39617,21 +39623,24 @@ impl Storage {
 
     pub(crate) fn stage_enum_alter(
         &self,
-        slot: usize,
+        target: TypeEditTarget,
         schema: SqlName,
         name: SqlName,
         members: &[EnumMember],
         txid: u32,
     ) -> Result<EnumAlterUndo, SqlError> {
+        let slot = target.slot(NamedTypeKind::Enum)?;
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.validate_type_edit_source(target)?;
         if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Enum(slot), txid) {
             let name = catalog.enums[slot].name;
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
+        catalog.validate_type_edit(target, txid)?;
         self.require_named_type_name(
             &catalog,
             schema,
@@ -40111,20 +40120,23 @@ impl Storage {
     }
 
     pub(crate) fn stage_composite_alter(
-        &mut self,
-        slot: usize,
+        &self,
+        target: TypeEditTarget,
         mut definition: CompositeDef,
         txid: u32,
     ) -> Result<CompositeAlterUndo, SqlError> {
+        let slot = target.slot(NamedTypeKind::Composite)?;
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
+        catalog.validate_type_edit_source(target)?;
         if let Some(owner) = catalog.conflicting_type_owner(NamedTypeSlot::Composite(slot), txid) {
             let name = catalog.composites[slot].name;
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
+        catalog.validate_type_edit(target, txid)?;
         catalog.bind_composite_fields(&mut definition.fields[..definition.n_fields], txid)?;
         self.require_named_type_name(
             &catalog,

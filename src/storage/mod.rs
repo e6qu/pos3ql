@@ -15,8 +15,11 @@ mod enum_images;
 mod enum_publication;
 pub(crate) use enum_publication::EnumMemberPublication;
 mod type_edits;
-pub(crate) use type_edits::{CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeEditTarget, TypeDdlUndo, TypeDdlDecision, TypeCommitChange};
 pub(crate) use statistics::CheckpointStatistics;
+pub(crate) use type_edits::{
+    CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeCommitChange, TypeDdlDecision,
+    TypeDdlUndo, TypeEditTarget,
+};
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -20446,8 +20449,12 @@ impl Storage {
                     .domains
                     .iter()
                     .enumerate()
-                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
-                        && !self.type_definition_images.retains(NamedTypeSlot::Domain(slot)))
+                    .position(|(slot, candidate)| {
+                        candidate.ddl_state == CatalogDdlState::Absent
+                            && !self
+                                .type_definition_images
+                                .retains(NamedTypeSlot::Domain(slot))
+                    })
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "domain catalog is full")
                     })?;
@@ -20455,7 +20462,9 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                type_catalog.versions.initialize(NamedTypeSlot::Domain(target_slot), definition.created_at);
+                type_catalog
+                    .versions
+                    .initialize(NamedTypeSlot::Domain(target_slot), definition.created_at);
                 type_catalog.domains[target_slot] = definition;
             }
             for source_slot in 0..type_catalog.enums.len() {
@@ -20468,8 +20477,12 @@ impl Storage {
                     .enums
                     .iter()
                     .enumerate()
-                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
-                        && !self.type_definition_images.retains(NamedTypeSlot::Enum(slot)))
+                    .position(|(slot, candidate)| {
+                        candidate.ddl_state == CatalogDdlState::Absent
+                            && !self
+                                .type_definition_images
+                                .retains(NamedTypeSlot::Enum(slot))
+                    })
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "enum catalog is full")
                     })?;
@@ -20483,7 +20496,9 @@ impl Storage {
                 })?;
                 let image = EnumImageReservation::copy(&self.enum_member_images, source, count)?;
                 definition.member_image = Some(image.publish());
-                type_catalog.versions.initialize(NamedTypeSlot::Enum(target_slot), definition.created_at);
+                type_catalog
+                    .versions
+                    .initialize(NamedTypeSlot::Enum(target_slot), definition.created_at);
                 type_catalog.enums[target_slot] = definition;
             }
             for source_slot in 0..type_catalog.composites.len() {
@@ -20496,8 +20511,12 @@ impl Storage {
                     .composites
                     .iter()
                     .enumerate()
-                    .position(|(slot, candidate)| candidate.ddl_state == CatalogDdlState::Absent
-                        && !self.type_definition_images.retains(NamedTypeSlot::Composite(slot)))
+                    .position(|(slot, candidate)| {
+                        candidate.ddl_state == CatalogDdlState::Absent
+                            && !self
+                                .type_definition_images
+                                .retains(NamedTypeSlot::Composite(slot))
+                    })
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -20520,7 +20539,9 @@ impl Storage {
                         field.collation = Collation::Catalog(target);
                     }
                 }
-                type_catalog.versions.initialize(NamedTypeSlot::Composite(target_slot), definition.created_at);
+                type_catalog
+                    .versions
+                    .initialize(NamedTypeSlot::Composite(target_slot), definition.created_at);
                 type_catalog.composites[target_slot] = definition;
             }
             drop(type_catalog);
@@ -38786,7 +38807,8 @@ impl Storage {
         name: SqlName,
         spec: DomainSpec,
     ) -> Result<usize, SqlError> {
-        self.create_domain_with_binding(schema, name, spec, 0, true).map(TypeDdlUndo::slot)
+        self.create_domain_with_binding(schema, name, spec, 0, true)
+            .map(TypeDdlUndo::slot)
     }
 
     fn create_domain_with_binding(
@@ -38824,7 +38846,9 @@ impl Storage {
             class: AccessClass::Domain,
             slot: new as u16,
         });
-        catalog.versions.initialize(NamedTypeSlot::Domain(new), created_at);
+        catalog
+            .versions
+            .initialize(NamedTypeSlot::Domain(new), created_at);
         catalog.domains[new] = DomainDef {
             database: current_database(),
             created_at,
@@ -38846,9 +38870,15 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid }
             },
         };
-        Ok(TypeDdlUndo::created(type_references::TypeIdentity::new(
-            catalog.origin, current_database(), NamedTypeSlot::Domain(new), created_at,
-        ), txid))
+        Ok(TypeDdlUndo::created(
+            type_references::TypeIdentity::new(
+                catalog.origin,
+                current_database(),
+                NamedTypeSlot::Domain(new),
+                created_at,
+            ),
+            txid,
+        ))
     }
 
     pub(crate) fn domain_for(&self, slot: usize, txid: u32) -> DomainDef {
@@ -39147,7 +39177,10 @@ impl Storage {
         let prior = domain.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
-            origin, domain.database, NamedTypeSlot::Domain(slot), domain.created_at,
+            origin,
+            domain.database,
+            NamedTypeSlot::Domain(slot),
+            domain.created_at,
         );
         domain.pending_definition = Some(PendingDomainDefinition {
             txid,
@@ -39155,7 +39188,12 @@ impl Storage {
             spec,
             identity: prior.and_then(|pending| pending.identity),
         });
-        Ok(DomainAlterUndo { source, transaction: txid, version, prior })
+        Ok(DomainAlterUndo {
+            source,
+            transaction: txid,
+            version,
+            prior,
+        })
     }
 
     pub(crate) fn stage_domain_identity(
@@ -39189,7 +39227,10 @@ impl Storage {
         let prior = domain.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
-            origin, domain.database, NamedTypeSlot::Domain(slot), domain.created_at,
+            origin,
+            domain.database,
+            NamedTypeSlot::Domain(slot),
+            domain.created_at,
         );
         let spec = prior.map_or(
             DomainSpec {
@@ -39210,18 +39251,27 @@ impl Storage {
             spec,
             identity: Some(PendingDomainIdentity { schema, name }),
         });
-        Ok(DomainAlterUndo { source, transaction: txid, version, prior })
+        Ok(DomainAlterUndo {
+            source,
+            transaction: txid,
+            version,
+            prior,
+        })
     }
 
     pub(crate) fn commit_domain_alter(&mut self, target: TypeEditTarget) {
-        let slot = target.slot(NamedTypeKind::Domain).expect("domain publication identifies its source kind");
+        let slot = target
+            .slot(NamedTypeKind::Domain)
+            .expect("domain publication identifies its source kind");
         let txid = target.transaction();
         let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            if !catalog.matches_type_edit(target) { return; }
+            if !catalog.matches_type_edit(target) {
+                return;
+            }
             let domain = catalog.domains[slot];
             if domain
                 .pending_definition
@@ -39255,35 +39305,28 @@ impl Storage {
         });
     }
 
-    pub(crate) fn rollback_domain_alter(
-        &self,
-        undo: DomainAlterUndo,
-    ) {
+    pub(crate) fn rollback_domain_alter(&self, undo: DomainAlterUndo) {
         let NamedTypeSlot::Domain(slot) = undo.source.slot() else {
             unreachable!("domain undo identifies a domain source");
         };
-        let mut catalog = self.type_catalog
+        let mut catalog = self
+            .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database()
+            || !catalog.contains_type_source(undo.source)
+        {
             return;
         }
-        if catalog.domains[slot].pending_definition.is_some_and(|pending|
-            pending.txid == undo.transaction && pending.version == undo.version
-        ) {
+        if catalog.domains[slot]
+            .pending_definition
+            .is_some_and(|pending| {
+                pending.txid == undo.transaction && pending.version == undo.version
+            })
+        {
             catalog.domains[slot].pending_definition = undo.prior;
         }
     }
-
-
-
-
-
-
-
-
-
-
 
     // --- Enum types (CREATE TYPE ... AS ENUM) ---
 
@@ -39527,7 +39570,8 @@ impl Storage {
         let slot = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
             slot
         } else {
-            self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?.slot()
+            self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?
+                .slot()
         };
         let mut catalog = self
             .type_catalog
@@ -39580,7 +39624,9 @@ impl Storage {
         });
         let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
         let member_count = image.count();
-        catalog.versions.initialize(NamedTypeSlot::Enum(new), created_at);
+        catalog
+            .versions
+            .initialize(NamedTypeSlot::Enum(new), created_at);
         catalog.enums[new] = EnumDef {
             database: current_database(),
             created_at,
@@ -39596,9 +39642,15 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid }
             },
         };
-        Ok(TypeDdlUndo::created(type_references::TypeIdentity::new(
-            catalog.origin, current_database(), NamedTypeSlot::Enum(new), created_at,
-        ), txid))
+        Ok(TypeDdlUndo::created(
+            type_references::TypeIdentity::new(
+                catalog.origin,
+                current_database(),
+                NamedTypeSlot::Enum(new),
+                created_at,
+            ),
+            txid,
+        ))
     }
 
     pub(crate) fn stage_enum_alter(
@@ -39677,7 +39729,9 @@ impl Storage {
         });
         Ok(EnumAlterUndo {
             source: type_references::TypeIdentity::new(
-                catalog.origin, catalog.enums[slot].database, NamedTypeSlot::Enum(slot),
+                catalog.origin,
+                catalog.enums[slot].database,
+                NamedTypeSlot::Enum(slot),
                 catalog.enums[slot].created_at,
             ),
             transaction: txid,
@@ -39769,7 +39823,9 @@ impl Storage {
     }
 
     pub(crate) fn commit_enum_alter(&mut self, target: TypeEditTarget) {
-        let slot = target.slot(NamedTypeKind::Enum).expect("enum publication identifies its source kind");
+        let slot = target
+            .slot(NamedTypeKind::Enum)
+            .expect("enum publication identifies its source kind");
         let txid = target.transaction();
         match self.commit_enum_members(target) {
             EnumMemberPublication::Complete => return,
@@ -39780,7 +39836,9 @@ impl Storage {
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            if !catalog.matches_type_edit(target) { return; }
+            if !catalog.matches_type_edit(target) {
+                return;
+            }
             let previous = catalog.enums[slot];
             let definition = previous.definition_for(txid);
             type_reference_moves::TypeReferenceMove::new(
@@ -39813,7 +39871,9 @@ impl Storage {
         };
         let definition = catalog.enums[slot].definition_for(txid);
         let previous = catalog.enums[slot];
-        catalog.versions.set(NamedTypeSlot::Enum(slot), pending.version);
+        catalog
+            .versions
+            .set(NamedTypeSlot::Enum(slot), pending.version);
         catalog.enums[slot] = definition;
         let mut tail = Some(pending.member_slot);
         while let Some(slot) = tail {
@@ -39880,28 +39940,22 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database()
+            || !catalog.contains_type_source(undo.source)
+        {
             return;
         }
         let definition = &catalog.enums[slot];
-        let Some(current) = definition.pending_definition.filter(|pending| {
-            pending.txid == undo.transaction
-                && pending.version == undo.version
-        }) else {
+        let Some(current) = definition
+            .pending_definition
+            .filter(|pending| pending.txid == undo.transaction && pending.version == undo.version)
+        else {
             // An already applied or superseded undo cannot release a later image.
             return;
         };
         self.release_pending_enum_members(&mut catalog, current.member_slot, None);
         catalog.enums[slot].pending_definition = undo.prior;
     }
-
-
-
-
-
-
-
-
 
     // --- Named composite types (CREATE TYPE ... AS (...)) ---
 
@@ -40094,7 +40148,10 @@ impl Storage {
         let prior = composite.pending_definition;
         let version = self.catalog_sequence.next()?;
         let source = type_references::TypeIdentity::new(
-            origin, composite.database, NamedTypeSlot::Composite(slot), composite.created_at,
+            origin,
+            composite.database,
+            NamedTypeSlot::Composite(slot),
+            composite.created_at,
         );
         composite.pending_definition = Some(PendingCompositeDefinition {
             txid,
@@ -40104,18 +40161,27 @@ impl Storage {
             fields: definition.fields,
             n_fields: definition.n_fields,
         });
-        Ok(CompositeAlterUndo { source, transaction: txid, version, prior })
+        Ok(CompositeAlterUndo {
+            source,
+            transaction: txid,
+            version,
+            prior,
+        })
     }
 
     pub(crate) fn commit_composite_alter(&mut self, target: TypeEditTarget) {
-        let slot = target.slot(NamedTypeKind::Composite).expect("composite publication identifies its source kind");
+        let slot = target
+            .slot(NamedTypeKind::Composite)
+            .expect("composite publication identifies its source kind");
         let txid = target.transaction();
         let movement = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            if !catalog.matches_type_edit(target) { return; }
+            if !catalog.matches_type_edit(target) {
+                return;
+            }
             let composite = catalog.composites[slot];
             let Some(pending) = composite
                 .pending_definition
@@ -40154,26 +40220,31 @@ impl Storage {
             composite.fields = pending.fields;
             composite.n_fields = pending.n_fields;
             composite.pending_definition = None;
-            catalog.versions.set(NamedTypeSlot::Composite(slot), pending.version);
+            catalog
+                .versions
+                .set(NamedTypeSlot::Composite(slot), pending.version);
         }
     }
 
-    pub(crate) fn rollback_composite_alter(
-        &self,
-        undo: CompositeAlterUndo,
-    ) {
+    pub(crate) fn rollback_composite_alter(&self, undo: CompositeAlterUndo) {
         let NamedTypeSlot::Composite(slot) = undo.source.slot() else {
             unreachable!("composite undo identifies a composite source");
         };
-        let mut catalog = self.type_catalog
+        let mut catalog = self
+            .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if undo.source.database() != current_database() || !catalog.contains_type_source(undo.source) {
+        if undo.source.database() != current_database()
+            || !catalog.contains_type_source(undo.source)
+        {
             return;
         }
-        if catalog.composites[slot].pending_definition.is_some_and(|pending|
-            pending.txid == undo.transaction && pending.version == undo.version
-        ) {
+        if catalog.composites[slot]
+            .pending_definition
+            .is_some_and(|pending| {
+                pending.txid == undo.transaction && pending.version == undo.version
+            })
+        {
             catalog.composites[slot].pending_definition = undo.prior;
         }
     }
@@ -40194,7 +40265,8 @@ impl Storage {
         name: SqlName,
         spec: CompositeSpec,
     ) -> Result<usize, SqlError> {
-        self.create_composite_with_binding(schema, name, spec, 0, true).map(TypeDdlUndo::slot)
+        self.create_composite_with_binding(schema, name, spec, 0, true)
+            .map(TypeDdlUndo::slot)
     }
 
     fn create_composite_with_binding(
@@ -40237,7 +40309,9 @@ impl Storage {
             class: AccessClass::Composite,
             slot: slot as u16,
         });
-        catalog.versions.initialize(NamedTypeSlot::Composite(slot), created_at);
+        catalog
+            .versions
+            .initialize(NamedTypeSlot::Composite(slot), created_at);
         catalog.composites[slot] = CompositeDef {
             database: current_database(),
             created_at,
@@ -40253,9 +40327,15 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid }
             },
         };
-        Ok(TypeDdlUndo::created(type_references::TypeIdentity::new(
-            catalog.origin, current_database(), NamedTypeSlot::Composite(slot), created_at,
-        ), txid))
+        Ok(TypeDdlUndo::created(
+            type_references::TypeIdentity::new(
+                catalog.origin,
+                current_database(),
+                NamedTypeSlot::Composite(slot),
+                created_at,
+            ),
+            txid,
+        ))
     }
 
     /// Replays a durable composite catalog identity. A WAL record names the
@@ -40292,7 +40372,9 @@ impl Storage {
             class: AccessClass::Composite,
             slot: slot as u16,
         });
-        catalog.versions.initialize(NamedTypeSlot::Composite(slot), created_at);
+        catalog
+            .versions
+            .initialize(NamedTypeSlot::Composite(slot), created_at);
         catalog.composites[slot] = CompositeDef {
             database: current_database(),
             created_at,
@@ -40310,14 +40392,6 @@ impl Storage {
         };
         Ok(slot)
     }
-
-
-
-
-
-
-
-
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other
     /// transactions keep seeing the committed catalog until commit).

@@ -426,7 +426,8 @@ impl TypeDefinitionImages {
         let key = TypeImageKey::select(&catalog, reference, transaction)?;
         let source = &catalog.domains[slot];
         if let Some((_, _, definition)) = self.domains.find(|candidate, definition| {
-            candidate.source == key.source && candidate.version == key.version
+            candidate.source == key.source
+                && candidate.version == key.version
                 && same_domain(definition, source, transaction)
         }) {
             return Ok(definition);
@@ -475,7 +476,8 @@ impl TypeDefinitionImages {
         let source = catalog.enums[slot].definition_for(transaction);
         let safe_member_count = catalog.enums[slot].safe_member_count_for(transaction);
         if let Some((_, _, definition)) = self.enums.find(|candidate, definition| {
-            candidate.source == key.source && candidate.version == key.version
+            candidate.source == key.source
+                && candidate.version == key.version
                 && same_enum(definition, &source, safe_member_count)
         }) {
             return Ok(definition);
@@ -516,7 +518,8 @@ impl TypeDefinitionImages {
         let key = TypeImageKey::select(&catalog, reference, transaction)?;
         let source = &catalog.composites[slot];
         if let Some((_, _, definition)) = self.composites.find(|candidate, definition| {
-            candidate.source == key.source && candidate.version == key.version
+            candidate.source == key.source
+                && candidate.version == key.version
                 && same_composite(definition, source, transaction)
         }) {
             return Ok(definition);
@@ -791,7 +794,8 @@ mod tests {
                     0,
                 )
             }
-        }.map(super::super::TypeDdlUndo::slot)
+        }
+        .map(super::super::TypeDdlUndo::slot)
     }
 
     fn reference(storage: &Storage, source: NamedTypeSlot) -> TypeReference {
@@ -822,21 +826,43 @@ mod tests {
     fn retire(storage: &mut Storage, source: NamedTypeSlot) {
         match source {
             NamedTypeSlot::Domain(slot) => {
-                let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Domain, "public", "reader_source", 0).unwrap().unwrap();
-            assert_eq!(dropped.slot(), slot);
-            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
+                let dropped = storage
+                    .stage_type_drop(
+                        crate::storage::NamedTypeKind::Domain,
+                        "public",
+                        "reader_source",
+                        0,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(dropped.slot(), slot);
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
             NamedTypeSlot::Enum(slot) => {
-                let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "reader_source", 0).unwrap().unwrap();
-            assert_eq!(dropped.slot(), slot);
-            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
+                let dropped = storage
+                    .stage_type_drop(
+                        crate::storage::NamedTypeKind::Enum,
+                        "public",
+                        "reader_source",
+                        0,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(dropped.slot(), slot);
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
             NamedTypeSlot::Composite(slot) => {
                 let dropped = storage
-                        .stage_type_drop(crate::storage::NamedTypeKind::Composite, "public", "reader_source", 0)
-                        .unwrap().unwrap();
-            assert_eq!(dropped.slot(), slot);
-            storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
+                    .stage_type_drop(
+                        crate::storage::NamedTypeKind::Composite,
+                        "public",
+                        "reader_source",
+                        0,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(dropped.slot(), slot);
+                storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             }
         }
     }
@@ -978,7 +1004,9 @@ mod tests {
             drop(scope);
             let mut altered = storage.composite_for(0, 0);
             altered.fields[0].name = SqlName::parse("after").unwrap();
-            storage.stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7).unwrap();
+            storage
+                .stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7)
+                .unwrap();
             storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
 
             let scope = outer.enter().unwrap();
@@ -1166,7 +1194,13 @@ mod tests {
             for (name, succeeds) in [("second", true), ("third", false)] {
                 let mut altered = storage.composite_for(0, 0);
                 altered.fields[0].name = SqlName::parse(name).unwrap();
-                storage.stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, altered, 7).unwrap();
+                storage
+                    .stage_composite_alter(
+                        storage.prepare_composite_edit(0, 7).unwrap().1,
+                        altered,
+                        7,
+                    )
+                    .unwrap();
                 storage.commit_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1);
                 let scope = outer.enter().unwrap();
                 let child = storage.spill_roots.retain_statement().unwrap();
@@ -1223,7 +1257,8 @@ mod tests {
                 },
                 0,
             )
-            .unwrap().slot();
+            .unwrap()
+            .slot();
         let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
         fields[0] = CompositeFieldDef {
             name: SqlName::parse("status").unwrap(),
@@ -1246,7 +1281,8 @@ mod tests {
                 },
                 0,
             )
-            .unwrap().slot();
+            .unwrap()
+            .slot();
         let bound = storage
             .type_catalog
             .lock()
@@ -1412,7 +1448,13 @@ mod tests {
                     NamedTypeSlot::Composite(_) => {
                         let mut definition = storage.composite_for(0, 0);
                         definition.fields[0].name = SqlName::parse("pending").unwrap();
-                        let prior = storage.stage_composite_alter(storage.prepare_composite_edit(0, 7).unwrap().1, definition, 7).unwrap();
+                        let prior = storage
+                            .stage_composite_alter(
+                                storage.prepare_composite_edit(0, 7).unwrap().1,
+                                definition,
+                                7,
+                            )
+                            .unwrap();
                         let selected = storage
                             .read_composite_definition(target, 7)
                             .unwrap()
@@ -1456,26 +1498,53 @@ mod tests {
         other.begin_transaction_identity(9).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let original = select(&first, 7);
-            assert_eq!(stage(&first, select(&first, 0), "11").err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                stage(&first, select(&first, 0), "11")
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             let earlier = stage(&first, original, "11").unwrap();
-            assert_eq!(stage(&first, original, "22").err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-            assert_eq!(stage(&other, original, "22").err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            assert_eq!(
+                stage(&first, original, "22").err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                stage(&other, original, "22").err().unwrap().sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
             let latest = stage(&first, select(&first, 7), "22").unwrap();
             commit(&mut first, earlier);
             assert_eq!(label(&first).as_str(), "22");
             let foreign = stage(&other, select(&other, 7), "11").unwrap();
             commit(&mut other, earlier);
             assert_eq!(label(&other).as_str(), "11");
-            assert_eq!(other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap_err().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert_eq!(
+                other
+                    .stage_type_drop(source.kind(), "public", "reader_source", 9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
             assert!(other.type_catalog.try_lock().is_ok());
             rollback(&other, earlier);
             assert_eq!(label(&other).as_str(), "11");
             rollback(&other, foreign);
             other.wake_transaction_waiters(7);
             assert_eq!(label(&other).as_str(), "before");
-            let dropped = other.stage_type_drop(source.kind(), "public", "reader_source", 9).unwrap().unwrap();
+            let dropped = other
+                .stage_type_drop(source.kind(), "public", "reader_source", 9)
+                .unwrap()
+                .unwrap();
             assert_eq!(dropped.slot(), 0);
-            assert_eq!(stage(&other, select(&other, 7), "22").err().unwrap().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert_eq!(
+                stage(&other, select(&other, 7), "22")
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
             assert!(other.type_catalog.try_lock().is_ok());
             other.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
             assert_eq!(label(&other).as_str(), "before");
@@ -1489,7 +1558,10 @@ mod tests {
 
             retire(&mut first, source);
             create(&mut first, source).unwrap();
-            assert_eq!(stage(&first, original, "22").err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            assert_eq!(
+                stage(&first, original, "22").err().unwrap().sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
             let replacement = stage(&first, select(&first, 7), "22").unwrap();
             commit(&mut first, earlier);
             rollback(&first, earlier);
@@ -1504,12 +1576,22 @@ mod tests {
         check_type_undo_lifetimes(
             NamedTypeSlot::Domain(0),
             |storage, transaction| storage.prepare_domain_edit(0, transaction).unwrap().1,
-            |storage, target, marker| storage.stage_domain_alter(target, DomainSpec {
-                base_domain: None, base_user_type: None, base: ColType::Int4,
-                base_type_mod: -1, not_null: false,
-                default_expr: Some(crate::util::StackStr::from_str(marker)),
-                checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
-            }, 7),
+            |storage, target, marker| {
+                storage.stage_domain_alter(
+                    target,
+                    DomainSpec {
+                        base_domain: None,
+                        base_user_type: None,
+                        base: ColType::Int4,
+                        base_type_mod: -1,
+                        not_null: false,
+                        default_expr: Some(crate::util::StackStr::from_str(marker)),
+                        checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                        n_checks: 0,
+                    },
+                    7,
+                )
+            },
             |storage, undo| storage.commit_domain_alter(undo.target()),
             |storage, undo| storage.rollback_domain_alter(undo),
             |storage| match storage.domain_for(0, 7).default_expr {
@@ -1520,10 +1602,19 @@ mod tests {
         check_type_undo_lifetimes(
             NamedTypeSlot::Enum(0),
             |storage, transaction| storage.prepare_enum_edit(0, transaction).unwrap().1,
-            |storage, target, marker| storage.stage_enum_alter(
-                target, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(),
-                &[EnumMember { label: SqlName::parse(marker).unwrap(), legacy_label: None, sort: 1.0 }], 7,
-            ),
+            |storage, target, marker| {
+                storage.stage_enum_alter(
+                    target,
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("reader_source").unwrap(),
+                    &[EnumMember {
+                        label: SqlName::parse(marker).unwrap(),
+                        legacy_label: None,
+                        sort: 1.0,
+                    }],
+                    7,
+                )
+            },
             |storage, undo| storage.commit_enum_alter(undo.target()),
             |storage, undo| storage.rollback_enum_alter(undo),
             |storage| storage.enum_for(0, 7).members().next().unwrap().label,

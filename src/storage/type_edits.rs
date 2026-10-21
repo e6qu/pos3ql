@@ -30,7 +30,10 @@ impl TypeEditTarget {
 
     pub(super) fn slot(self, kind: super::NamedTypeKind) -> Result<usize, SqlError> {
         if self.source.slot().kind() != kind {
-            return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "type edit has the wrong source kind"));
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "type edit has the wrong source kind"
+            ));
         }
         Ok(self.source.slot().index())
     }
@@ -53,8 +56,13 @@ pub(crate) struct TypeDdlUndo {
 
 impl TypeDdlUndo {
     pub(super) fn created(source: TypeIdentity, transaction: u32) -> Self {
-        Self { source, transaction, operation: TypeDdlOperation::Create,
-            version: source.created_at(), prior_version: 0 }
+        Self {
+            source,
+            transaction,
+            operation: TypeDdlOperation::Create,
+            version: source.created_at(),
+            prior_version: 0,
+        }
     }
 
     pub(crate) fn slot(self) -> usize {
@@ -88,7 +96,11 @@ impl<Definition> TypeAlterUndo<Definition> {
     }
 
     pub(crate) fn target(&self) -> TypeEditTarget {
-        TypeEditTarget { source: self.source, transaction: self.transaction, version: self.version }
+        TypeEditTarget {
+            source: self.source,
+            transaction: self.transaction,
+            version: self.version,
+        }
     }
 }
 
@@ -112,16 +124,29 @@ struct TypeRevision {
 impl TypeRevisions {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>().saturating_add(
-            config.max_domains.saturating_add(config.max_enums)
-                .saturating_add(config.max_composites).saturating_mul(size_of::<TypeRevision>()),
+            config
+                .max_domains
+                .saturating_add(config.max_enums)
+                .saturating_add(config.max_composites)
+                .saturating_mul(size_of::<TypeRevision>()),
         )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "type revision controls")?;
-        fn reserve(budget: &mut Budget, count: usize) -> Result<FixedVec<TypeRevision>, BudgetError> {
+        fn reserve(
+            budget: &mut Budget,
+            count: usize,
+        ) -> Result<FixedVec<TypeRevision>, BudgetError> {
             let mut values = FixedVec::new(budget, "type revisions", count)?;
-            for _ in 0..count { values.push(TypeRevision { definition: 0, ddl: 0 }).expect("reserved type revisions"); }
+            for _ in 0..count {
+                values
+                    .push(TypeRevision {
+                        definition: 0,
+                        ddl: 0,
+                    })
+                    .expect("reserved type revisions");
+            }
             Ok(values)
         }
         Ok(Self {
@@ -172,7 +197,9 @@ impl TypeRevisions {
         match (source, target) {
             (NamedTypeSlot::Domain(old), NamedTypeSlot::Domain(new)) => self.domains.swap(old, new),
             (NamedTypeSlot::Enum(old), NamedTypeSlot::Enum(new)) => self.enums.swap(old, new),
-            (NamedTypeSlot::Composite(old), NamedTypeSlot::Composite(new)) => self.composites.swap(old, new),
+            (NamedTypeSlot::Composite(old), NamedTypeSlot::Composite(new)) => {
+                self.composites.swap(old, new)
+            }
             _ => unreachable!("type relocation preserves its source kind"),
         }
     }
@@ -182,19 +209,40 @@ impl super::TypeCatalog {
     pub(super) fn matches_type_edit(&self, target: TypeEditTarget) -> bool {
         if !self.contains_type_source(target.source)
             || target.source.database() != super::current_database()
-        { return false; }
+        {
+            return false;
+        }
         let pending = match target.source.slot() {
-            NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
-            NamedTypeSlot::Enum(slot) => self.enums[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
-            NamedTypeSlot::Composite(slot) => self.composites[slot].pending_definition.as_ref().map(|pending| (pending.txid, pending.version)),
+            NamedTypeSlot::Domain(slot) => self.domains[slot]
+                .pending_definition
+                .as_ref()
+                .map(|pending| (pending.txid, pending.version)),
+            NamedTypeSlot::Enum(slot) => self.enums[slot]
+                .pending_definition
+                .as_ref()
+                .map(|pending| (pending.txid, pending.version)),
+            NamedTypeSlot::Composite(slot) => self.composites[slot]
+                .pending_definition
+                .as_ref()
+                .map(|pending| (pending.txid, pending.version)),
         };
         pending == Some((target.transaction, target.version))
     }
 
-    fn select_type_edit(&self, source: NamedTypeSlot, transaction: u32) -> Result<TypeEditTarget, SqlError> {
-        let snapshot = self.type_snapshot(source, transaction)?
+    fn select_type_edit(
+        &self,
+        source: NamedTypeSlot,
+        transaction: u32,
+    ) -> Result<TypeEditTarget, SqlError> {
+        let snapshot = self
+            .type_snapshot(source, transaction)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database())
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source no longer exists"))?;
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type edit source no longer exists"
+                )
+            })?;
         Ok(TypeEditTarget {
             source: snapshot.identity,
             transaction,
@@ -203,31 +251,55 @@ impl super::TypeCatalog {
     }
 
     pub(super) fn validate_type_edit_source(&self, target: TypeEditTarget) -> Result<(), SqlError> {
-        if target.source.database() != super::current_database() || !self.contains_type_source(target.source) {
-            return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source has been replaced"));
+        if target.source.database() != super::current_database()
+            || !self.contains_type_source(target.source)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type edit source has been replaced"
+            ));
         }
         Ok(())
     }
 
-    pub(super) fn validate_type_edit(&self, target: TypeEditTarget, transaction: u32) -> Result<(), SqlError> {
+    pub(super) fn validate_type_edit(
+        &self,
+        target: TypeEditTarget,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
         let current = self.select_type_edit(target.source.slot(), transaction)?;
         if current.source != target.source {
-            return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "type edit source has been replaced"));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type edit source has been replaced"
+            ));
         }
         if target.transaction != transaction || current.version != target.version {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type definition changed after edit preparation"));
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "type definition changed after edit preparation"
+            ));
         }
         Ok(())
     }
 
     pub(super) fn type_definition_version(&self, source: NamedTypeSlot, transaction: u32) -> u64 {
         let pending = match source {
-            NamedTypeSlot::Domain(slot) => self.domains[slot].pending_definition.as_ref()
-                .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
-            NamedTypeSlot::Enum(slot) => self.enums[slot].pending_definition.as_ref()
-                .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
-            NamedTypeSlot::Composite(slot) => self.composites[slot].pending_definition.as_ref()
-                .filter(|pending| pending.txid == transaction).map(|pending| pending.version),
+            NamedTypeSlot::Domain(slot) => self.domains[slot]
+                .pending_definition
+                .as_ref()
+                .filter(|pending| pending.txid == transaction)
+                .map(|pending| pending.version),
+            NamedTypeSlot::Enum(slot) => self.enums[slot]
+                .pending_definition
+                .as_ref()
+                .filter(|pending| pending.txid == transaction)
+                .map(|pending| pending.version),
+            NamedTypeSlot::Composite(slot) => self.composites[slot]
+                .pending_definition
+                .as_ref()
+                .filter(|pending| pending.txid == transaction)
+                .map(|pending| pending.version),
         };
         pending.unwrap_or_else(|| self.versions.get(source))
     }
@@ -238,66 +310,139 @@ impl super::TypeCatalog {
                 && TypeIdentity::new(self.origin, database, source.slot(), created_at) == source
         };
         match source.slot() {
-            NamedTypeSlot::Domain(slot) => self.domains.get(slot)
-                .is_some_and(|definition| matches(definition.database, definition.created_at, definition.ddl_state)),
-            NamedTypeSlot::Enum(slot) => self.enums.get(slot)
-                .is_some_and(|definition| matches(definition.database, definition.created_at, definition.ddl_state)),
-            NamedTypeSlot::Composite(slot) => self.composites.get(slot)
-                .is_some_and(|definition| matches(definition.database, definition.created_at, definition.ddl_state)),
+            NamedTypeSlot::Domain(slot) => self.domains.get(slot).is_some_and(|definition| {
+                matches(
+                    definition.database,
+                    definition.created_at,
+                    definition.ddl_state,
+                )
+            }),
+            NamedTypeSlot::Enum(slot) => self.enums.get(slot).is_some_and(|definition| {
+                matches(
+                    definition.database,
+                    definition.created_at,
+                    definition.ddl_state,
+                )
+            }),
+            NamedTypeSlot::Composite(slot) => self.composites.get(slot).is_some_and(|definition| {
+                matches(
+                    definition.database,
+                    definition.created_at,
+                    definition.ddl_state,
+                )
+            }),
         }
     }
 
-    pub(super) fn conflicting_type_owner(&self, source: NamedTypeSlot, transaction: u32) -> Option<u32> {
+    pub(super) fn conflicting_type_owner(
+        &self,
+        source: NamedTypeSlot,
+        transaction: u32,
+    ) -> Option<u32> {
         let owners = match source {
             NamedTypeSlot::Domain(slot) => [
                 self.domains[slot].ddl_state.pending_txid(),
-                self.domains[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                self.domains[slot]
+                    .pending_definition
+                    .as_ref()
+                    .map(|pending| pending.txid),
             ],
             NamedTypeSlot::Enum(slot) => [
                 self.enums[slot].ddl_state.pending_txid(),
-                self.enums[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                self.enums[slot]
+                    .pending_definition
+                    .as_ref()
+                    .map(|pending| pending.txid),
             ],
             NamedTypeSlot::Composite(slot) => [
                 self.composites[slot].ddl_state.pending_txid(),
-                self.composites[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                self.composites[slot]
+                    .pending_definition
+                    .as_ref()
+                    .map(|pending| pending.txid),
             ],
         };
-        owners.into_iter().flatten().find(|&owner| owner != transaction)
+        owners
+            .into_iter()
+            .flatten()
+            .find(|&owner| owner != transaction)
     }
 }
 
 impl super::Storage {
-    pub(crate) fn domain_reference_slot(&self, name: super::UserTypeName, transaction: u32) -> Result<Option<usize>, SqlError> {
+    pub(crate) fn domain_reference_slot(
+        &self,
+        name: super::UserTypeName,
+        transaction: u32,
+    ) -> Result<Option<usize>, SqlError> {
         let reference = super::TypeReference::from_bound_name(name)?;
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
-        let source = catalog.resolve_source_reference(reference, super::current_database(), transaction)?
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain dependency source no longer exists"))?;
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let source = catalog
+            .resolve_source_reference(reference, super::current_database(), transaction)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "domain dependency source no longer exists"
+                )
+            })?;
         Ok(match source.identity.slot() {
             NamedTypeSlot::Domain(slot) => Some(slot),
             NamedTypeSlot::Enum(_) | NamedTypeSlot::Composite(_) => None,
         })
     }
 
-    pub(crate) fn domain_depends_on(&self, mut slot: usize, target: usize, transaction: u32) -> Result<bool, SqlError> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+    pub(crate) fn domain_depends_on(
+        &self,
+        mut slot: usize,
+        target: usize,
+        transaction: u32,
+    ) -> Result<bool, SqlError> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let selected = catalog.select_type_edit(NamedTypeSlot::Domain(target), transaction)?;
         for _ in 0..catalog.domains.len() {
             let current = catalog.select_type_edit(NamedTypeSlot::Domain(slot), transaction)?;
-            if current.source == selected.source { return Ok(true); }
+            if current.source == selected.source {
+                return Ok(true);
+            }
             let definition = &catalog.domains[slot];
-            let parent = definition.pending_definition.as_ref()
+            let parent = definition
+                .pending_definition
+                .as_ref()
                 .filter(|pending| pending.txid == transaction)
                 .map_or(definition.base_domain, |pending| pending.spec.base_domain);
-            let Some(parent) = parent else { return Ok(false); };
-            let parent = catalog.resolve_source_reference(super::TypeReference::from_bound_name(parent)?,
-                super::current_database(), transaction)?
-                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain parent source no longer exists"))?;
+            let Some(parent) = parent else {
+                return Ok(false);
+            };
+            let parent = catalog
+                .resolve_source_reference(
+                    super::TypeReference::from_bound_name(parent)?,
+                    super::current_database(),
+                    transaction,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "domain parent source no longer exists"
+                    )
+                })?;
             let NamedTypeSlot::Domain(parent) = parent.identity.slot() else {
-                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "domain parent source is not a domain"));
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "domain parent source is not a domain"
+                ));
             };
             slot = parent;
         }
-        Err(sql_err!(sqlstate::INTERNAL_ERROR, "domain dependency cycle detected"))
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "domain dependency cycle detected"
+        ))
     }
 
     pub(crate) fn validate_type_commit(
@@ -306,26 +451,52 @@ impl super::Storage {
         changes: impl Iterator<Item = TypeCommitChange>,
     ) -> Result<(), SqlError> {
         let mut changes = changes.peekable();
-        if changes.peek().is_none() { return Ok(()); }
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        if changes.peek().is_none() {
+            return Ok(());
+        }
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         for change in changes {
             let (source, owner) = match change {
                 TypeCommitChange::Definition(target) => (target.source, target.transaction),
                 TypeCommitChange::Lifecycle(undo) => (undo.source, undo.transaction),
             };
-            if source.database() != super::current_database() || !catalog.contains_type_source(source) {
-                return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "transaction type source has been replaced"));
+            if source.database() != super::current_database()
+                || !catalog.contains_type_source(source)
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "transaction type source has been replaced"
+                ));
             }
-            if owner != transaction || catalog.conflicting_type_owner(source.slot(), transaction).is_some() {
-                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type change no longer belongs to its transaction"));
+            if owner != transaction
+                || catalog
+                    .conflicting_type_owner(source.slot(), transaction)
+                    .is_some()
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "type change no longer belongs to its transaction"
+                ));
             }
             let valid = match change {
                 TypeCommitChange::Definition(target) => {
                     let current = catalog.type_definition_version(source.slot(), transaction);
                     let pending = match source.slot() {
-                        NamedTypeSlot::Domain(slot) => catalog.domains[slot].pending_definition.as_ref().map(|pending| pending.txid),
-                        NamedTypeSlot::Enum(slot) => catalog.enums[slot].pending_definition.as_ref().map(|pending| pending.txid),
-                        NamedTypeSlot::Composite(slot) => catalog.composites[slot].pending_definition.as_ref().map(|pending| pending.txid),
+                        NamedTypeSlot::Domain(slot) => catalog.domains[slot]
+                            .pending_definition
+                            .as_ref()
+                            .map(|pending| pending.txid),
+                        NamedTypeSlot::Enum(slot) => catalog.enums[slot]
+                            .pending_definition
+                            .as_ref()
+                            .map(|pending| pending.txid),
+                        NamedTypeSlot::Composite(slot) => catalog.composites[slot]
+                            .pending_definition
+                            .as_ref()
+                            .map(|pending| pending.txid),
                     };
                     // Earlier edits are superseded by this transaction's final edit.
                     pending == Some(transaction) && current >= target.version
@@ -339,14 +510,24 @@ impl super::Storage {
                     use super::CatalogDdlState as State;
                     state.pending_txid() == Some(transaction)
                         && match undo.operation {
-                            TypeDdlOperation::Create => matches!(state, State::PendingCreate { .. } | State::PendingCreateDrop { .. }),
-                            TypeDdlOperation::Drop => matches!(state, State::PendingDrop { .. } | State::PendingCreateDrop { .. })
-                                && catalog.versions.ddl(source.slot()) == undo.version,
+                            TypeDdlOperation::Create => matches!(
+                                state,
+                                State::PendingCreate { .. } | State::PendingCreateDrop { .. }
+                            ),
+                            TypeDdlOperation::Drop => {
+                                matches!(
+                                    state,
+                                    State::PendingDrop { .. } | State::PendingCreateDrop { .. }
+                                ) && catalog.versions.ddl(source.slot()) == undo.version
+                            }
                         }
                 }
             };
             if !valid {
-                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "type change no longer belongs to its transaction"));
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "type change no longer belongs to its transaction"
+                ));
             }
         }
         Ok(())
@@ -357,10 +538,15 @@ impl super::Storage {
         use TypeDdlDecision::{Commit, Rollback};
         use TypeDdlOperation::{Create, Drop};
 
-        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         if !catalog.contains_type_source(undo.source)
             || undo.source.database() != super::current_database()
-        { return; }
+        {
+            return;
+        }
         let (state, schema, name) = match undo.source.slot() {
             NamedTypeSlot::Domain(slot) => {
                 let definition = &catalog.domains[slot];
@@ -375,19 +561,32 @@ impl super::Storage {
                 (definition.ddl_state, definition.schema, definition.name)
             }
         };
-        if state.pending_txid() != Some(undo.transaction) { return; }
+        if state.pending_txid() != Some(undo.transaction) {
+            return;
+        }
         if catalog.versions.ddl(undo.source.slot()) != undo.version
-            && !matches!((undo.operation, decision, state), (Create, Commit, State::PendingCreateDrop { .. }))
-        { return; }
+            && !matches!(
+                (undo.operation, decision, state),
+                (Create, Commit, State::PendingCreateDrop { .. })
+            )
+        {
+            return;
+        }
         let next = match (undo.operation, decision, state) {
-            (Create, Commit, State::PendingCreate { .. } | State::PendingCreateDrop { .. }) => state.commit_create(),
+            (Create, Commit, State::PendingCreate { .. } | State::PendingCreateDrop { .. }) => {
+                state.commit_create()
+            }
             (Create, Rollback, State::PendingCreate { .. }) => state.rollback_create(),
             (Drop, Commit, State::PendingDrop { .. }) => state.commit_drop(),
-            (Drop, Rollback, State::PendingDrop { .. } | State::PendingCreateDrop { .. }) => state.rollback_drop(undo.transaction),
+            (Drop, Rollback, State::PendingDrop { .. } | State::PendingCreateDrop { .. }) => {
+                state.rollback_drop(undo.transaction)
+            }
             _ => return,
         };
         if undo.operation == Drop && decision == Rollback {
-            catalog.versions.set_ddl(undo.source.slot(), undo.prior_version);
+            catalog
+                .versions
+                .set_ddl(undo.source.slot(), undo.prior_version);
         }
         // Keep the source owner until metadata removal and enum image release finish.
         if undo.operation == Drop && decision == Commit {
@@ -399,7 +598,9 @@ impl super::Storage {
         let ownership = match undo.source.slot() {
             NamedTypeSlot::Domain(slot) => {
                 catalog.domains[slot].ddl_state = next;
-                if next == State::Absent { catalog.domains[slot].pending_definition = None; }
+                if next == State::Absent {
+                    catalog.domains[slot].pending_definition = None;
+                }
                 &mut catalog.domains[slot].ownership
             }
             NamedTypeSlot::Enum(slot) => {
@@ -408,44 +609,74 @@ impl super::Storage {
             }
             NamedTypeSlot::Composite(slot) => {
                 catalog.composites[slot].ddl_state = next;
-                if next == State::Absent { catalog.composites[slot].pending_definition = None; }
+                if next == State::Absent {
+                    catalog.composites[slot].pending_definition = None;
+                }
                 &mut catalog.composites[slot].ownership
             }
         };
-        if undo.operation == Create && decision == Commit
-            && let Some(pending) = ownership.pending.filter(|pending| pending.txid == undo.transaction)
+        if undo.operation == Create
+            && decision == Commit
+            && let Some(pending) = ownership
+                .pending
+                .filter(|pending| pending.txid == undo.transaction)
         {
             ownership.owner = pending.owner;
             ownership.pending = None;
         }
     }
 
-    pub(crate) fn prepare_domain_edit(&self, slot: usize, transaction: u32) -> Result<(super::DomainDef, TypeEditTarget), SqlError> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+    pub(crate) fn prepare_domain_edit(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(super::DomainDef, TypeEditTarget), SqlError> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let target = catalog.select_type_edit(NamedTypeSlot::Domain(slot), transaction)?;
         Ok((catalog.domains[slot].definition_for(transaction), target))
     }
 
-    pub(crate) fn prepare_enum_edit(&self, slot: usize, transaction: u32) -> Result<(super::EnumDefinition, TypeEditTarget), SqlError> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+    pub(crate) fn prepare_enum_edit(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(super::EnumDefinition, TypeEditTarget), SqlError> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let target = catalog.select_type_edit(NamedTypeSlot::Enum(slot), transaction)?;
         let definition = catalog.enums[slot].definition_for(transaction);
-        let image = super::EnumImageRead::capture(&self.enum_member_images, definition.member_image);
-        Ok((super::EnumDefinition {
-            image,
-            member_count: definition.member_count as usize,
-            safe_member_count: catalog.enums[slot].safe_member_count_for(transaction),
-            database: definition.database,
-            created_at: definition.created_at,
-            schema: definition.schema,
-            name: definition.name,
-            ownership: definition.ownership,
-            ddl_state: definition.ddl_state,
-        }, target))
+        let image =
+            super::EnumImageRead::capture(&self.enum_member_images, definition.member_image);
+        Ok((
+            super::EnumDefinition {
+                image,
+                member_count: definition.member_count as usize,
+                safe_member_count: catalog.enums[slot].safe_member_count_for(transaction),
+                database: definition.database,
+                created_at: definition.created_at,
+                schema: definition.schema,
+                name: definition.name,
+                ownership: definition.ownership,
+                ddl_state: definition.ddl_state,
+            },
+            target,
+        ))
     }
 
-    pub(crate) fn prepare_composite_edit(&self, slot: usize, transaction: u32) -> Result<(super::CompositeDef, TypeEditTarget), SqlError> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+    pub(crate) fn prepare_composite_edit(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(super::CompositeDef, TypeEditTarget), SqlError> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let target = catalog.select_type_edit(NamedTypeSlot::Composite(slot), transaction)?;
         Ok((catalog.composites[slot].definition_for(transaction), target))
     }
@@ -457,7 +688,10 @@ impl super::Storage {
         name: &str,
         transaction: u32,
     ) -> Result<Option<TypeDdlUndo>, crate::sql::eval::SqlError> {
-        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let mut selected = None;
         let mut blocked = None;
         let matches = |candidate: super::UserTypeName| {
@@ -467,15 +701,21 @@ impl super::Storage {
             if reservation.slot.kind() != kind
                 || reservation.database != super::current_database()
                 || reservation.state == super::CatalogDdlState::Absent
-            { continue; }
+            {
+                continue;
+            }
             if (matches(reservation.current)
-                || reservation.pending.is_some_and(|(_, pending)| matches(pending)))
+                || reservation
+                    .pending
+                    .is_some_and(|(_, pending)| matches(pending)))
                 && let Some(owner) = catalog.conflicting_type_owner(reservation.slot, transaction)
             {
                 blocked = Some(owner);
                 break;
             }
-            let visible = reservation.pending.filter(|&(owner, _)| owner == transaction)
+            let visible = reservation
+                .pending
+                .filter(|&(owner, _)| owner == transaction)
                 .map_or(reservation.current, |(_, pending)| pending);
             if reservation.state.visible_to(transaction) && matches(visible) {
                 selected = Some((reservation.slot, reservation.state));
@@ -485,9 +725,13 @@ impl super::Storage {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(transaction, owner, name));
         }
-        let Some((source, state)) = selected else { return Ok(None); };
-        let identity = catalog.type_snapshot(source, transaction)?
-            .expect("a visible type selected for deletion has an identity").identity;
+        let Some((source, state)) = selected else {
+            return Ok(None);
+        };
+        let identity = catalog
+            .type_snapshot(source, transaction)?
+            .expect("a visible type selected for deletion has an identity")
+            .identity;
         let version = self.catalog_sequence.next()?;
         let prior_version = catalog.versions.ddl(source);
         catalog.versions.set_ddl(source, version);
@@ -497,7 +741,13 @@ impl super::Storage {
             NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state = state,
             NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = state,
         }
-        Ok(Some(TypeDdlUndo { source: identity, transaction, operation: TypeDdlOperation::Drop, version, prior_version }))
+        Ok(Some(TypeDdlUndo {
+            source: identity,
+            transaction,
+            operation: TypeDdlOperation::Drop,
+            version,
+            prior_version,
+        }))
     }
 }
 
@@ -513,22 +763,55 @@ mod tests {
     }
 
     fn create(storage: &mut Storage, kind: NamedTypeKind) -> TypeDdlUndo {
-        use crate::storage::{ColType, CompositeSpec, CompositeFieldDef, DomainSpec, EnumSpec,
-            EnumMember, CheckConstraint, MAX_DOMAIN_CHECKS, MAX_COMPOSITE_FIELDS};
+        use crate::storage::{
+            CheckConstraint, ColType, CompositeFieldDef, CompositeSpec, DomainSpec, EnumMember,
+            EnumSpec, MAX_COMPOSITE_FIELDS, MAX_DOMAIN_CHECKS,
+        };
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("owned_type").unwrap();
         match kind {
-            NamedTypeKind::Domain => storage.create_domain(schema, name, DomainSpec {
-                base_domain: None, base_user_type: None, base: ColType::Int4,
-                base_type_mod: -1, not_null: false, default_expr: None,
-                checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
-            }, 7).unwrap(),
-            NamedTypeKind::Enum => storage.create_enum(schema, name, EnumSpec {
-                members: &[EnumMember { label: SqlName::parse("ready").unwrap(), legacy_label: None, sort: 1.0 }],
-            }, 7).unwrap(),
-            NamedTypeKind::Composite => storage.create_composite(schema, name, CompositeSpec {
-                fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS], n_fields: 0,
-            }, 7).unwrap(),
+            NamedTypeKind::Domain => storage
+                .create_domain(
+                    schema,
+                    name,
+                    DomainSpec {
+                        base_domain: None,
+                        base_user_type: None,
+                        base: ColType::Int4,
+                        base_type_mod: -1,
+                        not_null: false,
+                        default_expr: None,
+                        checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                        n_checks: 0,
+                    },
+                    7,
+                )
+                .unwrap(),
+            NamedTypeKind::Enum => storage
+                .create_enum(
+                    schema,
+                    name,
+                    EnumSpec {
+                        members: &[EnumMember {
+                            label: SqlName::parse("ready").unwrap(),
+                            legacy_label: None,
+                            sort: 1.0,
+                        }],
+                    },
+                    7,
+                )
+                .unwrap(),
+            NamedTypeKind::Composite => storage
+                .create_composite(
+                    schema,
+                    name,
+                    CompositeSpec {
+                        fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS],
+                        n_fields: 0,
+                    },
+                    7,
+                )
+                .unwrap(),
         }
     }
 
@@ -545,7 +828,11 @@ mod tests {
     fn type_ddl_finalization_rejects_foreign_replaced_repeated_and_wrong_owner_records() {
         use CatalogDdlState::{Absent, PendingCreate, PendingDrop, Present};
         use TypeDdlDecision::{Commit, Rollback};
-        for kind in [NamedTypeKind::Domain, NamedTypeKind::Enum, NamedTypeKind::Composite] {
+        for kind in [
+            NamedTypeKind::Domain,
+            NamedTypeKind::Enum,
+            NamedTypeKind::Composite,
+        ] {
             let mut storage = fixture();
             let mut foreign = fixture();
             crate::mem::guard::forbid_alloc(|| {
@@ -553,37 +840,93 @@ mod tests {
                 let foreign_created = create(&mut foreign, kind);
                 for decision in [Commit, Rollback] {
                     foreign.finish_type_ddl(created, decision);
-                    storage.finish_type_ddl(TypeDdlUndo { transaction: 9, ..created }, decision);
+                    storage.finish_type_ddl(
+                        TypeDdlUndo {
+                            transaction: 9,
+                            ..created
+                        },
+                        decision,
+                    );
                     assert_eq!(state(&foreign, foreign_created), PendingCreate { txid: 7 });
                     assert_eq!(state(&storage, created), PendingCreate { txid: 7 });
                 }
-                assert_eq!(foreign.validate_type_commit(7, [TypeCommitChange::Lifecycle(created)].into_iter()).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(
+                    foreign
+                        .validate_type_commit(7, [TypeCommitChange::Lifecycle(created)].into_iter())
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::UNDEFINED_OBJECT
+                );
                 storage.finish_type_ddl(created, Commit);
                 storage.finish_type_ddl(created, Rollback);
                 assert_eq!(state(&storage, created), Present);
-                let earlier = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                let earlier = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
                 storage.finish_type_ddl(earlier, Rollback);
-                let latest = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                let latest = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
                 for decision in [Commit, Rollback] {
                     storage.finish_type_ddl(earlier, decision);
                     assert_eq!(state(&storage, latest), PendingDrop { txid: 7 });
                 }
-                assert_eq!(storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(earlier)].into_iter()).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-                storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(latest)].into_iter()).unwrap();
+                assert_eq!(
+                    storage
+                        .validate_type_commit(7, [TypeCommitChange::Lifecycle(earlier)].into_iter())
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                storage
+                    .validate_type_commit(7, [TypeCommitChange::Lifecycle(latest)].into_iter())
+                    .unwrap();
                 storage.finish_type_ddl(latest, Commit);
                 assert_eq!(state(&storage, latest), Absent);
                 let replacement = create(&mut storage, kind);
                 assert_eq!(replacement.slot(), created.slot());
                 storage.finish_type_ddl(replacement, Commit);
-                storage.apply_comment(crate::storage::CommentClass::Type, SqlName::parse("public").unwrap(), SqlName::parse("owned_type").unwrap(), 0,
-                    Some(crate::storage::comment_stackstr("replacement comment").unwrap())).unwrap();
+                storage
+                    .apply_comment(
+                        crate::storage::CommentClass::Type,
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("owned_type").unwrap(),
+                        0,
+                        Some(crate::storage::comment_stackstr("replacement comment").unwrap()),
+                    )
+                    .unwrap();
                 for obsolete in [created, earlier, latest] {
-                    for decision in [Commit, Rollback] { storage.finish_type_ddl(obsolete, decision); }
+                    for decision in [Commit, Rollback] {
+                        storage.finish_type_ddl(obsolete, decision);
+                    }
                 }
                 assert_eq!(state(&storage, replacement), Present);
-                assert_eq!(storage.comment_text(crate::storage::CommentClass::Type, "public", "owned_type", 0, 0).unwrap().as_str(), "replacement comment");
+                assert_eq!(
+                    storage
+                        .comment_text(
+                            crate::storage::CommentClass::Type,
+                            "public",
+                            "owned_type",
+                            0,
+                            0
+                        )
+                        .unwrap()
+                        .as_str(),
+                    "replacement comment"
+                );
                 if kind == NamedTypeKind::Enum {
-                    assert_eq!(storage.enum_for(replacement.slot(), 0).members().next().unwrap().label.as_str(), "ready");
+                    assert_eq!(
+                        storage
+                            .enum_for(replacement.slot(), 0)
+                            .members()
+                            .next()
+                            .unwrap()
+                            .label
+                            .as_str(),
+                        "ready"
+                    );
                 }
             });
         }
@@ -592,17 +935,36 @@ mod tests {
     #[test]
     fn type_create_then_drop_commits_or_rolls_back_in_record_order() {
         use TypeDdlDecision::{Commit, Rollback};
-        for kind in [NamedTypeKind::Domain, NamedTypeKind::Enum, NamedTypeKind::Composite] {
+        for kind in [
+            NamedTypeKind::Domain,
+            NamedTypeKind::Enum,
+            NamedTypeKind::Composite,
+        ] {
             let mut storage = fixture();
             crate::mem::guard::forbid_alloc(|| {
                 let created = create(&mut storage, kind);
-                let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
-                storage.validate_type_commit(7, [TypeCommitChange::Lifecycle(created), TypeCommitChange::Lifecycle(dropped)].into_iter()).unwrap();
+                let dropped = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
+                storage
+                    .validate_type_commit(
+                        7,
+                        [
+                            TypeCommitChange::Lifecycle(created),
+                            TypeCommitChange::Lifecycle(dropped),
+                        ]
+                        .into_iter(),
+                    )
+                    .unwrap();
                 storage.finish_type_ddl(created, Commit);
                 storage.finish_type_ddl(dropped, Commit);
                 assert_eq!(state(&storage, dropped), CatalogDdlState::Absent);
                 let created = create(&mut storage, kind);
-                let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                let dropped = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
                 storage.finish_type_ddl(dropped, Rollback);
                 storage.finish_type_ddl(created, Rollback);
                 assert_eq!(state(&storage, created), CatalogDdlState::Absent);

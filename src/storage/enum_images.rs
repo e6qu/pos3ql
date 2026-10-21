@@ -338,7 +338,8 @@ mod tests {
                 },
                 0,
             )
-            .unwrap().slot()
+            .unwrap()
+            .slot()
     }
 
     fn alter(
@@ -507,7 +508,10 @@ mod tests {
             storage.commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
-            let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap().unwrap();
+            let dropped = storage
+                .stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77)
+                .unwrap()
+                .unwrap();
             assert_eq!(dropped.slot(), slot);
             storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = storage
@@ -519,7 +523,8 @@ mod tests {
                     },
                     0,
                 )
-                .unwrap().slot();
+                .unwrap()
+                .slot();
             assert_eq!(replacement, slot);
             assert_ne!(
                 selected.created_at,
@@ -749,7 +754,10 @@ mod tests {
             old
         });
         crate::mem::guard::forbid_alloc(|| {
-            let dropped = storage.stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77).unwrap().unwrap();
+            let dropped = storage
+                .stage_type_drop(crate::storage::NamedTypeKind::Enum, "public", "state", 77)
+                .unwrap()
+                .unwrap();
             assert_eq!(dropped.slot(), slot);
             storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Commit);
             let replacement = create(&mut storage, "state");

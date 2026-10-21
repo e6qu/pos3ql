@@ -247,25 +247,32 @@ mod tests {
     ) -> Result<NameUndo, SqlError> {
         let UserTypeName { schema, name, .. } = identity(name);
         Ok(match slot {
-            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(storage.prepare_domain_edit(slot, txid).unwrap().1, schema, name, txid)?),
-            NamedTypeSlot::Enum(slot) => {
-                NameUndo::Enum(storage.stage_enum_alter(
-                    storage.prepare_enum_edit(slot, txid).unwrap().1,
-                    schema,
-                    name,
-                    &[EnumMember {
-                        label: SqlName::parse("ready").unwrap(),
-                        legacy_label: None,
-                        sort: 1.0,
-                    }],
-                    txid,
-                )?)
-            }
+            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(
+                storage.prepare_domain_edit(slot, txid).unwrap().1,
+                schema,
+                name,
+                txid,
+            )?),
+            NamedTypeSlot::Enum(slot) => NameUndo::Enum(storage.stage_enum_alter(
+                storage.prepare_enum_edit(slot, txid).unwrap().1,
+                schema,
+                name,
+                &[EnumMember {
+                    label: SqlName::parse("ready").unwrap(),
+                    legacy_label: None,
+                    sort: 1.0,
+                }],
+                txid,
+            )?),
             NamedTypeSlot::Composite(slot) => {
                 let mut definition = storage.composite_for(slot, txid);
                 definition.schema = schema;
                 definition.name = name;
-                NameUndo::Composite(storage.stage_composite_alter(storage.prepare_composite_edit(slot, txid).unwrap().1, definition, txid)?)
+                NameUndo::Composite(storage.stage_composite_alter(
+                    storage.prepare_composite_edit(slot, txid).unwrap().1,
+                    definition,
+                    txid,
+                )?)
             }
         })
     }
@@ -395,13 +402,33 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let source = create(&mut storage, kind, "before", 0).unwrap();
                 let undo = rename(&mut storage, source, "after", 7).unwrap();
-                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap(), None);
-                let dropped = storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap().unwrap();
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "before", 7)
+                        .unwrap(),
+                    None
+                );
+                let dropped = storage
+                    .stage_type_drop(kind.kind(), "public", "after", 7)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(dropped.slot(), source.index());
                 storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
                 rollback(&mut storage, undo);
-                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "after", 7).unwrap(), None);
-                assert_eq!(storage.stage_type_drop(kind.kind(), "public", "before", 7).unwrap().unwrap().slot(), source.index());
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "after", 7)
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    storage
+                        .stage_type_drop(kind.kind(), "public", "before", 7)
+                        .unwrap()
+                        .unwrap()
+                        .slot(),
+                    source.index()
+                );
             });
         }
     }
@@ -464,7 +491,10 @@ mod tests {
             storage.begin_transaction_identity(9).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 let slot = create(&mut storage, kind, "occupied", 0).unwrap();
-                let dropped = storage.stage_type_drop(kind.kind(), "public", "occupied", 7).unwrap().unwrap();
+                let dropped = storage
+                    .stage_type_drop(kind.kind(), "public", "occupied", 7)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(dropped.slot(), slot.index());
                 for requested in KINDS {
                     assert_eq!(

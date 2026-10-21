@@ -54,6 +54,7 @@ jobs:
             statement_files_miri_
             index_file_owners_miri_
             enum_image_ownership_pool_
+            storage::definition_pool::tests
             owned_ordered_source_tags
             stable_spill_generation_ranges
             stable_spill_generation_exhaustion

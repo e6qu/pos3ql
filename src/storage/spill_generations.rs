@@ -2314,6 +2314,40 @@ mod tests {
     }
 
     #[test]
+    fn statement_files_miri_definition_children_keep_parent_owners_until_final_release() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let parent = registry.retain_statement().unwrap();
+            let child = registry.retain_statement().unwrap();
+            let scope = parent.enter().unwrap();
+            registry.pin(&[handle(1)], true).unwrap();
+            registry.release(&[handle(1)], true);
+            {
+                let mut state = registry.roots.lock().unwrap();
+                let owner = state.statement_mut(parent.identity);
+                owner.references = owner.references.checked_add(1).unwrap();
+                state.statement_mut(child.identity).definition_parent = Some(parent.identity);
+            }
+            let child_scope = child.enter().unwrap();
+            let selected = registry.type_definition_reader().unwrap();
+            assert_eq!(selected.identity, child.identity);
+            drop(child_scope);
+            drop(scope);
+            drop(child);
+            drop(parent);
+            assert!(!registry.take_reclamation_pending());
+            assert_eq!(registry.roots.lock().unwrap().roots.len(), 1);
+            drop(selected);
+            assert!(registry.take_reclamation_pending());
+            let state = registry.roots.lock().unwrap();
+            assert!(state.roots.is_empty());
+            assert!(state.statements.iter().all(Option::is_none));
+        });
+    }
+
+    #[test]
     fn index_file_owners_miri_scope_outlives_storage_and_reused_owner_slots() {
         let config = test_config();
         let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));

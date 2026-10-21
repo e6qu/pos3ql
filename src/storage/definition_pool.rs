@@ -352,4 +352,25 @@ mod tests {
             assert_eq!(drops.load(Ordering::Relaxed), 1);
         });
     }
+
+    #[test]
+    fn definition_image_handles_keep_addresses_while_the_owning_chain_grows() {
+        let mut budget = Budget::new(DefinitionImagePool::<Key, u64>::budget_bytes(2, 1));
+        let pool = DefinitionImagePool::new(&mut budget, 2, 1, "handle images").unwrap();
+        let owner = DefinitionImages::new(&pool);
+        crate::mem::guard::forbid_alloc(|| {
+            let definition = owner.insert(Key(0), 17).unwrap();
+            let handle = owner.handle(definition);
+            drop(pool);
+            owner.insert(Key(0), 19).unwrap();
+            // SAFETY: owner retains this exact chain through both reads.
+            unsafe {
+                assert_eq!(*handle.definition(), 17);
+                assert_eq!(handle.key().0, 0);
+            }
+            assert_eq!(*definition, 17);
+            drop(handle);
+            drop(owner);
+        });
+    }
 }

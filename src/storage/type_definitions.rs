@@ -1045,7 +1045,7 @@ mod tests {
         }, 0).unwrap();
         let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
         fields[0] = CompositeFieldDef {
-            name: SqlName::parse("status").unwrap(), attribute_number: 1, ctype: ColType::Enum(0),
+            name: SqlName::parse("status").unwrap(), attribute_number: 1, ctype: ColType::Enum(0), dropped: false,
             user_type: Some(super::super::UserTypeName::declaration(schema, SqlName::parse("wrapped_reader").unwrap())),
             ..CompositeFieldDef::EMPTY
         };
@@ -1069,5 +1069,85 @@ mod tests {
             drop(selected);
             create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         });
+    }
+
+    #[test]
+    fn retained_type_identity_allows_exact_replay_and_rejects_reassignment() {
+        for source in SOURCES {
+            let mut storage = fixture();
+            create(&mut storage, source).unwrap();
+            let reference = reference(&storage, source);
+            let created_at = storage.type_catalog.lock().unwrap().type_snapshot(source, 0).unwrap().unwrap().identity.created_at();
+            let images = storage.type_definition_images();
+            crate::mem::guard::forbid_alloc(|| {
+                retain(&images, &storage, reference).unwrap();
+                storage.restore_type_identity(source, source, created_at).unwrap();
+                assert_eq!(storage.restore_type_identity(source, source, created_at + 1).unwrap_err().sqlstate, sqlstate::OBJECT_IN_USE);
+                retain(&images, &storage, reference).unwrap();
+                drop(images);
+                storage.restore_type_identity(source, source, created_at + 1).unwrap();
+                let replacement = storage.type_definition_images();
+                assert_eq!(retain(&replacement, &storage, reference).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            });
+        }
+    }
+
+    #[test]
+    fn selected_pending_type_definitions_survive_rollback_without_changing_new_readers() {
+        for source in SOURCES {
+            let mut storage = fixture();
+            create(&mut storage, source).unwrap();
+            let outer = storage.spill_roots.retain_statement().unwrap();
+            let target = TypeDefinitionTarget::Slot(source);
+            crate::mem::guard::forbid_alloc(|| {
+                let scope = outer.enter().unwrap();
+                match source {
+                    NamedTypeSlot::Domain(_) => {
+                        let prior = storage.stage_domain_alter(0, DomainSpec {
+                            base_domain: None, base_user_type: None, base: ColType::Int8,
+                            base_type_mod: -1, not_null: false, default_expr: None,
+                            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+                        }, 7).unwrap();
+                        let selected = storage.read_domain_definition(target, 7).unwrap().unwrap();
+                        storage.rollback_domain_alter(0, prior);
+                        assert_eq!(selected.base, ColType::Int8);
+                        assert!(!selected.not_null);
+                        assert!(selected.pending_definition.is_none());
+                        let child = storage.spill_roots.retain_statement().unwrap();
+                        let child_scope = child.enter().unwrap();
+                        let current = storage.read_domain_definition(target, 7).unwrap().unwrap();
+                        assert_eq!(current.base, ColType::Int4);
+                        assert!(current.not_null);
+                        drop(child_scope);
+                    }
+                    NamedTypeSlot::Enum(_) => {
+                        let undo = storage.stage_enum_alter(0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(), &[
+                            EnumMember { label: SqlName::parse("pending").unwrap(), legacy_label: None, sort: 1.0 },
+                        ], 7).unwrap();
+                        let selected = storage.read_enum_definition(target, 7).unwrap().unwrap();
+                        storage.rollback_enum_alter(0, undo);
+                        assert_eq!(selected.members().next().unwrap().label.as_str(), "pending");
+                        let child = storage.spill_roots.retain_statement().unwrap();
+                        let child_scope = child.enter().unwrap();
+                        assert_eq!(storage.read_enum_definition(target, 7).unwrap().unwrap().members().next().unwrap().label.as_str(), "before");
+                        drop(child_scope);
+                    }
+                    NamedTypeSlot::Composite(_) => {
+                        let mut definition = storage.composite_for(0, 0);
+                        definition.fields[0].name = SqlName::parse("pending").unwrap();
+                        let prior = storage.stage_composite_alter(0, definition, 7).unwrap();
+                        let selected = storage.read_composite_definition(target, 7).unwrap().unwrap();
+                        storage.rollback_composite_alter(0, prior);
+                        assert_eq!(selected.fields()[0].name.as_str(), "pending");
+                        assert!(selected.pending_definition.is_none());
+                        let child = storage.spill_roots.retain_statement().unwrap();
+                        let child_scope = child.enter().unwrap();
+                        assert_eq!(storage.read_composite_definition(target, 7).unwrap().unwrap().fields()[0].name.as_str(), "before");
+                        drop(child_scope);
+                    }
+                }
+                drop(scope);
+            });
+        }
     }
 }

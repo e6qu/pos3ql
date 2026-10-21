@@ -7689,9 +7689,7 @@ fn decode_op_inner<'a>(
                 1 => {
                     let reference =
                         crate::storage::TypeReference::from_storage(take_name(&mut at)?).ok()?;
-                    if reference.composite_slot().is_none() {
-                        return None;
-                    }
+                    reference.composite_slot()?;
                     crate::storage::TableTypeMembership::Composite(reference)
                 }
                 _ => return None,

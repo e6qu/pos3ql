@@ -1031,11 +1031,11 @@ impl super::Storage {
             let slot = match entry {
                 super::PathEntry::Schema(slot) => slot,
                 super::PathEntry::Catalog => {
-                    if ColType::from_sql_name(name.as_str()).is_some() {
+                    if let Some(builtin) = ColType::from_sql_name(name.as_str()) {
                         return Err(sql_err!(
                             sqlstate::WRONG_OBJECT_TYPE,
                             "type {} is not a composite type",
-                            name.as_str()
+                            builtin.name()
                         ));
                     }
                     continue;
@@ -1071,10 +1071,18 @@ impl super::Storage {
         });
         let Some(slot) = slot else {
             drop(catalog);
-            if (schema.as_str() == "pg_catalog" && ColType::from_sql_name(name.as_str()).is_some())
-                || self
-                    .find_visible(schema.as_str(), name.as_str(), transaction)
-                    .is_some()
+            if schema.as_str() == "pg_catalog"
+                && let Some(builtin) = ColType::from_sql_name(name.as_str())
+            {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "type {} is not a composite type",
+                    builtin.name()
+                ));
+            }
+            if self
+                .find_visible(schema.as_str(), name.as_str(), transaction)
+                .is_some()
                 || self
                     .view_slot(schema.as_str(), name.as_str(), transaction)
                     .is_some()
@@ -1084,7 +1092,7 @@ impl super::Storage {
             {
                 return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
-                    "type {} is not a stand-alone composite type",
+                    "type {} is the row type of another table",
                     name.as_str()
                 ));
             }

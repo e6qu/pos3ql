@@ -1,14 +1,6 @@
 //! Publish member images without changing a type identity or its references.
 
-use super::{PendingEnumDefinition, Storage};
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EnumAlterUndo {
-    pub(super) created_at: u64,
-    pub(super) transaction: u32,
-    pub(super) version: u64,
-    pub(super) prior: Option<PendingEnumDefinition>,
-}
+use super::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "type identity moves require exclusive publication"]

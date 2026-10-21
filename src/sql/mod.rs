@@ -19799,20 +19799,20 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::DomainDropped(slot) => {
             storage.rollback_domain_drop(slot as usize, txid);
         }
-        DdlUndo::DomainAltered { slot, prior } => {
-            storage.rollback_domain_alter(slot as usize, prior)
+        DdlUndo::DomainAltered { prior, .. } => {
+            storage.rollback_domain_alter(prior)
         }
         DdlUndo::EnumCreated(slot) => storage.rollback_enum_create(slot as usize),
         DdlUndo::CompositeCreated(slot) => storage.rollback_composite_create(slot as usize),
-        DdlUndo::CompositeAltered { slot, prior } => {
-            storage.rollback_composite_alter(slot as usize, prior)
+        DdlUndo::CompositeAltered { prior, .. } => {
+            storage.rollback_composite_alter(prior)
         }
         DdlUndo::CompositeDropped(slot) => storage.rollback_composite_drop(slot as usize, txid),
         DdlUndo::EnumDropped(slot) => {
             storage.rollback_enum_drop(slot as usize, txid);
         }
-        DdlUndo::EnumAltered { slot, prior } => {
-            storage.rollback_enum_alter(slot as usize, prior);
+        DdlUndo::EnumAltered { prior, .. } => {
+            storage.rollback_enum_alter(prior);
         }
         DdlUndo::IndexCreated(slot) => {
             let slot = slot as usize;

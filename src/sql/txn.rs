@@ -578,7 +578,7 @@ pub(crate) enum DdlUndo {
     DomainDropped(u32),
     DomainAltered {
         slot: u32,
-        prior: Option<crate::storage::PendingDomainDefinition>,
+        prior: crate::storage::DomainAlterUndo,
     },
     /// CREATE TYPE (enum) at this slot — undo by dropping it.
     EnumCreated(u32),
@@ -587,7 +587,7 @@ pub(crate) enum DdlUndo {
     /// ALTER TYPE on a named composite staged a private physical layout.
     CompositeAltered {
         slot: u32,
-        prior: Option<crate::storage::PendingCompositeDefinition>,
+        prior: crate::storage::CompositeAlterUndo,
     },
     /// DROP TYPE (...): revive the physical type slot on rollback.
     CompositeDropped(u32),

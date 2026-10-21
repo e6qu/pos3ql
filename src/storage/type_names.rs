@@ -217,19 +217,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum NameUndo {
+        Domain(super::super::DomainAlterUndo),
+        Enum(super::super::EnumAlterUndo),
+        Composite(super::super::CompositeAlterUndo),
+    }
+
     fn rename(
         storage: &mut Storage,
         slot: NamedTypeSlot,
         name: &str,
         txid: u32,
-    ) -> Result<(), SqlError> {
+    ) -> Result<NameUndo, SqlError> {
         let UserTypeName { schema, name, .. } = identity(name);
-        match slot {
-            NamedTypeSlot::Domain(slot) => {
-                storage.stage_domain_identity(slot, schema, name, txid)?;
-            }
+        Ok(match slot {
+            NamedTypeSlot::Domain(slot) => NameUndo::Domain(storage.stage_domain_identity(slot, schema, name, txid)?),
             NamedTypeSlot::Enum(slot) => {
-                storage.stage_enum_alter(
+                NameUndo::Enum(storage.stage_enum_alter(
                     slot,
                     schema,
                     name,
@@ -239,36 +244,22 @@ mod tests {
                         sort: 1.0,
                     }],
                     txid,
-                )?;
+                )?)
             }
             NamedTypeSlot::Composite(slot) => {
                 let mut definition = storage.composite_for(slot, txid);
                 definition.schema = schema;
                 definition.name = name;
-                storage.stage_composite_alter(slot, definition, txid)?;
+                NameUndo::Composite(storage.stage_composite_alter(slot, definition, txid)?)
             }
-        }
-        Ok(())
+        })
     }
 
-    fn rollback(storage: &mut Storage, slot: NamedTypeSlot) {
-        match slot {
-            NamedTypeSlot::Domain(slot) => storage.rollback_domain_alter(slot, None),
-            NamedTypeSlot::Enum(slot) => {
-                let undo = {
-                    let catalog = storage.type_catalog.lock().unwrap();
-                    let definition = catalog.enums[slot];
-                    let pending = definition.pending_definition.unwrap();
-                    super::super::EnumAlterUndo {
-                        created_at: definition.created_at,
-                        transaction: pending.txid,
-                        version: pending.version,
-                        prior: None,
-                    }
-                };
-                storage.rollback_enum_alter(slot, undo);
-            }
-            NamedTypeSlot::Composite(slot) => storage.rollback_composite_alter(slot, None),
+    fn rollback(storage: &mut Storage, undo: NameUndo) {
+        match undo {
+            NameUndo::Domain(undo) => storage.rollback_domain_alter(undo),
+            NameUndo::Enum(undo) => storage.rollback_enum_alter(undo),
+            NameUndo::Composite(undo) => storage.rollback_composite_alter(undo),
         }
     }
 
@@ -317,8 +308,8 @@ mod tests {
                         sqlstate::DUPLICATE_OBJECT
                     );
                     // A failed attempt leaves no staged definition or label image.
-                    rename(&mut storage, source, "available", 7).unwrap();
-                    rollback(&mut storage, source);
+                    let undo = rename(&mut storage, source, "available", 7).unwrap();
+                    rollback(&mut storage, undo);
                 });
             }
         }
@@ -334,7 +325,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| {
                     let source = create(&mut storage, existing, "before", 0).unwrap();
                     let contender = create(&mut storage, requested, "contender", 0).unwrap();
-                    rename(&mut storage, source, "after", 7).unwrap();
+                    let undo = rename(&mut storage, source, "after", 7).unwrap();
                     for name in ["before", "after"] {
                         assert_eq!(
                             create(&mut storage, requested, name, 9)
@@ -349,7 +340,7 @@ mod tests {
                             sqlstate::INTERNAL_LOCK_WAIT
                         );
                     }
-                    rollback(&mut storage, source);
+                    rollback(&mut storage, undo);
                     create(&mut storage, requested, "after", 9).unwrap();
                     assert_eq!(
                         create(&mut storage, requested, "before", 9)

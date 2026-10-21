@@ -19,6 +19,7 @@ use crate::sql_err;
 #[derive(Clone, Copy)]
 pub(super) struct TypeImageKey {
     source: TypeIdentity,
+    version: u64,
 }
 
 impl TypeImageKey {
@@ -129,6 +130,7 @@ impl TypeImageKey {
             })?;
         Ok(Self {
             source: source.identity,
+            version: catalog.type_definition_version(source.identity.slot(), transaction),
         })
     }
 }
@@ -424,7 +426,8 @@ impl TypeDefinitionImages {
         let key = TypeImageKey::select(&catalog, reference, transaction)?;
         let source = &catalog.domains[slot];
         if let Some((_, _, definition)) = self.domains.find(|candidate, definition| {
-            candidate.source == key.source && same_domain(definition, source, transaction)
+            candidate.source == key.source && candidate.version == key.version
+                && same_domain(definition, source, transaction)
         }) {
             return Ok(definition);
         }
@@ -472,7 +475,8 @@ impl TypeDefinitionImages {
         let source = catalog.enums[slot].definition_for(transaction);
         let safe_member_count = catalog.enums[slot].safe_member_count_for(transaction);
         if let Some((_, _, definition)) = self.enums.find(|candidate, definition| {
-            candidate.source == key.source && same_enum(definition, &source, safe_member_count)
+            candidate.source == key.source && candidate.version == key.version
+                && same_enum(definition, &source, safe_member_count)
         }) {
             return Ok(definition);
         }
@@ -512,7 +516,8 @@ impl TypeDefinitionImages {
         let key = TypeImageKey::select(&catalog, reference, transaction)?;
         let source = &catalog.composites[slot];
         if let Some((_, _, definition)) = self.composites.find(|candidate, definition| {
-            candidate.source == key.source && same_composite(definition, source, transaction)
+            candidate.source == key.source && candidate.version == key.version
+                && same_composite(definition, source, transaction)
         }) {
             return Ok(definition);
         }
@@ -717,12 +722,12 @@ mod tests {
         NamedTypeSlot::Composite(0),
     ];
 
-    fn fixture() -> Storage {
+    fn fixture(versions: usize) -> Storage {
         let mut config = test_config();
         config.max_domains = 1;
         config.max_enums = 1;
         config.max_composites = 1;
-        config.max_catalog_versions_per_object = 1;
+        config.max_catalog_versions_per_object = versions;
         config.query_workspace_slots = 1;
         let mut budget = test_budget(&config);
         Storage::new(&config, &mut budget).unwrap()
@@ -890,7 +895,7 @@ mod tests {
     #[test]
     fn type_definition_images_keep_retired_slots_unavailable_until_the_reader_releases() {
         for source in SOURCES {
-            let mut storage = fixture();
+            let mut storage = fixture(1);
             create(&mut storage, source).unwrap();
             let reference = reference(&storage, source);
             let images = storage.type_definition_images();
@@ -920,7 +925,7 @@ mod tests {
     #[test]
     fn retained_type_definitions_remain_readable_after_storage_is_removed() {
         for source in SOURCES {
-            let mut storage = fixture();
+            let mut storage = fixture(1);
             create(&mut storage, source).unwrap();
             let reference = reference(&storage, source);
             let images = storage.type_definition_images();
@@ -937,8 +942,8 @@ mod tests {
     #[test]
     fn type_definition_images_reject_foreign_storage_without_consuming_capacity() {
         for source in SOURCES {
-            let mut first = fixture();
-            let mut other = fixture();
+            let mut first = fixture(1);
+            let mut other = fixture(1);
             create(&mut first, source).unwrap();
             create(&mut other, source).unwrap();
             let first_reference = reference(&first, source);
@@ -965,7 +970,7 @@ mod tests {
 
     #[test]
     fn statement_type_readers_keep_selected_versions_and_nested_readers_select_current_values() {
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         create(&mut storage, NamedTypeSlot::Composite(0)).unwrap();
         let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Composite(0));
         let outer = storage.spill_roots.retain_statement().unwrap();
@@ -1013,7 +1018,7 @@ mod tests {
 
     #[test]
     fn child_type_reader_retains_its_parent_after_scopes_and_storage_are_removed() {
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         create(&mut storage, NamedTypeSlot::Domain(0)).unwrap();
         let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Domain(0));
         let outer = storage.spill_roots.retain_statement().unwrap();
@@ -1034,7 +1039,7 @@ mod tests {
 
     #[test]
     fn statement_type_absence_is_stable_and_a_new_transaction_reselects() {
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         let statement = storage.spill_roots.retain_statement().unwrap();
         let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Domain(0));
         crate::mem::guard::forbid_alloc(|| {
@@ -1075,7 +1080,7 @@ mod tests {
     #[test]
     fn selected_enum_keeps_transaction_order_and_new_label_safety_after_commit() {
         use crate::sql::types::{Datum, EnumMemberId};
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         let members = [
             EnumMember {
@@ -1153,7 +1158,7 @@ mod tests {
 
     #[test]
     fn exhausted_statement_type_images_release_cleanly_and_retry_without_more_memory() {
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         create(&mut storage, NamedTypeSlot::Composite(0)).unwrap();
         let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Composite(0));
         let outer = storage.spill_roots.retain_statement().unwrap();
@@ -1202,7 +1207,7 @@ mod tests {
 
     #[test]
     fn type_graph_capture_retains_nested_sources_before_any_value_is_decoded() {
-        let mut storage = fixture();
+        let mut storage = fixture(1);
         let schema = SqlName::parse("public").unwrap();
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         storage
@@ -1297,7 +1302,7 @@ mod tests {
     #[test]
     fn retained_type_identity_allows_exact_replay_and_rejects_reassignment() {
         for source in SOURCES {
-            let mut storage = fixture();
+            let mut storage = fixture(1);
             create(&mut storage, source).unwrap();
             let reference = reference(&storage, source);
             let created_at = storage
@@ -1341,7 +1346,7 @@ mod tests {
     #[test]
     fn selected_pending_type_definitions_survive_rollback_without_changing_new_readers() {
         for source in SOURCES {
-            let mut storage = fixture();
+            let mut storage = fixture(1);
             create(&mut storage, source).unwrap();
             let outer = storage.spill_roots.retain_statement().unwrap();
             let target = TypeDefinitionTarget::Slot(source);
@@ -1366,7 +1371,7 @@ mod tests {
                             )
                             .unwrap();
                         let selected = storage.read_domain_definition(target, 7).unwrap().unwrap();
-                        storage.rollback_domain_alter(0, prior);
+                        storage.rollback_domain_alter(prior);
                         assert_eq!(selected.base, ColType::Int8);
                         assert!(!selected.not_null);
                         assert!(selected.pending_definition.is_none());
@@ -1392,7 +1397,7 @@ mod tests {
                             )
                             .unwrap();
                         let selected = storage.read_enum_definition(target, 7).unwrap().unwrap();
-                        storage.rollback_enum_alter(0, undo);
+                        storage.rollback_enum_alter(undo);
                         assert_eq!(selected.members().next().unwrap().label.as_str(), "pending");
                         let child = storage.spill_roots.retain_statement().unwrap();
                         let child_scope = child.enter().unwrap();
@@ -1418,7 +1423,7 @@ mod tests {
                             .read_composite_definition(target, 7)
                             .unwrap()
                             .unwrap();
-                        storage.rollback_composite_alter(0, prior);
+                        storage.rollback_composite_alter(prior);
                         assert_eq!(selected.fields()[0].name.as_str(), "pending");
                         assert!(selected.pending_definition.is_none());
                         let child = storage.spill_roots.retain_statement().unwrap();
@@ -1439,5 +1444,78 @@ mod tests {
                 drop(scope);
             });
         }
+    }
+
+    fn check_type_undo_lifetimes<Undo: Copy>(
+        source: NamedTypeSlot,
+        stage: impl Fn(&mut Storage, &str) -> Undo,
+        rollback: impl Fn(&Storage, Undo),
+        label: impl Fn(&Storage) -> SqlName,
+    ) {
+        let mut first = fixture(2);
+        let mut other = fixture(2);
+        create(&mut first, source).unwrap();
+        create(&mut other, source).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let earlier = stage(&mut first, "11");
+            let latest = stage(&mut first, "22");
+            let foreign = stage(&mut other, "11");
+            rollback(&other, earlier);
+            assert_eq!(label(&other).as_str(), "11");
+            rollback(&other, foreign);
+            assert_eq!(label(&other).as_str(), "before");
+
+            rollback(&first, earlier);
+            assert_eq!(label(&first).as_str(), "22");
+            rollback(&first, latest);
+            assert_eq!(label(&first).as_str(), "11");
+            rollback(&first, earlier);
+            assert_eq!(label(&first).as_str(), "before");
+
+            retire(&mut first, source);
+            create(&mut first, source).unwrap();
+            let replacement = stage(&mut first, "22");
+            rollback(&first, earlier);
+            assert_eq!(label(&first).as_str(), "22");
+            rollback(&first, replacement);
+            assert_eq!(label(&first).as_str(), "before");
+        });
+    }
+
+    #[test]
+    fn type_edit_undo_rejects_superseded_replaced_and_foreign_sources() {
+        check_type_undo_lifetimes(
+            NamedTypeSlot::Domain(0),
+            |storage, marker| storage.stage_domain_alter(0, DomainSpec {
+                base_domain: None, base_user_type: None, base: ColType::Int4,
+                base_type_mod: -1, not_null: false,
+                default_expr: Some(crate::util::StackStr::from_str(marker)),
+                checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+            }, 7).unwrap(),
+            |storage, undo| storage.rollback_domain_alter(undo),
+            |storage| match storage.domain_for(0, 7).default_expr {
+                Some(expression) => SqlName::parse(expression.as_str()).unwrap(),
+                None => SqlName::parse("before").unwrap(),
+            },
+        );
+        check_type_undo_lifetimes(
+            NamedTypeSlot::Enum(0),
+            |storage, marker| storage.stage_enum_alter(
+                0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(),
+                &[EnumMember { label: SqlName::parse(marker).unwrap(), legacy_label: None, sort: 1.0 }], 7,
+            ).unwrap(),
+            |storage, undo| storage.rollback_enum_alter(undo),
+            |storage| storage.enum_for(0, 7).members().next().unwrap().label,
+        );
+        check_type_undo_lifetimes(
+            NamedTypeSlot::Composite(0),
+            |storage, marker| {
+                let mut definition = storage.composite_for(0, 7);
+                definition.fields[0].name = SqlName::parse(marker).unwrap();
+                storage.stage_composite_alter(0, definition, 7).unwrap()
+            },
+            |storage, undo| storage.rollback_composite_alter(undo),
+            |storage| storage.composite_for(0, 7).fields()[0].name,
+        );
     }
 }

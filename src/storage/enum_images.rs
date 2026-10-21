@@ -560,12 +560,12 @@ mod tests {
             drop(before);
             let prior = alter(&storage, slot, &members).unwrap();
             let pending = storage.enum_for(slot, 77);
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
             assert_eq!(pending.sort_of("shipped"), Some(3.0));
             assert!(alter(&storage, slot, &members).is_err());
             drop(pending);
             let prior = alter(&storage, slot, &members).unwrap();
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
         });
     }
@@ -731,11 +731,11 @@ mod tests {
         let slot = create(&mut storage, "state");
         let old = crate::mem::guard::forbid_alloc(|| {
             let old = alter(&storage, slot, &[member("first", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             let later = alter(&storage, slot, &[member("second", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(storage.enum_for(slot, 77).sort_of("second"), Some(1.0));
-            storage.rollback_enum_alter(slot, later);
+            storage.rollback_enum_alter(later);
             let other = storage
                 .stage_enum_alter(
                     slot,
@@ -745,9 +745,9 @@ mod tests {
                     88,
                 )
                 .unwrap();
-            storage.rollback_enum_alter(slot, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(storage.enum_for(slot, 88).sort_of("other"), Some(1.0));
-            storage.rollback_enum_alter(slot, other);
+            storage.rollback_enum_alter(other);
             old
         });
         crate::mem::guard::forbid_alloc(|| {
@@ -759,12 +759,12 @@ mod tests {
             let replacement = create(&mut storage, "state");
             assert_eq!(replacement, slot);
             let later = alter(&storage, replacement, &[member("replacement", 1.0)]).unwrap();
-            storage.rollback_enum_alter(replacement, old);
+            storage.rollback_enum_alter(old);
             assert_eq!(
                 storage.enum_for(replacement, 77).sort_of("replacement"),
                 Some(1.0)
             );
-            storage.rollback_enum_alter(replacement, later);
+            storage.rollback_enum_alter(later);
             assert_eq!(storage.enum_for(replacement, 0).sort_of("new"), Some(1.0));
         });
     }
@@ -784,7 +784,7 @@ mod tests {
         storage.replace_catalog_sequence_for_test(previous);
         crate::mem::guard::forbid_alloc(|| {
             let undo = alter(&storage, slot, &[member("changed", 1.0)]).unwrap();
-            storage.rollback_enum_alter(slot, undo);
+            storage.rollback_enum_alter(undo);
             assert_eq!(storage.enum_for(slot, 0).sort_of("new"), Some(1.0));
         });
     }
@@ -834,7 +834,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            storage.rollback_enum_alter(slot, prior);
+            storage.rollback_enum_alter(prior);
         });
     }
 

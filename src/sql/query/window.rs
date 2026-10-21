@@ -842,7 +842,7 @@ fn compute_window<'a>(
                 let mut y = x;
                 while y > 0 {
                     let c = cmp_order(
-                        ord, txid,
+                        ord,
                         scope,
                         rows,
                         offs,
@@ -852,6 +852,7 @@ fn compute_window<'a>(
                         params,
                         hooks,
                         storage,
+                        txid,
                     )?;
                     if c == core::cmp::Ordering::Greater {
                         part.swap(y - 1, y);

@@ -117,6 +117,17 @@ pub(crate) fn coerce_domain_value<'a>(
     params: &[Datum<'a>],
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage.read_domain_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
+    coerce_selected_domain_value(storage, &domain, value, txid, arena, params)
+}
+
+fn coerce_selected_domain_value<'a>(
+    storage: &Storage,
+    domain: &crate::storage::DomainDef,
+    value: Datum<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<Datum<'a>, SqlError> {
     let value = if let Some(parent_name) = domain.base_domain {
         let reference = crate::storage::TypeReference::from_bound_name(parent_name)?;
         let parent = storage
@@ -129,12 +140,7 @@ pub(crate) fn coerce_domain_value<'a>(
                     parent_name.name.as_str()
                 )
             })?;
-        let crate::storage::NamedTypeSlot::Domain(parent_slot) = reference.slot() else {
-            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "base domain reference is not a domain"));
-        };
-        let result = coerce_domain_value(storage, parent_slot, value, txid, arena, params)?;
-        drop(parent);
-        result
+        coerce_selected_domain_value(storage, &parent, value, txid, arena, params)?
     } else {
         match domain.base {
             crate::sql::types::ColType::Enum(slot) => {
@@ -156,7 +162,7 @@ pub(crate) fn coerce_domain_value<'a>(
         }
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(storage, txid, &domain, value, arena, params)?;
+    validate_domain_value(storage, txid, domain, value, arena, params)?;
     Ok(value)
 }
 
@@ -2675,6 +2681,7 @@ pub(crate) fn apply_fk_parent_actions(
 
             // Collect the referencing rows first: the rewrites below mutate
             // the row map, so the scan must complete before them.
+            let transaction = txn.txid;
             let refers = |child_row: &[Datum]| -> Result<bool, SqlError> {
                 for (&child_column, &parent_column) in fk.columns().iter().zip(parent_columns) {
                     let child = &child_row[child_column as usize];
@@ -2682,7 +2689,7 @@ pub(crate) fn apply_fk_parent_actions(
                     if child.is_null()
                         || parent.is_null()
                         || !compare_datums_collated(
-                            storage, txn.txid,
+                            storage, transaction,
                             cdef.columns()[child_column as usize].collation,
                             child,
                             parent,

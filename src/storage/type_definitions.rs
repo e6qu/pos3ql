@@ -884,4 +884,69 @@ mod tests {
             drop(scope);
         });
     }
+
+    #[test]
+    fn selected_enum_keeps_transaction_order_and_new_label_safety_after_commit() {
+        use crate::sql::types::{Datum, EnumMemberId};
+        let mut storage = fixture();
+        create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
+        let members = [
+            EnumMember { label: SqlName::parse("before").unwrap(), legacy_label: None, sort: 1.0 },
+            EnumMember { label: SqlName::parse("after").unwrap(), legacy_label: None, sort: 2.0 },
+        ];
+        storage.stage_enum_alter(0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(), &members, 7).unwrap();
+        let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Enum(0));
+        let statement = storage.spill_roots.retain_statement().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = statement.enter().unwrap();
+            let selected = storage.read_enum_definition(target, 7).unwrap().unwrap();
+            assert!(!selected.label_is_uncommitted("before"));
+            assert!(selected.label_is_uncommitted("after"));
+            let value = |member, label| Datum::Enum { slot: 0, member: Some(EnumMemberId::from_ordinal(member).unwrap()), sort: 0.0, label };
+            assert!(crate::sql::eval::compare_datums_collated(&storage, 7, crate::sql::ast::Collation::None, &value(0, "before"), &value(1, "after")).unwrap().is_lt());
+            drop(scope);
+            storage.commit_enum_alter(0, 7);
+            assert!(selected.label_is_uncommitted("after"));
+            let scope = statement.enter().unwrap();
+            let child = storage.spill_roots.retain_statement().unwrap();
+            let child_scope = child.enter().unwrap();
+            assert!(!storage.read_enum_definition(target, 0).unwrap().unwrap().label_is_uncommitted("after"));
+            drop(child_scope);
+            drop(scope);
+        });
+    }
+
+    #[test]
+    fn exhausted_statement_type_images_release_cleanly_and_retry_without_more_memory() {
+        let mut storage = fixture();
+        create(&mut storage, NamedTypeSlot::Composite(0)).unwrap();
+        let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Composite(0));
+        let outer = storage.spill_roots.retain_statement().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = outer.enter().unwrap();
+            let old = storage.read_composite_definition(target, 0).unwrap().unwrap();
+            drop(scope);
+            for (name, succeeds) in [("second", true), ("third", false)] {
+                let mut altered = storage.composite_for(0, 0);
+                altered.fields[0].name = SqlName::parse(name).unwrap();
+                storage.stage_composite_alter(0, altered, 7).unwrap();
+                storage.commit_composite_alter(0, 7);
+                let scope = outer.enter().unwrap();
+                let child = storage.spill_roots.retain_statement().unwrap();
+                let child_scope = child.enter().unwrap();
+                let read = storage.read_composite_definition(target, 0);
+                if succeeds {
+                    assert_eq!(read.unwrap().unwrap().fields()[0].name.as_str(), name);
+                } else {
+                    assert_eq!(read.err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                }
+                drop(child_scope);
+                drop(scope);
+            }
+            assert_eq!(old.fields()[0].name.as_str(), "before");
+            drop(old);
+            drop(outer);
+            assert_eq!(storage.read_composite_definition(target, 0).unwrap().unwrap().fields()[0].name.as_str(), "third");
+        });
+    }
 }

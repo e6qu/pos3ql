@@ -34063,6 +34063,7 @@ impl Storage {
     /// boundary so byte encoding can never accidentally become SQL order.
     pub(crate) fn compare_value_binding_keys(
         &self,
+        txid: u32,
         table_index: usize,
         binding: usize,
         navigation: Option<crate::store::NavigationSpec>,
@@ -34164,6 +34165,7 @@ impl Storage {
                 (_, Datum::Null) => core::cmp::Ordering::Greater,
                 (left, right) => crate::sql::eval::compare_datums_collated(
                     self,
+                    txid,
                     collations[position],
                     &left,
                     &right,

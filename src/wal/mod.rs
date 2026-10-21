@@ -1691,6 +1691,7 @@ pub(crate) enum WalOp<'a> {
     /// Absolute role definition, shared by CREATE and ALTER so replay is
     /// idempotent and a manifest/WAL handoff cannot expose a partial option set.
     UpsertRole {
+        slot: u16,
         oid: crate::storage::RoleOid,
         name: &'a str,
         attributes: RoleAttributes,
@@ -3888,7 +3889,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 }
                 Some(crate::storage::RoleCredential::Md5(_)) => 32,
             };
-            4 + 1
+            6 + 1
                 + name.len()
                 + 2
                 + 4
@@ -6054,6 +6055,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             attributes,
             oid,
+            slot,
         } => {
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
@@ -6065,6 +6067,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u16::from(attributes.password.is_some()) << 7)
                 | (u16::from(attributes.valid_until.is_some()) << 8);
             buffer.append(&oid.get().to_le_bytes())
+                && buffer.append(&slot.to_le_bytes())
                 && name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
@@ -10996,6 +10999,11 @@ fn decode_op_inner<'a>(
                 payload.get(at..at + 4)?.try_into().ok()?,
             ))?;
             at += 4;
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            if slot == u16::MAX || (slot == 0) != (oid == crate::storage::RoleOid::BOOTSTRAP) {
+                return None;
+            }
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -11050,6 +11058,7 @@ fn decode_op_inner<'a>(
             }
             Some(WalOp::UpsertRole {
                 oid,
+                slot,
                 name,
                 attributes: RoleAttributes {
                     superuser: flags & 1 != 0,

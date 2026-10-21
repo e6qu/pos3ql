@@ -180,6 +180,32 @@ impl SessionIdentity {
 }
 
 impl Storage {
+    pub(crate) fn role_reference_ready(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let role = catalog
+            .roles
+            .get(slot)
+            .filter(|role| role.visible_to(transaction))
+            .ok_or_else(|| {
+                crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "referenced role is not visible")
+            })?;
+        if let Some(pending) = role.pending
+            && pending.txid != transaction
+        {
+            let owner = pending.txid;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, "role reference"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn role_identity_sequence(&self) -> u64 {
         self.catalog_sources.roles.load(Ordering::Relaxed)
     }

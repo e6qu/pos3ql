@@ -45,15 +45,16 @@ keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
 2,147,483,647. Exhaustion returns `54000` before changing the role catalog.
 The required `role_sequence` manifest field retains the allocator's highest
 reservation, including deleted and rolled-back roles. `rol` records start with
-the identifier, followed by the encoded name and attributes. Journal role
-definitions start with a four-byte identifier. Prepared transaction owners use
+the identifier and preserved catalog slot, followed by the encoded name and
+attributes. Journal role definitions start with a four-byte identifier and
+two-byte catalog slot. Prepared transaction owners use
 that same four-byte identifier in the journal and its decimal form in `ptx`
 manifest records; they do not require the owning role to remain present.
 
 For example, deleting an account that prepared a transaction and creating a
 replacement account cannot give the replacement permission to finish that
 transaction. This remains true after checkpoint or journal recovery, even if
-catalog slots change. A superuser can still finish the abandoned transaction.
+a deleted account's slot is reused. A superuser can still finish the abandoned transaction.
 
 ## Why the storage layout matters
 

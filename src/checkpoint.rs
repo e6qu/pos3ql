@@ -4453,6 +4453,7 @@ impl Checkpointer {
                     let oid = crate::storage::RoleOid::parse(parse_field(words.next(), "rol OID")?)
                         .filter(|oid| oid.get() as u64 <= metadata.role_sequence)
                         .ok_or(CheckpointSetupError::Corrupt("invalid rol OID"))?;
+                    let slot: usize = parse_field(words.next(), "rol slot")?;
                     let name = decode_hex_name(
                         words
                             .next()
@@ -4556,6 +4557,7 @@ impl Checkpointer {
                                 valid_until,
                             },
                             oid,
+                            slot,
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -9210,7 +9212,7 @@ impl Checkpointer {
 
         // Roles are durable catalog authority. Parsed verifier material crosses
         // this object-backed manifest; plaintext passwords never do.
-        for (_, role) in storage.live_roles() {
+        for (slot, role) in storage.live_roles() {
             use core::fmt::Write;
             let attributes = role.attributes;
             let mut name = StackStr::<130>::new();
@@ -9275,8 +9277,9 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rol {} {} {} {} {} {} {} {} {} {}",
+                    "rol {} {} {} {} {} {} {} {} {} {} {}",
                     role.oid().get(),
+                    slot,
                     name.as_str(),
                     flags,
                     attributes.connection_limit,

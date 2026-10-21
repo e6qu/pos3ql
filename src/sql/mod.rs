@@ -16790,6 +16790,7 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                guc,
                 names,
                 *if_exists,
                 responder,
@@ -22831,8 +22832,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             attributes,
             oid,
+            slot,
         } => {
-            storage.install_role(crate::storage::SqlName::parse(name)?, attributes, oid)?;
+            storage.install_role(
+                crate::storage::SqlName::parse(name)?,
+                attributes,
+                oid,
+                usize::from(slot),
+            )?;
         }
         WalOp::DropRole { name } => storage.remove_role(name),
         WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,

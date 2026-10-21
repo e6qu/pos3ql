@@ -51,6 +51,14 @@ that owner leaves the transaction available to superusers; a replacement
 account cannot commit or roll it back. Reusing a catalog slot does not reuse
 the deleted account's identifier.
 
+Renaming or deleting a role waits for another transaction's unfinished ownership
+or permission changes. For example, if `orders_app` has created a table inside
+`BEGIN`, an administrator's `DROP ROLE orders_app` waits for that transaction.
+After commit, the table prevents deletion; after rollback, deletion can proceed
+if nothing else depends on the account. Dependencies include objects in other
+databases, publications, subscriptions, user mappings and grants made by the
+account. Recovery preserves role catalog positions as well as identifiers.
+
 Memory for connection identities is reserved at startup. The identities distinguish catalog slot reuse.
 Creation without a valid acting account fails before allocating identifiers or
 changing catalogs. Recovery supplies an explicit owner instead of substituting

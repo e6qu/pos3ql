@@ -6835,6 +6835,9 @@ pub fn alter_owner(
             role.as_str()
         ));
     };
+    if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
+        return sql_fail(error);
+    }
     let current = super::eval::funcs::system::current_user_owned();
     let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -6936,6 +6939,9 @@ pub fn alter_large_object_owner(
             role.as_str()
         ));
     };
+    if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
+        return sql_fail(error);
+    }
     let current = super::eval::funcs::system::current_user_owned();
     let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -7201,6 +7207,7 @@ pub fn create_role(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
+            slot: slot as u16,
             oid: storage.role(slot).oid(),
             name: name.as_str(),
             attributes,
@@ -7450,6 +7457,7 @@ pub fn alter_role(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
+            slot: slot as u16,
             oid: storage.role(slot).oid(),
             name: storage.role_name(slot, txn.txid).as_str(),
             attributes,
@@ -7838,6 +7846,7 @@ pub fn drop_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    guc: &crate::sql::guc::GucState,
     names: &[&str],
     if_exists: bool,
     responder: &mut Responder,
@@ -7845,7 +7854,11 @@ pub fn drop_role(
     if let Err(error) = require_create_role(storage, txn.txid) {
         return sql_fail(error);
     }
-    let current = super::eval::funcs::system::session_user_owned();
+    let protected = [
+        storage.current_role_slot(txn.txid),
+        storage.session_role_slot(guc.current_identity().source(), txn.txid),
+        storage.session_role_slot(guc.session_identity().source(), txn.txid),
+    ];
     for written in names {
         let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
@@ -7867,17 +7880,10 @@ pub fn drop_role(
                 resolved.as_str()
             ));
         };
-        if resolved.as_str() == current.as_str() {
+        if protected.contains(&Some(slot)) {
             return sql_fail(sql_err!(
                 sqlstate::OBJECT_IN_USE,
                 "current user cannot be dropped"
-            ));
-        }
-        if storage.role_object_dependency(slot, txn.txid).is_some() {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "role \"{}\" cannot be dropped because some objects depend on it",
-                resolved.as_str()
             ));
         }
         let membership_count = (0..storage.role_membership_count())
@@ -7962,6 +7968,25 @@ pub fn drop_role(
             {
                 return sql_fail(error);
             }
+        }
+    }
+    // Membership cleanup covers the complete target set before grantor and
+    // object dependencies are checked, including duplicate role names.
+    for written in names {
+        let Some(slot) = storage.find_role_visible(written, txn.txid) else {
+            continue;
+        };
+        let resolved = crate::util::StackStr::<64>::from_str(written);
+        let dependency = match storage.role_object_dependency(slot, txn.txid) {
+            Ok(dependency) => dependency,
+            Err(error) => return sql_fail(error),
+        };
+        if dependency.is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "role \"{}\" cannot be dropped because some objects depend on it",
+                resolved.as_str()
+            ));
         }
         let name = storage.role_name(slot, txn.txid);
         let prior = match storage.drop_role_in(slot, txn.txid) {
@@ -9022,6 +9047,9 @@ pub fn reassign_owned(
             resolved_owner.as_str()
         ));
     };
+    if let Err(error) = storage.role_reference_ready(target, txn.txid) {
+        return sql_fail(error);
+    }
     let current_name = super::eval::funcs::system::current_user_owned();
     let current = storage
         .find_role_visible(current_name.as_str(), txn.txid)
@@ -21974,6 +22002,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    guc,
                     names,
                     *if_exists,
                     responder,
@@ -29437,6 +29466,7 @@ fn catalog_owner_slot(storage: &Storage, txid: u32, written: &str) -> Result<i32
             role.as_str()
         ));
     }
+    storage.role_reference_ready(slot, txid)?;
     Ok(storage.role_oid(slot))
 }
 
@@ -35443,6 +35473,9 @@ pub fn alter_routine(
             return sql_fail(error);
         }
         let old_owner = storage.object_owner(object, txn.txid) as u16;
+        if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
+            return sql_fail(error);
+        }
         let prior = storage.set_object_owner(object, new_owner, txn.txid);
         if let Err(error) =
             txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior })
@@ -50366,6 +50399,9 @@ pub fn alter_database(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.role_reference_ready(owner, txn.txid) {
+        return sql_fail(error);
+    }
     let prior_owner = storage.set_object_owner(object, owner, txn.txid);
     let oid = storage.database(slot).oid;
     let lsn = storage.bump_lsn();

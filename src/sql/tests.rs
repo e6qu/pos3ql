@@ -19207,7 +19207,104 @@ fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
 }
 
 #[test]
-fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
+fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
+    for checkpoint in [false, true] {
+        let mut config = test_config(if checkpoint {
+            "role-publication-checkpoint"
+        } else {
+            "role-publication-journal"
+        });
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket =
+            format!("role-publication-{}-{}", checkpoint, std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let (aborted, prior) = engine
+            .storage
+            .create_role(
+                crate::storage::SqlName::parse("aborted_source_role").unwrap(),
+                crate::storage::RoleAttributes::ORDINARY,
+                41,
+            )
+            .unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE publication_slot_owner SUPERUSER",
+        );
+        assert!(!message_types(&output).contains(&b'E'));
+        let owner = engine.role_login("publication_slot_owner").unwrap();
+        assert!(usize::from(owner.slot) > aborted);
+        let mut actor = GucState::new();
+        actor.bind_session_user(owner.identity);
+        let output = run_with_guc(
+            &mut engine,
+            &mut budget,
+            "CREATE PUBLICATION source_slot_publication",
+            1 << 18,
+            &mut actor,
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.storage.rollback_role_change(aborted, prior);
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        let restored = recovered.role_login("publication_slot_owner").unwrap();
+        assert_eq!(restored.slot, owner.slot);
+        let output = run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "CREATE ROLE publication_slot_replacement",
+        );
+        assert!(!message_types(&output).contains(&b'E'));
+        let replacement = recovered
+            .role_login("publication_slot_replacement")
+            .unwrap();
+        assert_eq!(usize::from(replacement.slot), aborted);
+        let mut unauthorized = GucState::new();
+        unauthorized.bind_session_user(replacement.identity);
+        let output = run_with_guc(
+            &mut recovered,
+            &mut recovered_budget,
+            "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
+            1 << 18,
+            &mut unauthorized,
+        );
+        assert!(message_types(&output).contains(&b'E'));
+        let mut authorized = GucState::new();
+        authorized.bind_session_user(restored.identity);
+        let output = run_with_guc(
+            &mut recovered,
+            &mut recovered_budget,
+            "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
+            1 << 18,
+            &mut authorized,
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn catalog_creation_prepared_owner_keeps_role_slots_after_checkpoint() {
     let mut config = test_config("relocated-role-owner");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -19244,7 +19341,7 @@ fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
     let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let slot = recovered.storage.find_role("retained_source_role").unwrap();
-    assert_ne!(slot, prior_slot);
+    assert_eq!(slot, prior_slot);
     assert_eq!(recovered.storage.role_oid(slot), oid);
     let mut actor = GucState::new();
     actor.bind_session_user(

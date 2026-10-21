@@ -31,6 +31,8 @@ jobs:
           cargo test --lib --locked --
           storage::type_reference_moves::tests
           storage::type_references::tests
+          storage::table_edits::tests
+          storage::tests::shared_table
           sql::tests::captured_type_references
           sql::tests::typed_table_membership
           sql::tests::database_template_catalogs

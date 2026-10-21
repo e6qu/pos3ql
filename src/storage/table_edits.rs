@@ -40,9 +40,48 @@ impl<'storage> TableDefinitionEdit<'storage> {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
+        let (mut comments, _source) = loop {
+            let comments = self.storage.comment_catalog();
+            if !definition.requires_type_catalog() {
+                break (comments, None);
+            }
+            match super::row_ownership::try_mutex(
+                &self.storage.type_catalog,
+                "type catalog lock poisoned",
+            ) {
+                Ok(source) => {
+                    source.bind_table_definition(&mut definition, transaction)?;
+                    break (comments, Some(source));
+                }
+                Err(wait) => {
+                    let storage = self.storage;
+                    let table = self.table;
+                    let identity = self.definition.identity;
+                    drop(comments);
+                    drop(self);
+                    #[cfg(test)]
+                    storage
+                        .type_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    self = Self::new(storage, table);
+                    if self.definition.identity.database != identity.database
+                        || self.definition.identity.created_at != identity.created_at
+                    {
+                        return Err(sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "pending definition belongs to a retired table incarnation"
+                        ));
+                    }
+                }
+            }
+        };
         if let Some(owner) = self.definition.locked_by_other(transaction) {
             let name = self.definition.committed.name;
             let storage = self.storage;
+            drop(_source);
+            drop(comments);
             drop(self);
             return Err(storage.catalog_ddl_wait_error(transaction, owner, name.as_str()));
         }
@@ -92,7 +131,6 @@ impl<'storage> TableDefinitionEdit<'storage> {
         );
         // Acquire the selected definition before the shared comment catalog
         // or version allocator. Waiting for its readers never reserves either.
-        let mut comments = self.storage.comment_catalog();
         comment_identity.ensure_available(&comments)?;
         self.storage.pending_table_defs.stage_locked(
             &mut self.definition,

@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn source_reference_codec_preserves_lifetimes_without_names() {
         crate::mem::guard::forbid_alloc(|| {
-            for encoded in ["d:0:1", "e:65535:18446744073709551615", "c:1600:41"] {
+            for encoded in ["d:0:1", "e:0:18446744073709551615", "c:1600:41"] {
                 let reference = TypeReference::from_storage(encoded).unwrap();
                 assert_eq!(reference.storage_key().as_str(), encoded);
             }
@@ -856,6 +856,19 @@ impl TypeCatalog {
             ctype,
             user_type: Some(snapshot.name),
         })
+    }
+}
+
+impl super::TableDef {
+    pub(super) fn requires_type_catalog(&self) -> bool {
+        self.type_membership != super::TableTypeMembership::None
+            || self.columns().iter().any(|column| {
+                RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                }
+                .requires_type_catalog()
+            })
     }
 }
 

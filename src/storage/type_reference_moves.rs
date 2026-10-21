@@ -688,6 +688,45 @@ mod tests {
     }
 
     #[test]
+    fn table_submission_releases_all_owners_before_source_wait() {
+        for kind in KINDS {
+            for create in [false, true] {
+                let (storage, related, _, movement) = fixture(kind);
+                let mut definition = *storage.table_def(related, 0);
+                definition.name = SqlName::parse("submitted_table").unwrap();
+                let database = storage.current_database_oid();
+                let source = storage.type_catalog.lock().unwrap();
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        crate::sql::set_execution_database_oid(database);
+                        crate::mem::guard::forbid_alloc(|| {
+                            if create {
+                                storage.create_table_in(definition, 7)
+                            } else {
+                                storage
+                                    .write_table_def(related, 7, definition, &mapping("id"), false)
+                                    .map(|()| related)
+                            }
+                        })
+                    });
+                    let waiting = wait_until_contended(&storage);
+                    let available = storage.table_creation.try_lock().is_ok()
+                        && storage.comments.try_lock().is_ok()
+                        && storage.tables.iter().all(|table| {
+                            table.lifecycle.try_lock().is_ok()
+                                && table.definition.test_write().is_ok()
+                        });
+                    drop(source);
+                    let slot = writer.join().unwrap().unwrap();
+                    assert!(waiting, "submission never reached the source wait");
+                    assert!(available, "source wait retained a table or catalog owner");
+                    assert_identity(&storage, slot, 7, movement.prior);
+                });
+            }
+        }
+    }
+
+    #[test]
     fn captured_type_references_follow_moves_before_late_table_publication() {
         for kind in KINDS {
             let (storage, table, _, movement) = fixture(kind);

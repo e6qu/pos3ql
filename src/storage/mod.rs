@@ -20514,8 +20514,7 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics.committed();
                 let serial_values = self.table_serial_values(source_slot);
-                let target_slot =
-                    table_creation::TableCreation::new(self).allocate(definition, Some(txid))?;
+                let target_slot = table_creation::allocate(self, definition, Some(txid))?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
@@ -34830,11 +34829,10 @@ impl Storage {
         &self,
         index: usize,
         txid: u32,
-        mut def: TableDef,
+        def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        self.bind_user_type_columns_to(&mut def, txid)?;
         table_edits::TableDefinitionEdit::new(self, index).stage(
             txid,
             def,
@@ -34903,20 +34901,9 @@ impl Storage {
         }
     }
 
-    /// Rebinds every persisted user-defined column type from its stable name to
-    /// the current catalog slot. Slots are runtime identities and may change
-    /// across restart; scalar enums and enum/domain arrays therefore never
-    /// trust the slot encoded in the table definition.
+    /// Bind saved source lifetimes and refresh their cached SQL spelling.
     fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
-        if def.type_membership == TableTypeMembership::None
-            && def.columns().iter().all(|column| {
-                !RoutineResult {
-                    ctype: column.ctype,
-                    user_type: column.user_type,
-                }
-                .requires_type_catalog()
-            })
-        {
+        if !def.requires_type_catalog() {
             return Ok(());
         }
         let catalog = self
@@ -34932,7 +34919,6 @@ impl Storage {
 
     /// Journal replay installs a committed table under exclusive storage access.
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
-        let creation = table_creation::TableCreation::new(self);
         if def.n_columns > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -34944,21 +34930,7 @@ impl Storage {
             .columns()
             .iter()
             .any(|column| column.ctype.typlen() == -1);
-        if self
-            .find_table(def.schema.as_str(), def.name.as_str())
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_TABLE,
-                "relation \"{}\" already exists",
-                def.name.as_str()
-            ));
-        }
-        // A reloaded enum column decodes as `Enum(ENUM_SLOT_UNRESOLVED)` plus the
-        // enum's name (in `domain`); bind it to the live catalog slot now that
-        // the enum has itself been loaded (WAL/checkpoint order guarantees it).
-        self.bind_user_type_columns(&mut def)?;
-        let slot = creation.allocate(def, None)?;
+        let slot = table_creation::allocate(self, def, None)?;
         Ok(slot)
     }
 
@@ -35050,34 +35022,12 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&self, mut def: TableDef, txid: u32) -> Result<usize, SqlError> {
-        let creation = table_creation::TableCreation::new(self);
         def.has_toast |= def
             .columns()
             .iter()
             .any(|column| column.ctype.typlen() == -1);
         self.require_schema_create(def.schema.as_str(), txid)?;
-        if self
-            .find_visible(def.schema.as_str(), def.name.as_str(), txid)
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_TABLE,
-                "relation \"{}\" already exists",
-                def.name.as_str()
-            ));
-        }
-        if let Some(other) =
-            self.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
-        {
-            self.wait_for_transaction(txid, other)?;
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for concurrent DDL on \"{}\"",
-                def.name.as_str()
-            ));
-        }
-        self.bind_user_type_columns_to(&mut def, txid)?;
-        let slot = creation.allocate(def, Some(txid))?;
+        let slot = table_creation::allocate(self, def, Some(txid))?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }

@@ -8,31 +8,38 @@ use super::{
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
 
-pub(super) struct TableCreation<'storage> {
-    storage: &'storage Storage,
-    _names: std::sync::MutexGuard<'storage, ()>,
-}
-
-impl<'storage> TableCreation<'storage> {
-    pub(super) fn new(storage: &'storage Storage) -> Self {
-        Self {
-            storage,
-            _names: storage
-                .table_creation
-                .lock()
-                .expect("table creation lock poisoned"),
+/// Source validation and installation share owners. A source wait releases the
+/// name, lifecycle and definition owners before retrying the name reservation.
+pub(super) fn allocate(
+    storage: &Storage,
+    mut def: TableDef,
+    transaction: Option<u32>,
+) -> Result<usize, SqlError> {
+    loop {
+        let names = storage
+            .table_creation
+            .lock()
+            .expect("table creation lock poisoned");
+        let duplicate = match transaction {
+            Some(txid) => storage.find_visible(def.schema.as_str(), def.name.as_str(), txid),
+            None => storage.find_table(def.schema.as_str(), def.name.as_str()),
+        };
+        if duplicate.is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                def.name.as_str()
+            ));
         }
-    }
-
-    /// The name guard covers initialization of an empty slot, without object I/O.
-    /// Selected lifecycle ownership excludes retirement through failure cleanup.
-    pub(super) fn allocate(
-        &self,
-        def: TableDef,
-        transaction: Option<u32>,
-    ) -> Result<usize, SqlError> {
-        let storage = self.storage;
-        let Some((slot, _lifecycle)) = storage
+        if let Some(txid) = transaction {
+            if let Some(other) =
+                storage.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
+            {
+                drop(names);
+                return Err(storage.catalog_ddl_wait_error(txid, other, def.name.as_str()));
+            }
+        }
+        let Some((slot, lifecycle)) = storage
             .tables
             .iter()
             .take(storage.table_count())
@@ -63,25 +70,49 @@ impl<'storage> TableCreation<'storage> {
             slot: slot as u16,
         });
         let ownership = storage.initial_ownership(transaction.unwrap_or(0));
-        let created_at = storage.catalog_sequence.next()?;
-        let stamp = created_at;
         storage.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         storage.reset_implicit_index_statistics(slot);
         storage.clear_table_rows(slot);
         let table = &storage.tables[slot];
-        {
-            let mut state = table.definition.write();
-            state.committed = def;
-            state.pending_has_rules_txid = None;
-            state.identity = table_definitions::TableIdentity {
-                database: current_database(),
-                ownership,
-                created_at: stamp,
-                existence: transaction.map_or(CatalogDdlState::Present, |txid| {
-                    CatalogDdlState::PendingCreate { txid }
-                }),
-            };
+        let mut state = table.definition.write();
+        let source = if def.requires_type_catalog() {
+            match super::row_ownership::try_mutex(
+                &storage.type_catalog,
+                "type catalog lock poisoned",
+            ) {
+                Ok(source) => Some(source),
+                Err(wait) => {
+                    drop(state);
+                    drop(lifecycle);
+                    drop(names);
+                    #[cfg(test)]
+                    storage
+                        .type_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(source) = &source {
+            source.bind_table_definition(&mut def, transaction.unwrap_or(0))?;
         }
+        let created_at = storage.catalog_sequence.next()?;
+        state.committed = def;
+        state.pending_has_rules_txid = None;
+        state.identity = table_definitions::TableIdentity {
+            database: current_database(),
+            ownership,
+            created_at,
+            existence: transaction.map_or(CatalogDdlState::Present, |txid| {
+                CatalogDdlState::PendingCreate { txid }
+            }),
+        };
+        drop(state);
+        drop(source);
         table.mark_dirty();
         table
             .statistics
@@ -110,6 +141,6 @@ impl<'storage> TableCreation<'storage> {
             return Err(error);
         }
         storage.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);
-        Ok(slot)
+        return Ok(slot);
     }
 }

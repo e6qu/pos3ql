@@ -65659,17 +65659,17 @@ fn typed_table_membership_rejects_a_reused_source_lifetime() {
         .unwrap();
     let mut saved = *engine.storage.table_def(slot, 0);
     let source_slot = saved.type_membership.composite_slot().unwrap();
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP TYPE retired_typed_source CASCADE; \
-         CREATE TYPE retired_typed_source AS (id integer)",
-    );
-    assert!(
-        !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    for statement in [
+        "DROP TYPE retired_typed_source CASCADE",
+        "CREATE TYPE retired_typed_source AS (id integer)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     let (_, replacement) = engine
         .storage
         .composite_source(None, "retired_typed_source", 0)

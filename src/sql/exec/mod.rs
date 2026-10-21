@@ -11982,7 +11982,7 @@ pub(crate) fn drop_schema(
     };
     for t in 0..storage.table_count() {
         let def = storage.table_def(t, txn.txid);
-        if !storage.table(t).visible_to(txn.txid) || !in_listed(storage, def.schema.as_str()) {
+        if !storage.table_slot_visible_to(t, txn.txid) || !in_listed(storage, def.schema.as_str()) {
             continue;
         }
         let def = *def;
@@ -12145,7 +12145,7 @@ pub(crate) fn drop_schema(
         loop {
             let mut dependent = None;
             for table in 0..storage.table_count() {
-                if !storage.table(table).visible_to(txn.txid) {
+                if !storage.table_slot_visible_to(table, txn.txid) {
                     continue;
                 }
                 let def = storage.table_def(table, txn.txid);
@@ -12451,7 +12451,7 @@ pub(crate) fn drop_schema(
     // the constraint (PostgreSQL drops the constraint, not the table).
     for t in 0..storage.table_count() {
         let def = storage.table_def(t, txn.txid);
-        if !storage.table(t).visible_to(txn.txid) || in_listed(storage, def.schema.as_str()) {
+        if !storage.table_slot_visible_to(t, txn.txid) || in_listed(storage, def.schema.as_str()) {
             continue;
         }
         for f in 0..def.n_fkeys {
@@ -41468,8 +41468,7 @@ fn domain_column_in_use(
 ) -> Result<Option<(SqlName, SqlName, SqlName)>, SqlError> {
     let (_, target) = storage.prepare_domain_edit(domain_slot, txid)?;
     for table_index in 0..storage.table_count() {
-        let table = storage.table(table_index);
-        if !table.visible_to(txid) {
+        if !storage.table_slot_visible_to(table_index, txid) {
             continue;
         }
         let def = storage.table_def(table_index, txid);
@@ -41914,7 +41913,7 @@ fn validate_domain_rows(
 ) -> Result<(), SqlError> {
     let read = storage.validation_read();
     for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txid) {
+        if !storage.table_slot_visible_to(table_index, txid) {
             continue;
         }
         let def = *storage.table_def(table_index, txid);
@@ -42595,7 +42594,7 @@ pub(crate) fn drop_type(
 
 fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> Option<usize> {
     (0..storage.composite_count()).find(|&composite_slot| {
-        storage.composite(composite_slot).visible_to(txid)
+        storage.composite_slot_visible_to(composite_slot, txid)
             && storage
                 .composite_for(composite_slot, txid)
                 .active_fields()
@@ -42893,7 +42892,7 @@ fn drop_composite_type(
 
 fn typed_table_member(storage: &Storage, composite_slot: usize, txid: u32) -> Option<usize> {
     (0..storage.table_count()).find(|&table_slot| {
-        storage.table(table_slot).visible_to(txid)
+        storage.table_slot_visible_to(table_slot, txid)
             && storage
                 .table_def(table_slot, txid)
                 .type_membership
@@ -43150,7 +43149,7 @@ fn composite_column_in_use(
     txid: u32,
 ) -> Option<(SqlName, SqlName, SqlName)> {
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txid) {
+        if !storage.table_slot_visible_to(table_slot, txid) {
             continue;
         }
         let definition = storage.table_def(table_slot, txid);
@@ -43184,7 +43183,7 @@ fn reject_composite_attribute_type_with_dependents(
         || typed_table_member(storage, composite_slot, txid).is_some();
     let nested_field = composite_field_uses_composite(storage, root, txid)?.is_some();
     let domain = (0..storage.domain_count()).any(|slot| {
-        storage.domain_for(slot, txid).visible_to(txid)
+        storage.domain_slot_visible_to(slot, txid)
             && domain_composite_base(storage, slot, txid) == Some(composite_slot as u16)
     });
     let StoredDependencyClosure {
@@ -44861,8 +44860,7 @@ fn enum_column_in_use(
     txid: u32,
 ) -> Option<(SqlName, SqlName, SqlName)> {
     for table_index in 0..storage.table_count() {
-        let table = storage.table(table_index);
-        if !table.visible_to(txid) {
+        if !storage.table_slot_visible_to(table_index, txid) {
             continue;
         }
         let def = storage.table_def(table_index, txid);

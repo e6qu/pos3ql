@@ -26438,6 +26438,11 @@ impl Storage {
         oid: RoleOid,
     ) -> Result<usize, SqlError> {
         let mut catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
+        if catalog.roles.iter().any(|role| role.pending.is_some_and(|pending| {
+            role.lifetime == Some(oid) || role.name == name || pending.name == name
+        })) {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "stored role replaces a pending role definition"));
+        }
         let named = catalog.roles.iter().position(|role| role.live && role.name == name);
         let identified = catalog.roles.iter().position(|role| role.live && role.lifetime == Some(oid));
         if named.is_some() && named != identified {
@@ -26449,9 +26454,6 @@ impl Storage {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many roles (limit {})", catalog.roles.len())
             })?,
         };
-        if catalog.roles[slot].pending.is_some() {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "stored role replaces a pending role definition"));
-        }
         self.observe_role_oid(oid);
         catalog.roles[slot] = RoleDef {
             lifetime: Some(oid),
@@ -53627,6 +53629,32 @@ mod tests {
                 assert_eq!(storage.tables[reused].enforcer_count(), 1);
                 storage.rollback_create(reused);
             }
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_install_rejects_identity_conflicts_and_pending_sources() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let name = SqlName::parse("installed_actor").unwrap();
+        let (slot, _) = storage.create_role(name, RoleAttributes::ORDINARY, 7).unwrap();
+        let oid = storage.role(slot).oid();
+        let sequence = storage.role_identity_sequence();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, oid).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.role(slot).visible_to(7));
+            assert!(!storage.role(slot).visible_to(0));
+            storage.commit_role_change(slot);
+            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, oid).unwrap(), slot);
+            let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            let other_oid = RoleOid::parse(16_400).unwrap();
+            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY, other_oid).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.role_identity_sequence(), sequence);
+            assert_eq!(storage.role_oid(slot), oid.get());
+            let renamed = SqlName::parse("installed_renamed_actor").unwrap();
+            assert_eq!(storage.install_role(renamed, RoleAttributes::ORDINARY, oid).unwrap(), slot);
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), renamed.as_str());
         });
     }
 

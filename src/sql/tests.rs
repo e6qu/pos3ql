@@ -19205,6 +19205,8 @@ fn catalog_creation_prepared_owner_tracks_relocated_role_after_checkpoint() {
     let mut config = test_config("relocated-role-owner");
     config.object_store_on = true;
     config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
     config.object_store_bucket = format!("relocated-role-owner-{}", std::process::id());
     config.max_prepared_transactions = 2;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -19244,6 +19246,8 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
         let mut config = test_config(if checkpoint { "role-owner-checkpoint" } else { "role-owner-journal" });
         config.object_store_on = true;
         config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
         config.object_store_bucket = format!("role-owner-{}-{}", checkpoint, std::process::id());
         config.max_prepared_transactions = 2;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);

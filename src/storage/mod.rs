@@ -59999,6 +59999,9 @@ mod tests {
         config.max_policies = WORKERS;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let target = storage
+            .create_table(make_def("policy_target", &[]))
+            .unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -60015,7 +60018,7 @@ mod tests {
                         created_at: storage.catalog_sequence.next().unwrap(),
                         name: SqlName::parse(stack_format!(63, "policy_{worker}").as_str())
                             .unwrap(),
-                        table: 0,
+                        table: target as u16,
                         command: PolicyCommandKind::Select,
                         permissive: true,
                         definition: PolicyDefinition {
@@ -60055,7 +60058,7 @@ mod tests {
                 .create_policy(
                     PolicySpec {
                         name: SqlName::parse("policy_full").unwrap(),
-                        table: 0,
+                        table: target,
                         command: PolicyCommandKind::Select,
                         permissive: true,
                         definition: PolicyDefinition {
@@ -60088,7 +60091,7 @@ mod tests {
             catalog.definitions[0] = PolicyDef {
                 created_at: 99,
                 name: SqlName::parse("pending_policy").unwrap(),
-                table: 0,
+                table: target as u16,
                 ddl_state: CatalogDdlState::PendingCreate { txid: 10 },
                 ..PolicyDef::EMPTY
             };

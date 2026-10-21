@@ -217,6 +217,28 @@ mod tests {
     }
 
     #[test]
+    fn core_mutex_concurrent_first_use_initializes_one_native_location() {
+        let mutex = Mutex::new(0);
+        let start = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let run = || forbid_alloc(|| {
+                while !start.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                for _ in 0..32 {
+                    *mutex.lock().unwrap() += 1;
+                }
+            });
+            let first = scope.spawn(run);
+            let second = scope.spawn(run);
+            start.store(true, Ordering::Release);
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        forbid_alloc(|| assert_eq!(*mutex.lock().unwrap(), 64));
+    }
+
+    #[test]
     fn core_mutex_contention_blocks_and_releases_without_allocation() {
         let mutex = Mutex::new(0);
         let locked = mutex.lock().unwrap();

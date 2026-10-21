@@ -38,25 +38,10 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Tables, routines and saved queries publish their definitions and type references
-together, preserving source identities across rename and recovery. Readers now
-retain selected domain, enum and composite definitions in startup memory. Table
-reads and scalar function contracts capture nested types before execution waits;
-nested statements select their own visible definitions and share identical images.
-Type edits capture their source and definition revision together. Creation,
-deletion, commit and rollback carry the source lifetime and transaction owner;
-commit checks this ownership and dependent publication counters before durability.
-Subscription creation saves its stream identity instead of reconstructing it
-from allocation order during replay. Conflicting edits and deletion
-wait for their owner, including a transaction's pending rename.
-Before applying a type rename, storage checks again that the same edit still
-exists, including after a wait. It also updates tables created or changed during
-that wait. Enum label edits and name changes commit through one shared path.
-Core macOS locks keep their native state inline, including locks constructed by
-a running command. Native and memory-safety checks cover first use, movement,
-contention and recovery after a panic within the startup memory boundary.
-PostgreSQL comparisons keep result rows and error codes separate from multiline
-diagnostic wording; the dedicated message checks still compare error text.
+Readers retain selected table, routine and named-type definitions. Type changes
+recheck the selected edit after waits and include newly submitted dependent
+tables before changing their references together. The
+[current behavior guide](docs/implemented-baseline.md) owns the detailed contracts.
 
 When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running

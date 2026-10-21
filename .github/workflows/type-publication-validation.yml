@@ -58,7 +58,7 @@ jobs:
             ${{ runner.temp }}/type-publication-format.patch
       - name: Type publication, retained readers and rollback
         run: >-
-          cargo test --lib --locked -- mem::mutex::tests type_ domain_ enum_ composite_
+          cargo test --lib --locked -- mem::mutex::tests type_ domain_ enum_ composite_ table_name
           --test-threads=1 --nocapture
       - name: Clippy
         run: cargo clippy --lib --bins -- -D warnings

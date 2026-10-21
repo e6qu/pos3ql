@@ -31,8 +31,8 @@ SQL statements still use one CPU worker.
 A mutex protects one shared value from simultaneous changes. Core mutexes
 keep their native state inline, including on macOS using
 [Apple's native lock](https://developer.apple.com/documentation/os/os_unfair_lock).
-First use, replacement, movement, contention and unwinding are checked with
-allocation guards and an interpreter that detects invalid memory access.
+First use, replacement, movement, contention and recovery after a panic are
+checked with allocation guards and an interpreter that detects invalid memory access.
 Read/write locks allow several readers together or one writer.
 
 **User example:** a connection's first query and a newly created materialized
@@ -280,10 +280,13 @@ transaction-private and rolled-back names follow the same visibility rules as
 the definitions. Replay, database cloning and exclusive schema changes update
 the view through scoped writes. The views and pending name fields are inline in
 the table slots and included in startup memory; lookups allocate nothing.
+Creation also checks both committed and pending names through this view. If a
+matching table slot is reused during a wait, the conflict check selects it again.
 
 **User example:** checking an order's customer reference can find the customers
 table while an unrelated table definition is being changed. Looking for a table
-that does not exist also avoids waiting for unrelated definitions. SQL execution
+that does not exist, or creating a table with a different name, also avoids
+waiting for unrelated definitions. SQL execution
 is still serial; this removes a storage-level dependency before workers are added.
 Committed definition changes, table renames, rewrites and maintenance coordination
 remain in [PLAN.md](../PLAN.md).
@@ -484,8 +487,7 @@ Domain, enum and composite commits now use shared storage access. A name move
 rechecks its source and edit revision after waiting, and includes tables created
 or changed while it was acquiring locks. Source installation and dependent
 updates share those locks; exhausted publication counters leave everything intact.
-Saved journal
-references retain their source lifetime even when a rename commits
+Saved journal references retain their source lifetime even when a rename commits
 before an older dependent definition. Checkpoints preserve the same identities
 and resolve type definitions before their dependents. Some schema changes still
 wait for retained snapshots. Removing the remaining restrictions requires shared

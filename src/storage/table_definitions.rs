@@ -107,6 +107,18 @@ impl TableDefinition {
         super::row_ownership::try_read(&self.state, "table definition lock poisoned")
     }
 
+    pub(super) fn name_reservation_candidate(
+        &self,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+    ) -> Option<NameIdentity> {
+        self.names
+            .read()
+            .expect("table name lock poisoned")
+            .reservation_candidate(database, schema, name)
+    }
+
     pub(super) fn try_write_for_batch(
         &self,
     ) -> Result<DefinitionWrite<'_>, super::row_ownership::LockWait<'_>> {

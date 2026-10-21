@@ -35099,17 +35099,31 @@ impl Storage {
 
     /// The txid of another transaction holding uncommitted DDL for `name`.
     fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
-        self.tables.iter().find_map(|table| {
-            let definition =
-                TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
-            if definition.identity().database != current_database() {
+        let database = current_database();
+        loop {
+            let mut changed = false;
+            for table in self.tables.iter() {
+                let Some(expected) = table.definition.name_reservation_candidate(database, schema, name) else {
+                    continue;
+                };
+                // Only a matching name can require this definition owner.
+                let definition =
+                    TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
+                if !expected.matches(definition.identity()) {
+                    changed = true;
+                    continue;
+                }
+                let committed = definition.committed_definition();
+                let matches = (committed.schema.as_str() == schema && committed.name.as_str() == name)
+                    || (definition.schema.as_str() == schema && definition.name.as_str() == name);
+                if matches && let Some(owner) = definition.locked_by_other(txid) {
+                    return Some(owner);
+                }
+            }
+            if !changed {
                 return None;
             }
-            let committed = definition.committed_definition();
-            let matches = (committed.schema.as_str() == schema && committed.name.as_str() == name)
-                || (definition.schema.as_str() == schema && definition.name.as_str() == name);
-            matches.then(|| definition.locked_by_other(txid)).flatten()
-        })
+        }
     }
 
     /// Committed drop (journal replay): rows are retained until checkpoint.

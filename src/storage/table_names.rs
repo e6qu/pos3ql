@@ -81,6 +81,21 @@ impl TableNames {
         (visible_schema.as_str() == schema && visible_name.as_str() == name)
             .then_some(self.identity)
     }
+
+    pub(super) fn reservation_candidate(
+        &self,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+    ) -> Option<NameIdentity> {
+        let matches = |candidate_schema: SqlName, candidate_name: SqlName| {
+            candidate_schema.as_str() == schema && candidate_name.as_str() == name
+        };
+        (self.identity.database == database
+            && (matches(self.schema, self.name)
+                || self.pending.is_some_and(|(_, schema, name)| matches(schema, name))))
+            .then_some(self.identity)
+    }
 }
 
 enum StateWrite<'a> {

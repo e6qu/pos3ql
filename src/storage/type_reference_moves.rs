@@ -754,19 +754,32 @@ mod tests {
                         );
                         std::thread::yield_now();
                     }
-                    let submitted = if submission == 0 {
-                        storage.create_table_in(definition, 11)
-                    } else {
-                        storage
-                            .write_table_def(unrelated, 11, definition, &mapping("id"), false)
-                            .map(|()| unrelated)
-                    };
-                    if submission == 2 {
-                        storage.tables[unrelated].publication().generation = u64::MAX;
-                    }
+                    let (ready, received) = mpsc::sync_channel(1);
+                    let submitting_storage = &storage;
+                    let submitter = scope.spawn(move || {
+                        crate::sql::set_execution_database_oid(database);
+                        let result = crate::mem::guard::forbid_alloc(|| {
+                            let result = if submission == 0 {
+                                submitting_storage.create_table_in(definition, 11)
+                            } else {
+                                submitting_storage
+                                    .write_table_def(unrelated, 11, definition, &mapping("id"), false)
+                                    .map(|()| unrelated)
+                            };
+                            if submission == 2 {
+                                submitting_storage.tables[unrelated].publication().generation = u64::MAX;
+                            }
+                            result
+                        });
+                        ready.send(()).unwrap();
+                        result
+                    });
+                    // Release the artificial pause before joining a blocked submitter.
+                    let progress = received.recv_timeout(Duration::from_secs(5));
                     drop(resume);
                     let result = writer.join().unwrap();
-                    let dependent = submitted.unwrap();
+                    let dependent = submitter.join().unwrap().unwrap();
+                    assert!(progress.is_ok(), "late dependent submission waited on an unrelated definition");
                     if submission == 2 {
                         assert_eq!(
                             result.unwrap_err().sqlstate,

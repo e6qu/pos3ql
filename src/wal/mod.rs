@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 1;
+pub(crate) const RECORD_VERSION: u8 = 2;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -250,7 +250,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 5;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 6;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -2932,7 +2932,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n += 1 + def.inheritance.parents_ref().len() * 2;
             n += match def.type_membership {
                 crate::storage::TableTypeMembership::None => 1,
-                crate::storage::TableTypeMembership::Composite(_) => 3,
+                crate::storage::TableTypeMembership::Composite(reference) => {
+                    2 + reference.storage_key().len()
+                }
             };
             n += 1;
             n += 3;
@@ -4622,8 +4624,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             match def.type_membership {
                 crate::storage::TableTypeMembership::None => ok &= buffer.append(&[0]),
-                crate::storage::TableTypeMembership::Composite(slot) => {
-                    ok &= buffer.append(&[1]) && buffer.append(&slot.to_le_bytes());
+                crate::storage::TableTypeMembership::Composite(reference) => {
+                    ok &=
+                        buffer.append(&[1]) && name_bytes(buffer, reference.storage_key().as_str());
                 }
             }
             ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
@@ -7710,12 +7713,12 @@ fn decode_op_inner<'a>(
             def.type_membership = match membership_tag {
                 0 => crate::storage::TableTypeMembership::None,
                 1 => {
-                    let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                    at += 2;
-                    if usize::from(slot) >= crate::storage::MAX_COMPOSITE_CATALOG_SLOTS {
+                    let reference =
+                        crate::storage::TypeReference::from_storage(take_name(&mut at)?).ok()?;
+                    if reference.composite_slot().is_none() {
                         return None;
                     }
-                    crate::storage::TableTypeMembership::Composite(slot)
+                    crate::storage::TableTypeMembership::Composite(reference)
                 }
                 _ => return None,
             };
@@ -13897,7 +13900,9 @@ mod tests {
         definition.columns[0].not_null = crate::storage::NotNullOrigin::LocalAndInherited;
         definition.inheritance.append(3).unwrap();
         definition.inheritance.append(7).unwrap();
-        definition.type_membership = crate::storage::TableTypeMembership::Composite(11);
+        definition.type_membership = crate::storage::TableTypeMembership::Composite(
+            crate::storage::TypeReference::from_storage("c:11:41").unwrap(),
+        );
         definition.partition = PartitionDef::child(
             4,
             PartitionBound::Range {
@@ -13934,10 +13939,7 @@ mod tests {
         let restored = decode_table_payload(payload.readable())
             .expect("partition table definition did not decode");
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
-        assert_eq!(
-            restored.type_membership,
-            crate::storage::TableTypeMembership::Composite(11)
-        );
+        assert_eq!(restored.type_membership, definition.type_membership);
         let Some(crate::storage::PartitionAttachment {
             parent,
             state,
@@ -15771,7 +15773,7 @@ mod tests {
 
     #[test]
     fn unsupported_record_versions_leave_a_valid_journal_intact() {
-        for version in [0, RECORD_VERSION + 1] {
+        for version in [0, RECORD_VERSION - 1, RECORD_VERSION + 1] {
             let dir = temp_dir(&format!("record-version-{version}"));
             let config = test_config(&dir);
             let mut budget = Budget::new(1 << 20);

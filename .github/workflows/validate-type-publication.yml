@@ -32,4 +32,9 @@ jobs:
           storage::type_reference_moves::tests
           storage::type_references::tests
           sql::tests::captured_type_references
+          sql::tests::typed_table_membership
+          sql::tests::database_template_catalogs
+          sql::tests::alter_table_of_and_not_of
+          wal::tests
+          durable_format
           --test-threads=1

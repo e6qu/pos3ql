@@ -27,6 +27,7 @@ pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) use type_names::NamedTypeSlot;
 pub(crate) use type_references::StorageSetupError;
+pub use type_references::TypeReference;
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
@@ -1838,22 +1839,20 @@ impl TableStorageOptions {
     pub const DEFAULT: Self = Self { fillfactor: None };
 }
 
-/// Durable typed-table membership. A resolved composite slot, rather than a
-/// spelling, keeps type rename, schema move, recovery, and dependency checks
-/// on one identity boundary.
+/// Typed-table membership retains the composite source's complete lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableTypeMembership {
     None,
-    Composite(u16),
+    Composite(TypeReference),
 }
 
 impl TableTypeMembership {
     pub const NONE: Self = Self::None;
 
-    pub const fn composite_slot(self) -> Option<usize> {
+    pub fn composite_slot(self) -> Option<usize> {
         match self {
             Self::None => None,
-            Self::Composite(slot) => Some(slot as usize),
+            Self::Composite(reference) => reference.composite_slot(),
         }
     }
 }
@@ -20468,6 +20467,10 @@ impl Storage {
             }
             drop(type_catalog);
 
+            self.redeclare_template_source_types(source, target)?;
+            self.rebind_domain_base_types_to(txid)?;
+            self.rebind_user_type_declarations_to(txid)?;
+
             for source_slot in 0..self.tables.len() {
                 if self.tables[source_slot].database() != source || !self.tables[source_slot].live()
                 {
@@ -20506,6 +20509,7 @@ impl Storage {
                         column.collation = Collation::Catalog(target);
                     }
                 }
+                self.rebind_template_table_types(&mut definition, source, target, txid)?;
                 let created_at = self.tables[source_slot].created_at();
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics.committed();
@@ -21515,9 +21519,7 @@ impl Storage {
                     state: attachment.state,
                 });
             }
-            self.redeclare_template_type_references(source, target)?;
-            self.rebind_domain_base_types_to(txid)?;
-            self.rebind_user_type_declarations_to(txid)?;
+            self.redeclare_template_contract_types(source, target)?;
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid)?;
@@ -34906,40 +34908,22 @@ impl Storage {
     /// across restart; scalar enums and enum/domain arrays therefore never
     /// trust the slot encoded in the table definition.
     fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
-        if def.columns().iter().all(|column| {
-            !RoutineResult {
-                ctype: column.ctype,
-                user_type: column.user_type,
-            }
-            .requires_type_catalog()
-        }) {
+        if def.type_membership == TableTypeMembership::None
+            && def.columns().iter().all(|column| {
+                !RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                }
+                .requires_type_catalog()
+            })
+        {
             return Ok(());
         }
         let catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        for column in def.columns.iter_mut().take(def.n_columns) {
-            let result = catalog.bind_type_reference(
-                RoutineResult {
-                    ctype: column.ctype,
-                    user_type: column.user_type,
-                },
-                current_database(),
-                txid,
-            )?;
-            if let Some(kind) = result.polymorphic_type() {
-                return Err(sql_err!(
-                    sqlstate::INVALID_TABLE_DEFINITION,
-                    "column \"{}\" has pseudo-type {}",
-                    column.name.as_str(),
-                    kind.name()
-                ));
-            }
-            column.ctype = result.ctype;
-            column.user_type = result.user_type;
-        }
-        Ok(())
+        catalog.bind_table_definition(def, txid)
     }
 
     fn bind_user_type_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {

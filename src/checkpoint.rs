@@ -171,7 +171,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v17";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v18";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -3844,19 +3844,28 @@ impl Checkpointer {
                             CheckpointSetupError::Corrupt("invalid table inheritance")
                         })?;
                     }
-                    let membership: i32 = parse_field(words.next(), "typed-table membership")?;
-                    let type_membership = if membership == -1 {
+                    let membership = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "missing typed-table membership",
+                    ))?;
+                    let type_membership = if membership == "-1" {
                         crate::storage::TableTypeMembership::None
                     } else {
-                        let slot = u16::try_from(membership).map_err(|_| {
-                            CheckpointSetupError::Corrupt("invalid typed-table membership")
-                        })?;
-                        if usize::from(slot) >= storage.composite_count() {
+                        let reference = crate::storage::TypeReference::from_storage(membership)
+                            .map_err(|_| {
+                                CheckpointSetupError::Corrupt("invalid typed-table membership")
+                            })?;
+                        let slot =
+                            reference
+                                .composite_slot()
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "invalid typed-table membership",
+                                ))?;
+                        if slot >= storage.composite_count() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "typed-table membership out of range",
                             ));
                         }
-                        crate::storage::TableTypeMembership::Composite(slot)
+                        crate::storage::TableTypeMembership::Composite(reference)
                     };
                     let fillfactor: u8 = parse_field(words.next(), "table fillfactor")?;
                     if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
@@ -9748,11 +9757,13 @@ impl Checkpointer {
                     )
                 })?;
             }
-            let membership = definition
-                .type_membership
-                .composite_slot()
-                .map_or(-1, |slot| slot as i32);
-            write!(table_line, " {membership}").map_err(|_| {
+            match definition.type_membership {
+                crate::storage::TableTypeMembership::None => write!(table_line, " -1"),
+                crate::storage::TableTypeMembership::Composite(reference) => {
+                    write!(table_line, " {}", reference.storage_key())
+                }
+            }
+            .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table manifest line exceeds fixed capacity"
@@ -19243,7 +19254,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v17\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v18\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19647,7 +19658,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v18\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19673,7 +19684,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v18\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19682,7 +19693,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v17\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v18\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -19844,8 +19855,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v13",
                 "pos3ql-manifest-v14",
                 "pos3ql-manifest-v15",
-                "pos3ql-manifest-v18",
-                "pos3ql-manifest-v17 trailing",
+                "pos3ql-manifest-v19",
+                "pos3ql-manifest-v18 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -19922,11 +19933,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v17\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v18\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v17\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v18\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20140,7 +20151,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v17\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v18\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();
@@ -20153,7 +20164,7 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v13",
             "pos3ql-manifest-v14",
             "pos3ql-manifest-v15",
-            "pos3ql-manifest-v18",
+            "pos3ql-manifest-v19",
         ] {
             let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());

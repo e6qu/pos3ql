@@ -691,7 +691,7 @@ mod tests {
     fn catalog_submission_rejects_retired_operator_destinations() {
         use super::super::{OperatorDefinition, OperatorFamilyDefinition, OperatorSignature};
         let (storage, _, _, _) = fixture(TypeReferenceKind::Domain);
-        let owner = storage.role(storage.current_role_slot(0).unwrap()).oid;
+        let owner = Storage::role_oid(storage.current_role_slot(0).unwrap());
         let definition = OperatorDefinition {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("#@#").unwrap(),

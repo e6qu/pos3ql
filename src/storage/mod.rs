@@ -6,7 +6,7 @@
 //! are fixed at startup.
 
 mod catalog_sources;
-pub(crate) use catalog_sources::{RoleReference, SessionIdentity, SessionRole};
+pub(crate) use catalog_sources::{SessionIdentity, SessionRole};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -53629,6 +53629,60 @@ mod tests {
                 assert_eq!(storage.tables[reused].enforcer_count(), 1);
                 storage.rollback_create(reused);
             }
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_identity_survives_rename_but_rejects_slot_reuse() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let name = SqlName::parse("source_actor").unwrap();
+        let renamed = SqlName::parse("renamed_actor").unwrap();
+        let slot = storage.install_role(name, RoleAttributes::ORDINARY).unwrap();
+        let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = storage.rename_role(slot, renamed, 7).unwrap();
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), name.as_str());
+            assert_eq!(actor.refresh(&storage, 7).name().as_str(), renamed.as_str());
+            storage.rollback_role_change(slot, prior);
+            assert_eq!(actor.refresh(&storage, 7).name().as_str(), name.as_str());
+            storage.rename_role(slot, renamed, 7).unwrap();
+            storage.commit_role_change(slot);
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), renamed.as_str());
+            storage.drop_role_in(slot, 8).unwrap();
+            storage.commit_role_change(slot);
+            assert!(storage.session_role_slot(actor.source(), 0).is_none());
+            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY).unwrap(), slot);
+            assert_eq!(actor.refresh(&storage, 0).require_name().unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+            let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
+            assert_missing_creation_actor(storage.initial_ownership(9));
+            let replacement = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            assert_ne!(actor.source(), replacement.source());
+            assert_eq!(storage.session_role_slot(replacement.source(), 0), Some(slot));
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_identity_rejects_rollback_and_foreign_storage() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut other_budget = test_budget(&config);
+        let other = Storage::new(&config, &mut other_budget).unwrap();
+        let name = SqlName::parse("aborted_actor").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, prior) = storage.create_role(name, RoleAttributes::ORDINARY, 7).unwrap();
+            let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 7).unwrap());
+            assert_eq!(storage.session_role_slot(actor.source(), 7), Some(slot));
+            assert!(storage.session_role_slot(actor.source(), 8).is_none());
+            storage.rollback_role_change(slot, prior);
+            assert_eq!(storage.install_role(name, RoleAttributes::ORDINARY).unwrap(), slot);
+            assert!(storage.session_role_slot(actor.source(), 7).is_none());
+            let local = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            assert!(other.session_role_slot(local.source(), 0).is_none());
+            let bootstrap = SessionIdentity::bound(storage.capture_role_slot(0, 0).unwrap());
+            assert!(other.session_role_slot(bootstrap.source(), 0).is_none());
         });
     }
 

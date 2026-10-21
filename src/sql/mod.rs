@@ -569,7 +569,7 @@ pub struct Engine {
     replication_system_id: u64,
     /// Authenticated sessions per fixed role slot, used to enforce
     /// `CONNECTION LIMIT` without allocating in the server loop.
-    role_connections: FixedVec<u16>,
+    role_connections: FixedVec<RoleConnections>,
     database_connections: FixedVec<u16>,
     active_system_settings: ActiveSystemSettings,
     object_store_credentials_reload_requested: bool,
@@ -770,6 +770,12 @@ pub(crate) struct RoleLogin {
     pub replication: bool,
     pub connection_limit: i32,
     pub password: Option<crate::storage::RoleCredential>,
+}
+
+#[derive(Clone, Copy)]
+struct RoleConnections {
+    source: crate::storage::SessionRole,
+    count: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -3452,13 +3458,20 @@ impl Engine {
         core::mem::take(&mut self.object_store_credentials_reload_requested)
     }
 
-    pub(crate) fn role_can_connect(&self, role: u16) -> bool {
-        self.storage
-            .has_current_database_connect_privilege(role as usize, 0)
+    pub(crate) fn role_can_connect(&self, login: RoleLogin) -> bool {
+        self.storage.session_role_slot(login.identity.source(), 0) == Some(usize::from(login.slot))
+            && self.storage.has_current_database_connect_privilege(usize::from(login.slot), 0)
     }
 
     pub(crate) fn reserve_role_connection(&mut self, login: RoleLogin) -> bool {
-        let count = &mut self.role_connections[login.slot as usize];
+        if self.storage.session_role_slot(login.identity.source(), 0) != Some(usize::from(login.slot)) {
+            return false;
+        }
+        let connections = &mut self.role_connections[usize::from(login.slot)];
+        if connections.source != login.identity.source() {
+            *connections = RoleConnections { source: login.identity.source(), count: 0 };
+        }
+        let count = &mut connections.count;
         if !login.superuser
             && login.connection_limit >= 0
             && usize::from(*count) >= login.connection_limit as usize
@@ -3494,8 +3507,14 @@ impl Engine {
         true
     }
 
-    pub(crate) fn release_role_connection(&mut self, slot: u16) {
-        let count = &mut self.role_connections[slot as usize];
+    pub(crate) fn release_role_connection(&mut self, login: RoleLogin) {
+        let connections = &mut self.role_connections[usize::from(login.slot)];
+        if connections.source != login.identity.source() {
+            // The original role was dropped. Its connections do not belong
+            // to the replacement role now occupying this slot.
+            return;
+        }
+        let count = &mut connections.count;
         *count = count
             .checked_sub(1)
             .expect("an authenticated role connection is released once");
@@ -3561,7 +3580,7 @@ impl Engine {
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes
             + config.max_connections as usize * config.wal_buffer_bytes
-            + config.max_roles * size_of::<u16>()
+            + config.max_roles * size_of::<RoleConnections>()
             + config.max_databases * size_of::<u16>()
             + notify::NotifyState::budget_bytes(
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
@@ -3830,7 +3849,7 @@ impl Engine {
         }
         let mut role_connections = FixedVec::new(budget, "role_connections", config.max_roles)?;
         for _ in 0..config.max_roles {
-            role_connections.push(0).expect("sized to max_roles");
+            role_connections.push(RoleConnections { source: crate::storage::SessionRole::Unauthenticated, count: 0 }).expect("sized to max_roles");
         }
         let mut logical_decoding_truncates = FixedVec::new(
             budget,

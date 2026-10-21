@@ -19201,6 +19201,33 @@ fn session_authorization_is_transactional_and_resets_to_authenticated_role() {
 }
 
 #[test]
+fn catalog_creation_connection_limits_follow_role_lifetimes() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget, "CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
+    assert!(!message_types(&output).contains(&b'E'));
+    let original = engine.role_login("source_login").unwrap();
+    assert!(engine.reserve_role_connection(original));
+    assert!(!engine.reserve_role_connection(original));
+    let output = run_with(&mut engine, &mut budget, "ALTER ROLE source_login RENAME TO renamed_login");
+    assert!(!message_types(&output).contains(&b'E'));
+    let renamed = engine.role_login("renamed_login").unwrap();
+    assert!(!engine.reserve_role_connection(renamed));
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE renamed_login; CREATE ROLE source_login LOGIN CONNECTION LIMIT 1");
+    assert!(!message_types(&output).contains(&b'E'));
+    let replacement = engine.role_login("source_login").unwrap();
+    assert_eq!(original.slot, replacement.slot);
+    assert_ne!(original.identity.source(), replacement.identity.source());
+    assert!(!engine.role_can_connect(original));
+    assert!(!engine.reserve_role_connection(original));
+    assert!(engine.reserve_role_connection(replacement));
+    engine.release_role_connection(original);
+    assert!(!engine.reserve_role_connection(replacement));
+    engine.release_role_connection(replacement);
+    assert!(engine.reserve_role_connection(replacement));
+    engine.release_role_connection(replacement);
+}
+
+#[test]
 fn reset_session_authorization_survives_a_dropped_authenticated_role() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

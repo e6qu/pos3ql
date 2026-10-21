@@ -64,13 +64,6 @@ pub(crate) struct RoleReference {
 
 impl RoleReference {
     pub(crate) fn slot(self) -> u16 { self.identity.slot }
-    pub(crate) fn identity(self) -> RoleIdentity {
-        self.identity
-    }
-
-    pub(crate) fn name(self) -> SqlName {
-        self.name
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +73,7 @@ pub(crate) enum SessionRole {
     Bound(RoleIdentity),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionIdentity {
     source: SessionRole,
     name: crate::util::StackStr<64>,
@@ -114,7 +107,7 @@ impl SessionIdentity {
     }
 
     pub(crate) fn require_name(self) -> Result<crate::util::StackStr<64>, SqlError> {
-        if !self.name.as_str().is_empty() { return Ok(self.name); }
+        if self.source != SessionRole::Unauthenticated && !self.name.as_str().is_empty() { return Ok(self.name); }
         match self.source {
             SessionRole::Bound(identity) => Err(crate::sql_err!(sqlstate::UNDEFINED_OBJECT, "invalid role OID: {}", Storage::role_oid(usize::from(identity.slot)))),
             SessionRole::Bootstrap | SessionRole::Unauthenticated => Err(crate::sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "session role is not authenticated")),
@@ -186,4 +179,23 @@ impl Storage {
         Ok(RoleReference { identity, name: role.name_to(transaction) })
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_creation_role_lifetimes_reject_exhaustion_without_reuse() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(CatalogSources::reserve(&counter, "role").unwrap().get(), u64::MAX);
+            for _ in 0..2 {
+                let error = CatalogSources::reserve(&counter, "role").unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(error.message.as_str(), "role identity space exhausted");
+                assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+            }
+        });
+    }
 }

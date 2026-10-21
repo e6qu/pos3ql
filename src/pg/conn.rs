@@ -367,7 +367,7 @@ pub struct Conn {
     role_scram: Option<ScramServer>,
     login_verifier: LoginVerifier,
     auth_login: Option<crate::sql::RoleLogin>,
-    authenticated_role: Option<u16>,
+    authenticated_role: Option<crate::sql::RoleLogin>,
     auth_database: Option<crate::sql::DatabaseLogin>,
     authenticated_database: Option<u16>,
     database: StackStr<64>,
@@ -634,7 +634,7 @@ impl Conn {
         )
     }
 
-    pub(crate) fn authenticated_role(&self) -> Option<u16> {
+    pub(crate) fn authenticated_role(&self) -> Option<crate::sql::RoleLogin> {
         self.authenticated_role
     }
 
@@ -1431,7 +1431,7 @@ impl Conn {
             let Some(login) = self.auth_login else {
                 return Step::Close;
             };
-            if !engine.role_can_connect(login.slot) {
+            if !engine.role_can_connect(login) {
                 let mut responder = Responder::new(&mut self.send);
                 let _ = responder.error(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -1453,7 +1453,7 @@ impl Conn {
                 return Step::Close;
             }
             if !engine.reserve_database_connection(database, login.superuser) {
-                engine.release_role_connection(login.slot);
+                engine.release_role_connection(login);
                 let mut responder = Responder::new(&mut self.send);
                 let message = if !database.allow_connections {
                     "database is not currently accepting connections"
@@ -1464,7 +1464,7 @@ impl Conn {
                 return Step::Close;
             }
             self.guc.bind_session_user(login.identity);
-            self.authenticated_role = Some(login.slot);
+            self.authenticated_role = Some(login);
             self.authenticated_database = Some(database.slot);
         }
         let minor = self.minor;
@@ -1536,7 +1536,7 @@ impl Conn {
         if let Err(error) = engine.register_backend(
             id,
             database.oid,
-            self.authenticated_role.expect("role was reserved"),
+            self.authenticated_role.expect("role was reserved").slot,
             application_name.as_str(),
             client_addr,
             client_port,

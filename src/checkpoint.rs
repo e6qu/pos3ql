@@ -14287,8 +14287,14 @@ impl Checkpointer {
                 }
                 let mut comparison_error = None;
                 let mut compare_keys = |left: &[u8], right: &[u8]| match storage
-                    .compare_value_binding_keys(0, job.slot, job.binding, job.navigation, left, right)
-                {
+                    .compare_value_binding_keys(
+                        0,
+                        job.slot,
+                        job.binding,
+                        job.navigation,
+                        left,
+                        right,
+                    ) {
                     Ok(ordering) => ordering,
                     Err(error) => {
                         comparison_error = Some(error);

@@ -1,7 +1,7 @@
 //! Readers retain complete type definitions independently of live catalog slots.
 
-use std::sync::Arc;
 use super::spill_generations::StatementDefinitionIndex;
+use std::sync::Arc;
 
 use super::definition_pool::{
     DefinitionImageHandle, DefinitionImagePool, DefinitionImages, DefinitionKey,
@@ -41,7 +41,11 @@ impl TypeDefinitionTarget {
         }
     }
 
-    fn reference(self, storage: &Storage, transaction: u32) -> Result<Option<TypeReference>, SqlError> {
+    fn reference(
+        self,
+        storage: &Storage,
+        transaction: u32,
+    ) -> Result<Option<TypeReference>, SqlError> {
         if let Self::Bound(reference) = self {
             return Ok(Some(reference));
         }
@@ -52,7 +56,9 @@ impl TypeDefinitionTarget {
         let snapshot = catalog
             .type_snapshot(self.slot(), transaction)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database());
-        snapshot.map(|snapshot| TypeReference::from_bound_name(snapshot.name)).transpose()
+        snapshot
+            .map(|snapshot| TypeReference::from_bound_name(snapshot.name))
+            .transpose()
     }
 
     pub(super) fn validate(
@@ -302,7 +308,9 @@ impl TypeDefinitionImages {
         let image = if let Some(index) = selected {
             self.domains.handle_at(index.index(self)?)
         } else {
-            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
+            let Some(reference) = target.reference(storage, transaction)? else {
+                return Ok(None);
+            };
             self.domains
                 .handle(self.domain(storage, reference, transaction)?)
         };
@@ -328,7 +336,9 @@ impl TypeDefinitionImages {
         let image = if let Some(index) = selected {
             self.enums.handle_at(index.index(self)?)
         } else {
-            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
+            let Some(reference) = target.reference(storage, transaction)? else {
+                return Ok(None);
+            };
             self.enums
                 .handle(self.enumeration(storage, reference, transaction)?)
         };
@@ -354,7 +364,9 @@ impl TypeDefinitionImages {
         let image = if let Some(index) = selected {
             self.composites.handle_at(index.index(self)?)
         } else {
-            let Some(reference) = target.reference(storage, transaction)? else { return Ok(None); };
+            let Some(reference) = target.reference(storage, transaction)? else {
+                return Ok(None);
+            };
             self.composites
                 .handle(self.composite(storage, reference, transaction)?)
         };
@@ -529,14 +541,23 @@ impl Storage {
         transaction: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<Option<super::StatementFileLease>, SqlError> {
-        let Some(first) = roots.next() else { return Ok(None); };
+        let Some(first) = roots.next() else {
+            return Ok(None);
+        };
         let owner = self.spill_roots.type_definition_reader()?;
         let scope = owner.enter()?;
         let mark = arena.mark();
         let result = (|| {
-            let capacity = self.domain_count().saturating_add(self.enum_count()).saturating_add(self.composite_count());
-            let queue = arena.alloc_slice_with(capacity, |_| None).map_err(|_| sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED, "type definition graph exceeds the statement arena"))?;
+            let capacity = self
+                .domain_count()
+                .saturating_add(self.enum_count())
+                .saturating_add(self.composite_count());
+            let queue = arena.alloc_slice_with(capacity, |_| None).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "type definition graph exceeds the statement arena"
+                )
+            })?;
             let mut count = 0;
             for name in core::iter::once(first).chain(roots) {
                 self.queue_type_definition(queue, &mut count, name, transaction)?;
@@ -547,8 +568,13 @@ impl Storage {
                 let target = TypeDefinitionTarget::Bound(reference);
                 match reference.slot() {
                     NamedTypeSlot::Domain(_) => {
-                        let source = self.read_domain_definition(target, transaction)?.expect("a bound type read reports absence as an error");
-                        for child in [source.base_domain, source.base_user_type].into_iter().flatten() {
+                        let source = self
+                            .read_domain_definition(target, transaction)?
+                            .expect("a bound type read reports absence as an error");
+                        for child in [source.base_domain, source.base_user_type]
+                            .into_iter()
+                            .flatten()
+                        {
                             self.queue_type_definition(queue, &mut count, child, transaction)?;
                         }
                     }
@@ -556,7 +582,9 @@ impl Storage {
                         self.read_enum_definition(target, transaction)?;
                     }
                     NamedTypeSlot::Composite(_) => {
-                        let source = self.read_composite_definition(target, transaction)?.expect("a bound type read reports absence as an error");
+                        let source = self
+                            .read_composite_definition(target, transaction)?
+                            .expect("a bound type read reports absence as an error");
                         for child in source.active_fields().filter_map(|field| field.user_type) {
                             self.queue_type_definition(queue, &mut count, child, transaction)?;
                         }
@@ -568,7 +596,9 @@ impl Storage {
         })();
         // SAFETY: only the temporary queue borrows this scratch. Definition
         // images and the returned statement owner reside in startup pools.
-        unsafe { arena.rewind_to(mark); }
+        unsafe {
+            arena.rewind_to(mark);
+        }
         result?;
         drop(scope);
         Ok(Some(owner))
@@ -582,49 +612,89 @@ impl Storage {
         transaction: u32,
     ) -> Result<(), SqlError> {
         let reference = TypeReference::from_bound_name(name)?;
-        if let Some(previous) = queue[..*count].iter().flatten().find(|entry| entry.slot() == reference.slot()) {
+        if let Some(previous) = queue[..*count]
+            .iter()
+            .flatten()
+            .find(|entry| entry.slot() == reference.slot())
+        {
             if *previous != reference {
                 // Captured and recovered spellings can name the same source.
                 // Validate either spelling against the selected lifetime.
                 let target = TypeDefinitionTarget::Bound(reference);
                 match reference.slot() {
-                    NamedTypeSlot::Domain(_) => { self.read_domain_definition(target, transaction)?; }
-                    NamedTypeSlot::Enum(_) => { self.read_enum_definition(target, transaction)?; }
-                    NamedTypeSlot::Composite(_) => { self.read_composite_definition(target, transaction)?; }
+                    NamedTypeSlot::Domain(_) => {
+                        self.read_domain_definition(target, transaction)?;
+                    }
+                    NamedTypeSlot::Enum(_) => {
+                        self.read_enum_definition(target, transaction)?;
+                    }
+                    NamedTypeSlot::Composite(_) => {
+                        self.read_composite_definition(target, transaction)?;
+                    }
                 }
             }
             return Ok(());
         }
         let Some(entry) = queue.get_mut(*count) else {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "type definition graph exceeds its configured source slots"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "type definition graph exceeds its configured source slots"
+            ));
         };
         *entry = Some(reference);
         *count += 1;
         Ok(())
     }
 
-    pub(crate) fn read_domain_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<DomainDef>>, SqlError> {
+    pub(crate) fn read_domain_definition(
+        &self,
+        target: TypeDefinitionTarget,
+        transaction: u32,
+    ) -> Result<Option<TypeDefinitionRead<DomainDef>>, SqlError> {
         if !matches!(target.slot(), NamedTypeSlot::Domain(_)) {
-            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not a domain"));
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "selected type source is not a domain"
+            ));
         }
         let reader = self.spill_roots.type_definition_reader()?;
-        reader.type_definition(self, target, transaction, |images, selected| images.domain_image(self, target, transaction, selected))
+        reader.type_definition(self, target, transaction, |images, selected| {
+            images.domain_image(self, target, transaction, selected)
+        })
     }
 
-    pub(crate) fn read_enum_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<EnumDefinition>>, SqlError> {
+    pub(crate) fn read_enum_definition(
+        &self,
+        target: TypeDefinitionTarget,
+        transaction: u32,
+    ) -> Result<Option<TypeDefinitionRead<EnumDefinition>>, SqlError> {
         if !matches!(target.slot(), NamedTypeSlot::Enum(_)) {
-            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not an enum"));
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "selected type source is not an enum"
+            ));
         }
         let reader = self.spill_roots.type_definition_reader()?;
-        reader.type_definition(self, target, transaction, |images, selected| images.enum_image(self, target, transaction, selected))
+        reader.type_definition(self, target, transaction, |images, selected| {
+            images.enum_image(self, target, transaction, selected)
+        })
     }
 
-    pub(crate) fn read_composite_definition(&self, target: TypeDefinitionTarget, transaction: u32) -> Result<Option<TypeDefinitionRead<CompositeDef>>, SqlError> {
+    pub(crate) fn read_composite_definition(
+        &self,
+        target: TypeDefinitionTarget,
+        transaction: u32,
+    ) -> Result<Option<TypeDefinitionRead<CompositeDef>>, SqlError> {
         if !matches!(target.slot(), NamedTypeSlot::Composite(_)) {
-            return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "selected type source is not a composite"));
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "selected type source is not a composite"
+            ));
         }
         let reader = self.spill_roots.type_definition_reader()?;
-        reader.type_definition(self, target, transaction, |images, selected| images.composite_image(self, target, transaction, selected))
+        reader.type_definition(self, target, transaction, |images, selected| {
+            images.composite_image(self, target, transaction, selected)
+        })
     }
 
     pub(crate) fn type_definition_images(&self) -> TypeDefinitionImages {
@@ -901,7 +971,10 @@ mod tests {
         let outer = storage.spill_roots.retain_statement().unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let scope = outer.enter().unwrap();
-            let old = storage.read_composite_definition(target, 0).unwrap().unwrap();
+            let old = storage
+                .read_composite_definition(target, 0)
+                .unwrap()
+                .unwrap();
             assert_eq!(old.fields()[0].name.as_str(), "before");
             drop(scope);
             let mut altered = storage.composite_for(0, 0);
@@ -910,11 +983,23 @@ mod tests {
             storage.commit_composite_alter(0, 7);
 
             let scope = outer.enter().unwrap();
-            assert_eq!(storage.read_composite_definition(target, 0).unwrap().unwrap().fields()[0].name.as_str(), "before");
+            assert_eq!(
+                storage
+                    .read_composite_definition(target, 0)
+                    .unwrap()
+                    .unwrap()
+                    .fields()[0]
+                    .name
+                    .as_str(),
+                "before"
+            );
             for _ in 0..100 {
                 let child = storage.spill_roots.retain_statement().unwrap();
                 let child_scope = child.enter().unwrap();
-                let current = storage.read_composite_definition(target, 0).unwrap().unwrap();
+                let current = storage
+                    .read_composite_definition(target, 0)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(current.fields()[0].name.as_str(), "after");
                 assert_eq!(old.fields()[0].name.as_str(), "before");
                 drop(child_scope);
@@ -960,9 +1045,29 @@ mod tests {
             let bound = TypeDefinitionTarget::Bound(reference(&storage, NamedTypeSlot::Domain(0)));
             let scope = statement.enter().unwrap();
             assert!(storage.read_domain_definition(target, 0).unwrap().is_none());
-            assert_eq!(storage.read_domain_definition(bound, 0).err().unwrap().sqlstate, sqlstate::UNDEFINED_OBJECT);
-            assert_eq!(storage.read_enum_definition(target, 0).err().unwrap().sqlstate, sqlstate::DATATYPE_MISMATCH);
-            assert!(storage.read_domain_definition(bound, 7).unwrap().unwrap().not_null);
+            assert_eq!(
+                storage
+                    .read_domain_definition(bound, 0)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
+            assert_eq!(
+                storage
+                    .read_enum_definition(target, 0)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::DATATYPE_MISMATCH
+            );
+            assert!(
+                storage
+                    .read_domain_definition(bound, 7)
+                    .unwrap()
+                    .unwrap()
+                    .not_null
+            );
             drop(scope);
         });
     }
@@ -973,10 +1078,26 @@ mod tests {
         let mut storage = fixture();
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         let members = [
-            EnumMember { label: SqlName::parse("before").unwrap(), legacy_label: None, sort: 1.0 },
-            EnumMember { label: SqlName::parse("after").unwrap(), legacy_label: None, sort: 2.0 },
+            EnumMember {
+                label: SqlName::parse("before").unwrap(),
+                legacy_label: None,
+                sort: 1.0,
+            },
+            EnumMember {
+                label: SqlName::parse("after").unwrap(),
+                legacy_label: None,
+                sort: 2.0,
+            },
         ];
-        storage.stage_enum_alter(0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(), &members, 7).unwrap();
+        storage
+            .stage_enum_alter(
+                0,
+                SqlName::parse("public").unwrap(),
+                SqlName::parse("reader_source").unwrap(),
+                &members,
+                7,
+            )
+            .unwrap();
         let target = TypeDefinitionTarget::Slot(NamedTypeSlot::Enum(0));
         let statement = storage.spill_roots.retain_statement().unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -984,15 +1105,36 @@ mod tests {
             let selected = storage.read_enum_definition(target, 7).unwrap().unwrap();
             assert!(!selected.label_is_uncommitted("before"));
             assert!(selected.label_is_uncommitted("after"));
-            let value = |member, label| Datum::Enum { slot: 0, member: Some(EnumMemberId::from_ordinal(member).unwrap()), sort: 0.0, label };
-            assert!(crate::sql::eval::compare_datums_collated(&storage, 7, crate::sql::ast::Collation::None, &value(0, "before"), &value(1, "after")).unwrap().is_lt());
+            let value = |member, label| Datum::Enum {
+                slot: 0,
+                member: Some(EnumMemberId::from_ordinal(member).unwrap()),
+                sort: 0.0,
+                label,
+            };
+            assert!(
+                crate::sql::eval::compare_datums_collated(
+                    &storage,
+                    7,
+                    crate::sql::ast::Collation::None,
+                    &value(0, "before"),
+                    &value(1, "after")
+                )
+                .unwrap()
+                .is_lt()
+            );
             drop(scope);
             storage.commit_enum_alter(0, 7);
             assert!(selected.label_is_uncommitted("after"));
             let scope = statement.enter().unwrap();
             let child = storage.spill_roots.retain_statement().unwrap();
             let child_scope = child.enter().unwrap();
-            assert!(!storage.read_enum_definition(target, 0).unwrap().unwrap().label_is_uncommitted("after"));
+            assert!(
+                !storage
+                    .read_enum_definition(target, 0)
+                    .unwrap()
+                    .unwrap()
+                    .label_is_uncommitted("after")
+            );
             drop(child_scope);
             drop(scope);
         });
@@ -1006,7 +1148,10 @@ mod tests {
         let outer = storage.spill_roots.retain_statement().unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let scope = outer.enter().unwrap();
-            let old = storage.read_composite_definition(target, 0).unwrap().unwrap();
+            let old = storage
+                .read_composite_definition(target, 0)
+                .unwrap()
+                .unwrap();
             drop(scope);
             for (name, succeeds) in [("second", true), ("third", false)] {
                 let mut altered = storage.composite_for(0, 0);
@@ -1020,7 +1165,10 @@ mod tests {
                 if succeeds {
                     assert_eq!(read.unwrap().unwrap().fields()[0].name.as_str(), name);
                 } else {
-                    assert_eq!(read.err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                    assert_eq!(
+                        read.err().unwrap().sqlstate,
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED
+                    );
                 }
                 drop(child_scope);
                 drop(scope);
@@ -1028,7 +1176,16 @@ mod tests {
             assert_eq!(old.fields()[0].name.as_str(), "before");
             drop(old);
             drop(outer);
-            assert_eq!(storage.read_composite_definition(target, 0).unwrap().unwrap().fields()[0].name.as_str(), "third");
+            assert_eq!(
+                storage
+                    .read_composite_definition(target, 0)
+                    .unwrap()
+                    .unwrap()
+                    .fields()[0]
+                    .name
+                    .as_str(),
+                "third"
+            );
         });
     }
 
@@ -1037,31 +1194,86 @@ mod tests {
         let mut storage = fixture();
         let schema = SqlName::parse("public").unwrap();
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
-        storage.create_domain(schema, SqlName::parse("wrapped_reader").unwrap(), DomainSpec {
-            base_domain: None,
-            base_user_type: Some(super::super::UserTypeName::declaration(schema, SqlName::parse("reader_source").unwrap())),
-            base: ColType::Enum(0), base_type_mod: -1, not_null: false, default_expr: None,
-            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
-        }, 0).unwrap();
+        storage
+            .create_domain(
+                schema,
+                SqlName::parse("wrapped_reader").unwrap(),
+                DomainSpec {
+                    base_domain: None,
+                    base_user_type: Some(super::super::UserTypeName::declaration(
+                        schema,
+                        SqlName::parse("reader_source").unwrap(),
+                    )),
+                    base: ColType::Enum(0),
+                    base_type_mod: -1,
+                    not_null: false,
+                    default_expr: None,
+                    checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                    n_checks: 0,
+                },
+                0,
+            )
+            .unwrap();
         let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
         fields[0] = CompositeFieldDef {
-            name: SqlName::parse("status").unwrap(), attribute_number: 1, ctype: ColType::Enum(0), dropped: false,
-            user_type: Some(super::super::UserTypeName::declaration(schema, SqlName::parse("wrapped_reader").unwrap())),
+            name: SqlName::parse("status").unwrap(),
+            attribute_number: 1,
+            ctype: ColType::Enum(0),
+            dropped: false,
+            user_type: Some(super::super::UserTypeName::declaration(
+                schema,
+                SqlName::parse("wrapped_reader").unwrap(),
+            )),
             ..CompositeFieldDef::EMPTY
         };
-        storage.create_composite(schema, SqlName::parse("record_reader").unwrap(), CompositeSpec { fields, n_fields: 1 }, 0).unwrap();
-        let bound = storage.type_catalog.lock().unwrap().type_snapshot(NamedTypeSlot::Composite(0), 0).unwrap().unwrap().name;
+        storage
+            .create_composite(
+                schema,
+                SqlName::parse("record_reader").unwrap(),
+                CompositeSpec {
+                    fields,
+                    n_fields: 1,
+                },
+                0,
+            )
+            .unwrap();
+        let bound = storage
+            .type_catalog
+            .lock()
+            .unwrap()
+            .type_snapshot(NamedTypeSlot::Composite(0), 0)
+            .unwrap()
+            .unwrap()
+            .name;
         let enumeration = reference(&storage, NamedTypeSlot::Enum(0));
         let mut budget = Budget::new(1025);
         let tiny = crate::mem::arena::Arena::new(&mut budget, "tiny type graph", 1).unwrap();
         let arena = crate::mem::arena::Arena::new(&mut budget, "type graph", 1024).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(storage.select_type_definition_graph(core::iter::once(bound), 0, &tiny).err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            let graph = storage.select_type_definition_graph(core::iter::once(bound), 0, &arena).unwrap().unwrap();
+            assert_eq!(
+                storage
+                    .select_type_definition_graph(core::iter::once(bound), 0, &tiny)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let graph = storage
+                .select_type_definition_graph(core::iter::once(bound), 0, &arena)
+                .unwrap()
+                .unwrap();
             retire(&mut storage, NamedTypeSlot::Enum(0));
-            assert_eq!(create(&mut storage, NamedTypeSlot::Enum(0)).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                create(&mut storage, NamedTypeSlot::Enum(0))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
             let scope = graph.enter().unwrap();
-            let selected = storage.read_enum_definition(TypeDefinitionTarget::Bound(enumeration), 0).unwrap().unwrap();
+            let selected = storage
+                .read_enum_definition(TypeDefinitionTarget::Bound(enumeration), 0)
+                .unwrap()
+                .unwrap();
             assert_eq!(selected.members().next().unwrap().label.as_str(), "before");
             drop(scope);
             drop(graph);
@@ -1077,17 +1289,40 @@ mod tests {
             let mut storage = fixture();
             create(&mut storage, source).unwrap();
             let reference = reference(&storage, source);
-            let created_at = storage.type_catalog.lock().unwrap().type_snapshot(source, 0).unwrap().unwrap().identity.created_at();
+            let created_at = storage
+                .type_catalog
+                .lock()
+                .unwrap()
+                .type_snapshot(source, 0)
+                .unwrap()
+                .unwrap()
+                .identity
+                .created_at();
             let images = storage.type_definition_images();
             crate::mem::guard::forbid_alloc(|| {
                 retain(&images, &storage, reference).unwrap();
-                storage.restore_type_identity(source, source, created_at).unwrap();
-                assert_eq!(storage.restore_type_identity(source, source, created_at + 1).unwrap_err().sqlstate, sqlstate::OBJECT_IN_USE);
+                storage
+                    .restore_type_identity(source, source, created_at)
+                    .unwrap();
+                assert_eq!(
+                    storage
+                        .restore_type_identity(source, source, created_at + 1)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::OBJECT_IN_USE
+                );
                 retain(&images, &storage, reference).unwrap();
                 drop(images);
-                storage.restore_type_identity(source, source, created_at + 1).unwrap();
+                storage
+                    .restore_type_identity(source, source, created_at + 1)
+                    .unwrap();
                 let replacement = storage.type_definition_images();
-                assert_eq!(retain(&replacement, &storage, reference).unwrap_err().sqlstate, sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(
+                    retain(&replacement, &storage, reference)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::UNDEFINED_OBJECT
+                );
             });
         }
     }
@@ -1103,11 +1338,22 @@ mod tests {
                 let scope = outer.enter().unwrap();
                 match source {
                     NamedTypeSlot::Domain(_) => {
-                        let prior = storage.stage_domain_alter(0, DomainSpec {
-                            base_domain: None, base_user_type: None, base: ColType::Int8,
-                            base_type_mod: -1, not_null: false, default_expr: None,
-                            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
-                        }, 7).unwrap();
+                        let prior = storage
+                            .stage_domain_alter(
+                                0,
+                                DomainSpec {
+                                    base_domain: None,
+                                    base_user_type: None,
+                                    base: ColType::Int8,
+                                    base_type_mod: -1,
+                                    not_null: false,
+                                    default_expr: None,
+                                    checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                                    n_checks: 0,
+                                },
+                                7,
+                            )
+                            .unwrap();
                         let selected = storage.read_domain_definition(target, 7).unwrap().unwrap();
                         storage.rollback_domain_alter(0, prior);
                         assert_eq!(selected.base, ColType::Int8);
@@ -1121,28 +1367,61 @@ mod tests {
                         drop(child_scope);
                     }
                     NamedTypeSlot::Enum(_) => {
-                        let undo = storage.stage_enum_alter(0, SqlName::parse("public").unwrap(), SqlName::parse("reader_source").unwrap(), &[
-                            EnumMember { label: SqlName::parse("pending").unwrap(), legacy_label: None, sort: 1.0 },
-                        ], 7).unwrap();
+                        let undo = storage
+                            .stage_enum_alter(
+                                0,
+                                SqlName::parse("public").unwrap(),
+                                SqlName::parse("reader_source").unwrap(),
+                                &[EnumMember {
+                                    label: SqlName::parse("pending").unwrap(),
+                                    legacy_label: None,
+                                    sort: 1.0,
+                                }],
+                                7,
+                            )
+                            .unwrap();
                         let selected = storage.read_enum_definition(target, 7).unwrap().unwrap();
                         storage.rollback_enum_alter(0, undo);
                         assert_eq!(selected.members().next().unwrap().label.as_str(), "pending");
                         let child = storage.spill_roots.retain_statement().unwrap();
                         let child_scope = child.enter().unwrap();
-                        assert_eq!(storage.read_enum_definition(target, 7).unwrap().unwrap().members().next().unwrap().label.as_str(), "before");
+                        assert_eq!(
+                            storage
+                                .read_enum_definition(target, 7)
+                                .unwrap()
+                                .unwrap()
+                                .members()
+                                .next()
+                                .unwrap()
+                                .label
+                                .as_str(),
+                            "before"
+                        );
                         drop(child_scope);
                     }
                     NamedTypeSlot::Composite(_) => {
                         let mut definition = storage.composite_for(0, 0);
                         definition.fields[0].name = SqlName::parse("pending").unwrap();
                         let prior = storage.stage_composite_alter(0, definition, 7).unwrap();
-                        let selected = storage.read_composite_definition(target, 7).unwrap().unwrap();
+                        let selected = storage
+                            .read_composite_definition(target, 7)
+                            .unwrap()
+                            .unwrap();
                         storage.rollback_composite_alter(0, prior);
                         assert_eq!(selected.fields()[0].name.as_str(), "pending");
                         assert!(selected.pending_definition.is_none());
                         let child = storage.spill_roots.retain_statement().unwrap();
                         let child_scope = child.enter().unwrap();
-                        assert_eq!(storage.read_composite_definition(target, 7).unwrap().unwrap().fields()[0].name.as_str(), "before");
+                        assert_eq!(
+                            storage
+                                .read_composite_definition(target, 7)
+                                .unwrap()
+                                .unwrap()
+                                .fields()[0]
+                                .name
+                                .as_str(),
+                            "before"
+                        );
                         drop(child_scope);
                     }
                 }

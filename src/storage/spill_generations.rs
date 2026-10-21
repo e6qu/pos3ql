@@ -529,7 +529,7 @@ struct PinnedRoot<Root> {
     garbage_retained: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StatementFileIdentity {
     slot: usize,
     serial: NonZeroU64,
@@ -792,12 +792,24 @@ pub(super) struct StatementDefinitionIndex<'lease, Definition> {
 }
 
 impl<'lease, Definition> StatementDefinitionIndex<'lease, Definition> {
-    fn new(_lease: &'lease StatementFileLease, owner: &'lease super::TypeDefinitionImages, index: usize) -> Self {
-        Self { index, owner, _lease: core::marker::PhantomData, _definition: core::marker::PhantomData }
+    fn new(
+        _lease: &'lease StatementFileLease,
+        owner: &'lease super::TypeDefinitionImages,
+        index: usize,
+    ) -> Self {
+        Self {
+            index,
+            owner,
+            _lease: core::marker::PhantomData,
+            _definition: core::marker::PhantomData,
+        }
     }
     pub(super) fn index(self, owner: &super::TypeDefinitionImages) -> Result<usize, SqlError> {
         if !core::ptr::eq(self.owner, owner) {
-            return Err(sql_err!(sqlstate::INTERNAL_ERROR, "selected type image belongs to a different statement root"));
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected type image belongs to a different statement root"
+            ));
         }
         Ok(self.index)
     }
@@ -824,20 +836,47 @@ impl StatementFileLease {
         select: impl for<'images, 'selection> FnOnce(
             &'images super::TypeDefinitionImages,
             Option<StatementDefinitionIndex<'selection, Definition>>,
-        ) -> Result<Option<super::definition_pool::DefinitionImageHandle<super::type_definitions::TypeImageKey, Definition>>, SqlError>,
+        ) -> Result<
+            Option<
+                super::definition_pool::DefinitionImageHandle<
+                    super::type_definitions::TypeImageKey,
+                    Definition,
+                >,
+            >,
+            SqlError,
+        >,
     ) -> Result<Option<super::type_definitions::TypeDefinitionRead<Definition>>, SqlError> {
         if !Arc::ptr_eq(&self.registry, &storage.spill_roots) {
-            return Err(sql_err!(sqlstate::INTERNAL_ERROR,
-                "type definition lease belongs to different storage"));
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "type definition lease belongs to different storage"
+            ));
         }
-        let source_slot = self.registry.type_source_index(target.slot()).ok_or_else(||
-            sql_err!(sqlstate::UNDEFINED_OBJECT, "selected type source is outside its catalog"))?;
+        let source_slot = self
+            .registry
+            .type_source_index(target.slot())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "selected type source is outside its catalog"
+                )
+            })?;
         let image = {
-            let mut state = self.registry.roots.lock().expect("retained file root lock poisoned");
+            let mut state = self
+                .registry
+                .roots
+                .lock()
+                .expect("retained file root lock poisoned");
             let database = super::current_database();
-            if state.statement_mut(self.identity).definition_database.is_some_and(|owner| owner != database) {
-                return Err(sql_err!(sqlstate::DATATYPE_MISMATCH,
-                    "statement type definitions belong to a different database"));
+            if state
+                .statement_mut(self.identity)
+                .definition_database
+                .is_some_and(|owner| owner != database)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "statement type definitions belong to a different database"
+                ));
             }
             let root = self.definition_root(&mut state, storage)?;
             let width = self.registry.type_offsets[3];
@@ -857,13 +896,19 @@ impl StatementFileLease {
             if previous == usize::MAX - 1 {
                 return match target {
                     super::type_definitions::TypeDefinitionTarget::Slot(_) => Ok(None),
-                    super::type_definitions::TypeDefinitionTarget::Bound(_) => Err(sql_err!(sqlstate::UNDEFINED_OBJECT,
-                        "captured type source is absent from the statement")),
+                    super::type_definitions::TypeDefinitionTarget::Bound(_) => Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured type source is absent from the statement"
+                    )),
                 };
             }
-            let images = state.statement_mut(root).type_definitions.as_ref()
+            let images = state
+                .statement_mut(root)
+                .type_definitions
+                .as_ref()
                 .expect("type retention root owns its image chains");
-            let selected = (previous != usize::MAX).then(|| StatementDefinitionIndex::new(self, images, previous));
+            let selected = (previous != usize::MAX)
+                .then(|| StatementDefinitionIndex::new(self, images, previous));
             let Some(image) = select(images, selected)? else {
                 state.type_selections[position].write(usize::MAX - 1);
                 return Ok(None);
@@ -875,24 +920,49 @@ impl StatementFileLease {
         // SAFETY: the original statement reference retains either its own
         // immutable chains or a counted direct parent. Cached indices come
         // only from the same root's correctly typed source image selector.
-        Ok(Some(unsafe { super::type_definitions::TypeDefinitionRead::new(lease, image) }))
+        Ok(Some(unsafe {
+            super::type_definitions::TypeDefinitionRead::new(lease, image)
+        }))
     }
 
-    fn definition_root(&self, state: &mut RetainedRootState, storage: &Storage) -> Result<StatementFileIdentity, SqlError> {
+    fn definition_root(
+        &self,
+        state: &mut RetainedRootState,
+        storage: &Storage,
+    ) -> Result<StatementFileIdentity, SqlError> {
         let owner = state.statement_mut(self.identity);
-        if let Some(root) = owner.definition_parent { return Ok(root); }
-        if owner.type_definitions.is_some() { return Ok(self.identity); }
-        let selected = SELECTED_STATEMENT_FILES.with(Cell::get)
+        if let Some(root) = owner.definition_parent {
+            return Ok(root);
+        }
+        if owner.type_definitions.is_some() {
+            return Ok(self.identity);
+        }
+        let selected = SELECTED_STATEMENT_FILES
+            .with(Cell::get)
             .filter(|selected| selected.registry == Arc::as_ptr(&self.registry) as usize)
             .map_or(self.identity, |selected| selected.identity);
-        let root = state.statement_mut(selected).definition_parent.unwrap_or(selected);
+        let root = state
+            .statement_mut(selected)
+            .definition_parent
+            .unwrap_or(selected);
         let root_owner = state.statement_mut(root);
-        assert!(root_owner.definition_parent.is_none(), "type definition parents are direct roots");
+        assert!(
+            root_owner.definition_parent.is_none(),
+            "type definition parents are direct roots"
+        );
         let references = if root != self.identity {
-            Some(root_owner.references.checked_add(1).ok_or_else(||
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "statement definition references exhausted"))?)
-        } else { None };
-        root_owner.type_definitions.get_or_insert_with(|| storage.type_definition_images());
+            Some(root_owner.references.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement definition references exhausted"
+                )
+            })?)
+        } else {
+            None
+        };
+        root_owner
+            .type_definitions
+            .get_or_insert_with(|| storage.type_definition_images());
         if let Some(references) = references {
             root_owner.references = references;
             state.statement_mut(self.identity).definition_parent = Some(root);
@@ -901,11 +971,22 @@ impl StatementFileLease {
     }
 
     pub(super) fn try_clone(&self) -> Result<Self, SqlError> {
-        let mut state = self.registry.roots.lock().expect("retained file root lock poisoned");
+        let mut state = self
+            .registry
+            .roots
+            .lock()
+            .expect("retained file root lock poisoned");
         let owner = state.statement_mut(self.identity);
-        owner.references = owner.references.checked_add(1).ok_or_else(||
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "statement file references exhausted"))?;
-        Ok(Self { registry: Arc::clone(&self.registry), identity: self.identity })
+        owner.references = owner.references.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement file references exhausted"
+            )
+        })?;
+        Ok(Self {
+            registry: Arc::clone(&self.registry),
+            identity: self.identity,
+        })
     }
 
     pub(crate) fn enter(&self) -> Result<StatementFileScope, SqlError> {
@@ -928,24 +1009,43 @@ impl StatementFileLease {
             .roots
             .lock()
             .expect("retained SST root lock poisoned");
-        let references = state.statement_mut(identity).references.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "statement file references exhausted"
-            )
-        })?;
+        let references = state
+            .statement_mut(identity)
+            .references
+            .checked_add(1)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file references exhausted"
+                )
+            })?;
         let definition_references = if identity != self.identity {
-            Some(state.statement_mut(self.identity).references.checked_add(1).ok_or_else(|| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "statement definition references exhausted")
-            })?)
-        } else { None };
+            Some(
+                state
+                    .statement_mut(self.identity)
+                    .references
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement definition references exhausted"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         state.statement_mut(identity).references = references;
         if let Some(references) = definition_references {
             state.statement_mut(self.identity).references = references;
         }
         drop(state);
         SELECTED_STATEMENT_FILES.with(|selected| {
-            selected.set(Some(SelectedStatementFiles { registry, identity, selection_identity: self.identity }));
+            selected.set(Some(SelectedStatementFiles {
+                registry,
+                identity,
+                selection_identity: self.identity,
+            }));
         });
         STATEMENT_FILE_SCOPE_DEPTH.with(|current| current.set(depth));
         Ok(StatementFileScope {
@@ -953,7 +1053,10 @@ impl StatementFileLease {
                 registry: Arc::clone(&self.registry),
                 identity,
             },
-            _definition_lease: definition_references.map(|_| Self { registry: Arc::clone(&self.registry), identity: self.identity }),
+            _definition_lease: definition_references.map(|_| Self {
+                registry: Arc::clone(&self.registry),
+                identity: self.identity,
+            }),
             previous,
             depth,
             thread: core::marker::PhantomData,
@@ -1010,7 +1113,12 @@ impl SpillRootRegistry {
     fn type_offsets(config: &Config) -> [usize; 4] {
         let enums = config.max_domains;
         let composites = enums.saturating_add(config.max_enums);
-        [0, enums, composites, composites.saturating_add(config.max_composites)]
+        [
+            0,
+            enums,
+            composites,
+            composites.saturating_add(config.max_composites),
+        ]
     }
 
     pub(super) fn capacity(config: &Config) -> usize {
@@ -1027,7 +1135,11 @@ impl SpillRootRegistry {
         let statements = super::statement_snapshot_capacity(config);
         (size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>())
             .saturating_add(statements.saturating_mul(size_of::<Option<StatementFileOwner>>()))
-            .saturating_add(statements.saturating_mul(Self::type_offsets(config)[3]).saturating_mul(size_of::<usize>()))
+            .saturating_add(
+                statements
+                    .saturating_mul(Self::type_offsets(config)[3])
+                    .saturating_mul(size_of::<usize>()),
+            )
             .saturating_add(RetainedRootPool::<RowFileRoot>::budget_bytes(
                 Self::capacity(config),
                 statements,
@@ -1046,7 +1158,11 @@ impl SpillRootRegistry {
         let statement_capacity = super::statement_snapshot_capacity(config);
         let type_offsets = Self::type_offsets(config);
         let type_selection_count = statement_capacity.saturating_mul(type_offsets[3]);
-        budget.draw_array(type_selection_count, size_of::<usize>(), "statement type definition selections")?;
+        budget.draw_array(
+            type_selection_count,
+            size_of::<usize>(),
+            "statement type definition selections",
+        )?;
         let type_selections = Box::<[usize]>::new_uninit_slice(type_selection_count);
         let roots = RetainedRootPool::new(budget, Self::capacity(config), statement_capacity)?;
         let index_roots =
@@ -1123,7 +1239,9 @@ impl SpillRootRegistry {
             if has_roots {
                 let rows = state.roots.release_statement(identity);
                 let indexes = state.index_roots.release_statement(identity);
-                if rows || indexes { self.reclamation_pending.store(true, Ordering::Release); }
+                if rows || indexes {
+                    self.reclamation_pending.store(true, Ordering::Release);
+                }
             }
             state.statements[identity.slot] = None;
         }
@@ -1133,7 +1251,8 @@ impl SpillRootRegistry {
     /// separate statement reference for exactly the callback's duration.
     pub(super) fn type_definition_reader(self: &Arc<Self>) -> Result<StatementFileLease, SqlError> {
         let mut state = self.roots.lock().expect("retained file root lock poisoned");
-        let selected = SELECTED_STATEMENT_FILES.with(Cell::get)
+        let selected = SELECTED_STATEMENT_FILES
+            .with(Cell::get)
             .filter(|selected| selected.registry == Arc::as_ptr(self) as usize)
             .map(|selected| selected.selection_identity);
         let Some(identity) = selected else {

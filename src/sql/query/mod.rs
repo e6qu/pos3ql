@@ -2307,8 +2307,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         let Some(definition) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
-        )? else { return Ok(None); };
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         Ok(definition
             .members()
             .position(|member| member.label.as_str() == label)
@@ -3785,8 +3791,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
-        )? else { return Ok(None); };
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3799,8 +3811,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn enum_label_sort(&self, slot: u16, label: &str) -> Result<Option<f64>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
-        )? else { return Ok(None); };
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -3818,8 +3836,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))), self.txid,
-        )? else { return Ok(None); };
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            self.txid,
+        )?
+        else {
+            return Ok(None);
+        };
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
@@ -6936,7 +6960,8 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     }
                     (false, false) => {
                         let c = crate::sql::eval::compare_datums_collated(
-                            storage, txid,
+                            storage,
+                            txid,
                             order_collations[j],
                             &ka,
                             &kb,
@@ -6959,7 +6984,8 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // with the last on the ORDER BY keys (hidden columns after `width`).
     if statement.with_ties && limit > 0 {
         end = match materialize::extend_ties(
-            storage, txid,
+            storage,
+            txid,
             &order_collations[..statement.order_by.len()],
             out_rows,
             width,
@@ -7087,7 +7113,14 @@ fn select_into_rows_mode<'a>(
             let rows_mut = arena
                 .alloc_slice_with(rows.len(), |i| rows[i])
                 .map_err(|_| arena_full())?;
-            setops::sort_set_rows(storage, txid, arena, rows_mut, statement.order_by, &cols[..n])?;
+            setops::sort_set_rows(
+                storage,
+                txid,
+                arena,
+                rows_mut,
+                statement.order_by,
+                &cols[..n],
+            )?;
             rows = rows_mut;
         }
         let start = (offset as usize).min(rows.len());
@@ -7101,7 +7134,8 @@ fn select_into_rows_mode<'a>(
             let boundary = rows[end - 1];
             while end < rows.len()
                 && setops::set_rows_tie(
-                    storage, txid,
+                    storage,
+                    txid,
                     boundary,
                     rows[end],
                     statement.order_by,

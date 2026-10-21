@@ -4758,7 +4758,8 @@ fn find_conflict<'a>(
                                 return Ok(false);
                             }
                             if !compare_datums_collated(
-                                storage, txid,
+                                storage,
+                                txid,
                                 def.columns()[column].collation,
                                 &values[column],
                                 &other[column],
@@ -4809,7 +4810,8 @@ fn find_conflict<'a>(
                                         arena,
                                     )?;
                                 crate::sql::exec::constraints::key_values_equal(
-                                    storage, txid,
+                                    storage,
+                                    txid,
                                     &collations[..*n_columns],
                                     &keys[..*n_columns],
                                     &other_keys[..*n_columns],
@@ -4890,7 +4892,8 @@ fn find_conflict<'a>(
                                 if candidate_member
                                     && other_member
                                     && crate::sql::exec::constraints::key_values_equal(
-                                        storage, txid,
+                                        storage,
+                                        txid,
                                         &collations[..partial_index.n_columns],
                                         &candidate_keys[..partial_index.n_columns],
                                         &other_keys[..partial_index.n_columns],
@@ -26037,7 +26040,8 @@ fn execute_trigger_block<'a>(
                             !operand.is_null()
                                 && !value.is_null()
                                 && compare_datums_collated(
-                                    context.storage(), context.txn.txid,
+                                    context.storage(),
+                                    context.txn.txid,
                                     collation,
                                     &operand,
                                     &value,
@@ -53713,7 +53717,14 @@ pub(crate) fn resolve_parameter_input_type(
     }
     let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
     if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + storage.domain_count() as i32).contains(&oid) {
-        let domain = storage.read_domain_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(domain_slot)), txid)?.ok_or_else(unknown_type)?;
+        let domain = storage
+            .read_domain_definition(
+                crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(
+                    domain_slot,
+                )),
+                txid,
+            )?
+            .ok_or_else(unknown_type)?;
         if !domain.visible_to(txid) {
             return Err(unknown_type());
         }
@@ -53726,7 +53737,14 @@ pub(crate) fn resolve_parameter_input_type(
     if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
         .contains(&oid)
     {
-        let domain = storage.read_domain_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(domain_array_slot)), txid)?.ok_or_else(unknown_type)?;
+        let domain = storage
+            .read_domain_definition(
+                crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(
+                    domain_array_slot,
+                )),
+                txid,
+            )?
+            .ok_or_else(unknown_type)?;
         if !domain.visible_to(txid) {
             return Err(unknown_type());
         }
@@ -53749,13 +53767,29 @@ pub(crate) fn resolve_parameter_input_type(
     match ctype {
         ColType::Enum(slot) | ColType::Array(crate::sql::types::ArrElem::Enum(slot))
             if slot as usize >= storage.enum_count()
-                || !storage.read_enum_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(slot as usize)), txid)?.ok_or_else(unknown_type)?.visible_to(txid) =>
+                || !storage
+                    .read_enum_definition(
+                        crate::storage::TypeDefinitionTarget::Slot(
+                            crate::storage::NamedTypeSlot::Enum(slot as usize),
+                        ),
+                        txid,
+                    )?
+                    .ok_or_else(unknown_type)?
+                    .visible_to(txid) =>
         {
             Err(unknown_type())
         }
         ColType::Composite(slot) | ColType::Array(crate::sql::types::ArrElem::Composite(slot))
             if slot as usize >= storage.composite_count()
-                || !storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(unknown_type)?.visible_to(txid) =>
+                || !storage
+                    .read_composite_definition(
+                        crate::storage::TypeDefinitionTarget::Slot(
+                            crate::storage::NamedTypeSlot::Composite(slot as usize),
+                        ),
+                        txid,
+                    )?
+                    .ok_or_else(unknown_type)?
+                    .visible_to(txid) =>
         {
             Err(unknown_type())
         }
@@ -54367,7 +54401,20 @@ fn decode_binary_array<'a>(
                     } => Datum::CompositeText {
                         slot: composite_slot,
                         physical_fields: storage
-                            .read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(composite_slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?
+                            .read_composite_definition(
+                                crate::storage::TypeDefinitionTarget::Slot(
+                                    crate::storage::NamedTypeSlot::Composite(
+                                        composite_slot as usize,
+                                    ),
+                                ),
+                                txid,
+                            )?
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "composite type does not exist"
+                                )
+                            })?
                             .n_fields as u16,
                         text: composite_storage_text(value, composite_slot, storage, txid, arena)?,
                     },
@@ -54386,7 +54433,17 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: (storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?.n_fields as u16)
+                    physical_fields: (storage
+                        .read_composite_definition(
+                            crate::storage::TypeDefinitionTarget::Slot(
+                                crate::storage::NamedTypeSlot::Composite(slot as usize),
+                            ),
+                            txid,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                        })?
+                        .n_fields as u16)
                         | COMPOSITE_MEMBER_IDENTITIES,
                     text: arena.alloc_str_display(value).map_err(|_| {
                         sql_err!(
@@ -69223,7 +69280,17 @@ pub(crate) fn coerce<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: (storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?.n_fields as u16)
+            physical_fields: (storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::Slot(
+                        crate::storage::NamedTypeSlot::Composite(slot as usize),
+                    ),
+                    txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                })?
+                .n_fields as u16)
                 | COMPOSITE_MEMBER_IDENTITIES,
             text,
         });
@@ -69536,7 +69603,14 @@ fn composite_storage_text<'a>(
             "composite storage requires a materialized composite"
         ));
     };
-    let definition = storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
+    let definition = storage
+        .read_composite_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
+                slot as usize,
+            )),
+            txid,
+        )?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
     let physical = arena
         .alloc_slice_with(definition.n_fields, |_| RecordField {
             name: "",
@@ -69623,7 +69697,14 @@ fn coerce_composite_value_inner<'a>(
             "cannot cast non-record value to named composite"
         ));
     };
-    let definition = storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
+    let definition = storage
+        .read_composite_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
+                slot as usize,
+            )),
+            txid,
+        )?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
     if !definition.visible_to(txid) {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -69779,7 +69860,14 @@ fn decode_composite_text_inner<'a>(
                 "malformed composite literal"
             )
         })?;
-    let definition = storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
+    let definition = storage
+        .read_composite_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
+                slot as usize,
+            )),
+            txid,
+        )?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
     let mut raw_values = [""; crate::storage::MAX_COMPOSITE_FIELDS];
     let mut quoted_values = [false; crate::storage::MAX_COMPOSITE_FIELDS];
     let mut count = 0usize;
@@ -70005,7 +70093,17 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: (storage.read_composite_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?.n_fields as u16)
+                    physical_fields: (storage
+                        .read_composite_definition(
+                            crate::storage::TypeDefinitionTarget::Slot(
+                                crate::storage::NamedTypeSlot::Composite(slot as usize),
+                            ),
+                            txid,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist")
+                        })?
+                        .n_fields as u16)
                         | COMPOSITE_MEMBER_IDENTITIES,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
@@ -70036,7 +70134,14 @@ pub(crate) fn coerce_enum_value<'a>(
         }
         return Ok(resolved);
     }
-    let def = storage.read_enum_definition(crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(slot as usize)), txid)?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
+    let def = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                slot as usize,
+            )),
+            txid,
+        )?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
     let label = match v {
         Datum::Enum { label, .. } | Datum::Text(label) => label,
         Datum::Bpchar(s) => s.trim_end_matches(' '),
@@ -70083,10 +70188,14 @@ pub(crate) fn ensure_enum_value_is_safe(
     label: &str,
     txid: u32,
 ) -> Result<(), SqlError> {
-    let definition = storage.read_enum_definition(
-        crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(slot as usize)),
-        txid,
-    )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                slot as usize,
+            )),
+            txid,
+        )?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
     if !definition.label_is_uncommitted(label) {
         return Ok(());
     }

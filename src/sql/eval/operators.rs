@@ -548,7 +548,8 @@ fn local_timestamp_for_compare(timestamp: i64) -> Result<i64, SqlError> {
 /// Compares values under a resolved SQL collation.  Text and blank-padded char
 /// share the database comparator; every other type retains its native order.
 pub fn compare_datums_collated(
-    storage: &crate::storage::Storage, txid: u32,
+    storage: &crate::storage::Storage,
+    txid: u32,
     collation: Collation,
     left: &Datum<'_>,
     right: &Datum<'_>,

@@ -32,10 +32,14 @@ pub(crate) fn resolve<'a>(
     if usize::from(slot) >= storage.enum_count() {
         return Err(corrupt());
     }
-    let definition = storage.read_enum_definition(
-        crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))),
-        txid,
-    )?.ok_or_else(corrupt)?;
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            txid,
+        )?
+        .ok_or_else(corrupt)?;
     if !definition.visible_to(txid) {
         return Err(corrupt());
     }
@@ -91,10 +95,14 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     if usize::from(slot) >= storage.enum_count() {
         return Err(corrupt());
     }
-    let definition = storage.read_enum_definition(
-        crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(usize::from(slot))),
-        txid,
-    )?.ok_or_else(corrupt)?;
+    let definition = storage
+        .read_enum_definition(
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
+                usize::from(slot),
+            )),
+            txid,
+        )?
+        .ok_or_else(corrupt)?;
     let member = match member {
         Some(index) => definition.members().nth(index.ordinal() as usize),
         None => definition.members().find(|member| {

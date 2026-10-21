@@ -68,10 +68,10 @@ use snapshot_leases::{
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
 pub(crate) use spill_generations::SpillGenerationId;
-pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 pub(crate) use spill_generations::{
     SpillGenerationReservation, SpillInstallation, SpillPublication,
 };
+pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -9590,7 +9590,8 @@ impl EnumDef {
         if self.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
             return self.definition_for(txid).member_count as usize;
         }
-        self.pending_definition.filter(|pending| pending.txid == txid)
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
             .map_or(self.member_count, |pending| pending.safe_member_count) as usize
     }
 
@@ -39422,7 +39423,11 @@ impl Storage {
                 .expect("type catalog lock poisoned");
             let definition = catalog.enums[slot].definition_for(txid);
             let image = EnumImageRead::capture(&self.enum_member_images, definition.member_image);
-            (definition, image, catalog.enums[slot].safe_member_count_for(txid))
+            (
+                definition,
+                image,
+                catalog.enums[slot].safe_member_count_for(txid),
+            )
         };
         EnumDefinition {
             image,

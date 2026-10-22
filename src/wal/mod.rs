@@ -15736,6 +15736,96 @@ mod tests {
     }
 
     #[test]
+    fn metadata_wal_positions_and_restart_flags_reject_corruption() {
+        let identity = crate::storage::CatalogPosition::new(7, 42).unwrap();
+        let backing = crate::storage::CatalogPosition::new(8, 43).unwrap();
+        let operations = [
+            WalOp::CreateMatview {
+                identity,
+                backing,
+                schema: "public",
+                name: "report",
+                sql: "SELECT 1 AS value",
+                path: "public",
+                dependencies: WalStoredQueryDependencies::Captured(
+                    crate::storage::StoredQueryDependencies::EMPTY.view(),
+                ),
+                populated: true,
+            },
+            WalOp::DropMatview {
+                identity,
+                schema: "public",
+                name: "report",
+            },
+            WalOp::SetMatviewPopulated {
+                identity,
+                schema: "public",
+                name: "report",
+                populated: false,
+            },
+            WalOp::RenameSequence {
+                identity,
+                schema: "public",
+                name: "counter",
+                new_name: "renamed",
+            },
+            WalOp::SetSequenceSchema {
+                identity,
+                schema: "public",
+                name: "counter",
+                new_schema: "other",
+            },
+            WalOp::DropTable {
+                identity,
+                schema: "public",
+                name: "report",
+            },
+            WalOp::CreateSequence {
+                identity,
+                schema: "public",
+                name: "counter",
+                data_type: crate::storage::SeqType::Bigint,
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                start_value: 10,
+                cache: 1,
+                cycle: false,
+                restart: Some(50),
+                owner: None,
+                generator_for: None,
+                persistence: crate::storage::RelationPersistence::Permanent,
+            },
+        ];
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "metadata WAL", 4096).unwrap();
+        let mut encoded = FixedBuf::new(&mut budget, "metadata WAL reencoded", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for operation in &operations {
+                payload.clear();
+                assert!(append_payload(&mut payload, operation));
+                assert_eq!(payload.len(), encoded_payload_len(operation));
+                let decoded = decode_op(op_kind(operation), payload.readable()).unwrap();
+                encoded.clear();
+                assert!(append_payload(&mut encoded, &decoded));
+                assert_eq!(encoded.readable(), payload.readable());
+                for end in 0..payload.len() {
+                    assert!(decode_op(op_kind(operation), &payload.readable()[..end]).is_none());
+                }
+                payload.filled_mut()[2..10].fill(0);
+                assert!(decode_op(op_kind(operation), payload.readable()).is_none());
+            }
+            let operation = &operations[6];
+            payload.clear();
+            assert!(append_payload(&mut payload, operation));
+            let restart_flag = 10 + 1 + "counter".len() + 1 + "public".len() + 2 + 5 * 8 + 1;
+            assert_eq!(payload.readable()[restart_flag], 1);
+            payload.filled_mut()[restart_flag] = 2;
+            assert!(decode_op(op_kind(operation), payload.readable()).is_none());
+        });
+    }
+
+    #[test]
     fn routine_payload_rejects_corrupt_dependency_suffix() {
         let definition = crate::storage::RoutineDef {
             created_at: 1,

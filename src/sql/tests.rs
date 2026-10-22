@@ -78092,7 +78092,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v15",
         "pos3ql-manifest-v18",
         "pos3ql-manifest-v19",
-        "pos3ql-manifest-v21",
+        "pos3ql-manifest-v20",
+        "pos3ql-manifest-v22",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }

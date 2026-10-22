@@ -108,6 +108,7 @@ pub(super) fn allocate(
             database: current_database(),
             ownership,
             created_at,
+            ddl_version: created_at,
             existence: transaction.map_or(CatalogDdlState::Present, |txid| {
                 CatalogDdlState::PendingCreate { txid }
             }),

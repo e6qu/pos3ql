@@ -541,7 +541,7 @@ mod tests {
                 .write_table_def(next, 9, definition, &mapping("id"), false)
                 .unwrap();
             storage.rollback_table_def(next, 9);
-            storage.drop_table_in(next, 9);
+            let dropped = storage.drop_table_in(next, 9).unwrap();
             assert_eq!(
                 storage.tables[next].existence(),
                 CatalogDdlState::PendingCreateDrop { txid: 9 }
@@ -553,7 +553,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            storage.rollback_drop(next);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             storage
                 .write_table_def(next, 9, definition, &mapping("id"), false)
                 .unwrap();

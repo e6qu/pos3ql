@@ -5424,6 +5424,7 @@ impl Engine {
             ));
         }
         let query_validation = txn.ddl().iter().try_for_each(|undo| match undo {
+            DdlUndo::Dropped(undo) => self.storage.validate_table_drop(*undo, txn.txid),
             DdlUndo::MatviewChanged(change) => {
                 self.storage.validate_matview_change(*change, txn.txid)
             }
@@ -6740,13 +6741,14 @@ impl Engine {
                         txn.txid,
                     );
                 }
-                DdlUndo::Dropped(slot) => {
-                    let name = self.storage.table(*slot as usize).definition().name;
-                    let schema = self.storage.table(*slot as usize).definition().schema;
-                    self.storage.commit_drop(*slot as usize);
-                    // The table's indexes were pending-dropped with it.
-                    self.storage
-                        .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+                DdlUndo::Dropped(undo) => {
+                    if let Some((schema, name)) = self
+                        .storage
+                        .finish_table_drop(*undo, crate::storage::CatalogDdlDecision::Commit)
+                    {
+                        self.storage
+                            .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+                    }
                 }
                 DdlUndo::TableAltered(_) => {}
                 DdlUndo::ViewChanged(publication) => self.storage.finish_view_publication(
@@ -19668,11 +19670,12 @@ fn decode_wal_routine_signature(
 fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
     match undo {
         DdlUndo::Created(slot) => storage.rollback_create(slot as usize),
-        DdlUndo::Dropped(slot) => {
-            storage.rollback_drop(slot as usize);
-            let name = storage.table(slot as usize).definition().name;
-            let schema = storage.table(slot as usize).definition().schema;
-            storage.rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+        DdlUndo::Dropped(undo) => {
+            if let Some((schema, name)) =
+                storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback)
+            {
+                storage.rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+            }
         }
         DdlUndo::TableAltered(slot) => {
             storage.rollback_table_def(slot as usize, txid);

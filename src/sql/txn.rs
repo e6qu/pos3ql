@@ -351,7 +351,7 @@ pub(crate) enum DdlUndo {
     Created(u32),
     /// DROP TABLE at this slot (rows retained until commit) — undo by
     /// reviving it (and its indexes).
-    Dropped(u32),
+    Dropped(crate::storage::CatalogDdlUndo),
     /// ALTER TABLE appended one pending table-definition version. Row-image
     /// undo is carried by the ordinary touched-row log.
     TableAltered(u32),
@@ -2384,6 +2384,19 @@ impl TxnState {
         while self.subscription_advances.len() > mark {
             self.subscription_advances.pop();
         }
+    }
+
+    pub(crate) fn record_table_drop(
+        &mut self,
+        storage: &crate::storage::Storage,
+        undo: crate::storage::CatalogDdlUndo,
+    ) -> Result<(), SqlError> {
+        storage.validate_table_drop(undo, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::Dropped(undo)) {
+            storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_matview_change(

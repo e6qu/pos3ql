@@ -41,7 +41,7 @@ mod tests {
         config.max_materialized_views = 1;
         config.max_tables = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
         let table = storage
             .create_table(make_def(
                 "original_materialized",

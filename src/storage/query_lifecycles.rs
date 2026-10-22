@@ -334,7 +334,8 @@ impl Storage {
                     Some(rule.target.comment_subid()),
                 )
             }
-            CatalogObjectSlot::MaterializedView(_)
+            CatalogObjectSlot::Table(_)
+            | CatalogObjectSlot::MaterializedView(_)
             | CatalogObjectSlot::Sequence(_)
             | CatalogObjectSlot::Routine(_) => {
                 return Err(sql_err!(

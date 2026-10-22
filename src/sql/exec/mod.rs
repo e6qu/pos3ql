@@ -6075,10 +6075,13 @@ fn drop_table_kind(
                 if let Err(e) = wal_result {
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
+                let dropped = match storage.drop_table_in(index, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(e) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(e);
                 }
-                storage.drop_table_in(index, txn.txid);
                 // A table's indexes are dropped with it (no separate journal
                 // record; DropTable replay re-applies this).
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
@@ -13380,10 +13383,13 @@ pub(crate) fn drop_schema(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::Dropped(*table as u32)) {
+                let dropped = match storage.drop_table_in(*table, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(error);
                 }
-                storage.drop_table_in(*table, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
@@ -13661,10 +13667,13 @@ pub(crate) fn drop_schema(
                 ) {
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(*t as u32)) {
+                let dropped = match storage.drop_table_in(*t, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(e) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(e);
                 }
-                storage.drop_table_in(*t, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
             }
         }
@@ -39754,10 +39763,13 @@ pub fn drop_materialized_view(
         ) {
             return sql_fail(e);
         }
-        if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(idx as u32)) {
+        let dropped = match storage.drop_table_in(idx, txn.txid) {
+            Ok(undo) => undo,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(e) = txn.record_table_drop(storage, dropped) {
             return sql_fail(e);
         }
-        storage.drop_table_in(idx, txn.txid);
         storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
         // Drop the matview catalog entry.
         let lsn = storage.bump_lsn();
@@ -44993,8 +45005,8 @@ fn drop_matview_slot(
             name: name.as_str(),
         },
     )?;
-    txn.record_ddl(super::txn::DdlUndo::Dropped(table as u32))?;
-    storage.drop_table_in(table, txn.txid);
+    let dropped = storage.drop_table_in(table, txn.txid)?;
+    txn.record_table_drop(storage, dropped)?;
     storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
     let lsn = storage.bump_lsn();
     wal.stage_reserved(

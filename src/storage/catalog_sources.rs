@@ -463,6 +463,7 @@ mod tests {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CatalogObjectSlot {
+    Table(usize),
     View(usize),
     Rule(usize),
     MaterializedView(usize),
@@ -473,7 +474,8 @@ pub(super) enum CatalogObjectSlot {
 impl CatalogObjectSlot {
     fn index(self) -> usize {
         match self {
-            Self::View(slot)
+            Self::Table(slot)
+            | Self::View(slot)
             | Self::Rule(slot)
             | Self::MaterializedView(slot)
             | Self::Sequence(slot)

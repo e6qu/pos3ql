@@ -719,7 +719,7 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
     use DdlUndo::*;
     Some(match undo {
         Created(slot) => (ObjectRef::Table(slot as usize), Mutation::Create),
-        Dropped(slot) => (ObjectRef::Table(slot as usize), Mutation::Drop),
+        Dropped(undo) => (ObjectRef::Table(undo.slot()), Mutation::Drop),
         TableAltered(slot) => (ObjectRef::Table(slot as usize), Mutation::Alter),
         ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
             (ObjectRef::View(undo.slot()), Mutation::Create)

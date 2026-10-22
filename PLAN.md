@@ -33,7 +33,7 @@ remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
 The next combined batch covers sequence edits and identity restarts, routine
-body and name publication, and materialized-view creation and deletion. Check stale undo and backing-relation reuse,
+body and name publication, and materialized-view creation and deletion. Check stale undo, backing-relation reuse and table comment retirement,
 comment and permission cleanup, savepoints, exhaustion, and recovery together.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The

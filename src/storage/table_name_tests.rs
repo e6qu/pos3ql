@@ -151,7 +151,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
             storage.find_table("public", "private_lookup"),
             Some(created)
         );
-        storage.drop_table_in(created, 8);
+        let dropped = storage.drop_table_in(created, 8).unwrap();
         assert_eq!(storage.find_visible("public", "private_lookup", 8), None);
         assert_eq!(
             storage.find_visible("public", "private_lookup", 7),
@@ -161,7 +161,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
             storage.find_table("public", "private_lookup"),
             Some(created)
         );
-        storage.rollback_drop(created);
+        storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
         storage.commit_drop(created);
         assert_eq!(storage.find_table("public", "private_lookup"), None);
         let replacement = storage

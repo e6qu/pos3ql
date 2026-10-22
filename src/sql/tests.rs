@@ -8,6 +8,118 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_relation_replacements_preserve_comments_for_the_selected_object() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-relation-replacements-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/08_metadata_relation_replacements.sql"
+            ),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "fresh",
+                "replacement",
+                "fresh",
+                "2",
+                "replacement",
+                "type comment"
+            ]
+        );
+    }
+}
+
+#[test]
+fn metadata_materialized_undo_exhaustion_restores_backing_and_catalog() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-materialized-undo-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 2;
+        config.max_materialized_views = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SEQUENCE reserved_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE MATERIALIZED VIEW retained_materialized AS SELECT 7 AS value",
+            true,
+        );
+        for statement in [
+            "CREATE MATERIALIZED VIEW overflow_materialized AS SELECT 9 AS value",
+            "DROP MATERIALIZED VIEW retained_materialized",
+        ] {
+            session.success(
+                &mut engine,
+                "BEGIN; COMMENT ON SEQUENCE reserved_sequence IS 'reserved'",
+                true,
+            );
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let transaction = session.transaction.txid;
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "retained_materialized", transaction)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "overflow_materialized", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            session.success(&mut engine, "ROLLBACK", true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT value FROM retained_materialized",
+                    true
+                )),
+                ["7"]
+            );
+        }
+        session.success(
+            &mut engine,
+            "CREATE MATERIALIZED VIEW overflow_materialized AS SELECT 9 AS value",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "DROP MATERIALIZED VIEW retained_materialized",
+            true,
+        );
+    }
+}
+
+#[test]
 fn metadata_undo_exhaustion_releases_sequence_and_routine_changes() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -24,10 +136,17 @@ fn metadata_undo_exhaustion_releases_sequence_and_routine_changes() {
         session.success(&mut engine, "CREATE SEQUENCE retained_sequence", true);
         session.success(
             &mut engine,
+            "CREATE TABLE retained_table(value integer)",
+            true,
+        );
+        session.success(
+            &mut engine,
             "CREATE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             true,
         );
         for statement in [
+            "CREATE TABLE overflow_table(value integer)",
+            "DROP TABLE retained_table",
             "CREATE SEQUENCE overflow_sequence",
             "DROP SEQUENCE retained_sequence",
             "ALTER SEQUENCE retained_sequence RENAME TO overflow_sequence",
@@ -49,6 +168,20 @@ fn metadata_undo_exhaustion_releases_sequence_and_routine_changes() {
                 String::from_utf8_lossy(&output)
             );
             let transaction = session.transaction.txid;
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "retained_table", transaction)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_table", transaction)
+                    .is_none(),
+                "{statement}"
+            );
             assert!(
                 engine
                     .storage

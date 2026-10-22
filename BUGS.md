@@ -13,7 +13,7 @@ rollback, connection identity, permission checks, ownership across databases,
 recovery and slot reuse must preserve valid data and selected source identities.
 An unfinished metadata reference must prevent account deletion until its
 transaction commits or rolls back, including after prepared recovery.
-View, materialized-view, rule, sequence and routine undo must not change a replacement
+View, materialized-view, rule, sequence, routine and table-drop undo must not change a replacement
 object or its comments. Materialized-view changes retain the backing relation's
 lifetime as well. A failed undo-log attachment must release the staged
 change; identity restarts use the same ownership checks as sequence edits.

@@ -11,6 +11,7 @@ mod query_lifecycles;
 mod routine_lifecycles;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
+mod table_lifecycles;
 pub(crate) use query_lifecycles::{
     MatviewPopulationUndo, RuleAlterUndo, RulePublication, ViewCatalogIdentity, ViewPublication,
 };
@@ -35271,31 +35272,78 @@ impl Storage {
             let mut state = self.tables[index].definition.write();
             if state.identity.database != selected.database
                 || state.identity.created_at != selected.created_at
+                || state.identity.ddl_version != selected.ddl_version
+                || state.identity.existence != selected.existence
                 || state.identity.existence == CatalogDdlState::Absent
             {
                 return None;
             }
-            let types =
-                match row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned") {
-                    Ok(types) => types,
-                    Err(wait) => {
-                        drop(state);
-                        drop(lifecycle);
-                        #[cfg(test)]
-                        self.type_publication
-                            .waits
-                            .fetch_add(1, core::sync::atomic::Ordering::Release);
-                        wait.wait();
-                        continue;
-                    }
-                };
-            state.identity.existence = CatalogDdlState::Absent;
+            let attempt: Result<_, row_ownership::LockWait<'_>> = (|| {
+                let types =
+                    row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned")?;
+                let comments =
+                    row_ownership::try_mutex(&self.comments, "comment catalog lock poisoned")?;
+                let permissions =
+                    row_ownership::try_mutex(&self.acl_catalog, "ACL catalog lock poisoned")?;
+                let extensions = row_ownership::try_mutex(
+                    &self.extension_catalog,
+                    "extension catalog lock poisoned",
+                )?;
+                Ok((types, comments, permissions, extensions))
+            })();
+            let (types, mut comments, mut permissions, mut extensions) = match attempt {
+                Ok(owners) => owners,
+                Err(wait) => {
+                    drop(state);
+                    drop(lifecycle);
+                    #[cfg(test)]
+                    self.type_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    continue;
+                }
+            };
+            let source = self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(index),
+                selected.database,
+                selected.created_at,
+            );
+            let transaction = selected.existence.pending_drop_txid();
             let (schema, name) = (state.committed.schema, state.committed.name);
+            for comment in comments.entries.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.database == Some(selected.database)
+                    && comment.pending_drop.map_or_else(
+                        || {
+                            transaction.is_none()
+                                && comment.pending.is_none()
+                                && comment.pending_identity.is_none()
+                                && (matches!(
+                                    comment.class,
+                                    CommentClass::Relation | CommentClass::Type
+                                ) && comment.schema == schema
+                                    && comment.name == name
+                                    || comment.class == CommentClass::Constraint
+                                        && comment.subid == index as u32)
+                        },
+                        |pending| Some(pending.txid) == transaction && pending.source == source,
+                    )
+            }) {
+                *comment = CommentEntry::empty();
+            }
+            let object = AccessObject {
+                class: AccessClass::Table,
+                slot: index as u16,
+            };
+            Self::clear_object_acl_entries_locked(&mut permissions, object);
+            Self::clear_extension_dependencies_for_object_locked(&mut extensions, object);
+            state.identity.existence = CatalogDdlState::Absent;
             drop(state);
-            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-            self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
             drop(types);
+            drop(comments);
+            drop(permissions);
+            drop(extensions);
             return Some(lifecycle);
         }
     }
@@ -35313,24 +35361,6 @@ impl Storage {
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
-    }
-
-    /// Other transactions keep the committed image until the drop commits.
-    pub fn drop_table_in(&self, index: usize, txid: u32) {
-        let _lifecycle = self.tables[index].lifecycle();
-        {
-            let mut state = self.tables[index].definition.write();
-            state.identity.existence = state.identity.existence.drop_by(txid);
-        }
-        for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
-            rule.database == current_database()
-                && rule.visible_to(txid)
-                && rule.definition_for(txid).target == RuleTarget::Table(index as u16)
-        }) {
-            rule.ddl_state = rule.ddl_state.drop_by(txid);
-            rule.pending_parent_drop_txid = Some(txid);
-        }
-        self.tables[index].mark_dirty();
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
@@ -35352,6 +35382,10 @@ impl Storage {
         let Some(_lifecycle) = self.retire_table_names(index, selected) else {
             return;
         };
+        self.retire_table_data(index);
+    }
+
+    fn retire_table_data(&self, index: usize) {
         self.release_enforcers(index);
         self.reset_relation_statistics(index);
         self.reset_implicit_index_statistics(index);
@@ -35386,23 +35420,6 @@ impl Storage {
         self.clear_pending_table_statistics(index);
         self.clear_table_rows(index);
         self.tables[index].statistics.clear_wal();
-    }
-
-    /// Restores the prior existence and attached rules after an uncommitted DROP.
-    pub fn rollback_drop(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let txid = {
-            let mut state = self.tables[index].definition.write();
-            let txid = state
-                .identity
-                .existence
-                .pending_txid()
-                .expect("table DROP owns catalog state");
-            state.identity.existence = state.identity.existence.rollback_drop(txid);
-            txid
-        };
-        self.view_rule_catalog()
-            .rollback_target_rules(RuleTarget::Table(index as u16), txid);
     }
 
     /// Whether any live view exists (lets the executor skip view expansion).
@@ -52128,7 +52145,7 @@ mod tests {
             );
             assert!(storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
-            storage.drop_table_in(slot, 7);
+            let dropped = storage.drop_table_in(slot, 7).unwrap();
             assert!(!storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
             assert!(!storage.table(slot).is_free());
@@ -52136,18 +52153,18 @@ mod tests {
             let error = storage.create_table_in(replacement, 8).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(error.message.as_str(), "too many tables (limit 1)");
-            storage.rollback_drop(slot);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             assert_eq!(storage.table(slot).identity().existence, original.existence);
             assert!(storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
             storage.commit_create(slot);
             assert!(storage.table(slot).visible_to(8));
-            storage.drop_table_in(slot, 9);
+            let dropped = storage.drop_table_in(slot, 9).unwrap();
             assert!(!storage.table(slot).visible_to(9));
             assert!(storage.table(slot).visible_to(8));
-            storage.rollback_drop(slot);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             assert!(storage.table(slot).visible_to(9));
-            storage.drop_table_in(slot, 9);
+            storage.drop_table_in(slot, 9).unwrap();
             storage.commit_drop(slot);
             let reused = storage.create_table_in(replacement, 8).unwrap();
             assert_eq!(reused, slot);
@@ -59959,9 +59976,10 @@ mod tests {
             }
             scope.spawn(move || {
                 crate::mem::guard::forbid_alloc(|| {
-                    storage.drop_table_in(second, 7);
-                    storage.rollback_drop(second);
-                    storage.drop_table_in(second, 8);
+                    let dropped = storage.drop_table_in(second, 7).unwrap();
+                    storage
+                        .finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
+                    storage.drop_table_in(second, 8).unwrap();
                     storage.commit_drop(second);
                     storage.commit_create(third);
                     storage.rollback_create(third);
@@ -60062,8 +60080,8 @@ mod tests {
                 assert!(done || cursor > prior_cursor || after < before);
                 assert!(storage.row_versions.test_write().is_ok());
                 assert!(storage.tables[first].rows.test_write().is_ok());
-                storage.drop_table_in(other, 8);
-                storage.rollback_drop(other);
+                let dropped = storage.drop_table_in(other, 8).unwrap();
+                storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
                 let rows = storage.tables[first].rows.read();
                 for (key, row) in rows.iter() {
                     assert_eq!(

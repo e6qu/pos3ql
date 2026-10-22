@@ -5083,6 +5083,29 @@ pub(crate) fn select_hash_join_plan<'a>(
     }))
 }
 
+pub(super) fn validate_materialized_view_reads(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
+    predicate: Option<&Expr<'_>>,
+    arena: &Arena,
+    transaction: u32,
+) -> Result<(), SqlError> {
+    // A constant-false WHERE removes the scan at planning time. LIMIT 0
+    // still initializes the scan and therefore must perform this check.
+    if predicate.is_some_and(|predicate| {
+        matches!(predicate, Expr::Null)
+            || super::plan::plan_time_bool(predicate, arena) == Some(false)
+    }) {
+        return Ok(());
+    }
+    for table in 0..scope.n {
+        if scope.slots[table] != usize::MAX && scope.derived[table].is_none() {
+            storage.require_populated_materialized_view(scope.slots[table], transaction)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -5226,9 +5249,9 @@ fn scan_source_mode<'a>(
                 false,
             )?;
             storage.record_serializable_read(txid, scope.slots[table]);
-            storage.require_populated_materialized_view(scope.slots[table], txid)?;
         }
     }
+    validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;

@@ -358,15 +358,12 @@ pub(crate) enum DdlUndo {
     ViewChanged(crate::storage::ViewPublication),
     ViewDropped(crate::storage::QueryDdlUndo),
     MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
-    RuleCreated {
-        slot: u32,
+    RuleChanged {
+        publication: crate::storage::RulePublication,
         prior_table_rule_txid: Option<u32>,
     },
-    RuleAltered {
-        slot: u32,
-        prior: Option<crate::storage::PendingRuleDefinition>,
-    },
-    RuleDropped(u32),
+    RuleAltered(crate::storage::RuleAlterUndo),
+    RuleDropped(crate::storage::QueryDdlUndo),
     /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
     RoutineCreated(u32),
     RoutineDropped(u32),

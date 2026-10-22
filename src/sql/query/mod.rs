@@ -6171,6 +6171,15 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // PostgreSQL does — so a per-row error in an unreturned row does not
     // surface (constant errors already surfaced via the plan-time check).
     if limit == 0 {
+        if let Err(error) = scan::validate_materialized_view_reads(
+            storage,
+            &scope,
+            statement.where_clause,
+            arena,
+            txid,
+        ) {
+            return sql_fail(error);
+        }
         responder.command_complete("SELECT 0")?;
         return sql_ok();
     }

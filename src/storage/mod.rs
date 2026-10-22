@@ -8,7 +8,8 @@
 mod catalog_sources;
 mod query_lifecycles;
 pub(crate) use query_lifecycles::{
-    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, ViewPublication,
+    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, RuleAlterUndo, RulePublication,
+    ViewPublication,
 };
 mod role_dependencies;
 pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
@@ -4966,7 +4967,7 @@ impl ViewOptions {
 }
 
 #[derive(Clone)]
-pub struct ViewDefinition {
+pub(crate) struct ViewDefinition {
     pub persistence: RelationPersistence,
     pub columns: ViewColumns,
     pub query: StoredQueryDefinition,
@@ -5284,12 +5285,6 @@ pub(crate) struct PendingViewDefinition {
     name: SqlName,
     options: ViewOptions,
     columns: ViewColumns,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PendingObjectSchema {
-    pub txid: u32,
-    pub schema: SqlName,
 }
 
 /// A logical publication.  Publications are database-scoped catalog objects;
@@ -12753,6 +12748,13 @@ pub struct CommentEntry {
     pub live: Option<StackStr<COMMENT_MAX>>,
     pub pending: Option<PendingComment>,
     pending_identity: Option<PendingCommentIdentity>,
+    pending_drop: Option<PendingCommentDrop>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingCommentDrop {
+    txid: u32,
+    source: query_lifecycles::QueryIdentity,
 }
 
 struct CommentCatalog {
@@ -12762,7 +12764,10 @@ struct CommentCatalog {
 impl CommentCatalog {
     fn reap(&mut self, slot: usize) {
         let comment = &mut self.entries[slot];
-        if comment.live.is_none() && comment.pending.is_none() && comment.pending_identity.is_none()
+        if comment.live.is_none()
+            && comment.pending.is_none()
+            && comment.pending_identity.is_none()
+            && comment.pending_drop.is_none()
         {
             *comment = CommentEntry::empty();
         }
@@ -12840,6 +12845,9 @@ impl Iterator for VisibleCommentIter<'_> {
             let comment = catalog.entries[slot];
             if !comment.used
                 || comment
+                    .pending_drop
+                    .is_some_and(|pending| pending.txid == self.txid)
+                || comment
                     .database
                     .is_some_and(|database| database != self.database)
             {
@@ -12878,6 +12886,7 @@ impl CommentEntry {
             live: None,
             pending: None,
             pending_identity: None,
+            pending_drop: None,
         }
     }
 
@@ -12907,6 +12916,9 @@ impl CommentEntry {
         txid: u32,
     ) -> bool {
         self.used
+            && !self
+                .pending_drop
+                .is_some_and(|pending| pending.txid == txid)
             && self.database == database
             && self.class == class
             && self.subid == subid
@@ -21591,6 +21603,7 @@ impl Storage {
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
+                entry.pending_drop = None;
                 comments.entries[target_slot] = entry;
             }
             drop(comments);
@@ -27475,7 +27488,9 @@ impl Storage {
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
-            c.database == database
+            c.used
+                && !c.pending_drop.is_some_and(|pending| pending.txid == txid)
+                && c.database == database
                 && c.class == class
                 && c.subid == subid
                 && (Self::comment_identity_uses_subid(class)
@@ -27502,6 +27517,7 @@ impl Storage {
             live: None,
             pending: Some(PendingComment { txid, text }),
             pending_identity: None,
+            pending_drop: None,
         };
         Ok((slot, None))
     }
@@ -27601,6 +27617,7 @@ impl Storage {
             live: text,
             pending: None,
             pending_identity: None,
+            pending_drop: None,
         };
         Ok(())
     }
@@ -40742,8 +40759,18 @@ impl Storage {
         }
         let database = self.view(slot).database;
         let (schema, name) = (self.view(slot).schema, self.view(slot).name);
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        if view.ddl_state.pending_drop_txid() == Some(0) {
+            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        } else {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
+                comment
+                    .pending_drop
+                    .is_some_and(|pending| pending.source == source)
+            }) {
+                *comment = CommentEntry::empty();
+            }
+        }
         for rule_slot in 0..self.rule_count() {
             if self.rule(rule_slot).database == database
                 && self.rule(rule_slot).definition.target == RuleTarget::View(slot as u16)
@@ -49961,7 +49988,7 @@ impl Storage {
         dependencies: StoredQueryDependencyView<'_>,
         or_replace: bool,
         txid: u32,
-    ) -> Result<(usize, Option<PendingRuleDefinition>), SqlError> {
+    ) -> Result<RulePublication, SqlError> {
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -50009,10 +50036,33 @@ impl Storage {
                 definition,
                 dependency_slot,
             });
-            return Ok((slot, prior));
+            let rule = owners.catalog.rules[slot];
+            return Ok(RulePublication::Altered(RuleAlterUndo {
+                target: query_lifecycles::QueryEditTarget {
+                    source: self.query_identity(
+                        query_lifecycles::QueryCatalogSlot::Rule(slot),
+                        rule.database,
+                        rule.created_at,
+                    ),
+                    transaction: txid,
+                    version,
+                },
+                prior,
+            }));
         }
-        self.create_new_rule_in(&mut owners, definition, dependencies, txid)
-            .map(|slot| (slot, None))
+        let slot = self.create_new_rule_in(&mut owners, definition, dependencies, txid)?;
+        let rule = owners.catalog.rules[slot];
+        Ok(RulePublication::Created(QueryDdlUndo {
+            source: self.query_identity(
+                query_lifecycles::QueryCatalogSlot::Rule(slot),
+                rule.database,
+                rule.created_at,
+            ),
+            transaction: txid,
+            operation: query_lifecycles::QueryDdlOperation::Create,
+            version: rule.ddl_version,
+            prior_version: 0,
+        }))
     }
 
     /// The caller validates the target or publishes a new view owning it.
@@ -50058,17 +50108,16 @@ impl Storage {
 
     pub(crate) fn alter_rule(
         &self,
-        slot: usize,
+        selected_target: query_lifecycles::QueryEditTarget,
         change: RuleMetadataChange,
         txid: u32,
-    ) -> Result<(Option<PendingRuleDefinition>, RuleDefinition), SqlError> {
-        let selected = self.rule(slot);
-        if selected.database != current_database() || !selected.visible_to(txid) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "rewrite rule no longer exists"
-            ));
-        }
+    ) -> Result<(RuleAlterUndo, RuleDefinition), SqlError> {
+        let slot = selected_target.rule_slot()?;
+        let selected = {
+            let catalog = self.view_rule_catalog();
+            self.validate_rule_edit(&catalog, selected_target, txid)?;
+            catalog.rules[slot]
+        };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -50076,6 +50125,7 @@ impl Storage {
             target.table(),
         );
         owners.validate_rule_target(target, txid)?;
+        self.validate_rule_edit(&owners.catalog, selected_target, txid)?;
         let current = &owners.catalog.rules[slot];
         if current.database != selected.database
             || current.created_at != selected.created_at
@@ -50182,42 +50232,16 @@ impl Storage {
                 });
             }
         }
-        Ok((prior, definition))
-    }
-
-    pub(crate) fn drop_rule(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.view_rule_catalog();
-        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.drop_by(txid);
-    }
-
-    pub(crate) fn commit_rule_create(&mut self, slot: usize) {
-        let target = {
-            let mut catalog = self.view_rule_catalog();
-            catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.commit_create();
-            catalog.rules[slot].definition.target
-        };
-        if let RuleTarget::Table(table) = target {
-            let mut state = self.tables[usize::from(table)].definition.write();
-            state.committed.has_rules = true;
-            state.pending_has_rules_txid = None;
-        }
-    }
-
-    pub(crate) fn rollback_rule_create(&mut self, slot: usize, prior_table_rule_txid: Option<u32>) {
-        if let RuleTarget::Table(table) = self.rule(slot).definition.target {
-            self.tables[usize::from(table)]
-                .definition
-                .write()
-                .pending_has_rules_txid = prior_table_rule_txid;
-        }
-        self.discard_rule_create(slot);
-    }
-
-    /// A rejected history claim never acquired the table flag it would undo.
-    pub(crate) fn discard_rule_create(&self, slot: usize) {
-        let mut catalog = self.view_rule_catalog();
-        let _ = catalog.rules[slot].ddl_state.rollback_create();
-        self.clear_rule_slot_in(&mut catalog, slot);
+        Ok((
+            RuleAlterUndo {
+                target: query_lifecycles::QueryEditTarget {
+                    version,
+                    ..selected_target
+                },
+                prior,
+            },
+            definition,
+        ))
     }
 
     pub(crate) fn begin_rule_history(
@@ -50257,66 +50281,6 @@ impl Storage {
         state.committed.has_rules || state.pending_has_rules_txid == Some(txid)
     }
 
-    pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.view_rule_catalog();
-        if let Some(pending) = catalog.rules[slot].pending
-            && pending.txid == txid
-        {
-            self.commit_pending_dependencies(
-                StoredQueryDependencyOwner::Rule(slot as u16),
-                pending.dependency_slot,
-            );
-            let old = catalog.rules[slot].definition;
-            catalog.rules[slot].definition = pending.definition;
-            catalog.rules[slot].pending = None;
-            drop(catalog);
-            let subid = pending.definition.target.comment_subid();
-            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
-                comment.used
-                    && comment.class == CommentClass::Rule
-                    && comment.subid == subid
-                    && comment
-                        .pending_identity
-                        .is_some_and(|identity| identity.txid == txid)
-            }) {
-                if old.name != pending.definition.name {
-                    comment.name = pending.definition.name;
-                }
-                comment.pending_identity = None;
-            }
-        }
-    }
-
-    pub(crate) fn rollback_rule_alter(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingRuleDefinition>,
-    ) {
-        let current = self.rule(slot).pending;
-        let committed = self.rule(slot).definition;
-        let restored = prior.map_or(committed, |pending| pending.definition);
-        if let Some(current) = current {
-            self.release_pending_dependencies(current.dependency_slot);
-            let subid = current.definition.target.comment_subid();
-            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
-                comment.used
-                    && comment.class == CommentClass::Rule
-                    && comment.subid == subid
-                    && comment
-                        .pending_identity
-                        .is_some_and(|identity| identity.txid == current.txid)
-            }) {
-                comment.pending_identity =
-                    (restored.name != comment.name).then_some(PendingCommentIdentity {
-                        txid: current.txid,
-                        schema: SqlName::EMPTY,
-                        name: restored.name,
-                    });
-            }
-        }
-        self.view_rule_catalog().rules[slot].pending = prior;
-    }
-
     fn clear_rule_comments(&self, definition: RuleDefinition) {
         let subid = definition.target.comment_subid();
         for comment in self.comment_catalog().entries.iter_mut() {
@@ -50338,13 +50302,6 @@ impl Storage {
         self.clear_pending_dependency_chain(pending);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
         catalog.rules[slot] = RuleDef::EMPTY;
-    }
-
-    pub(crate) fn commit_rule_drop(&mut self, slot: usize) {
-        self.clear_rule_comments(self.rule(slot).definition);
-        let mut catalog = self.view_rule_catalog();
-        let _ = catalog.rules[slot].ddl_state.commit_drop();
-        self.clear_rule_slot_in(&mut catalog, slot);
     }
 
     /// Rules are internal relation dependents. Session teardown drops a
@@ -50373,11 +50330,6 @@ impl Storage {
             }
             self.clear_rule_slot_in(&mut catalog, slot);
         }
-    }
-
-    pub(crate) fn rollback_rule_drop(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.view_rule_catalog();
-        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_rule(
@@ -54963,14 +54915,19 @@ mod tests {
             assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Absent);
             assert_eq!(storage.rule(0).created_at, 0);
             assert!(storage.rule_dependencies(0, 7).entries().is_empty());
-            let (slot, _) = storage
+            let publication_slot = storage
                 .create_rule(definition, StoredQueryDependencies::EMPTY.view(), false, 7)
                 .unwrap();
+            let slot = publication_slot.slot();
             let (prior, _) = storage
-                .alter_rule(slot, RuleMetadataChange::SetEnabled(definition.enabled), 7)
+                .alter_rule(
+                    storage.prepare_rule_edit(slot, 7).unwrap(),
+                    RuleMetadataChange::SetEnabled(definition.enabled),
+                    7,
+                )
                 .unwrap();
-            assert!(prior.is_none());
-            storage.rollback_rule_create(slot, None);
+            assert!(prior.prior.is_none());
+            storage.finish_rule_publication(publication_slot, None, QueryDdlDecision::Rollback);
             assert_eq!(storage.rule(slot).created_at, 0);
             assert!(storage.rule(slot).pending.is_none());
             assert!(
@@ -54982,13 +54939,16 @@ mod tests {
                     .iter()
                     .all(|pending| !pending.used)
             );
-            let (reused, _) = storage
+            let publication_reused = storage
                 .create_rule(definition, StoredQueryDependencies::EMPTY.view(), false, 8)
                 .unwrap();
+            let reused = publication_reused.slot();
             assert_eq!(reused, slot);
-            storage.commit_rule_create(reused);
-            storage.drop_rule(reused, 8);
-            storage.commit_rule_drop(reused);
+            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
+            let dropped = storage
+                .drop_rule(storage.prepare_rule_edit(reused, 8).unwrap(), 8)
+                .unwrap();
+            storage.commit_rule_drop(dropped);
             assert_eq!(storage.rule(reused).definition.name, SqlName::EMPTY);
             assert_eq!(storage.rule(reused).created_at, 0);
         });
@@ -55455,10 +55415,18 @@ mod tests {
         let rule = storage.view_return_rule(slot);
         let definition = storage.rule(rule).definition;
         storage
-            .alter_rule(rule, RuleMetadataChange::SetEnabled(definition.enabled), 8)
+            .alter_rule(
+                storage.prepare_rule_edit(rule, 8).unwrap(),
+                RuleMetadataChange::SetEnabled(definition.enabled),
+                8,
+            )
             .unwrap();
         storage
-            .alter_rule(rule, RuleMetadataChange::SetEnabled(definition.enabled), 8)
+            .alter_rule(
+                storage.prepare_rule_edit(rule, 8).unwrap(),
+                RuleMetadataChange::SetEnabled(definition.enabled),
+                8,
+            )
             .unwrap();
         let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
         storage.view_rule_catalog().views[slot].database = other_database;
@@ -56434,42 +56402,46 @@ mod tests {
             ..RuleDefinition::EMPTY
         };
         crate::mem::guard::forbid_alloc(|| {
-            let (a, _) = storage
+            let publication_a = storage
                 .create_rule(first, StoredQueryDependencies::EMPTY.view(), false, 7)
                 .unwrap();
+            let a = publication_a.slot();
             let prior_a = storage.begin_rule_history(target, 7).unwrap();
             assert_eq!(prior_a, None);
             assert!(storage.table_has_rules(table, 7));
             assert!(!storage.table_has_rules(table, 8));
-            let (rejected, _) = storage
+            let publication_rejected = storage
                 .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 8)
                 .unwrap();
+            let rejected = publication_rejected.slot();
             assert_eq!(
                 storage.begin_rule_history(target, 8).unwrap_err().sqlstate,
                 sqlstate::INTERNAL_LOCK_WAIT
             );
-            storage.discard_rule_create(rejected);
+            storage.discard_rule_create(publication_rejected);
             assert_eq!(storage.rule(rejected).ddl_state, CatalogDdlState::Absent);
             assert!(storage.table_has_rules(table, 7));
             assert!(!storage.table_has_rules(table, 8));
             assert_eq!(storage.tables[table].ddl_locked_by_other(8), Some(7));
             storage.release_row_locks(8);
-            let (b, _) = storage
+            let publication_b = storage
                 .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 7)
                 .unwrap();
+            let b = publication_b.slot();
             let prior_b = storage.begin_rule_history(target, 7).unwrap();
             assert_eq!(prior_b, Some(7));
-            storage.rollback_rule_create(b, prior_b);
+            storage.finish_rule_publication(publication_b, prior_b, QueryDdlDecision::Rollback);
             assert!(storage.table_has_rules(table, 7));
-            storage.rollback_rule_create(a, prior_a);
+            storage.finish_rule_publication(publication_a, prior_a, QueryDdlDecision::Rollback);
             assert!(!storage.table_has_rules(table, 7));
             assert_eq!(storage.tables[table].ddl_locked_by_other(8), None);
-            let (reused, _) = storage
+            let publication_reused = storage
                 .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 8)
                 .unwrap();
+            let reused = publication_reused.slot();
             assert_eq!(reused, a);
             assert_eq!(storage.begin_rule_history(target, 8).unwrap(), None);
-            storage.commit_rule_create(reused);
+            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
             assert!(storage.table_has_rules(table, 0));
             assert_eq!(
                 storage.tables[table]
@@ -60963,7 +60935,7 @@ mod tests {
             .write_table_def(first, 7, updated, &[None; MAX_COLUMNS], false)
             .unwrap();
         let target = RuleTarget::Table(second as u16);
-        let (rule, _) = storage
+        let publication_rule = storage
             .create_rule(
                 RuleDefinition {
                     name: SqlName::parse("cleanup_rule").unwrap(),
@@ -60976,8 +60948,9 @@ mod tests {
                 7,
             )
             .unwrap();
+        let rule = publication_rule.slot();
         storage.begin_rule_history(target, 7).unwrap();
-        storage.commit_rule_create(rule);
+        storage.finish_rule_publication(publication_rule, None, QueryDdlDecision::Commit);
         let held = storage.table_def(first, 7);
         assert_eq!(held.name.as_str(), "held_pending_cleanup");
         let (sent, received) = std::sync::mpsc::sync_channel(1);

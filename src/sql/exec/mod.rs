@@ -37617,48 +37617,41 @@ pub fn create_rule(
             Ok(definition) => definition,
             Err(error) => return sql_fail(error),
         };
-    let existing = storage.rule_slot(target, rule.name, txn.txid);
-    let (slot, prior) =
+    let publication =
         match storage.create_rule(definition, dependencies.view(), rule.or_replace, txn.txid) {
-            Ok(created) => created,
+            Ok(publication) => publication,
             Err(error) => return sql_fail(error),
         };
-    let prior_table_rule_txid = if existing.is_none() {
-        match storage.begin_rule_history(target, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => {
-                storage.discard_rule_create(slot);
-                return sql_fail(error);
+    let slot = publication.slot();
+    let prior_table_rule_txid =
+        if matches!(publication, crate::storage::RulePublication::Created(_)) {
+            match storage.begin_rule_history(target, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => {
+                    storage.discard_rule_create(publication);
+                    return sql_fail(error);
+                }
             }
-        }
-    } else {
-        None
-    };
-    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        if existing.is_some() {
-            storage.rollback_rule_alter(slot, prior);
         } else {
-            storage.rollback_rule_create(slot, prior_table_rule_txid);
-        }
+            None
+        };
+    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+        storage.finish_rule_publication(
+            publication,
+            prior_table_rule_txid,
+            crate::storage::QueryDdlDecision::Rollback,
+        );
         return sql_fail(error);
     }
-    let undo = if existing.is_some() {
-        super::txn::DdlUndo::RuleAltered {
-            slot: slot as u32,
-            prior,
-        }
-    } else {
-        super::txn::DdlUndo::RuleCreated {
-            slot: slot as u32,
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleChanged {
+        publication,
+        prior_table_rule_txid,
+    }) {
+        storage.finish_rule_publication(
+            publication,
             prior_table_rule_txid,
-        }
-    };
-    if let Err(error) = txn.record_ddl(undo) {
-        if existing.is_some() {
-            storage.rollback_rule_alter(slot, prior);
-        } else {
-            storage.rollback_rule_create(slot, prior_table_rule_txid);
-        }
+            crate::storage::QueryDdlDecision::Rollback,
+        );
         return sql_fail(error);
     }
     responder.command_complete("CREATE RULE")?;
@@ -37701,8 +37694,12 @@ pub fn alter_rule(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let (prior, definition) = match storage.alter_rule(
-        slot,
+        selected,
         crate::storage::RuleMetadataChange::Rename(new_name),
         txn.txid,
     ) {
@@ -37710,14 +37707,11 @@ pub fn alter_rule(
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        storage.rollback_rule_alter(slot, prior);
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_rule_alter(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
     responder.command_complete("ALTER RULE")?;
@@ -37759,8 +37753,12 @@ fn alter_table_rule_enabled(
         crate::sql::ast::TriggerEnableMode::Always => crate::storage::RuleEnabled::Always,
         crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::RuleEnabled::Disabled,
     };
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let (prior, definition) = match storage.alter_rule(
-        slot,
+        selected,
         crate::storage::RuleMetadataChange::SetEnabled(enabled),
         txn.txid,
     ) {
@@ -37768,14 +37766,11 @@ fn alter_table_rule_enabled(
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        storage.rollback_rule_alter(slot, prior);
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_rule_alter(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
     if emit_completion {
@@ -37841,7 +37836,14 @@ pub fn drop_rule(
             table.name
         ));
     }
-    storage.drop_rule(slot, txn.txid);
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
+    let dropped = match storage.drop_rule(selected, txn.txid) {
+        Ok(undo) => undo,
+        Err(error) => return sql_fail(error),
+    };
     let (schema, relation) = storage.rule_target_names(target, txn.txid);
     let target_kind = match target {
         crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
@@ -37860,12 +37862,12 @@ pub fn drop_rule(
                 name,
             },
         ) {
-            storage.rollback_rule_drop(slot, txn.txid);
+            storage.rollback_rule_drop(dropped);
             return sql_fail(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32)) {
-        storage.rollback_rule_drop(slot, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+        storage.rollback_rule_drop(dropped);
         return sql_fail(error);
     }
     responder.command_complete("DROP RULE")?;
@@ -44749,8 +44751,11 @@ fn drop_selected_stored_queries(
             continue;
         }
         stage_rule_drop(storage, wal, txn, definition)?;
-        storage.drop_rule(slot, txn.txid);
-        txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32))?;
+        let dropped = storage.drop_rule(storage.prepare_rule_edit(slot, txn.txid)?, txn.txid)?;
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+            storage.rollback_rule_drop(dropped);
+            return Err(error);
+        }
     }
     // Dependents are already closed transitively. Reverse slot order avoids
     // immediately reusing a just-freed low slot while this plan is executing.

@@ -580,7 +580,7 @@ fn shared_log_positions_catalog_exhaustion_preserves_compound_view_creation_and_
             "CREATE VIEW catalog_position_rejected_view AS SELECT 2 AS id",
         ),
         (
-            1,
+            0,
             "CREATE OR REPLACE VIEW catalog_position_view AS SELECT 2 AS id",
         ),
         (

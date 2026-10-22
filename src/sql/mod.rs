@@ -5422,6 +5422,14 @@ impl Engine {
                 .storage
                 .validate_view_publication(*publication, txn.txid),
             DdlUndo::ViewDropped(undo) => self.storage.validate_view_drop(*undo, txn.txid),
+            DdlUndo::RuleChanged { publication, .. } => self
+                .storage
+                .validate_rule_publication(*publication, txn.txid),
+            DdlUndo::RuleAltered(undo) => self.storage.validate_rule_publication(
+                crate::storage::RulePublication::Altered(*undo),
+                txn.txid,
+            ),
+            DdlUndo::RuleDropped(undo) => self.storage.validate_rule_drop(*undo, txn.txid),
             DdlUndo::MatviewPopulationChanged(undo) => {
                 self.storage.validate_matview_population(*undo, txn.txid)
             }
@@ -6730,13 +6738,16 @@ impl Engine {
                 DdlUndo::MatviewPopulationChanged(undo) => self
                     .storage
                     .finish_matview_population(*undo, crate::storage::QueryDdlDecision::Commit),
-                DdlUndo::RuleCreated { slot, .. } => {
-                    self.storage.commit_rule_create(*slot as usize)
-                }
-                DdlUndo::RuleAltered { slot, .. } => {
-                    self.storage.commit_rule_alter(*slot as usize, txn.txid)
-                }
-                DdlUndo::RuleDropped(slot) => self.storage.commit_rule_drop(*slot as usize),
+                DdlUndo::RuleChanged {
+                    publication,
+                    prior_table_rule_txid,
+                } => self.storage.finish_rule_publication(
+                    *publication,
+                    *prior_table_rule_txid,
+                    crate::storage::QueryDdlDecision::Commit,
+                ),
+                DdlUndo::RuleAltered(undo) => self.storage.commit_rule_alter(*undo),
+                DdlUndo::RuleDropped(undo) => self.storage.commit_rule_drop(*undo),
                 DdlUndo::RoutineCreated(slot) => {
                     self.storage.commit_routine_create(*slot as usize, txn.txid)
                 }
@@ -19669,12 +19680,16 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::MatviewPopulationChanged(undo) => {
             storage.finish_matview_population(undo, crate::storage::QueryDdlDecision::Rollback)
         }
-        DdlUndo::RuleCreated {
-            slot,
+        DdlUndo::RuleChanged {
+            publication,
             prior_table_rule_txid,
-        } => storage.rollback_rule_create(slot as usize, prior_table_rule_txid),
-        DdlUndo::RuleAltered { slot, prior } => storage.rollback_rule_alter(slot as usize, prior),
-        DdlUndo::RuleDropped(slot) => storage.rollback_rule_drop(slot as usize, txid),
+        } => storage.finish_rule_publication(
+            publication,
+            prior_table_rule_txid,
+            crate::storage::QueryDdlDecision::Rollback,
+        ),
+        DdlUndo::RuleAltered(undo) => storage.rollback_rule_alter(undo),
+        DdlUndo::RuleDropped(undo) => storage.rollback_rule_drop(undo),
         DdlUndo::RoutineCreated(slot) => storage.rollback_routine_create(slot as usize),
         DdlUndo::RoutineDropped(slot) => storage.rollback_routine_drop(slot as usize, txid),
         DdlUndo::RoutineReplaced { slot, prior } => {

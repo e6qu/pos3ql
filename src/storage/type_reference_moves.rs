@@ -1382,7 +1382,7 @@ mod tests {
                 )
             }
             SavedQueryKind::Rule => {
-                let (slot, _) = storage.create_rule(
+                let publication_slot = storage.create_rule(
                     RuleDefinition {
                         name: SqlName::parse("typed_submission").unwrap(),
                         target: RuleTarget::Table(related as u16),
@@ -1392,6 +1392,7 @@ mod tests {
                     false,
                     7,
                 )?;
+                let slot = publication_slot.slot();
                 Ok(storage
                     .committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)))
             }
@@ -1464,7 +1465,7 @@ mod tests {
                         crate::mem::guard::forbid_alloc(|| {
                             storage.finish_view_publication(
                                 publication_unrelated,
-                                super::super::QueryDdlDecision::Commit,
+                                super::super::crate::storage::QueryDdlDecision::Commit,
                             )
                         });
                         finished.send(()).unwrap();
@@ -1557,10 +1558,15 @@ mod tests {
                 target: RuleTarget::Table(related as u16),
                 ..RuleDefinition::EMPTY
             };
-            let (rule_slot, _) = storage
+            let publication_rule_slot = storage
                 .create_rule(rule, dependencies.view(), false, 0)
                 .unwrap();
-            storage.commit_rule_create(rule_slot);
+            let rule_slot = publication_rule_slot.slot();
+            storage.finish_rule_publication(
+                publication_rule_slot,
+                None,
+                crate::storage::QueryDdlDecision::Commit,
+            );
             let policy = PolicySpec {
                 name: SqlName::parse("recovered_policy").unwrap(),
                 table: related,
@@ -1762,7 +1768,7 @@ mod tests {
             let name = SqlName::parse("original_rule").unwrap();
             let renamed = SqlName::parse("renamed_rule").unwrap();
             let target = RuleTarget::Table(related as u16);
-            let (slot, _) = storage
+            let publication_slot = storage
                 .create_rule(
                     RuleDefinition {
                         name,
@@ -1774,7 +1780,12 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            storage.commit_rule_create(slot);
+            let slot = publication_slot.slot();
+            storage.finish_rule_publication(
+                publication_slot,
+                None,
+                crate::storage::QueryDdlDecision::Commit,
+            );
             storage
                 .apply_comment(
                     CommentClass::Rule,
@@ -1785,12 +1796,16 @@ mod tests {
                 )
                 .unwrap();
             let mut source = storage.type_catalog.lock().unwrap();
-            std::thread::scope(|scope| {
+            let undo = std::thread::scope(|scope| {
                 let storage = &storage;
                 let writer = scope.spawn(move || {
                     crate::sql::set_execution_database_oid(database);
                     crate::mem::guard::forbid_alloc(|| {
-                        storage.alter_rule(slot, RuleMetadataChange::Rename(renamed), 7)
+                        storage.alter_rule(
+                            storage.prepare_rule_edit(slot, 7).unwrap(),
+                            RuleMetadataChange::Rename(renamed),
+                            7,
+                        )
                     })
                 });
                 let waiting = wait_until_contended(storage);
@@ -1813,7 +1828,7 @@ mod tests {
                 drop(source);
                 let (prior, installed) = writer.join().unwrap().unwrap();
                 assert!(waiting && available);
-                assert!(prior.is_none());
+                assert!(prior.prior.is_none());
                 assert_eq!(installed.name, renamed);
                 assert_eq!(installed.enabled, RuleEnabled::Always);
                 let pending = storage.rule(slot).pending.unwrap();
@@ -1829,8 +1844,9 @@ mod tests {
                 );
                 assert_eq!(entries[0].name, movement.current.name);
                 assert_eq!(entries[0].referenced_name, movement.prior.name);
+                prior
             });
-            crate::mem::guard::forbid_alloc(|| storage.rollback_rule_alter(slot, None));
+            crate::mem::guard::forbid_alloc(|| storage.rollback_rule_alter(undo));
             assert!(storage.rule(slot).pending.is_none());
             assert!(
                 storage

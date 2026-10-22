@@ -170,6 +170,102 @@ mod tests {
             second.finish_view_publication(replacement, QueryDdlDecision::Rollback);
         });
     }
+
+    #[test]
+    fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
+        let mut storage = fixture(2);
+        let view = create(&storage, "rule_parent", 7);
+        storage.finish_view_publication(view, QueryDdlDecision::Commit);
+        let definition = super::super::RuleDefinition {
+            name: name("first_rule"),
+            target: super::super::RuleTarget::View(view.slot() as u16),
+            ..super::super::RuleDefinition::EMPTY
+        };
+        let dependencies = StoredQueryDependencies::EMPTY;
+        crate::mem::guard::forbid_alloc(|| {
+            let created = storage
+                .create_rule(definition, dependencies.view(), false, 9)
+                .unwrap();
+            let stale = storage.prepare_rule_edit(created.slot(), 9).unwrap();
+            storage.finish_rule_publication(created, None, QueryDdlDecision::Rollback);
+            let replacement = storage
+                .create_rule(definition, dependencies.view(), false, 11)
+                .unwrap();
+            assert_eq!(replacement.slot(), created.slot());
+            storage.finish_rule_publication(created, None, QueryDdlDecision::Commit);
+            storage.discard_rule_create(created);
+            assert_eq!(
+                storage
+                    .alter_rule(
+                        stale,
+                        super::super::RuleMetadataChange::Rename(name("stolen_rule")),
+                        9
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
+            storage.finish_rule_publication(replacement, None, QueryDdlDecision::Commit);
+            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
+            let (first, _) = storage
+                .alter_rule(
+                    selected,
+                    super::super::RuleMetadataChange::Rename(name("second_rule")),
+                    13,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .alter_rule(
+                        selected,
+                        super::super::RuleMetadataChange::Rename(name("stale_rule")),
+                        13
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
+            let (second, _) = storage
+                .alter_rule(
+                    selected,
+                    super::super::RuleMetadataChange::Rename(name("third_rule")),
+                    13,
+                )
+                .unwrap();
+            storage.rollback_rule_alter(first);
+            assert_eq!(
+                storage.rule(replacement.slot()).definition_for(13).name,
+                name("third_rule")
+            );
+            storage.rollback_rule_alter(second);
+            storage.rollback_rule_alter(first);
+            let dropped = storage
+                .drop_rule(
+                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
+                    13,
+                )
+                .unwrap();
+            storage.rollback_rule_drop(dropped);
+            let current = storage
+                .drop_rule(
+                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
+                    13,
+                )
+                .unwrap();
+            storage.commit_rule_drop(dropped);
+            storage.rollback_rule_drop(dropped);
+            assert!(!storage.rule(replacement.slot()).visible_to(13));
+            storage.commit_rule_drop(current);
+            let final_rule = storage
+                .create_rule(definition, dependencies.view(), false, 15)
+                .unwrap();
+            storage.commit_rule_drop(current);
+            storage.rollback_rule_alter(second);
+            assert!(storage.rule(final_rule.slot()).visible_to(15));
+            storage.finish_rule_publication(final_rule, None, QueryDdlDecision::Rollback);
+        });
+    }
 }
 
 impl QueryCatalogSlot {
@@ -232,6 +328,16 @@ impl QueryEditTarget {
             )),
         }
     }
+
+    pub(super) fn rule_slot(self) -> Result<usize, SqlError> {
+        match self.source.slot {
+            QueryCatalogSlot::Rule(slot) => Ok(slot),
+            _ => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "edit source is not a rule"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +370,25 @@ pub(crate) struct RuleAlterUndo {
 impl RuleAlterUndo {
     pub(crate) fn slot(self) -> usize {
         self.target.slot()
+    }
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Rule undo stays in the startup-reserved transaction log"
+)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RulePublication {
+    Created(QueryDdlUndo),
+    Altered(RuleAlterUndo),
+}
+
+impl RulePublication {
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            Self::Created(undo) => undo.slot(),
+            Self::Altered(undo) => undo.slot(),
+        }
     }
 }
 
@@ -325,6 +450,589 @@ impl MatviewPopulationUndo {
 }
 
 impl Storage {
+    pub(super) fn stage_query_comment_drop_in(
+        &self,
+        owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
+        source: QueryIdentity,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let (schema, name, rule_subid) = match source.slot {
+            QueryCatalogSlot::View(slot) => {
+                let view = owners.catalog.views[slot];
+                (
+                    view.schema_for(transaction),
+                    view.name_for(transaction),
+                    None,
+                )
+            }
+            QueryCatalogSlot::Rule(slot) => {
+                let rule = owners.catalog.rules[slot].definition_for(transaction);
+                (
+                    super::SqlName::EMPTY,
+                    rule.name,
+                    Some(rule.target.comment_subid()),
+                )
+            }
+            QueryCatalogSlot::MaterializedView(_) => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "comment source is not a view or rewrite rule"
+                ));
+            }
+        };
+        let comments = owners
+            .comments
+            .as_mut()
+            .expect("query retirement owns comments");
+        let matches = |comment: &super::CommentEntry| {
+            let class_matches = match rule_subid {
+                Some(subid) => comment.class == super::CommentClass::Rule && comment.subid == subid,
+                None => matches!(
+                    comment.class,
+                    super::CommentClass::Relation | super::CommentClass::Type
+                ),
+            };
+            class_matches
+                && comment.matches_to(
+                    Some(current_database()),
+                    comment.class,
+                    schema.as_str(),
+                    name.as_str(),
+                    comment.subid,
+                    transaction,
+                )
+        };
+        if comments
+            .entries
+            .iter()
+            .filter(|comment| matches(comment))
+            .any(|comment| {
+                comment
+                    .pending
+                    .is_some_and(|pending| pending.txid != transaction)
+                    || comment
+                        .pending_identity
+                        .is_some_and(|identity| identity.txid != transaction)
+                    || comment
+                        .pending_drop
+                        .is_some_and(|pending| pending.txid != transaction)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "object comment is owned by another transaction"
+            ));
+        }
+        for comment in comments
+            .entries
+            .iter_mut()
+            .filter(|comment| matches(comment))
+        {
+            comment.pending_drop = Some(super::PendingCommentDrop {
+                txid: transaction,
+                source,
+            });
+        }
+        Ok(())
+    }
+
+    fn rollback_query_comment_drop_in(
+        &self,
+        comments: &mut super::CommentCatalog,
+        source: QueryIdentity,
+        transaction: u32,
+    ) {
+        for comment in comments.entries.iter_mut().filter(|comment| {
+            comment
+                .pending_drop
+                .is_some_and(|pending| pending.txid == transaction && pending.source == source)
+        }) {
+            comment.pending_drop = None;
+        }
+    }
+
+    fn rule_ddl_matches(&self, rule: &super::RuleDef, undo: QueryDdlUndo) -> bool {
+        matches!(undo.source.slot, QueryCatalogSlot::Rule(_))
+            && undo
+                .source
+                .matches(self, rule.database, rule.created_at, rule.ddl_state)
+            && match undo.operation {
+                QueryDdlOperation::Create => {
+                    rule.ddl_state.pending_txid() == Some(undo.transaction)
+                        && matches!(
+                            rule.ddl_state,
+                            CatalogDdlState::PendingCreate { .. }
+                                | CatalogDdlState::PendingCreateDrop { .. }
+                        )
+                }
+                QueryDdlOperation::Drop => {
+                    rule.ddl_state.pending_drop_txid() == Some(undo.transaction)
+                        && rule.ddl_version == undo.version
+                }
+            }
+    }
+
+    fn retire_rule_in(
+        &self,
+        owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
+        slot: usize,
+    ) {
+        let rule = owners.catalog.rules[slot];
+        let source =
+            self.query_identity(QueryCatalogSlot::Rule(slot), rule.database, rule.created_at);
+        for comment in owners
+            .comments
+            .as_mut()
+            .expect("rule retirement owns comments")
+            .entries
+            .iter_mut()
+            .filter(|comment| {
+                comment
+                    .pending_drop
+                    .is_none_or(|pending| pending.source == source)
+                    && comment.used
+                    && comment.database == Some(current_database())
+                    && comment.class == super::CommentClass::Rule
+                    && comment.name == rule.definition.name
+                    && comment.subid == rule.definition.target.comment_subid()
+            })
+        {
+            *comment = super::CommentEntry::empty();
+        }
+        let mut next = rule.pending.map(|pending| pending.dependency_slot);
+        while let Some(pending_slot) = next {
+            let pending = &mut owners.dependencies.pending[pending_slot as usize];
+            next = pending.previous;
+            *pending = super::PendingStoredQueryDependencies::EMPTY;
+        }
+        let image =
+            self.committed_dependency_image(super::StoredQueryDependencyOwner::Rule(slot as u16));
+        owners.dependencies.counts[image] = 0;
+        owners.catalog.rules[slot] = super::RuleDef::EMPTY;
+    }
+
+    pub(crate) fn discard_rule_create(&self, publication: RulePublication) {
+        let RulePublication::Created(undo) = publication else {
+            return;
+        };
+        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        if owners
+            .catalog
+            .rules
+            .get(slot)
+            .is_some_and(|rule| self.rule_ddl_matches(rule, undo))
+        {
+            self.retire_rule_in(&mut owners, slot);
+        }
+    }
+
+    pub(crate) fn finish_rule_publication(
+        &mut self,
+        publication: RulePublication,
+        prior_table_rule_txid: Option<u32>,
+        decision: QueryDdlDecision,
+    ) {
+        let undo = match publication {
+            RulePublication::Created(undo) => undo,
+            RulePublication::Altered(undo) => {
+                match decision {
+                    QueryDdlDecision::Commit => self.commit_rule_alter(undo),
+                    QueryDdlDecision::Rollback => self.rollback_rule_alter(undo),
+                }
+                return;
+            }
+        };
+        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let Some(rule) = owners
+            .catalog
+            .rules
+            .get(slot)
+            .copied()
+            .filter(|rule| self.rule_ddl_matches(rule, undo))
+        else {
+            return;
+        };
+        match decision {
+            QueryDdlDecision::Commit => {
+                self.publish_pending_rule_in(&mut owners, slot, undo.transaction);
+                owners.catalog.rules[slot].ddl_state = rule.ddl_state.commit_create();
+            }
+            QueryDdlDecision::Rollback => self.retire_rule_in(&mut owners, slot),
+        }
+        drop(owners);
+        if let super::RuleTarget::Table(table) = rule.definition.target {
+            let mut state = self.tables[usize::from(table)].definition.write();
+            match decision {
+                QueryDdlDecision::Commit => {
+                    state.committed.has_rules = true;
+                    if state.pending_has_rules_txid == Some(undo.transaction) {
+                        state.pending_has_rules_txid = None;
+                    }
+                }
+                QueryDdlDecision::Rollback => {
+                    if state.pending_has_rules_txid == Some(undo.transaction) {
+                        state.pending_has_rules_txid = prior_table_rule_txid;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn drop_rule(
+        &self,
+        target: QueryEditTarget,
+        transaction: u32,
+    ) -> Result<QueryDdlUndo, SqlError> {
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let catalog = &mut owners.catalog;
+        let slot = self.validate_rule_edit(catalog, target, transaction)?;
+        let version = self.catalog_sequence.next()?;
+        self.stage_query_comment_drop_in(&mut owners, target.source, transaction)?;
+        let rule = &mut owners.catalog.rules[slot];
+        let prior_version = rule.ddl_version;
+        rule.ddl_state = rule.ddl_state.drop_by(transaction);
+        rule.ddl_version = version;
+        Ok(QueryDdlUndo {
+            source: target.source,
+            transaction,
+            operation: QueryDdlOperation::Drop,
+            version,
+            prior_version,
+        })
+    }
+
+    pub(crate) fn commit_rule_drop(&self, undo: QueryDdlUndo) {
+        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        if undo.operation == QueryDdlOperation::Drop
+            && owners
+                .catalog
+                .rules
+                .get(slot)
+                .is_some_and(|rule| self.rule_ddl_matches(rule, undo))
+        {
+            self.retire_rule_in(&mut owners, slot);
+        }
+    }
+
+    pub(crate) fn rollback_rule_drop(&self, undo: QueryDdlUndo) {
+        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let catalog = &mut owners.catalog;
+        let Some(rule) = catalog
+            .rules
+            .get_mut(slot)
+            .filter(|rule| self.rule_ddl_matches(rule, undo))
+        else {
+            return;
+        };
+        if undo.operation != QueryDdlOperation::Drop {
+            return;
+        }
+        rule.ddl_state = rule.ddl_state.rollback_drop(undo.transaction);
+        rule.ddl_version = undo.prior_version;
+        self.rollback_query_comment_drop_in(
+            owners
+                .comments
+                .as_mut()
+                .expect("rule rollback owns comments"),
+            undo.source,
+            undo.transaction,
+        );
+    }
+
+    pub(crate) fn validate_rule_publication(
+        &self,
+        publication: RulePublication,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let catalog = self.view_rule_catalog();
+        let valid = match publication {
+            RulePublication::Created(undo) => {
+                undo.transaction == transaction
+                    && catalog
+                        .rules
+                        .get(undo.slot())
+                        .is_some_and(|rule| self.rule_ddl_matches(rule, undo))
+            }
+            RulePublication::Altered(undo) => {
+                undo.target.transaction == transaction
+                    && catalog.rules.get(undo.slot()).is_some_and(|rule| {
+                        undo.target.source.matches(
+                            self,
+                            rule.database,
+                            rule.created_at,
+                            rule.ddl_state,
+                        ) && rule.pending.is_some_and(|pending| {
+                            pending.txid == transaction && pending.version >= undo.target.version
+                        })
+                    })
+            }
+        };
+        if !valid {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "rewrite rule publication changed before commit"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_rule_drop(
+        &self,
+        undo: QueryDdlUndo,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let catalog = self.view_rule_catalog();
+        if undo.transaction != transaction
+            || undo.operation != QueryDdlOperation::Drop
+            || !catalog
+                .rules
+                .get(undo.slot())
+                .is_some_and(|rule| self.rule_ddl_matches(rule, undo))
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "rewrite rule drop changed before commit"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_rule_edit(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<QueryEditTarget, SqlError> {
+        let catalog = self.view_rule_catalog();
+        let rule = catalog
+            .rules
+            .get(slot)
+            .filter(|rule| rule.database == current_database() && rule.visible_to(transaction))
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "rewrite rule no longer exists"))?;
+        if let Some(owner) = rule
+            .pending
+            .map(|pending| pending.txid)
+            .or_else(|| rule.ddl_state.pending_txid())
+            .filter(|owner| *owner != transaction)
+        {
+            let name = rule.definition.name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, name.as_str()));
+        }
+        Ok(QueryEditTarget {
+            source: self.query_identity(
+                QueryCatalogSlot::Rule(slot),
+                rule.database,
+                rule.created_at,
+            ),
+            transaction,
+            version: rule.pending.map_or(rule.version, |pending| pending.version),
+        })
+    }
+
+    pub(super) fn validate_rule_edit(
+        &self,
+        catalog: &super::ViewRuleCatalog,
+        target: QueryEditTarget,
+        transaction: u32,
+    ) -> Result<usize, SqlError> {
+        let slot = target.rule_slot()?;
+        let rule = catalog
+            .rules
+            .get(slot)
+            .filter(|rule| {
+                target
+                    .source
+                    .matches(self, rule.database, rule.created_at, rule.ddl_state)
+                    && rule.visible_to(transaction)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "rewrite rule source has been replaced"
+                )
+            })?;
+        if target.transaction != transaction
+            || rule
+                .pending
+                .is_some_and(|pending| pending.txid != transaction)
+            || rule.pending.map_or(rule.version, |pending| pending.version) != target.version
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "rewrite rule changed before publication"
+            ));
+        }
+        Ok(slot)
+    }
+
+    fn publish_pending_rule_in(
+        &self,
+        owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
+        slot: usize,
+        transaction: u32,
+    ) {
+        let Some(pending) = owners.catalog.rules[slot]
+            .pending
+            .filter(|pending| pending.txid == transaction)
+        else {
+            return;
+        };
+        let old = owners.catalog.rules[slot].definition;
+        self.commit_pending_dependencies_in(
+            &mut owners.dependencies,
+            super::StoredQueryDependencyOwner::Rule(slot as u16),
+            pending.dependency_slot,
+        );
+        owners.catalog.rules[slot].definition = pending.definition;
+        owners.catalog.rules[slot].version = pending.version;
+        owners.catalog.rules[slot].pending = None;
+        for comment in owners
+            .comments
+            .as_mut()
+            .expect("rule publication owns comments")
+            .entries
+            .iter_mut()
+            .filter(|comment| {
+                comment.used
+                    && comment.database == Some(current_database())
+                    && comment.class == super::CommentClass::Rule
+                    && comment.name == old.name
+                    && comment.subid == old.target.comment_subid()
+                    && comment
+                        .pending_identity
+                        .is_some_and(|identity| identity.txid == transaction)
+            })
+        {
+            let identity = comment
+                .pending_identity
+                .take()
+                .expect("selected comment identity");
+            comment.schema = identity.schema;
+            comment.name = identity.name;
+        }
+    }
+
+    pub(crate) fn commit_rule_alter(&self, undo: RuleAlterUndo) {
+        let target = undo.target;
+        let Ok(slot) = target.rule_slot() else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
+            target
+                .source
+                .matches(self, rule.database, rule.created_at, rule.ddl_state)
+                && rule.pending.is_some_and(|pending| {
+                    pending.txid == target.transaction && pending.version == target.version
+                })
+        }) else {
+            return;
+        };
+        if rule.definition.is_view_return()
+            && let super::RuleTarget::View(view) = rule.definition.target
+            && (owners.catalog.views[usize::from(view)]
+                .pending_definition
+                .is_some_and(|pending| pending.txid == target.transaction)
+                || owners.catalog.views[usize::from(view)]
+                    .ddl_state
+                    .pending_txid()
+                    == Some(target.transaction))
+        {
+            return;
+        }
+        self.publish_pending_rule_in(&mut owners, slot, target.transaction);
+    }
+
+    pub(crate) fn rollback_rule_alter(&self, undo: RuleAlterUndo) {
+        let target = undo.target;
+        let Ok(slot) = target.rule_slot() else {
+            return;
+        };
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
+            target
+                .source
+                .matches(self, rule.database, rule.created_at, rule.ddl_state)
+        }) else {
+            return;
+        };
+        let Some(current) = rule.pending.filter(|pending| {
+            pending.txid == target.transaction && pending.version == target.version
+        }) else {
+            return;
+        };
+        let restored = undo
+            .prior
+            .map_or(rule.definition, |pending| pending.definition);
+        owners.dependencies.pending[current.dependency_slot as usize] =
+            super::PendingStoredQueryDependencies::EMPTY;
+        owners.catalog.rules[slot].pending = undo.prior;
+        for comment in owners
+            .comments
+            .as_mut()
+            .expect("rule undo owns comments")
+            .entries
+            .iter_mut()
+            .filter(|comment| {
+                comment.used
+                    && comment.database == Some(current_database())
+                    && comment.class == super::CommentClass::Rule
+                    && comment.name == rule.definition.name
+                    && comment.subid == rule.definition.target.comment_subid()
+                    && comment
+                        .pending_identity
+                        .is_some_and(|identity| identity.txid == target.transaction)
+            })
+        {
+            comment.pending_identity =
+                (restored.name != comment.name).then_some(super::PendingCommentIdentity {
+                    txid: target.transaction,
+                    schema: super::SqlName::EMPTY,
+                    name: restored.name,
+                });
+        }
+    }
+
     pub(crate) fn validate_view_publication(
         &self,
         publication: ViewPublication,
@@ -434,7 +1142,12 @@ impl Storage {
         name: &str,
         transaction: u32,
     ) -> Result<Option<QueryDdlUndo>, SqlError> {
-        let mut catalog = self.view_rule_catalog();
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let catalog = &mut owners.catalog;
         let mut selected = None;
         let mut blocked = None;
         for (slot, view) in catalog.views.iter().enumerate() {
@@ -463,7 +1176,7 @@ impl Storage {
             }
         }
         if let Some(owner) = blocked {
-            drop(catalog);
+            drop(owners);
             return Err(self.catalog_ddl_wait_error(transaction, owner, name));
         }
         let Some(slot) = selected else {
@@ -485,11 +1198,15 @@ impl Storage {
                     .filter(|owner| *owner != transaction)
             });
         if let Some(owner) = blocked {
-            drop(catalog);
+            drop(owners);
             return Err(self.catalog_ddl_wait_error(transaction, owner, name));
         }
         let view = catalog.views[slot];
         let version = self.catalog_sequence.next()?;
+        let source =
+            self.query_identity(QueryCatalogSlot::View(slot), view.database, view.created_at);
+        self.stage_query_comment_drop_in(&mut owners, source, transaction)?;
+        let catalog = &mut owners.catalog;
         catalog.views[slot].ddl_state = view.ddl_state.drop_by(transaction);
         catalog.views[slot].ddl_version = version;
         for rule in catalog.rules.iter_mut().filter(|rule| {
@@ -541,8 +1258,13 @@ impl Storage {
     }
 
     pub(crate) fn rollback_view_drop(&self, undo: QueryDdlUndo) {
-        let mut catalog = self.view_rule_catalog();
-        let Some(slot) = self.matches_view_drop(&catalog, undo) else {
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            None,
+        );
+        let catalog = &mut owners.catalog;
+        let Some(slot) = self.matches_view_drop(catalog, undo) else {
             return;
         };
         catalog.rollback_target_rules(super::RuleTarget::View(slot as u16), undo.transaction);
@@ -550,6 +1272,14 @@ impl Storage {
             .ddl_state
             .rollback_drop(undo.transaction);
         catalog.views[slot].ddl_version = undo.prior_version;
+        self.rollback_query_comment_drop_in(
+            owners
+                .comments
+                .as_mut()
+                .expect("view rollback owns comments"),
+            undo.source,
+            undo.transaction,
+        );
     }
 
     pub(crate) fn require_populated_materialized_view(
@@ -1079,19 +1809,7 @@ impl Storage {
     ) {
         let view = owners.catalog.views[slot];
         let rule_slot = usize::from(view.return_rule);
-        if let Some(rule) = owners.catalog.rules[rule_slot]
-            .pending
-            .filter(|rule| rule.txid == pending.txid)
-        {
-            self.commit_pending_dependencies_in(
-                &mut owners.dependencies,
-                super::StoredQueryDependencyOwner::Rule(rule_slot as u16),
-                rule.dependency_slot,
-            );
-            owners.catalog.rules[rule_slot].definition = rule.definition;
-            owners.catalog.rules[rule_slot].version = rule.version;
-            owners.catalog.rules[rule_slot].pending = None;
-        }
+        self.publish_pending_rule_in(owners, rule_slot, pending.txid);
         let current = &mut owners.catalog.views[slot];
         current.schema = pending.schema;
         current.name = pending.name;
@@ -1181,6 +1899,7 @@ impl Storage {
                 {
                     self.publish_pending_view_in(&mut owners, slot, pending);
                 }
+                self.publish_pending_rule_in(&mut owners, rule_slot, undo.transaction);
                 owners.catalog.views[slot].ddl_state = view.ddl_state.commit_create();
                 let ownership = &mut owners.catalog.views[slot].ownership;
                 if let Some(pending) = ownership

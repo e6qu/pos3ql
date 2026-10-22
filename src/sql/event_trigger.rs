@@ -765,9 +765,15 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         TriggerCreated(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Create),
         TriggerDropped(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Drop),
         TriggerAltered { slot, .. } => (ObjectRef::Trigger(slot as usize), Mutation::Alter),
-        RuleCreated { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Create),
-        RuleDropped(slot) => (ObjectRef::Rule(slot as usize), Mutation::Drop),
-        RuleAltered { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Alter),
+        RuleChanged { publication, .. } => (
+            ObjectRef::Rule(publication.slot()),
+            match publication {
+                crate::storage::RulePublication::Created(_) => Mutation::Create,
+                crate::storage::RulePublication::Altered(_) => Mutation::Alter,
+            },
+        ),
+        RuleDropped(undo) => (ObjectRef::Rule(undo.slot()), Mutation::Drop),
+        RuleAltered(undo) => (ObjectRef::Rule(undo.slot()), Mutation::Alter),
         PolicyCreated(slot) => (ObjectRef::Policy(slot as usize), Mutation::Create),
         PolicyDropped(slot) => (ObjectRef::Policy(slot as usize), Mutation::Drop),
         PolicyAltered { slot, .. } => (ObjectRef::Policy(slot as usize), Mutation::Alter),

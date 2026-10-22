@@ -1130,7 +1130,7 @@ mod tests {
                 .write_pending(table, 1, 7, 1, Some(location))
                 .unwrap();
             storage.restore_pending(table, 1, 7, undo);
-            storage.drop_table_in(table, 7);
+            let dropped = storage.drop_table_in(table, 7).unwrap();
             assert_eq!(
                 storage
                     .write_pending(table, 1, 7, 1, Some(location))
@@ -1138,17 +1138,17 @@ mod tests {
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            storage.rollback_drop(table);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             storage.commit_create(table);
             let prepared = storage
                 .prepare_pending_write(table, 1, 7, 1, Some(location), true)
                 .unwrap();
-            storage.drop_table_in(table, 8);
+            let dropped = storage.drop_table_in(table, 8).unwrap();
             assert!(matches!(
                 storage.publish_pending_write(prepared).unwrap(),
                 PendingPublication::Wait(8, _)
             ));
-            storage.rollback_drop(table);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             let undo = storage
                 .write_pending(table, 1, 7, 1, Some(location))
                 .unwrap();

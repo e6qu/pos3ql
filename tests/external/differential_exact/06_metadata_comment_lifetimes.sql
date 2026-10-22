@@ -1,0 +1,11 @@
+CREATE SEQUENCE metadata_comment_sequence;
+COMMENT ON SEQUENCE metadata_comment_sequence IS 'original';
+BEGIN;
+COMMENT ON SEQUENCE metadata_comment_sequence IS 'retiring';
+DROP SEQUENCE metadata_comment_sequence;
+CREATE SEQUENCE metadata_comment_sequence;
+SELECT COALESCE(obj_description('metadata_comment_sequence'::regclass, 'pg_class'), 'fresh');
+COMMENT ON SEQUENCE metadata_comment_sequence IS 'replacement';
+COMMIT;
+SELECT COALESCE(obj_description('metadata_comment_sequence'::regclass, 'pg_class'), 'missing');
+DROP SEQUENCE metadata_comment_sequence;

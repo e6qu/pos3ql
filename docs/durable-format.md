@@ -20,8 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v20` | yes | yes | Retains durable role and type identities and counters, typed blocks, enum members, and exact view and return-rule catalog positions and creation stamps. |
-| Journal record | Version `6` at header byte 17; bytes 18–23 are zero | yes | yes | Retains durable account identifiers. View replacement preserves object identifiers; materialized-view refresh state follows its transaction. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v21` | yes | yes | Retains role and type identities, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Journal record | Version `7` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog records retain selected source identities. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -38,7 +38,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v19 and older manifests are rejected before their references are used.
+Manifest v20 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -179,7 +179,7 @@ BEFORE another member. Renaming or renumbering never changes an existing member'
 identity. Row values keep this identity separately from their cached label and
 sort position. Catalog-aware reads select the current label and sort position.
 
-Manifest v15 adds an optional legacy label after each enum member's sort bits.
+Enum manifest records include an optional legacy label after each member's sort bits.
 The retained enum payload readers for kinds 23/147 initialize this binding from their
 labels. Journal kind 149 writes the current label, sort bits, and an optional
 legacy label for each member; it retains the u32 member count. Existing legacy
@@ -237,9 +237,7 @@ those generations and schedules replacements; scalar key hashes use stable membe
 identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
-valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-current journal records or manifest v20. Kind 153 applies to ordinary row writes
-too, so the upgrade is required before resuming writes, even without enum DDL.
+valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. The current manifest and journal framing reject incompatible recovery candidates before they can interpret these records.
 
 Journal routine type references identify their saved source lifetime. Replay
 refreshes the SQL spelling from that source; a missing lifetime cannot select a
@@ -267,7 +265,7 @@ first. The first connection can then commit. After restart, the cast still
 refers to that same type, now named `current_code`. Its saved name cannot select
 a replacement that reused `order_code`.
 
-Manifest v18 and current journal records preserve the physical slot and
+The current manifest and journal records preserve the physical slot and
 `created_at` identity of each domain, enum and named composite. The required
 `catalog_sequence` manifest field remembers the highest creation number used,
 including objects deleted before checkpoint. Restore never assigns
@@ -286,10 +284,10 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 6.
+contracts share this encoding. Table definition payloads use version 7.
 
 Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
-0–15; byte 16 selects the operation; byte 17 is version 3; bytes 18–23 are zero.
+0–15; byte 16 selects the operation; byte 17 is version 7; bytes 18–23 are zero.
 A checksum-valid unsupported version stops local replay without truncating the
 journal. Uploaded records validate the same version before decoding. Update all
 recovery candidates together and use a fresh prefix or verified logical transfer
@@ -317,10 +315,6 @@ For example, changing a customer identifier domain and then renaming a record
 that contains it must recover the new domain reference after losing local caches.
 Prepared transactions retain the same name-change records through checkpoints.
 
-Binaries that predate kind 148 cannot recover a journal containing it. Upgrade
-all recovery and replacement candidates before executing composite type renames
-or schema moves; do not downgrade that prefix afterward. The current manifest and journal identities above apply to these records too.
-
 Full cast and operator catalog records freeze the transaction's current type
 names before journal staging. A domain rename followed by an operator, family
 or class owner edit must not restore an old input or result name during replay.
@@ -342,7 +336,7 @@ For example, a prepared transaction that created a type keeps its owner from
 being deleted after the server loses its local caches. A prepared view read
 continues to block a conflicting rule change. Committing or rolling back the
 prepared transaction releases its recovered locks. The current journal framing
-is version 6; earlier frames are rejected. Replayed view replacement edits the
+is version 7; earlier frames are rejected. Replayed view replacement edits the
 existing view and return rule, preserving their object identifiers. A
 materialized-view refresh publishes its population flag with the transaction's
 rows; prepared recovery must retain that pending decision.
@@ -355,6 +349,51 @@ encoded query. Recovery rejects unavailable positions and mismatched identities;
 it never relocates an existing object to make room. This preserves identifiers
 when an aborted creation leaves a gap in either catalog.
 
+## Catalog identities and sequence restarts
+
+**User example:** one connection creates a materialized report inside a transaction
+and later rolls it back. Another connection creates a different report and commits.
+After loss of the local disk, the committed report keeps its catalog identity,
+backing table and comments even though the earlier creation left unused positions.
+
+A catalog position is a two-byte slot followed by an eight-byte nonzero creation
+stamp, both little endian. Table creation and drop, sequence definition/value/name
+changes, routine definition/name/drop changes, and materialized-view changes carry
+this selected identity. Materialized-view creation also carries its backing table's
+position. Restore checks configured capacity, database, lifetime and occupied slots;
+it never moves an object to a different position to make room. User table payloads
+start with version 7 and this ten-byte position. The internal large-object page
+table alone keeps its reserved slot and zero creation stamp in the manifest.
+
+Checkpoint records use `table2` (slot and creation stamp), `sq7` (slot and stamp),
+`rtn2` (slot and stamp), and `mv6` (catalog and backing positions). The required
+`catalog_sequence` is at least every restored creation stamp. Prepared records
+reconstruct pending definitions and deletions before accepting new client work.
+
+`ALTER SEQUENCE ... RESTART` owns a private value image until commit. The journal
+records an explicit restart-presence byte and optional eight-byte restart value.
+For example, restarting at 50 and calling `nextval` in a prepared transaction must
+not replace the committed value 10 if that transaction is later rolled back.
+Ordinary `nextval` advances remain nontransactional.
+
+Database creation journal records also retain a copy inventory: a four-byte
+count followed by eleven bytes per copied table, named type, sequence, view,
+rewrite rule, materialized view or routine. Each entry has a one-byte kind and
+the ten-byte catalog position. Entries are ordered by kind and slot; unknown
+kinds, duplicate slots, missing source lifetimes, unavailable positions and
+unused entries are errors. The source lifetime selects each copied object,
+so unrelated rolled-back creations cannot change its recovered slot. Encoding
+uses the existing fixed journal buffers and adds no startup allocation.
+`max_rules`, like other catalog slot capacities, cannot exceed 65,535.
+
+The added binary positions are included in the common journal size calculation;
+restart presence costs one byte, plus eight when present. Manifest records grow
+by at most 22 bytes per table, 27 per sequence, 7 per routine and 54 per
+materialized view. Table header scratch is fixed at 278 bytes (previously 256).
+The configured `checkpoint_manifest_bytes` remains fixed: a full buffer fails
+explicitly rather than growing or discarding fields. No runtime heap growth or
+new configurable capacity is introduced.
+
 ## Reader changes
 
 A format change declares its accepted reader identities and current writer
@@ -363,7 +402,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v18. Startup, backup retention, and
+The only accepted checkpoint manifest is v21. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

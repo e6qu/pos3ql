@@ -8,6 +8,845 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_recovery_reuses_populated_retired_table_positions() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("metadata-table-reuse-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine, "CREATE TABLE reused_orders(id integer PRIMARY KEY); INSERT INTO reused_orders VALUES (1)", false);
+            let slot = engine
+                .storage
+                .find_table("public", "reused_orders")
+                .unwrap();
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            for value in 2..=4 {
+                let previous = engine.storage.table(slot).created_at();
+                session.success(&mut engine, "DROP TABLE reused_orders", false);
+                session.success(&mut engine, &format!("CREATE TABLE reused_orders(id integer PRIMARY KEY); INSERT INTO reused_orders VALUES ({value})"), false);
+                assert_eq!(
+                    engine.storage.find_table("public", "reused_orders"),
+                    Some(slot)
+                );
+                assert_ne!(engine.storage.table(slot).created_at(), previous);
+            }
+            let birth = engine.storage.table(slot).created_at();
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            assert_eq!(
+                cold.storage.find_table("public", "reused_orders"),
+                Some(slot)
+            );
+            assert_eq!(cold.storage.table(slot).created_at(), birth);
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&session.success(&mut cold, "SELECT id FROM reused_orders", false)),
+                ["4"]
+            );
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    "INSERT INTO reused_orders VALUES (4)",
+                    false
+                )),
+                ["23505"]
+            );
+        }
+    }
+}
+
+#[test]
+fn metadata_object_descriptions_select_the_actual_catalog() {
+    let mut config = test_config("metadata-object-descriptions");
+    config.max_ddl_per_transaction = 16;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/09_metadata_object_descriptions.sql"
+            ),
+            true
+        )),
+        [
+            "function|function",
+            "table|table",
+            "t",
+            "type|type",
+            "t",
+            "1215|26 19",
+            "1348|26"
+        ]
+    );
+    for statement in [
+        "SELECT obj_description()",
+        "SELECT obj_description(1, 'pg_class', 0)",
+        "SELECT obj_description(*)",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, statement, true)),
+            ["42883"],
+            "{statement}"
+        );
+    }
+}
+
+#[test]
+fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollback() {
+    fn positions(engine: &Engine) -> Vec<u8> {
+        let mut budget = Budget::new(4096);
+        let mut bytes = crate::mem::FixedBuf::new(&mut budget, "clone positions", 4096).unwrap();
+        let image = crate::storage::WalDatabaseClonePositions::Captured {
+            storage: &engine.storage,
+            database: engine.storage.current_database_oid(),
+        };
+        crate::mem::guard::forbid_alloc(|| assert!(image.append(&mut bytes)));
+        bytes.readable().to_vec()
+    }
+    const DEFINITION: &str = "CREATE DOMAIN code AS integer; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("metadata-copy-recovery-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            engine
+                .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                .unwrap();
+            let mut retained =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            retained.success(&mut engine, DEFINITION, false);
+            engine
+                .select_database(crate::storage::DatabaseOid::POSTGRES)
+                .unwrap();
+            let mut discarded =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+            discarded.success(&mut engine, &format!("BEGIN; {DEFINITION}"), false);
+            retained.success(
+                &mut engine,
+                "CREATE DATABASE copied_orders TEMPLATE template1",
+                false,
+            );
+            discarded.success(&mut engine, "ROLLBACK", false);
+            let copied = engine
+                .storage
+                .database_slot("copied_orders", 0)
+                .map(|slot| engine.storage.database(slot).oid)
+                .unwrap();
+            engine.select_database(copied).unwrap();
+            let original = positions(&engine);
+            retained.success(&mut engine, "ALTER SEQUENCE order_counter RENAME TO copied_counter; CREATE OR REPLACE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; REFRESH MATERIALIZED VIEW saved_report", false);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(discarded);
+            drop(retained);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            cold.select_database(copied).unwrap();
+            assert_eq!(
+                positions(&cold),
+                original,
+                "checkpoint={checkpoint}, mode={mode:?}"
+            );
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT nextval('copied_counter'); SELECT order_body(); SELECT id FROM saved_report; SELECT id FROM order_report; SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'p'", false)), ["10", "2", "7", "7", "primary key"]);
+        }
+    }
+}
+
+#[test]
+fn metadata_materialized_template_keeps_its_copied_backing_table() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-materialized-template-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let template = engine
+            .storage
+            .database_slot("template1", 0)
+            .map(|slot| engine.storage.database(slot).oid)
+            .unwrap();
+        engine.select_database(template).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE MATERIALIZED VIEW saved_report AS SELECT 7 AS value; COMMENT ON MATERIALIZED VIEW saved_report IS 'copied report'", true);
+        let source = engine
+            .storage
+            .matview_slot("public", "saved_report", 0)
+            .unwrap();
+        let source_table = engine.storage.matview_table(source);
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        session.success(
+            &mut engine,
+            "CREATE DATABASE copied_reports TEMPLATE template1",
+            true,
+        );
+        let copied = engine
+            .storage
+            .database_slot("copied_reports", 0)
+            .map(|slot| engine.storage.database(slot).oid)
+            .unwrap();
+        engine.select_database(copied).unwrap();
+        let target = engine
+            .storage
+            .matview_slot("public", "saved_report", 0)
+            .unwrap();
+        let target_table = engine.storage.matview_table(target);
+        assert_ne!(target_table, source_table);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM saved_report; SELECT obj_description('saved_report'::regclass)",
+                true
+            )),
+            ["7", "copied report"]
+        );
+        session.success(&mut engine, "DROP MATERIALIZED VIEW saved_report", true);
+        engine.select_database(template).unwrap();
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM saved_report; SELECT obj_description('saved_report'::regclass)",
+                true
+            )),
+            ["7", "copied report"]
+        );
+    }
+}
+
+#[test]
+fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        for commit in [false, true] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let name = format!("metadata-prepared-recovery-{checkpoint}-{commit}-{mode:?}");
+                let mut config = test_config(&name);
+                config.transaction_mode = mode;
+                config.max_prepared_transactions = 1;
+                config.max_ddl_per_transaction = 16;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE SEQUENCE retained_counter START 10; SELECT nextval('retained_counter'); CREATE FUNCTION retained_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW retained_report AS SELECT 7 AS value; CREATE SEQUENCE deleted_counter START 30; CREATE FUNCTION deleted_body() RETURNS integer LANGUAGE SQL AS 'SELECT 4'", false);
+                session.success(&mut engine, "BEGIN; DROP SEQUENCE deleted_counter; DROP FUNCTION deleted_body(); ALTER SEQUENCE retained_counter RESTART WITH 50; SELECT nextval('retained_counter'); ALTER SEQUENCE retained_counter RENAME TO pending_counter; ALTER FUNCTION retained_body() RENAME TO pending_body; CREATE OR REPLACE FUNCTION pending_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; DROP MATERIALIZED VIEW retained_report; CREATE MATERIALIZED VIEW pending_report AS SELECT 9 AS value; CREATE SEQUENCE pending_created_counter; CREATE FUNCTION pending_created_body() RETURNS integer LANGUAGE SQL AS 'SELECT 3'; PREPARE TRANSACTION 'metadata-pending'", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                drop(session);
+                drop(engine);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut cold_budget =
+                    test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+                let gid = ast::PreparedTransactionId::parse("metadata-pending").unwrap();
+                let prepared = cold.prepared_transactions.find(gid).unwrap();
+                let transaction = cold
+                    .prepared_transactions
+                    .slot(prepared)
+                    .metadata()
+                    .transaction_id;
+                let counter = cold
+                    .storage
+                    .sequence_slot("public", "retained_counter", 0)
+                    .unwrap();
+                let committed = cold.storage.sequence_value_for(counter, 0);
+                assert_eq!(committed, (10, true));
+                assert_eq!(
+                    cold.storage
+                        .sequence_slot("public", "pending_counter", transaction),
+                    Some(counter)
+                );
+                let pending = cold.storage.sequence_value_for(counter, transaction);
+                assert_eq!(pending, (50, true));
+                let routine = cold
+                    .storage
+                    .routine_slot_by_name_unambiguous("public", "retained_body", 0)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    cold.storage.routine_for(routine, 0).body.as_str(),
+                    "SELECT 1"
+                );
+                assert_eq!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "pending_body", transaction)
+                        .unwrap(),
+                    Some(routine)
+                );
+                assert_eq!(
+                    cold.storage.routine_for(routine, transaction).body.as_str(),
+                    "SELECT 2"
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "retained_report", 0)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "retained_report", transaction)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "pending_report", 0)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "pending_report", transaction)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "pending_created_counter", 0)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "pending_created_counter", transaction)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "pending_created_body", 0)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous(
+                            "public",
+                            "pending_created_body",
+                            transaction
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", 0)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", transaction)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", 0)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", transaction)
+                        .unwrap()
+                        .is_none()
+                );
+                let mut resolved = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+                resolved.success(
+                    &mut cold,
+                    if commit {
+                        "COMMIT PREPARED 'metadata-pending'"
+                    } else {
+                        "ROLLBACK PREPARED 'metadata-pending'"
+                    },
+                    false,
+                );
+                assert_eq!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", 0)
+                        .is_none(),
+                    commit
+                );
+                assert_eq!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", 0)
+                        .unwrap()
+                        .is_none(),
+                    commit
+                );
+                let statement = if commit {
+                    "SELECT nextval('pending_counter'); SELECT pending_body(); SELECT value FROM pending_report; SELECT pending_created_body()"
+                } else {
+                    "SELECT nextval('retained_counter'); SELECT retained_body(); SELECT value FROM retained_report"
+                };
+                let expected: &[&str] = if commit {
+                    &["51", "2", "9", "3"]
+                } else {
+                    &["11", "1", "7"]
+                };
+                assert_eq!(
+                    data_rows(&resolved.success(&mut cold, statement, false)),
+                    expected
+                );
+                drop(resolved);
+                drop(cold);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut replay_budget =
+                    test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+                let mut replay_session =
+                    ConfiguredTransactionSession::new(&config, &mut replay_budget);
+                let expected: &[&str] = if commit {
+                    &["52", "2", "9", "3"]
+                } else {
+                    &["12", "1", "7"]
+                };
+                assert_eq!(
+                    data_rows(&replay_session.success(&mut replayed, statement, false)),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn metadata_recovery_keeps_catalog_positions_after_concurrent_creation_rollback() {
+    fn identities(engine: &Engine) -> [(usize, u64); 4] {
+        let sequence = engine
+            .storage
+            .sequence_slot("public", "retained_sequence", 0)
+            .unwrap();
+        let routine = engine
+            .storage
+            .routine_slot_by_name_unambiguous("public", "retained_function", 0)
+            .unwrap()
+            .unwrap();
+        let materialized = engine
+            .storage
+            .matview_slot("public", "retained_materialized", 0)
+            .unwrap();
+        let table = engine.storage.matview_table(materialized);
+        [
+            (sequence, engine.storage.sequence(sequence).created_at),
+            (routine, engine.storage.routine(routine).created_at),
+            (
+                materialized,
+                engine.storage.matview(materialized).created_at,
+            ),
+            (table, engine.storage.table(table).created_at()),
+        ]
+    }
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("metadata-catalog-recovery-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_sequences = 2;
+            config.max_routines = 2;
+            config.max_materialized_views = 2;
+            config.max_ddl_per_transaction = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut discarded =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+            let mut retained =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            discarded.success(&mut engine, "BEGIN; CREATE SEQUENCE discarded_sequence; CREATE FUNCTION discarded_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW discarded_materialized AS SELECT 1 AS value", false);
+            retained.success(&mut engine, "CREATE SEQUENCE retained_sequence START 10; CREATE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 7'; CREATE MATERIALIZED VIEW retained_materialized AS SELECT 7 AS value; COMMENT ON SEQUENCE retained_sequence IS 'sequence'; COMMENT ON FUNCTION retained_function() IS 'routine'; COMMENT ON MATERIALIZED VIEW retained_materialized IS 'materialized'", false);
+            discarded.success(&mut engine, "ROLLBACK", false);
+            retained.success(&mut engine, "SELECT nextval('retained_sequence')", false);
+            let original = identities(&engine);
+            assert_eq!(original[0].0, 1);
+            assert_eq!(original[1].0, 1);
+            assert_eq!(original[2].0, 1);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(discarded);
+            drop(retained);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            assert_eq!(
+                identities(&cold),
+                original,
+                "checkpoint={checkpoint}, mode={mode:?}"
+            );
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT retained_function(); SELECT value FROM retained_materialized; SELECT nextval('retained_sequence'); SELECT obj_description('retained_sequence'::regclass); SELECT obj_description('retained_function()'::regprocedure); SELECT obj_description('retained_materialized'::regclass)", false)), ["7", "7", "11", "sequence", "routine", "materialized"]);
+        }
+    }
+}
+
+#[test]
+fn metadata_relation_replacements_preserve_comments_for_the_selected_object() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-relation-replacements-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/08_metadata_relation_replacements.sql"
+            ),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "fresh",
+                "replacement",
+                "fresh",
+                "2",
+                "replacement",
+                "type comment"
+            ]
+        );
+    }
+}
+
+#[test]
+fn metadata_materialized_undo_exhaustion_restores_backing_and_catalog() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-materialized-undo-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 2;
+        config.max_materialized_views = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SEQUENCE reserved_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE MATERIALIZED VIEW retained_materialized AS SELECT 7 AS value",
+            true,
+        );
+        for statement in [
+            "CREATE MATERIALIZED VIEW overflow_materialized AS SELECT 9 AS value",
+            "DROP MATERIALIZED VIEW retained_materialized",
+        ] {
+            session.success(
+                &mut engine,
+                "BEGIN; COMMENT ON SEQUENCE reserved_sequence IS 'reserved'",
+                true,
+            );
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let transaction = session.transaction.txid;
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "retained_materialized", 0)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "overflow_materialized", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            let backing =
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", transaction);
+            if statement.starts_with("CREATE") {
+                let backing =
+                    backing.expect("the aborted transaction owns its earlier backing-table undo");
+                assert!(session.transaction.ddl().iter().any(|undo| matches!(undo,
+                    DdlUndo::Created(slot) if *slot as usize == backing)));
+            } else {
+                assert!(backing.is_none(), "{statement}");
+            }
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
+            session.success(&mut engine, "ROLLBACK", true);
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT value FROM retained_materialized",
+                    true
+                )),
+                ["7"]
+            );
+        }
+        session.success(
+            &mut engine,
+            "CREATE MATERIALIZED VIEW overflow_materialized AS SELECT 9 AS value",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "DROP MATERIALIZED VIEW retained_materialized",
+            true,
+        );
+    }
+}
+
+#[test]
+fn metadata_undo_exhaustion_releases_sequence_and_routine_changes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-undo-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 1;
+        config.max_sequences = 2;
+        config.max_routines = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SEQUENCE retained_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE TABLE retained_table(value integer)",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            true,
+        );
+        for statement in [
+            "CREATE TABLE overflow_table(value integer)",
+            "DROP TABLE retained_table",
+            "CREATE SEQUENCE overflow_sequence",
+            "DROP SEQUENCE retained_sequence",
+            "ALTER SEQUENCE retained_sequence RENAME TO overflow_sequence",
+            "CREATE FUNCTION overflow_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+            "DROP FUNCTION retained_function()",
+            "ALTER FUNCTION retained_function() RENAME TO overflow_function",
+            "CREATE OR REPLACE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+        ] {
+            session.success(
+                &mut engine,
+                "BEGIN; COMMENT ON SEQUENCE retained_sequence IS 'reserved'",
+                true,
+            );
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let transaction = session.transaction.txid;
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "retained_table", transaction)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_table", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .sequence_slot("public", "retained_sequence", transaction)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .sequence_slot("public", "overflow_sequence", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            let routine = engine
+                .storage
+                .routine_slot_by_name_unambiguous("public", "retained_function", transaction)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                engine
+                    .storage
+                    .routine_for(routine, transaction)
+                    .body
+                    .as_str(),
+                "SELECT 1",
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .routine_slot_by_name_unambiguous("public", "overflow_function", transaction)
+                    .unwrap()
+                    .is_none(),
+                "{statement}"
+            );
+            session.success(&mut engine, "ROLLBACK", true);
+        }
+        session.success(&mut engine, "CREATE SEQUENCE overflow_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION overflow_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT retained_function(), overflow_function()",
+                true
+            )),
+            ["1|9"]
+        );
+    }
+}
+
+#[test]
+fn metadata_savepoints_keep_sequence_values_and_routine_comments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-savepoints-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential_exact/07_metadata_savepoints.sql"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "10",
+                "50",
+                "11",
+                "12",
+                "changed",
+                "changed",
+                "2",
+                "original",
+                "2",
+                "original",
+                "changed",
+                "9",
+                "replacement",
+            ]
+        );
+    }
+}
+
+#[test]
+fn metadata_sequence_comment_reuse_keeps_replacement() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-sequence-comments-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_sequences = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/06_metadata_comment_lifetimes.sql"
+            ),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["fresh", "replacement"]);
+    }
+}
+
+#[test]
 fn view_replacement_preserves_identity_without_spare_catalog_slots() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -42678,7 +43517,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut config = test_config("sequence_journal_retry");
     // Reserve the durable transaction marker as well as the CREATE record;
     // this remains too small for the later absolute sequence retry record.
-    config.wal_bytes = 192;
+    config.wal_bytes = 192 + crate::storage::CatalogPosition::ENCODED_BYTES;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
@@ -77438,7 +78277,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v20\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v21\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -77469,7 +78308,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v15",
         "pos3ql-manifest-v18",
         "pos3ql-manifest-v19",
-        "pos3ql-manifest-v21",
+        "pos3ql-manifest-v20",
+        "pos3ql-manifest-v22",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -77627,7 +78467,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v20\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v21\n"))
     );
     drop(recovered);
 

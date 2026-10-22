@@ -1397,8 +1397,14 @@ mod tests {
                     .committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)))
             }
             SavedQueryKind::MaterializedView => storage
-                .create_matview(related, definition.query, false, 7)
-                .map(|slot| storage.matview_dependency_image(slot)),
+                .create_matview(
+                    crate::storage::CatalogAllocation::New,
+                    related,
+                    definition.query,
+                    false,
+                    7,
+                )
+                .map(|change| storage.matview_dependency_image(change.slot())),
             SavedQueryKind::Policy => storage
                 .create_policy(
                     PolicySpec {
@@ -1465,7 +1471,7 @@ mod tests {
                         crate::mem::guard::forbid_alloc(|| {
                             storage.finish_view_publication(
                                 publication_unrelated,
-                                crate::storage::QueryDdlDecision::Commit,
+                                crate::storage::CatalogDdlDecision::Commit,
                             )
                         });
                         finished.send(()).unwrap();
@@ -1565,7 +1571,7 @@ mod tests {
             storage.finish_rule_publication(
                 publication_rule_slot,
                 None,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             let policy = PolicySpec {
                 name: SqlName::parse("recovered_policy").unwrap(),
@@ -1785,7 +1791,7 @@ mod tests {
             storage.finish_rule_publication(
                 publication_slot,
                 None,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             storage
                 .apply_comment(

@@ -730,9 +730,11 @@ SQL execution or replace the remaining durable-commit coordinator.
 
 Table cleanup and existence changes use a lock belonging to the selected table.
 Waiting for that table's retained definition does not reserve unrelated tables
-or the shared definition pool. Committed removal marks the table absent before
-releasing its rows and dependent metadata. Journal replay retains rows until
-checkpoint, as before.
+or the shared definition pool. Removal keeps the table name reserved until
+comment, permission and extension cleanup can complete under their owners.
+Unrelated type creation can proceed while that cleanup waits. The table becomes
+absent before its rows and remaining dependents are released. Journal replay
+retains rows until checkpoint.
 
 Row cleanup releases the shared version pools and row map after at most 64 map
 scan/removal steps, then continues from its saved position. It preserves lookups
@@ -773,6 +775,39 @@ slots for its name. Each connection sees only its own uncommitted creation.
 A read and an update of an existing order can progress while table creation
 waits for its reservation guard; this storage-level test does not enable
 parallel SQL execution.
+
+### Changing sequences and routines
+
+Sequence edits, function bodies and names retain the object and revision selected
+before a wait. Savepoint rollback and a full transaction rollback restore the
+corresponding definitions and comments. Old undo cannot alter an object created
+later in the same slot. A full undo log rejects the command with `54000` and
+releases the staged change. The undo images occupy the startup-reserved log.
+
+```sql
+CREATE SEQUENCE order_numbers START 10;
+SELECT nextval('order_numbers'); -- 10
+BEGIN;
+ALTER SEQUENCE order_numbers RESTART WITH 50;
+SELECT nextval('order_numbers'); -- 50
+ROLLBACK;
+SELECT nextval('order_numbers'); -- 11
+```
+
+An ordinary `nextval` is not rolled back. A restart keeps private values until
+commit, including when a prepared transaction survives loss of the local disk.
+Sequence names share PostgreSQL's relation/type namespace: creating a sequence
+with an existing enum's name fails with `42710` and leaves that type unchanged.
+
+Function replacement publishes its body, signature and saved dependencies together
+with its pending name. Routine comments follow the function's identifier, so
+renaming one overload cannot rename another overload's comments. Dropping and
+recreating a table, sequence, routine or materialized view starts a new lifetime
+without inheriting the previous object's comment or permissions.
+For example, `obj_description('order_total()'::regprocedure, 'pg_proc')`
+reads a function comment. The one-argument form searches local object comments
+across catalogs; an unknown explicit catalog returns NULL. Shared account and
+database comments use `shobj_description`.
 
 ### Replacing views and refreshing saved results
 
@@ -819,6 +854,19 @@ preserve view, row-type, array-type and internal rule identifiers, including
 gaps left by rolled-back creation. Tests delete the entire local data directory
 before reopening from object storage; committed refresh results and prepared
 commit or rollback decisions retain the corresponding readable state.
+Tables, sequences, routines and materialized-view catalogs also retain their
+exact saved positions and creation identities. A materialized view retains the
+backing table's lifetime; a database template copy selects its copied table.
+Unknown or occupied saved positions fail recovery rather than selecting a
+replacement. Replaying a committed table drop releases its rows and dependencies
+before a later creation reuses the saved position. For example, repeatedly
+running `pg_restore --clean` against populated tables must leave the final rows
+readable after restart. See the [current stored formats](durable-format.md).
+
+When a committed index follows a table rename or schema move, its key and
+included columns also follow the transaction's composed column mapping. Dropping
+an earlier column and renaming the table in one transaction must keep the index
+bound to its original key and payload columns.
 
 ### Changing rewrite rules
 
@@ -861,6 +909,10 @@ restart and recovery without local caches. Saved commit and rollback decisions
 release the transaction's private rows and catalog entries before replay, so
 recovery cannot wait on its own unfinished table or sequence creation. Live
 resolution, startup recovery, and savepoint rollback share catalog undo.
+A checkpoint keeps the committed definitions of objects waiting for a prepared
+deletion. For example, preparing `DROP MATERIALIZED VIEW report` must not erase
+its saved definition: `ROLLBACK PREPARED` still needs the original report.
+The same committed-existence rule applies to catalog snapshot filters.
 A transaction listed as prepared in a checkpoint may have committed or rolled
 back later. Recovery verifies its original saved batch and identities before
 applying later decisions; a missing or mismatched batch still rejects startup.

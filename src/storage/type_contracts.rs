@@ -69,10 +69,11 @@ impl CatalogTypes<'_> {
                 )?;
                 if let Some(pending) = &mut definition.pending_definition {
                     routine_type_fields(
-                        &mut pending.arguments[..pending.argument_count],
-                        &mut pending.parameters[..pending.parameter_count],
-                        &mut pending.result_columns[..pending.result_column_count],
-                        &mut pending.kind,
+                        &mut pending.definition.arguments[..pending.definition.argument_count],
+                        &mut pending.definition.parameters[..pending.definition.parameter_count],
+                        &mut pending.definition.result_columns
+                            [..pending.definition.result_column_count],
+                        &mut pending.definition.kind,
                         &mut visit,
                     )?;
                 }
@@ -174,20 +175,22 @@ pub(super) fn routine_type_fields<E>(
 }
 
 // Restrict destinations so the type catalog cannot be locked twice by one attempt.
-pub(super) trait CatalogTypeDestination {}
-impl CatalogTypeDestination for super::OperatorCatalog {}
-impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<RoutineDef> {}
-impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<CastDef> {}
-impl CatalogTypeDestination for super::ViewRuleCatalog {}
-impl CatalogTypeDestination for super::PolicyCatalog {}
-impl CatalogTypeDestination for crate::mem::fixed_vec::FixedVec<super::MatviewDef> {}
+/// These destinations cannot alias the shared type catalog acquired with them.
+pub(super) trait CatalogPublicationDestination {}
+impl CatalogPublicationDestination for super::OperatorCatalog {}
+impl CatalogPublicationDestination for crate::mem::fixed_vec::FixedVec<RoutineDef> {}
+impl CatalogPublicationDestination for crate::mem::fixed_vec::FixedVec<CastDef> {}
+impl CatalogPublicationDestination for super::ViewRuleCatalog {}
+impl CatalogPublicationDestination for super::SequenceCatalog {}
+impl CatalogPublicationDestination for super::PolicyCatalog {}
+impl CatalogPublicationDestination for crate::mem::fixed_vec::FixedVec<super::MatviewDef> {}
 
-pub(super) struct CatalogTypeOwners<'storage, Catalog: CatalogTypeDestination> {
+pub(super) struct CatalogTypeOwners<'storage, Catalog: CatalogPublicationDestination> {
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     types: MutexGuard<'storage, TypeCatalog>,
 }
 
-impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
+impl<Catalog: CatalogPublicationDestination> CatalogTypeOwners<'_, Catalog> {
     pub(super) fn bind_definition<T: CatalogTypeDefinition>(
         &self,
         definition: &mut T,
@@ -199,11 +202,14 @@ impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
 
 pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
+    TypedCatalogCreation,
     ViewDefinition,
     ViewMetadataEdit,
-    QueryMetadataCommit,
-    ViewLifecycle,
+    MetadataCommit,
+    CatalogLifecycle,
+    CatalogRetirement,
     QueryDefinition(super::StoredQueryDependencyView<'input>),
+    QueryCreation(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
 }
 
@@ -211,6 +217,35 @@ pub(super) enum CatalogPublicationInput<'input> {
 pub(super) struct QueryTableTarget {
     slot: usize,
     identity: super::table_definitions::TableIdentity,
+}
+
+impl QueryTableTarget {
+    pub(super) fn slot(self) -> usize {
+        self.slot
+    }
+    pub(super) fn created_at(self) -> u64 {
+        self.identity.created_at
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QueryTargetUse {
+    Read,
+    Retirement,
+    JournalRetirement,
+}
+
+impl QueryTargetUse {
+    fn accepts(self, existence: super::CatalogDdlState, transaction: u32) -> bool {
+        existence.visible_to(transaction)
+            || match self {
+                Self::Read => false,
+                Self::Retirement => existence.pending_drop_txid() == Some(transaction),
+                Self::JournalRetirement => {
+                    transaction == 0 && existence == super::CatalogDdlState::Absent
+                }
+            }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -238,15 +273,24 @@ struct QueryTableOwners<'storage> {
     selected: QueryTableTarget,
 }
 
+struct CatalogOwnerRequirements {
+    types: bool,
+    permissions: bool,
+    comments: bool,
+    extensions: bool,
+}
+
 impl CatalogPublicationInput<'_> {
-    fn requires_catalog(&self) -> bool {
-        match self {
-            Self::RoutineContract
-            | Self::RuleMetadataEdit
-            | Self::ViewDefinition
-            | Self::ViewMetadataEdit => true,
-            Self::QueryMetadataCommit | Self::ViewLifecycle => false,
-            Self::QueryDefinition(dependencies) => {
+    fn requirements(&self) -> CatalogOwnerRequirements {
+        let (types, permissions, comments, extensions) = match self {
+            Self::RoutineContract => (true, false, true, false),
+            Self::TypedCatalogCreation => (true, true, true, false),
+            Self::ViewDefinition => (true, true, false, false),
+            Self::ViewMetadataEdit | Self::RuleMetadataEdit => (true, false, true, false),
+            Self::MetadataCommit => (false, false, true, false),
+            Self::CatalogLifecycle => (false, true, true, false),
+            Self::CatalogRetirement => (false, true, true, true),
+            Self::QueryDefinition(dependencies) | Self::QueryCreation(dependencies) => (
                 dependencies.entries().iter().any(|dependency| {
                     matches!(
                         dependency.class,
@@ -254,22 +298,32 @@ impl CatalogPublicationInput<'_> {
                             | super::DependencyClass::Enum
                             | super::DependencyClass::Composite
                     )
-                })
-            }
+                }),
+                matches!(self, Self::QueryCreation(_)),
+                matches!(self, Self::QueryCreation(_)),
+                false,
+            ),
+        };
+        CatalogOwnerRequirements {
+            types,
+            permissions,
+            comments,
+            extensions,
         }
     }
 }
 
-pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogTypeDestination> {
+pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogPublicationDestination> {
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
     pub(super) types: Option<MutexGuard<'storage, TypeCatalog>>,
     pub(super) permissions: Option<MutexGuard<'storage, super::AclCatalog>>,
     target: Option<QueryTableOwners<'storage>>,
     pub(super) comments: Option<MutexGuard<'storage, super::CommentCatalog>>,
+    pub(super) extensions: Option<MutexGuard<'storage, super::ExtensionCatalog>>,
 }
 
-impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
+impl<Catalog: CatalogPublicationDestination> CatalogDependencyOwners<'_, Catalog> {
     pub(super) fn allocate_preserved_query_image(
         &mut self,
         storage: &Storage,
@@ -303,12 +357,16 @@ impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
         Ok(slot)
     }
 
-    pub(super) fn validate_target(&self, transaction: u32) -> Result<(), SqlError> {
+    pub(super) fn validate_target(
+        &self,
+        transaction: u32,
+        usage: QueryTargetUse,
+    ) -> Result<(), SqlError> {
         if let Some(target) = &self.target {
             let current = target.definition.identity;
             if current.database != target.selected.identity.database
                 || current.created_at != target.selected.identity.created_at
-                || !current.existence.visible_to(transaction)
+                || !usage.accepts(current.existence, transaction)
                 || current
                     .existence
                     .pending_drop_txid()
@@ -321,6 +379,23 @@ impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn target_names(
+        &self,
+        transaction: u32,
+    ) -> Option<(super::SqlName, super::SqlName)> {
+        let target = self.target.as_ref()?;
+        let definition = &target.definition;
+        Some(
+            definition
+                .pending
+                .filter(|pending| pending.transaction == transaction)
+                .map_or(
+                    (definition.committed.schema, definition.committed.name),
+                    |pending| (pending.schema, pending.name),
+                ),
+        )
     }
 
     pub(super) fn write_query_image(
@@ -443,7 +518,7 @@ impl CatalogDependencyOwners<'_, super::ViewRuleCatalog> {
         transaction: u32,
     ) -> Result<(), SqlError> {
         match selected {
-            QueryRuleTarget::Table(_) => self.validate_target(transaction),
+            QueryRuleTarget::Table(_) => self.validate_target(transaction, QueryTargetUse::Read),
             QueryRuleTarget::View {
                 slot,
                 database,
@@ -496,7 +571,7 @@ impl Storage {
     ) -> Result<QueryRuleTarget, SqlError> {
         match target {
             super::RuleTarget::Table(slot) => self
-                .query_table_target(usize::from(slot), transaction)
+                .query_table_target(usize::from(slot), transaction, QueryTargetUse::Read)
                 .map(QueryRuleTarget::Table),
             super::RuleTarget::View(slot) => {
                 let catalog = self.view_rule_catalog();
@@ -525,6 +600,7 @@ impl Storage {
         &self,
         slot: usize,
         transaction: u32,
+        usage: QueryTargetUse,
     ) -> Result<QueryTableTarget, SqlError> {
         let table = self.tables.get(slot).ok_or_else(|| {
             crate::sql_err!(
@@ -534,7 +610,7 @@ impl Storage {
         })?;
         let state = table.definition.read();
         if state.identity.database != super::current_database()
-            || !state.identity.existence.visible_to(transaction)
+            || !usage.accepts(state.identity.existence, transaction)
         {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::UNDEFINED_TABLE,
@@ -547,27 +623,16 @@ impl Storage {
         })
     }
 
-    pub(super) fn catalog_dependency_owners<'storage, Catalog: CatalogTypeDestination>(
+    pub(super) fn catalog_dependency_owners<'storage, Catalog: CatalogPublicationDestination>(
         &'storage self,
         destination: &'storage Mutex<Catalog>,
         input: CatalogPublicationInput<'_>,
         target: Option<QueryTableTarget>,
     ) -> CatalogDependencyOwners<'storage, Catalog> {
-        let requires_types = input.requires_catalog();
-        let requires_comments = matches!(
-            input,
-            CatalogPublicationInput::RuleMetadataEdit
-                | CatalogPublicationInput::ViewMetadataEdit
-                | CatalogPublicationInput::QueryMetadataCommit
-                | CatalogPublicationInput::ViewLifecycle
-        );
-        let requires_permissions = matches!(
-            input,
-            CatalogPublicationInput::ViewDefinition | CatalogPublicationInput::ViewLifecycle
-        );
+        let requirements = input.requirements();
         loop {
             let attempt: Result<_, super::row_ownership::LockWait<'storage>> = (|| {
-                let permissions = if requires_permissions {
+                let permissions = if requirements.permissions {
                     Some(super::row_ownership::try_mutex(
                         &self.acl_catalog,
                         "ACL catalog lock poisoned",
@@ -591,7 +656,7 @@ impl Storage {
                     }
                     None => None,
                 };
-                let comments = if requires_comments {
+                let comments = if requirements.comments {
                     Some(super::row_ownership::try_mutex(
                         &self.comments,
                         "comment catalog lock poisoned",
@@ -603,7 +668,7 @@ impl Storage {
                     destination,
                     "dependent catalog publication lock poisoned",
                 )?;
-                let types = if requires_types {
+                let types = if requirements.types {
                     Some(super::row_ownership::try_mutex(
                         &self.type_catalog,
                         "type catalog lock poisoned",
@@ -615,6 +680,14 @@ impl Storage {
                     &self.stored_query_dependencies,
                     "stored-query dependency catalog lock poisoned",
                 )?;
+                let extensions = if requirements.extensions {
+                    Some(super::row_ownership::try_mutex(
+                        &self.extension_catalog,
+                        "extension catalog lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
                 Ok(CatalogDependencyOwners {
                     catalog,
                     types,
@@ -622,6 +695,7 @@ impl Storage {
                     dependencies,
                     target,
                     comments,
+                    extensions,
                 })
             })();
             match attempt {
@@ -640,7 +714,7 @@ impl Storage {
     /// Final validation and destination installation share these owners. A
     /// source wait releases the destination, matching type-name publication's
     /// rule that no earlier owner remains held while waiting for another one.
-    pub(super) fn catalog_type_owners<'storage, Catalog: CatalogTypeDestination>(
+    pub(super) fn catalog_type_owners<'storage, Catalog: CatalogPublicationDestination>(
         &'storage self,
         destination: &'storage Mutex<Catalog>,
     ) -> CatalogTypeOwners<'storage, Catalog> {

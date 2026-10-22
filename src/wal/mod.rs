@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 6;
+pub(crate) const RECORD_VERSION: u8 = 7;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -250,7 +250,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 6;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 7;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -932,7 +932,10 @@ pub(crate) enum WalOp<'a> {
     /// A table definition staged by the SQL executor. Borrowing keeps the WAL
     /// operation discriminant small even when configured inline schema bounds
     /// make `TableDef` large.
-    CreateTable(&'a TableDef),
+    CreateTable {
+        identity: crate::storage::CatalogPosition,
+        definition: &'a TableDef,
+    },
     /// A validated table-definition payload read from WAL. Replay materializes
     /// it into its bounded stack scratch only at the table-application choke
     /// point, rather than inflating every decoded WAL operation.
@@ -949,6 +952,7 @@ pub(crate) enum WalOp<'a> {
         column_mapping: [u16; MAX_COLUMNS],
     },
     DropTable {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
     },
@@ -1342,6 +1346,7 @@ pub(crate) enum WalOp<'a> {
     CreateDatabase {
         oid: i32,
         template_oid: i32,
+        positions: crate::storage::WalDatabaseClonePositions<'a>,
         definition: crate::storage::DatabaseDefinition,
         owner: u16,
     },
@@ -1415,11 +1420,13 @@ pub(crate) enum WalOp<'a> {
         new_schema: &'a str,
     },
     SetSequenceSchema {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         new_schema: &'a str,
     },
     RenameSequence {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         new_name: &'a str,
@@ -1439,6 +1446,8 @@ pub(crate) enum WalOp<'a> {
     /// CREATE MATERIALIZED VIEW: its rows replay as the backing table's own
     /// Upsert records; this records only the defining query and populated state.
     CreateMatview {
+        identity: crate::storage::CatalogPosition,
+        backing: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         sql: &'a str,
@@ -1447,11 +1456,13 @@ pub(crate) enum WalOp<'a> {
         populated: bool,
     },
     DropMatview {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
     },
     /// REFRESH / WITH [NO] DATA changing whether the matview is populated.
     SetMatviewPopulated {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         populated: bool,
@@ -1460,20 +1471,23 @@ pub(crate) enum WalOp<'a> {
     /// absolutely, so an ALTER replays as a redefinition). `data_type` is the
     /// `SeqType` discriminant.
     CreateSequence {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
-        data_type: u8,
+        data_type: crate::storage::SeqType,
         increment: i64,
         min_value: i64,
         max_value: i64,
         start_value: i64,
         cache: i64,
         cycle: bool,
+        restart: Option<i64>,
         owner: Option<crate::storage::SequenceOwner>,
         generator_for: Option<crate::storage::SequenceOwner>,
         persistence: crate::storage::RelationPersistence,
     },
     DropSequence {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
     },
@@ -1543,6 +1557,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     CreateRoutine {
+        identity: crate::storage::CatalogPosition,
         definition: &'a crate::storage::RoutineDef,
         dependencies: WalStoredQueryDependencies<'a>,
     },
@@ -1619,11 +1634,13 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     DropRoutine {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         argument_signature: &'a [u8],
     },
     AlterRoutineIdentity {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         argument_signature: &'a [u8],
@@ -1640,6 +1657,7 @@ pub(crate) enum WalOp<'a> {
     /// replay is idempotent. Advances are non-transactional (they survive
     /// ROLLBACK), matching PostgreSQL's sequence gaps.
     SequenceAdvance {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         name: &'a str,
         last: i64,
@@ -2603,7 +2621,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
         WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
-        WalOp::CreateTable(definition) => {
+        WalOp::CreateTable { definition, .. } => {
             if table_needs_typed_journal(definition) {
                 KIND_CREATE_TYPED
             } else {
@@ -2869,8 +2887,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => payload.len(),
-        WalOp::CreateTable(def) => {
-            let mut n = 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
+        WalOp::CreateTable {
+            definition: def, ..
+        } => {
+            let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
             n += match def.access_method {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
@@ -2953,7 +2973,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             previous_name,
             ..
         } => 1 + previous_schema.len() + 1 + previous_name.len() + 1 + MAX_COLUMNS * 2,
-        WalOp::DropTable { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::DropTable { schema, name, .. } => 10 + 1 + name.len() + 1 + schema.len(),
         WalOp::Upsert {
             schema,
             table,
@@ -3330,7 +3350,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropTablespace { name } => 1 + name.len(),
         WalOp::CreateAccessMethod { name, .. } => 8 + 1 + name.len() + 1,
         WalOp::DropAccessMethod { name } => 1 + name.len(),
-        WalOp::CreateDatabase { definition, .. } => 10 + database_definition_len(*definition),
+        WalOp::CreateDatabase {
+            definition,
+            positions,
+            ..
+        } => 10 + database_definition_len(*definition) + positions.encoded_len(),
         WalOp::AlterDatabase { definition, .. } => 6 + database_definition_len(*definition),
         WalOp::DropDatabase { .. } => 4,
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
@@ -3389,21 +3413,23 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             new_schema,
         }
-        | WalOp::SetSequenceSchema {
-            schema,
-            name,
-            new_schema,
-        }
         | WalOp::SetViewSchema {
             schema,
             name,
             new_schema,
         } => 1 + schema.len() + 1 + name.len() + 1 + new_schema.len(),
+        WalOp::SetSequenceSchema {
+            schema,
+            name,
+            new_schema,
+            ..
+        } => 10 + 1 + schema.len() + 1 + name.len() + 1 + new_schema.len(),
         WalOp::RenameSequence {
             schema,
             name,
             new_name,
-        } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
+            ..
+        } => 10 + 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::DropTableFk {
             schema,
             table,
@@ -3417,7 +3443,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             dependencies,
             ..
         } => {
-            1 + name.len()
+            20 + 1
+                + name.len()
                 + 2
                 + sql.len()
                 + 1
@@ -3427,24 +3454,29 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + dependencies.encoded_len()
         }
-        WalOp::DropMatview { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetMatviewPopulated { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
+        WalOp::DropMatview { schema, name, .. } => 10 + 1 + name.len() + 1 + schema.len(),
+        WalOp::SetMatviewPopulated { schema, name, .. } => {
+            10 + 1 + name.len() + 1 + schema.len() + 1
+        }
         WalOp::CreateSequence {
             schema,
             name,
             owner,
             generator_for,
+            restart,
             ..
         } => {
             // name, schema, then 1 (data_type) + 5×8 (increment/min/max/start/
             // cache) + 1 (cycle).
-            1 + name.len()
+            10 + 1
+                + name.len()
                 + 1
                 + schema.len()
-                + 3
+                + 2
                 + 5 * 8
                 + 1
                 + 1
+                + restart.map_or(1, |_| 9)
                 + owner.map_or(0, |owner| {
                     1 + owner.table_schema.as_str().len()
                         + 1
@@ -3461,7 +3493,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                         + generator.column.as_str().len()
                 })
         }
-        WalOp::DropSequence { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::DropSequence { schema, name, .. } => 10 + 1 + name.len() + 1 + schema.len(),
         WalOp::CreateDomain(_, def) => {
             let de = def.default_expr.map(|e| e.as_str().len()).unwrap_or(0);
             let parent = def.base_domain.map(|d| d.storage_name().len()).unwrap_or(0);
@@ -3566,8 +3598,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateRoutine {
             definition: def,
             dependencies,
+            ..
         } => {
-            8 + 2
+            10 + 2
                 + 3
                 + 4
                 + def.attributes.cost_bits.map_or(1, |_| 9)
@@ -3813,15 +3846,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             name,
             argument_signature,
-        } => 1 + name.len() + 1 + schema.len() + argument_signature.len(),
+            ..
+        } => 10 + 1 + name.len() + 1 + schema.len() + argument_signature.len(),
         WalOp::AlterRoutineIdentity {
             schema,
             name,
             argument_signature,
             new_schema,
             new_name,
+            ..
         } => {
-            1 + name.len()
+            10 + 1
+                + name.len()
                 + 1
                 + schema.len()
                 + argument_signature.len()
@@ -3836,7 +3872,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             new_schema,
             new_name,
         } => 1 + name.len() + 1 + schema.len() + 1 + new_schema.len() + 1 + new_name.len(),
-        WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
+        WalOp::SequenceAdvance { schema, name, .. } => {
+            10 + 1 + name.len() + 1 + schema.len() + 8 + 1
+        }
         WalOp::ResetUnloggedRelations => 0,
         WalOp::Comment {
             schema, name, text, ..
@@ -4512,8 +4550,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => buffer.append(payload),
-        WalOp::CreateTable(def) => {
+        WalOp::CreateTable {
+            identity,
+            definition: def,
+        } => {
             let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
+                && buffer.append(&identity.encode())
                 && name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
             ok &= buffer.append(&[
@@ -4666,7 +4708,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::DropTable { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::DropTable {
+            identity,
+            schema,
+            name,
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+        }
         WalOp::Upsert {
             schema,
             table,
@@ -5343,6 +5393,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::CreateDatabase {
             oid,
             template_oid,
+            positions,
             definition,
             owner,
         } => {
@@ -5350,6 +5401,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&template_oid.to_le_bytes())
                 && append_database_definition(buffer, *definition)
                 && buffer.append(&owner.to_le_bytes())
+                && positions.append(buffer)
         }
         WalOp::AlterDatabase {
             oid,
@@ -5440,11 +5492,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             new_schema,
         }
-        | WalOp::SetSequenceSchema {
-            schema,
-            name,
-            new_schema,
-        }
         | WalOp::SetViewSchema {
             schema,
             name,
@@ -5452,17 +5499,36 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_schema)
         }
+        WalOp::SetSequenceSchema {
+            identity,
+            schema,
+            name,
+            new_schema,
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, new_schema)
+        }
         WalOp::RenameSequence {
+            identity,
             schema,
             name,
             new_name,
-        } => name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_name),
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, new_name)
+        }
         WalOp::DropTableFk {
             schema,
             table,
             fk_name,
         } => name_bytes(buffer, schema) && name_bytes(buffer, table) && name_bytes(buffer, fk_name),
         WalOp::CreateMatview {
+            identity,
+            backing,
             schema,
             name,
             sql,
@@ -5470,7 +5536,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             dependencies,
             populated,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && buffer.append(&backing.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
                 && name_bytes(buffer, schema)
@@ -5479,19 +5547,28 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[u8::from(*populated)])
                 && dependencies.append(buffer)
         }
-        WalOp::DropMatview { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        WalOp::DropMatview {
+            identity,
+            schema,
+            name,
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
         }
         WalOp::SetMatviewPopulated {
+            identity,
             schema,
             name,
             populated,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[u8::from(*populated)])
         }
         WalOp::CreateSequence {
+            identity,
             schema,
             name,
             data_type,
@@ -5501,20 +5578,26 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             start_value,
             cache,
             cycle,
+            restart,
             owner,
             generator_for,
             persistence,
         } => {
-            let mut ok = name_bytes(buffer, name)
+            let mut ok = buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
-                && buffer.append(&[u8::MAX, persistence.code(), *data_type])
+                && buffer.append(&[persistence.code(), data_type.to_u8()])
                 && buffer.append(&increment.to_le_bytes())
                 && buffer.append(&min_value.to_le_bytes())
                 && buffer.append(&max_value.to_le_bytes())
                 && buffer.append(&start_value.to_le_bytes())
                 && buffer.append(&cache.to_le_bytes())
                 && buffer.append(&[u8::from(*cycle)])
-                && buffer.append(&[u8::from(owner.is_some())]);
+                && buffer.append(&[u8::from(restart.is_some())]);
+            if let Some(value) = restart {
+                ok &= buffer.append(&value.to_le_bytes());
+            }
+            ok &= buffer.append(&[u8::from(owner.is_some())]);
             if let Some(owner) = owner {
                 ok &= name_bytes(buffer, owner.table_schema.as_str())
                     && name_bytes(buffer, owner.table.as_str())
@@ -5528,8 +5611,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::DropSequence { schema, name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, schema)
+        WalOp::DropSequence {
+            identity,
+            schema,
+            name,
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
         }
         WalOp::CreateDomain(slot, def) => {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
@@ -5675,11 +5764,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
         WalOp::CreateRoutine {
+            identity,
             definition: def,
             dependencies,
         } => {
-            let mut ok = buffer.append(&def.created_at.to_le_bytes())
-                && buffer.append(&def.ownership.owner.to_le_bytes())
+            let mut ok = identity.created_at() == def.created_at
+                && buffer.append(&identity.encode())
+                && buffer.append(&def.ownership.committed().owner.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
                 && buffer.append(&[def.argument_count as u8]);
@@ -5995,22 +6086,26 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::DropRoutine {
+            identity,
             schema,
             name,
             argument_signature,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(argument_signature)
         }
         WalOp::AlterRoutineIdentity {
+            identity,
             schema,
             name,
             argument_signature,
             new_schema,
             new_name,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(argument_signature)
                 && name_bytes(buffer, new_schema)
@@ -6028,12 +6123,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, new_name)
         }
         WalOp::SequenceAdvance {
+            identity,
             schema,
             name,
             last,
             is_called,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&last.to_le_bytes())
                 && buffer.append(&[u8::from(*is_called)])
@@ -7033,8 +7130,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     decode_op_inner(kind, payload, WalDecodeOutput::NONE)
 }
 
-pub(crate) fn decode_table_payload(payload: &[u8]) -> Option<TableDef> {
-    let mut definition = TableDef::empty();
+pub(crate) fn decode_table_payload(
+    payload: &[u8],
+) -> Option<(crate::storage::CatalogPosition, TableDef)> {
+    let mut definition = None;
     decode_op_inner(
         KIND_CREATE,
         payload,
@@ -7043,7 +7142,7 @@ pub(crate) fn decode_table_payload(payload: &[u8]) -> Option<TableDef> {
             ..WalDecodeOutput::NONE
         },
     )?;
-    Some(definition)
+    definition
 }
 
 pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<(u16, crate::storage::DomainDef)> {
@@ -7066,7 +7165,11 @@ pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<(u16, crate::stora
 pub(crate) fn decode_routine_payload(
     payload: &[u8],
     wide_results: bool,
-) -> Option<(crate::storage::RoutineDef, WalStoredQueryDependencies<'_>)> {
+) -> Option<(
+    crate::storage::CatalogPosition,
+    crate::storage::RoutineDef,
+    WalStoredQueryDependencies<'_>,
+)> {
     let mut decoded = None;
     decode_op_inner(
         if wide_results {
@@ -7157,10 +7260,11 @@ pub(crate) fn decode_operator_class_payload(
 }
 
 struct WalDecodeOutput<'output, 'payload> {
-    table: Option<&'output mut TableDef>,
+    table: Option<&'output mut Option<(crate::storage::CatalogPosition, TableDef)>>,
     domain: Option<&'output mut crate::storage::DomainDef>,
     routine: Option<
         &'output mut Option<(
+            crate::storage::CatalogPosition,
             crate::storage::RoutineDef,
             WalStoredQueryDependencies<'payload>,
         )>,
@@ -7187,6 +7291,16 @@ impl WalDecodeOutput<'_, '_> {
         operator_family: None,
         operator_class: None,
     };
+}
+
+fn take_catalog_position(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::CatalogPosition> {
+    let end = at.checked_add(crate::storage::CatalogPosition::ENCODED_BYTES)?;
+    let position = crate::storage::CatalogPosition::decode(payload.get(*at..end)?)?;
+    *at = end;
+    Some(position)
 }
 
 fn decode_op_inner<'a>(
@@ -7403,10 +7517,11 @@ fn decode_op_inner<'a>(
         }),
         KIND_CREATE | KIND_CREATE_TYPED => decode_large_op(|| {
             let table_version = payload.get(at).copied()?;
-            if !matches!(table_version, 3 | TABLE_DEF_PAYLOAD_VERSION) {
+            if table_version != TABLE_DEF_PAYLOAD_VERSION {
                 return None;
             }
             at += 1;
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
@@ -7421,24 +7536,15 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             at += 1;
-            let (persistence, on_commit) = if table_version >= 4 {
-                let persistence =
-                    crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
-                at += 1;
-                let on_commit = match *payload.get(at)? {
-                    0 => crate::storage::OnCommitAction::PreserveRows,
-                    1 => crate::storage::OnCommitAction::DeleteRows,
-                    2 => crate::storage::OnCommitAction::Drop,
-                    _ => return None,
-                };
-                at += 1;
-                (persistence, on_commit)
-            } else {
-                (
-                    crate::storage::RelationPersistence::Permanent,
-                    crate::storage::OnCommitAction::PreserveRows,
-                )
+            let persistence = crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
+            at += 1;
+            let on_commit = match *payload.get(at)? {
+                0 => crate::storage::OnCommitAction::PreserveRows,
+                1 => crate::storage::OnCommitAction::DeleteRows,
+                2 => crate::storage::OnCommitAction::Drop,
+                _ => return None,
             };
+            at += 1;
             let tablespace = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let access_method = match *payload.get(at)? {
@@ -7751,7 +7857,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             if let Some(output) = decoded_table {
-                *output = def;
+                *output = Some((identity, def));
             }
             Some(if kind == KIND_CREATE_TYPED {
                 WalOp::RestoreTypedTable(payload)
@@ -7781,9 +7887,14 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropTable { schema, name })
+            (at == payload.len()).then_some(WalOp::DropTable {
+                identity,
+                schema,
+                name,
+            })
         }),
         KIND_UPSERT | KIND_UPSERT_V2 => decode_large_op(|| {
             let table = take_name(&mut at)?;
@@ -8895,6 +9006,8 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_CREATE_MATVIEW => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            let backing = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
@@ -8915,6 +9028,8 @@ fn decode_op_inner<'a>(
             at = payload.len();
             let dependencies = WalStoredQueryDependencies::Encoded(encoded);
             (at == payload.len()).then_some(WalOp::CreateMatview {
+                identity,
+                backing,
                 schema,
                 name,
                 sql,
@@ -8924,16 +9039,23 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_MATVIEW => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropMatview { schema, name })
+            (at == payload.len()).then_some(WalOp::DropMatview {
+                identity,
+                schema,
+                name,
+            })
         }),
         KIND_SET_MATVIEW_POPULATED => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let populated = stored_boolean(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SetMatviewPopulated {
+                identity,
                 schema,
                 name,
                 populated,
@@ -9345,9 +9467,12 @@ fn decode_op_inner<'a>(
             let definition = decode_database_definition(payload, &mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let positions = crate::storage::DatabaseClonePositions::decode(payload.get(at..)?)?;
+            at = payload.len();
             (at == payload.len()).then_some(WalOp::CreateDatabase {
                 oid,
                 template_oid,
+                positions: crate::storage::WalDatabaseClonePositions::Encoded(positions),
                 definition,
                 owner,
             })
@@ -9399,20 +9524,13 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_CREATE_SEQUENCE => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let marker = *payload.get(at)?;
+            let persistence = crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
             at += 1;
-            let (persistence, data_type) = if marker == u8::MAX {
-                let persistence =
-                    crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
-                at += 1;
-                let data_type = *payload.get(at)?;
-                at += 1;
-                (persistence, data_type)
-            } else {
-                (crate::storage::RelationPersistence::Permanent, marker)
-            };
+            let data_type = crate::storage::SeqType::from_u8(*payload.get(at)?)?;
+            at += 1;
             let take_i64 = |at: &mut usize| -> Option<i64> {
                 let v = i64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().unwrap());
                 *at += 8;
@@ -9425,29 +9543,37 @@ fn decode_op_inner<'a>(
             let cache = take_i64(&mut at)?;
             let cycle = stored_boolean(*payload.get(at)?)?;
             at += 1;
+            let restarted = stored_boolean(*payload.get(at)?)?;
+            at += 1;
+            let restart = if restarted {
+                Some(take_i64(&mut at)?)
+            } else {
+                None
+            };
             let has_owner = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let owner = has_owner
-                .then(|| {
-                    Some(crate::storage::SequenceOwner {
-                        table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                        table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                        column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                    })
+            let owner = if has_owner {
+                Some(crate::storage::SequenceOwner {
+                    table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                 })
-                .flatten();
+            } else {
+                None
+            };
             let has_generator = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let generator_for = has_generator
-                .then(|| {
-                    Some(crate::storage::SequenceOwner {
-                        table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                        table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                        column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
-                    })
+            let generator_for = if has_generator {
+                Some(crate::storage::SequenceOwner {
+                    table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
+                    column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                 })
-                .flatten();
+            } else {
+                None
+            };
             (at == payload.len()).then_some(WalOp::CreateSequence {
+                identity,
                 schema,
                 name,
                 data_type,
@@ -9457,17 +9583,24 @@ fn decode_op_inner<'a>(
                 start_value,
                 cache,
                 cycle,
+                restart,
                 owner,
                 generator_for,
                 persistence,
             })
         }),
         KIND_DROP_SEQUENCE => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropSequence { schema, name })
+            (at == payload.len()).then_some(WalOp::DropSequence {
+                identity,
+                schema,
+                name,
+            })
         }),
         KIND_SEQUENCE_ADVANCE => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
@@ -9475,6 +9608,7 @@ fn decode_op_inner<'a>(
             let is_called = stored_boolean(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SequenceAdvance {
+                identity,
                 schema,
                 name,
                 last,
@@ -9841,8 +9975,8 @@ fn decode_op_inner<'a>(
         }),
         KIND_CREATE_ROUTINE | KIND_CREATE_ROUTINE_V2 => decode_large_op(|| {
             let wide_results = kind == KIND_CREATE_ROUTINE_V2;
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
+            let created_at = identity.created_at();
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let name = take_name(&mut at)?;
@@ -10097,6 +10231,8 @@ fn decode_op_inner<'a>(
             let definition = crate::storage::RoutineDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
                 created_at,
+                version: created_at,
+                ddl_version: created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 pending_identity: None,
@@ -10123,6 +10259,7 @@ fn decode_op_inner<'a>(
             };
             if let Some(output) = decoded_routine {
                 *output = Some((
+                    identity,
                     definition,
                     WalStoredQueryDependencies::Encoded(encoded_dependencies),
                 ));
@@ -10686,6 +10823,7 @@ fn decode_op_inner<'a>(
             Some(WalOp::RestoreOperatorClass(payload))
         }),
         KIND_DROP_ROUTINE => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let argument_signature = payload.get(at..)?;
@@ -10694,12 +10832,14 @@ fn decode_op_inner<'a>(
                 return None;
             }
             Some(WalOp::DropRoutine {
+                identity,
                 schema,
                 name,
                 argument_signature,
             })
         }),
         KIND_ALTER_ROUTINE_IDENTITY => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let signature_start = at;
@@ -10720,6 +10860,7 @@ fn decode_op_inner<'a>(
             let new_schema = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::AlterRoutineIdentity {
+                identity,
                 schema,
                 name,
                 argument_signature,
@@ -10844,20 +10985,24 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_SET_SEQUENCE_SCHEMA => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::SetSequenceSchema {
+                identity,
                 schema,
                 name,
                 new_schema,
             })
         }),
         KIND_RENAME_SEQUENCE => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenameSequence {
+                identity,
                 schema,
                 name,
                 new_name,
@@ -13282,7 +13427,13 @@ mod tests {
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
         ));
         let operations = [
-            (KIND_CREATE_TYPED, WalOp::CreateTable(&table)),
+            (
+                KIND_CREATE_TYPED,
+                WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: &table,
+                },
+            ),
             (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(0, &domain)),
             (
                 KIND_CREATE_VIEW_BOUND,
@@ -13341,7 +13492,7 @@ mod tests {
                 match *kind {
                     KIND_CREATE_TYPED => {
                         assert!(decode_op(KIND_CREATE, payload.readable()).is_none());
-                        let decoded = decode_table_payload(payload.readable()).unwrap();
+                        let (_, decoded) = decode_table_payload(payload.readable()).unwrap();
                         assert_eq!(decoded.columns[0].default, table.columns[0].default);
                     }
                     KIND_CREATE_DOMAIN_TYPED => {
@@ -13944,7 +14095,7 @@ mod tests {
             let operation = decode_record(record).unwrap();
             let shown = match operation {
                 WalOp::RestoreTable(payload) => {
-                    let definition = decode_table_payload(payload).unwrap();
+                    let (_, definition) = decode_table_payload(payload).unwrap();
                     format!("{lsn}:CreateTable({definition:?})")
                 }
                 WalOp::RestoreDomain(payload) => {
@@ -13974,7 +14125,10 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "truncated table payload", 4096).unwrap();
         assert!(append_payload(
             &mut payload,
-            &WalOp::CreateTable(&definition)
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                definition: &definition
+            }
         ));
         let truncated_len = payload.len() - definition.n_columns;
         assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
@@ -13994,9 +14148,12 @@ mod tests {
                 payload.clear();
                 assert!(append_payload(
                     &mut payload,
-                    &WalOp::CreateTable(&definition)
+                    &WalOp::CreateTable {
+                        identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                        definition: &definition
+                    }
                 ));
-                let restored = decode_table_payload(payload.readable()).unwrap();
+                let (_, restored) = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.columns[1].collation, collation);
             });
         }
@@ -14042,9 +14199,12 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
         assert!(append_payload(
             &mut payload,
-            &WalOp::CreateTable(&definition)
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                definition: &definition
+            }
         ));
-        let restored = decode_table_payload(payload.readable())
+        let (_, restored) = decode_table_payload(payload.readable())
             .expect("partition table definition did not decode");
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
         assert_eq!(restored.type_membership, definition.type_membership);
@@ -14592,8 +14752,14 @@ mod tests {
         };
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
-            wal.append_committed(1, &WalOp::CreateTable(&sample_def()))
-                .unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: &sample_def(),
+                },
+            )
+            .unwrap();
             wal.append_committed(
                 2,
                 &WalOp::Upsert {
@@ -14621,6 +14787,7 @@ mod tests {
             wal.append_committed(
                 4,
                 &WalOp::DropTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                     schema: "public",
                     name: "t",
                 },
@@ -14629,15 +14796,17 @@ mod tests {
             wal.append_committed(
                 5,
                 &WalOp::CreateSequence {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                     schema: "public",
                     name: "s",
-                    data_type: 1,
+                    data_type: crate::storage::SeqType::Integer,
                     increment: 2,
                     min_value: 1,
                     max_value: 100,
                     start_value: 5,
                     cache: 1,
                     cycle: true,
+                    restart: None,
                     owner: Some(sequence_link),
                     generator_for: Some(sequence_link),
                     persistence: crate::storage::RelationPersistence::Permanent,
@@ -14647,6 +14816,7 @@ mod tests {
             wal.append_committed(
                 6,
                 &WalOp::SequenceAdvance {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                     schema: "public",
                     name: "s",
                     last: 42,
@@ -14657,6 +14827,7 @@ mod tests {
             wal.append_committed(
                 7,
                 &WalOp::DropSequence {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                     schema: "public",
                     name: "s",
                 },
@@ -14769,6 +14940,7 @@ mod tests {
             wal.append_committed(
                 17,
                 &WalOp::AlterRoutineIdentity {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                     schema: "public",
                     name: "routine",
                     argument_signature: &[1, 23, 0],
@@ -14980,6 +15152,7 @@ mod tests {
         wal.append_committed(
             26,
             &WalOp::DropTable {
+                identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
                 schema: "public",
                 name: "u",
             },
@@ -15572,6 +15745,96 @@ mod tests {
     }
 
     #[test]
+    fn metadata_wal_positions_and_restart_flags_reject_corruption() {
+        let identity = crate::storage::CatalogPosition::new(7, 42).unwrap();
+        let backing = crate::storage::CatalogPosition::new(8, 43).unwrap();
+        let operations = [
+            WalOp::CreateMatview {
+                identity,
+                backing,
+                schema: "public",
+                name: "report",
+                sql: "SELECT 1 AS value",
+                path: "public",
+                dependencies: WalStoredQueryDependencies::Captured(
+                    crate::storage::StoredQueryDependencies::EMPTY.view(),
+                ),
+                populated: true,
+            },
+            WalOp::DropMatview {
+                identity,
+                schema: "public",
+                name: "report",
+            },
+            WalOp::SetMatviewPopulated {
+                identity,
+                schema: "public",
+                name: "report",
+                populated: false,
+            },
+            WalOp::RenameSequence {
+                identity,
+                schema: "public",
+                name: "counter",
+                new_name: "renamed",
+            },
+            WalOp::SetSequenceSchema {
+                identity,
+                schema: "public",
+                name: "counter",
+                new_schema: "other",
+            },
+            WalOp::DropTable {
+                identity,
+                schema: "public",
+                name: "report",
+            },
+            WalOp::CreateSequence {
+                identity,
+                schema: "public",
+                name: "counter",
+                data_type: crate::storage::SeqType::Bigint,
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                start_value: 10,
+                cache: 1,
+                cycle: false,
+                restart: Some(50),
+                owner: None,
+                generator_for: None,
+                persistence: crate::storage::RelationPersistence::Permanent,
+            },
+        ];
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "metadata WAL", 4096).unwrap();
+        let mut encoded = FixedBuf::new(&mut budget, "metadata WAL reencoded", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for operation in &operations {
+                payload.clear();
+                assert!(append_payload(&mut payload, operation));
+                assert_eq!(payload.len(), encoded_payload_len(operation));
+                let decoded = decode_op(op_kind(operation), payload.readable()).unwrap();
+                encoded.clear();
+                assert!(append_payload(&mut encoded, &decoded));
+                assert_eq!(encoded.readable(), payload.readable());
+                for end in 0..payload.len() {
+                    assert!(decode_op(op_kind(operation), &payload.readable()[..end]).is_none());
+                }
+                payload.filled_mut()[2..10].fill(0);
+                assert!(decode_op(op_kind(operation), payload.readable()).is_none());
+            }
+            let operation = &operations[6];
+            payload.clear();
+            assert!(append_payload(&mut payload, operation));
+            let restart_flag = 10 + 1 + "counter".len() + 1 + "public".len() + 2 + 5 * 8 + 1;
+            assert_eq!(payload.readable()[restart_flag], 1);
+            payload.filled_mut()[restart_flag] = 2;
+            assert!(decode_op(op_kind(operation), payload.readable()).is_none());
+        });
+    }
+
+    #[test]
     fn routine_payload_rejects_corrupt_dependency_suffix() {
         let definition = crate::storage::RoutineDef {
             created_at: 1,
@@ -15580,9 +15843,14 @@ mod tests {
             body: crate::util::StackStr::from_str("SELECT 1"),
             creation_path: crate::util::StackStr::from_str("public"),
             ddl_state: crate::storage::CatalogDdlState::Present,
+            ownership: crate::storage::Ownership {
+                owner: 0,
+                pending: Some(crate::storage::PendingOwnership { txid: 7, owner: 42 }),
+            },
             ..crate::storage::RoutineDef::EMPTY
         };
         let operation = WalOp::CreateRoutine {
+            identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
             definition: &definition,
             dependencies: WalStoredQueryDependencies::Captured(
                 crate::storage::StoredQueryDependencies::EMPTY.view(),
@@ -15597,6 +15865,8 @@ mod tests {
         .unwrap();
         assert!(append_payload(&mut payload, &operation));
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_some());
+        let (_, restored, _) = decode_routine_payload(payload.readable(), false).unwrap();
+        assert_eq!(restored.ownership.owner, 42);
         let last = payload.len() - 1;
         payload.filled_mut()[last] = 0xff;
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_none());
@@ -15725,6 +15995,7 @@ mod tests {
             };
         }
         let operation = WalOp::CreateRoutine {
+            identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
             definition: &definition,
             dependencies: WalStoredQueryDependencies::Captured(
                 crate::storage::StoredQueryDependencies::EMPTY.view(),
@@ -15743,7 +16014,8 @@ mod tests {
                 decode_op(KIND_CREATE_ROUTINE_V2, payload.readable()),
                 Some(WalOp::RestoreRoutine { .. })
             ));
-            let (decoded, dependencies) = decode_routine_payload(payload.readable(), true).unwrap();
+            let (_, decoded, dependencies) =
+                decode_routine_payload(payload.readable(), true).unwrap();
             assert_eq!(decoded.argument_count, MAX_ROUTINE_ARGUMENTS);
             assert_eq!(decoded.result_column_count, MAX_ROUTINE_OUTPUT_COLUMNS);
             assert_eq!(decoded.config_count, MAX_ROUTINE_CONFIGS);

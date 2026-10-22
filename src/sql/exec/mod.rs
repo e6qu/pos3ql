@@ -847,7 +847,7 @@ fn create_owned_sequence(
     plan: OwnedSequencePlan,
     persistence: crate::storage::RelationPersistence,
     txid: u32,
-) -> Result<usize, SqlError> {
+) -> Result<crate::storage::SequenceChange, SqlError> {
     if storage.relation_name_taken(plan.schema.as_str(), plan.name.as_str(), txid) {
         return Err(sql_err!(
             sqlstate::DUPLICATE_TABLE,
@@ -857,6 +857,7 @@ fn create_owned_sequence(
     }
     let slot = storage.create_sequence(
         crate::storage::SequenceCreateSpec {
+            allocation: crate::storage::CatalogAllocation::New,
             schema: plan.schema,
             name: plan.name,
             spec: plan.spec,
@@ -874,9 +875,11 @@ fn create_owned_sequence(
             txid,
             lsn,
             &WalOp::CreateSequence {
+                restart: None,
+                identity: storage.sequence_position(slot.slot()),
                 schema: plan.schema.as_str(),
                 name: plan.name.as_str(),
-                data_type: plan.spec.data_type.to_u8(),
+                data_type: plan.spec.data_type,
                 increment: plan.spec.increment,
                 min_value: plan.spec.min_value,
                 max_value: plan.spec.max_value,
@@ -890,7 +893,7 @@ fn create_owned_sequence(
         )
     };
     if let Err(error) = wal_result {
-        storage.rollback_sequence_create(slot);
+        storage.finish_sequence_change(slot, crate::storage::CatalogDdlDecision::Rollback);
         return Err(error);
     }
     Ok(slot)
@@ -1054,7 +1057,14 @@ fn create_table_kind(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&def))
+                wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateTable {
+                        identity: storage.table_position(slot),
+                        definition: &def,
+                    },
+                )
             };
             if let Err(e) = wal_result {
                 // Nothing reached the journal; undo the in-memory apply.
@@ -1116,10 +1126,7 @@ fn create_table_kind(
                         Ok(sequence_slot) => sequence_slot,
                         Err(error) => return sql_fail(error),
                     };
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::SequenceCreated(sequence_slot as u32))
-                {
-                    storage.rollback_sequence_create(sequence_slot);
+                if let Err(error) = txn.record_sequence_change(storage, sequence_slot) {
                     return sql_fail(error);
                 }
                 if let Err(error) = apply_default_privileges_to_new_object(
@@ -1127,7 +1134,7 @@ fn create_table_kind(
                     txn,
                     crate::storage::AccessObject {
                         class: crate::storage::AccessClass::Sequence,
-                        slot: sequence_slot as u16,
+                        slot: sequence_slot.slot() as u16,
                     },
                 ) {
                     return sql_fail(error);
@@ -5985,6 +5992,7 @@ fn drop_table_kind(
                                 txn.txid,
                                 lsn,
                                 &WalOp::DropSequence {
+                                    identity: storage.sequence_position(sequence_index),
                                     schema: sequence_schema.as_str(),
                                     name: sequence_name.as_str(),
                                 },
@@ -5999,9 +6007,7 @@ fn drop_table_kind(
                         txn.txid,
                     ) {
                         Ok(Some(slot)) => {
-                            if let Err(error) =
-                                txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
-                            {
+                            if let Err(error) = txn.record_sequence_change(storage, slot) {
                                 return sql_fail(error);
                             }
                         }
@@ -6072,6 +6078,7 @@ fn drop_table_kind(
                             txn.txid,
                             lsn,
                             &WalOp::DropTable {
+                                identity: storage.table_position(index),
                                 schema: def.schema.as_str(),
                                 name: def.name.as_str(),
                             },
@@ -6080,10 +6087,13 @@ fn drop_table_kind(
                 if let Err(e) = wal_result {
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(index as u32)) {
+                let dropped = match storage.drop_table_in(index, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(e) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(e);
                 }
-                storage.drop_table_in(index, txn.txid);
                 // A table's indexes are dropped with it (no separate journal
                 // record; DropTable replay re-applies this).
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
@@ -10238,6 +10248,7 @@ pub(crate) fn drop_owned(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
+                identity: storage.routine_position(slot),
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
                 argument_signature: signature,
@@ -10245,9 +10256,15 @@ pub(crate) fn drop_owned(
         ) {
             return sql_fail(error);
         }
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_routine(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_routine_change(storage, change) {
             return sql_fail(error);
         }
     }
@@ -13373,42 +13390,47 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
+                        identity: storage.table_position(*table),
                         schema: def.schema.as_str(),
                         name: def.name.as_str(),
                     },
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::Dropped(*table as u32)) {
+                let dropped = match storage.drop_table_in(*table, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(error);
                 }
-                storage.drop_table_in(*table, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropMatview {
+                        identity: storage.matview_position(*catalog),
                         schema: def.schema.as_str(),
                         name: def.name.as_str(),
                     },
                 ) {
                     return sql_fail(error);
                 }
-                match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
-                    Ok(Some(slot)) => {
-                        debug_assert_eq!(slot, *catalog);
-                        if let Err(error) =
-                            txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))
-                        {
-                            return sql_fail(error);
-                        }
-                    }
-                    Ok(None) => {}
+                let target = match storage.prepare_matview_edit(*catalog, txn.txid) {
+                    Ok(target) => target,
                     Err(error) => return sql_fail(error),
+                };
+                let change = match storage.drop_matview(target, txn.txid) {
+                    Ok(change) => change,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) = txn.record_matview_change(storage, change) {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Sequence(sequence) => {
+                let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let (schema, name) = (sequence.schema, sequence.name);
                 let lsn = storage.bump_lsn();
@@ -13416,6 +13438,7 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropSequence {
+                        identity,
                         schema: schema.as_str(),
                         name: name.as_str(),
                     },
@@ -13424,9 +13447,7 @@ pub(crate) fn drop_schema(
                 }
                 match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
-                        if let Err(error) =
-                            txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
-                        {
+                        if let Err(error) = txn.record_sequence_change(storage, slot) {
                             return sql_fail(error);
                         }
                     }
@@ -13620,6 +13641,7 @@ pub(crate) fn drop_schema(
                         txn.txid,
                         lsn,
                         &WalOp::DropSequence {
+                            identity: storage.sequence_position(sequence_slot),
                             schema: schema.as_str(),
                             name: name.as_str(),
                         },
@@ -13628,9 +13650,7 @@ pub(crate) fn drop_schema(
                     }
                     match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
                         Ok(Some(slot)) => {
-                            if let Err(error) =
-                                txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
-                            {
+                            if let Err(error) = txn.record_sequence_change(storage, slot) {
                                 return sql_fail(error);
                             }
                         }
@@ -13659,16 +13679,20 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
+                        identity: storage.table_position(*t),
                         schema: def.schema.as_str(),
                         name: def.name.as_str(),
                     },
                 ) {
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(*t as u32)) {
+                let dropped = match storage.drop_table_in(*t, txn.txid) {
+                    Ok(undo) => undo,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(e) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(e);
                 }
-                storage.drop_table_in(*t, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
             }
         }
@@ -33361,10 +33385,9 @@ pub fn create_routine(
             ));
         }
     }
-    let slot = match replaced {
+    let (slot, creation) = match replaced {
         Some(slot) => {
-            let pending = crate::storage::PendingRoutineDefinition {
-                txid: txn.txid,
+            let pending = crate::storage::RoutineDefinition {
                 arguments,
                 argument_count,
                 parameters,
@@ -33379,9 +33402,17 @@ pub fn create_routine(
                 body_kind,
                 body,
                 creation_path,
-                dependency_slot: u32::MAX,
             };
-            let prior = match storage.replace_routine(slot, pending, dependencies.view()) {
+            let target = match storage.prepare_routine_edit(slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.replace_routine(
+                target,
+                pending,
+                crate::storage::RoutineDependencies::Replace(dependencies.view()),
+                txn.txid,
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -33393,6 +33424,7 @@ pub fn create_routine(
                     txn.txid,
                     lsn,
                     &WalOp::CreateRoutine {
+                        identity: storage.routine_position(slot),
                         definition: &definition,
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                             dependencies.view(),
@@ -33401,17 +33433,13 @@ pub fn create_routine(
                 )
             };
             if let Err(error) = wal_result {
-                storage.rollback_routine_replace(slot, prior);
+                storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_routine_replace(slot, prior);
+            if let Err(error) = txn.record_routine_change(storage, prior) {
                 return sql_fail(error);
             }
-            slot
+            (slot, None)
         }
         None => match storage.create_routine(
             RoutineSpec {
@@ -33436,11 +33464,11 @@ pub fn create_routine(
             },
             txn.txid,
         ) {
-            Ok(slot) => slot,
+            Ok(change) => (change.slot(), Some(change)),
             Err(error) => return sql_fail(error),
         },
     };
-    if replaced.is_none() {
+    if let Some(created) = creation {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         let wal_result = {
@@ -33449,6 +33477,7 @@ pub fn create_routine(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
+                    identity: storage.routine_position(slot),
                     definition: &stored,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         dependencies.view(),
@@ -33457,11 +33486,10 @@ pub fn create_routine(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_create(slot);
+            storage.finish_routine_change(created, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
-            storage.rollback_routine_create(slot);
+        if let Err(error) = txn.record_routine_change(storage, created) {
             return sql_fail(error);
         }
     }
@@ -34155,10 +34183,9 @@ pub fn create_aggregate(
         }
     }
     let body = StackStr::new();
-    let slot = match replaced {
+    let (slot, creation) = match replaced {
         Some(slot) => {
-            let pending = crate::storage::PendingRoutineDefinition {
-                txid: txn.txid,
+            let pending = crate::storage::RoutineDefinition {
                 arguments,
                 argument_count: total_arguments,
                 parameters,
@@ -34174,12 +34201,18 @@ pub fn create_aggregate(
                 body_kind: crate::storage::RoutineBodyKind::String,
                 body,
                 creation_path: StackStr::new(),
-                dependency_slot: u32::MAX,
+            };
+            let target = match storage.prepare_routine_edit(slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
             };
             let prior = match storage.replace_routine(
-                slot,
+                target,
                 pending,
-                crate::storage::StoredQueryDependencies::EMPTY.view(),
+                crate::storage::RoutineDependencies::Replace(
+                    crate::storage::StoredQueryDependencies::EMPTY.view(),
+                ),
+                txn.txid,
             ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
@@ -34192,6 +34225,7 @@ pub fn create_aggregate(
                     txn.txid,
                     lsn,
                     &WalOp::CreateRoutine {
+                        identity: storage.routine_position(slot),
                         definition: &durable,
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                             dependencies.view(),
@@ -34200,17 +34234,13 @@ pub fn create_aggregate(
                 )
             };
             if let Err(error) = wal_result {
-                storage.rollback_routine_replace(slot, prior);
+                storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_routine_replace(slot, prior);
+            if let Err(error) = txn.record_routine_change(storage, prior) {
                 return sql_fail(error);
             }
-            slot
+            (slot, None)
         }
         None => match storage.create_routine(
             RoutineSpec {
@@ -34236,11 +34266,11 @@ pub fn create_aggregate(
             },
             txn.txid,
         ) {
-            Ok(slot) => slot,
+            Ok(change) => (change.slot(), Some(change)),
             Err(error) => return sql_fail(error),
         },
     };
-    if replaced.is_none() {
+    if let Some(created) = creation {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         let wal_result = {
@@ -34249,6 +34279,7 @@ pub fn create_aggregate(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
+                    identity: storage.routine_position(slot),
                     definition: &stored,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         dependencies.view(),
@@ -34257,11 +34288,10 @@ pub fn create_aggregate(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_create(slot);
+            storage.finish_routine_change(created, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
-            storage.rollback_routine_create(slot);
+        if let Err(error) = txn.record_routine_change(storage, created) {
             return sql_fail(error);
         }
         if let Err(error) = apply_default_privileges_to_new_object(
@@ -35367,8 +35397,7 @@ pub fn alter_routine(
                 _ => unreachable!("definition action set is closed above"),
             }
         }
-        let pending = crate::storage::PendingRoutineDefinition {
-            txid: txn.txid,
+        let pending = crate::storage::RoutineDefinition {
             arguments: routine.arguments,
             argument_count: routine.argument_count,
             parameters: routine.parameters,
@@ -35383,9 +35412,17 @@ pub fn alter_routine(
             body_kind: routine.body_kind,
             body: routine.body,
             creation_path: routine.creation_path,
-            dependency_slot: u32::MAX,
         };
-        let prior = match storage.replace_routine_preserving_dependencies(slot, pending) {
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let prior = match storage.replace_routine(
+            target,
+            pending,
+            crate::storage::RoutineDependencies::Preserve,
+            txn.txid,
+        ) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -35397,6 +35434,7 @@ pub fn alter_routine(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
+                    identity: storage.routine_position(slot),
                     definition: &durable,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         dependencies.view(),
@@ -35405,14 +35443,10 @@ pub fn alter_routine(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_replace(slot, prior);
+            storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_routine_replace(slot, prior);
+        if let Err(error) = txn.record_routine_change(storage, prior) {
             return sql_fail(error);
         }
         responder.command_complete(match kind {
@@ -35556,7 +35590,11 @@ pub fn alter_routine(
         Ok(signature) => signature,
         Err(error) => return sql_fail(error),
     };
-    let prior = match storage.alter_routine_identity(slot, new_schema, new_name, txn.txid) {
+    let target = match storage.prepare_routine_edit(slot, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    let prior = match storage.alter_routine_identity(target, new_schema, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -35565,6 +35603,7 @@ pub fn alter_routine(
         txn.txid,
         lsn,
         &WalOp::AlterRoutineIdentity {
+            identity: storage.routine_position(slot),
             schema: old_schema.as_str(),
             name: old_name.as_str(),
             argument_signature: signature,
@@ -35572,14 +35611,10 @@ pub fn alter_routine(
             new_name: new_name.as_str(),
         },
     ) {
-        storage.restore_routine_identity(slot, prior);
+        storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineIdentityAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.restore_routine_identity(slot, prior);
+    if let Err(error) = txn.record_routine_change(storage, prior) {
         return sql_fail(error);
     }
     responder.command_complete(match kind {
@@ -35978,6 +36013,7 @@ pub fn drop_routine(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoutine {
+                    identity: storage.routine_position(dependent),
                     schema: definition.schema_for(txn.txid).as_str(),
                     name: definition.name_for(txn.txid).as_str(),
                     argument_signature: signature,
@@ -35985,11 +36021,15 @@ pub fn drop_routine(
             ) {
                 return sql_fail(error);
             }
-            storage.drop_routine(dependent, txn.txid);
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::RoutineDropped(dependent as u32))
-            {
-                storage.rollback_routine_drop(dependent, txn.txid);
+            let target = match storage.prepare_routine_edit(dependent, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let change = match storage.drop_routine(target, txn.txid) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_routine_change(storage, change) {
                 return sql_fail(error);
             }
         }
@@ -36078,6 +36118,7 @@ pub fn drop_routine(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
+                identity: storage.routine_position(slot),
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
                 argument_signature: signature,
@@ -36085,9 +36126,15 @@ pub fn drop_routine(
         ) {
             return sql_fail(error);
         }
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_routine(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_routine_change(storage, change) {
             return sql_fail(error);
         }
     }
@@ -36374,7 +36421,7 @@ pub fn create_view(
                     Ok(None) => {
                         storage.finish_view_publication(
                             publication,
-                            crate::storage::QueryDdlDecision::Rollback,
+                            crate::storage::CatalogDdlDecision::Rollback,
                         );
                         return sql_fail(sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -36384,7 +36431,7 @@ pub fn create_view(
                     Err(error) => {
                         storage.finish_view_publication(
                             publication,
-                            crate::storage::QueryDdlDecision::Rollback,
+                            crate::storage::CatalogDdlDecision::Rollback,
                         );
                         return sql_fail(error);
                     }
@@ -36424,14 +36471,14 @@ pub fn create_view(
                 // The journal rejected the record; undo the in-memory apply.
                 storage.finish_view_publication(
                     publication,
-                    crate::storage::QueryDdlDecision::Rollback,
+                    crate::storage::CatalogDdlDecision::Rollback,
                 );
                 return sql_fail(e);
             }
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
                 storage.finish_view_publication(
                     publication,
-                    crate::storage::QueryDdlDecision::Rollback,
+                    crate::storage::CatalogDdlDecision::Rollback,
                 );
                 return sql_fail(error);
             }
@@ -37091,12 +37138,12 @@ fn rewrite_view_column_dependents(
         };
         if let Err(error) = staged {
             storage
-                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
             storage
-                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
     }
@@ -37640,7 +37687,7 @@ pub fn create_rule(
         storage.finish_rule_publication(
             publication,
             prior_table_rule_txid,
-            crate::storage::QueryDdlDecision::Rollback,
+            crate::storage::CatalogDdlDecision::Rollback,
         );
         return sql_fail(error);
     }
@@ -37651,7 +37698,7 @@ pub fn create_rule(
         storage.finish_rule_publication(
             publication,
             prior_table_rule_txid,
-            crate::storage::QueryDdlDecision::Rollback,
+            crate::storage::CatalogDdlDecision::Rollback,
         );
         return sql_fail(error);
     }
@@ -39178,7 +39225,14 @@ pub fn create_table_as(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&def))
+                wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateTable {
+                        identity: storage.table_position(slot),
+                        definition: &def,
+                    },
+                )
             };
             if let Err(e) = wal_result {
                 storage.rollback_create(slot);
@@ -39314,6 +39368,7 @@ pub fn create_table_as(
         let mut cpath = crate::util::StackStr::<128>::new();
         let _ = write!(cpath, "{raw_path}");
         match storage.create_matview(
+            crate::storage::CatalogAllocation::New,
             table_index,
             crate::storage::StoredQueryDefinition {
                 sql: buffer,
@@ -39323,7 +39378,8 @@ pub fn create_table_as(
             with_data,
             txn.txid,
         ) {
-            Ok(slot) => {
+            Ok(change) => {
+                let slot = change.slot();
                 let lsn = storage.bump_lsn();
                 let wal_result = {
                     let dependencies = storage.matview_dependencies(slot);
@@ -39331,6 +39387,12 @@ pub fn create_table_as(
                         txn.txid,
                         lsn,
                         &WalOp::CreateMatview {
+                            identity: storage.matview_position(slot),
+                            backing: crate::storage::CatalogPosition::new(
+                                table_index,
+                                storage.table(table_index).created_at(),
+                            )
+                            .expect("materialized view retains its backing relation"),
                             schema: def.schema.as_str(),
                             name: name.name,
                             sql,
@@ -39343,11 +39405,13 @@ pub fn create_table_as(
                     )
                 };
                 if let Err(e) = wal_result {
-                    storage.rollback_matview_create(slot);
+                    storage.finish_matview_change(
+                        change,
+                        crate::storage::CatalogDdlDecision::Rollback,
+                    );
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewCreated(slot as u32)) {
-                    storage.rollback_matview_create(slot);
+                if let Err(e) = txn.record_matview_change(storage, change) {
                     return sql_fail(e);
                 }
                 if let Err(error) = apply_default_privileges_to_new_object(
@@ -39576,7 +39640,7 @@ pub fn refresh_materialized_view(
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::MatviewPopulationChanged(population)) {
-        storage.finish_matview_population(population, crate::storage::QueryDdlDecision::Rollback);
+        storage.finish_matview_population(population, crate::storage::CatalogDdlDecision::Rollback);
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -39584,6 +39648,7 @@ pub fn refresh_materialized_view(
         txn.txid,
         lsn,
         &WalOp::SetMatviewPopulated {
+            identity: storage.matview_position(slot),
             schema: def.schema.as_str(),
             name: def.name.as_str(),
             populated: true,
@@ -39734,16 +39799,20 @@ pub fn drop_materialized_view(
             txn.txid,
             lsn,
             &WalOp::DropTable {
+                identity: storage.table_position(idx),
                 schema: def.schema.as_str(),
                 name: def.name.as_str(),
             },
         ) {
             return sql_fail(e);
         }
-        if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Dropped(idx as u32)) {
+        let dropped = match storage.drop_table_in(idx, txn.txid) {
+            Ok(undo) => undo,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(e) = txn.record_table_drop(storage, dropped) {
             return sql_fail(e);
         }
-        storage.drop_table_in(idx, txn.txid);
         storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
         // Drop the matview catalog entry.
         let lsn = storage.bump_lsn();
@@ -39751,20 +39820,33 @@ pub fn drop_materialized_view(
             txn.txid,
             lsn,
             &WalOp::DropMatview {
+                identity: storage.matview_position(
+                    storage
+                        .matview_slot_for_table(idx, txn.txid)
+                        .expect("selected materialized view retains its catalog entry"),
+                ),
                 schema: def.schema.as_str(),
                 name: def.name.as_str(),
             },
         ) {
             return sql_fail(e);
         }
-        match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
-            Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32)) {
-                    return sql_fail(e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => return sql_fail(e),
+        let Some(slot) = storage.matview_slot_for_table(idx, txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "materialized-view catalog entry no longer exists"
+            ));
+        };
+        let target = match storage.prepare_matview_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_matview(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_matview_change(storage, change) {
+            return sql_fail(error);
         }
     }
     responder.command_complete("DROP MATERIALIZED VIEW")?;
@@ -40007,6 +40089,7 @@ pub fn create_sequence(
     };
     let slot = match storage.create_sequence(
         crate::storage::SequenceCreateSpec {
+            allocation: crate::storage::CatalogAllocation::New,
             schema,
             name: sqlname,
             spec,
@@ -40027,9 +40110,11 @@ pub fn create_sequence(
             txn.txid,
             lsn,
             &WalOp::CreateSequence {
+                restart: None,
+                identity: storage.sequence_position(slot.slot()),
                 schema: schema.as_str(),
                 name: name.name,
-                data_type: spec.data_type.to_u8(),
+                data_type: spec.data_type,
                 increment: spec.increment,
                 min_value: spec.min_value,
                 max_value: spec.max_value,
@@ -40043,10 +40128,10 @@ pub fn create_sequence(
         )
     };
     if let Err(e) = wal_result {
-        storage.rollback_sequence_create(slot);
+        storage.finish_sequence_change(slot, crate::storage::CatalogDdlDecision::Rollback);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SequenceCreated(slot as u32)) {
+    if let Err(e) = txn.record_sequence_change(storage, slot) {
         return sql_fail(e);
     }
     if let Err(error) = apply_default_privileges_to_new_object(
@@ -40054,7 +40139,7 @@ pub fn create_sequence(
         txn,
         crate::storage::AccessObject {
             class: crate::storage::AccessClass::Sequence,
-            slot: slot as u16,
+            slot: slot.slot() as u16,
         },
     ) {
         return sql_fail(error);
@@ -40242,7 +40327,14 @@ fn rewrite_sequence_default_references(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table_slot),
+                definition: &altered,
+            },
+        )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
             return Err(error);
@@ -40414,8 +40506,12 @@ pub fn alter_sequence(
     {
         return sql_fail(error);
     }
+    let sequence_target = match storage.prepare_sequence_edit(slot, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
     let prior_definition = match storage.stage_sequence_alter(
-        slot,
+        sequence_target,
         crate::storage::SequenceAlteration {
             schema: target_schema,
             name: target_name,
@@ -40441,21 +40537,25 @@ pub fn alter_sequence(
         let lsn = storage.bump_lsn();
         let operation = if schema_move {
             WalOp::SetSequenceSchema {
+                identity: storage.sequence_position(slot),
                 schema: prior.schema.as_str(),
                 name: prior.name.as_str(),
                 new_schema: schema.as_str(),
             }
         } else if rename {
             WalOp::RenameSequence {
+                identity: storage.sequence_position(slot),
                 schema: prior.schema.as_str(),
                 name: prior.name.as_str(),
                 new_name: sname.as_str(),
             }
         } else {
             WalOp::CreateSequence {
+                restart,
+                identity: storage.sequence_position(slot),
                 schema: schema.as_str(),
                 name: sname.as_str(),
-                data_type: spec.data_type.to_u8(),
+                data_type: spec.data_type,
                 increment: spec.increment,
                 min_value: spec.min_value,
                 max_value: spec.max_value,
@@ -40468,7 +40568,10 @@ pub fn alter_sequence(
             }
         };
         if let Err(e) = wal.stage_reserved(txn.txid, lsn, &operation) {
-            storage.rollback_sequence_alter(slot, prior_definition);
+            storage.finish_sequence_change(
+                prior_definition,
+                crate::storage::CatalogDdlDecision::Rollback,
+            );
             return sql_fail(e);
         }
         let (last, is_called) = storage.sequence_value_for(slot, txn.txid);
@@ -40477,21 +40580,21 @@ pub fn alter_sequence(
             txn.txid,
             lsn,
             &WalOp::SequenceAdvance {
+                identity: storage.sequence_position(slot),
                 schema: schema.as_str(),
                 name: sname.as_str(),
                 last,
                 is_called,
             },
         ) {
-            storage.rollback_sequence_alter(slot, prior_definition);
+            storage.finish_sequence_change(
+                prior_definition,
+                crate::storage::CatalogDdlDecision::Rollback,
+            );
             return sql_fail(e);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
-        slot: slot as u32,
-        prior: prior_definition,
-    }) {
-        storage.rollback_sequence_alter(slot, prior_definition);
+    if let Err(error) = txn.record_sequence_change(storage, prior_definition) {
         return sql_fail(error);
     }
     seq_session.invalidate_cache(slot);
@@ -40675,6 +40778,7 @@ pub fn drop_sequence(
                 txn.txid,
                 lsn,
                 &WalOp::DropSequence {
+                    identity: storage.sequence_position(slot),
                     schema: schema.as_str(),
                     name: sname.as_str(),
                 },
@@ -40685,7 +40789,7 @@ pub fn drop_sequence(
         }
         match storage.drop_sequence(schema.as_str(), sname.as_str(), txn.txid) {
             Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32)) {
+                if let Err(e) = txn.record_sequence_change(storage, slot) {
                     return sql_fail(e);
                 }
             }
@@ -41286,13 +41390,15 @@ fn drop_type_dependent_routines(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
+                identity: storage.routine_position(slot),
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
                 argument_signature: signature,
             },
         )?;
-        storage.drop_routine(slot, txn.txid);
-        txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32))?;
+        let change =
+            storage.drop_routine(storage.prepare_routine_edit(slot, txn.txid)?, txn.txid)?;
+        txn.record_routine_change(storage, change)?;
     }
     Ok(())
 }
@@ -44797,16 +44903,15 @@ fn drop_selected_stored_queries(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
+                identity: storage.routine_position(slot),
                 schema: routine.schema_for(txn.txid).as_str(),
                 name: routine.name_for(txn.txid).as_str(),
                 argument_signature: signature,
             },
         )?;
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
-            return Err(error);
-        }
+        let change =
+            storage.drop_routine(storage.prepare_routine_edit(slot, txn.txid)?, txn.txid)?;
+        txn.record_routine_change(storage, change)?;
     }
     Ok(())
 }
@@ -44962,25 +45067,27 @@ fn drop_matview_slot(
         txn.txid,
         lsn,
         &WalOp::DropTable {
+            identity: storage.table_position(table),
             schema: schema.as_str(),
             name: name.as_str(),
         },
     )?;
-    txn.record_ddl(super::txn::DdlUndo::Dropped(table as u32))?;
-    storage.drop_table_in(table, txn.txid);
+    let dropped = storage.drop_table_in(table, txn.txid)?;
+    txn.record_table_drop(storage, dropped)?;
     storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropMatview {
+            identity: storage.matview_position(slot),
             schema: schema.as_str(),
             name: name.as_str(),
         },
     )?;
-    if let Some(slot) = storage.drop_matview(schema.as_str(), name.as_str(), txn.txid)? {
-        txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))?;
-    }
+    let target = storage.prepare_matview_edit(slot, txn.txid)?;
+    let change = storage.drop_matview(target, txn.txid)?;
+    txn.record_matview_change(storage, change)?;
     Ok(())
 }
 
@@ -46410,7 +46517,14 @@ fn rewrite_composite_dependent_tables(
                 return Err(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered)) {
+            if let Err(error) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::CreateTable {
+                    identity: storage.table_position(table_slot),
+                    definition: &altered,
+                },
+            ) {
                 storage.rollback_table_def(table_slot, txn.txid);
                 return Err(error);
             }
@@ -46521,12 +46635,12 @@ fn rewrite_composite_dependent_views(
         };
         if let Err(error) = staged {
             storage
-                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
             storage
-                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
     }
@@ -49873,7 +49987,14 @@ fn stage_table_definition(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&next))?;
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table),
+                definition: &next,
+            },
+        )?;
     }
     storage.write_table_def(table, txn.txid, next, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table as u32)) {
@@ -50168,6 +50289,7 @@ pub fn create_database(
     let slot = match storage.create_database(
         requested_oid,
         template_oid,
+        crate::storage::DatabaseCloneAllocation::New,
         definition,
         owner as u16,
         txn.txid,
@@ -50183,6 +50305,10 @@ pub fn create_database(
         &WalOp::CreateDatabase {
             oid: oid.get(),
             template_oid: template_oid.get(),
+            positions: crate::storage::WalDatabaseClonePositions::Captured {
+                storage,
+                database: oid,
+            },
             definition,
             owner: owner as u16,
         },
@@ -53829,17 +53955,29 @@ pub fn apply_replication_truncate(
                     definition.columns()[column].name.as_str(),
                     txn.txid,
                 ) {
-                    let start = storage.sequence_for(sequence, txn.txid).start_value;
-                    let prior = storage.reset_sequence_value(sequence, txn.txid, start);
-                    if let Err(error) =
-                        txn.record_ddl(crate::sql::txn::DdlUndo::OwnedSequenceReset {
-                            sequence: sequence as u32,
-                            prior,
-                        })
-                    {
-                        storage.restore_sequence_value(sequence, prior);
-                        return Err(error);
-                    }
+                    let definition = storage.sequence_for(sequence, txn.txid);
+                    let change = storage.stage_sequence_alter(
+                        storage.prepare_sequence_edit(sequence, txn.txid)?,
+                        crate::storage::SequenceAlteration {
+                            schema: definition.schema,
+                            name: definition.name,
+                            spec: crate::storage::SeqSpec {
+                                data_type: definition.data_type,
+                                increment: definition.increment,
+                                min_value: definition.min_value,
+                                max_value: definition.max_value,
+                                start_value: definition.start_value,
+                                cache: definition.cache,
+                                cycle: definition.cycle,
+                            },
+                            owner: definition.owner,
+                            generator_for: definition.generator_for,
+                            persistence: definition.persistence,
+                            restart: Some(definition.start_value),
+                        },
+                        txn.txid,
+                    )?;
+                    txn.record_sequence_change(storage, change)?;
                 } else {
                     let prior = storage.table_serial_value(table, column);
                     txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
@@ -62719,15 +62857,36 @@ pub(crate) fn truncate(
                     def.columns()[c].name.as_str(),
                     txn.txid,
                 ) {
-                    let start_value = storage.sequence_for(sequence_slot, txn.txid).start_value;
-                    let prior = storage.reset_sequence_value(sequence_slot, txn.txid, start_value);
-                    if let Err(error) =
-                        txn.record_ddl(crate::sql::txn::DdlUndo::OwnedSequenceReset {
-                            sequence: sequence_slot as u32,
-                            prior,
-                        })
-                    {
-                        storage.restore_sequence_value(sequence_slot, prior);
+                    let definition = storage.sequence_for(sequence_slot, txn.txid);
+                    let target = match storage.prepare_sequence_edit(sequence_slot, txn.txid) {
+                        Ok(target) => target,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let change = match storage.stage_sequence_alter(
+                        target,
+                        crate::storage::SequenceAlteration {
+                            schema: definition.schema,
+                            name: definition.name,
+                            spec: crate::storage::SeqSpec {
+                                data_type: definition.data_type,
+                                increment: definition.increment,
+                                min_value: definition.min_value,
+                                max_value: definition.max_value,
+                                start_value: definition.start_value,
+                                cache: definition.cache,
+                                cycle: definition.cycle,
+                            },
+                            owner: definition.owner,
+                            generator_for: definition.generator_for,
+                            persistence: definition.persistence,
+                            restart: Some(definition.start_value),
+                        },
+                        txn.txid,
+                    ) {
+                        Ok(change) => change,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(error) = txn.record_sequence_change(storage, change) {
                         return sql_fail(error);
                     }
                     continue;
@@ -63254,7 +63413,14 @@ fn rename_attached_index_constraint(
         },
     )?;
     let lsn = storage.bump_lsn();
-    wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+    wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::CreateTable {
+            identity: storage.table_position(table_index),
+            definition: &altered,
+        },
+    )?;
     storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
         storage.rollback_table_def(table_index, txn.txid);
@@ -63331,7 +63497,14 @@ fn drop_dependent_foreign_keys(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table_slot),
+                definition: &altered,
+            },
+        )?;
         storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
@@ -64503,7 +64676,14 @@ fn alter_table_inheritance(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&updated)) {
+    if let Err(error) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::CreateTable {
+            identity: storage.table_position(child),
+            definition: &updated,
+        },
+    ) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, updated, &mapping, false) {
@@ -64928,7 +65108,14 @@ fn alter_partition_attachment(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+    if let Err(error) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::CreateTable {
+            identity: storage.table_position(child),
+            definition: &new_def,
+        },
+    ) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, new_def, &mapping, false) {
@@ -64980,9 +65167,14 @@ fn alter_partition_attachment(
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(error) =
-                    wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&dependent))
-                {
+                if let Err(error) = wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateTable {
+                        identity: storage.table_position(descendant),
+                        definition: &dependent,
+                    },
+                ) {
                     return sql_fail(error);
                 }
                 if let Err(error) =
@@ -66044,7 +66236,14 @@ fn alter_table_relation(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+            if let Err(error) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::CreateTable {
+                    identity: storage.table_position(table_index),
+                    definition: &new_def,
+                },
+            ) {
                 return sql_fail(error);
             }
         }
@@ -66053,8 +66252,12 @@ fn alter_table_relation(
             .flatten()
         {
             let sequence = storage.sequence_for(alteration.slot, txn.txid);
+            let sequence_target = match storage.prepare_sequence_edit(alteration.slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
             let prior = match storage.stage_sequence_alter(
-                alteration.slot,
+                sequence_target,
                 crate::storage::SequenceAlteration {
                     schema: sequence.schema,
                     name: sequence.name,
@@ -66076,9 +66279,11 @@ fn alter_table_relation(
                     txn.txid,
                     lsn,
                     &WalOp::CreateSequence {
+                        restart: alteration.restart,
+                        identity: storage.sequence_position(alteration.slot),
                         schema: sequence.schema.as_str(),
                         name: sequence.name.as_str(),
-                        data_type: alteration.spec.data_type.to_u8(),
+                        data_type: alteration.spec.data_type,
                         increment: alteration.spec.increment,
                         min_value: alteration.spec.min_value,
                         max_value: alteration.spec.max_value,
@@ -66090,7 +66295,10 @@ fn alter_table_relation(
                         persistence: sequence.persistence,
                     },
                 ) {
-                    storage.rollback_sequence_alter(alteration.slot, prior);
+                    storage.finish_sequence_change(
+                        prior,
+                        crate::storage::CatalogDdlDecision::Rollback,
+                    );
                     return sql_fail(error);
                 }
                 let (last, is_called) = storage.sequence_value_for(alteration.slot, txn.txid);
@@ -66099,21 +66307,21 @@ fn alter_table_relation(
                     txn.txid,
                     lsn,
                     &WalOp::SequenceAdvance {
+                        identity: storage.sequence_position(alteration.slot),
                         schema: sequence.schema.as_str(),
                         name: sequence.name.as_str(),
                         last,
                         is_called,
                     },
                 ) {
-                    storage.rollback_sequence_alter(alteration.slot, prior);
+                    storage.finish_sequence_change(
+                        prior,
+                        crate::storage::CatalogDdlDecision::Rollback,
+                    );
                     return sql_fail(error);
                 }
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
-                slot: alteration.slot as u32,
-                prior,
-            }) {
-                storage.rollback_sequence_alter(alteration.slot, prior);
+            if let Err(error) = txn.record_sequence_change(storage, prior) {
                 return sql_fail(error);
             }
             seq_session.invalidate_cache(alteration.slot);
@@ -67673,7 +67881,14 @@ fn alter_table_relation(
             return sql_fail(e);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+        if let Err(e) = wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table_index),
+                definition: &new_def,
+            },
+        ) {
             return sql_fail(e);
         }
         for i in 0..rewritten_rows {
@@ -67706,10 +67921,7 @@ fn alter_table_relation(
                 Ok(sequence_slot) => sequence_slot,
                 Err(error) => return sql_fail(error),
             };
-        if let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::SequenceCreated(sequence_slot as u32))
-        {
-            storage.rollback_sequence_create(sequence_slot);
+        if let Err(error) = txn.record_sequence_change(storage, sequence_slot) {
             return sql_fail(error);
         }
         if let Err(error) = apply_default_privileges_to_new_object(
@@ -67717,7 +67929,7 @@ fn alter_table_relation(
             txn,
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Sequence,
-                slot: sequence_slot as u16,
+                slot: sequence_slot.slot() as u16,
             },
         ) {
             return sql_fail(error);
@@ -67732,6 +67944,7 @@ fn alter_table_relation(
                 txn.txid,
                 lsn,
                 &WalOp::DropSequence {
+                    identity: storage.sequence_position(sequence_slot),
                     schema: sequence_schema.as_str(),
                     name: sequence_name.as_str(),
                 },
@@ -67741,10 +67954,7 @@ fn alter_table_relation(
         }
         match storage.drop_sequence(sequence_schema.as_str(), sequence_name.as_str(), txn.txid) {
             Ok(Some(slot)) => {
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::SequenceDropped(slot as u32))
-                {
-                    storage.rollback_sequence_drop(slot, txn.txid);
+                if let Err(error) = txn.record_sequence_change(storage, slot) {
                     return sql_fail(error);
                 }
             }
@@ -67757,8 +67967,12 @@ fn alter_table_relation(
         .flatten()
     {
         let sequence = storage.sequence_for(alteration.slot, txn.txid);
+        let sequence_target = match storage.prepare_sequence_edit(alteration.slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
         let prior = match storage.stage_sequence_alter(
-            alteration.slot,
+            sequence_target,
             crate::storage::SequenceAlteration {
                 schema: sequence.schema,
                 name: sequence.name,
@@ -67780,9 +67994,11 @@ fn alter_table_relation(
                 txn.txid,
                 lsn,
                 &WalOp::CreateSequence {
+                    restart: alteration.restart,
+                    identity: storage.sequence_position(alteration.slot),
                     schema: sequence.schema.as_str(),
                     name: sequence.name.as_str(),
-                    data_type: alteration.spec.data_type.to_u8(),
+                    data_type: alteration.spec.data_type,
                     increment: alteration.spec.increment,
                     min_value: alteration.spec.min_value,
                     max_value: alteration.spec.max_value,
@@ -67794,7 +68010,7 @@ fn alter_table_relation(
                     persistence: sequence.persistence,
                 },
             ) {
-                storage.rollback_sequence_alter(alteration.slot, prior);
+                storage.finish_sequence_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
             let (last, is_called) = storage.sequence_value_for(alteration.slot, txn.txid);
@@ -67803,21 +68019,18 @@ fn alter_table_relation(
                 txn.txid,
                 lsn,
                 &WalOp::SequenceAdvance {
+                    identity: storage.sequence_position(alteration.slot),
                     schema: sequence.schema.as_str(),
                     name: sequence.name.as_str(),
                     last,
                     is_called,
                 },
             ) {
-                storage.rollback_sequence_alter(alteration.slot, prior);
+                storage.finish_sequence_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
-            slot: alteration.slot as u32,
-            prior,
-        }) {
-            storage.rollback_sequence_alter(alteration.slot, prior);
+        if let Err(error) = txn.record_sequence_change(storage, prior) {
             return sql_fail(error);
         }
         seq_session.invalidate_cache(alteration.slot);
@@ -67871,9 +68084,11 @@ fn alter_table_relation(
                 txn.txid,
                 lsn,
                 &WalOp::CreateSequence {
+                    restart: None,
+                    identity: storage.sequence_position(sequence_slot),
                     schema: sequence_schema.as_str(),
                     name: sequence_name.as_str(),
-                    data_type: spec.data_type.to_u8(),
+                    data_type: spec.data_type,
                     increment: spec.increment,
                     min_value: spec.min_value,
                     max_value: spec.max_value,
@@ -68216,9 +68431,14 @@ fn alter_table_relation(
                         return sql_fail(error);
                     }
                     let lsn = storage.bump_lsn();
-                    if let Err(error) =
-                        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&dependent))
-                    {
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::CreateTable {
+                            identity: storage.table_position(descendant),
+                            definition: &dependent,
+                        },
+                    ) {
                         return sql_fail(error);
                     }
                 }
@@ -68517,7 +68737,14 @@ fn alter_table_replica_identity(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&next)) {
+        if let Err(error) = wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table_index),
+                definition: &next,
+            },
+        ) {
             return sql_fail(error);
         }
     }

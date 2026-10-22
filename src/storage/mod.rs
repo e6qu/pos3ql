@@ -6,13 +6,27 @@
 //! are fixed at startup.
 
 mod catalog_sources;
-mod query_lifecycles;
-pub(crate) use query_lifecycles::{
-    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, RuleAlterUndo, RulePublication,
-    ViewCatalogIdentity, ViewPublication,
+mod database_clone_positions;
+pub(crate) use database_clone_positions::{
+    DatabaseCloneAllocation, DatabaseCloneKind, DatabaseClonePositions, WalDatabaseClonePositions,
 };
+mod matview_lifecycles;
+mod query_lifecycles;
+mod routine_lifecycles;
+pub(crate) use matview_lifecycles::MatviewDdlUndo;
+mod sequence_lifecycles;
+mod table_lifecycles;
+pub(crate) use query_lifecycles::{
+    MatviewPopulationUndo, RuleAlterUndo, RulePublication, ViewCatalogIdentity, ViewPublication,
+};
+pub(crate) use routine_lifecycles::{RoutineChange, RoutineDependencies};
+pub(crate) use sequence_lifecycles::SequenceChange;
+pub(crate) use table_creation::TableCreation;
 mod role_dependencies;
-pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
+pub(crate) use catalog_sources::{
+    CatalogAllocation, CatalogDdlDecision, CatalogDdlUndo, CatalogPosition, RoleOid,
+    SessionIdentity, SessionRole,
+};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -3729,6 +3743,10 @@ pub enum CatalogDdlState {
 }
 
 impl CatalogDdlState {
+    pub(crate) const fn committed_exists(self) -> bool {
+        matches!(self, Self::Present | Self::PendingDrop { .. })
+    }
+
     pub const fn visible_to(self, txid: u32) -> bool {
         match self {
             Self::Absent => false,
@@ -4659,7 +4677,7 @@ fn rename_dependency_schema(entries: &mut [StoredQueryDependency], old: SqlName,
 /// Keeping these fields together makes it impossible for a catalog creation
 /// path to pass SQL text without its binding context.
 #[derive(Clone)]
-pub struct StoredQueryDefinition {
+pub(crate) struct StoredQueryDefinition {
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub dependencies: StoredQueryDependencies,
@@ -6278,6 +6296,8 @@ pub struct MatviewDef {
     /// The physical relation that owns the materialized rows and the sole
     /// source of this catalog object's relation identity.
     pub(crate) backing_table: u16,
+    backing_created_at: u64,
+    ddl_version: u64,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub ownership: Ownership,
@@ -6293,6 +6313,8 @@ impl MatviewDef {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
         backing_table: u16::MAX,
+        backing_created_at: 0,
+        ddl_version: 0,
         sql: StackStr::new(),
         creation_path: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
@@ -8459,7 +8481,7 @@ impl RoutineCallKind {
 pub(crate) enum RoutineIdentity {
     Allocate,
     Preserve {
-        created_at: u64,
+        position: CatalogPosition,
         ownership: Ownership,
     },
 }
@@ -8478,6 +8500,8 @@ impl RoutineArgumentDef {
 pub(crate) struct RoutineDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
+    pub(crate) version: u64,
+    pub(crate) ddl_version: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub(crate) pending_identity: Option<PendingRoutineIdentity>,
@@ -8505,7 +8529,14 @@ pub(crate) struct RoutineDef {
 /// an old result contract (or vice versa).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingRoutineDefinition {
-    pub(crate) txid: u32,
+    pub(super) txid: u32,
+    pub(super) version: u64,
+    pub(super) dependency_slot: u32,
+    pub(super) definition: RoutineDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoutineDefinition {
     pub(crate) arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) argument_count: usize,
     pub(crate) parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
@@ -8520,13 +8551,14 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) body_kind: RoutineBodyKind,
     pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
     pub(crate) creation_path: StackStr<128>,
-    pub(crate) dependency_slot: u32,
 }
 
 impl RoutineDef {
     pub(crate) const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
+        version: 0,
+        ddl_version: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         pending_identity: None,
@@ -8550,6 +8582,17 @@ impl RoutineDef {
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
     };
+
+    pub(super) fn revision_for(&self, transaction: u32) -> u64 {
+        self.pending_definition
+            .filter(|pending| pending.txid == transaction)
+            .map_or(self.version, |pending| pending.version)
+            .max(
+                self.pending_identity
+                    .filter(|pending| pending.txid == transaction)
+                    .map_or(self.version, |pending| pending.version),
+            )
+    }
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -8587,12 +8630,12 @@ impl RoutineDef {
 
     fn kind_for(&self, txid: u32) -> RoutineKind {
         self.pending_definition_for(txid)
-            .map_or(self.kind, |pending| pending.kind)
+            .map_or(self.kind, |pending| pending.definition.kind)
     }
 
     fn attributes_for(&self, txid: u32) -> RoutineAttributes {
         self.pending_definition_for(txid)
-            .map_or(self.attributes, |pending| pending.attributes)
+            .map_or(self.attributes, |pending| pending.definition.attributes)
     }
 
     fn accepts_input_arity_for(&self, arity: usize, txid: u32) -> bool {
@@ -8603,8 +8646,8 @@ impl RoutineDef {
             ),
             |pending| {
                 (
-                    pending.argument_count,
-                    &pending.parameters[..pending.parameter_count],
+                    pending.definition.argument_count,
+                    &pending.definition.parameters[..pending.definition.parameter_count],
                 )
             },
         );
@@ -8733,26 +8776,34 @@ impl RoutineDef {
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
-        self.pending_definition
+        let mut definition = self
+            .pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
-                arguments: pending.arguments,
-                argument_count: pending.argument_count,
-                parameters: pending.parameters,
-                parameter_count: pending.parameter_count,
-                kind: pending.kind,
-                result_columns: pending.result_columns,
-                result_column_count: pending.result_column_count,
-                language: pending.language,
-                attributes: pending.attributes,
-                configs: pending.configs,
-                config_count: pending.config_count,
-                body_kind: pending.body_kind,
-                body: pending.body,
-                creation_path: pending.creation_path,
+                version: self.revision_for(txid),
+                arguments: pending.definition.arguments,
+                argument_count: pending.definition.argument_count,
+                parameters: pending.definition.parameters,
+                parameter_count: pending.definition.parameter_count,
+                kind: pending.definition.kind,
+                result_columns: pending.definition.result_columns,
+                result_column_count: pending.definition.result_column_count,
+                language: pending.definition.language,
+                attributes: pending.definition.attributes,
+                configs: pending.definition.configs,
+                config_count: pending.definition.config_count,
+                body_kind: pending.definition.body_kind,
+                body: pending.definition.body,
+                creation_path: pending.definition.creation_path,
                 pending_definition: None,
                 ..*self
-            })
+            });
+        definition.version = self.revision_for(txid);
+        definition.schema = self.schema_for(txid);
+        definition.name = self.name_for(txid);
+        definition.pending_identity = None;
+        definition.pending_definition = None;
+        definition
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
@@ -9345,6 +9396,7 @@ impl TriggerDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingRoutineIdentity {
     pub txid: u32,
+    pub(super) version: u64,
     pub schema: SqlName,
     pub name: SqlName,
 }
@@ -9856,11 +9908,12 @@ impl SeqType {
         }
     }
 
-    pub fn from_u8(v: u8) -> SeqType {
-        match v {
-            0 => SeqType::Smallint,
-            1 => SeqType::Integer,
-            _ => SeqType::Bigint,
+    pub(crate) const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Smallint),
+            1 => Some(Self::Integer),
+            2 => Some(Self::Bigint),
+            _ => None,
         }
     }
 }
@@ -9873,6 +9926,8 @@ impl SeqType {
 pub struct SequenceDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
+    version: u64,
+    ddl_version: u64,
     cache_generation: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -9902,6 +9957,8 @@ impl SequenceDef {
     const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
+        version: 0,
+        ddl_version: 0,
         cache_generation: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -9978,6 +10035,7 @@ pub(crate) struct SequenceCacheIdentity {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingSequenceDefinition {
     pub txid: u32,
+    pub(super) version: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub spec: SeqSpec,
@@ -9990,26 +10048,6 @@ pub(crate) struct PendingSequenceDefinition {
     /// A staged RESTART owns its temporary value image. Other definition
     /// changes do not make `nextval` transactional.
     pub restarted: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SequenceValueState {
-    Committed {
-        last_value: i64,
-        is_called: bool,
-        log_count: i64,
-        dirty: bool,
-        generation: u64,
-        staged_generation: u64,
-    },
-    Pending {
-        last_value: i64,
-        is_called: bool,
-        log_count: i64,
-        dirty: bool,
-        generation: u64,
-        staged_generation: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10057,6 +10095,7 @@ pub(crate) struct SeqSpec {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCreateSpec {
+    pub allocation: CatalogAllocation,
     pub schema: SqlName,
     pub name: SqlName,
     pub spec: SeqSpec,
@@ -10094,6 +10133,7 @@ impl SequenceDef {
             .map_or_else(
                 || *self,
                 |pending| Self {
+                    version: pending.version,
                     schema: pending.schema,
                     name: pending.name,
                     data_type: pending.spec.data_type,
@@ -12777,7 +12817,7 @@ pub struct CommentEntry {
 #[derive(Clone, Copy, Debug)]
 struct PendingCommentDrop {
     txid: u32,
-    source: query_lifecycles::QueryIdentity,
+    source: catalog_sources::CatalogObjectIdentity,
 }
 
 struct CommentCatalog {
@@ -13785,7 +13825,7 @@ impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
             self.next_slot += 1;
             let entry = (self.entry)(&catalog, slot);
             let visible = if self.checkpoint {
-                entry.ddl_state == CatalogDdlState::Present
+                entry.ddl_state.committed_exists()
             } else {
                 self.database == Some(entry.database) && entry.visible_to(self.txid)
             };
@@ -13924,7 +13964,7 @@ impl Iterator for MatviewIter<'_> {
             let definition = *catalog.get(slot)?;
             self.next_slot += 1;
             let visible = if self.checkpoint {
-                definition.ddl_state == CatalogDdlState::Present
+                definition.ddl_state.committed_exists()
             } else {
                 self.database == Some(definition.database) && definition.visible_to(self.txid)
             };
@@ -16581,8 +16621,8 @@ impl Storage {
                 && self.view(slot).schema == schema
             {
                 let view = self.view(slot);
-                let source = self.query_identity(
-                    query_lifecycles::QueryCatalogSlot::View(slot),
+                let source = self.catalog_object_identity(
+                    catalog_sources::CatalogObjectSlot::View(slot),
                     view.database,
                     view.created_at,
                 );
@@ -16619,11 +16659,11 @@ impl Storage {
                 && sequence.persistence == RelationPersistence::Temporary
                 && sequence.schema == schema
             {
-                let mut catalog = self.sequence_catalog();
-                catalog.definitions[slot].ddl_state =
-                    catalog.definitions[slot].ddl_state.drop_by(0);
-                drop(catalog);
-                self.commit_sequence_drop(slot);
+                self.retire_temporary_sequence_source(self.catalog_object_identity(
+                    catalog_sources::CatalogObjectSlot::Sequence(slot),
+                    sequence.database,
+                    sequence.created_at,
+                ));
             }
         }
     }
@@ -16671,11 +16711,11 @@ impl Storage {
                                 owner.table_schema == schema && owner.table == table
                             })
                         {
-                            let mut catalog = self.sequence_catalog();
-                            catalog.definitions[sequence].ddl_state =
-                                catalog.definitions[sequence].ddl_state.drop_by(0);
-                            drop(catalog);
-                            self.commit_sequence_drop(sequence);
+                            self.retire_temporary_sequence_source(self.catalog_object_identity(
+                                catalog_sources::CatalogObjectSlot::Sequence(sequence),
+                                definition.database,
+                                definition.created_at,
+                            ));
                         }
                     }
                     self.commit_drop(slot);
@@ -20255,13 +20295,14 @@ impl Storage {
         &mut self,
         requested_oid: Option<DatabaseOid>,
         template: DatabaseOid,
+        allocation: DatabaseCloneAllocation<'_>,
         definition: DatabaseDefinition,
         owner: u16,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let slot = self.reserve_database(requested_oid, definition, owner, txid)?;
         let oid = self.database(slot).oid;
-        if let Err(error) = self.clone_database_catalog(template, oid, txid) {
+        if let Err(error) = self.clone_database_catalog(template, oid, allocation, txid) {
             self.clear_database_catalog(oid);
             self.retire_database(slot, true);
             return Err(error);
@@ -20405,6 +20446,7 @@ impl Storage {
         &mut self,
         source: DatabaseOid,
         target: DatabaseOid,
+        allocation: DatabaseCloneAllocation<'_>,
         txid: u32,
     ) -> Result<(), SqlError> {
         let prior_database = current_database();
@@ -20512,19 +20554,21 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .domains
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Domain(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "domain catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Domain,
+                    definition.created_at,
+                    type_catalog
+                        .domains
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent
+                                && !self
+                                    .type_definition_images
+                                    .retains(NamedTypeSlot::Domain(slot)))
+                            .then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20540,19 +20584,21 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .enums
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Enum(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "enum catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Enum,
+                    definition.created_at,
+                    type_catalog
+                        .enums
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent
+                                && !self
+                                    .type_definition_images
+                                    .retains(NamedTypeSlot::Enum(slot)))
+                            .then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20574,22 +20620,20 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .composites
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Composite(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "composite catalog is full"
-                        )
-                    })?;
+                let target_slot =
+                    allocation.select(
+                        DatabaseCloneKind::Composite,
+                        definition.created_at,
+                        type_catalog.composites.iter().enumerate().filter_map(
+                            |(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent
+                                    && !self
+                                        .type_definition_images
+                                        .retains(NamedTypeSlot::Composite(slot)))
+                                .then_some(slot)
+                            },
+                        ),
+                    )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20660,7 +20704,12 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics.committed();
                 let serial_values = self.table_serial_values(source_slot);
-                let target_slot = table_creation::allocate(self, definition, Some(txid))?;
+                let target_slot = table_creation::allocate(
+                    self,
+                    definition,
+                    allocation.table(created_at)?,
+                    TableCreation::Pending(txid),
+                )?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
@@ -20721,13 +20770,15 @@ impl Storage {
                     continue;
                 }
                 let mut definition = source_definition;
-                let target_slot = sequence_catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "sequence catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Sequence,
+                    definition.created_at,
+                    sequence_catalog.definitions.iter().enumerate().filter_map(
+                        |(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        },
+                    ),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20748,13 +20799,17 @@ impl Storage {
                         continue;
                     }
                     let mut definition = source_definition;
-                    let target_slot = catalog
-                        .views
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::View,
+                        definition.created_at,
+                        catalog
+                            .views
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            }),
+                    )?;
                     definition.database = target;
                     definition.ownership = definition.ownership.committed();
                     definition.pending_definition = None;
@@ -20816,16 +20871,17 @@ impl Storage {
                             ));
                         }
                     };
-                    let target_slot = catalog
-                        .rules
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "rewrite-rule catalog is full"
-                            )
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::Rule,
+                        rule.created_at,
+                        catalog
+                            .rules
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            }),
+                    )?;
                     rule.database = target;
                     rule.pending = None;
                     rule.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -20855,16 +20911,36 @@ impl Storage {
                     continue;
                 }
                 let mut definition = source_definition;
-                let target_slot = self
-                    .matview_catalog()
+                let backing = self
+                    .tables
                     .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .take(self.table_count())
+                    .enumerate()
+                    .find_map(|(slot, table)| {
+                        let identity = table.identity();
+                        (identity.database == target
+                            && identity.created_at == definition.backing_created_at
+                            && identity.existence.visible_to(txid))
+                        .then_some(slot)
+                    })
                     .ok_or_else(|| {
                         sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "materialized-view catalog is full"
+                            sqlstate::INTERNAL_ERROR,
+                            "template materialized-view backing table was not cloned"
                         )
                     })?;
+                definition.backing_table = backing as u16;
+                definition.backing_created_at = self.table(backing).created_at();
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::MaterializedView,
+                    definition.created_at,
+                    self.matview_catalog()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -20884,12 +20960,13 @@ impl Storage {
                     {
                         continue;
                     }
-                    let target_slot = routines
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "routine catalog is full")
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::Routine,
+                        definition.created_at,
+                        routines.iter().enumerate().filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                    )?;
                     definition.database = target;
                     definition.ownership = definition.ownership.committed();
                     definition.pending_identity = None;
@@ -21623,6 +21700,36 @@ impl Storage {
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full")
                     })?;
+                if entry.class == CommentClass::Constraint {
+                    let source_table = self
+                        .tables
+                        .get(entry.subid as usize)
+                        .filter(|table| table.database() == source)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "template constraint comment has no source table"
+                            )
+                        })?;
+                    entry.subid = self
+                        .tables
+                        .iter()
+                        .take(self.table_count())
+                        .enumerate()
+                        .find_map(|(slot, table)| {
+                            let identity = table.identity();
+                            (identity.database == target
+                                && identity.created_at == source_table.created_at()
+                                && identity.existence.visible_to(txid))
+                            .then_some(slot as u32)
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template constraint comment table was not cloned"
+                            )
+                        })?;
+                }
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
@@ -21669,7 +21776,7 @@ impl Storage {
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
-            Ok(())
+            allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
         result
@@ -23505,7 +23612,7 @@ impl Storage {
             catalog: &self.schemas,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, DomainDef)> + '_ {
@@ -23513,7 +23620,7 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {
@@ -23521,7 +23628,7 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_composites(&self) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
@@ -23529,12 +23636,12 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
         self.view_entries().accepting(0, |value, _| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && value.persistence != RelationPersistence::Temporary
         })
     }
@@ -23546,7 +23653,7 @@ impl Storage {
             catalog: &self.publications,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_replication_slots(
@@ -23567,8 +23674,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
-                || value.cleanup != SubscriptionCleanup::None
+            value.ddl_state.committed_exists() || value.cleanup != SubscriptionCleanup::None
         })
     }
 
@@ -23590,7 +23696,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value, _, _, _)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && value.persistence != RelationPersistence::Temporary
         })
     }
@@ -23600,7 +23706,7 @@ impl Storage {
             catalog: &self.casts,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, CollationDef)> + '_ {
@@ -23608,7 +23714,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_text_search_objects(
@@ -23618,7 +23724,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_conversions(
@@ -23628,7 +23734,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_event_triggers(
@@ -23638,7 +23744,7 @@ impl Storage {
             catalog: &self.event_triggers,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_rules(&self) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
@@ -23646,7 +23752,7 @@ impl Storage {
             .map(|(_, entry)| entry)
             .enumerate()
             .filter(|(_, rule)| {
-                rule.ddl_state == CatalogDdlState::Present
+                rule.ddl_state.committed_exists()
                     && !rule.definition.is_view_return()
                     && !matches!(
                         rule.definition.target,
@@ -23668,7 +23774,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_operator_families(
@@ -23678,7 +23784,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_operator_classes(
@@ -23688,7 +23794,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_access_methods(
@@ -23698,7 +23804,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_triggers(&self) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
@@ -23707,7 +23813,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && !matches!(
                     value.target,
                     TriggerTarget::Table(table)
@@ -23731,7 +23837,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && self.table_def(usize::from(value.table), 0).persistence
                     != RelationPersistence::Temporary
         })
@@ -23743,7 +23849,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && self.table_def(usize::from(value.table), 0).persistence
                     != RelationPersistence::Temporary
         })
@@ -23754,7 +23860,7 @@ impl Storage {
             catalog: &self.extension_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_extension_dependencies(
@@ -23779,7 +23885,7 @@ impl Storage {
 
     pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, IndexDef)> + '_ {
         self.matching_indexes(|value| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && !self.tables.iter().any(|table| {
                     table.database() == value.database
                         && table.live()
@@ -27419,20 +27525,37 @@ impl Storage {
         new_name: SqlName,
         txid: u32,
     ) {
+        self.stage_object_comment_identity_locked(
+            &mut self.comment_catalog(),
+            class,
+            (old_schema, old_name),
+            (new_schema, new_name),
+            txid,
+        );
+    }
+
+    fn stage_object_comment_identity_locked(
+        &self,
+        comments: &mut CommentCatalog,
+        class: CommentClass,
+        old: (SqlName, SqlName),
+        new: (SqlName, SqlName),
+        txid: u32,
+    ) {
+        let (old_schema, old_name) = old;
+        let (new_schema, new_name) = new;
         let database = Some(current_database());
-        let mut comments = self.comment_catalog();
         for comment in comments.entries.iter_mut().filter(|comment| {
-            comment.used
-                && comment.database == database
-                && comment.class == class
-                && ((comment.schema == old_schema && comment.name == old_name)
-                    || comment.pending_identity.is_some_and(|identity| {
-                        identity.txid == txid
-                            && identity.schema == old_schema
-                            && identity.name == old_name
-                    }))
+            comment.matches_to(
+                database,
+                class,
+                old_schema.as_str(),
+                old_name.as_str(),
+                comment.subid,
+                txid,
+            )
         }) {
-            let changed = old_schema != new_schema || old_name != new_name;
+            let changed = comment.schema != new_schema || comment.name != new_name;
             comment.pending_identity = changed.then_some(PendingCommentIdentity {
                 txid,
                 schema: new_schema,
@@ -27448,10 +27571,29 @@ impl Storage {
         old_name: SqlName,
         txid: u32,
     ) {
+        self.commit_object_comment_identity_locked(
+            &mut self.comment_catalog(),
+            class,
+            old_schema,
+            old_name,
+            txid,
+        );
+    }
+
+    fn commit_object_comment_identity_locked(
+        &self,
+        comments: &mut CommentCatalog,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        txid: u32,
+    ) {
         let database = Some(current_database());
-        let mut comments = self.comment_catalog();
         for comment in comments.entries.iter_mut().filter(|comment| {
             comment.used
+                && comment
+                    .pending_drop
+                    .is_none_or(|pending| pending.txid != txid)
                 && comment.database == database
                 && comment.class == class
                 && comment.schema == old_schema
@@ -27688,6 +27830,29 @@ impl Storage {
         self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP)
     }
 
+    pub(crate) fn table_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.table(slot).created_at())
+            .expect("table position selects a user relation")
+    }
+
+    pub(crate) fn restore_table(
+        &mut self,
+        position: CatalogPosition,
+        mut definition: TableDef,
+        creation: TableCreation,
+    ) -> Result<usize, SqlError> {
+        definition.has_toast |= definition
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
+        table_creation::allocate(
+            self,
+            definition,
+            CatalogAllocation::Restore(position),
+            creation,
+        )
+    }
+
     /// Transactional create: the schema exists only for `txid` until commit.
     pub fn create_schema_in(&self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
         let role = self.current_role_slot(txid).ok_or_else(|| {
@@ -27880,9 +28045,9 @@ impl Storage {
             let mut body = definition.body;
             rename_schema_qualified_sql(&mut body, prior, name)?;
             if let Some(pending) = definition.pending_definition {
-                let mut path = pending.creation_path;
+                let mut path = pending.definition.creation_path;
                 rename_schema_path(&mut path, prior, name)?;
-                let mut body = pending.body;
+                let mut body = pending.definition.body;
                 rename_schema_qualified_sql(&mut body, prior, name)?;
             }
         }
@@ -28110,26 +28275,26 @@ impl Storage {
             rename_schema_qualified_sql(&mut definition.body, prior, name)?;
             if let Some(pending) = &mut definition.pending_definition {
                 rename_routine_arguments_schema(
-                    &mut pending.arguments,
-                    pending.argument_count,
+                    &mut pending.definition.arguments,
+                    pending.definition.argument_count,
                     prior,
                     name,
                 );
                 rename_routine_parameters_schema(
-                    &mut pending.parameters,
-                    pending.parameter_count,
+                    &mut pending.definition.parameters,
+                    pending.definition.parameter_count,
                     prior,
                     name,
                 );
                 rename_routine_arguments_schema(
-                    &mut pending.result_columns,
-                    pending.result_column_count,
+                    &mut pending.definition.result_columns,
+                    pending.definition.result_column_count,
                     prior,
                     name,
                 );
-                rename_routine_kind_schema(&mut pending.kind, prior, name);
-                rename_schema_path(&mut pending.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut pending.body, prior, name)?;
+                rename_routine_kind_schema(&mut pending.definition.kind, prior, name);
+                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut pending.definition.body, prior, name)?;
             }
         }
         drop(routines);
@@ -28592,7 +28757,14 @@ impl Storage {
     }
 
     fn clear_extension_dependencies_for_object(&self, object: AccessObject) {
-        for dependency in self.extension_catalog().dependencies.iter_mut() {
+        Self::clear_extension_dependencies_for_object_locked(&mut self.extension_catalog(), object);
+    }
+
+    fn clear_extension_dependencies_for_object_locked(
+        catalog: &mut ExtensionCatalog,
+        object: AccessObject,
+    ) {
+        for dependency in catalog.dependencies.iter_mut() {
             if dependency.object == object {
                 *dependency = ExtensionDependency::EMPTY;
             }
@@ -35054,7 +35226,8 @@ impl Storage {
             .columns()
             .iter()
             .any(|column| column.ctype.typlen() == -1);
-        let slot = table_creation::allocate(self, def, None)?;
+        let slot =
+            table_creation::allocate(self, def, CatalogAllocation::New, TableCreation::Committed)?;
         Ok(slot)
     }
 
@@ -35089,10 +35262,22 @@ impl Storage {
 
     /// Completes a pending ALTER TABLE replay when its final definition arrives.
     /// Returns false when the definition is an ordinary CREATE TABLE.
-    pub fn complete_replay_table_rewrite(&mut self, mut def: TableDef) -> Result<bool, SqlError> {
+    pub(crate) fn complete_replay_table_rewrite(
+        &mut self,
+        position: CatalogPosition,
+        mut def: TableDef,
+    ) -> Result<bool, SqlError> {
         let Some(rewrite) = self.replay_table_rewrite.take() else {
             return Ok(false);
         };
+        if rewrite.table != position.slot()
+            || self.table(rewrite.table).created_at() != position.created_at()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal table rewrite source identity does not match"
+            ));
+        }
         self.bind_user_type_columns(&mut def)?;
         let mut column_mapping = [None; MAX_COLUMNS];
         for (old_column, &target_column) in rewrite.column_mapping.iter().enumerate() {
@@ -35151,7 +35336,12 @@ impl Storage {
             .iter()
             .any(|column| column.ctype.typlen() == -1);
         self.require_schema_create(def.schema.as_str(), txid)?;
-        let slot = table_creation::allocate(self, def, Some(txid))?;
+        let slot = table_creation::allocate(
+            self,
+            def,
+            CatalogAllocation::New,
+            TableCreation::Pending(txid),
+        )?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -35201,31 +35391,78 @@ impl Storage {
             let mut state = self.tables[index].definition.write();
             if state.identity.database != selected.database
                 || state.identity.created_at != selected.created_at
+                || state.identity.ddl_version != selected.ddl_version
+                || state.identity.existence != selected.existence
                 || state.identity.existence == CatalogDdlState::Absent
             {
                 return None;
             }
-            let types =
-                match row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned") {
-                    Ok(types) => types,
-                    Err(wait) => {
-                        drop(state);
-                        drop(lifecycle);
-                        #[cfg(test)]
-                        self.type_publication
-                            .waits
-                            .fetch_add(1, core::sync::atomic::Ordering::Release);
-                        wait.wait();
-                        continue;
-                    }
-                };
-            state.identity.existence = CatalogDdlState::Absent;
+            let attempt: Result<_, row_ownership::LockWait<'_>> = (|| {
+                let types =
+                    row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned")?;
+                let comments =
+                    row_ownership::try_mutex(&self.comments, "comment catalog lock poisoned")?;
+                let permissions =
+                    row_ownership::try_mutex(&self.acl_catalog, "ACL catalog lock poisoned")?;
+                let extensions = row_ownership::try_mutex(
+                    &self.extension_catalog,
+                    "extension catalog lock poisoned",
+                )?;
+                Ok((types, comments, permissions, extensions))
+            })();
+            let (types, mut comments, mut permissions, mut extensions) = match attempt {
+                Ok(owners) => owners,
+                Err(wait) => {
+                    drop(state);
+                    drop(lifecycle);
+                    #[cfg(test)]
+                    self.type_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    continue;
+                }
+            };
+            let source = self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(index),
+                selected.database,
+                selected.created_at,
+            );
+            let transaction = selected.existence.pending_drop_txid();
             let (schema, name) = (state.committed.schema, state.committed.name);
+            for comment in comments.entries.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.database == Some(selected.database)
+                    && comment.pending_drop.map_or_else(
+                        || {
+                            transaction.is_none()
+                                && comment.pending.is_none()
+                                && comment.pending_identity.is_none()
+                                && (matches!(
+                                    comment.class,
+                                    CommentClass::Relation | CommentClass::Type
+                                ) && comment.schema == schema
+                                    && comment.name == name
+                                    || comment.class == CommentClass::Constraint
+                                        && comment.subid == index as u32)
+                        },
+                        |pending| Some(pending.txid) == transaction && pending.source == source,
+                    )
+            }) {
+                *comment = CommentEntry::empty();
+            }
+            let object = AccessObject {
+                class: AccessClass::Table,
+                slot: index as u16,
+            };
+            Self::clear_object_acl_entries_locked(&mut permissions, object);
+            Self::clear_extension_dependencies_for_object_locked(&mut extensions, object);
+            state.identity.existence = CatalogDdlState::Absent;
             drop(state);
-            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-            self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
             drop(types);
+            drop(comments);
+            drop(permissions);
+            drop(extensions);
             return Some(lifecycle);
         }
     }
@@ -35243,24 +35480,6 @@ impl Storage {
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
-    }
-
-    /// Other transactions keep the committed image until the drop commits.
-    pub fn drop_table_in(&self, index: usize, txid: u32) {
-        let _lifecycle = self.tables[index].lifecycle();
-        {
-            let mut state = self.tables[index].definition.write();
-            state.identity.existence = state.identity.existence.drop_by(txid);
-        }
-        for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
-            rule.database == current_database()
-                && rule.visible_to(txid)
-                && rule.definition_for(txid).target == RuleTarget::Table(index as u16)
-        }) {
-            rule.ddl_state = rule.ddl_state.drop_by(txid);
-            rule.pending_parent_drop_txid = Some(txid);
-        }
-        self.tables[index].mark_dirty();
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
@@ -35282,6 +35501,10 @@ impl Storage {
         let Some(_lifecycle) = self.retire_table_names(index, selected) else {
             return;
         };
+        self.retire_table_data(index);
+    }
+
+    fn retire_table_data(&self, index: usize) {
         self.release_enforcers(index);
         self.reset_relation_statistics(index);
         self.reset_implicit_index_statistics(index);
@@ -35316,23 +35539,6 @@ impl Storage {
         self.clear_pending_table_statistics(index);
         self.clear_table_rows(index);
         self.tables[index].statistics.clear_wal();
-    }
-
-    /// Restores the prior existence and attached rules after an uncommitted DROP.
-    pub fn rollback_drop(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let txid = {
-            let mut state = self.tables[index].definition.write();
-            let txid = state
-                .identity
-                .existence
-                .pending_txid()
-                .expect("table DROP owns catalog state");
-            state.identity.existence = state.identity.existence.rollback_drop(txid);
-            txid
-        };
-        self.view_rule_catalog()
-            .rollback_target_rules(RuleTarget::Table(index as u16), txid);
     }
 
     /// Whether any live view exists (lets the executor skip view expansion).
@@ -37623,170 +37829,6 @@ impl Storage {
         })
     }
 
-    pub(crate) fn restore_matview_population(
-        &mut self,
-        slot: usize,
-        populated: bool,
-    ) -> Result<(), SqlError> {
-        let version = self.catalog_sequence.next()?;
-        let mut catalog = self.matview_catalog();
-        let view = catalog
-            .get_mut(slot)
-            .filter(|view| view.database == current_database() && view.visible_to(0))
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "journal changes an absent materialized view"
-                )
-            })?;
-        view.populated = populated;
-        view.population_version = version;
-        view.pending_population = None;
-        Ok(())
-    }
-
-    /// Registers a materialized view as an uncommitted CREATE owned by `txid`.
-    /// Unlike `create_view`, the name-vs-table collision is owned by the backing
-    /// table's own creation, so no `find_table`/`or_replace` handling is needed.
-    pub fn create_matview(
-        &self,
-        backing_table: usize,
-        query: StoredQueryDefinition,
-        populated: bool,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let target = self.query_table_target(backing_table, txid)?;
-        let name = self.table_def(backing_table, txid).name;
-        let ownership = self.initial_ownership(txid)?;
-        let mut owners = self.catalog_dependency_owners(
-            &self.matviews,
-            type_contracts::CatalogPublicationInput::QueryDefinition(query.dependencies.view()),
-            Some(target),
-        );
-        owners.validate_target(txid)?;
-        if let Some(existing) = owners.catalog.iter().find(|m| {
-            m.database == current_database()
-                && m.ddl_state != CatalogDdlState::Absent
-                && usize::from(m.backing_table) == backing_table
-        }) {
-            if let Some(blocker) = existing
-                .ddl_state
-                .pending_txid()
-                .filter(|&owner| owner != txid)
-            {
-                drop(owners);
-                return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-            }
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_TABLE,
-                "materialized view \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        let new = owners
-            .catalog
-            .iter()
-            .position(|m| m.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many materialized views (limit {})",
-                    owners.catalog.len()
-                )
-            })?;
-        let created_at = self.catalog_sequence.next()?;
-        let image = self.matview_dependency_image(new);
-        owners.write_query_image(self, image, query.dependencies.view(), txid)?;
-        owners.catalog[new] = MatviewDef {
-            database: current_database(),
-            created_at,
-            backing_table: backing_table as u16,
-            sql: query.sql,
-            creation_path: query.creation_path,
-            ownership,
-            populated,
-            population_version: created_at,
-            pending_population: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        drop(owners);
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::MaterializedView,
-            slot: new as u16,
-        });
-        Ok(new)
-    }
-
-    pub fn drop_matview(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let blocker = self.matview_catalog().iter().find_map(|m| {
-            (m.database == current_database() && m.ddl_state != CatalogDdlState::Absent && {
-                let table = self.table_def(usize::from(m.backing_table), txid);
-                table.schema.as_str() == schema && table.name.as_str() == name
-            })
-            .then_some(m.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        });
-        if let Some(blocker) = blocker {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(i) = self.matview_catalog().iter().position(|m| {
-            m.database == current_database() && m.visible_to(txid) && {
-                let table = self.table_def(usize::from(m.backing_table), txid);
-                table.schema.as_str() == schema && table.name.as_str() == name
-            }
-        }) else {
-            return Ok(None);
-        };
-        self.stage_matview_comment_drop(i, txid)?;
-        self.pending_drop_matview(i, txid);
-        Ok(Some(i))
-    }
-
-    fn pending_drop_matview(&mut self, slot: usize, txid: u32) {
-        let mut matviews = self.matview_catalog();
-        let m = &mut matviews[slot];
-        m.ddl_state = m.ddl_state.drop_by(txid);
-    }
-
-    pub fn commit_matview_create(&mut self, slot: usize) {
-        let mut matviews = self.matview_catalog();
-        matviews[slot].ddl_state = matviews[slot].ddl_state.commit_create();
-    }
-
-    pub fn commit_matview_drop(&mut self, slot: usize) {
-        let transaction = self
-            .matview(slot)
-            .ddl_state
-            .pending_drop_txid()
-            .expect("materialized-view retirement follows a pending drop");
-        self.finish_matview_comment_drop(slot, transaction, QueryDdlDecision::Commit);
-        self.matview_catalog()[slot] = MatviewDef::EMPTY;
-        let image = self.matview_dependency_image(slot);
-        self.clear_dependency_image(image);
-        self.clear_extension_dependencies_for_object(AccessObject {
-            class: AccessClass::MaterializedView,
-            slot: slot as u16,
-        });
-    }
-
-    pub fn rollback_matview_create(&mut self, slot: usize) {
-        self.matview_catalog()[slot] = MatviewDef::EMPTY;
-        let image = self.matview_dependency_image(slot);
-        self.clear_dependency_image(image);
-    }
-
-    pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
-        self.finish_matview_comment_drop(slot, txid, QueryDdlDecision::Rollback);
-        let mut matviews = self.matview_catalog();
-        let m = &mut matviews[slot];
-        m.ddl_state = m.ddl_state.rollback_drop(txid);
-    }
-
     // --- Sequences -------------------------------------------------------
 
     pub fn live_sequences(&self) -> impl Iterator<Item = SequenceDef> + '_ {
@@ -37973,238 +38015,8 @@ impl Storage {
         self.relation_kind_in(schema, name, txid).is_some()
     }
 
-    /// Registers a sequence as an uncommitted CREATE owned by `txid`. The caller
-    /// has already validated options and checked the name is free.
-    pub(crate) fn create_sequence(
-        &mut self,
-        create: SequenceCreateSpec,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let SequenceCreateSpec {
-            schema,
-            name,
-            spec,
-            owner,
-            generator_for,
-            persistence,
-        } = create;
-        self.require_schema_create(schema.as_str(), txid)?;
-        let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self.sequence_catalog();
-        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
-            (s.database == current_database()
-                && s.schema.as_str() == schema.as_str()
-                && s.name.as_str() == name.as_str())
-            .then_some(s.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            drop(catalog);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        let Some(new) = catalog
-            .definitions
-            .iter()
-            .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many sequences (limit {})",
-                catalog.definitions.len()
-            ));
-        };
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Sequence,
-            slot: new as u16,
-        });
-        catalog.definitions[new] = SequenceDef {
-            database: current_database(),
-            created_at,
-            cache_generation: 0,
-            schema,
-            name,
-            ownership,
-            data_type: spec.data_type,
-            increment: spec.increment,
-            min_value: spec.min_value,
-            max_value: spec.max_value,
-            start_value: spec.start_value,
-            cache: spec.cache,
-            cycle: spec.cycle,
-            persistence,
-            owner,
-            generator_for,
-            pending_definition: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        catalog.values[new] = SequenceValues::initial(spec.start_value);
-        drop(catalog);
-        if persistence == RelationPersistence::Temporary {
-            self.mark_temporary_transaction(txid);
-        }
-        Ok(new)
-    }
-
     pub(crate) fn sequence_for(&self, slot: usize, txid: u32) -> SequenceDef {
         self.sequence_catalog().definitions[slot].definition_for(txid)
-    }
-
-    pub(crate) fn stage_sequence_alter(
-        &mut self,
-        slot: usize,
-        alteration: SequenceAlteration,
-        txid: u32,
-    ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
-        let mut catalog = self.sequence_catalog();
-        let current_identity = catalog.definitions[slot].definition_for(txid);
-        let pending = catalog.definitions[slot].pending_definition;
-        if let Some(pending) = pending
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "sequence \"{}\" is being altered by another transaction",
-                catalog.definitions[slot].name.as_str()
-            ));
-        }
-        let sequence_values = &mut catalog.values[slot];
-        let prior = pending.map(|pending| PendingSequenceDefinition {
-            last_value: sequence_values.pending.last_value,
-            is_called: sequence_values.pending.is_called,
-            log_count: sequence_values.pending.log_count,
-            ..pending
-        });
-        let active = if pending.is_some_and(|pending| pending.txid == txid) {
-            sequence_values.pending
-        } else {
-            sequence_values.committed
-        };
-        let (last_value, is_called) = alteration
-            .restart
-            .map_or((active.last_value, active.is_called), |value| {
-                (value, false)
-            });
-        let restarted = pending.is_some_and(|pending| pending.txid == txid && pending.restarted)
-            || alteration.restart.is_some();
-        sequence_values.pending = SequenceValue {
-            last_value,
-            is_called,
-            log_count: 0,
-            dirty: alteration.restart.is_some(),
-            generation: sequence_values.pending.generation.wrapping_add(1),
-            staged_generation: 0,
-        };
-        catalog.definitions[slot].pending_definition = Some(PendingSequenceDefinition {
-            txid,
-            schema: alteration.schema,
-            name: alteration.name,
-            spec: alteration.spec,
-            owner: alteration.owner,
-            generator_for: alteration.generator_for,
-            persistence: alteration.persistence,
-            last_value,
-            is_called,
-            log_count: 0,
-            restarted,
-        });
-        drop(catalog);
-        if current_identity.schema != alteration.schema || current_identity.name != alteration.name
-        {
-            self.stage_object_comment_identity(
-                CommentClass::Relation,
-                current_identity.schema,
-                current_identity.name,
-                alteration.schema,
-                alteration.name,
-                txid,
-            );
-        }
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_sequence_alter(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.sequence_catalog();
-        if catalog.definitions[slot]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .is_some()
-        {
-            let old_schema = catalog.definitions[slot].schema;
-            let old_name = catalog.definitions[slot].name;
-            let definition = catalog.definitions[slot].definition_for(txid);
-            catalog.definitions[slot] = definition;
-            let values = &mut catalog.values[slot];
-            values.committed = values.pending;
-            values.committed.dirty = false;
-            values.committed.staged_generation = 0;
-            values.pending.dirty = false;
-            values.pending.staged_generation = 0;
-            if old_schema != catalog.definitions[slot].schema
-                || old_name != catalog.definitions[slot].name
-            {
-                let new_schema = catalog.definitions[slot].schema;
-                let new_name = catalog.definitions[slot].name;
-                drop(catalog);
-                self.commit_object_comment_identity(
-                    CommentClass::Relation,
-                    old_schema,
-                    old_name,
-                    txid,
-                );
-                self.rename_stored_query_dependency(
-                    DependencyClass::Sequence,
-                    slot,
-                    None,
-                    new_schema,
-                    new_name,
-                );
-            }
-        }
-    }
-
-    pub(crate) fn rollback_sequence_alter(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingSequenceDefinition>,
-    ) {
-        let mut catalog = self.sequence_catalog();
-        let current = catalog.definitions[slot].pending_definition;
-        let txid = current.map(|pending| pending.txid);
-        let old_identity = current.map(|pending| (pending.schema, pending.name));
-        // ALTER SEQUENCE's definition is transactional, but an advance made
-        // under an ordinary staged definition is not.  Only RESTART owns a
-        // temporary value image that rollback may discard.
-        catalog.definitions[slot].pending_definition = prior;
-        let values = &mut catalog.values[slot];
-        if current.is_some_and(|pending| !pending.restarted) {
-            values.committed = values.pending;
-        }
-        if let Some(prior) = prior {
-            values.pending = SequenceValue {
-                last_value: prior.last_value,
-                is_called: prior.is_called,
-                log_count: prior.log_count,
-                dirty: false,
-                generation: values.pending.generation.wrapping_add(1),
-                staged_generation: 0,
-            };
-        } else {
-            values.pending.dirty = false;
-        }
-        if let (Some(txid), Some((old_schema, old_name))) = (txid, old_identity) {
-            let visible = catalog.definitions[slot].definition_for(txid);
-            if old_schema != visible.schema || old_name != visible.name {
-                drop(catalog);
-                self.stage_object_comment_identity(
-                    CommentClass::Relation,
-                    old_schema,
-                    old_name,
-                    visible.schema,
-                    visible.name,
-                    txid,
-                );
-            }
-        }
     }
 
     pub(crate) fn reserve_sequence_values(
@@ -38351,160 +38163,6 @@ impl Storage {
         }
     }
 
-    pub(crate) fn reset_sequence_value(
-        &self,
-        slot: usize,
-        txid: u32,
-        value: i64,
-    ) -> SequenceValueState {
-        let mut catalog = self.sequence_catalog();
-        let sequence = catalog.definitions[slot];
-        let pending = sequence
-            .pending_definition
-            .is_some_and(|pending| pending.txid == txid);
-        if pending {
-            let state = &mut catalog.values[slot].pending;
-            let prior = SequenceValueState::Pending {
-                last_value: state.last_value,
-                is_called: state.is_called,
-                log_count: state.log_count,
-                dirty: state.dirty,
-                generation: state.generation,
-                staged_generation: state.staged_generation,
-            };
-            *state = SequenceValue {
-                last_value: value,
-                is_called: false,
-                log_count: 0,
-                dirty: true,
-                generation: state.generation.wrapping_add(1),
-                staged_generation: state.staged_generation,
-            };
-            return prior;
-        }
-        let state = &mut catalog.values[slot].committed;
-        let prior = SequenceValueState::Committed {
-            last_value: state.last_value,
-            is_called: state.is_called,
-            log_count: state.log_count,
-            dirty: state.dirty,
-            generation: state.generation,
-            staged_generation: state.staged_generation,
-        };
-        *state = SequenceValue {
-            last_value: value,
-            is_called: false,
-            log_count: 0,
-            dirty: true,
-            generation: state.generation.wrapping_add(1),
-            staged_generation: state.staged_generation,
-        };
-        prior
-    }
-
-    pub(crate) fn restore_sequence_value(&self, slot: usize, prior: SequenceValueState) {
-        let mut catalog = self.sequence_catalog();
-        match prior {
-            SequenceValueState::Committed {
-                last_value,
-                is_called,
-                log_count,
-                dirty,
-                generation,
-                staged_generation,
-            } => {
-                catalog.values[slot].committed = SequenceValue {
-                    last_value,
-                    is_called,
-                    log_count,
-                    dirty,
-                    generation,
-                    staged_generation,
-                };
-            }
-            SequenceValueState::Pending {
-                last_value,
-                is_called,
-                log_count,
-                dirty,
-                generation,
-                staged_generation,
-            } => {
-                catalog.values[slot].pending = SequenceValue {
-                    last_value,
-                    is_called,
-                    log_count,
-                    dirty,
-                    generation,
-                    staged_generation,
-                };
-            }
-        }
-    }
-
-    pub fn drop_sequence(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let mut catalog = self.sequence_catalog();
-        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
-            let definition = s.definition_for(txid);
-            (s.database == current_database()
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name)
-                .then_some(s.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            drop(catalog);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(i) = catalog.definitions.iter().position(|s| {
-            let definition = s.definition_for(txid);
-            s.database == current_database()
-                && s.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-        }) else {
-            return Ok(None);
-        };
-        let sequence = &mut catalog.definitions[i];
-        sequence.ddl_state = sequence.ddl_state.drop_by(txid);
-        Ok(Some(i))
-    }
-
-    pub fn commit_sequence_create(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
-    }
-
-    pub fn commit_sequence_drop(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        let (schema, name) = (
-            catalog.definitions[slot].schema,
-            catalog.definitions[slot].name,
-        );
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
-        catalog.definitions[slot] = SequenceDef::EMPTY;
-        catalog.values[slot] = SequenceValues::initial(1);
-        drop(catalog);
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-    }
-
-    pub fn rollback_sequence_create(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.rollback_create();
-        catalog.definitions[slot] = SequenceDef::EMPTY;
-        catalog.values[slot] = SequenceValues::initial(1);
-    }
-
-    pub fn rollback_sequence_drop(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.sequence_catalog();
-        let sequence = &mut catalog.definitions[slot];
-        sequence.ddl_state = sequence.ddl_state.rollback_drop(txid);
-    }
-
     pub(crate) fn restore_sequence_value_image(
         &mut self,
         slot: usize,
@@ -38528,26 +38186,38 @@ impl Storage {
 
     /// Applies a replayed/absolute `SequenceAdvance`: set value state directly,
     /// without marking dirty (replay must not re-journal).
-    pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
+    pub(crate) fn apply_sequence_advance(
+        &mut self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+        last: i64,
+        is_called: bool,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let slot = self.sequence_replay_slot(position, schema, name, transaction)?;
         let catalog = self
             .sequence_catalog
             .get_mut()
             .expect("sequence catalog lock poisoned");
-        if let Some(i) = catalog.definitions.iter().position(|s| {
-            s.database == current_database()
-                && s.ddl_state != CatalogDdlState::Absent
-                && s.schema.as_str() == schema
-                && s.name.as_str() == name
-        }) {
-            catalog.values[i].committed = SequenceValue {
-                last_value: last,
-                is_called,
-                log_count: 0,
-                dirty: false,
-                generation: 0,
-                staged_generation: 0,
-            };
-        }
+        let sequence = catalog.definitions[slot];
+        let value = if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == transaction)
+        {
+            &mut catalog.values[slot].pending
+        } else {
+            &mut catalog.values[slot].committed
+        };
+        *value = SequenceValue {
+            last_value: last,
+            is_called,
+            log_count: 0,
+            dirty: false,
+            generation: 0,
+            staged_generation: 0,
+        };
+        Ok(())
     }
 
     // --- Domains (`CREATE DOMAIN`) ---------------------------------------
@@ -40674,14 +40344,14 @@ impl Storage {
         if definition.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
-        Ok(ViewPublication::Created(QueryDdlUndo {
-            source: self.query_identity(
-                query_lifecycles::QueryCatalogSlot::View(new),
+        Ok(ViewPublication::Created(CatalogDdlUndo {
+            source: self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::View(new),
                 current_database(),
                 created_at,
             ),
             transaction: txid,
-            operation: query_lifecycles::QueryDdlOperation::Create,
+            operation: catalog_sources::CatalogDdlOperation::Create,
             version: created_at,
             prior_version: 0,
         }))
@@ -40703,7 +40373,7 @@ impl Storage {
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
-    fn retire_view_source(&mut self, source: query_lifecycles::QueryIdentity) {
+    fn retire_view_source(&mut self, source: catalog_sources::CatalogObjectIdentity) {
         let Some(slot) = source.view_slot() else {
             return;
         };
@@ -42235,95 +41905,6 @@ impl Storage {
         Ok(found)
     }
 
-    pub(crate) fn alter_routine_identity(
-        &mut self,
-        slot: usize,
-        schema: SqlName,
-        name: SqlName,
-        txid: u32,
-    ) -> Result<Option<PendingRoutineIdentity>, SqlError> {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        let routine = routines[slot];
-        if let Some(pending) = routine.pending_identity
-            && pending.txid != txid
-        {
-            drop(routines);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, routine.name.as_str()));
-        }
-        if routines.iter().enumerate().any(|(other, candidate)| {
-            other != slot
-                && candidate.database == current_database()
-                && candidate.visible_to(txid)
-                && candidate.schema_for(txid) == schema
-                && candidate.name_for(txid) == name
-                && candidate.argument_count == routine.argument_count
-                && candidate
-                    .arguments()
-                    .iter()
-                    .zip(routine.arguments())
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    })
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_FUNCTION,
-                "routine \"{}\" already exists with same argument types",
-                name.as_str()
-            ));
-        }
-        if let Some(blocker) = routines.iter().enumerate().find_map(|(other, candidate)| {
-            (other != slot)
-                .then_some(candidate.pending_identity)
-                .flatten()
-                .filter(|pending| {
-                    pending.txid != txid
-                        && pending.schema == schema
-                        && pending.name == name
-                        && candidate.argument_count == routine.argument_count
-                        && candidate.arguments().iter().zip(routine.arguments()).all(
-                            |(left, right)| {
-                                left.ctype == right.ctype && left.user_type == right.user_type
-                            },
-                        )
-                })
-                .map(|pending| pending.txid)
-        }) {
-            drop(routines);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        let prior = routines[slot].pending_identity;
-        routines[slot].pending_identity = Some(PendingRoutineIdentity { txid, schema, name });
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_routine_identity(&mut self, slot: usize, txid: u32) {
-        let changed = {
-            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-            let routine = &mut routines[slot];
-            if let Some(pending) = routine.pending_identity
-                && pending.txid == txid
-            {
-                routine.schema = pending.schema;
-                routine.name = pending.name;
-                routine.pending_identity = None;
-                Some((pending.schema, pending.name))
-            } else {
-                None
-            }
-        };
-        if let Some((schema, name)) = changed {
-            self.rename_stored_query_dependency(DependencyClass::Routine, slot, None, schema, name);
-        }
-    }
-
-    pub(crate) fn restore_routine_identity(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingRoutineIdentity>,
-    ) {
-        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_identity = prior;
-    }
-
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
         AccessObject {
             class: AccessClass::Routine,
@@ -42362,472 +41943,6 @@ impl Storage {
             self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16))
         };
         self.snapshot_dependency_image(image, arena)
-    }
-
-    pub(crate) fn create_routine(
-        &mut self,
-        spec: RoutineSpec,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let RoutineSpec {
-            identity,
-            schema,
-            name,
-            mut arguments,
-            argument_count,
-            mut parameters,
-            parameter_count,
-            mut kind,
-            mut result_columns,
-            result_column_count,
-            language,
-            attributes,
-            configs,
-            config_count,
-            body_kind,
-            body,
-            creation_path,
-            dependencies,
-        } = spec;
-        if config_count > configs.len()
-            || configs[..config_count]
-                .iter()
-                .enumerate()
-                .any(|(index, config)| {
-                    configs[..index]
-                        .iter()
-                        .any(|prior| prior.name == config.name)
-                })
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "routine configuration contract is invalid"
-            ));
-        }
-        if parameter_count > parameters.len()
-            || parameters[..parameter_count]
-                .iter()
-                .filter(|parameter| parameter.mode.is_input())
-                .count()
-                != argument_count
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "routine parameter contract does not match its input signature"
-            ));
-        }
-        let output_parameter_count = parameters[..parameter_count]
-            .iter()
-            .filter(|parameter| parameter.mode.is_output())
-            .count();
-        let mut saw_default = false;
-        let mut saw_variadic = false;
-        for parameter in &parameters[..parameter_count] {
-            if saw_variadic && !matches!(parameter.mode, RoutineParameterMode::Out) {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "VARIADIC parameter must be the last input parameter"
-                ));
-            }
-            if parameter.mode.is_input() {
-                if parameter.mode.default().is_some() {
-                    saw_default = true;
-                } else if saw_default {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "input parameters after one with a default value must also have defaults"
-                    ));
-                }
-            }
-            saw_variadic |= matches!(parameter.mode, RoutineParameterMode::Variadic { .. });
-        }
-        match kind {
-            RoutineKind::TableFunction => {
-                if result_column_count == 0 || result_column_count > result_columns.len() {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "record-returning function must have between one and {} result columns",
-                        result_columns.len()
-                    ));
-                }
-                if result_columns[..result_column_count]
-                    .iter()
-                    .enumerate()
-                    .any(|(index, column)| {
-                        result_columns[..index]
-                            .iter()
-                            .any(|prior| prior.name == column.name)
-                    })
-                {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "routine result column names must be distinct"
-                    ));
-                }
-            }
-            RoutineKind::RecordFunction { .. }
-                if result_column_count < 2
-                    || result_column_count != output_parameter_count
-                    || result_column_count > result_columns.len() =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "record function result contract does not match its output parameters"
-                ));
-            }
-            RoutineKind::RecordFunction { .. } => {}
-            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. }
-                if result_column_count != 0
-                    && (result_column_count != 1 || output_parameter_count != 1) =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "scalar function result contract does not match its output parameter"
-                ));
-            }
-            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. } => {}
-            RoutineKind::Trigger
-            | RoutineKind::EventTrigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_)
-                if result_column_count != 0 =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "routine kind cannot define result columns"
-                ));
-            }
-            RoutineKind::Trigger
-            | RoutineKind::EventTrigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_) => {}
-        }
-        type_contracts::routine_type_fields(
-            &mut arguments[..argument_count],
-            &mut parameters[..parameter_count],
-            &mut result_columns[..result_column_count],
-            &mut kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        self.require_schema_create(schema.as_str(), txid)?;
-        let allocated_ownership = if matches!(identity, RoutineIdentity::Allocate) {
-            Some(self.initial_ownership(txid)?)
-        } else {
-            None
-        };
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        owners.bind_routine_contract(
-            &mut arguments[..argument_count],
-            &mut parameters[..parameter_count],
-            &mut result_columns[..result_column_count],
-            &mut kind,
-            txid,
-        )?;
-        owners.validate_dependencies(dependencies.view(), txid)?;
-        let routines = &mut owners.catalog;
-        if let Some(blocker) = routines.iter().find_map(|routine| {
-            (routine.database == current_database()
-                && routine.schema_for(txid) == schema
-                && routine.name_for(txid) == name
-                && routine.argument_count == argument_count
-                && routine.arguments()[..argument_count]
-                    .iter()
-                    .zip(&arguments[..argument_count])
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    }))
-            .then_some(routine.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if routines.iter().any(|routine| {
-            routine.database == current_database()
-                && routine.visible_to(txid)
-                && routine.schema_for(txid) == schema
-                && routine.name_for(txid) == name
-                && routine.argument_count == argument_count
-                && routine.arguments()[..argument_count]
-                    .iter()
-                    .zip(&arguments[..argument_count])
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    })
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_FUNCTION,
-                "function \"{}\" already exists with same argument types",
-                name.as_str()
-            ));
-        }
-        let Some(slot) = routines
-            .iter()
-            .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many routines (limit {})",
-                routines.len()
-            ));
-        };
-        let (created_at, ownership) = match identity {
-            RoutineIdentity::Allocate => (
-                self.catalog_sequence.next()?,
-                allocated_ownership.expect("allocated routine ownership was prepared"),
-            ),
-            RoutineIdentity::Preserve {
-                created_at,
-                ownership,
-            } => {
-                self.catalog_sequence.observe(created_at);
-                (created_at, ownership)
-            }
-        };
-        owners.write_query_image(
-            self,
-            self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
-            dependencies.view(),
-            txid,
-        )?;
-        owners.catalog[slot] = RoutineDef {
-            database: current_database(),
-            created_at,
-            schema,
-            name,
-            pending_identity: None,
-            pending_definition: None,
-            arguments,
-            argument_count,
-            parameters,
-            parameter_count,
-            kind,
-            result_columns,
-            result_column_count,
-            language,
-            attributes,
-            configs,
-            config_count,
-            body_kind,
-            body,
-            creation_path,
-            ownership,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        drop(owners);
-        self.clear_object_acl_entries(Self::routine_access_object(slot));
-        Ok(slot)
-    }
-
-    pub(crate) fn commit_routine_create(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.commit_create();
-        let ownership = &mut routines[slot].ownership;
-        if let Some(pending) = ownership.pending
-            && pending.txid == txid
-        {
-            ownership.owner = pending.owner;
-            ownership.pending = None;
-        }
-    }
-
-    pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
-        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
-    }
-
-    pub(crate) fn replace_routine(
-        &mut self,
-        slot: usize,
-        mut definition: PendingRoutineDefinition,
-        dependencies: StoredQueryDependencyView<'_>,
-    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        type_contracts::routine_type_fields(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, definition.txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        let routine = self.routine(slot);
-        let name = routine.name;
-        if let Some(pending) = routine.pending_definition
-            && pending.txid != definition.txid
-        {
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        if owners.catalog[slot].database != routine.database
-            || owners.catalog[slot].created_at != routine.created_at
-            || !owners.catalog[slot].visible_to(definition.txid)
-        {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "routine changed before its definition could be published"
-            ));
-        }
-        owners.bind_routine_contract(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            definition.txid,
-        )?;
-        let prior = owners.catalog[slot].pending_definition;
-        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let previous = prior.map(|pending| pending.dependency_slot);
-        definition.dependency_slot = owners.allocate_query_image(
-            self,
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            previous,
-            dependencies,
-            definition.txid,
-        )?;
-        owners.catalog[slot].pending_definition = Some(definition);
-        Ok(prior)
-    }
-
-    pub(crate) fn replace_routine_preserving_dependencies(
-        &mut self,
-        slot: usize,
-        mut definition: PendingRoutineDefinition,
-    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        type_contracts::routine_type_fields(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, definition.txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        let routine = self.routine(slot);
-        let name = routine.name;
-        if let Some(pending) = routine.pending_definition
-            && pending.txid != definition.txid
-        {
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        if owners.catalog[slot].database != routine.database
-            || owners.catalog[slot].created_at != routine.created_at
-            || !owners.catalog[slot].visible_to(definition.txid)
-        {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "routine changed before its definition could be published"
-            ));
-        }
-        owners.bind_routine_contract(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            definition.txid,
-        )?;
-        let prior = owners.catalog[slot].pending_definition;
-        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let previous = prior.map(|pending| pending.dependency_slot);
-        definition.dependency_slot = owners.allocate_preserved_query_image(
-            self,
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            previous,
-            definition.txid,
-        )?;
-        owners.catalog[slot].pending_definition = Some(definition);
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_routine_replace(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.routine(slot).pending_definition
-            && pending.txid == txid
-        {
-            self.commit_pending_dependencies(
-                StoredQueryDependencyOwner::Routine(slot as u16),
-                pending.dependency_slot,
-            );
-            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-            let routine = &mut routines[slot];
-            routine.arguments = pending.arguments;
-            routine.argument_count = pending.argument_count;
-            routine.parameters = pending.parameters;
-            routine.parameter_count = pending.parameter_count;
-            routine.kind = pending.kind;
-            routine.result_columns = pending.result_columns;
-            routine.result_column_count = pending.result_column_count;
-            routine.language = pending.language;
-            routine.attributes = pending.attributes;
-            routine.configs = pending.configs;
-            routine.config_count = pending.config_count;
-            routine.body_kind = pending.body_kind;
-            routine.body = pending.body;
-            routine.creation_path = pending.creation_path;
-            routine.pending_definition = None;
-        }
-    }
-
-    pub(crate) fn rollback_routine_replace(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingRoutineDefinition>,
-    ) {
-        if let Some(current) = self.routine(slot).pending_definition {
-            self.release_pending_dependencies(current.dependency_slot);
-        }
-        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_definition =
-            prior;
-    }
-
-    pub(crate) fn drop_routine(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.drop_by(txid);
-    }
-
-    pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
-        let routine = self.routine(slot);
-        let routine_oid = routine_oid(&routine);
-        let oid = routine_oid as u32;
-        let pending = routine
-            .pending_definition
-            .map(|pending| pending.dependency_slot);
-        self.reset_function_statistics(routine_oid);
-        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
-        let object = Self::routine_access_object(slot);
-        self.clear_object_acl_entries(object);
-        self.clear_extension_dependencies_for_object(object);
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
-        self.drop_comments_by_subid(CommentClass::Routine, oid);
-        self.clear_pending_dependency_chain(pending);
-    }
-
-    pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn policy(&self, slot: usize) -> PolicyDef {
@@ -43022,14 +42137,15 @@ impl Storage {
                 "table slot exceeds policy catalog capacity"
             )
         })?;
-        let target = self.query_table_target(spec.table, txid)?;
+        let target =
+            self.query_table_target(spec.table, txid, type_contracts::QueryTargetUse::Read)?;
         Self::validate_policy_role_image(self.policy_roles_per_image, spec.roles)?;
         let mut owners = self.catalog_dependency_owners(
             &self.policy_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(target),
         );
-        owners.validate_target(txid)?;
+        owners.validate_target(txid, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
         if catalog.definitions.iter().any(|policy| {
             policy.database == current_database()
@@ -43115,13 +42231,17 @@ impl Storage {
             ));
         }
         Self::validate_policy_role_image(self.policy_roles_per_image, roles)?;
-        let target = self.query_table_target(usize::from(selected.table), txid)?;
+        let target = self.query_table_target(
+            usize::from(selected.table),
+            txid,
+            type_contracts::QueryTargetUse::Read,
+        )?;
         let mut owners = self.catalog_dependency_owners(
             &self.policy_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(target),
         );
-        owners.validate_target(txid)?;
+        owners.validate_target(txid, type_contracts::QueryTargetUse::Read)?;
         let current = &owners.catalog.definitions[slot];
         if current.database != selected.database
             || current.created_at != selected.created_at
@@ -43303,7 +42423,8 @@ impl Storage {
                 "policy role count exceeds durable representation"
             )
         })?;
-        let publication_target = self.query_table_target(spec.table, 0)?;
+        let publication_target =
+            self.query_table_target(spec.table, 0, type_contracts::QueryTargetUse::Read)?;
         let scratch_start = self.policy_role_replay_image * self.policy_roles_per_image;
         let mut catalog = self
             .policy_catalog
@@ -43354,7 +42475,7 @@ impl Storage {
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(publication_target),
         );
-        owners.validate_target(0)?;
+        owners.validate_target(0, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
         let existing = catalog.definitions.iter().position(|policy| {
             policy.database == current_database()
@@ -44225,57 +43346,59 @@ impl Storage {
             catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
-    pub(crate) fn replay_create_routine(
+    pub(crate) fn replay_routine_definition(
         &mut self,
-        mut definition: RoutineDef,
+        position: CatalogPosition,
+        definition: RoutineDef,
         dependencies: StoredQueryDependencies,
-    ) -> Result<(), SqlError> {
-        definition.ownership = definition.ownership.committed();
-        if let Some(slot) = self.routine_slot_by_declared_signature(
-            definition.schema.as_str(),
-            definition.name.as_str(),
-            definition.arguments(),
-            0,
-        ) {
-            // CREATE OR REPLACE keeps its routine object identifier.  WAL uses
-            // the complete post-change definition for both creates and
-            // replacements, so the matching durable identity selects an
-            // in-place replay rather than a drop/reallocate cycle.
-            if self.routine(slot).created_at == definition.created_at {
-                let mut owners = self.catalog_dependency_owners(
-                    &self.routines,
-                    type_contracts::CatalogPublicationInput::RoutineContract,
-                    None,
-                );
-                owners.bind_routine_contract(
-                    &mut definition.arguments[..definition.argument_count],
-                    &mut definition.parameters[..definition.parameter_count],
-                    &mut definition.result_columns[..definition.result_column_count],
-                    &mut definition.kind,
-                    0,
-                )?;
-                owners.write_query_image(
-                    self,
-                    self.committed_dependency_image(StoredQueryDependencyOwner::Routine(
-                        slot as u16,
-                    )),
-                    dependencies.view(),
-                    0,
-                )?;
-                definition.pending_identity = None;
-                definition.pending_definition = None;
-                definition.ddl_state = CatalogDdlState::Present;
-                owners.catalog[slot] = definition;
-                return Ok(());
-            }
-            self.drop_routine(slot, 0);
-            self.commit_routine_drop(slot);
+        transaction: u32,
+    ) -> Result<RoutineChange, SqlError> {
+        if definition.created_at != position.created_at() || position.slot() >= self.routine_count()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal routine source identity is invalid"
+            ));
         }
-        let slot = self.create_routine(
+        let slot = position.slot();
+        let current = self.routine(slot);
+        if current.ddl_state != CatalogDdlState::Absent {
+            if current.database != current_database()
+                || current.created_at != position.created_at()
+                || !current.visible_to(transaction)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal routine position belongs to a different source"
+                ));
+            }
+            return self.replace_routine(
+                self.prepare_routine_edit(slot, transaction)?,
+                RoutineDefinition {
+                    arguments: definition.arguments,
+                    argument_count: definition.argument_count,
+                    parameters: definition.parameters,
+                    parameter_count: definition.parameter_count,
+                    kind: definition.kind,
+                    result_columns: definition.result_columns,
+                    result_column_count: definition.result_column_count,
+                    language: definition.language,
+                    attributes: definition.attributes,
+                    configs: definition.configs,
+                    config_count: definition.config_count,
+                    body_kind: definition.body_kind,
+                    body: definition.body,
+                    creation_path: definition.creation_path,
+                },
+                RoutineDependencies::Replace(dependencies.view()),
+                transaction,
+            );
+        }
+        self.create_routine(
             RoutineSpec {
                 identity: RoutineIdentity::Preserve {
-                    created_at: definition.created_at,
-                    ownership: definition.ownership,
+                    position,
+                    ownership: definition.ownership.committed(),
                 },
                 schema: definition.schema,
                 name: definition.name,
@@ -44295,10 +43418,8 @@ impl Storage {
                 creation_path: definition.creation_path,
                 dependencies,
             },
-            0,
-        )?;
-        self.commit_routine_create(slot, 0);
-        Ok(())
+            transaction,
+        )
     }
 
     pub(crate) fn extended_statistics_count(&self) -> usize {
@@ -46763,14 +45884,6 @@ impl Storage {
         }
         let current = *self.tables[index].definition();
         if current.name != def.name {
-            for index_def in self.index_catalog().iter_mut() {
-                if index_def.database == database_oid
-                    && index_def.schema == current.schema
-                    && index_def.table == current.name
-                {
-                    index_def.table = def.name;
-                }
-            }
             for table in self.tables.iter_mut() {
                 if table.database() != database_oid {
                     continue;
@@ -46821,13 +45934,20 @@ impl Storage {
         drop(sequence_catalog);
         for index_def in self.index_catalog().iter_mut() {
             if index_def.database != database_oid
-                || index_def.ddl_state != CatalogDdlState::Present
-                || index_def.schema != old.schema
-                || index_def.table != old.name
+                || index_def.schema != current.schema
+                || index_def.table != current.name
             {
                 continue;
             }
-            for column in &mut index_def.columns[..index_def.n_cols] {
+            if index_def.ddl_state != CatalogDdlState::Present {
+                index_def.schema = def.schema;
+                index_def.table = def.name;
+                continue;
+            }
+            for (key, column) in index_def.columns[..index_def.n_cols].iter_mut().enumerate() {
+                if index_def.expressions[key].is_some() {
+                    continue;
+                }
                 let Some(target_name) = column_mapping
                     .get(*column as usize)
                     .and_then(|target| *target)
@@ -49994,9 +49114,9 @@ impl Storage {
             });
             let rule = owners.catalog.rules[slot];
             return Ok(RulePublication::Altered(RuleAlterUndo {
-                target: query_lifecycles::QueryEditTarget {
-                    source: self.query_identity(
-                        query_lifecycles::QueryCatalogSlot::Rule(slot),
+                target: catalog_sources::CatalogEditTarget {
+                    source: self.catalog_object_identity(
+                        catalog_sources::CatalogObjectSlot::Rule(slot),
                         rule.database,
                         rule.created_at,
                     ),
@@ -50008,14 +49128,14 @@ impl Storage {
         }
         let slot = self.create_new_rule_in(&mut owners, definition, dependencies, txid)?;
         let rule = owners.catalog.rules[slot];
-        Ok(RulePublication::Created(QueryDdlUndo {
-            source: self.query_identity(
-                query_lifecycles::QueryCatalogSlot::Rule(slot),
+        Ok(RulePublication::Created(CatalogDdlUndo {
+            source: self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Rule(slot),
                 rule.database,
                 rule.created_at,
             ),
             transaction: txid,
-            operation: query_lifecycles::QueryDdlOperation::Create,
+            operation: catalog_sources::CatalogDdlOperation::Create,
             version: rule.ddl_version,
             prior_version: 0,
         }))
@@ -50064,7 +49184,7 @@ impl Storage {
 
     pub(crate) fn alter_rule(
         &self,
-        selected_target: query_lifecycles::QueryEditTarget,
+        selected_target: catalog_sources::CatalogEditTarget,
         change: RuleMetadataChange,
         txid: u32,
     ) -> Result<(RuleAlterUndo, RuleDefinition), SqlError> {
@@ -50204,7 +49324,7 @@ impl Storage {
         }
         Ok((
             RuleAlterUndo {
-                target: query_lifecycles::QueryEditTarget {
+                target: catalog_sources::CatalogEditTarget {
                     version,
                     ..selected_target
                 },
@@ -53131,7 +52251,7 @@ mod tests {
             );
             assert!(storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
-            storage.drop_table_in(slot, 7);
+            let dropped = storage.drop_table_in(slot, 7).unwrap();
             assert!(!storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
             assert!(!storage.table(slot).is_free());
@@ -53139,18 +52259,18 @@ mod tests {
             let error = storage.create_table_in(replacement, 8).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(error.message.as_str(), "too many tables (limit 1)");
-            storage.rollback_drop(slot);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             assert_eq!(storage.table(slot).identity().existence, original.existence);
             assert!(storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
             storage.commit_create(slot);
             assert!(storage.table(slot).visible_to(8));
-            storage.drop_table_in(slot, 9);
+            let dropped = storage.drop_table_in(slot, 9).unwrap();
             assert!(!storage.table(slot).visible_to(9));
             assert!(storage.table(slot).visible_to(8));
-            storage.rollback_drop(slot);
+            storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
             assert!(storage.table(slot).visible_to(9));
-            storage.drop_table_in(slot, 9);
+            storage.drop_table_in(slot, 9).unwrap();
             storage.commit_drop(slot);
             let reused = storage.create_table_in(replacement, 8).unwrap();
             assert_eq!(reused, slot);
@@ -53631,7 +52751,8 @@ mod tests {
             assert_missing_creation_actor(table_creation::allocate(
                 &storage,
                 make_def("unowned_table", &[("id", ColType::Int4, false)]),
-                Some(7),
+                CatalogAllocation::New,
+                TableCreation::Pending(7),
             ));
             assert_eq!(storage.catalog_sequence.current(), sequence);
             assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
@@ -54293,6 +53414,7 @@ mod tests {
                 .create_database(
                     None,
                     DatabaseOid::POSTGRES,
+                    DatabaseCloneAllocation::New,
                     test_database_definition("cloned_orders"),
                     0,
                     17,
@@ -54355,6 +53477,7 @@ mod tests {
                     .create_database(
                         None,
                         DatabaseOid::TEMPLATE1,
+                        DatabaseCloneAllocation::New,
                         test_database_definition("retired_database"),
                         0,
                         17,
@@ -54427,6 +53550,7 @@ mod tests {
                     .create_database(
                         None,
                         DatabaseOid::POSTGRES,
+                        DatabaseCloneAllocation::New,
                         test_database_definition("failed_clone"),
                         0,
                         19
@@ -54753,12 +53877,12 @@ mod tests {
                             if iteration == 15 {
                                 storage.finish_view_publication(
                                     publication_slot,
-                                    crate::storage::QueryDdlDecision::Commit,
+                                    crate::storage::CatalogDdlDecision::Commit,
                                 );
                             } else {
                                 storage.finish_view_publication(
                                     publication_slot,
-                                    crate::storage::QueryDdlDecision::Rollback,
+                                    crate::storage::CatalogDdlDecision::Rollback,
                                 );
                             }
                         }
@@ -54880,7 +54004,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(prior.prior.is_none());
-            storage.finish_rule_publication(publication_slot, None, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_slot, None, CatalogDdlDecision::Rollback);
             assert_eq!(storage.rule(slot).created_at, 0);
             assert!(storage.rule(slot).pending.is_none());
             assert!(
@@ -54897,7 +54021,7 @@ mod tests {
                 .unwrap();
             let reused = publication_reused.slot();
             assert_eq!(reused, slot);
-            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(publication_reused, None, CatalogDdlDecision::Commit);
             let dropped = storage
                 .drop_rule(storage.prepare_rule_edit(reused, 8).unwrap(), 8)
                 .unwrap();
@@ -55086,7 +54210,7 @@ mod tests {
             let slot = publication_slot.slot();
             storage.finish_view_publication(
                 publication_slot,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             assert_eq!(
                 storage
@@ -55117,7 +54241,7 @@ mod tests {
             assert_ne!(filler, slot);
             storage.finish_view_publication(
                 publication_filler,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             let mut replacement = test_view_definition(StoredQueryDependencies::EMPTY);
             replacement.query.sql = StackStr::from_str("SELECT 2");
@@ -55150,7 +54274,7 @@ mod tests {
                 storage.rule(0).definition_for(8).source.as_str(),
                 "SELECT 2"
             );
-            storage.finish_view_publication(publication, QueryDdlDecision::Rollback);
+            storage.finish_view_publication(publication, CatalogDdlDecision::Rollback);
             assert!(storage.view(slot).pending_definition.is_none());
             assert!(storage.rule(0).pending.is_none());
             assert_eq!(storage.view(2).created_at, 0);
@@ -55176,7 +54300,7 @@ mod tests {
             assert_eq!(reused, slot);
             storage.finish_view_publication(
                 publication_reused,
-                crate::storage::QueryDdlDecision::Rollback,
+                crate::storage::CatalogDdlDecision::Rollback,
             );
             assert_eq!(storage.view(slot).created_at, 0);
             assert_eq!(storage.view(slot).return_rule, u16::MAX);
@@ -55316,7 +54440,8 @@ mod tests {
             )
             .unwrap();
         let slot = publication_slot.slot();
-        storage.finish_view_publication(publication_slot, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_slot, crate::storage::CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let prior = storage
                 .stage_view_rename(storage.prepare_view_edit(slot, 8).unwrap(), new, 8)
@@ -55346,7 +54471,7 @@ mod tests {
             assert_ne!(publication_reused_name.slot(), slot);
             storage.finish_view_publication(
                 publication_reused_name,
-                crate::storage::QueryDdlDecision::Rollback,
+                crate::storage::CatalogDdlDecision::Rollback,
             );
             let dropped = storage.drop_view("public", "new_view", 8).unwrap().unwrap();
             assert_eq!(dropped.slot(), slot);
@@ -55376,7 +54501,8 @@ mod tests {
             )
             .unwrap();
         let slot = publication_slot.slot();
-        storage.finish_view_publication(publication_slot, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_slot, crate::storage::CatalogDdlDecision::Commit);
         let rule = storage.view_return_rule(slot);
         let definition = storage.rule(rule).definition;
         storage
@@ -55851,6 +54977,8 @@ mod tests {
                 database: _,
                 created_at: _,
                 backing_table: _,
+                backing_created_at: _,
+                ddl_version: _,
                 sql: _,
                 creation_path: _,
                 ownership: _,
@@ -56396,9 +55524,9 @@ mod tests {
             assert_ne!(a, b);
             let prior_b = storage.begin_rule_history(target, 7).unwrap();
             assert_eq!(prior_b, Some(7));
-            storage.finish_rule_publication(publication_b, prior_b, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_b, prior_b, CatalogDdlDecision::Rollback);
             assert!(storage.table_has_rules(table, 7));
-            storage.finish_rule_publication(publication_a, prior_a, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_a, prior_a, CatalogDdlDecision::Rollback);
             assert!(!storage.table_has_rules(table, 7));
             assert_eq!(storage.tables[table].ddl_locked_by_other(8), None);
             let publication_reused = storage
@@ -56407,7 +55535,7 @@ mod tests {
             let reused = publication_reused.slot();
             assert_eq!(reused, a);
             assert_eq!(storage.begin_rule_history(target, 8).unwrap(), None);
-            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(publication_reused, None, CatalogDdlDecision::Commit);
             assert!(storage.table_has_rules(table, 0));
             assert_eq!(
                 storage.tables[table]
@@ -56550,7 +55678,8 @@ mod tests {
             )
             .unwrap();
         let view = publication_view.slot();
-        storage.finish_view_publication(publication_view, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_view, crate::storage::CatalogDdlDecision::Commit);
         let mut encoded = FixedBuf::new(&mut budget, "prepared relation locks", 512).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage
@@ -57265,6 +56394,7 @@ mod tests {
             }
             catalog[1].pending_identity = Some(PendingRoutineIdentity {
                 txid: 7,
+                version: 1,
                 schema: SqlName::parse("public").unwrap(),
                 name: SqlName::parse("renamed").unwrap(),
             });
@@ -59127,6 +58257,7 @@ mod tests {
         let sequence = storage
             .create_sequence(
                 SequenceCreateSpec {
+                    allocation: crate::storage::CatalogAllocation::New,
                     schema: SqlName::parse("public").unwrap(),
                     name: SqlName::parse("concurrent_sequence").unwrap(),
                     spec: SeqSpec {
@@ -59145,8 +58276,8 @@ mod tests {
                 0,
             )
             .unwrap();
-        storage.commit_sequence_create(sequence);
-        assert_eq!(sequence, 0);
+        storage.finish_sequence_change(sequence, CatalogDdlDecision::Commit);
+        assert_eq!(sequence.slot(), 0);
         let catalog = &storage.sequence_catalog;
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -59516,6 +58647,7 @@ mod tests {
             let slot = storage
                 .create_sequence(
                     SequenceCreateSpec {
+                        allocation: crate::storage::CatalogAllocation::New,
                         schema: SqlName::parse("public").unwrap(),
                         name: SqlName::parse(sequence_names[worker]).unwrap(),
                         spec: SeqSpec {
@@ -59534,8 +58666,8 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            storage.commit_sequence_create(slot);
-            slot
+            storage.finish_sequence_change(slot, CatalogDdlDecision::Commit);
+            slot.slot()
         });
 
         std::thread::scope(|scope| {
@@ -60262,6 +59394,16 @@ mod tests {
         config.max_materialized_views = WORKERS;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        for name in [
+            "materialized_a",
+            "materialized_b",
+            "materialized_c",
+            "materialized_d",
+        ] {
+            storage
+                .create_table(make_def(name, &[("value", ColType::Int4, true)]))
+                .unwrap();
+        }
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -60273,6 +59415,8 @@ mod tests {
                         database: current_database(),
                         created_at,
                         backing_table: worker as u16,
+                        backing_created_at: storage.table(worker).created_at(),
+                        ddl_version: created_at,
                         sql: StackStr::from_str("SELECT 1"),
                         creation_path: StackStr::from_str("public"),
                         ownership: Ownership::BOOTSTRAP,
@@ -60298,7 +59442,7 @@ mod tests {
                 scope.spawn(move || {
                     let target = storage.prepare_matview_population(slot, 0).unwrap();
                     let undo = storage.stage_matview_population(target, true, 0).unwrap();
-                    storage.finish_matview_population(undo, QueryDdlDecision::Commit);
+                    storage.finish_matview_population(undo, CatalogDdlDecision::Commit);
                 });
             }
         });
@@ -60308,15 +59452,19 @@ mod tests {
                 .all(|definition| definition.populated)
         );
 
-        {
-            let mut catalog = storage.matview_catalog();
-            catalog[0].ddl_state = CatalogDdlState::PendingCreate { txid: 10 };
-            catalog[0].ownership.pending = Some(PendingOwnership {
-                txid: 10,
-                owner: BOOTSTRAP_ROLE,
-            });
-        }
-        storage.rollback_matview_create(0);
+        let selected = storage.prepare_matview_edit(0, 10).unwrap();
+        let retired = storage.drop_matview(selected, 10).unwrap();
+        storage.finish_matview_change(retired, CatalogDdlDecision::Commit);
+        let created = storage
+            .create_matview(
+                crate::storage::CatalogAllocation::New,
+                0,
+                test_view_definition(StoredQueryDependencies::EMPTY).query,
+                false,
+                10,
+            )
+            .unwrap();
+        storage.finish_matview_change(created, CatalogDdlDecision::Rollback);
         let empty = storage.matview(0);
         assert_eq!(empty.database, DatabaseOid::POSTGRES);
         assert_eq!(empty.created_at, 0);
@@ -60611,7 +59759,10 @@ mod tests {
         );
         assert!(
             storage
-                .complete_replay_table_rewrite(make_def("t", &[("id", ColType::Int4, true)]))
+                .complete_replay_table_rewrite(
+                    storage.table_position(0),
+                    make_def("t", &[("id", ColType::Int4, true)])
+                )
                 .unwrap()
         );
         storage.ensure_no_pending_replay_table_rewrite().unwrap();
@@ -60619,6 +59770,11 @@ mod tests {
 
     #[test]
     fn catalog_ddl_state_has_one_visibility_rule() {
+        for transaction in [0, 1] {
+            assert!(CatalogDdlState::PendingDrop { txid: transaction }.committed_exists());
+            assert!(!CatalogDdlState::PendingCreate { txid: transaction }.committed_exists());
+            assert!(!CatalogDdlState::PendingCreateDrop { txid: transaction }.committed_exists());
+        }
         assert!(!CatalogDdlState::Absent.visible_to(1));
         assert!(CatalogDdlState::Present.visible_to(1));
         assert!(CatalogDdlState::PendingCreate { txid: 1 }.visible_to(1));
@@ -60916,7 +60072,7 @@ mod tests {
             .unwrap();
         let rule = publication_rule.slot();
         storage.begin_rule_history(target, 7).unwrap();
-        storage.finish_rule_publication(publication_rule, None, QueryDdlDecision::Commit);
+        storage.finish_rule_publication(publication_rule, None, CatalogDdlDecision::Commit);
         let held = storage.table_def(first, 7);
         assert_eq!(held.name.as_str(), "held_pending_cleanup");
         let (sent, received) = std::sync::mpsc::sync_channel(1);
@@ -60941,9 +60097,10 @@ mod tests {
             }
             scope.spawn(move || {
                 crate::mem::guard::forbid_alloc(|| {
-                    storage.drop_table_in(second, 7);
-                    storage.rollback_drop(second);
-                    storage.drop_table_in(second, 8);
+                    let dropped = storage.drop_table_in(second, 7).unwrap();
+                    storage
+                        .finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
+                    storage.drop_table_in(second, 8).unwrap();
                     storage.commit_drop(second);
                     storage.commit_create(third);
                     storage.rollback_create(third);
@@ -61044,8 +60201,8 @@ mod tests {
                 assert!(done || cursor > prior_cursor || after < before);
                 assert!(storage.row_versions.test_write().is_ok());
                 assert!(storage.tables[first].rows.test_write().is_ok());
-                storage.drop_table_in(other, 8);
-                storage.rollback_drop(other);
+                let dropped = storage.drop_table_in(other, 8).unwrap();
+                storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
                 let rows = storage.tables[first].rows.read();
                 for (key, row) in rows.iter() {
                     assert_eq!(

@@ -1064,6 +1064,14 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 1348,
+        name: "obj_description",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 1387,
         name: "pg_get_constraintdef",
         result_oid: 25,
@@ -14362,22 +14370,59 @@ pub fn user_type_name_text<'a>(
 
 /// The comment text `txid` sees on the object with this OID (and column
 /// `subid`), for `obj_description`/`col_description`. `catalog_name` selects
-/// the object's catalog, defaulting to `pg_class` for deprecated one-argument
-/// `obj_description`.
+/// the object's catalog. None searches local catalogs for one-argument
+/// `obj_description`; shared descriptions remain separate.
 pub fn comment_text_for<'a>(
     storage: &Storage,
     txid: u32,
-    catalog_name: &str,
+    catalog_name: Option<&str>,
     oid: u32,
     subid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let signed_oid = i32::try_from(oid).ok();
+    let mut found = None;
     for (class, schema, name, csub, text) in storage.comments_visible(txid) {
         let schema = schema.as_str();
         let name = name.as_str();
         let text = text.as_str();
-        let hit = match catalog_name {
+        let selected_catalog = match catalog_name {
+            Some(name) => name,
+            None => match class {
+                crate::storage::CommentClass::Role
+                | crate::storage::CommentClass::Database
+                | crate::storage::CommentClass::Tablespace => continue,
+                crate::storage::CommentClass::Relation => "pg_class",
+                crate::storage::CommentClass::Schema => "pg_namespace",
+                crate::storage::CommentClass::Type => "pg_type",
+                crate::storage::CommentClass::Extension => "pg_extension",
+                crate::storage::CommentClass::Trigger => "pg_trigger",
+                crate::storage::CommentClass::Collation => "pg_collation",
+                crate::storage::CommentClass::Conversion => "pg_conversion",
+                crate::storage::CommentClass::EventTrigger => "pg_event_trigger",
+                crate::storage::CommentClass::Rule => "pg_rewrite",
+                crate::storage::CommentClass::TextSearchParser => "pg_ts_parser",
+                crate::storage::CommentClass::TextSearchTemplate => "pg_ts_template",
+                crate::storage::CommentClass::TextSearchDictionary => "pg_ts_dict",
+                crate::storage::CommentClass::TextSearchConfiguration => "pg_ts_config",
+                crate::storage::CommentClass::LargeObject => "pg_largeobject",
+                crate::storage::CommentClass::Routine => "pg_proc",
+                crate::storage::CommentClass::Policy => "pg_policy",
+                crate::storage::CommentClass::Statistics => "pg_statistic_ext",
+                crate::storage::CommentClass::Publication => "pg_publication",
+                crate::storage::CommentClass::Subscription => "pg_subscription",
+                crate::storage::CommentClass::ForeignServer => "pg_foreign_server",
+                crate::storage::CommentClass::Cast => "pg_cast",
+                crate::storage::CommentClass::Operator => "pg_operator",
+                crate::storage::CommentClass::OperatorFamily => "pg_opfamily",
+                crate::storage::CommentClass::OperatorClass => "pg_opclass",
+                crate::storage::CommentClass::Constraint => "pg_constraint",
+                crate::storage::CommentClass::ForeignDataWrapper => "pg_foreign_data_wrapper",
+                crate::storage::CommentClass::AccessMethod => "pg_am",
+                crate::storage::CommentClass::ProceduralLanguage => "pg_language",
+            },
+        };
+        let hit = match selected_catalog {
             "pg_namespace" => {
                 class == crate::storage::CommentClass::Schema
                     && subid == 0
@@ -14648,20 +14693,36 @@ pub fn comment_text_for<'a>(
                         )
                     })
             }
-            _ => {
+            "pg_extension" => {
+                class == crate::storage::CommentClass::Extension
+                    && subid == 0
+                    && storage
+                        .extension_slot(name, txid)
+                        .is_some_and(|slot| Some(extension_oid(slot)) == signed_oid)
+            }
+            "pg_class" => {
                 class == crate::storage::CommentClass::Relation
                     && csub as i32 == subid
                     && relation_oid_of(storage, txid, schema, name) == signed_oid
             }
+            _ => false,
         };
         if hit {
             let bytes = arena
                 .alloc_slice_copy(text.as_bytes())
                 .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+            if found
+                .replace(unsafe { core::str::from_utf8_unchecked(bytes) })
+                .is_some()
+            {
+                return Err(sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "more than one row returned by a subquery used as an expression"
+                ));
+            }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// One materialized foreign-key constraint.

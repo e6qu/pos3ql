@@ -160,7 +160,7 @@ fn describe_items_with_output_aliases<'q>(
         }
         fn comment<'a>(
             &self,
-            catalog_name: &str,
+            catalog_name: Option<&str>,
             oid: u32,
             subid: i32,
             arena: &'a crate::mem::arena::Arena,

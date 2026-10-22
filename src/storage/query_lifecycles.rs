@@ -1,8 +1,11 @@
 //! Stored-query edits and undo retain their selected object and revision.
 
-use super::type_references::CatalogOrigin;
+use super::catalog_sources::{
+    CatalogDdlDecision, CatalogDdlOperation, CatalogDdlUndo, CatalogEditTarget,
+    CatalogObjectIdentity, CatalogObjectSlot,
+};
 use super::{
-    CatalogDdlState, DatabaseOid, PendingRuleDefinition, PendingViewDefinition, SqlError, Storage,
+    CatalogDdlState, PendingRuleDefinition, PendingViewDefinition, SqlError, Storage,
     current_database, sqlstate,
 };
 use crate::sql_err;
@@ -47,109 +50,9 @@ impl ViewCatalogIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QueryCatalogSlot {
-    View(usize),
-    Rule(usize),
-    MaterializedView(usize),
-}
-
-impl QueryCatalogSlot {
-    fn index(self) -> usize {
-        match self {
-            Self::View(slot) | Self::Rule(slot) | Self::MaterializedView(slot) => slot,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct QueryIdentity {
-    origin: CatalogOrigin,
-    database: DatabaseOid,
-    slot: QueryCatalogSlot,
-    created_at: u64,
-}
-
-impl QueryIdentity {
-    pub(super) fn view_slot(self) -> Option<usize> {
-        match self.slot {
-            QueryCatalogSlot::View(slot) => Some(slot),
-            _ => None,
-        }
-    }
-
-    pub(super) fn matches(
-        self,
-        storage: &Storage,
-        database: DatabaseOid,
-        created_at: u64,
-        state: CatalogDdlState,
-    ) -> bool {
-        self.origin == storage.catalog_sources.origin()
-            && self.database == current_database()
-            && self.database == database
-            && self.created_at == created_at
-            && state != CatalogDdlState::Absent
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct QueryEditTarget {
-    pub(super) source: QueryIdentity,
-    pub(super) transaction: u32,
-    pub(super) version: u64,
-}
-
-impl QueryEditTarget {
-    pub(crate) fn slot(self) -> usize {
-        self.source.slot.index()
-    }
-
-    pub(super) fn view_slot(self) -> Result<usize, SqlError> {
-        match self.source.slot {
-            QueryCatalogSlot::View(slot) => Ok(slot),
-            _ => Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "edit source is not a view"
-            )),
-        }
-    }
-
-    pub(super) fn rule_slot(self) -> Result<usize, SqlError> {
-        match self.source.slot {
-            QueryCatalogSlot::Rule(slot) => Ok(slot),
-            _ => Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "edit source is not a rule"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QueryDdlOperation {
-    Create,
-    Drop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueryDdlUndo {
-    pub(super) source: QueryIdentity,
-    pub(super) transaction: u32,
-    pub(super) operation: QueryDdlOperation,
-    pub(super) version: u64,
-    pub(super) prior_version: u64,
-}
-
-impl QueryDdlUndo {
-    pub(crate) fn slot(self) -> usize {
-        self.source.slot.index()
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuleAlterUndo {
-    pub(super) target: QueryEditTarget,
+    pub(super) target: CatalogEditTarget,
     pub(super) prior: Option<PendingRuleDefinition>,
 }
 
@@ -165,7 +68,7 @@ impl RuleAlterUndo {
 )]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RulePublication {
-    Created(QueryDdlUndo),
+    Created(CatalogDdlUndo),
     Altered(RuleAlterUndo),
 }
 
@@ -180,7 +83,7 @@ impl RulePublication {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ViewAlterUndo {
-    pub(super) target: QueryEditTarget,
+    pub(super) target: CatalogEditTarget,
     pub(super) prior: Option<PendingViewDefinition>,
     pub(super) return_rule: Option<RuleAlterUndo>,
 }
@@ -197,7 +100,7 @@ impl ViewAlterUndo {
 )]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ViewPublication {
-    Created(QueryDdlUndo),
+    Created(CatalogDdlUndo),
     Altered(ViewAlterUndo),
 }
 
@@ -210,22 +113,16 @@ impl ViewPublication {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueryDdlDecision {
-    Commit,
-    Rollback,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PendingMatviewPopulation {
     pub(super) transaction: u32,
-    version: u64,
+    pub(super) version: u64,
     pub(super) populated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MatviewPopulationUndo {
-    target: QueryEditTarget,
+    target: CatalogEditTarget,
     prior: Option<PendingMatviewPopulation>,
 }
 
@@ -417,11 +314,11 @@ impl Storage {
     pub(super) fn stage_query_comment_drop_in(
         &self,
         owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
-        source: QueryIdentity,
+        source: CatalogObjectIdentity,
         transaction: u32,
     ) -> Result<(), SqlError> {
-        let (schema, name, rule_subid) = match source.slot {
-            QueryCatalogSlot::View(slot) => {
+        let (schema, name, rule_subid) = match source.slot() {
+            CatalogObjectSlot::View(slot) => {
                 let view = owners.catalog.views[slot];
                 (
                     view.schema_for(transaction),
@@ -429,7 +326,7 @@ impl Storage {
                     None,
                 )
             }
-            QueryCatalogSlot::Rule(slot) => {
+            CatalogObjectSlot::Rule(slot) => {
                 let rule = owners.catalog.rules[slot].definition_for(transaction);
                 (
                     super::SqlName::EMPTY,
@@ -437,7 +334,10 @@ impl Storage {
                     Some(rule.target.comment_subid()),
                 )
             }
-            QueryCatalogSlot::MaterializedView(_) => {
+            CatalogObjectSlot::Table(_)
+            | CatalogObjectSlot::MaterializedView(_)
+            | CatalogObjectSlot::Sequence(_)
+            | CatalogObjectSlot::Routine(_) => {
                 return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "comment source is not a view or rewrite rule"
@@ -454,7 +354,7 @@ impl Storage {
     fn stage_query_comment_drop(
         &self,
         comments: &mut super::CommentCatalog,
-        source: QueryIdentity,
+        source: CatalogObjectIdentity,
         schema: super::SqlName,
         name: super::SqlName,
         rule_subid: Option<u32>,
@@ -478,44 +378,13 @@ impl Storage {
                     transaction,
                 )
         };
-        if comments
-            .entries
-            .iter()
-            .filter(|comment| matches(comment))
-            .any(|comment| {
-                comment
-                    .pending
-                    .is_some_and(|pending| pending.txid != transaction)
-                    || comment
-                        .pending_identity
-                        .is_some_and(|identity| identity.txid != transaction)
-                    || comment
-                        .pending_drop
-                        .is_some_and(|pending| pending.txid != transaction)
-            })
-        {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "object comment is owned by another transaction"
-            ));
-        }
-        for comment in comments
-            .entries
-            .iter_mut()
-            .filter(|comment| matches(comment))
-        {
-            comment.pending_drop = Some(super::PendingCommentDrop {
-                txid: transaction,
-                source,
-            });
-        }
-        Ok(())
+        self.stage_catalog_comment_drop(comments, source, transaction, matches)
     }
 
     fn rollback_query_comment_drop_in(
         &self,
         comments: &mut super::CommentCatalog,
-        source: QueryIdentity,
+        source: CatalogObjectIdentity,
         transaction: u32,
     ) {
         for comment in comments.entries.iter_mut().filter(|comment| {
@@ -527,64 +396,13 @@ impl Storage {
         }
     }
 
-    pub(super) fn stage_matview_comment_drop(
-        &self,
-        slot: usize,
-        transaction: u32,
-    ) -> Result<(), SqlError> {
-        let view = self.matview(slot);
-        let source = self.query_identity(
-            QueryCatalogSlot::MaterializedView(slot),
-            view.database,
-            view.created_at,
-        );
-        let definition = self.table_def(usize::from(view.backing_table), transaction);
-        self.stage_query_comment_drop(
-            &mut self.comment_catalog(),
-            source,
-            definition.schema,
-            definition.name,
-            None,
-            transaction,
-        )
-    }
-
-    pub(super) fn finish_matview_comment_drop(
-        &self,
-        slot: usize,
-        transaction: u32,
-        decision: QueryDdlDecision,
-    ) {
-        let view = self.matview(slot);
-        let source = self.query_identity(
-            QueryCatalogSlot::MaterializedView(slot),
-            view.database,
-            view.created_at,
-        );
-        let mut comments = self.comment_catalog();
-        match decision {
-            QueryDdlDecision::Commit => {
-                for comment in comments.entries.iter_mut().filter(|comment| {
-                    comment.pending_drop.is_some_and(|pending| {
-                        pending.txid == transaction && pending.source == source
-                    })
-                }) {
-                    *comment = super::CommentEntry::empty();
-                }
-            }
-            QueryDdlDecision::Rollback => {
-                self.rollback_query_comment_drop_in(&mut comments, source, transaction);
-            }
-        }
-    }
-
-    fn rule_ddl_matches(&self, rule: &super::RuleDef, undo: QueryDdlUndo) -> bool {
-        matches!(undo.source.slot, QueryCatalogSlot::Rule(_))
+    fn rule_ddl_matches(&self, rule: &super::RuleDef, undo: CatalogDdlUndo) -> bool {
+        matches!(undo.source.slot(), CatalogObjectSlot::Rule(_))
             && undo
                 .source
                 .matches(self, rule.database, rule.created_at, rule.ddl_state)
             && match undo.operation {
-                QueryDdlOperation::Create => {
+                CatalogDdlOperation::Create => {
                     rule.ddl_state.pending_txid() == Some(undo.transaction)
                         && matches!(
                             rule.ddl_state,
@@ -592,7 +410,7 @@ impl Storage {
                                 | CatalogDdlState::PendingCreateDrop { .. }
                         )
                 }
-                QueryDdlOperation::Drop => {
+                CatalogDdlOperation::Drop => {
                     rule.ddl_state.pending_drop_txid() == Some(undo.transaction)
                         && rule.ddl_version == undo.version
                 }
@@ -605,8 +423,11 @@ impl Storage {
         slot: usize,
     ) {
         let rule = owners.catalog.rules[slot];
-        let source =
-            self.query_identity(QueryCatalogSlot::Rule(slot), rule.database, rule.created_at);
+        let source = self.catalog_object_identity(
+            CatalogObjectSlot::Rule(slot),
+            rule.database,
+            rule.created_at,
+        );
         for comment in owners
             .comments
             .as_mut()
@@ -642,12 +463,12 @@ impl Storage {
         let RulePublication::Created(undo) = publication else {
             return;
         };
-        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+        let CatalogObjectSlot::Rule(slot) = undo.source.slot() else {
             return;
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         if owners
@@ -664,24 +485,24 @@ impl Storage {
         &mut self,
         publication: RulePublication,
         prior_table_rule_txid: Option<u32>,
-        decision: QueryDdlDecision,
+        decision: CatalogDdlDecision,
     ) {
         let undo = match publication {
             RulePublication::Created(undo) => undo,
             RulePublication::Altered(undo) => {
                 match decision {
-                    QueryDdlDecision::Commit => self.commit_rule_alter(undo),
-                    QueryDdlDecision::Rollback => self.rollback_rule_alter(undo),
+                    CatalogDdlDecision::Commit => self.commit_rule_alter(undo),
+                    CatalogDdlDecision::Rollback => self.rollback_rule_alter(undo),
                 }
                 return;
             }
         };
-        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+        let CatalogObjectSlot::Rule(slot) = undo.source.slot() else {
             return;
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let Some(rule) = owners
@@ -694,23 +515,23 @@ impl Storage {
             return;
         };
         match decision {
-            QueryDdlDecision::Commit => {
+            CatalogDdlDecision::Commit => {
                 self.publish_pending_rule_in(&mut owners, slot, undo.transaction);
                 owners.catalog.rules[slot].ddl_state = rule.ddl_state.commit_create();
             }
-            QueryDdlDecision::Rollback => self.retire_rule_in(&mut owners, slot),
+            CatalogDdlDecision::Rollback => self.retire_rule_in(&mut owners, slot),
         }
         drop(owners);
         if let super::RuleTarget::Table(table) = rule.definition.target {
             let mut state = self.tables[usize::from(table)].definition.write();
             match decision {
-                QueryDdlDecision::Commit => {
+                CatalogDdlDecision::Commit => {
                     state.committed.has_rules = true;
                     if state.pending_has_rules_txid == Some(undo.transaction) {
                         state.pending_has_rules_txid = None;
                     }
                 }
-                QueryDdlDecision::Rollback => {
+                CatalogDdlDecision::Rollback => {
                     if state.pending_has_rules_txid == Some(undo.transaction) {
                         state.pending_has_rules_txid = prior_table_rule_txid;
                     }
@@ -721,12 +542,12 @@ impl Storage {
 
     pub(crate) fn drop_rule(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         transaction: u32,
-    ) -> Result<QueryDdlUndo, SqlError> {
+    ) -> Result<CatalogDdlUndo, SqlError> {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -737,25 +558,25 @@ impl Storage {
         let prior_version = rule.ddl_version;
         rule.ddl_state = rule.ddl_state.drop_by(transaction);
         rule.ddl_version = version;
-        Ok(QueryDdlUndo {
+        Ok(CatalogDdlUndo {
             source: target.source,
             transaction,
-            operation: QueryDdlOperation::Drop,
+            operation: CatalogDdlOperation::Drop,
             version,
             prior_version,
         })
     }
 
-    pub(crate) fn commit_rule_drop(&self, undo: QueryDdlUndo) {
-        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+    pub(crate) fn commit_rule_drop(&self, undo: CatalogDdlUndo) {
+        let CatalogObjectSlot::Rule(slot) = undo.source.slot() else {
             return;
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
-        if undo.operation == QueryDdlOperation::Drop
+        if undo.operation == CatalogDdlOperation::Drop
             && owners
                 .catalog
                 .rules
@@ -766,13 +587,13 @@ impl Storage {
         }
     }
 
-    pub(crate) fn rollback_rule_drop(&self, undo: QueryDdlUndo) {
-        let QueryCatalogSlot::Rule(slot) = undo.source.slot else {
+    pub(crate) fn rollback_rule_drop(&self, undo: CatalogDdlUndo) {
+        let CatalogObjectSlot::Rule(slot) = undo.source.slot() else {
             return;
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -783,7 +604,7 @@ impl Storage {
         else {
             return;
         };
-        if undo.operation != QueryDdlOperation::Drop {
+        if undo.operation != CatalogDdlOperation::Drop {
             return;
         }
         rule.ddl_state = rule.ddl_state.rollback_drop(undo.transaction);
@@ -837,12 +658,12 @@ impl Storage {
 
     pub(crate) fn validate_rule_drop(
         &self,
-        undo: QueryDdlUndo,
+        undo: CatalogDdlUndo,
         transaction: u32,
     ) -> Result<(), SqlError> {
         let catalog = self.view_rule_catalog();
         if undo.transaction != transaction
-            || undo.operation != QueryDdlOperation::Drop
+            || undo.operation != CatalogDdlOperation::Drop
             || !catalog
                 .rules
                 .get(undo.slot())
@@ -860,7 +681,7 @@ impl Storage {
         &self,
         slot: usize,
         transaction: u32,
-    ) -> Result<QueryEditTarget, SqlError> {
+    ) -> Result<CatalogEditTarget, SqlError> {
         let catalog = self.view_rule_catalog();
         let rule = catalog
             .rules
@@ -877,9 +698,9 @@ impl Storage {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(transaction, owner, name.as_str()));
         }
-        Ok(QueryEditTarget {
-            source: self.query_identity(
-                QueryCatalogSlot::Rule(slot),
+        Ok(CatalogEditTarget {
+            source: self.catalog_object_identity(
+                CatalogObjectSlot::Rule(slot),
                 rule.database,
                 rule.created_at,
             ),
@@ -891,7 +712,7 @@ impl Storage {
     pub(super) fn validate_rule_edit(
         &self,
         catalog: &super::ViewRuleCatalog,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         transaction: u32,
     ) -> Result<usize, SqlError> {
         let slot = target.rule_slot()?;
@@ -978,7 +799,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
@@ -1013,7 +834,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
@@ -1088,7 +909,7 @@ impl Storage {
             })?;
         let valid = match publication {
             ViewPublication::Created(undo) => {
-                undo.operation == QueryDdlOperation::Create
+                undo.operation == CatalogDdlOperation::Create
                     && view.ddl_state.pending_txid() == Some(transaction)
                     && (matches!(view.ddl_state, CatalogDdlState::PendingCreateDrop { .. })
                         || matches!(view.ddl_state, CatalogDdlState::PendingCreate { .. })
@@ -1111,7 +932,7 @@ impl Storage {
 
     pub(crate) fn validate_view_drop(
         &self,
-        undo: QueryDdlUndo,
+        undo: CatalogDdlUndo,
         transaction: u32,
     ) -> Result<(), SqlError> {
         let catalog = self.view_rule_catalog();
@@ -1130,7 +951,7 @@ impl Storage {
         transaction: u32,
     ) -> Result<(), SqlError> {
         let target = undo.target;
-        let QueryCatalogSlot::MaterializedView(slot) = target.source.slot else {
+        let CatalogObjectSlot::MaterializedView(slot) = target.source.slot() else {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "population source is not a materialized view"
@@ -1168,10 +989,10 @@ impl Storage {
         schema: &str,
         name: &str,
         transaction: u32,
-    ) -> Result<Option<QueryDdlUndo>, SqlError> {
+    ) -> Result<Option<CatalogDdlUndo>, SqlError> {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -1230,8 +1051,11 @@ impl Storage {
         }
         let view = catalog.views[slot];
         let version = self.catalog_sequence.next()?;
-        let source =
-            self.query_identity(QueryCatalogSlot::View(slot), view.database, view.created_at);
+        let source = self.catalog_object_identity(
+            CatalogObjectSlot::View(slot),
+            view.database,
+            view.created_at,
+        );
         self.stage_query_comment_drop_in(&mut owners, source, transaction)?;
         let catalog = &mut owners.catalog;
         catalog.views[slot].ddl_state = view.ddl_state.drop_by(transaction);
@@ -1244,14 +1068,14 @@ impl Storage {
             rule.ddl_state = rule.ddl_state.drop_by(transaction);
             rule.pending_parent_drop_txid = Some(transaction);
         }
-        Ok(Some(QueryDdlUndo {
-            source: self.query_identity(
-                QueryCatalogSlot::View(slot),
+        Ok(Some(CatalogDdlUndo {
+            source: self.catalog_object_identity(
+                CatalogObjectSlot::View(slot),
                 view.database,
                 view.created_at,
             ),
             transaction,
-            operation: QueryDdlOperation::Drop,
+            operation: CatalogDdlOperation::Drop,
             version,
             prior_version: view.ddl_version,
         }))
@@ -1260,11 +1084,11 @@ impl Storage {
     fn matches_view_drop(
         &self,
         catalog: &super::ViewRuleCatalog,
-        undo: QueryDdlUndo,
+        undo: CatalogDdlUndo,
     ) -> Option<usize> {
         let slot = undo.source.view_slot()?;
         let view = catalog.views.get(slot)?;
-        (undo.operation == QueryDdlOperation::Drop
+        (undo.operation == CatalogDdlOperation::Drop
             && undo
                 .source
                 .matches(self, view.database, view.created_at, view.ddl_state)
@@ -1277,17 +1101,17 @@ impl Storage {
         .then_some(slot)
     }
 
-    pub(crate) fn commit_view_drop(&mut self, undo: QueryDdlUndo) {
+    pub(crate) fn commit_view_drop(&mut self, undo: CatalogDdlUndo) {
         let selected = self.matches_view_drop(&self.view_rule_catalog(), undo);
         if selected.is_some() {
             self.retire_view_source(undo.source);
         }
     }
 
-    pub(crate) fn rollback_view_drop(&self, undo: QueryDdlUndo) {
+    pub(crate) fn rollback_view_drop(&self, undo: CatalogDdlUndo) {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -1330,7 +1154,7 @@ impl Storage {
         &self,
         slot: usize,
         transaction: u32,
-    ) -> Result<QueryEditTarget, SqlError> {
+    ) -> Result<CatalogEditTarget, SqlError> {
         let catalog = self.matview_catalog();
         let view = catalog
             .get(slot)
@@ -1352,9 +1176,9 @@ impl Storage {
                 "materialized view population",
             ));
         }
-        Ok(QueryEditTarget {
-            source: self.query_identity(
-                QueryCatalogSlot::MaterializedView(slot),
+        Ok(CatalogEditTarget {
+            source: self.catalog_object_identity(
+                CatalogObjectSlot::MaterializedView(slot),
                 view.database,
                 view.created_at,
             ),
@@ -1368,11 +1192,11 @@ impl Storage {
 
     pub(crate) fn stage_matview_population(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         populated: bool,
         transaction: u32,
     ) -> Result<MatviewPopulationUndo, SqlError> {
-        let QueryCatalogSlot::MaterializedView(slot) = target.source.slot else {
+        let CatalogObjectSlot::MaterializedView(slot) = target.source.slot() else {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "population edit source is not a materialized view"
@@ -1420,7 +1244,7 @@ impl Storage {
             populated,
         });
         Ok(MatviewPopulationUndo {
-            target: QueryEditTarget { version, ..target },
+            target: CatalogEditTarget { version, ..target },
             prior,
         })
     }
@@ -1428,10 +1252,10 @@ impl Storage {
     pub(crate) fn finish_matview_population(
         &self,
         undo: MatviewPopulationUndo,
-        decision: QueryDdlDecision,
+        decision: CatalogDdlDecision,
     ) {
         let target = undo.target;
-        let QueryCatalogSlot::MaterializedView(slot) = target.source.slot else {
+        let CatalogObjectSlot::MaterializedView(slot) = target.source.slot() else {
             return;
         };
         let mut catalog = self.matview_catalog();
@@ -1448,26 +1272,12 @@ impl Storage {
             return;
         };
         match decision {
-            QueryDdlDecision::Commit => {
+            CatalogDdlDecision::Commit => {
                 view.populated = pending.populated;
                 view.population_version = pending.version;
                 view.pending_population = None;
             }
-            QueryDdlDecision::Rollback => view.pending_population = undo.prior,
-        }
-    }
-
-    pub(super) fn query_identity(
-        &self,
-        slot: QueryCatalogSlot,
-        database: DatabaseOid,
-        created_at: u64,
-    ) -> QueryIdentity {
-        QueryIdentity {
-            origin: self.catalog_sources.origin(),
-            database,
-            slot,
-            created_at,
+            CatalogDdlDecision::Rollback => view.pending_population = undo.prior,
         }
     }
 
@@ -1475,7 +1285,7 @@ impl Storage {
         &self,
         slot: usize,
         transaction: u32,
-    ) -> Result<QueryEditTarget, SqlError> {
+    ) -> Result<CatalogEditTarget, SqlError> {
         let catalog = self.view_rule_catalog();
         let view = catalog
             .views
@@ -1506,10 +1316,10 @@ impl Storage {
         slot: usize,
         view: &super::ViewDef,
         transaction: u32,
-    ) -> QueryEditTarget {
-        QueryEditTarget {
-            source: self.query_identity(
-                QueryCatalogSlot::View(slot),
+    ) -> CatalogEditTarget {
+        CatalogEditTarget {
+            source: self.catalog_object_identity(
+                CatalogObjectSlot::View(slot),
                 view.database,
                 view.created_at,
             ),
@@ -1525,7 +1335,7 @@ impl Storage {
     pub(super) fn validate_view_edit(
         &self,
         catalog: &super::ViewRuleCatalog,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         transaction: u32,
     ) -> Result<usize, SqlError> {
         let slot = target.view_slot()?;
@@ -1569,7 +1379,7 @@ impl Storage {
 
     pub(crate) fn replace_view_definition(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1584,7 +1394,7 @@ impl Storage {
     pub(super) fn replace_view_in(
         &self,
         owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1633,12 +1443,12 @@ impl Storage {
             columns: definition.columns,
         });
         Ok(ViewAlterUndo {
-            target: QueryEditTarget { version, ..target },
+            target: CatalogEditTarget { version, ..target },
             prior: current.pending_definition,
             return_rule: Some(RuleAlterUndo {
-                target: QueryEditTarget {
-                    source: self.query_identity(
-                        QueryCatalogSlot::Rule(rule_slot),
+                target: CatalogEditTarget {
+                    source: self.catalog_object_identity(
+                        CatalogObjectSlot::Rule(rule_slot),
                         rule.database,
                         rule.created_at,
                     ),
@@ -1652,7 +1462,7 @@ impl Storage {
 
     fn stage_view_metadata(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         transaction: u32,
         edit: impl FnOnce(&mut PendingViewDefinition),
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1693,7 +1503,7 @@ impl Storage {
         );
         owners.catalog.views[slot].pending_definition = Some(pending);
         Ok(ViewAlterUndo {
-            target: QueryEditTarget {
+            target: CatalogEditTarget {
                 version: pending.version,
                 ..target
             },
@@ -1704,7 +1514,7 @@ impl Storage {
 
     pub(crate) fn stage_view_schema(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         schema: super::SqlName,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1713,7 +1523,7 @@ impl Storage {
 
     pub(crate) fn stage_view_rename(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         name: super::SqlName,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1722,7 +1532,7 @@ impl Storage {
 
     pub(crate) fn stage_view_options(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         options: super::ViewOptions,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1733,7 +1543,7 @@ impl Storage {
 
     pub(crate) fn stage_view_columns(
         &self,
-        target: QueryEditTarget,
+        target: CatalogEditTarget,
         columns: super::ViewColumns,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
@@ -1808,7 +1618,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let Some(view) = owners.catalog.views.get(slot).copied() else {
@@ -1876,35 +1686,35 @@ impl Storage {
     pub(crate) fn finish_view_publication(
         &self,
         publication: ViewPublication,
-        decision: QueryDdlDecision,
+        decision: CatalogDdlDecision,
     ) {
         let undo = match publication {
             ViewPublication::Created(undo) => undo,
             ViewPublication::Altered(undo) => {
                 match decision {
-                    QueryDdlDecision::Commit => self.commit_view_alter(undo),
-                    QueryDdlDecision::Rollback => self.rollback_view_alter(undo),
+                    CatalogDdlDecision::Commit => self.commit_view_alter(undo),
+                    CatalogDdlDecision::Rollback => self.rollback_view_alter(undo),
                 }
                 return;
             }
         };
-        let QueryCatalogSlot::View(slot) = undo.source.slot else {
+        let CatalogObjectSlot::View(slot) = undo.source.slot() else {
             return;
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewLifecycle,
+            super::type_contracts::CatalogPublicationInput::CatalogLifecycle,
             None,
         );
         let Some(view) = owners.catalog.views.get(slot).copied() else {
             return;
         };
-        let committing_create_drop = decision == QueryDdlDecision::Commit
+        let committing_create_drop = decision == CatalogDdlDecision::Commit
             && view.ddl_state
                 == (CatalogDdlState::PendingCreateDrop {
                     txid: undo.transaction,
                 });
-        if undo.operation != QueryDdlOperation::Create
+        if undo.operation != CatalogDdlOperation::Create
             || !undo
                 .source
                 .matches(self, view.database, view.created_at, view.ddl_state)
@@ -1919,7 +1729,7 @@ impl Storage {
         }
         let rule_slot = usize::from(view.return_rule);
         match decision {
-            QueryDdlDecision::Commit => {
+            CatalogDdlDecision::Commit => {
                 if let Some(pending) = view
                     .pending_definition
                     .filter(|pending| pending.txid == undo.transaction)
@@ -1939,7 +1749,7 @@ impl Storage {
                 let state = owners.catalog.rules[rule_slot].ddl_state;
                 owners.catalog.rules[rule_slot].ddl_state = state.commit_create();
             }
-            QueryDdlDecision::Rollback => {
+            CatalogDdlDecision::Rollback => {
                 Self::clear_object_acl_entries_locked(
                     owners
                         .permissions
@@ -1974,7 +1784,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
         let Some(view) = owners.catalog.views.get(slot).copied() else {
@@ -2126,11 +1936,11 @@ mod tests {
         let original = create(&storage, "original_view", 7);
         let selected = storage.prepare_view_edit(original.slot(), 7).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
+            storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
             let replacement = create(&storage, "replacement_view", 9);
             assert_eq!(replacement.slot(), original.slot());
-            storage.finish_view_publication(original, QueryDdlDecision::Commit);
-            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
+            storage.finish_view_publication(original, CatalogDdlDecision::Commit);
+            storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
             assert!(storage.find_view("public", "replacement_view", 9).is_some());
             assert!(storage.find_view("public", "replacement_view", 0).is_none());
             assert_eq!(
@@ -2141,7 +1951,7 @@ mod tests {
                 sqlstate::UNDEFINED_TABLE
             );
             assert!(storage.find_view("public", "replacement_view", 9).is_some());
-            storage.finish_view_publication(replacement, QueryDdlDecision::Commit);
+            storage.finish_view_publication(replacement, CatalogDdlDecision::Commit);
             assert!(storage.find_view("public", "replacement_view", 0).is_some());
         });
     }
@@ -2150,7 +1960,7 @@ mod tests {
     fn query_lifecycle_view_edits_and_undo_follow_one_revision() {
         let storage = fixture(1);
         let created = create(&storage, "original_view", 7);
-        storage.finish_view_publication(created, QueryDdlDecision::Commit);
+        storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let selected = storage.prepare_view_edit(created.slot(), 9).unwrap();
             let first = storage
@@ -2189,7 +1999,7 @@ mod tests {
     fn query_lifecycle_view_drop_undo_cannot_finalize_a_later_drop() {
         let mut storage = fixture(1);
         let created = create(&storage, "original_view", 7);
-        storage.finish_view_publication(created, QueryDdlDecision::Commit);
+        storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let first = storage
                 .drop_view("public", "original_view", 9)
@@ -2214,7 +2024,7 @@ mod tests {
                     .find_view("public", "replacement_view", 11)
                     .is_some()
             );
-            storage.finish_view_publication(replacement, QueryDdlDecision::Rollback);
+            storage.finish_view_publication(replacement, CatalogDdlDecision::Rollback);
         });
     }
 
@@ -2227,8 +2037,8 @@ mod tests {
         let mut second = fixture(1);
         let replacement = create(&second, "replacement_view", 11);
         crate::mem::guard::forbid_alloc(|| {
-            second.finish_view_publication(selected, QueryDdlDecision::Commit);
-            second.finish_view_publication(selected, QueryDdlDecision::Rollback);
+            second.finish_view_publication(selected, CatalogDdlDecision::Commit);
+            second.finish_view_publication(selected, CatalogDdlDecision::Rollback);
             assert_eq!(
                 second
                     .stage_view_rename(target, name("foreign_view"), 9)
@@ -2243,7 +2053,7 @@ mod tests {
             second.commit_view_drop(dropped);
             second.rollback_view_drop(dropped);
             assert!(second.find_view("public", "replacement_view", 11).is_some());
-            second.finish_view_publication(replacement, QueryDdlDecision::Rollback);
+            second.finish_view_publication(replacement, CatalogDdlDecision::Rollback);
         });
     }
 
@@ -2251,7 +2061,7 @@ mod tests {
     fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
         let mut storage = fixture(2);
         let view = create(&storage, "rule_parent", 7);
-        storage.finish_view_publication(view, QueryDdlDecision::Commit);
+        storage.finish_view_publication(view, CatalogDdlDecision::Commit);
         let definition = super::super::RuleDefinition {
             name: name("first_rule"),
             target: super::super::RuleTarget::View(view.slot() as u16),
@@ -2264,12 +2074,12 @@ mod tests {
                 .create_rule(definition, dependencies.view(), false, 9)
                 .unwrap();
             let stale = storage.prepare_rule_edit(created.slot(), 9).unwrap();
-            storage.finish_rule_publication(created, None, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(created, None, CatalogDdlDecision::Rollback);
             let replacement = storage
                 .create_rule(definition, dependencies.view(), false, 11)
                 .unwrap();
             assert_eq!(replacement.slot(), created.slot());
-            storage.finish_rule_publication(created, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(created, None, CatalogDdlDecision::Commit);
             storage.discard_rule_create(created);
             assert_eq!(
                 storage
@@ -2282,7 +2092,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::UNDEFINED_OBJECT
             );
-            storage.finish_rule_publication(replacement, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(replacement, None, CatalogDdlDecision::Commit);
             let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
             let (first, _) = storage
                 .alter_rule(
@@ -2340,7 +2150,7 @@ mod tests {
             storage.commit_rule_drop(current);
             storage.rollback_rule_alter(second);
             assert!(storage.rule(final_rule.slot()).visible_to(15));
-            storage.finish_rule_publication(final_rule, None, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(final_rule, None, CatalogDdlDecision::Rollback);
         });
     }
 }

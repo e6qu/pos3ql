@@ -53,7 +53,7 @@ mod tests {
         #[derive(Debug)]
         enum RowCreation {
             Table(usize),
-            View(super::super::QueryDdlUndo),
+            View(super::super::CatalogDdlUndo),
         }
         for kind in KINDS {
             for view in [false, true] {
@@ -113,7 +113,7 @@ mod tests {
                         match row {
                             RowCreation::View(undo) => storage.finish_view_publication(
                                 super::super::ViewPublication::Created(undo),
-                                super::super::QueryDdlDecision::Rollback,
+                                super::super::CatalogDdlDecision::Rollback,
                             ),
                             RowCreation::Table(slot) => storage.rollback_create(slot),
                         }
@@ -157,30 +157,63 @@ mod tests {
     }
 
     #[test]
-    fn shared_type_creation_waits_for_retired_relation_comment_cleanup() {
+    fn shared_type_creation_keeps_retiring_names_until_comment_cleanup() {
         for kind in KINDS {
             let mut storage = fixture(TransactionMode::Mvcc);
             let table = storage
                 .create_table(make_def("cleanup_name", &[("id", ColType::Int4, false)]))
                 .unwrap();
+            storage
+                .apply_comment(
+                    super::super::CommentClass::Relation,
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("cleanup_name").unwrap(),
+                    0,
+                    Some(super::super::comment_stackstr("old comment").unwrap()),
+                )
+                .unwrap();
             let comments = storage.comments.lock().unwrap();
             let before = storage.type_publication.waits.load(Ordering::Acquire);
+            let (finished, received) = std::sync::mpsc::sync_channel(1);
             std::thread::scope(|scope| {
                 let dropper =
                     scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_drop(table)));
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while storage.tables[table].live() && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-                let removed = !storage.tables[table].live();
-                let writer = scope.spawn(|| {
-                    crate::mem::guard::forbid_alloc(|| create(&storage, kind, "cleanup_name", 7))
-                });
                 let waited = saw_wait(&storage, before);
+                let retained = storage.tables[table].live();
+                let writer = scope.spawn(|| {
+                    let result = crate::mem::guard::forbid_alloc(|| {
+                        (
+                            create(&storage, kind, "independent_name", 7),
+                            create(&storage, kind, "cleanup_name", 7),
+                        )
+                    });
+                    finished.send(()).unwrap();
+                    result
+                });
+                let progress = received.recv_timeout(Duration::from_secs(5));
                 drop(comments);
                 dropper.join().unwrap();
-                let created = writer.join().unwrap().unwrap();
-                assert!(removed && waited);
+                let (independent, conflicting) = writer.join().unwrap();
+                assert!(waited && retained && progress.is_ok());
+                assert_eq!(
+                    conflicting.unwrap_err().sqlstate,
+                    sqlstate::DUPLICATE_OBJECT
+                );
+                storage.finish_type_ddl(independent.unwrap(), TypeDdlDecision::Rollback);
+                let created =
+                    crate::mem::guard::forbid_alloc(|| create(&storage, kind, "cleanup_name", 7))
+                        .unwrap();
+                assert!(
+                    storage
+                        .comment_text(
+                            super::super::CommentClass::Relation,
+                            "public",
+                            "cleanup_name",
+                            0,
+                            7
+                        )
+                        .is_none()
+                );
                 storage.finish_type_ddl(created, TypeDdlDecision::Rollback);
             });
         }

@@ -351,26 +351,20 @@ pub(crate) enum DdlUndo {
     Created(u32),
     /// DROP TABLE at this slot (rows retained until commit) — undo by
     /// reviving it (and its indexes).
-    Dropped(u32),
+    Dropped(crate::storage::CatalogDdlUndo),
     /// ALTER TABLE appended one pending table-definition version. Row-image
     /// undo is carried by the ordinary touched-row log.
     TableAltered(u32),
     ViewChanged(crate::storage::ViewPublication),
-    ViewDropped(crate::storage::QueryDdlUndo),
+    ViewDropped(crate::storage::CatalogDdlUndo),
     MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
     RuleChanged {
         publication: crate::storage::RulePublication,
         prior_table_rule_txid: Option<u32>,
     },
     RuleAltered(crate::storage::RuleAlterUndo),
-    RuleDropped(crate::storage::QueryDdlUndo),
-    /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
-    RoutineCreated(u32),
-    RoutineDropped(u32),
-    RoutineReplaced {
-        slot: u32,
-        prior: Option<crate::storage::PendingRoutineDefinition>,
-    },
+    RuleDropped(crate::storage::CatalogDdlUndo),
+    RoutineChanged(crate::storage::RoutineChange),
     CastCreated(u32),
     CastDropped(u32),
     OperatorCreated(u32),
@@ -440,10 +434,6 @@ pub(crate) enum DdlUndo {
     StatisticsKeysAltered {
         slot: u32,
         prior: Option<crate::storage::PendingExtendedStatisticsKeys>,
-    },
-    RoutineIdentityAltered {
-        slot: u32,
-        prior: Option<crate::storage::PendingRoutineIdentity>,
     },
     /// CREATE PUBLICATION at this slot.
     PublicationCreated(u32),
@@ -531,20 +521,12 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingSubscriptionName>,
     },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
-    MatviewCreated(u32),
+    MatviewChanged(crate::storage::MatviewDdlUndo),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.
-    MatviewDropped(u32),
-    /// CREATE SEQUENCE at this slot — undo by dropping it. (Its *value* state is
-    /// not transactional; only existence rolls back.)
-    SequenceCreated(u32),
-    /// DROP SEQUENCE at this slot — undo by reviving it.
-    SequenceDropped(u32),
+    /// Sequence definitions and transactional restarts retain their selected source.
+    SequenceChanged(crate::storage::SequenceChange),
     LargeObjectCreated(u32),
     LargeObjectDropped(u32),
-    SequenceAltered {
-        slot: u32,
-        prior: Option<crate::storage::PendingSequenceDefinition>,
-    },
     /// CREATE DOMAIN retains its source identity and transaction owner.
     DomainCreated(crate::storage::TypeDdlUndo),
     /// DROP DOMAIN retains its source identity and transaction owner.
@@ -597,13 +579,6 @@ pub(crate) enum DdlUndo {
         table: u32,
         column: u16,
         prior: i64,
-    },
-    /// TRUNCATE ... RESTART IDENTITY reset a catalog sequence. Sequence value
-    /// changes ordinarily survive rollback; this explicit restart is the one
-    /// transactional exception PostgreSQL defines.
-    OwnedSequenceReset {
-        sequence: u32,
-        prior: crate::storage::SequenceValueState,
     },
     /// CREATE SCHEMA at this slot — undo by dropping it.
     SchemaCreated(u32),
@@ -2409,6 +2384,58 @@ impl TxnState {
         while self.subscription_advances.len() > mark {
             self.subscription_advances.pop();
         }
+    }
+
+    pub(crate) fn record_table_drop(
+        &mut self,
+        storage: &crate::storage::Storage,
+        undo: crate::storage::CatalogDdlUndo,
+    ) -> Result<(), SqlError> {
+        storage.validate_table_drop(undo, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::Dropped(undo)) {
+            storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_matview_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        change: crate::storage::MatviewDdlUndo,
+    ) -> Result<(), SqlError> {
+        storage.validate_matview_change(change, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::MatviewChanged(change)) {
+            storage.finish_matview_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_routine_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        change: crate::storage::RoutineChange,
+    ) -> Result<(), SqlError> {
+        storage.validate_routine_change(change, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::RoutineChanged(change)) {
+            storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_sequence_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        change: crate::storage::SequenceChange,
+    ) -> Result<(), SqlError> {
+        storage.validate_sequence_change(change, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::SequenceChanged(change)) {
+            storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {

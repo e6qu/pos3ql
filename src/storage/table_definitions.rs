@@ -44,6 +44,7 @@ pub(crate) struct TableIdentity {
     pub(crate) ownership: Ownership,
     /// Monotonic catalog stamp orders dependencies and detects slot reuse.
     pub(crate) created_at: u64,
+    pub(super) ddl_version: u64,
     pub(crate) existence: CatalogDdlState,
 }
 
@@ -52,6 +53,7 @@ impl TableIdentity {
         database: DatabaseOid::POSTGRES,
         ownership: Ownership::BOOTSTRAP,
         created_at: 0,
+        ddl_version: 0,
         existence: CatalogDdlState::Absent,
     };
 

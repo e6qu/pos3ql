@@ -32,6 +32,12 @@ When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
+Next connect table-shape changes and schema moves to complete transaction
+publication, including indexes, captured column mappings and comments. Check
+reader and backup retention while old files are replaced. Index bindings must
+remain valid through composed table-name and column changes. Recovery may retain
+exclusive startup access; ordinary publication must allow unrelated operations
+to progress under their own owners.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The
 [current behavior guide](docs/implemented-baseline.md) owns the implemented

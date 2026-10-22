@@ -719,7 +719,7 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
     use DdlUndo::*;
     Some(match undo {
         Created(slot) => (ObjectRef::Table(slot as usize), Mutation::Create),
-        Dropped(slot) => (ObjectRef::Table(slot as usize), Mutation::Drop),
+        Dropped(undo) => (ObjectRef::Table(undo.slot()), Mutation::Drop),
         TableAltered(slot) => (ObjectRef::Table(slot as usize), Mutation::Alter),
         ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
             (ObjectRef::View(undo.slot()), Mutation::Create)
@@ -728,11 +728,16 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         ViewChanged(crate::storage::ViewPublication::Altered(undo)) => {
             (ObjectRef::View(undo.slot()), Mutation::Alter)
         }
-        RoutineCreated(slot) => (ObjectRef::Routine(slot as usize), Mutation::Create),
-        RoutineDropped(slot) => (ObjectRef::Routine(slot as usize), Mutation::Drop),
-        RoutineReplaced { slot, .. } | RoutineIdentityAltered { slot, .. } => {
-            (ObjectRef::Routine(slot as usize), Mutation::Alter)
-        }
+        RoutineChanged(change) => (
+            ObjectRef::Routine(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else if change.is_drop() {
+                Mutation::Drop
+            } else {
+                Mutation::Alter
+            },
+        ),
         CastCreated(slot) => (ObjectRef::Cast(slot as usize), Mutation::Create),
         CastDropped(slot) => (ObjectRef::Cast(slot as usize), Mutation::Drop),
         OperatorCreated(slot) => (ObjectRef::Operator(slot as usize), Mutation::Create),
@@ -798,14 +803,27 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         | SubscriptionRenamed { slot, .. } => {
             (ObjectRef::Subscription(slot as usize), Mutation::Alter)
         }
-        MatviewCreated(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Create),
+        MatviewChanged(change) => (
+            ObjectRef::MaterializedView(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else {
+                Mutation::Drop
+            },
+        ),
         MatviewPopulationChanged(undo) => {
             (ObjectRef::MaterializedView(undo.slot()), Mutation::Alter)
         }
-        MatviewDropped(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Drop),
-        SequenceCreated(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Create),
-        SequenceDropped(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Drop),
-        SequenceAltered { slot, .. } => (ObjectRef::Sequence(slot as usize), Mutation::Alter),
+        SequenceChanged(change) => (
+            ObjectRef::Sequence(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else if change.is_drop() {
+                Mutation::Drop
+            } else {
+                Mutation::Alter
+            },
+        ),
         DomainCreated(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Create),
         DomainDropped(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Drop),
         DomainAltered(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Alter),

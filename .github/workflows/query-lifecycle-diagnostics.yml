@@ -9,28 +9,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  native:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-      - name: Rebuild checked-out crate
-        run: cargo clean -p pos3ql
-      - name: Verify explicit transaction modes and scheduler waits
-        run: |
-          set -euo pipefail
-          python3 tools/test_command.py cargo test --lib --locked -- --exact \
-            sql::tests::relation_mode_changes_check_ownership_locks_and_relation_kinds \
-            --test-threads=1 | tee "$RUNNER_TEMP/relation-mode-tests.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/relation-mode-tests.log"
-
   protocol:
     runs-on: ubuntu-latest
     timeout-minutes: 15

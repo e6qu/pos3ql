@@ -380,20 +380,14 @@ done
 
 step "raw wire-protocol probes (SSLRequest, negotiation, framing)"
 restart_main_server wire
-if POS3QL_PORT=$PG_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
+if POS3QL_PORT=$PG_PORT POS3QL_SERVER_PID=$SERVER_PID \
+    POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
+    python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else
   bad "wire probes"
   cat "$WORK/wire.out"
   tail -120 "$WORK/server-wire.log"
-  if [[ "$(uname -s)" == Linux ]]; then
-    printf '%s\n' 'native server stack after wire-probe failure (arguments omitted)'
-    if ! timeout --signal=TERM 8s sudo -n gdb --nx --nh --quiet --batch \
-      -ex 'set pagination off' -ex 'set print frame-arguments none' \
-      -ex 'set print entry-values no' -ex 'thread apply all bt' -p "$SERVER_PID"; then
-      printf '%s\n' 'native stack capture failed; the wire-probe failure is retained'
-    fi
-  fi
 fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"

@@ -304,9 +304,10 @@ check still validates rows declared with its child domain. Moving a domain to
 another schema before deleting the old schema preserves outside table columns
 that use the moved domain.
 
-Domain, enum and composite creation use shared storage ownership. Their names
-share a namespace with table, view and materialized-view row types. For example,
-after `CREATE TABLE orders (id integer)`, `CREATE DOMAIN orders AS integer`
+Domain, enum and composite creation use shared storage ownership. A table, view
+or materialized view also reserves its name for the type describing its rows.
+A named type cannot use that name in the same schema. For example,
+after `CREATE TABLE public.orders (id integer)`, `CREATE DOMAIN public.orders AS integer`
 returns `42710`; renaming or moving a type cannot create that collision either.
 The checks and definition installation share catalog ownership, including when
 two creators race. A wait releases partially acquired catalogs. Table name

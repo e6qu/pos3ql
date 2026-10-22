@@ -53,6 +53,11 @@ the deleted account's identifier.
 
 Deleting a role waits for another transaction's unfinished ownership or permission
 changes. Renaming the account can proceed while its table creation is unfinished.
+Metadata changes retain a shared account lock until commit or rollback; deleting
+that account needs an exclusive lock. Creating objects for the same account can
+overlap. Savepoint rollback releases locks acquired after that savepoint, and
+prepared transactions keep their account locks through recovery. `pg_locks`
+reports these as object locks using the account's durable identifier.
 For example, if `orders_app` has created a table inside
 `BEGIN`, an administrator's `DROP ROLE orders_app` waits for that transaction.
 After commit, the table prevents deletion; after rollback, deletion can proceed
@@ -298,6 +303,19 @@ pending name changes. For example, renaming a parent domain before adding a
 check still validates rows declared with its child domain. Moving a domain to
 another schema before deleting the old schema preserves outside table columns
 that use the moved domain.
+
+Domain, enum and composite creation use shared storage ownership. A table, view
+or materialized view also reserves its name for the type describing its rows.
+A named type cannot use that name in the same schema. For example,
+after `CREATE TABLE public.orders (id integer)`, `CREATE DOMAIN public.orders AS integer`
+returns `42710`; renaming or moving a type cannot create that collision either.
+The checks and definition installation share catalog ownership, including when
+two creators race. A wait releases partially acquired catalogs. Table name
+checks use the small name views, so an unrelated definition reader need not
+finish first. Removing a table clears its type comments before allowing a new
+type to take the name.
+Renaming to the existing name returns PostgreSQL's duplicate error; moving to
+the current schema succeeds without changing the object.
 
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
@@ -775,8 +793,10 @@ After a view is renamed inside a transaction, rule listings use its new name.
 View changes and removal use those names too. The same names are recorded for
 restart; rollback restores the old names.
 
-Table and view slots have distinct lock identities. The lock registry reserves
-space at startup for each transaction's tables and views; exhaustion returns
+Tables, views and accounts have distinct lock identities. Account locks use
+durable identifiers, so they do not transfer to a reused catalog position.
+The lock registry reserves `(max_connections + max_prepared_transactions) ×
+(max_tables + 1 + max_views + max_roles)` entries at startup; exhaustion returns
 `54000` naming the registry. Prepared transactions retain view locks through
 restart and recovery without local caches. Saved commit and rollback decisions
 release the transaction's private rows and catalog entries before replay, so

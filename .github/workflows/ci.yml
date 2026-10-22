@@ -33,7 +33,7 @@ jobs:
           --test-threads=1
 
       - name: macOS allocation-free mutex boundary
-        run: cargo clippy --lib --bins -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   macos-lock-ownership:
     name: macOS mutex ownership
@@ -201,7 +201,7 @@ jobs:
         run: cargo build --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --lib --bins -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Integration guards
         run: cargo test --locked --test no_noops --test sqlstate_gate

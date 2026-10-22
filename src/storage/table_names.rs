@@ -46,6 +46,39 @@ pub(super) struct TableNames {
 }
 
 impl TableNames {
+    pub(super) fn row_type_name_conflict(
+        &self,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Result<bool, u32> {
+        if self.identity.database != database || self.existence == CatalogDdlState::Absent {
+            return Ok(false);
+        }
+        let matches = |schema_name: SqlName, relation_name: SqlName| {
+            schema_name.as_str() == schema && relation_name.as_str() == name
+        };
+        let reserved = matches(self.schema, self.name)
+            || self
+                .pending
+                .is_some_and(|(_, schema, name)| matches(schema, name));
+        if reserved
+            && let Some(owner) = self
+                .pending
+                .map(|(owner, _, _)| owner)
+                .or_else(|| self.existence.pending_txid())
+                .filter(|owner| *owner != transaction)
+        {
+            return Err(owner);
+        }
+        let (schema, name) = self
+            .pending
+            .filter(|(owner, _, _)| *owner == transaction)
+            .map_or((self.schema, self.name), |(_, schema, name)| (schema, name));
+        Ok(self.existence.visible_to(transaction) && matches(schema, name))
+    }
+
     pub(super) fn from_state(state: &DefinitionState) -> Self {
         Self {
             identity: NameIdentity {
@@ -113,6 +146,10 @@ pub(super) struct DefinitionWrite<'a> {
 }
 
 impl<'a> DefinitionWrite<'a> {
+    pub(super) fn publish_names(&self) {
+        *self.names.write().expect("table name lock poisoned") = TableNames::from_state(self);
+    }
+
     pub(super) fn shared(
         state: RwLockWriteGuard<'a, DefinitionState>,
         names: &'a RwLock<TableNames>,
@@ -160,8 +197,7 @@ impl DerefMut for DefinitionWrite<'_> {
 
 impl Drop for DefinitionWrite<'_> {
     fn drop(&mut self) {
-        let names = TableNames::from_state(self);
-        *self.names.write().expect("table name lock poisoned") = names;
+        self.publish_names();
     }
 }
 

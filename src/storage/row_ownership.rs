@@ -401,7 +401,7 @@ mod tests {
                 let mut slots = scratch
                     .alloc_owned_slice_with(storage.tables.len(), |_| None)
                     .unwrap();
-                let wait = try_heap_rows(
+                let _wait = try_heap_rows(
                     &storage.row_versions,
                     storage.tables.iter().map(|table| &table.rows),
                     &mut slots,
@@ -418,7 +418,6 @@ mod tests {
                     .unwrap();
                 storage.restore_pending(other, 1, 9, undo);
                 assert!(storage.tables[other].rows.is_empty());
-                drop(wait);
             }
             drop(held);
 
@@ -470,7 +469,7 @@ mod tests {
                 let mut slots = scratch
                     .alloc_owned_slice_with(maps.len(), |_| None)
                     .unwrap();
-                let wait = try_heap_rows(&versions, maps.iter(), &mut slots)
+                let _wait = try_heap_rows(&versions, maps.iter(), &mut slots)
                     .err()
                     .unwrap();
                 assert!(slots.iter().all(Option::is_none));
@@ -496,7 +495,6 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(other.remove(&1).unwrap().committed_lsn, 7);
-                drop(wait);
             }
             drop(held);
 

@@ -19218,8 +19218,8 @@ mod stored_dependency_tests {
                 .unwrap()
                 .get(&merged.handle.roster, &mut scratch)
                 .unwrap();
-            for bytes in scratch[..len].chunks_exact(32) {
-                let id = BlockId(bytes.try_into().unwrap());
+            for bytes in scratch[..len].as_chunks::<32>().0 {
+                let id = BlockId(*bytes);
                 assert!(
                     namespace
                         .borrow()

@@ -45,6 +45,45 @@ pub(super) struct NameReservation {
 }
 
 impl TypeCatalog {
+    fn named_type_name_conflict(
+        &self,
+        database: DatabaseOid,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+        excluding: Option<NamedTypeSlot>,
+    ) -> Result<Option<NamedTypeKind>, u32> {
+        let target = UserTypeName::declaration(schema, name);
+        let mut conflict = None;
+        for reservation in self.name_reservations() {
+            if reservation.database != database
+                || reservation.state == CatalogDdlState::Absent
+                || Some(reservation.slot) == excluding
+            {
+                continue;
+            }
+            let reserved = reservation.current == target
+                || reservation
+                    .pending
+                    .is_some_and(|(_, pending)| pending == target);
+            let owner = reservation
+                .pending
+                .map(|(owner, _)| owner)
+                .or_else(|| reservation.state.pending_txid());
+            if reserved && let Some(owner) = owner.filter(|owner| *owner != transaction) {
+                return Err(owner);
+            }
+            let visible = reservation
+                .pending
+                .filter(|(owner, _)| *owner == transaction)
+                .map_or(reservation.current, |(_, pending)| pending);
+            if reservation.state.visible_to(transaction) && visible == target {
+                conflict = Some(reservation.slot.kind());
+            }
+        }
+        Ok(conflict)
+    }
+
     pub(super) fn name_reservations(&self) -> impl Iterator<Item = NameReservation> + '_ {
         self.domains
             .iter()
@@ -104,6 +143,108 @@ impl TypeCatalog {
 }
 
 impl Storage {
+    fn row_type_name_conflict(
+        &self,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+        excluding: Option<super::RuleTarget>,
+        selected_views: Option<&super::ViewRuleCatalog>,
+    ) -> Result<bool, SqlError> {
+        for (slot, table) in self.tables.iter().enumerate() {
+            if excluding == Some(super::RuleTarget::Table(slot as u16)) {
+                continue;
+            }
+            match table.definition.row_type_name_conflict(
+                current_database(),
+                schema.as_str(),
+                name.as_str(),
+                transaction,
+            ) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(owner) => {
+                    return Err(self.catalog_ddl_wait_error(transaction, owner, name.as_str()));
+                }
+            }
+        }
+        let check_views = |views: &super::ViewRuleCatalog| -> Result<bool, u32> {
+            for (slot, view) in views.views.iter().enumerate() {
+                if excluding == Some(super::RuleTarget::View(slot as u16))
+                    || view.database != current_database()
+                    || view.ddl_state == CatalogDdlState::Absent
+                {
+                    continue;
+                }
+                let matches =
+                    |owner| view.schema_for(owner) == schema && view.name_for(owner) == name;
+                for owner in [
+                    view.ddl_state.pending_txid(),
+                    view.pending_schema.map(|pending| pending.txid),
+                    view.pending_name.map(|pending| pending.txid),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if owner != transaction
+                        && ((view.schema == schema && view.name == name) || matches(owner))
+                    {
+                        return Err(owner);
+                    }
+                }
+                if view.visible_to(transaction) && matches(transaction) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let conflict = match selected_views {
+            Some(views) => check_views(views),
+            None => {
+                let views = self.view_rule_catalog();
+                check_views(&views)
+            }
+        };
+        conflict.map_err(|owner| self.catalog_ddl_wait_error(transaction, owner, name.as_str()))
+    }
+
+    pub(super) fn require_row_type_name(
+        &self,
+        catalog: &TypeCatalog,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+        excluding: Option<super::RuleTarget>,
+        selected_views: Option<&super::ViewRuleCatalog>,
+    ) -> Result<(), SqlError> {
+        if self.row_type_name_conflict(schema, name, transaction, excluding, selected_views)? {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let named = catalog
+            .named_type_name_conflict(current_database(), schema, name, transaction, None)
+            .map_err(|owner| self.catalog_ddl_wait_error(transaction, owner, name.as_str()))?;
+        if let Some(kind) = named {
+            return Err(if kind == NamedTypeKind::Composite {
+                sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    name.as_str()
+                )
+            } else {
+                sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    name.as_str()
+                )
+            });
+        }
+        Ok(())
+    }
+
     // The caller keeps this catalog locked through validation and publication.
     // Other transactions reserve both names until a rename commits or rolls back.
     pub(super) fn require_named_type_name(
@@ -114,38 +255,45 @@ impl Storage {
         txid: u32,
         excluding: Option<NamedTypeSlot>,
     ) -> Result<(), SqlError> {
-        let target = UserTypeName::declaration(schema, name);
-        let mut exists = false;
-        for reservation in catalog.name_reservations() {
-            if reservation.database != current_database()
-                || reservation.state == CatalogDdlState::Absent
-                || Some(reservation.slot) == excluding
-            {
-                continue;
+        let composite_rename = match excluding {
+            Some(NamedTypeSlot::Composite(slot)) => {
+                let definition = catalog.composites[slot].definition_for(txid);
+                definition.schema == schema && definition.name != name
             }
-            let reserved = reservation.current == target
-                || reservation
-                    .pending
-                    .is_some_and(|(_, pending)| pending == target);
-            let owner = reservation
-                .pending
-                .map(|(owner, _)| owner)
-                .or_else(|| reservation.state.pending_txid());
-            if reserved && let Some(owner) = owner.filter(|&owner| owner != txid) {
-                return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
-            }
-            let visible = reservation
-                .pending
-                .filter(|&(owner, _)| owner == txid)
-                .map_or(reservation.current, |(_, pending)| pending);
-            exists |= reservation.state.visible_to(txid) && visible == target;
+            _ => false,
+        };
+        let named = catalog
+            .named_type_name_conflict(current_database(), schema, name, txid, excluding)
+            .map_err(|owner| self.catalog_ddl_wait_error(txid, owner, name.as_str()))?;
+        if let Some(kind) = named {
+            return Err(if composite_rename && kind == NamedTypeKind::Composite {
+                sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    name.as_str()
+                )
+            } else {
+                sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    name.as_str()
+                )
+            });
         }
-        if exists {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
+        if self.row_type_name_conflict(schema, name, txid, None, None)? {
+            return Err(if composite_rename {
+                sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    name.as_str()
+                )
+            } else {
+                sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    name.as_str()
+                )
+            });
         }
         Ok(())
     }
@@ -233,6 +381,10 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "Undo stays inline inside allocation-forbidden tests"
+    )]
     enum NameUndo {
         Domain(super::super::DomainAlterUndo),
         Enum(super::super::EnumAlterUndo),
@@ -323,11 +475,19 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| {
                     create(&mut storage, existing, "occupied", 0).unwrap();
                     let source = create(&mut storage, requested, "source", 0).unwrap();
+                    let expected = if matches!(
+                        (requested, existing),
+                        (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_))
+                    ) {
+                        sqlstate::DUPLICATE_TABLE
+                    } else {
+                        sqlstate::DUPLICATE_OBJECT
+                    };
                     assert_eq!(
                         rename(&mut storage, source, "occupied", 7)
                             .unwrap_err()
                             .sqlstate,
-                        sqlstate::DUPLICATE_OBJECT
+                        expected
                     );
                     // A failed attempt leaves no staged definition or label image.
                     let undo = rename(&mut storage, source, "available", 7).unwrap();

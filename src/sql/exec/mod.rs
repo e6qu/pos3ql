@@ -7886,6 +7886,9 @@ pub fn drop_role(
                 "current user cannot be dropped"
             ));
         }
+        if let Err(error) = storage.lock_role_for_drop(slot, txn.txid) {
+            return sql_fail(error);
+        }
         let membership_count = (0..storage.role_membership_count())
             .filter(|membership_slot| {
                 let membership = storage.role_membership(*membership_slot);
@@ -9012,6 +9015,13 @@ fn resolve_owned_roles(
                 "permission denied to drop objects"
             ));
         }
+        if storage.role(role).oid() == crate::storage::RoleOid::BOOTSTRAP {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot change objects owned by a role required by the database system"
+            ));
+        }
+        storage.role_reference_ready(role, txid)?;
         let role = role as u16;
         if !output[..count].contains(&role) {
             output[count] = role;
@@ -13210,9 +13220,9 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
-                if let Err(error) = storage.lock_relation(
+                if let Err(error) = storage.lock_object(
                     txn.txid,
-                    crate::storage::RelationLockTarget::View(*v),
+                    crate::storage::ObjectLockTarget::View(*v),
                     crate::sql::ast::TableLockMode::AccessExclusive,
                     false,
                 ) {
@@ -36221,9 +36231,9 @@ pub fn create_view(
                 .then_some(slot)
         })
     {
-        if let Err(error) = storage.lock_relation(
+        if let Err(error) = storage.lock_object(
             txn.txid,
-            crate::storage::RelationLockTarget::View(slot),
+            crate::storage::ObjectLockTarget::View(slot),
             crate::sql::ast::TableLockMode::AccessExclusive,
             false,
         ) {
@@ -36533,9 +36543,9 @@ pub fn alter_view(
             },
         );
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
-        crate::storage::RelationLockTarget::View(slot),
+        crate::storage::ObjectLockTarget::View(slot),
         crate::sql::ast::TableLockMode::AccessExclusive,
         false,
     ) {
@@ -36894,10 +36904,6 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            if new_name == current_name.as_str() {
-                responder.command_complete("ALTER VIEW")?;
-                return sql_ok();
-            }
             if storage.relation_name_taken(schema.as_str(), new_name, txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_TABLE,
@@ -37632,7 +37638,7 @@ pub fn create_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37709,7 +37715,7 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37768,7 +37774,7 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37832,7 +37838,7 @@ pub fn drop_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -41713,6 +41719,10 @@ pub fn alter_domain(
             _ => unreachable!(),
         };
         if current.schema == schema && current.name == domain_name {
+            if matches!(action, A::SetSchema(_)) {
+                responder.command_complete("ALTER DOMAIN")?;
+                return sql_ok();
+            }
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "type \"{}\" already exists",
@@ -44863,9 +44873,9 @@ fn drop_view_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    storage.lock_relation(
+    storage.lock_object(
         txn.txid,
-        crate::storage::RelationLockTarget::View(slot),
+        crate::storage::ObjectLockTarget::View(slot),
         crate::sql::ast::TableLockMode::AccessExclusive,
         false,
     )?;
@@ -45158,8 +45168,11 @@ pub fn alter_type(
             let current_schema = current.schema;
             let current_name = current.name;
             if current.name.as_str() == *new_name {
-                responder.command_complete("ALTER TYPE")?;
-                return sql_ok();
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    new_name
+                ));
             }
             if storage
                 .enum_slot(current.schema.as_str(), new_name, txn.txid)
@@ -45240,11 +45253,8 @@ pub fn alter_type(
                 Err(error) => return sql_fail(error),
             };
             if current.schema == schema {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
-                    current.name.as_str()
-                ));
+                responder.command_complete("ALTER TYPE")?;
+                return sql_ok();
             }
             if storage
                 .domain_slot(schema.as_str(), current.name.as_str(), txn.txid)
@@ -45445,11 +45455,8 @@ fn alter_composite_type(
                 Err(error) => return sql_fail(error),
             };
             if altered.schema == schema {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
-                    altered.name.as_str()
-                ));
+                responder.command_complete("ALTER TYPE")?;
+                return sql_ok();
             }
             if storage
                 .domain_slot(schema.as_str(), altered.name.as_str(), txn.txid)
@@ -45471,22 +45478,9 @@ fn alter_composite_type(
         }
         A::RenameTo(new_name) => {
             if altered.name.as_str() == *new_name {
-                responder.command_complete("ALTER TYPE")?;
-                return sql_ok();
-            }
-            if storage
-                .enum_slot(altered.schema.as_str(), new_name, txn.txid)
-                .is_some()
-                || storage
-                    .domain_slot(altered.schema.as_str(), new_name, txn.txid)
-                    .is_some()
-                || storage
-                    .composite_slot(altered.schema.as_str(), new_name, txn.txid)
-                    .is_some_and(|other| other != slot)
-            {
                 return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
                     new_name
                 ));
             }
@@ -47030,9 +47024,9 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
-            if let Err(error) = storage.lock_relation(
+            if let Err(error) = storage.lock_object(
                 txn.txid,
-                crate::storage::RelationLockTarget::View(slot),
+                crate::storage::ObjectLockTarget::View(slot),
                 crate::sql::ast::TableLockMode::AccessExclusive,
                 false,
             ) {

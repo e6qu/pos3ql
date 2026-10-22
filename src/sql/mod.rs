@@ -6558,7 +6558,7 @@ impl Engine {
                 self.storage
                     .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
                 self.storage.release_serializable(txn.txid);
-                self.storage.release_table_locks(txn.txid);
+                self.storage.release_object_locks(txn.txid);
                 self.storage.release_row_locks(txn.txid);
                 self.storage.release_advisory_transaction_locks(txn.txid);
                 let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
@@ -7649,7 +7649,7 @@ impl Engine {
             self.storage
                 .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
             self.storage.release_serializable(txn.txid);
-            self.storage.release_table_locks(txn.txid);
+            self.storage.release_object_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
             self.storage.release_advisory_transaction_locks(txn.txid);
             self.promote_transaction_state(txn, resolution_lsn, None)
@@ -11383,7 +11383,7 @@ impl Engine {
                 );
             }
         };
-        if let Err(error) = storage.lock_relation(
+        if let Err(error) = storage.lock_object(
             txn.txid,
             target.into(),
             ast::TableLockMode::RowExclusive,
@@ -20002,7 +20002,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
 fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
     storage.end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
     storage.release_serializable(txn.txid);
-    storage.release_table_locks(txn.txid);
+    storage.release_object_locks(txn.txid);
     storage.release_row_locks(txn.txid);
     storage.release_advisory_transaction_locks(txn.txid);
     // Reverse-replay every write to its prior image (newest first), so a

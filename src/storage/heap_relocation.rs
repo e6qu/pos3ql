@@ -1602,11 +1602,9 @@ mod tests {
             let mut workspace = workspace(8);
             crate::mem::guard::forbid_alloc(|| {
                 if stage == 0 {
-                    let version = storage
-                        .row_versions
-                        .test_write()
-                        .ok()
-                        .expect("fixture version owner");
+                    let Ok(version) = storage.row_versions.test_write() else {
+                        panic!("fixture version owner");
+                    };
                     assert_eq!(
                         workspace
                             .begin(&storage, MaintenanceMode::Background)
@@ -1620,11 +1618,10 @@ mod tests {
                     .begin(&storage, MaintenanceMode::Background)
                     .unwrap();
                 let version = (stage == 1).then(|| {
-                    storage
-                        .row_versions
-                        .test_write()
-                        .ok()
-                        .expect("fixture version owner")
+                    let Ok(version) = storage.row_versions.test_write() else {
+                        panic!("fixture version owner");
+                    };
+                    version
                 });
                 let rows = (stage != 1).then(|| storage.tables[table].rows.write());
                 assert_eq!(

@@ -4694,9 +4694,9 @@ fn subst_tableref<'a>(
     });
     if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
         if context.txid != 0 && context.execution.is_some() {
-            context.storage.lock_relation(
+            context.storage.lock_object(
                 context.txid,
-                crate::storage::RelationLockTarget::View(slot),
+                crate::storage::ObjectLockTarget::View(slot),
                 crate::sql::ast::TableLockMode::AccessShare,
                 false,
             )?;

@@ -26,6 +26,7 @@ mod table_definitions;
 mod table_edits;
 mod table_names;
 mod type_contracts;
+mod type_creation;
 mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
 mod type_names;
@@ -13037,14 +13038,16 @@ pub enum ResolvedRelation {
     Catalog,
 }
 
-/// A view and a stored table can use the same numeric slot without sharing a lock.
+/// Relations and accounts have separate lock identities. Account identifiers
+/// remain distinct when a catalog position is reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RelationLockTarget {
+pub(crate) enum ObjectLockTarget {
     Table(usize),
     View(usize),
+    Role(RoleOid),
 }
 
-impl From<RuleTarget> for RelationLockTarget {
+impl From<RuleTarget> for ObjectLockTarget {
     fn from(target: RuleTarget) -> Self {
         match target {
             RuleTarget::Table(slot) => Self::Table(usize::from(slot)),
@@ -13053,22 +13056,22 @@ impl From<RuleTarget> for RelationLockTarget {
     }
 }
 
-fn relation_lock_capacity(config: &Config) -> usize {
+fn object_lock_capacity(config: &Config) -> usize {
     (config.max_connections as usize + config.max_prepared_transactions)
-        * (table_slot_capacity(config) + config.max_views)
+        * (table_slot_capacity(config) + config.max_views + config.max_roles)
 }
 
 #[derive(Clone, Copy)]
-struct TableLock {
+struct ObjectLock {
     owner: u32,
     wait_owner: crate::sql::lock::WaitOwner,
-    relation: RelationLockTarget,
+    relation: ObjectLockTarget,
     /// Acquisition sequence for each table-lock mode. PostgreSQL permits a
     /// transaction to hold multiple incomparable modes on one relation.
     modes: [u64; 8],
 }
 
-impl TableLock {
+impl ObjectLock {
     fn mask(&self) -> u8 {
         self.modes
             .iter()
@@ -13080,7 +13083,7 @@ impl TableLock {
 }
 
 struct LockState {
-    table: FixedVec<TableLock>,
+    table: FixedVec<ObjectLock>,
     row: crate::sql::lock::LockManager,
     advisory: crate::sql::lock::AdvisoryLockManager,
     sequence: u64,
@@ -17385,6 +17388,12 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
         self.role_reference_ready(usize::from(owner), txid)?;
+        if self.current_role_slot(txid) != Some(usize::from(owner)) {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            ));
+        }
         self.foreign_catalog().stage_owner(class, slot, owner, txid)
     }
 
@@ -18181,7 +18190,7 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_routines
                 * size_of::<FunctionTransactionStatistics>()
-            + relation_lock_capacity(config) * size_of::<TableLock>()
+            + object_lock_capacity(config) * size_of::<ObjectLock>()
             + crate::sql::lock::LockManager::budget_bytes(
                 (config.max_connections as usize + config.max_prepared_transactions)
                     * config.txn_rows,
@@ -18955,7 +18964,7 @@ impl Storage {
             "function_transaction_statistics",
             transaction_capacity * config.max_routines,
         )?;
-        let table_locks = FixedVec::new(budget, "table_locks", relation_lock_capacity(config))?;
+        let table_locks = FixedVec::new(budget, "object_locks", object_lock_capacity(config))?;
         let row_locks = crate::sql::lock::LockManager::new(
             budget,
             transaction_capacity * config.txn_rows,
@@ -23821,6 +23830,10 @@ impl Storage {
     /// object later allocated into the same slot.
     fn clear_object_acl_entries(&self, object: AccessObject) {
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        Self::clear_object_acl_entries_locked(&mut catalog, object);
+    }
+
+    fn clear_object_acl_entries_locked(catalog: &mut AclCatalog, object: AccessObject) {
         for entry in catalog.objects.iter_mut() {
             if entry.object == object {
                 entry.live = false;
@@ -26309,6 +26322,7 @@ impl Storage {
     }
 
     pub fn drop_role_in(&self, slot: usize, txid: u32) -> Result<Option<PendingRole>, SqlError> {
+        self.lock_role_for_drop(slot, txid)?;
         if self.role_object_dependency(slot, txid)?.is_some() {
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -35133,17 +35147,51 @@ impl Storage {
         }
     }
 
+    fn retire_table_names(
+        &self,
+        index: usize,
+        selected: table_definitions::TableIdentity,
+    ) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            let lifecycle = self.tables[index].lifecycle();
+            let mut state = self.tables[index].definition.write();
+            if state.identity.database != selected.database
+                || state.identity.created_at != selected.created_at
+                || state.identity.existence == CatalogDdlState::Absent
+            {
+                return None;
+            }
+            let types =
+                match row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned") {
+                    Ok(types) => types,
+                    Err(wait) => {
+                        drop(state);
+                        drop(lifecycle);
+                        #[cfg(test)]
+                        self.type_publication
+                            .waits
+                            .fetch_add(1, core::sync::atomic::Ordering::Release);
+                        wait.wait();
+                        continue;
+                    }
+                };
+            state.identity.existence = CatalogDdlState::Absent;
+            let (schema, name) = (state.committed.schema, state.committed.name);
+            drop(state);
+            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+            self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
+            drop(types);
+            return Some(lifecycle);
+        }
+    }
+
     /// Committed drop (journal replay): rows are retained until checkpoint.
     pub fn drop_table(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let (schema, name) = {
-            let mut state = self.tables[index].definition.write();
-            state.identity.existence = CatalogDdlState::Absent;
-            (state.committed.schema, state.committed.name)
+        let selected = self.tables[index].definition.read().identity;
+        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+            return;
         };
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
@@ -35179,19 +35227,16 @@ impl Storage {
 
     /// Removes the committed table before retiring its rows and dependents.
     pub fn commit_drop(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let (schema, name) = {
-            let mut state = self.tables[index].definition.write();
-            assert!(matches!(
-                state.identity.existence,
-                CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
-            ));
-            state.identity.existence = CatalogDdlState::Absent;
-            (state.committed.schema, state.committed.name)
+        let selected = self.tables[index].definition.read().identity;
+        assert!(matches!(
+            selected.existence,
+            CatalogDdlState::Absent
+                | CatalogDdlState::Present
+                | CatalogDdlState::PendingDrop { .. }
+        ));
+        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+            return;
         };
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.reset_relation_statistics(index);
         self.reset_implicit_index_statistics(index);
@@ -38793,7 +38838,7 @@ impl Storage {
     /// replay/checkpoint with `txid == 0`, committed directly). The caller has
     /// validated the base type and constraints and checked the name is free.
     pub(crate) fn create_domain(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         spec: DomainSpec,
@@ -38815,7 +38860,7 @@ impl Storage {
     }
 
     fn create_domain_with_binding(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         mut spec: DomainSpec,
@@ -38825,10 +38870,7 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+        let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
             catalog.bind_domain_spec(&mut spec, txid)?;
         }
@@ -38845,10 +38887,13 @@ impl Storage {
                 catalog.domains.len()
             ));
         };
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Domain,
-            slot: new as u16,
-        });
+        Self::clear_object_acl_entries_locked(
+            &mut permissions,
+            AccessObject {
+                class: AccessClass::Domain,
+                slot: new as u16,
+            },
+        );
         catalog
             .versions
             .initialize(NamedTypeSlot::Domain(new), created_at);
@@ -39604,7 +39649,7 @@ impl Storage {
     /// replay/checkpoint with `txid == 0`, committed directly). The caller has
     /// validated the labels. Storage checks the shared named-type namespace.
     pub(crate) fn create_enum(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         spec: EnumSpec<'_>,
@@ -39613,10 +39658,7 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+        let (mut permissions, mut catalog) = self.type_creation_catalogs();
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
             e.ddl_state == CatalogDdlState::Absent
@@ -39630,12 +39672,15 @@ impl Storage {
                 catalog.enums.len()
             ));
         };
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Enum,
-            slot: new as u16,
-        });
         let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
         let member_count = image.count();
+        Self::clear_object_acl_entries_locked(
+            &mut permissions,
+            AccessObject {
+                class: AccessClass::Enum,
+                slot: new as u16,
+            },
+        );
         catalog
             .versions
             .initialize(NamedTypeSlot::Enum(new), created_at);
@@ -40284,7 +40329,7 @@ impl Storage {
     }
 
     pub(crate) fn create_composite(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         spec: CompositeSpec,
@@ -40304,7 +40349,7 @@ impl Storage {
     }
 
     fn create_composite_with_binding(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         mut spec: CompositeSpec,
@@ -40314,10 +40359,7 @@ impl Storage {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+        let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
             catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         }
@@ -40339,10 +40381,13 @@ impl Storage {
                 catalog.composites.len()
             ));
         };
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Composite,
-            slot: slot as u16,
-        });
+        Self::clear_object_acl_entries_locked(
+            &mut permissions,
+            AccessObject {
+                class: AccessClass::Composite,
+                slot: slot as u16,
+            },
+        );
         catalog
             .versions
             .initialize(NamedTypeSlot::Composite(slot), created_at);
@@ -40376,7 +40421,7 @@ impl Storage {
     /// slot explicitly, so restart cannot rebind existing rows to whichever
     /// free slot happens to be allocated first.
     pub(crate) fn create_composite_at(
-        &mut self,
+        &self,
         slot: usize,
         schema: SqlName,
         name: SqlName,
@@ -40385,10 +40430,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+        let (mut permissions, mut catalog) = self.type_creation_catalogs();
         catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
@@ -40402,10 +40444,13 @@ impl Storage {
             ));
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Composite,
-            slot: slot as u16,
-        });
+        Self::clear_object_acl_entries_locked(
+            &mut permissions,
+            AccessObject {
+                class: AccessClass::Composite,
+                slot: slot as u16,
+            },
+        );
         catalog
             .versions
             .initialize(NamedTypeSlot::Composite(slot), created_at);
@@ -40452,9 +40497,7 @@ impl Storage {
         let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            type_contracts::CatalogPublicationInput::QueryDefinition(
-                definition.query.dependencies.view(),
-            ),
+            type_contracts::CatalogPublicationInput::ViewDefinition,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -40481,6 +40524,17 @@ impl Storage {
                 name.as_str()
             ));
         }
+        self.require_row_type_name(
+            owners
+                .types
+                .as_deref()
+                .expect("view creation owns the type catalog"),
+            schema,
+            name,
+            txid,
+            existing.map(|slot| RuleTarget::View(slot as u16)),
+            Some(&**catalog),
+        )?;
         let Some(new) = catalog
             .views
             .iter()
@@ -40753,6 +40807,20 @@ impl Storage {
             let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
+        {
+            let types = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.require_row_type_name(
+                &types,
+                schema,
+                old_name,
+                txid,
+                Some(RuleTarget::View(slot as u16)),
+                None,
+            )?;
+        }
         self.view_rule_catalog().views[slot].pending_schema =
             Some(PendingObjectSchema { txid, schema });
         let visible_schema = self.view(slot).schema_for(txid);
@@ -40844,6 +40912,20 @@ impl Storage {
             let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
+        {
+            let types = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.require_row_type_name(
+                &types,
+                old_schema,
+                name,
+                txid,
+                Some(RuleTarget::View(slot as u16)),
+                None,
+            )?;
+        }
         self.view_rule_catalog().views[slot].pending_name = Some(PendingViewName { txid, name });
         let new_schema = self.view(slot).schema_for(txid);
         let new_name = self.view(slot).name_for(txid);
@@ -47701,12 +47783,12 @@ impl Storage {
         self.lock_state().advisory.view_count()
     }
 
-    pub(crate) fn visit_table_locks(
+    pub(crate) fn visit_object_locks(
         &self,
         mut visit: impl FnMut(
             u32,
             crate::sql::lock::WaitOwner,
-            RelationLockTarget,
+            ObjectLockTarget,
             crate::sql::ast::TableLockMode,
         ),
     ) {
@@ -47736,7 +47818,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn table_lock_view_count(&self) -> usize {
+    pub(crate) fn object_lock_view_count(&self) -> usize {
         self.lock_state()
             .table
             .iter()
@@ -47751,17 +47833,29 @@ impl Storage {
         mode: crate::sql::ast::TableLockMode,
         nowait: bool,
     ) -> Result<(), SqlError> {
-        self.lock_relation(txid, RelationLockTarget::Table(table), mode, nowait)
+        self.lock_object(txid, ObjectLockTarget::Table(table), mode, nowait)
     }
 
-    pub(crate) fn lock_relation(
+    pub(crate) fn lock_object(
         &self,
         txid: u32,
-        relation: RelationLockTarget,
+        relation: ObjectLockTarget,
         mode: crate::sql::ast::TableLockMode,
         nowait: bool,
     ) -> Result<(), SqlError> {
         use crate::sql::ast::TableLockMode;
+
+        if matches!(relation, ObjectLockTarget::Role(_))
+            && !matches!(
+                mode,
+                TableLockMode::AccessShare | TableLockMode::AccessExclusive
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid role-lock mode"
+            ));
+        }
 
         fn mode_bit(mode: TableLockMode) -> u8 {
             1 << mode as u8
@@ -47852,9 +47946,10 @@ impl Storage {
 
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
-        let protection = match self.transaction_mode {
-            crate::config::TransactionMode::Mvcc => mode,
-            crate::config::TransactionMode::Locking => match mode {
+        let protection = match (relation, self.transaction_mode) {
+            (ObjectLockTarget::Role(_), _) => mode,
+            (_, crate::config::TransactionMode::Mvcc) => mode,
+            (_, crate::config::TransactionMode::Locking) => match mode {
                 TableLockMode::AccessShare | TableLockMode::Share => TableLockMode::Share,
                 TableLockMode::AccessExclusive => TableLockMode::AccessExclusive,
                 _ => TableLockMode::Exclusive,
@@ -47889,7 +47984,14 @@ impl Storage {
             }
             locks.row.wait_for(wait_owner, blocker)?;
             drop(locks);
-            self.mark_current_backend_wait("Lock", "relation");
+            self.mark_current_backend_wait(
+                "Lock",
+                if matches!(relation, ObjectLockTarget::Role(_)) {
+                    "object"
+                } else {
+                    "relation"
+                },
+            );
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a relation lock"
@@ -47906,7 +48008,7 @@ impl Storage {
         modes[protection as usize] = sequence;
         locks
             .table
-            .push(TableLock {
+            .push(ObjectLock {
                 owner: txid,
                 wait_owner,
                 relation,
@@ -47915,7 +48017,7 @@ impl Storage {
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table-lock registry is full ({} locks)",
+                    "object-lock registry is full ({} locks)",
                     locks.table.capacity()
                 )
             })
@@ -47959,7 +48061,7 @@ impl Storage {
         let locks = self.lock_state();
         for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
             let (kind, schema, name) = match lock.relation {
-                RelationLockTarget::Table(slot) => {
+                ObjectLockTarget::Table(slot) => {
                     let table = &self.tables[slot];
                     let definition = table.definition();
                     if !definition.identity().live() {
@@ -47967,7 +48069,7 @@ impl Storage {
                     }
                     (0, definition.schema, definition.name)
                 }
-                RelationLockTarget::View(slot) => {
+                ObjectLockTarget::View(slot) => {
                     let view = self.view(slot);
                     if !matches!(
                         view.ddl_state,
@@ -47976,6 +48078,14 @@ impl Storage {
                         continue;
                     }
                     (3, view.schema, view.name)
+                }
+                ObjectLockTarget::Role(oid) => {
+                    for (mode, acquired_at) in lock.modes.iter().enumerate() {
+                        if *acquired_at != 0 {
+                            append_lock(output, 4, mode as u8, oid.get() as u64, "", "")?;
+                        }
+                    }
+                    continue;
                 }
             };
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
@@ -48080,10 +48190,9 @@ impl Storage {
                 0 | 3 => {
                     let relation = if kind == 0 {
                         self.find_visible(schema, table, 0)
-                            .map(RelationLockTarget::Table)
+                            .map(ObjectLockTarget::Table)
                     } else {
-                        self.view_slot(schema, table, 0)
-                            .map(RelationLockTarget::View)
+                        self.view_slot(schema, table, 0).map(ObjectLockTarget::View)
                     }
                     .ok_or_else(|| {
                         sql_err!(
@@ -48109,7 +48218,7 @@ impl Storage {
                             ));
                         }
                     };
-                    self.lock_relation(txid, relation, table_mode, false)?;
+                    self.lock_object(txid, relation, table_mode, false)?;
                 }
                 1 => {
                     let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
@@ -48182,6 +48291,31 @@ impl Storage {
                         ));
                     }
                 }
+                4 => {
+                    let source = i32::try_from(rowid)
+                        .ok()
+                        .and_then(RoleOid::parse)
+                        .filter(|source| *source != RoleOid::BOOTSTRAP)
+                        .filter(|_| schema.is_empty() && table.is_empty())
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared lock WAL has an invalid role identity"
+                            )
+                        })?;
+                    let mode = match mode {
+                        0 => crate::sql::ast::TableLockMode::AccessShare,
+                        7 => crate::sql::ast::TableLockMode::AccessExclusive,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared lock WAL has an invalid role-lock mode"
+                            ));
+                        }
+                    };
+                    self.observe_role_oid(source);
+                    self.lock_object(txid, ObjectLockTarget::Role(source), mode, false)?;
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::DATA_EXCEPTION,
@@ -48223,7 +48357,7 @@ impl Storage {
         }
     }
 
-    pub fn release_table_locks(&self, txid: u32) {
+    pub fn release_object_locks(&self, txid: u32) {
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
         let mut changed = false;
@@ -53628,7 +53762,7 @@ mod tests {
     fn catalog_creation_role_dependencies_wait_for_pending_owners() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         let (role, _) = storage
             .create_role(
                 SqlName::parse("pending_owner").unwrap(),
@@ -53669,8 +53803,10 @@ mod tests {
                 )
                 .unwrap();
             storage.rollback_create(during_rename);
+            storage.release_object_locks(9);
             storage.rollback_role_change(role, renamed);
             storage.rollback_create(table);
+            storage.release_object_locks(7);
             assert_eq!(storage.role_object_dependency(role, 8).unwrap(), None);
             let prior = storage.drop_role_in(role, 8).unwrap();
             let sequence = storage.catalog_identity_sequence();
@@ -56559,14 +56695,14 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage.begin_prepared_transaction_identity(7).unwrap();
             storage
-                .lock_relation(
+                .lock_object(
                     7,
-                    RelationLockTarget::View(0),
+                    ObjectLockTarget::View(0),
                     crate::sql::ast::TableLockMode::AccessShare,
                     false,
                 )
                 .unwrap();
-            storage.visit_table_locks(|_, owner, _, _| {
+            storage.visit_object_locks(|_, owner, _, _| {
                 assert_eq!(crate::sql::lock::wait_owner_pid(owner), None)
             });
             let ordinary = storage.start_transaction_identity().unwrap();
@@ -56597,7 +56733,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::DATA_EXCEPTION
             );
-            storage.release_table_locks(7);
+            storage.release_object_locks(7);
             storage.finish_transaction_identity(7, false);
             storage.finish_transaction_identity(ordinary, false);
         });
@@ -56724,9 +56860,9 @@ mod tests {
                 .lock_table(7, 0, TableLockMode::AccessExclusive, false)
                 .unwrap();
             storage
-                .lock_relation(
+                .lock_object(
                     8,
-                    RelationLockTarget::View(0),
+                    ObjectLockTarget::View(0),
                     TableLockMode::AccessShare,
                     false,
                 )
@@ -56740,9 +56876,9 @@ mod tests {
             );
             assert_eq!(
                 storage
-                    .lock_relation(
+                    .lock_object(
                         9,
-                        RelationLockTarget::View(0),
+                        ObjectLockTarget::View(0),
                         TableLockMode::AccessExclusive,
                         true
                     )
@@ -56751,19 +56887,19 @@ mod tests {
                 sqlstate::LOCK_NOT_AVAILABLE
             );
             let mut visited = 0;
-            storage.visit_table_locks(|_, _, _, _| {
+            storage.visit_object_locks(|_, _, _, _| {
                 assert!(storage.locks.try_lock().is_ok());
                 visited += 1;
             });
             assert_eq!(visited, 2);
-            storage.release_table_locks(7);
-            storage.release_table_locks(8);
+            storage.release_object_locks(7);
+            storage.release_object_locks(8);
             let capacity = storage.lock_state().table.capacity();
             for owner in 1..=capacity as u32 {
                 storage
-                    .lock_relation(
+                    .lock_object(
                         owner,
-                        RelationLockTarget::View(0),
+                        ObjectLockTarget::View(0),
                         TableLockMode::AccessShare,
                         false,
                     )
@@ -56773,9 +56909,9 @@ mod tests {
                 .lock_table(capacity as u32 + 1, 0, TableLockMode::AccessShare, false)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(error.message.as_str().contains("table-lock registry"));
+            assert!(error.message.as_str().contains("object-lock registry"));
             assert_eq!(storage.lock_state().table.len(), capacity);
-            storage.release_table_locks(1);
+            storage.release_object_locks(1);
             storage
                 .lock_table(capacity as u32 + 1, 0, TableLockMode::AccessShare, false)
                 .unwrap();
@@ -56807,9 +56943,9 @@ mod tests {
                 .unwrap();
             let before_view = storage.lock_mark();
             storage
-                .lock_relation(
+                .lock_object(
                     7,
-                    RelationLockTarget::View(view),
+                    ObjectLockTarget::View(view),
                     TableLockMode::AccessExclusive,
                     false,
                 )
@@ -56820,15 +56956,15 @@ mod tests {
             assert_eq!(encoded.readable()[table_record_bytes], 3);
             storage.rollback_locks_to(7, before_view);
             storage
-                .lock_relation(
+                .lock_object(
                     8,
-                    RelationLockTarget::View(view),
+                    ObjectLockTarget::View(view),
                     TableLockMode::AccessShare,
                     false,
                 )
                 .unwrap();
-            storage.release_table_locks(7);
-            storage.release_table_locks(8);
+            storage.release_object_locks(7);
+            storage.release_object_locks(8);
             storage
                 .restore_transaction_locks(9, encoded.readable())
                 .unwrap();
@@ -56841,9 +56977,9 @@ mod tests {
             );
             assert_eq!(
                 storage
-                    .lock_relation(
+                    .lock_object(
                         10,
-                        RelationLockTarget::View(view),
+                        ObjectLockTarget::View(view),
                         TableLockMode::AccessShare,
                         true
                     )
@@ -56851,7 +56987,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::LOCK_NOT_AVAILABLE
             );
-            storage.release_table_locks(9);
+            storage.release_object_locks(9);
             for invalid in [254, 255] {
                 encoded.filled_mut()[table_record_bytes] = invalid;
                 assert_eq!(
@@ -56861,7 +56997,7 @@ mod tests {
                         .sqlstate,
                     sqlstate::DATA_EXCEPTION
                 );
-                storage.release_table_locks(9);
+                storage.release_object_locks(9);
             }
             encoded.filled_mut()[table_record_bytes] = 3;
             encoded.filled_mut()[table_record_bytes + 1] = 255;
@@ -56872,7 +57008,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::DATA_EXCEPTION
             );
-            storage.release_table_locks(9);
+            storage.release_object_locks(9);
             encoded.filled_mut()[table_record_bytes + 1] = TableLockMode::AccessExclusive as u8;
             let bytes = encoded.readable();
             assert_eq!(
@@ -56882,11 +57018,11 @@ mod tests {
                     .sqlstate,
                 sqlstate::DATA_EXCEPTION
             );
-            storage.release_table_locks(9);
+            storage.release_object_locks(9);
             storage
                 .restore_transaction_locks(9, encoded.readable())
                 .unwrap();
-            storage.release_table_locks(9);
+            storage.release_object_locks(9);
         });
     }
 
@@ -56913,10 +57049,10 @@ mod tests {
                             modes[0] = sequence;
                             locks
                                 .table
-                                .push(TableLock {
+                                .push(ObjectLock {
                                     owner,
                                     wait_owner: crate::sql::lock::prepared_wait_owner(owner),
-                                    relation: RelationLockTarget::Table(0),
+                                    relation: ObjectLockTarget::Table(0),
                                     modes,
                                 })
                                 .unwrap();
@@ -56930,7 +57066,8 @@ mod tests {
         assert_eq!(locks.table.len(), 4);
         assert_eq!(
             locks.table.capacity(),
-            transaction_capacity * (table_slot_capacity(&config) + config.max_views)
+            transaction_capacity
+                * (table_slot_capacity(&config) + config.max_views + config.max_roles)
         );
         assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
     }
@@ -57402,7 +57539,7 @@ mod tests {
         config.max_enum_labels_per_type = WORKERS;
         config.max_composites = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {

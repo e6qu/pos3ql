@@ -78,6 +78,18 @@ DROP SCHEMA mv_life_target;
 -- WITH NO DATA creates it unpopulated; REFRESH fills it.
 CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM base WITH NO DATA;
 SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+BEGIN;
+SAVEPOINT before_refresh;
+REFRESH MATERIALIZED VIEW mv2;
+SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+ROLLBACK TO before_refresh;
+SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+COMMIT;
+BEGIN;
+REFRESH MATERIALIZED VIEW mv2;
+ROLLBACK;
+SELECT relispopulated FROM pg_class WHERE relname = 'mv2';
+SELECT count(*) FROM mv2;
 REFRESH MATERIALIZED VIEW mv2;
 SELECT count(*) FROM mv2;
 

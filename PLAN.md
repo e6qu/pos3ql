@@ -47,6 +47,11 @@ wait, and keep old row, index and backup data until their readers have finished.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion.
 
+Keep a view's object identifiers, owner, permissions and dependents when its
+query is replaced, including at the configured view and rule limits. Bind view
+and rule edits and undo to the selected object and version. A rolled-back
+materialized-view refresh must restore whether that view contains readable data.
+
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.

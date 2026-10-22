@@ -8,6 +8,126 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn view_replacement_preserves_identity_without_spare_catalog_slots() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("view-replacement-identity-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_views = 1;
+        config.max_rules = 1;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE VIEW retained_view AS SELECT 1 AS value",
+            true,
+        );
+        let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, \
+                            rewrite.oid, relation.relowner \
+                            FROM pg_class relation \
+                            JOIN pg_type row_type ON row_type.oid = relation.reltype \
+                            JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid \
+                            WHERE relation.relname = 'retained_view' \
+                              AND rewrite.rulename = '_RETURN'";
+        let original = data_rows(&session.success(&mut engine, identity_sql, true));
+        assert_eq!(original.len(), 1);
+        for value in 2..=4 {
+            session.success(
+                &mut engine,
+                &format!("CREATE OR REPLACE VIEW retained_view AS SELECT {value} AS value"),
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, identity_sql, true)),
+                original
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+                [value.to_string()]
+            );
+        }
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_replace; CREATE OR REPLACE VIEW retained_view AS SELECT 5 AS value; ROLLBACK TO before_replace", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+            ["4"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, identity_sql, true)),
+            original
+        );
+        session.success(
+            &mut engine,
+            "CREATE OR REPLACE VIEW retained_view AS SELECT 6 AS value; ROLLBACK",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+            ["4"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, identity_sql, true)),
+            original
+        );
+    }
+}
+
+#[test]
+fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("materialized-population-rollback-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE TABLE population_source(value integer); INSERT INTO population_source VALUES (1); CREATE MATERIALIZED VIEW population_view AS SELECT value FROM population_source WITH NO DATA", true);
+        let population_sql =
+            "SELECT relispopulated FROM pg_class WHERE relname = 'population_view'";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, population_sql, true)),
+            ["f"]
+        );
+        for rollback in ["ROLLBACK TO before_refresh", "ROLLBACK"] {
+            session.success(
+                &mut engine,
+                "BEGIN; SAVEPOINT before_refresh; REFRESH MATERIALIZED VIEW population_view",
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, population_sql, true)),
+                ["t"]
+            );
+            session.success(&mut engine, rollback, true);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, population_sql, true)),
+                ["f"]
+            );
+            if rollback.starts_with("ROLLBACK TO") {
+                session.success(&mut engine, "COMMIT", true);
+            }
+        }
+        session.success(
+            &mut engine,
+            "REFRESH MATERIALIZED VIEW population_view",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, population_sql, true)),
+            ["t"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM population_view", true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
 fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     let mut config = test_config("retained-row-walk-sst");
     config.object_store_on = true;

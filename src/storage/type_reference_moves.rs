@@ -1828,7 +1828,7 @@ mod tests {
     fn catalog_submission_rejects_retired_operator_destinations() {
         use super::super::{OperatorDefinition, OperatorFamilyDefinition, OperatorSignature};
         let (storage, _, _, _) = fixture(TypeReferenceKind::Domain);
-        let owner = Storage::role_oid(storage.current_role_slot(0).unwrap());
+        let owner = storage.role_oid(storage.current_role_slot(0).unwrap());
         let definition = OperatorDefinition {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("#@#").unwrap(),
@@ -2887,7 +2887,7 @@ mod tests {
         ] {
             let movement = TypeReferenceMove::new(
                 TypeIdentity::new(
-                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    super::super::type_references::CatalogOrigin::new().unwrap(),
                     DatabaseOid::POSTGRES,
                     named_slot(kind, 0),
                     1,
@@ -2925,7 +2925,7 @@ mod tests {
         ] {
             let movement = TypeReferenceMove::new(
                 TypeIdentity::new(
-                    super::super::type_references::TypeOrigin::new().unwrap(),
+                    super::super::type_references::CatalogOrigin::new().unwrap(),
                     DatabaseOid::POSTGRES,
                     named_slot(kind, 0),
                     1,

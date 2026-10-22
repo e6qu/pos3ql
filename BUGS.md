@@ -9,8 +9,9 @@ No defects currently meet this blocked-only boundary.
 
 A configured capacity limit may reject work explicitly. Partial changes, lost
 reader data, hidden runtime allocation or leaked ownership are defects. Waiting,
-rollback, recovery and slot reuse must preserve valid data and selected source
-identities. Keep detailed contracts in the
+rollback, connection identity, permission checks, ownership across databases,
+recovery and slot reuse must preserve valid data and selected source identities.
+Keep detailed contracts in the
 [current behavior guide](docs/implemented-baseline.md) and regression evidence in
 the implementing PR.
 

@@ -20,8 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v18` | yes | yes | Requires durable type slots/lifetimes, a catalog identity counter and a completed type-loading boundary; retains typed blocks and enum member identities. |
-| Journal record | Version `3` at header byte 17; bytes 18–23 are zero | yes | yes | Subscription creation carries its durable source identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v19` | yes | yes | Requires durable role and type identities and their counters, plus a completed type-loading boundary; retains typed blocks and enum member identities. |
+| Journal record | Version `4` at header byte 17; bytes 18–23 are zero | yes | yes | Role definitions and prepared transaction owners carry durable role identifiers. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -38,7 +38,23 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v17 and older manifests are rejected before their references are used.
+Manifest v18 and older manifests are rejected before their references are used.
+
+Role identifiers are independent of catalog slots. The bootstrap administrator
+keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
+2,147,483,647. Exhaustion returns `54000` before changing the role catalog.
+The required `role_sequence` manifest field retains the allocator's highest
+reservation, including deleted and rolled-back roles. `rol` records start with
+the identifier and preserved catalog slot, followed by the encoded name and
+attributes. Journal role definitions start with a four-byte identifier and
+two-byte catalog slot. Prepared transaction owners use
+that same four-byte identifier in the journal and its decimal form in `ptx`
+manifest records; they do not require the owning role to remain present.
+
+For example, deleting an account that prepared a transaction and creating a
+replacement account cannot give the replacement permission to finish that
+transaction. This remains true after checkpoint or journal recovery, even if
+a deleted account's slot is reused. A superuser can still finish the abandoned transaction.
 
 ## Why the storage layout matters
 
@@ -222,7 +238,7 @@ identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-current journal records or manifest v18. Kind 153 applies to ordinary row writes
+current journal records or manifest v19. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
 Journal routine type references identify their saved source lifetime. Replay

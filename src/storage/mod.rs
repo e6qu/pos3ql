@@ -5,6 +5,9 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
+mod catalog_sources;
+mod role_dependencies;
+pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -7279,7 +7282,7 @@ struct OperatorClassIter<'a> {
 
 #[derive(Debug)]
 struct TypeCatalog {
-    origin: type_references::TypeOrigin,
+    origin: type_references::CatalogOrigin,
     versions: type_edits::TypeRevisions,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
@@ -11952,6 +11955,8 @@ pub(crate) enum RoleObjectDependency {
     DefaultPrivilege,
     ColumnPrivilege,
     Policy,
+    GrantedRoleMembership,
+    ForeignUserMapping,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12281,6 +12286,7 @@ pub struct PendingRole {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RoleDef {
+    lifetime: Option<RoleOid>,
     pub name: SqlName,
     pub attributes: RoleAttributes,
     pub live: bool,
@@ -12288,6 +12294,11 @@ pub struct RoleDef {
 }
 
 impl RoleDef {
+    pub(crate) fn oid(&self) -> RoleOid {
+        self.lifetime
+            .expect("a selected role has a durable identity")
+    }
+
     pub fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
             Some(pending) if pending.txid == txid => pending.exists,
@@ -13094,7 +13105,7 @@ pub(crate) struct PreparedTransactionCatalogEntry {
     pub transaction_id: u32,
     pub gid: StackStr<199>,
     pub prepared_at: i64,
-    pub owner: u16,
+    pub owner: RoleOid,
     pub database: DatabaseOid,
     pub first_lsn: u64,
     pub prepared_lsn: u64,
@@ -13396,7 +13407,7 @@ impl BackendActivityState {
 pub(crate) struct BackendActivity {
     pub(crate) pid: i32,
     pub(crate) database: DatabaseOid,
-    pub(crate) role: u16,
+    pub(crate) role: catalog_sources::RoleReference,
     pub(crate) application_name: StackStr<64>,
     pub(crate) client_addr: Option<crate::sql::net::NetAddr>,
     pub(crate) client_port: i32,
@@ -13947,6 +13958,7 @@ pub struct Storage {
     comments: Mutex<CommentCatalog>,
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
+    catalog_sources: catalog_sources::CatalogSources,
     next_rowid: row_identities::RowIdentities,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
@@ -16084,7 +16096,7 @@ impl Storage {
         &self,
         pid: i32,
         database: DatabaseOid,
-        role: u16,
+        role: SessionIdentity,
         application_name: &str,
         client_addr: Option<crate::sql::net::NetAddr>,
         client_port: i32,
@@ -16094,6 +16106,7 @@ impl Storage {
         ssl_cipher: Option<&'static str>,
         ssl_bits: Option<i32>,
     ) -> Result<(), SqlError> {
+        let role = self.resolve_session_role(role.source(), 0)?;
         let now = crate::sql::datetime::now_micros();
         let activity = BackendActivity {
             pid,
@@ -16331,16 +16344,18 @@ impl Storage {
         else {
             return Ok(false);
         };
-        let current_name = crate::sql::eval::funcs::system::current_user_owned();
         let current_role = self
-            .find_role_visible(current_name.as_str(), txid)
+            .current_role_slot(txid)
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
         let current_superuser = self.role(current_role).attributes_to(txid).superuser;
-        let target_role = usize::from(target.role);
-        let target_superuser = self.role(target_role).attributes_to(txid).superuser;
+        let target_role = self.session_role_slot(target.role.source(), txid);
+        let target_superuser =
+            target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
         if target.pid != self.current_connection_id()
             && !current_superuser
-            && (target_superuser || !self.role_is_member_of(current_role, target_role, txid))
+            && (target_superuser
+                || !target_role
+                    .is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
         {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -17140,12 +17155,13 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )?;
         self.clear_object_acl_entries(AccessObject {
@@ -17160,12 +17176,13 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )?;
         self.clear_object_acl_entries(AccessObject {
@@ -17180,6 +17197,9 @@ impl Storage {
         definition: foreign::UserMappingDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        if let foreign::ForeignMappingUser::Role(role) = definition.user {
+            self.role_reference_ready(usize::from(role), txid)?;
+        }
         let created_at = self.catalog_sequence.next()?;
         self.foreign_catalog()
             .create_mapping(current_database(), created_at, definition, txid)
@@ -17190,12 +17210,13 @@ impl Storage {
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         self.foreign_catalog().create_table(
             current_database(),
             created_at,
             definition,
-            self.initial_ownership(txid),
+            ownership,
             txid,
         )
     }
@@ -17229,6 +17250,9 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::UserMappingDefinition>>, SqlError>
     {
+        if let foreign::ForeignMappingUser::Role(role) = definition.user {
+            self.role_reference_ready(usize::from(role), txid)?;
+        }
         self.foreign_catalog().alter_mapping(slot, definition, txid)
     }
 
@@ -17360,6 +17384,7 @@ impl Storage {
         owner: u16,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(usize::from(owner), txid)?;
         self.foreign_catalog().stage_owner(class, slot, owner, txid)
     }
 
@@ -18056,7 +18081,8 @@ impl Storage {
             + type_reference_moves::TypePublication::budget_bytes(config)
             + type_edits::TypeRevisions::budget_bytes(config)
             + Self::type_definition_image_budget_bytes(config)
-            + size_of::<type_references::TypeOrigin>()
+            + size_of::<type_references::CatalogOrigin>()
+            + size_of::<catalog_sources::CatalogSources>()
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -18173,11 +18199,12 @@ impl Storage {
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
-        let type_origin = type_references::TypeOrigin::new()?;
+        let catalog_origin = type_references::CatalogOrigin::new()?;
         budget.draw(
-            size_of::<type_references::TypeOrigin>(),
-            "type reference origin",
+            size_of::<type_references::CatalogOrigin>(),
+            "catalog reference origin",
         )?;
+        let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         budget.draw(size_of::<usize>(), "routine catalog capacity")?;
@@ -18662,6 +18689,11 @@ impl Storage {
         for slot in 0..config.max_roles {
             roles
                 .push(RoleDef {
+                    lifetime: if slot == 0 {
+                        Some(RoleOid::BOOTSTRAP)
+                    } else {
+                        None
+                    },
                     name: if slot == 0 {
                         SqlName::parse("postgres").expect("bootstrap role name fits")
                     } else {
@@ -19019,7 +19051,7 @@ impl Storage {
                 values: sequence_values,
             }),
             type_catalog: Mutex::new(TypeCatalog {
-                origin: type_origin,
+                origin: catalog_origin,
                 versions: type_definition_versions,
                 domains,
                 enums,
@@ -19087,6 +19119,7 @@ impl Storage {
             }),
             comments: Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
+            catalog_sources,
             transaction_mode: config.transaction_mode,
             snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
@@ -19428,7 +19461,9 @@ impl Storage {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "prepared transaction manifest exceeds max_prepared_transactions"
             )
-        })
+        })?;
+        self.observe_role_oid(entry.owner);
+        Ok(())
     }
 
     /// Installs the configured database-default collation before recovery or
@@ -20341,7 +20376,7 @@ impl Storage {
                 self.alloc_schema(
                     source_schema.name,
                     CatalogDdlState::PendingCreate { txid },
-                    Some(source_schema.ownership.committed()),
+                    source_schema.ownership.committed(),
                 )?;
             }
 
@@ -22535,11 +22570,9 @@ impl Storage {
             .position(|role| role.visible_to(txid) && role.name_to(txid).as_str() == name)
     }
 
-    /// PostgreSQL preassigns OIDs to built-in roles. The bootstrap role keeps
-    /// OID 10 for compatibility with the existing catalog; user roles occupy
-    /// a deterministic catalog range.
-    pub fn role_oid(slot: usize) -> i32 {
-        if slot == 0 { 10 } else { 16_384 + slot as i32 }
+    /// OIDs survive renames and recovery, and are not reused for a new role.
+    pub fn role_oid(&self, slot: usize) -> i32 {
+        self.role(slot).oid().get()
     }
 
     pub fn role_membership_oid(slot: usize) -> i32 {
@@ -22554,7 +22587,8 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, role)| {
-                (role.visible_to(txid) && Self::role_oid(slot) == oid).then_some(slot)
+                (role.visible_to(txid) && role.lifetime.is_some_and(|source| source.get() == oid))
+                    .then_some(slot)
             })
     }
 
@@ -22580,9 +22614,7 @@ impl Storage {
             },
             AccessClass::EventTrigger => self.event_trigger(slot).definition.ownership,
             AccessClass::Database => self.database(slot).ownership,
-            AccessClass::LargeObject => {
-                unreachable!("large object ownership is synchronized separately")
-            }
+            AccessClass::LargeObject => self.large_object(slot).ownership,
             AccessClass::ForeignDataWrapper => self.foreign_catalog().entry_wrapper(slot).ownership,
             AccessClass::ForeignServer => self.foreign_catalog().entry_server(slot).ownership,
             AccessClass::Language => {
@@ -22642,18 +22674,21 @@ impl Storage {
         }
     }
 
-    fn initial_ownership(&self, txid: u32) -> Ownership {
+    fn initial_ownership(&self, txid: u32) -> Result<Ownership, SqlError> {
         if txid == 0 {
-            return Ownership::BOOTSTRAP;
+            return Ok(Ownership::BOOTSTRAP);
         }
-        let role_name = crate::sql::eval::funcs::system::current_user_owned();
-        let owner = self
-            .find_role_visible(role_name.as_str(), txid)
-            .unwrap_or(0) as u16;
-        Ownership {
+        let owner = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })? as u16;
+        self.role_reference_ready(usize::from(owner), txid)?;
+        Ok(Ownership {
             owner: 0,
             pending: Some(PendingOwnership { txid, owner }),
-        }
+        })
     }
 
     pub(crate) fn object_owner(&self, object: AccessObject, txid: u32) -> usize {
@@ -22683,8 +22718,10 @@ impl Storage {
     }
 
     pub(crate) fn current_role_slot(&self, txid: u32) -> Option<usize> {
-        let role = crate::sql::eval::funcs::system::current_user_owned();
-        self.find_role_visible(role.as_str(), txid)
+        self.session_role_slot(
+            crate::sql::eval::funcs::system::current_identity().source(),
+            txid,
+        )
     }
 
     pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
@@ -22733,6 +22770,7 @@ impl Storage {
         requested: Option<LargeObjectOid>,
         txid: u32,
     ) -> Result<(usize, LargeObjectOid), SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let database = current_database();
         let (oid, allocated, blocker) = {
             let mut catalog = self
@@ -22789,7 +22827,6 @@ impl Storage {
             slot: slot as u16,
         });
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         self.large_objects
             .lock()
             .expect("large object catalog lock poisoned")
@@ -23165,6 +23202,10 @@ impl Storage {
         if !self.access_object_in_current_database(object) {
             return false;
         }
+        self.access_object_visible_in_any_database(object, txid)
+    }
+
+    fn access_object_visible_in_any_database(&self, object: AccessObject, txid: u32) -> bool {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].visible_to(txid),
@@ -23800,111 +23841,13 @@ impl Storage {
         }
     }
 
-    pub(crate) fn role_object_dependency(
-        &self,
-        role: usize,
-        txid: u32,
-    ) -> Option<RoleObjectDependency> {
-        let (foreign_wrapper_capacity, foreign_server_capacity) = {
-            let catalog = self.foreign_catalog();
-            (catalog.wrapper_capacity(), catalog.server_capacity())
-        };
-        let owned = [
-            (AccessClass::Table, self.tables.len()),
-            (AccessClass::View, self.view_count()),
-            (AccessClass::MaterializedView, self.matview_count()),
-            (AccessClass::Sequence, self.sequence_count()),
-            (AccessClass::Schema, self.schema_count()),
-            (AccessClass::Domain, self.domain_count()),
-            (AccessClass::Enum, self.enum_count()),
-            (AccessClass::Index, self.index_count()),
-            (AccessClass::Routine, self.routine_count()),
-            (AccessClass::Composite, self.composite_count()),
-            (AccessClass::Tablespace, self.tablespace_capacity()),
-            (AccessClass::Statistics, self.extended_statistics_count()),
-            (AccessClass::Extension, self.extension_count()),
-            (AccessClass::EventTrigger, self.event_trigger_capacity()),
-            (
-                AccessClass::LargeObject,
-                self.access_class_slots(AccessClass::LargeObject),
-            ),
-            (AccessClass::ForeignDataWrapper, foreign_wrapper_capacity),
-            (AccessClass::ForeignServer, foreign_server_capacity),
-        ]
-        .into_iter()
-        .any(|(class, count)| {
-            (0..count).any(|slot| {
-                let object = AccessObject {
-                    class,
-                    slot: slot as u16,
-                };
-                self.access_object_visible_to(object, txid)
-                    && self.object_owner(object, txid) == role
-            })
-        });
-        let owned_catalog = self
-            .operators_visible_to(txid)
-            .any(|(_, definition)| definition.owner == Self::role_oid(role))
-            || self
-                .operator_families_visible_to(txid)
-                .any(|(_, definition)| definition.owner == Self::role_oid(role))
-            || self
-                .operator_classes_visible_to(txid)
-                .any(|(_, definition)| definition.owner == Self::role_oid(role))
-            || self
-                .collations_visible_to(txid)
-                .any(|(_, definition)| definition.owner == Self::role_oid(role))
-            || self
-                .conversions_visible_to(txid)
-                .any(|(_, definition)| definition.owner == Self::role_oid(role));
-        if owned {
-            return Some(RoleObjectDependency::OwnedObject);
-        }
-        if owned_catalog {
-            return Some(RoleObjectDependency::OwnedCatalogObject);
-        }
-        {
-            let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-            if catalog.objects.iter().any(|entry| {
-                let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
-                visible
-                    && self.access_object_visible_to(entry.object, txid)
-                    && (grantee == role as u16 || grantor == role as u16)
-            }) {
-                return Some(RoleObjectDependency::ObjectPrivilege);
-            }
-            if catalog.parameters.iter().any(|entry| {
-                let (visible, grantee, grantor, _, _) = Self::parameter_acl_visible(entry, txid);
-                visible && (grantee == role as u16 || grantor == role as u16)
-            }) {
-                return Some(RoleObjectDependency::ParameterPrivilege);
-            }
-            if catalog.defaults.iter().any(|entry| {
-                let (defined, _, _) = Self::default_acl_visible(entry, txid);
-                defined && (entry.owner == role as u16 || entry.grantee == role as u16)
-            }) {
-                return Some(RoleObjectDependency::DefaultPrivilege);
-            }
-            if catalog.columns.iter().any(|entry| {
-                let (visible, grantee, grantor, _, _) = Self::column_acl_visible(entry, txid);
-                visible
-                    && self.access_object_visible_to(entry.target.relation, txid)
-                    && (grantee == role as u16 || grantor == role as u16)
-            }) {
-                return Some(RoleObjectDependency::ColumnPrivilege);
-            }
-        }
-        self.policies_with_slots_visible_to(txid)
-            .any(|(slot, _)| self.policy_roles(slot, txid).contains(&(role as u16)))
-            .then_some(RoleObjectDependency::Policy)
-    }
-
     pub(crate) fn set_tablespace_owner(
         &self,
         slot: usize,
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(owner, txid)?;
         let mut tablespaces = self
             .tablespaces
             .lock()
@@ -23934,6 +23877,7 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(owner, txid)?;
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         if let Some(blocker) = schemas[slot].pending_owner_other_than(txid) {
             let name = schemas[slot].name;
@@ -23960,6 +23904,7 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(owner, txid)?;
         let mut catalog = self.extension_catalog();
         if let Some(blocker) = catalog.definitions[slot].pending_owner_other_than(txid) {
             let name = catalog.definitions[slot].name;
@@ -24568,6 +24513,10 @@ impl Storage {
         grant_options: PrivilegeSet,
         txid: u32,
     ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        if grantee != PUBLIC_ROLE {
+            self.role_reference_ready(usize::from(grantee), txid)?;
+        }
+        self.role_reference_ready(usize::from(grantor), txid)?;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let slot = catalog
             .objects
@@ -24801,6 +24750,10 @@ impl Storage {
         grant_options: crate::sql::ast::ParameterPrivileges,
         txid: u32,
     ) -> Result<(usize, Option<PendingParameterAcl>), SqlError> {
+        if grantee != PUBLIC_ROLE {
+            self.role_reference_ready(usize::from(grantee), txid)?;
+        }
+        self.role_reference_ready(usize::from(grantor), txid)?;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let slot = catalog
             .parameters
@@ -25226,6 +25179,10 @@ impl Storage {
         grant_options: PrivilegeSet,
         txid: u32,
     ) -> Result<(usize, Option<PendingDefaultAcl>), SqlError> {
+        self.role_reference_ready(usize::from(key.owner), txid)?;
+        if key.grantee != PUBLIC_ROLE {
+            self.role_reference_ready(usize::from(key.grantee), txid)?;
+        }
         let DefaultAclKey {
             owner,
             schema,
@@ -25435,6 +25392,10 @@ impl Storage {
         grant_options: PrivilegeSet,
         txid: u32,
     ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        if grantee != PUBLIC_ROLE {
+            self.role_reference_ready(usize::from(grantee), txid)?;
+        }
+        self.role_reference_ready(usize::from(grantor), txid)?;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let slot = catalog
             .columns
@@ -26153,8 +26114,8 @@ impl Storage {
         }
     }
 
-    pub(crate) fn initial_catalog_owner(&self, txid: u32) -> i32 {
-        Self::role_oid(usize::from(self.initial_ownership(txid).owner_to(txid)))
+    pub(crate) fn initial_catalog_owner(&self, txid: u32) -> Result<i32, SqlError> {
+        Ok(self.role_oid(usize::from(self.initial_ownership(txid)?.owner_to(txid))))
     }
 
     pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -26250,7 +26211,9 @@ impl Storage {
             ));
         };
         let prior = catalog.roles[slot].pending;
+        let lifetime = self.catalog_sources.next_role()?;
         catalog.roles[slot] = RoleDef {
+            lifetime: Some(lifetime),
             name,
             attributes: RoleAttributes::ORDINARY,
             live: false,
@@ -26346,6 +26309,12 @@ impl Storage {
     }
 
     pub fn drop_role_in(&self, slot: usize, txid: u32) -> Result<Option<PendingRole>, SqlError> {
+        if self.role_object_dependency(slot, txid)?.is_some() {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "role cannot be dropped because objects depend on it"
+            ));
+        }
         let mut catalog = self
             .role_catalog
             .lock()
@@ -26389,10 +26358,10 @@ impl Storage {
             if !pending.exists {
                 catalog.roles[slot].name = SqlName::EMPTY;
             }
-            !pending.exists
+            (!pending.exists).then_some(catalog.roles[slot].oid())
         };
-        if dropped {
-            self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
+        if let Some(oid) = dropped {
+            self.drop_comments_by_subid(CommentClass::Role, oid.get() as u32);
         }
     }
 
@@ -26409,35 +26378,59 @@ impl Storage {
     }
 
     /// Committed role install used by WAL and manifest recovery.
-    pub fn install_role(
+    pub(crate) fn install_role(
         &self,
         name: SqlName,
         attributes: RoleAttributes,
+        oid: RoleOid,
+        slot: usize,
     ) -> Result<usize, SqlError> {
         let mut catalog = self
             .role_catalog
             .lock()
             .expect("role catalog lock poisoned");
-        if let Some(slot) = catalog
-            .roles
-            .iter()
-            .position(|role| role.live && role.name == name)
-        {
-            catalog.roles[slot].attributes = attributes;
-            return Ok(slot);
-        }
-        let Some(slot) = catalog
-            .roles
-            .iter()
-            .position(|role| !role.live && role.pending.is_none())
-        else {
+        if slot >= catalog.roles.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many roles (limit {})",
-                catalog.roles.len()
+                "stored role slot exceeds max_roles"
             ));
-        };
+        }
+        if (slot == 0) != (oid == RoleOid::BOOTSTRAP) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role has an invalid bootstrap slot"
+            ));
+        }
+        if catalog.roles.iter().any(|role| {
+            role.pending.is_some_and(|pending| {
+                role.lifetime == Some(oid) || role.name == name || pending.name == name
+            })
+        }) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "stored role replaces a pending role definition"
+            ));
+        }
+        let named = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name == name);
+        let identified = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.lifetime == Some(oid));
+        if named.is_some_and(|named| named != slot)
+            || identified.is_some_and(|identified| identified != slot)
+            || (catalog.roles[slot].live && catalog.roles[slot].lifetime != Some(oid))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role slot identifies a different role"
+            ));
+        }
+        self.observe_role_oid(oid);
         catalog.roles[slot] = RoleDef {
+            lifetime: Some(oid),
             name,
             attributes,
             live: true,
@@ -26456,7 +26449,7 @@ impl Storage {
             .iter()
             .position(|role| role.live && role.name.as_str() == name)
         {
-            self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
+            self.drop_comments_by_subid(CommentClass::Role, roles.roles[slot].oid().get() as u32);
             let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
             for entry in catalog.objects.iter_mut() {
                 if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
@@ -26496,6 +26489,7 @@ impl Storage {
             }
             drop(catalog);
             roles.roles[slot] = RoleDef {
+                lifetime: None,
                 name: SqlName::EMPTY,
                 attributes: RoleAttributes::ORDINARY,
                 live: false,
@@ -26615,6 +26609,9 @@ impl Storage {
         exists: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
+        for source in [role, member, grantor] {
+            self.role_reference_ready(source, txid)?;
+        }
         let mut catalog = self
             .role_catalog
             .lock()
@@ -26800,6 +26797,9 @@ impl Storage {
         value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleSetting>), SqlError> {
+        if let Some(role) = scope.role() {
+            self.role_reference_ready(usize::from(role), txid)?;
+        }
         let mut catalog = self
             .role_catalog
             .lock()
@@ -27627,7 +27627,7 @@ impl Storage {
     /// Committed create (journal replay): the schema is immediately part of
     /// the durable image.
     pub fn create_schema(&self, name: SqlName) -> Result<usize, SqlError> {
-        self.alloc_schema(name, CatalogDdlState::Present, None)
+        self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP)
     }
 
     /// Transactional create: the schema exists only for `txid` until commit.
@@ -27646,17 +27646,20 @@ impl Storage {
                 database.name.as_str()
             ));
         }
-        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid }, None)
+        self.alloc_schema(
+            name,
+            CatalogDdlState::PendingCreate { txid },
+            self.initial_ownership(txid)?,
+        )
     }
 
     fn alloc_schema(
         &self,
         name: SqlName,
         ddl_state: CatalogDdlState,
-        ownership: Option<Ownership>,
+        ownership: Ownership,
     ) -> Result<usize, SqlError> {
         let txid = ddl_state.pending_txid().unwrap_or(0);
-        let ownership = ownership.unwrap_or_else(|| self.initial_ownership(txid));
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         if let Some(blocker) = schemas.iter().find_map(|schema| {
             (schema.database == current_database() && schema.name == name)
@@ -28306,7 +28309,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut catalog = self.extension_catalog();
         if catalog.definitions.iter().any(|extension| {
             extension.database == current_database()
@@ -35474,6 +35477,7 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(owner, txid)?;
         let mut publications = self
             .publications
             .lock()
@@ -36248,6 +36252,7 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.role_reference_ready(owner, txid)?;
         self.require_subscription_owner(slot, txid)?;
         let mut catalog = self
             .subscription_catalog
@@ -37192,7 +37197,7 @@ impl Storage {
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_PUBLICATION_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut publications = self
             .publications
             .lock()
@@ -37529,7 +37534,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let target = self.query_table_target(backing_table, txid)?;
         let name = self.table_def(backing_table, txid).name;
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.matviews,
             type_contracts::CatalogPublicationInput::QueryDefinition(query.dependencies.view()),
@@ -37854,7 +37859,7 @@ impl Storage {
             persistence,
         } = create;
         self.require_schema_create(schema.as_str(), txid)?;
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
         let mut catalog = self.sequence_catalog();
         if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
@@ -38818,8 +38823,8 @@ impl Storage {
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -39606,8 +39611,8 @@ impl Storage {
         txid: u32,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40307,8 +40312,8 @@ impl Storage {
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40378,8 +40383,8 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
-        let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
             .lock()
@@ -40444,7 +40449,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(
@@ -42827,8 +42832,11 @@ impl Storage {
             },
         )?;
         self.require_schema_create(schema.as_str(), txid)?;
-        let allocated_ownership =
-            matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
+        let allocated_ownership = if matches!(identity, RoutineIdentity::Allocate) {
+            Some(self.initial_ownership(txid)?)
+        } else {
+            None
+        };
         let mut owners = self.catalog_dependency_owners(
             &self.routines,
             type_contracts::CatalogPublicationInput::RoutineContract,
@@ -43308,6 +43316,11 @@ impl Storage {
         dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        for role in spec.roles {
+            if *role != PUBLIC_ROLE {
+                self.role_reference_ready(usize::from(*role), txid)?;
+            }
+        }
         if spec.table >= self.tables.len()
             || spec.roles.is_empty()
             || (matches!(spec.command, PolicyCommandKind::Insert)
@@ -43397,6 +43410,11 @@ impl Storage {
         dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<Option<PendingPolicyDefinition>, SqlError> {
+        for role in roles {
+            if *role != PUBLIC_ROLE {
+                self.role_reference_ready(usize::from(*role), txid)?;
+            }
+        }
         let selected = self.policy(slot);
         if selected.database != current_database() || !selected.visible_to(txid) {
             return Err(sql_err!(
@@ -44718,7 +44736,7 @@ impl Storage {
                 "invalid extended statistics key count"
             ));
         }
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         let mut catalog = self
             .extended_statistics_catalog
             .lock()
@@ -45684,7 +45702,7 @@ impl Storage {
         } else {
             0
         };
-        let ownership = self.initial_ownership(txid);
+        let ownership = self.initial_ownership(txid)?;
         if self
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
@@ -53310,7 +53328,7 @@ mod tests {
             transaction_id,
             gid: StackStr::from_str(gid),
             prepared_at: generation as i64,
-            owner: 0,
+            owner: RoleOid::BOOTSTRAP,
             database: DatabaseOid::POSTGRES,
             first_lsn: generation,
             prepared_lsn: generation,
@@ -53603,6 +53621,379 @@ mod tests {
                 assert_eq!(storage.tables[reused].enforcer_count(), 1);
                 storage.rollback_create(reused);
             }
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_dependencies_wait_for_pending_owners() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let (role, _) = storage
+            .create_role(
+                SqlName::parse("pending_owner").unwrap(),
+                RoleAttributes {
+                    superuser: true,
+                    ..RoleAttributes::ORDINARY
+                },
+                7,
+            )
+            .unwrap();
+        storage.commit_role_change(role);
+        let actor = SessionIdentity::bound(storage.capture_role_slot(role, 0).unwrap());
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
+        crate::mem::guard::forbid_alloc(|| {
+            let table = storage
+                .create_table_in(
+                    make_def("pending_owned_table", &[("id", ColType::Int4, false)]),
+                    7,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .role_object_dependency(role, 8)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            let renamed = storage
+                .rename_role(role, SqlName::parse("pending_renamed_owner").unwrap(), 8)
+                .unwrap();
+            let during_rename = storage
+                .create_table_in(
+                    make_def(
+                        "create_during_owner_rename",
+                        &[("id", ColType::Int4, false)],
+                    ),
+                    9,
+                )
+                .unwrap();
+            storage.rollback_create(during_rename);
+            storage.rollback_role_change(role, renamed);
+            storage.rollback_create(table);
+            assert_eq!(storage.role_object_dependency(role, 8).unwrap(), None);
+            let prior = storage.drop_role_in(role, 8).unwrap();
+            let sequence = storage.catalog_identity_sequence();
+            let error = storage
+                .create_table_in(
+                    make_def("wait_for_owner_drop", &[("id", ColType::Int4, false)]),
+                    9,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert_eq!(storage.catalog_identity_sequence(), sequence);
+            assert!(
+                storage
+                    .find_table("public", "wait_for_owner_drop")
+                    .is_none()
+            );
+            storage.rollback_role_change(role, prior);
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_install_rejects_identity_conflicts_and_pending_sources() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let name = SqlName::parse("installed_actor").unwrap();
+        let (slot, _) = storage
+            .create_role(name, RoleAttributes::ORDINARY, 7)
+            .unwrap();
+        let oid = storage.role(slot).oid();
+        let sequence = storage.role_identity_sequence();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, oid, slot)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert!(storage.role(slot).visible_to(7));
+            assert!(!storage.role(slot).visible_to(0));
+            storage.commit_role_change(slot);
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, oid, slot)
+                    .unwrap(),
+                slot
+            );
+            let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            let other_oid = RoleOid::parse(16_400).unwrap();
+            assert_eq!(
+                storage
+                    .install_role(name, RoleAttributes::ORDINARY, other_oid, slot)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.role_identity_sequence(), sequence);
+            assert_eq!(storage.role_oid(slot), oid.get());
+            let renamed = SqlName::parse("installed_renamed_actor").unwrap();
+            assert_eq!(
+                storage
+                    .install_role(renamed, RoleAttributes::ORDINARY, oid, slot)
+                    .unwrap(),
+                slot
+            );
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), renamed.as_str());
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        storage
+            .restore_role_identity_sequence(i32::MAX as u64)
+            .unwrap();
+        let sequence = storage.catalog_identity_sequence();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..2 {
+                let error = storage
+                    .create_role(
+                        SqlName::parse("exhausted_actor").unwrap(),
+                        RoleAttributes::ORDINARY,
+                        7,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(error.message.as_str(), "role identity space exhausted");
+                assert!(storage.find_role_visible("exhausted_actor", 7).is_none());
+                assert_eq!(storage.role_identity_sequence(), i32::MAX as u64);
+                assert_eq!(storage.catalog_identity_sequence(), sequence);
+                assert_eq!(storage.role_oid(0), 10);
+            }
+        });
+    }
+
+    #[test]
+    fn catalog_creation_known_name_requires_an_authenticated_identity() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let actor = SessionIdentity::unauthenticated("postgres");
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.current_role_slot(7).is_none());
+            assert_missing_creation_actor(storage.initial_ownership(7));
+            assert_eq!(
+                actor.require_name().unwrap_err().sqlstate,
+                sqlstate::INSUFFICIENT_PRIVILEGE
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_identity_survives_rename_but_rejects_slot_reuse() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let name = SqlName::parse("source_actor").unwrap();
+        let renamed = SqlName::parse("renamed_actor").unwrap();
+        let slot = storage
+            .install_role(
+                name,
+                RoleAttributes::ORDINARY,
+                storage.catalog_sources.next_role().unwrap(),
+                1,
+            )
+            .unwrap();
+        let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = storage.rename_role(slot, renamed, 7).unwrap();
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), name.as_str());
+            assert_eq!(actor.refresh(&storage, 7).name().as_str(), renamed.as_str());
+            storage.rollback_role_change(slot, prior);
+            assert_eq!(actor.refresh(&storage, 7).name().as_str(), name.as_str());
+            storage.rename_role(slot, renamed, 7).unwrap();
+            storage.commit_role_change(slot);
+            assert_eq!(actor.refresh(&storage, 0).name().as_str(), renamed.as_str());
+            storage.drop_role_in(slot, 8).unwrap();
+            storage.commit_role_change(slot);
+            assert!(storage.session_role_slot(actor.source(), 0).is_none());
+            assert_eq!(
+                storage
+                    .install_role(
+                        name,
+                        RoleAttributes::ORDINARY,
+                        storage.catalog_sources.next_role().unwrap(),
+                        slot
+                    )
+                    .unwrap(),
+                slot
+            );
+            assert_eq!(
+                actor
+                    .refresh(&storage, 0)
+                    .require_name()
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
+            let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
+            assert_missing_creation_actor(storage.initial_ownership(9));
+            let replacement = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            assert_ne!(actor.source(), replacement.source());
+            assert_eq!(
+                storage.session_role_slot(replacement.source(), 0),
+                Some(slot)
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_creation_role_identity_rejects_rollback_and_foreign_storage() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut other_budget = test_budget(&config);
+        let other = Storage::new(&config, &mut other_budget).unwrap();
+        let name = SqlName::parse("aborted_actor").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, prior) = storage
+                .create_role(name, RoleAttributes::ORDINARY, 7)
+                .unwrap();
+            let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 7).unwrap());
+            assert_eq!(storage.session_role_slot(actor.source(), 7), Some(slot));
+            assert!(storage.session_role_slot(actor.source(), 8).is_none());
+            storage.rollback_role_change(slot, prior);
+            assert_eq!(
+                storage
+                    .install_role(
+                        name,
+                        RoleAttributes::ORDINARY,
+                        storage.catalog_sources.next_role().unwrap(),
+                        slot
+                    )
+                    .unwrap(),
+                slot
+            );
+            assert!(storage.session_role_slot(actor.source(), 7).is_none());
+            let local = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
+            assert!(other.session_role_slot(local.source(), 0).is_none());
+            let bootstrap = SessionIdentity::bound(storage.capture_role_slot(0, 0).unwrap());
+            assert!(other.session_role_slot(bootstrap.source(), 0).is_none());
+        });
+    }
+
+    fn assert_missing_creation_actor<T>(result: Result<T, SqlError>) {
+        let error = match result {
+            Ok(_) => panic!("a missing actor was accepted as an object owner"),
+            Err(error) => error,
+        };
+        assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        assert_eq!(
+            error.message.as_str(),
+            "current role is not present in the role catalog"
+        );
+    }
+
+    #[test]
+    fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let wrapper = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("base_wrapper").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                0,
+            )
+            .unwrap();
+        let server = storage
+            .create_foreign_server(
+                foreign::ForeignServerDefinition {
+                    name: SqlName::parse("base_server").unwrap(),
+                    wrapper: wrapper as u16,
+                    server_type: None,
+                    version: None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                0,
+            )
+            .unwrap();
+        let table = storage
+            .create_table(make_def("base_table", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let sequence = storage.catalog_sequence.current();
+        let next_oid = storage.large_objects.lock().unwrap().next_oid;
+        let actor = crate::sql::eval::funcs::system::enter_current_user(
+            SessionIdentity::unauthenticated("missing_creator"),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_missing_creation_actor(storage.initial_ownership(7));
+            assert_missing_creation_actor(storage.initial_catalog_owner(7));
+            assert_missing_creation_actor(storage.create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("unowned_wrapper").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                7,
+            ));
+            assert_missing_creation_actor(storage.create_foreign_server(
+                foreign::ForeignServerDefinition {
+                    name: SqlName::parse("unowned_server").unwrap(),
+                    wrapper: wrapper as u16,
+                    server_type: None,
+                    version: None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                7,
+            ));
+            assert_missing_creation_actor(storage.create_foreign_table_binding(
+                foreign::ForeignTableDefinition {
+                    table: table as u16,
+                    server: server as u16,
+                    options: foreign::ForeignOptions::EMPTY,
+                    column_options: foreign::ForeignColumnOptions::EMPTY,
+                },
+                7,
+            ));
+            assert_missing_creation_actor(storage.create_large_object(None, 7));
+            assert_missing_creation_actor(table_creation::allocate(
+                &storage,
+                make_def("unowned_table", &[("id", ColType::Int4, false)]),
+                Some(7),
+            ));
+            assert_eq!(storage.catalog_sequence.current(), sequence);
+            assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
+            assert!(storage.find_table("public", "unowned_table").is_none());
+        });
+        drop(actor);
+        let (_, oid) = storage.create_large_object(None, 7).unwrap();
+        assert_eq!(Some(oid), next_oid);
+        assert_eq!(storage.catalog_sequence.current(), sequence + 1);
+    }
+
+    #[test]
+    fn catalog_creation_replay_uses_its_explicit_owner_without_a_session_actor() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let _actor = crate::sql::eval::funcs::system::enter_current_user(
+            SessionIdentity::unauthenticated("missing_creator"),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.initial_ownership(0).unwrap().owner, BOOTSTRAP_ROLE);
+            let slot = storage
+                .alloc_schema(
+                    SqlName::parse("replayed_schema").unwrap(),
+                    CatalogDdlState::Present,
+                    Ownership::BOOTSTRAP,
+                )
+                .unwrap();
+            let schemas = storage.schemas.lock().unwrap();
+            assert_eq!(schemas[slot].ownership.owner, BOOTSTRAP_ROLE);
+            assert!(schemas[slot].ownership.pending.is_none());
         });
     }
 
@@ -54359,7 +54750,7 @@ mod tests {
                 .alloc_schema(
                     SqlName::parse("clone_extra").unwrap(),
                     CatalogDdlState::Present,
-                    Some(Ownership::BOOTSTRAP),
+                    Ownership::BOOTSTRAP,
                 )
                 .unwrap();
             assert_eq!(
@@ -58194,6 +58585,14 @@ mod tests {
         config.max_large_objects = WORKERS;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
+        let (owner, _) = storage
+            .create_role(
+                SqlName::parse("large_object_owner").unwrap(),
+                RoleAttributes::ORDINARY,
+                7,
+            )
+            .unwrap();
+        storage.commit_role_change(owner);
         let catalog = &storage.large_objects;
         let claimed: [std::sync::atomic::AtomicBool; ADVANCES] =
             std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
@@ -58250,9 +58649,9 @@ mod tests {
             .expect("large object catalog lock poisoned")
             .definitions[0]
             .ownership
-            .owner = 1;
+            .owner = owner as u16;
         assert_eq!(
-            storage.role_object_dependency(1, 0),
+            storage.role_object_dependency(owner, 0).unwrap(),
             Some(RoleObjectDependency::OwnedObject)
         );
     }
@@ -58269,19 +58668,27 @@ mod tests {
         const WORKERS: usize = 4;
         let parameters = ["acl.a", "acl.b", "acl.c", "acl.d"];
         let mut config = test_config();
+        config.max_roles = WORKERS + 2;
         config.max_acl_entries = 3 + WORKERS;
         config.max_column_acl_entries = WORKERS;
         config.max_default_acl_entries = WORKERS;
         config.max_parameter_acl_entries = WORKERS;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
+        let grantees = ["acl_a", "acl_b", "acl_c", "acl_d", "acl_e"].map(|name| {
+            let (slot, _) = storage
+                .create_role(SqlName::parse(name).unwrap(), RoleAttributes::ORDINARY, 1)
+                .unwrap();
+            storage.commit_role_change(slot);
+            slot as u16
+        });
 
         std::thread::scope(|scope| {
             for (worker, parameter) in parameters.iter().copied().enumerate() {
                 let storage = &storage;
+                let grantee = grantees[worker];
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
-                    let grantee = worker as u16 + 1;
                     let object = AccessObject {
                         class: AccessClass::Database,
                         slot: 0,
@@ -58370,17 +58777,19 @@ mod tests {
         assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_parameter_acls().count(), WORKERS);
-        assert!(
+        assert_eq!(
             storage
                 .change_parameter_acl(
                     crate::sql::ast::ParameterName::parse("acl.e").unwrap(),
-                    5,
+                    grantees[WORKERS],
                     BOOTSTRAP_ROLE,
                     crate::sql::ast::ParameterPrivileges::SET,
                     crate::sql::ast::ParameterPrivileges::NONE,
                     0,
                 )
-                .is_err()
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
     }
 
@@ -59255,13 +59664,13 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_reused").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 11 },
-                Some(Ownership {
+                Ownership {
                     owner: BOOTSTRAP_ROLE,
                     pending: Some(PendingOwnership {
                         txid: 11,
                         owner: BOOTSTRAP_ROLE,
                     }),
-                }),
+                },
             )
             .unwrap();
         assert_eq!(reused, reclaimed);
@@ -59274,13 +59683,13 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_committed").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 12 },
-                Some(Ownership {
+                Ownership {
                     owner: BOOTSTRAP_ROLE,
                     pending: Some(PendingOwnership {
                         txid: 12,
                         owner: BOOTSTRAP_ROLE,
                     }),
-                }),
+                },
             )
             .unwrap();
         storage.commit_schema_create(committed);
@@ -59293,7 +59702,7 @@ mod tests {
             .alloc_schema(
                 SqlName::parse("schema_pending").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 20 },
-                Some(Ownership::BOOTSTRAP),
+                Ownership::BOOTSTRAP,
             )
             .unwrap();
         assert_eq!(
@@ -59301,7 +59710,7 @@ mod tests {
                 .alloc_schema(
                     SqlName::parse("schema_pending").unwrap(),
                     CatalogDdlState::PendingCreate { txid: 21 },
-                    Some(Ownership::BOOTSTRAP),
+                    Ownership::BOOTSTRAP,
                 )
                 .unwrap_err()
                 .sqlstate,
@@ -59669,7 +60078,9 @@ mod tests {
         assert_eq!(storage.checkpoint_foreign_wrappers().count(), WORKERS);
         assert_eq!(storage.checkpoint_foreign_servers().count(), WORKERS);
         assert_eq!(
-            storage.role_object_dependency(usize::from(BOOTSTRAP_ROLE), 0),
+            storage
+                .role_object_dependency(usize::from(BOOTSTRAP_ROLE), 0)
+                .unwrap(),
             Some(RoleObjectDependency::OwnedObject)
         );
         for (slot, entry) in storage.foreign_wrappers(0) {

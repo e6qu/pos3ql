@@ -367,7 +367,7 @@ pub struct Conn {
     role_scram: Option<ScramServer>,
     login_verifier: LoginVerifier,
     auth_login: Option<crate::sql::RoleLogin>,
-    authenticated_role: Option<u16>,
+    authenticated_role: Option<crate::sql::RoleLogin>,
     auth_database: Option<crate::sql::DatabaseLogin>,
     authenticated_database: Option<u16>,
     database: StackStr<64>,
@@ -634,7 +634,7 @@ impl Conn {
         )
     }
 
-    pub(crate) fn authenticated_role(&self) -> Option<u16> {
+    pub(crate) fn authenticated_role(&self) -> Option<crate::sql::RoleLogin> {
         self.authenticated_role
     }
 
@@ -1431,7 +1431,7 @@ impl Conn {
             let Some(login) = self.auth_login else {
                 return Step::Close;
             };
-            if !engine.role_can_connect(login.slot) {
+            if !engine.role_can_connect(login) {
                 let mut responder = Responder::new(&mut self.send);
                 let _ = responder.error(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -1453,7 +1453,7 @@ impl Conn {
                 return Step::Close;
             }
             if !engine.reserve_database_connection(database, login.superuser) {
-                engine.release_role_connection(login.slot);
+                engine.release_role_connection(login);
                 let mut responder = Responder::new(&mut self.send);
                 let message = if !database.allow_connections {
                     "database is not currently accepting connections"
@@ -1463,7 +1463,8 @@ impl Conn {
                 let _ = responder.error(sqlstate::TOO_MANY_CONNECTIONS, message);
                 return Step::Close;
             }
-            self.authenticated_role = Some(login.slot);
+            self.guc.bind_session_user(login.identity);
+            self.authenticated_role = Some(login);
             self.authenticated_database = Some(database.slot);
         }
         let minor = self.minor;
@@ -1535,7 +1536,7 @@ impl Conn {
         if let Err(error) = engine.register_backend(
             id,
             database.oid,
-            self.authenticated_role.expect("role was reserved"),
+            self.authenticated_role.expect("role was reserved").identity,
             application_name.as_str(),
             client_addr,
             client_port,
@@ -5836,7 +5837,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
@@ -6035,7 +6036,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
@@ -6301,7 +6302,7 @@ mod tests {
             server.set_nonblocking(true).unwrap();
             conn.open(server, 72);
             conn.phase = Phase::Ready;
-            let role = engine.role_login("postgres").unwrap().slot;
+            let role = engine.role_login("postgres").unwrap().identity;
             engine
                 .register_backend(
                     72,
@@ -8044,6 +8045,7 @@ mod tests {
     #[test]
     fn login_verifier_makes_bootstrap_and_role_credentials_disjoint() {
         let login = crate::sql::RoleLogin {
+            identity: crate::storage::SessionIdentity::bootstrap(),
             slot: 0,
             can_login: true,
             valid: true,
@@ -8110,6 +8112,7 @@ mod tests {
     #[test]
     fn replication_requires_a_replication_role_or_superuser() {
         let login = crate::sql::RoleLogin {
+            identity: crate::storage::SessionIdentity::bootstrap(),
             slot: 0,
             can_login: true,
             valid: true,

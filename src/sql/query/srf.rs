@@ -4906,11 +4906,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let value = crate::sql::eval::eval_full(expression, arena, params, columns, &hooks)?;
             routine_params[input_index] = crate::sql::eval::cast_to(value, parameter.ctype, arena)?;
         }
-        let owner = storage.role_name(routine.ownership.owner_to(txid).into(), txid);
+        let owner = crate::storage::SessionIdentity::bound(
+            storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
+        );
         let _security = routine
             .attributes
             .security_definer
-            .then(|| crate::sql::eval::funcs::system::enter_current_user(owner.as_str()));
+            .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
         let _config = (!routine.configs().is_empty())
             .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;

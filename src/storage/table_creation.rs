@@ -15,6 +15,7 @@ pub(super) fn allocate(
     mut def: TableDef,
     transaction: Option<u32>,
 ) -> Result<usize, SqlError> {
+    let ownership = storage.initial_ownership(transaction.unwrap_or(0))?;
     loop {
         let names = storage
             .table_creation
@@ -68,7 +69,6 @@ pub(super) fn allocate(
             class: AccessClass::Table,
             slot: slot as u16,
         });
-        let ownership = storage.initial_ownership(transaction.unwrap_or(0));
         storage.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         storage.reset_implicit_index_statistics(slot);
         storage.clear_table_rows(slot);

@@ -636,10 +636,10 @@ impl SeqSession {
 struct GucValues {
     /// Effective authorization identifier. Kept in the transactional GUC
     /// snapshot so SET ROLE follows PostgreSQL's rollback/savepoint behavior.
-    current_role: StackStr<64>,
+    current_role: crate::storage::SessionIdentity,
     /// Transactional session authorization identifier. SET SESSION
     /// AUTHORIZATION changes this and current_role together.
-    session_authorization: StackStr<64>,
+    session_authorization: crate::storage::SessionIdentity,
     datestyle: StackStr<48>,
     intervalstyle: IntervalStyle,
     lc_monetary: StackStr<16>,
@@ -741,8 +741,8 @@ pub(crate) enum PasswordEncryption {
 impl GucValues {
     fn new() -> Self {
         let mut values = Self {
-            current_role: StackStr::from_str("postgres"),
-            session_authorization: StackStr::from_str("postgres"),
+            current_role: crate::storage::SessionIdentity::bootstrap(),
+            session_authorization: crate::storage::SessionIdentity::bootstrap(),
             datestyle: StackStr::new(),
             intervalstyle: IntervalStyle::Postgres,
             lc_monetary: StackStr::from_str("C.UTF-8"),
@@ -998,7 +998,7 @@ pub struct GucState {
     /// Immutable authenticated identity from the startup packet. PostgreSQL
     /// uses this identity—not a later SET ROLE or SET SESSION
     /// AUTHORIZATION—as the authority for changing session authorization.
-    authenticated_user: StackStr<64>,
+    authenticated_user: crate::storage::SessionIdentity,
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
     random: Cell<PrngState>,
@@ -1257,7 +1257,7 @@ impl GucState {
         transaction_mode: crate::config::TransactionMode,
     ) -> Self {
         let values = GucValues::new();
-        let mut g = Self {
+        Self {
             transaction_mode,
             store: RefCell::new(GucStore {
                 current: values,
@@ -1280,12 +1280,10 @@ impl GucState {
                     savepoint_count: 0,
                 },
             }),
-            authenticated_user: StackStr::new(),
+            authenticated_user: crate::storage::SessionIdentity::bootstrap(),
             seq_session: SeqSession::new(),
             random: Cell::new(PrngState::UNINITIALIZED),
-        };
-        let _ = write!(g.authenticated_user, "postgres");
-        g
+        }
     }
 
     pub fn search_path(&self) -> StackStr<SEARCH_PATH_BYTES> {
@@ -1386,7 +1384,7 @@ impl GucState {
     }
 
     pub fn session_user(&self) -> StackStr<64> {
-        self.store.borrow().current.session_authorization
+        self.store.borrow().current.session_authorization.name()
     }
 
     pub fn authenticated_user(&self) -> &str {
@@ -1394,10 +1392,12 @@ impl GucState {
     }
 
     pub fn set_session_user(&mut self, user: &str) {
-        self.authenticated_user = StackStr::new();
-        let _ = core::fmt::Write::write_str(&mut self.authenticated_user, user);
+        self.bind_session_user(crate::storage::SessionIdentity::unauthenticated(user));
+    }
+
+    pub(crate) fn bind_session_user(&mut self, role: crate::storage::SessionIdentity) {
+        self.authenticated_user = role;
         let mut store = self.store.borrow_mut();
-        let role = StackStr::from_str(user);
         store.current.current_role = role;
         store.current.session_authorization = role;
         store.defaults.current_role = role;
@@ -1409,12 +1409,11 @@ impl GucState {
     }
 
     pub fn current_role(&self) -> StackStr<64> {
-        self.store.borrow().current.current_role
+        self.store.borrow().current.current_role.name()
     }
 
-    pub fn set_role(&self, role: &str, local: bool) {
+    pub(crate) fn set_role(&self, role: crate::storage::SessionIdentity, local: bool) {
         let mut store = self.store.borrow_mut();
-        let role = StackStr::from_str(role);
         store.current.current_role = role;
         if store.transaction.active && !local {
             store.transaction.session.current_role = role;
@@ -1423,12 +1422,15 @@ impl GucState {
 
     pub fn reset_role(&self, local: bool) {
         let session_user = self.store.borrow().current.session_authorization;
-        self.set_role(session_user.as_str(), local);
+        self.set_role(session_user, local);
     }
 
-    pub fn set_session_authorization(&self, role: &str, local: bool) {
+    pub(crate) fn set_session_authorization(
+        &self,
+        role: crate::storage::SessionIdentity,
+        local: bool,
+    ) {
         let mut store = self.store.borrow_mut();
-        let role = StackStr::from_str(role);
         store.current.session_authorization = role;
         store.current.current_role = role;
         if store.transaction.active && !local {
@@ -1439,7 +1441,33 @@ impl GucState {
 
     pub fn reset_session_authorization(&self, local: bool) {
         let authenticated_user = self.authenticated_user;
-        self.set_session_authorization(authenticated_user.as_str(), local);
+        self.set_session_authorization(authenticated_user, local);
+    }
+
+    pub(crate) fn current_identity(&self) -> crate::storage::SessionIdentity {
+        self.store.borrow().current.current_role
+    }
+
+    pub(crate) fn session_identity(&self) -> crate::storage::SessionIdentity {
+        self.store.borrow().current.session_authorization
+    }
+
+    pub(crate) fn authenticated_identity(&self) -> crate::storage::SessionIdentity {
+        self.authenticated_user
+    }
+
+    pub(crate) fn refresh_identities(
+        &mut self,
+        storage: &crate::storage::Storage,
+        transaction: u32,
+    ) {
+        self.authenticated_user = self.authenticated_user.refresh(storage, transaction);
+        let mut store = self.store.borrow_mut();
+        store.current.current_role = store.current.current_role.refresh(storage, transaction);
+        store.current.session_authorization = store
+            .current
+            .session_authorization
+            .refresh(storage, transaction);
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {

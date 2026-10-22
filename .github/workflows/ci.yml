@@ -29,7 +29,7 @@ jobs:
 
       - name: Socket readiness and allocation-free catalog publication
         run: >-
-          cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name
+          cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           --test-threads=1
 
       - name: macOS allocation-free mutex boundary
@@ -85,6 +85,7 @@ jobs:
             stable_spill_generation_exhaustion
             type_publication_workspace_exact_startup_budget
             bound_type_origin_never_reuses_an_exhausted_identifier
+            storage::catalog_sources::tests
             mem::mutex::tests
           )
           # All libtest filters share one interpreter startup.

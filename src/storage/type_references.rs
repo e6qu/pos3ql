@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub(crate) enum StorageSetupError {
     Budget(BudgetError),
-    TypeIdentitySpaceExhausted,
+    CatalogIdentitySpaceExhausted,
 }
 
 impl From<BudgetError> for StorageSetupError {
@@ -26,8 +26,8 @@ impl std::fmt::Display for StorageSetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::TypeIdentitySpaceExhausted => {
-                formatter.write_str("type catalog identity space exhausted")
+            Self::CatalogIdentitySpaceExhausted => {
+                formatter.write_str("catalog reference identity space exhausted")
             }
         }
     }
@@ -37,15 +37,15 @@ impl std::error::Error for StorageSetupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Budget(error) => Some(error),
-            Self::TypeIdentitySpaceExhausted => None,
+            Self::CatalogIdentitySpaceExhausted => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TypeOrigin(u64);
+pub(super) struct CatalogOrigin(u64);
 
-impl TypeOrigin {
+impl CatalogOrigin {
     pub(super) fn new() -> Result<Self, StorageSetupError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self::reserve(&NEXT)
@@ -56,7 +56,7 @@ impl TypeOrigin {
         loop {
             let next = current
                 .checked_add(1)
-                .ok_or(StorageSetupError::TypeIdentitySpaceExhausted)?;
+                .ok_or(StorageSetupError::CatalogIdentitySpaceExhausted)?;
             match sequence.compare_exchange_weak(
                 current,
                 next,
@@ -90,7 +90,7 @@ pub(super) struct TypeIdentity {
 
 impl TypeIdentity {
     pub(super) fn new(
-        origin: TypeOrigin,
+        origin: CatalogOrigin,
         database: DatabaseOid,
         slot: NamedTypeSlot,
         created_at: u64,
@@ -112,8 +112,8 @@ impl TypeIdentity {
         }
     }
 
-    fn origin(self) -> TypeOrigin {
-        TypeOrigin(u64::from_le_bytes(self.origin))
+    fn origin(self) -> CatalogOrigin {
+        CatalogOrigin(u64::from_le_bytes(self.origin))
     }
 
     pub(super) fn database(self) -> DatabaseOid {
@@ -291,7 +291,7 @@ impl TypeReference {
 
 fn redeclare_template_reference(
     name: &mut Option<UserTypeName>,
-    origin: TypeOrigin,
+    origin: CatalogOrigin,
     source: DatabaseOid,
 ) -> Result<(), SqlError> {
     let Some(identity) = name else {
@@ -403,7 +403,7 @@ mod tests {
             NamedTypeSlot::Enum(65535),
             NamedTypeSlot::Composite(1600),
         ] {
-            let origin = TypeOrigin(u64::MAX);
+            let origin = CatalogOrigin(u64::MAX);
             let database = DatabaseOid::parse(i32::MAX).unwrap();
             let identity = TypeIdentity::new(origin, database, source, u64::MAX);
             assert_eq!(identity.slot(), source);
@@ -473,13 +473,13 @@ mod tests {
     fn bound_type_origin_never_reuses_an_exhausted_identifier() {
         let sequence = AtomicU64::new(u64::MAX - 1);
         assert_eq!(
-            TypeOrigin::reserve(&sequence).unwrap(),
-            TypeOrigin(u64::MAX - 1)
+            CatalogOrigin::reserve(&sequence).unwrap(),
+            CatalogOrigin(u64::MAX - 1)
         );
         for _ in 0..2 {
             assert!(matches!(
-                TypeOrigin::reserve(&sequence),
-                Err(StorageSetupError::TypeIdentitySpaceExhausted)
+                CatalogOrigin::reserve(&sequence),
+                Err(StorageSetupError::CatalogIdentitySpaceExhausted)
             ));
             assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
         }

@@ -9390,7 +9390,7 @@ fn pg_foreign_data_wrapper<'a>(
                 Datum::Int4(2328),
                 Datum::Int4(foreign_data_wrapper_oid(slot)),
                 text(wrapper.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(entry.ownership.owner_to(txid) as usize)),
+                Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(match wrapper.handler {
                     crate::storage::foreign::ForeignDataHandler::None => 0,
                     crate::storage::foreign::ForeignDataHandler::Postgres => {
@@ -9437,7 +9437,7 @@ fn pg_foreign_server<'a>(
                 Datum::Int4(1417),
                 Datum::Int4(foreign_server_oid(slot)),
                 text(server.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(entry.ownership.owner_to(txid) as usize)),
+                Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(foreign_data_wrapper_oid(server.wrapper as usize)),
                 match server.server_type {
                     Some(value) => text(value.as_str(), arena)?,
@@ -9503,7 +9503,7 @@ fn pg_user_mapping<'a>(
         let user = match mapping.user {
             crate::storage::foreign::ForeignMappingUser::Public => 0,
             crate::storage::foreign::ForeignMappingUser::Role(slot) => {
-                Storage::role_oid(slot as usize)
+                storage.role_oid(slot as usize)
             }
         };
         rows[index] = row(
@@ -9546,7 +9546,7 @@ fn pg_user_mappings<'a>(
         let (user, user_name) = match mapping.user {
             crate::storage::foreign::ForeignMappingUser::Public => (0, text("PUBLIC", arena)?),
             crate::storage::foreign::ForeignMappingUser::Role(role) => (
-                Storage::role_oid(role as usize),
+                storage.role_oid(role as usize),
                 text(storage.role_name(role as usize, txid).as_str(), arena)?,
             ),
         };
@@ -9667,9 +9667,9 @@ fn catalog_owner(
     }
 }
 
-fn catalog_owner_oid(owner: CatalogOwner) -> i32 {
+fn catalog_owner_oid(storage: &Storage, owner: CatalogOwner) -> i32 {
     match owner {
-        CatalogOwner::Role(slot) => Storage::role_oid(slot),
+        CatalogOwner::Role(slot) => storage.role_oid(slot),
         CatalogOwner::DatabaseOwner => PG_DATABASE_OWNER_OID,
     }
 }
@@ -9684,14 +9684,17 @@ fn catalog_owner_name(storage: &Storage, owner: CatalogOwner, txid: u32) -> SqlN
 }
 
 fn owner_oid(storage: &Storage, class: crate::storage::AccessClass, slot: usize, txid: u32) -> i32 {
-    catalog_owner_oid(catalog_owner(
+    catalog_owner_oid(
         storage,
-        crate::storage::AccessObject {
-            class,
-            slot: slot as u16,
-        },
-        txid,
-    ))
+        catalog_owner(
+            storage,
+            crate::storage::AccessObject {
+                class,
+                slot: slot as u16,
+            },
+            txid,
+        ),
+    )
 }
 
 fn owner_name<'a>(
@@ -9942,7 +9945,7 @@ fn pg_largeobject_metadata<'a>(
         rows[count] = row(
             &[
                 Datum::Oid(object.oid.get()),
-                Datum::Oid(Storage::role_oid(object.ownership.owner_to(txid) as usize) as u32),
+                Datum::Oid(storage.role_oid(object.ownership.owner_to(txid) as usize) as u32),
                 acl(storage, access, txid, arena)?,
             ],
             arena,
@@ -10272,7 +10275,7 @@ fn pg_default_acl<'a>(
             &[
                 Datum::Int4(90_000 + entry_slot as i32),
                 Datum::Int4(826),
-                Datum::Int4(Storage::role_oid(entry.owner as usize)),
+                Datum::Int4(storage.role_oid(entry.owner as usize)),
                 Datum::Int4(namespace),
                 text(object_type, arena)?,
                 Datum::Array {
@@ -10450,7 +10453,7 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
         return Some(oid);
     }
     (0..storage.role_count()).find_map(|slot| {
-        let oid = Storage::role_oid(slot);
+        let oid = storage.role_oid(slot);
         let visible = storage.role_slot_by_oid(oid, txid)?;
         identifier_spelling_matches(written, storage.role_name(visible, txid).as_str())
             .then_some(oid)
@@ -16034,7 +16037,11 @@ fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     }
 }
 
-fn policy_role_oids<'a>(roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn policy_role_oids<'a>(
+    storage: &Storage,
+    roles: &[u16],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let values = arena
         .alloc_slice_with(roles.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
@@ -16042,7 +16049,7 @@ fn policy_role_oids<'a>(roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, Sq
         values[index] = Datum::Int4(if role == crate::storage::PUBLIC_ROLE {
             0
         } else {
-            Storage::role_oid(usize::from(role))
+            storage.role_oid(usize::from(role))
         });
     }
     Ok(Datum::Array {
@@ -16802,7 +16809,7 @@ fn pg_policy<'a>(
                     arena,
                 )?,
                 Datum::Bool(policy.permissive),
-                policy_role_oids(&storage.policy_roles(slot, txid), arena)?,
+                policy_role_oids(storage, &storage.policy_roles(slot, txid), arena)?,
                 policy_definition
                     .using
                     .map(|source| text(source.as_str(), arena))
@@ -16885,9 +16892,7 @@ fn pg_publication<'a>(
                 Datum::Int4(6104),
                 Datum::Int4(publication_oid(slot)),
                 text(publication.name_for(txid).as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(
-                    publication.ownership.owner_to(txid) as usize
-                )),
+                Datum::Int4(storage.role_oid(publication.ownership.owner_to(txid) as usize)),
                 Datum::Bool(definition.all_tables),
                 Datum::Bool(definition.publish_insert),
                 Datum::Bool(definition.publish_update),
@@ -18183,9 +18188,7 @@ fn pg_subscription<'a>(
                 Datum::Int4(storage.current_database_oid().get()),
                 skip_lsn,
                 text(subscription.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(
-                    subscription.ownership.owner_to(txid) as usize
-                )),
+                Datum::Int4(storage.role_oid(subscription.ownership.owner_to(txid) as usize)),
                 Datum::Bool(subscription.enabled_to(txid)),
                 Datum::Bool(definition.behavior.binary),
                 text(definition.behavior.streaming.pg_code(), arena)?,
@@ -18673,7 +18676,7 @@ fn pg_class<'a>(
                     slot: matview as u16,
                 },
             );
-        let relation_owner = Storage::role_oid(storage.object_owner(relation_object, txid));
+        let relation_owner = storage.role_oid(storage.object_owner(relation_object, txid));
         let reloptions = match table_def.storage_options.fillfactor {
             Some(fillfactor) => Datum::Array {
                 element: super::types::ArrElem::Text,
@@ -18764,7 +18767,7 @@ fn pg_class<'a>(
         let table_oid = table_oid(storage, slot);
         let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
         let toast_index_name = crate::stack_format!(72, "{}_index", toast_name.as_str());
-        let owner = Storage::role_oid(storage.object_owner(
+        let owner = storage.role_oid(storage.object_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Table,
                 slot: slot as u16,
@@ -18875,7 +18878,7 @@ fn pg_class<'a>(
                 Datum::Float8(-1.0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
+                Datum::Int4(storage.role_oid(storage.object_owner(object, txid))),
                 Datum::Int4(0),
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -19356,7 +19359,7 @@ fn pg_tablespace<'a>(
                     _ => tablespace_oid(tablespace),
                 }),
                 text(tablespace.name_for(txid).as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
+                Datum::Int4(storage.role_oid(storage.object_owner(object, txid))),
                 acl(storage, object, txid, arena)?,
                 tablespace_options(tablespace.options_for(txid), arena)?,
             ],
@@ -25257,9 +25260,7 @@ fn pg_event_trigger<'a>(
                 Datum::Int4(storage.event_trigger(slot).oid()),
                 text(event_trigger.name.as_str(), arena)?,
                 text(event_trigger.event.name(), arena)?,
-                Datum::Int4(Storage::role_oid(usize::from(
-                    event_trigger.ownership.owner_to(txid),
-                ))),
+                Datum::Int4(storage.role_oid(usize::from(event_trigger.ownership.owner_to(txid)))),
                 Datum::Int4(crate::storage::routine_oid(&routine)),
                 Datum::Bpchar(match event_trigger.enabled {
                     crate::storage::TriggerEnabled::Origin => "O",
@@ -25831,7 +25832,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         crate::storage::RoutineParallel::Unsafe => "u",
                     },
                 }),
-                Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
+                Datum::Int4(storage.role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(routine.attributes.security_definer),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
                 Datum::Int4(match routine.language {
@@ -26983,8 +26984,7 @@ fn pg_stat_activity<'a>(
         let rows = arena
             .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
             .map_err(|_| arena_full())?;
-        let current_name = crate::sql::eval::funcs::system::current_user_owned();
-        let current_role = storage.find_role_visible(current_name.as_str(), txid);
+        let current_role = storage.current_role_slot(txid);
         let see_all =
             current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
         let mut count = 0usize;
@@ -26996,10 +26996,14 @@ fn pg_stat_activity<'a>(
             let database_name = storage
                 .database_slot_by_oid(activity.database, txid)
                 .map(|slot| storage.database_definition(slot, txid).name);
-            let role_name = storage.role_name(usize::from(activity.role), txid);
+            let role = storage
+                .resolve_session_role(activity.role.source(), txid)
+                .ok();
+            let activity_role = role.map(|role| usize::from(role.slot()));
+            let role_name = role.map(|role| role.name());
             let visible = activity.pid == storage.current_connection_id()
                 || see_all
-                || current_role == Some(usize::from(activity.role));
+                || (current_role.is_some() && current_role == activity_role);
             let query = if visible {
                 activity.query.as_str()
             } else {
@@ -27014,8 +27018,11 @@ fn pg_stat_activity<'a>(
                     },
                     Datum::Int4(activity.pid),
                     Datum::Null,
-                    Datum::Oid(Storage::role_oid(usize::from(activity.role)) as u32),
-                    text(role_name.as_str(), arena)?,
+                    Datum::Oid(activity.role.oid().get() as u32),
+                    match role_name {
+                        Some(name) => text(name.as_str(), arena)?,
+                        None => Datum::Null,
+                    },
                     text(activity.application_name.as_str(), arena)?,
                     activity.client_addr.map_or(Datum::Null, Datum::Inet),
                     Datum::Null,
@@ -28088,7 +28095,7 @@ fn pg_shdepend<'a>(
                     Datum::Oid(oid as u32),
                     Datum::Int4(0),
                     Datum::Oid(1260),
-                    Datum::Oid(Storage::role_oid(storage.object_owner(object, txid)) as u32),
+                    Datum::Oid(storage.role_oid(storage.object_owner(object, txid)) as u32),
                     Datum::Char(b'o'),
                 ],
                 arena,
@@ -29279,7 +29286,7 @@ fn pg_namespace<'a>(
                 Datum::Int4(PG_NAMESPACE_OID),
                 Datum::Int4(namespace_oid(storage, schema.as_str())),
                 text(schema.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(usize::from(owner))),
+                Datum::Int4(storage.role_oid(usize::from(owner))),
                 Datum::Null,
             ],
             arena,
@@ -29533,7 +29540,7 @@ fn pg_group<'a>(
                 let membership = storage.role_membership(membership_slot);
                 if membership.visible_to(txid) && usize::from(membership.role) == slot {
                     members[member_count] =
-                        Datum::Oid(Storage::role_oid(usize::from(membership.member)) as u32);
+                        Datum::Oid(storage.role_oid(usize::from(membership.member)) as u32);
                     member_count += 1;
                 }
             }
@@ -29559,7 +29566,7 @@ fn pg_group<'a>(
         let role = storage.role(slot);
         if role.visible_to(txid) && !role.attributes_to(txid).can_login {
             append(
-                Storage::role_oid(slot),
+                storage.role_oid(slot),
                 role.name_to(txid).as_str(),
                 Some(slot),
             )?;
@@ -29594,7 +29601,7 @@ fn pg_shadow<'a>(
             Datum::Oid(oid) => oid as i32,
             _ => return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid role OID")),
         };
-        let role_slot = (0..storage.role_count()).find(|slot| Storage::role_oid(*slot) == role_oid);
+        let role_slot = storage.role_slot_by_oid(role_oid, txid);
         let config_capacity = role_slot.map_or(0, |role_slot| {
             use crate::storage::RoleSettingScope;
             storage
@@ -29702,7 +29709,7 @@ fn pg_roles<'a>(
         };
         output[count] = row(
             &[
-                Datum::Int4(Storage::role_oid(slot)),
+                Datum::Int4(storage.role_oid(slot)),
                 text(
                     arena
                         .alloc_str(role.name_to(txid).as_str())
@@ -29846,7 +29853,7 @@ fn pg_authid<'a>(
         };
         output[count] = row(
             &[
-                Datum::Int4(Storage::role_oid(slot)),
+                Datum::Int4(storage.role_oid(slot)),
                 text(role.name_to(txid).as_str(), arena)?,
                 Datum::Bool(attributes.superuser),
                 Datum::Bool(attributes.inherit),
@@ -29885,9 +29892,9 @@ fn pg_auth_members<'a>(
         output[count] = row(
             &[
                 Datum::Int4(Storage::role_membership_oid(slot)),
-                Datum::Int4(Storage::role_oid(membership.role as usize)),
-                Datum::Int4(Storage::role_oid(membership.member as usize)),
-                Datum::Int4(Storage::role_oid(membership.grantor_to(txid) as usize)),
+                Datum::Int4(storage.role_oid(membership.role as usize)),
+                Datum::Int4(storage.role_oid(membership.member as usize)),
+                Datum::Int4(storage.role_oid(membership.grantor_to(txid) as usize)),
                 Datum::Bool(options.admin),
                 Datum::Bool(options.inherit),
                 Datum::Bool(options.set),
@@ -29946,9 +29953,9 @@ fn pg_db_role_setting<'a>(
             }
         }
         let (database, role) = match scope {
-            RoleSettingScope::RoleAllDatabases(role) => (0, Storage::role_oid(role as usize)),
+            RoleSettingScope::RoleAllDatabases(role) => (0, storage.role_oid(role as usize)),
             RoleSettingScope::RoleInDatabase { role, database } => {
-                (database.get(), Storage::role_oid(role as usize))
+                (database.get(), storage.role_oid(role as usize))
             }
             RoleSettingScope::AllRolesInDatabase(database) => (database.get(), 0),
         };
@@ -29996,9 +30003,7 @@ fn pg_database<'a>(
             &[
                 Datum::Int4(database.oid.get()),
                 text(database_definition.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(usize::from(
-                    database.ownership.owner_to(txid),
-                ))),
+                Datum::Int4(storage.role_oid(usize::from(database.ownership.owner_to(txid)))),
                 Datum::Int4(database_definition.encoding.code()),
                 text(
                     core::str::from_utf8(&[database_definition.locale_provider.code()])
@@ -30236,10 +30241,10 @@ fn pg_prepared_xacts<'a>(
                 Datum::Oid(entry.transaction_id),
                 text(entry.gid.as_str(), arena)?,
                 Datum::Timestamptz(entry.prepared_at),
-                text(
-                    storage.role_name(usize::from(entry.owner), txid).as_str(),
-                    arena,
-                )?,
+                match storage.role_slot_by_oid(entry.owner.get(), txid) {
+                    Some(role) => text(storage.role_name(role, txid).as_str(), arena)?,
+                    None => Datum::Null,
+                },
                 match database {
                     Some(name) => text(name.as_str(), arena)?,
                     None => Datum::Null,

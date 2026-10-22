@@ -42,6 +42,14 @@ Readers retain selected table, routine and named-type definitions. Type changes
 recheck the selected edit after waits and include newly submitted dependent
 tables before changing their references together. The
 [current behavior guide](docs/implemented-baseline.md) owns the detailed contracts.
+Connections retain their authenticated and selected accounts through renames,
+savepoints and account replacement. Object creation rejects a missing account
+before changing catalogs; connection limits and query permissions distinguish
+the account that originally logged in from a replacement. Durable role
+identifiers keep prepared transaction ownership distinct through recovery.
+Role deletion waits for unfinished ownership and permission changes. Dependency
+checks cover every database, and recovery preserves role catalog positions so
+saved owners cannot become a different account after an aborted creation.
 
 When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running

@@ -22,6 +22,49 @@ local disk caches. A logical subscriber can receive an order update, but it
 may lag behind the publisher. An unsupported XPath expression returns an
 error rather than quietly giving a different answer.
 
+### Connections keep the same user
+
+A connection belongs to the account that logged in, even if an administrator
+renames that account. `current_user`, `session_user`, `RESET ROLE` and
+`RESET SESSION AUTHORIZATION` follow that account. Role changes saved in a
+transaction or savepoint retain the same account through rollback.
+
+For example, connect as `orders_app`, then run these commands as an administrator
+in another connection:
+
+```sql
+ALTER ROLE orders_app RENAME TO orders_writer;
+CREATE ROLE orders_app LOGIN;
+```
+
+The existing connection reports `orders_writer` and creates objects owned by
+that account. The new `orders_app` account has its own permissions and connection
+limit. If the original account is later deleted, its existing connections can
+still run `SELECT 1`, but `current_user` and `session_user` return `42704`.
+Creating objects returns `42501`; recreating either name does not restore the
+deleted account's permissions. A replacement account cannot inspect or cancel
+the old connection's queries.
+
+Role identifiers also survive journal and checkpoint recovery. Renaming the
+owner of a prepared transaction changes the displayed owner name. Deleting
+that owner leaves the transaction available to superusers; a replacement
+account cannot commit or roll it back. Reusing a catalog slot does not reuse
+the deleted account's identifier.
+
+Deleting a role waits for another transaction's unfinished ownership or permission
+changes. Renaming the account can proceed while its table creation is unfinished.
+For example, if `orders_app` has created a table inside
+`BEGIN`, an administrator's `DROP ROLE orders_app` waits for that transaction.
+After commit, the table prevents deletion; after rollback, deletion can proceed
+if nothing else depends on the account. Dependencies include objects in other
+databases, publications, subscriptions, user mappings and grants made by the
+account. Recovery preserves role catalog positions as well as identifiers.
+
+Memory for connection identities is reserved at startup. The identities distinguish catalog slot reuse.
+Creation without a valid acting account fails before allocating identifiers or
+changing catalogs. Recovery supplies an explicit owner instead of substituting
+the bootstrap administrator for an absent user.
+
 ## Runtime ownership
 
 This section explains the recent concurrency preparation. “Ownership” means

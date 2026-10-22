@@ -64,6 +64,24 @@ BEGIN;
 COMMIT PREPARED 'missing-two-phase';
 ROLLBACK;
 
+CREATE ROLE two_phase_original;
+SET ROLE two_phase_original;
+BEGIN;
+SELECT 1;
+PREPARE TRANSACTION 'two-phase-owner-lifetime';
+RESET ROLE;
+ALTER ROLE two_phase_original RENAME TO two_phase_renamed;
+SELECT owner FROM pg_prepared_xacts WHERE gid = 'two-phase-owner-lifetime';
+DROP ROLE two_phase_renamed;
+CREATE ROLE two_phase_original;
+SELECT owner IS NULL FROM pg_prepared_xacts WHERE gid = 'two-phase-owner-lifetime';
+SET ROLE two_phase_original;
+COMMIT PREPARED 'two-phase-owner-lifetime';
+ROLLBACK PREPARED 'two-phase-owner-lifetime';
+RESET ROLE;
+ROLLBACK PREPARED 'two-phase-owner-lifetime';
+DROP ROLE two_phase_original;
+
 DROP TABLE two_phase_trigger_rows, two_phase_trigger_audit;
 DROP FUNCTION two_phase_trigger_write();
 DROP SEQUENCE two_phase_sequence;

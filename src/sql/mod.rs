@@ -21529,7 +21529,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
         } => {
             let index = storage.table_replay_slot(identity, schema, name, 0)?;
-            storage.drop_table(index);
+            storage.commit_drop(index);
             storage.drop_indexes_for(schema, name, 0);
             storage.commit_indexes_for(schema, name, 0);
         }

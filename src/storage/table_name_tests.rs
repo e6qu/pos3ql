@@ -4,6 +4,76 @@ use super::tests::{make_def, test_budget, test_config};
 use super::*;
 use std::time::Duration;
 
+#[test]
+fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
+    for (schema, name) in [
+        ("public", "binding_renamed"),
+        ("binding_schema", "binding_source"),
+        ("binding_schema", "binding_renamed"),
+    ] {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage
+            .create_schema(SqlName::parse("binding_schema").unwrap())
+            .unwrap();
+        let table = storage
+            .create_table(make_def(
+                "binding_source",
+                &[
+                    ("discarded", ColType::Int4, false),
+                    ("key", ColType::Int4, false),
+                    ("payload", ColType::Int4, false),
+                ],
+            ))
+            .unwrap();
+        let mut index = IndexDef {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("binding_index").unwrap(),
+            table: SqlName::parse("binding_source").unwrap(),
+            n_cols: 1,
+            n_include_cols: 1,
+            ..IndexDef::EMPTY
+        };
+        index.columns[0] = 1;
+        index.include_columns[0] = 2;
+        let slot = storage.create_index(index, 7).unwrap();
+        storage.commit_index_create(slot);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut definition = make_def(
+                name,
+                &[
+                    ("key", ColType::Int4, false),
+                    ("payload", ColType::Int4, false),
+                ],
+            );
+            definition.schema = SqlName::parse(schema).unwrap();
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[1] = Some(SqlName::parse("key").unwrap());
+            mapping[2] = Some(SqlName::parse("payload").unwrap());
+            storage
+                .write_table_def(table, 7, definition, &mapping, true)
+                .unwrap();
+            let pending = storage.index_visible_to(slot, 7).unwrap();
+            assert_eq!((pending.columns[0], pending.include_columns[0]), (0, 1));
+            let committed = storage.index_visible_to(slot, 8).unwrap();
+            assert_eq!((committed.columns[0], committed.include_columns[0]), (1, 2));
+            storage.rollback_table_def(table, 7);
+            assert_eq!(storage.index_visible_to(slot, 7).unwrap().columns[0], 1);
+            storage
+                .write_table_def(table, 7, definition, &mapping, true)
+                .unwrap();
+            assert!(storage.commit_table_def(table, 7));
+            let committed = storage.index_visible_to(slot, 8).unwrap();
+            assert_eq!(
+                (committed.schema.as_str(), committed.table.as_str()),
+                (schema, name)
+            );
+            assert_eq!((committed.columns[0], committed.include_columns[0]), (0, 1));
+        });
+    }
+}
+
 fn fixture() -> (Storage, usize, usize) {
     let config = test_config();
     let mut budget = test_budget(&config);

@@ -45884,14 +45884,6 @@ impl Storage {
         }
         let current = *self.tables[index].definition();
         if current.name != def.name {
-            for index_def in self.index_catalog().iter_mut() {
-                if index_def.database == database_oid
-                    && index_def.schema == current.schema
-                    && index_def.table == current.name
-                {
-                    index_def.table = def.name;
-                }
-            }
             for table in self.tables.iter_mut() {
                 if table.database() != database_oid {
                     continue;
@@ -45942,13 +45934,20 @@ impl Storage {
         drop(sequence_catalog);
         for index_def in self.index_catalog().iter_mut() {
             if index_def.database != database_oid
-                || index_def.ddl_state != CatalogDdlState::Present
-                || index_def.schema != old.schema
-                || index_def.table != old.name
+                || index_def.schema != current.schema
+                || index_def.table != current.name
             {
                 continue;
             }
-            for column in &mut index_def.columns[..index_def.n_cols] {
+            if index_def.ddl_state != CatalogDdlState::Present {
+                index_def.schema = def.schema;
+                index_def.table = def.name;
+                continue;
+            }
+            for (key, column) in index_def.columns[..index_def.n_cols].iter_mut().enumerate() {
+                if index_def.expressions[key].is_some() {
+                    continue;
+                }
                 let Some(target_name) = column_mapping
                     .get(*column as usize)
                     .and_then(|target| *target)

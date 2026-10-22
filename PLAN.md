@@ -34,7 +34,8 @@ statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
 Next connect table-shape changes and schema moves to complete transaction
 publication, including indexes, captured column mappings and comments. Check
-reader and backup retention while old files are replaced. Recovery may retain
+reader and backup retention while old files are replaced. Index bindings must
+remain valid through composed table-name and column changes. Recovery may retain
 exclusive startup access; ordinary publication must allow unrelated operations
 to progress under their own owners.
 Some metadata capture and maintenance reads still block the worker. Raising

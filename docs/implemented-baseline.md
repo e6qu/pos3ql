@@ -858,7 +858,15 @@ Tables, sequences, routines and materialized-view catalogs also retain their
 exact saved positions and creation identities. A materialized view retains the
 backing table's lifetime; a database template copy selects its copied table.
 Unknown or occupied saved positions fail recovery rather than selecting a
-replacement. See the [current stored formats](durable-format.md).
+replacement. Replaying a committed table drop releases its rows and dependencies
+before a later creation reuses the saved position. For example, repeatedly
+running `pg_restore --clean` against populated tables must leave the final rows
+readable after restart. See the [current stored formats](durable-format.md).
+
+When a committed index follows a table rename or schema move, its key and
+included columns also follow the transaction's composed column mapping. Dropping
+an earlier column and renaming the table in one transaction must keep the index
+bound to its original key and payload columns.
 
 ### Changing rewrite rules
 

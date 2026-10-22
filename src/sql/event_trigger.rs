@@ -721,9 +721,13 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         Created(slot) => (ObjectRef::Table(slot as usize), Mutation::Create),
         Dropped(slot) => (ObjectRef::Table(slot as usize), Mutation::Drop),
         TableAltered(slot) => (ObjectRef::Table(slot as usize), Mutation::Alter),
-        ViewCreated(slot) => (ObjectRef::View(slot as usize), Mutation::Create),
-        ViewDropped(slot) => (ObjectRef::View(slot as usize), Mutation::Drop),
-        ViewSchemaChanged { slot, .. } => (ObjectRef::View(slot as usize), Mutation::Alter),
+        ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
+            (ObjectRef::View(undo.slot()), Mutation::Create)
+        }
+        ViewDropped(undo) => (ObjectRef::View(undo.slot()), Mutation::Drop),
+        ViewChanged(crate::storage::ViewPublication::Altered(undo)) => {
+            (ObjectRef::View(undo.slot()), Mutation::Alter)
+        }
         RoutineCreated(slot) => (ObjectRef::Routine(slot as usize), Mutation::Create),
         RoutineDropped(slot) => (ObjectRef::Routine(slot as usize), Mutation::Drop),
         RoutineReplaced { slot, .. } | RoutineIdentityAltered { slot, .. } => {
@@ -789,6 +793,9 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
             (ObjectRef::Subscription(slot as usize), Mutation::Alter)
         }
         MatviewCreated(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Create),
+        MatviewPopulationChanged(undo) => {
+            (ObjectRef::MaterializedView(undo.slot()), Mutation::Alter)
+        }
         MatviewDropped(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Drop),
         SequenceCreated(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Create),
         SequenceDropped(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Drop),

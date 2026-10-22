@@ -71,6 +71,11 @@ fn view_replacement_preserves_identity_without_spare_catalog_slots() {
             data_rows(&session.success(&mut engine, identity_sql, true)),
             original
         );
+        session.success(&mut engine, "DROP VIEW retained_view; BEGIN; CREATE VIEW discarded_view AS SELECT 1 AS value; DROP VIEW discarded_view; COMMIT; CREATE VIEW final_view AS SELECT 1 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM final_view", true)),
+            ["1"]
+        );
     }
 }
 
@@ -91,6 +96,12 @@ fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
         assert_eq!(
             data_rows(&session.success(&mut engine, population_sql, true)),
             ["f"]
+        );
+        let unreadable = session.execute(&mut engine, "SELECT count(*) FROM population_view", true);
+        assert!(
+            String::from_utf8_lossy(&unreadable).contains("C55000\0"),
+            "{}",
+            String::from_utf8_lossy(&unreadable)
         );
         for rollback in ["ROLLBACK TO before_refresh", "ROLLBACK"] {
             session.success(
@@ -122,6 +133,37 @@ fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
         );
         assert_eq!(
             data_rows(&session.success(&mut engine, "SELECT value FROM population_view", true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
+fn query_lifecycle_parent_rollback_preserves_earlier_rule_deletion() {
+    for (kind, creation) in [
+        ("TABLE", "CREATE TABLE rule_parent(id integer)"),
+        ("VIEW", "CREATE VIEW rule_parent AS SELECT 1 AS id"),
+    ] {
+        let mut config = test_config(&format!("rule-parent-rollback-{kind}"));
+        config.transaction_mode = crate::config::TransactionMode::Mvcc;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, creation, true);
+        session.success(&mut engine, "CREATE RULE remembered_rule AS ON INSERT TO rule_parent DO INSTEAD NOTHING; BEGIN; DROP RULE remembered_rule ON rule_parent; SAVEPOINT before_parent_drop", true);
+        session.success(
+            &mut engine,
+            &format!("DROP {kind} rule_parent; ROLLBACK TO before_parent_drop"),
+            true,
+        );
+        let rule_count = "SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_rule'";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, rule_count, true)),
+            ["0"]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, rule_count, true)),
             ["1"]
         );
     }
@@ -2863,7 +2905,7 @@ fn regcollation_values_and_dependencies_survive_object_cold_recovery() {
         .views_visible_to(0)
         .find_map(|(slot, view)| (view.name.as_str() == "durable_collation_view").then_some(slot))
         .unwrap();
-    let dependency = engine.storage.view_dependencies(view_slot).entries()[0];
+    let dependency = engine.storage.view_dependencies(view_slot, 0).entries()[0];
     assert_eq!(dependency.schema.as_str(), "durable_collations");
     assert_eq!(dependency.name.as_str(), "byte_order_v2");
     engine.commit_wal().unwrap();
@@ -67574,7 +67616,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67586,7 +67628,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67598,7 +67640,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_search_view)
+            .view_dependencies(cloned_search_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67627,7 +67669,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {

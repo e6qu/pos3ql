@@ -342,7 +342,10 @@ For example, a prepared transaction that created a type keeps its owner from
 being deleted after the server loses its local caches. A prepared view read
 continues to block a conflicting rule change. Committing or rolling back the
 prepared transaction releases its recovered locks. The current journal framing
-is version 5; earlier frames are rejected.
+is version 6; earlier frames are rejected. Replayed view replacement edits the
+existing view and return rule, preserving their object identifiers. A
+materialized-view refresh publishes its population flag with the transaction's
+rows; prepared recovery must retain that pending decision.
 
 ## Reader changes
 

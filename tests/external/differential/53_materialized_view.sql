@@ -78,6 +78,11 @@ DROP SCHEMA mv_life_target;
 -- WITH NO DATA creates it unpopulated; REFRESH fills it.
 CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM base WITH NO DATA;
 SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+SELECT relispopulated FROM pg_class WHERE relname = 'mv2';
+SELECT count(*) FROM mv2;
+SELECT id FROM mv2 LIMIT 0;
+SELECT id FROM mv2 WHERE false;
+COPY mv2 TO STDOUT;
 BEGIN;
 SAVEPOINT before_refresh;
 REFRESH MATERIALIZED VIEW mv2;
@@ -92,6 +97,18 @@ SELECT relispopulated FROM pg_class WHERE relname = 'mv2';
 SELECT count(*) FROM mv2;
 REFRESH MATERIALIZED VIEW mv2;
 SELECT count(*) FROM mv2;
+CREATE ROLE materialized_maintainer;
+GRANT USAGE ON SCHEMA public TO materialized_maintainer;
+SET ROLE materialized_maintainer;
+REFRESH MATERIALIZED VIEW mv2;
+RESET ROLE;
+GRANT MAINTAIN ON mv2 TO materialized_maintainer;
+SET ROLE materialized_maintainer;
+REFRESH MATERIALIZED VIEW mv2;
+SELECT current_user::text;
+RESET ROLE;
+DROP OWNED BY materialized_maintainer;
+DROP ROLE materialized_maintainer;
 
 -- A materialized view over a set-operation body.
 CREATE MATERIALIZED VIEW mv3 AS SELECT id FROM base WHERE id = 1 UNION SELECT id FROM base WHERE id = 4;

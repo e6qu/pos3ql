@@ -1017,7 +1017,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
     use txn::DdlUndo;
     let (class, slot) = match undo {
         DdlUndo::Created(slot) => (AccessClass::Table, slot),
-        DdlUndo::ViewCreated(slot) => (AccessClass::View, slot),
+        DdlUndo::ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
+            (AccessClass::View, undo.slot() as u32)
+        }
         DdlUndo::MatviewCreated(slot) => (AccessClass::MaterializedView, slot),
         DdlUndo::RoutineCreated(slot) => (AccessClass::Routine, slot),
         DdlUndo::SequenceCreated(slot) => (AccessClass::Sequence, slot),
@@ -5415,6 +5417,20 @@ impl Engine {
                 "commit reached durability before queued constraint triggers fired"
             ));
         }
+        let query_validation = txn.ddl().iter().try_for_each(|undo| match undo {
+            DdlUndo::ViewChanged(publication) => self
+                .storage
+                .validate_view_publication(*publication, txn.txid),
+            DdlUndo::ViewDropped(undo) => self.storage.validate_view_drop(*undo, txn.txid),
+            DdlUndo::MatviewPopulationChanged(undo) => {
+                self.storage.validate_matview_population(*undo, txn.txid)
+            }
+            _ => Ok(()),
+        });
+        if let Err(error) = query_validation {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let type_changes = txn.ddl().iter().filter_map(|undo| {
             use crate::storage::TypeCommitChange;
             Some(match undo {
@@ -5928,10 +5944,12 @@ impl Engine {
                     class: crate::storage::AccessClass::Table,
                     slot: slot as u16,
                 }),
-                DdlUndo::ViewCreated(slot) => Some(crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::View,
-                    slot: slot as u16,
-                }),
+                DdlUndo::ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
+                    Some(crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: undo.slot() as u16,
+                    })
+                }
                 DdlUndo::MatviewCreated(slot) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::MaterializedView,
                     slot: slot as u16,
@@ -6704,30 +6722,14 @@ impl Engine {
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
                 }
                 DdlUndo::TableAltered(_) => {}
-                DdlUndo::ViewCreated(slot) => {
-                    self.storage.commit_view_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::View,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
-                }
-                DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
-                DdlUndo::ViewReplaced { old, .. } => self.storage.commit_view_drop(*old as usize),
-                DdlUndo::ViewSchemaChanged { slot, .. } => {
-                    self.storage.commit_view_schema(*slot as usize, txn.txid)
-                }
-                DdlUndo::ViewRenamed { slot, .. } => {
-                    self.storage.commit_view_rename(*slot as usize, txn.txid)
-                }
-                DdlUndo::ViewOptionsChanged { slot, .. } => {
-                    self.storage.commit_view_options(*slot as usize, txn.txid)
-                }
-                DdlUndo::ViewColumnsChanged { slot, .. } => {
-                    self.storage.commit_view_columns(*slot as usize, txn.txid)
-                }
+                DdlUndo::ViewChanged(publication) => self.storage.finish_view_publication(
+                    *publication,
+                    crate::storage::QueryDdlDecision::Commit,
+                ),
+                DdlUndo::ViewDropped(undo) => self.storage.commit_view_drop(*undo),
+                DdlUndo::MatviewPopulationChanged(undo) => self
+                    .storage
+                    .finish_matview_population(*undo, crate::storage::QueryDdlDecision::Commit),
                 DdlUndo::RuleCreated { slot, .. } => {
                     self.storage.commit_rule_create(*slot as usize)
                 }
@@ -18040,14 +18042,20 @@ impl Engine {
                     Ok(schema) => schema,
                     Err(error) => return Ok(Err(error)),
                 };
-                let prior =
-                    match self
-                        .storage
-                        .stage_view_schema(object.slot as usize, target, txn.txid)
-                    {
-                        Ok(prior) => prior,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                let edit_target = match self
+                    .storage
+                    .prepare_view_edit(object.slot as usize, txn.txid)
+                {
+                    Ok(selected) => selected,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let prior = match self
+                    .storage
+                    .stage_view_schema(edit_target, target, txn.txid)
+                {
+                    Ok(prior) => prior,
+                    Err(error) => return Ok(Err(error)),
+                };
                 let lsn = self.storage.bump_lsn();
                 if let Err(error) = self.wal.stage_reserved(
                     txn.txid,
@@ -18058,16 +18066,13 @@ impl Engine {
                         new_schema,
                     },
                 ) {
-                    self.storage
-                        .rollback_view_schema(object.slot as usize, prior);
+                    self.storage.rollback_view_alter(prior);
                     return Ok(Err(error));
                 }
-                if let Err(error) = txn.record_ddl(DdlUndo::ViewSchemaChanged {
-                    slot: object.slot as u32,
-                    prior,
-                }) {
-                    self.storage
-                        .rollback_view_schema(object.slot as usize, prior);
+                if let Err(error) = txn.record_ddl(DdlUndo::ViewChanged(
+                    crate::storage::ViewPublication::Altered(prior),
+                )) {
+                    self.storage.rollback_view_alter(prior);
                     return Ok(Err(error));
                 }
                 continue;
@@ -19658,7 +19663,12 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::TableAltered(slot) => {
             storage.rollback_table_def(slot as usize, txid);
         }
-        DdlUndo::ViewCreated(slot) => storage.rollback_view_create(slot as usize),
+        DdlUndo::ViewChanged(publication) => {
+            storage.finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback)
+        }
+        DdlUndo::MatviewPopulationChanged(undo) => {
+            storage.finish_matview_population(undo, crate::storage::QueryDdlDecision::Rollback)
+        }
         DdlUndo::RuleCreated {
             slot,
             prior_table_rule_txid,
@@ -19745,22 +19755,8 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::RoutineIdentityAltered { slot, prior } => {
             storage.restore_routine_identity(slot as usize, prior)
         }
-        DdlUndo::ViewDropped(slot) => {
-            storage.rollback_view_drop(slot as usize, txid);
-        }
-        DdlUndo::ViewReplaced { old, new } => {
-            storage.retarget_view_dependents(new as usize, old as usize);
-            storage.rollback_view_drop(old as usize, txid);
-        }
-        DdlUndo::ViewSchemaChanged { slot, prior } => {
-            storage.rollback_view_schema(slot as usize, prior)
-        }
-        DdlUndo::ViewRenamed { slot, prior } => storage.rollback_view_rename(slot as usize, prior),
-        DdlUndo::ViewOptionsChanged { slot, prior } => {
-            storage.rollback_view_options(slot as usize, prior)
-        }
-        DdlUndo::ViewColumnsChanged { slot, prior } => {
-            storage.rollback_view_columns(slot as usize, prior)
+        DdlUndo::ViewDropped(undo) => {
+            storage.rollback_view_drop(undo);
         }
         DdlUndo::PublicationCreated(slot) => storage.rollback_publication_create(slot as usize),
         DdlUndo::PublicationDropped(slot) => storage.rollback_publication_drop(slot as usize, txid),
@@ -21304,7 +21300,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let _ = write!(creation_path, "{path}");
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
-            let (new_slot, old_slot) = storage.create_view(
+            let publication = storage.create_view(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 crate::storage::ViewDefinition {
@@ -21348,13 +21344,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 true,
                 0,
             )?;
-            if let Some(old) = old_slot {
-                storage.retarget_view_dependents(old, new_slot);
-            }
-            storage.commit_view_create(new_slot);
-            if let Some(old) = old_slot {
-                storage.commit_view_drop(old);
-            }
+            storage.finish_view_publication(publication, crate::storage::QueryDdlDecision::Commit);
         }
         WalOp::DropView { schema, name } => {
             if let Some(slot) = storage.drop_view(schema, name, 0)? {
@@ -21389,8 +21379,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     },
                 )?),
             };
-            storage.stage_view_options(
-                slot,
+            let undo = storage.stage_view_options(
+                storage.prepare_view_edit(slot, 0)?,
                 crate::storage::ViewOptions {
                     security: if security_invoker {
                         crate::storage::ViewSecurity::Invoker
@@ -21410,7 +21400,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
-            storage.commit_view_options(slot, 0);
+            storage.commit_view_alter(undo);
         }
         WalOp::SetViewColumns {
             schema,
@@ -21433,8 +21423,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         name
                     )
                 })?;
-            storage.stage_view_columns(slot, columns, 0)?;
-            storage.commit_view_columns(slot, 0);
+            let undo =
+                storage.stage_view_columns(storage.prepare_view_edit(slot, 0)?, columns, 0)?;
+            storage.commit_view_alter(undo);
         }
         WalOp::RenameView {
             schema,
@@ -21451,8 +21442,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         name
                     )
                 })?;
-            storage.stage_view_rename(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
-            storage.commit_view_rename(slot, 0);
+            let undo = storage.stage_view_rename(
+                storage.prepare_view_edit(slot, 0)?,
+                crate::storage::SqlName::parse(new_name)?,
+                0,
+            )?;
+            storage.commit_view_alter(undo);
         }
         WalOp::SetRule {
             slot,
@@ -21998,7 +21993,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             populated,
         } => {
             if let Some(slot) = storage.matview_slot(schema, name, 0) {
-                storage.set_matview_populated(slot, populated);
+                storage.restore_matview_population(slot, populated)?;
             }
         }
         WalOp::CreateSequence {
@@ -22808,8 +22803,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         name
                     )
                 })?;
-            storage.stage_view_schema(slot, crate::storage::SqlName::parse(new_schema)?, 0)?;
-            storage.commit_view_schema(slot, 0);
+            let undo = storage.stage_view_schema(
+                storage.prepare_view_edit(slot, 0)?,
+                crate::storage::SqlName::parse(new_schema)?,
+                0,
+            )?;
+            storage.commit_view_alter(undo);
         }
         WalOp::DropTableFk {
             schema,

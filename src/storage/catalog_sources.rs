@@ -32,6 +32,10 @@ pub(super) struct CatalogSources {
 }
 
 impl CatalogSources {
+    pub(super) fn origin(&self) -> CatalogOrigin {
+        self.origin
+    }
+
     pub(super) fn new(origin: CatalogOrigin, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(core::mem::size_of::<Self>(), "catalog source controls")?;
         Ok(Self {

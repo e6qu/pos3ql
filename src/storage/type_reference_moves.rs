@@ -1367,13 +1367,14 @@ mod tests {
         let definition = test_view_definition(dependencies);
         match publication {
             SavedQueryKind::View => {
-                let (slot, _) = storage.create_view(
+                let publication_slot = storage.create_view(
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("typed_submission").unwrap(),
                     definition,
                     false,
                     7,
                 )?;
+                let slot = publication_slot.slot();
                 Ok(
                     storage.committed_dependency_image(StoredQueryDependencyOwner::Rule(
                         storage.view(slot).return_rule,
@@ -1430,7 +1431,7 @@ mod tests {
                 let database = storage.current_database_oid();
                 let dependency = query_dependency(&storage, movement);
                 let identity = dependency.identity;
-                let (unrelated, _) = storage
+                let publication_unrelated = storage
                     .create_view(
                         SqlName::parse("public").unwrap(),
                         SqlName::parse("builtin_submission").unwrap(),
@@ -1439,6 +1440,7 @@ mod tests {
                         9,
                     )
                     .unwrap();
+                let unrelated = publication_unrelated.slot();
                 let (finished, received) = std::sync::mpsc::sync_channel(1);
                 let mut source = storage.type_catalog.lock().unwrap();
                 std::thread::scope(|scope| {
@@ -1459,7 +1461,12 @@ mod tests {
                         && storage.tables[related].definition.test_write().is_ok();
                     let unrelated_writer = scope.spawn(move || {
                         crate::sql::set_execution_database_oid(database);
-                        crate::mem::guard::forbid_alloc(|| storage.commit_view_create(unrelated));
+                        crate::mem::guard::forbid_alloc(|| {
+                            storage.finish_view_publication(
+                                publication_unrelated,
+                                super::super::QueryDdlDecision::Commit,
+                            )
+                        });
                         finished.send(()).unwrap();
                     });
                     let unrelated_progress =

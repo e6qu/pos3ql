@@ -10496,7 +10496,7 @@ impl Checkpointer {
                         .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
                     ManifestViewColumns(view.columns),
-                    ManifestDependencies(storage.view_dependencies(view_slot).view())
+                    ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
                 ),
             )?;
         }
@@ -17999,7 +17999,7 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
                 ))
             })?;
     } else {
-        let (new_slot, old_slot) = storage
+        let publication = storage
             .create_view(sql_name(&schema)?, sql_name(&name)?, definition, true, 0)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
@@ -18007,10 +18007,7 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
                     error.message.as_str()
                 ))
             })?;
-        storage.commit_view_create(new_slot);
-        if let Some(old_slot) = old_slot {
-            storage.commit_view_drop(old_slot);
-        }
+        storage.finish_view_publication(publication, crate::storage::QueryDdlDecision::Commit);
     }
     Ok(())
 }

@@ -30,7 +30,7 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: View replacement and refresh rollback
-        run: cargo test --lib --locked -- view_replacement_ materialized_view_population_ --test-threads=1
+        run: cargo test --lib --locked -- view_ rule_ materialized_ type_ catalog_creation_ query_lifecycle_ --test-threads=1
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
   postgresql:
@@ -78,5 +78,7 @@ jobs:
           RUN_SLT: "0"
           RUN_FUZZ: "0"
         run: |
-          FAST_CORPUS_ONLY=64_view_catalog bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql"
-          FAST_CORPUS_ONLY=53_materialized_view bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql"
+          result=0
+          FAST_CORPUS_ONLY=64_view_catalog bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql" || result=1
+          FAST_CORPUS_ONLY=53_materialized_view bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql" || result=1
+          exit "$result"

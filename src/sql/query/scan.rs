@@ -5226,6 +5226,7 @@ fn scan_source_mode<'a>(
                 false,
             )?;
             storage.record_serializable_read(txid, scope.slots[table]);
+            storage.require_populated_materialized_view(scope.slots[table], txid)?;
         }
     }
     let sample_plans = arena

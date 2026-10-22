@@ -13253,10 +13253,11 @@ pub(crate) fn drop_schema(
                     Ok(d) => d,
                     Err(e) => return sql_fail(e),
                 };
-                if let Some(slot) = dropped
-                    && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
-                {
-                    return sql_fail(e);
+                if let Some(undo) = dropped {
+                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
+                        storage.rollback_view_drop(undo);
+                        return sql_fail(error);
+                    }
                 }
             }
             SchemaObject::Routine(routine) => {
@@ -36367,25 +36368,26 @@ pub fn create_view(
         or_replace,
         txn.txid,
     ) {
-        Ok((new_slot, old_slot)) => {
+        Ok(publication) => {
+            let new_slot = publication.slot();
             if check_option.is_some() {
                 match super::query::resolve_view_for_dml(storage, *name, txn.txid, arena) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        storage.rollback_view_create(new_slot);
-                        if let Some(old_slot) = old_slot {
-                            storage.rollback_view_drop(old_slot, txn.txid);
-                        }
+                        storage.finish_view_publication(
+                            publication,
+                            crate::storage::QueryDdlDecision::Rollback,
+                        );
                         return sql_fail(sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "newly created view is absent during check option validation"
                         ));
                     }
                     Err(error) => {
-                        storage.rollback_view_create(new_slot);
-                        if let Some(old_slot) = old_slot {
-                            storage.rollback_view_drop(old_slot, txn.txid);
-                        }
+                        storage.finish_view_publication(
+                            publication,
+                            crate::storage::QueryDdlDecision::Rollback,
+                        );
                         return sql_fail(error);
                     }
                 }
@@ -36414,50 +36416,34 @@ pub fn create_view(
                             super::ast::ViewCheckOption::Cascaded => 2,
                         }),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            storage.view_dependencies(new_slot).view(),
+                            storage.view_dependencies(new_slot, txn.txid).view(),
                         ),
                     },
                 )
             };
             if let Err(e) = staged {
                 // The journal rejected the record; undo the in-memory apply.
-                storage.rollback_view_create(new_slot);
-                if let Some(o) = old_slot {
-                    storage.rollback_view_drop(o, txn.txid);
-                }
+                storage.finish_view_publication(
+                    publication,
+                    crate::storage::QueryDdlDecision::Rollback,
+                );
                 return sql_fail(e);
             }
-            // Rollback undo: drop the new view; revive any superseded one.
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32)) {
-                return sql_fail(e);
-            }
-            let new_object = crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: new_slot as u16,
-            };
-            if let Some(old_slot) = old_slot {
-                let old_object = crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::View,
-                    slot: old_slot as u16,
-                };
-                let owner = storage.object_owner(old_object, txn.txid);
-                storage.set_object_owner(new_object, owner, txn.txid);
-                if let Err(error) = preserve_object_acl(storage, txn, old_object, new_object) {
-                    return sql_fail(error);
-                }
-            } else if let Err(error) =
-                apply_default_privileges_to_new_object(storage, txn, new_object)
-            {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+                storage.finish_view_publication(
+                    publication,
+                    crate::storage::QueryDdlDecision::Rollback,
+                );
                 return sql_fail(error);
             }
-            if let Some(old) = old_slot {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-                    old: old as u32,
-                    new: new_slot as u32,
-                }) {
-                    return sql_fail(e);
+            if matches!(publication, crate::storage::ViewPublication::Created(_)) {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: new_slot as u16,
+                };
+                if let Err(error) = apply_default_privileges_to_new_object(storage, txn, object) {
+                    return sql_fail(error);
                 }
-                storage.retarget_view_dependents(old, new_slot);
             }
         }
         Err(e) => return sql_fail(e),
@@ -36543,6 +36529,10 @@ pub fn alter_view(
             },
         );
     };
+    let edit_target = match storage.prepare_view_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     if let Err(error) = storage.lock_object(
         txn.txid,
         crate::storage::ObjectLockTarget::View(slot),
@@ -36601,7 +36591,7 @@ pub fn alter_view(
             Ok(target) => target,
             Err(error) => return sql_fail(error),
         };
-        let prior = match storage.stage_view_schema(slot, target, txn.txid) {
+        let prior = match storage.stage_view_schema(edit_target, target, txn.txid) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -36618,14 +36608,13 @@ pub fn alter_view(
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_schema(slot, prior);
+            storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSchemaChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_schema(slot, prior);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+            crate::storage::ViewPublication::Altered(prior),
+        )) {
+            storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
         responder.command_complete("ALTER VIEW")?;
@@ -36744,7 +36733,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36765,14 +36754,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36795,7 +36783,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36816,14 +36804,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36851,7 +36838,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36872,14 +36859,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             if let Err(error) = rewrite_view_column_dependents(
@@ -36915,7 +36901,7 @@ pub fn alter_view(
                 Ok(target) => target,
                 Err(error) => return sql_fail(error),
             };
-            let prior = match storage.stage_view_rename(slot, target, txn.txid) {
+            let prior = match storage.stage_view_rename(edit_target, target, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36936,14 +36922,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_rename(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_rename(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36959,7 +36944,7 @@ pub fn alter_view(
         let view = storage.view(slot);
         view.names_for(txn.txid)
     };
-    let prior = match storage.stage_view_options(slot, options, txn.txid) {
+    let prior = match storage.stage_view_options(edit_target, options, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -36983,14 +36968,13 @@ pub fn alter_view(
         )
     };
     if let Err(error) = staged {
-        storage.rollback_view_options(slot, prior);
+        storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewOptionsChanged {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_view_options(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+        crate::storage::ViewPublication::Altered(prior),
+    )) {
+        storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
     responder.command_complete("ALTER VIEW")?;
@@ -37019,16 +37003,15 @@ fn rewrite_view_column_dependents(
         {
             continue;
         }
-        let references_column =
-            storage
-                .view_dependencies(view_slot)
-                .entries()
-                .iter()
-                .any(|dependency| {
-                    dependency.class == crate::storage::DependencyClass::View
-                        && usize::from(dependency.slot) == source_view
-                        && dependency.referenced_columns.contains(source_column)
-                });
+        let references_column = storage
+            .view_dependencies(view_slot, txn.txid)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::View
+                    && usize::from(dependency.slot) == source_view
+                    && dependency.referenced_columns.contains(source_column)
+            });
         if !references_column {
             continue;
         }
@@ -37061,9 +37044,8 @@ fn rewrite_view_column_dependents(
         }
 
         let dependent_columns = view.columns.with_aliases(true);
-        let (new_slot, old_slot) = storage.create_view(
-            view.schema,
-            view.name,
+        let undo = storage.replace_view_definition(
+            storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
                 columns: dependent_columns,
@@ -37076,9 +37058,10 @@ fn rewrite_view_column_dependents(
                     ..view.options_for(txn.txid)
                 },
             },
-            true,
             txn.txid,
         )?;
+        let publication = crate::storage::ViewPublication::Altered(undo);
+        let new_slot = publication.slot();
         let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
             Ok(())
         } else {
@@ -37101,41 +37084,21 @@ fn rewrite_view_column_dependents(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot).view(),
+                        storage.view_dependencies(new_slot, txn.txid).view(),
                     ),
                 },
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_create(new_slot);
-            if let Some(old_slot) = old_slot {
-                storage.rollback_view_drop(old_slot, txn.txid);
-            }
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
             return Err(error);
         }
-        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
-        let old_slot = old_slot.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "dependent view replacement lost its prior definition"
-            )
-        })?;
-        let old_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: old_slot as u16,
-        };
-        let new_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: new_slot as u16,
-        };
-        let owner = storage.object_owner(old_object, txn.txid);
-        storage.set_object_owner(new_object, owner, txn.txid);
-        preserve_object_acl(storage, txn, old_object, new_object)?;
-        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-            old: old_slot as u32,
-            new: new_slot as u32,
-        })?;
-        storage.retarget_view_dependents(old_slot, new_slot);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -39440,6 +39403,26 @@ pub fn refresh_materialized_view(
             name.name
         ));
     };
+    let population_target = match storage.prepare_matview_population(slot, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = require_table_privilege(
+        storage,
+        table_index,
+        crate::storage::PrivilegeSet::MAINTAIN,
+        txn.txid,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     // Copy the stored query out before mutating storage.
     let matview = storage.matview(slot);
     let sql = match arena.alloc_str(matview.sql.as_str()) {
@@ -39451,8 +39434,14 @@ pub fn refresh_materialized_view(
             ));
         }
     };
-    let user = super::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(matview.creation_path.as_str(), user.as_str(), txn.txid);
+    let owner = match storage
+        .capture_role_slot(usize::from(matview.ownership.owner_to(txn.txid)), txn.txid)
+    {
+        Ok(owner) => crate::storage::SessionIdentity::bound(owner),
+        Err(error) => return sql_fail(error),
+    };
+    let _owner = super::eval::funcs::system::enter_current_user(owner);
+    let path = storage.compute_path(matview.creation_path.as_str(), owner.as_str(), txn.txid);
     let select = match crate::sql::parser::parse_query(sql, arena) {
         Ok(select) => select,
         Err(error) => return sql_fail(error),
@@ -39578,8 +39567,14 @@ pub fn refresh_materialized_view(
             return sql_fail(e);
         }
     }
-    // Mark it populated (durably).
-    storage.set_matview_populated(slot, true);
+    let population = match storage.stage_matview_population(population_target, true, txn.txid) {
+        Ok(undo) => undo,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::MatviewPopulationChanged(population)) {
+        storage.finish_matview_population(population, crate::storage::QueryDdlDecision::Rollback);
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.stage_reserved(
         txn.txid,
@@ -43525,7 +43520,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .snapshot_view_dependencies(slot, arena)?
+                .snapshot_view_dependencies(slot, txid, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -44301,7 +44296,10 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0usize;
-            for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries() {
+            for dependency in storage
+                .snapshot_view_dependencies(slot, txid, arena)?
+                .entries()
+            {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View => view_depth[dependency.slot as usize]
@@ -44606,7 +44604,9 @@ fn report_stored_query_dependents(
                             let _ = write!(parent, "{}", root.suffix.as_str());
                         }
                     } else {
-                        for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries()
+                        for dependency in storage
+                            .snapshot_view_dependencies(slot, txid, arena)?
+                            .entries()
                         {
                             if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
@@ -44899,8 +44899,11 @@ fn drop_view_slot(
             },
         )?;
     }
-    if let Some(slot) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
-        txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))?;
+    if let Some(undo) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
+            storage.rollback_view_drop(undo);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -46463,9 +46466,8 @@ fn rewrite_composite_dependent_views(
             path,
             arena,
         )?;
-        let (new_slot, old_slot) = storage.create_view(
-            view.schema,
-            view.name,
+        let undo = storage.replace_view_definition(
+            storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
                 columns: view.columns,
@@ -46478,9 +46480,10 @@ fn rewrite_composite_dependent_views(
                     ..view.options_for(txn.txid)
                 },
             },
-            true,
             txn.txid,
         )?;
+        let publication = crate::storage::ViewPublication::Altered(undo);
+        let new_slot = publication.slot();
         let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
             Ok(())
         } else {
@@ -46503,41 +46506,21 @@ fn rewrite_composite_dependent_views(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot).view(),
+                        storage.view_dependencies(new_slot, txn.txid).view(),
                     ),
                 },
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_create(new_slot);
-            if let Some(old_slot) = old_slot {
-                storage.rollback_view_drop(old_slot, txn.txid);
-            }
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
             return Err(error);
         }
-        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
-        let new_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: new_slot as u16,
-        };
-        let old_slot = old_slot.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "stored view replacement lost its prior definition"
-            )
-        })?;
-        let old_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: old_slot as u16,
-        };
-        let owner = storage.object_owner(old_object, txn.txid);
-        storage.set_object_owner(new_object, owner, txn.txid);
-        preserve_object_acl(storage, txn, old_object, new_object)?;
-        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-            old: old_slot as u32,
-            new: new_slot as u32,
-        })?;
-        storage.retarget_view_dependents(old_slot, new_slot);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -47141,10 +47124,11 @@ pub fn drop_view(
                 Ok(d) => d,
                 Err(e) => return sql_fail(e),
             };
-            if let Some(slot) = dropped
-                && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
-            {
-                return sql_fail(e);
+            if let Some(undo) = dropped {
+                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
+                    storage.rollback_view_drop(undo);
+                    return sql_fail(error);
+                }
             }
         } else if if_exists {
             responder.notice(
@@ -52142,15 +52126,7 @@ pub fn copy_begin(
                 ));
             }
         }
-        if let Some(slot) = storage.matview_slot_for_table(table_index, txid)
-            && !storage.matview(slot).populated
-        {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot copy from unpopulated materialized view \"{}\"",
-                def.name.as_str()
-            ));
-        }
+        storage.require_populated_materialized_view(table_index, txid)?;
     }
     // Direction-only options are refused as PostgreSQL does.
     let opts = &statement.options;

@@ -130,6 +130,23 @@ SELECT relation.oid = saved.relation_oid, relation.reltype = saved.type_oid,
   JOIN pg_type row_type ON row_type.oid = relation.reltype
   JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
  WHERE rewrite.rulename = '_RETURN';
+COMMENT ON VIEW view_replacement_identity IS 'original view comment';
+BEGIN;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 4 AS value;
+SELECT obj_description('view_replacement_identity'::regclass) IS NULL;
+COMMENT ON VIEW view_replacement_identity IS 'new view comment';
+COMMIT;
+SELECT obj_description('view_replacement_identity'::regclass);
+CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+BEGIN;
+DROP RULE remembered_view_rule ON view_replacement_identity;
+SAVEPOINT before_view_drop;
+DROP VIEW view_replacement_identity;
+ROLLBACK TO before_view_drop;
+SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_view_rule';
+ROLLBACK;
+SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_view_rule';
 DROP VIEW view_replacement_identity;
 DROP TABLE view_replacement_identifiers;
 

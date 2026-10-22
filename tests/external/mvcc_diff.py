@@ -999,6 +999,9 @@ def rule_publication_transcript(reader, writer) -> list[str]:
         ]:
             results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
         reader.execute("ROLLBACK")
+        results.append("view_after_reader_disable-rule=" + str(sqlstate(
+            writer, "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"
+        )))
         writer.execute("BEGIN")
         writer.execute("ALTER VIEW rule_publication_view_diff RENAME TO rule_publication_renamed_diff")
         renamed_rules = writer.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename IN ('rule_publication_view_diff','rule_publication_renamed_diff') ORDER BY tablename,rulename").fetchall()

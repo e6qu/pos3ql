@@ -7910,6 +7910,43 @@ fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
 }
 
 #[test]
+fn rewrite_rule_view_type_rejection_waits_for_reader_lock() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("view-rule-rejection-lock-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        reader.success(&mut engine, "CREATE VIEW locked_rule_view AS SELECT 1 AS value; BEGIN; SELECT value FROM locked_rule_view", true);
+        writer.success(&mut engine, "SET lock_timeout = '1ms'", true);
+        let command = "ALTER TABLE locked_rule_view DISABLE RULE \"_RETURN\"";
+        let blocked = writer.execute(&mut engine, command, true);
+        assert!(
+            String::from_utf8_lossy(&blocked).contains("C55P03\0"),
+            "{}",
+            String::from_utf8_lossy(&blocked)
+        );
+        reader.success(&mut engine, "ROLLBACK", true);
+        let rejected = writer.execute(&mut engine, command, true);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("C42809\0"),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, "SELECT ev_enabled FROM pg_rewrite WHERE ev_class = 'locked_rule_view'::regclass AND rulename = '_RETURN'", true)),
+            ["O"]
+        );
+    }
+}
+
+#[test]
 fn rewrite_rule_actions_are_set_oriented_ordered_and_qualified() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

@@ -65319,9 +65319,17 @@ fn alter_table_relation(
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
-            Some(crate::storage::ResolvedRelation::View(_))
+            Some(crate::storage::ResolvedRelation::View(view))
                 if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]) =>
             {
+                if let Err(error) = storage.lock_object(
+                    txn.txid,
+                    crate::storage::ObjectLockTarget::View(view),
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
                 return sql_fail(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a table",

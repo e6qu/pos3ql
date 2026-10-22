@@ -35147,17 +35147,51 @@ impl Storage {
         }
     }
 
+    fn retire_table_names(
+        &self,
+        index: usize,
+        selected: table_definitions::TableIdentity,
+    ) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            let lifecycle = self.tables[index].lifecycle();
+            let mut state = self.tables[index].definition.write();
+            if state.identity.database != selected.database
+                || state.identity.created_at != selected.created_at
+                || state.identity.existence == CatalogDdlState::Absent
+            {
+                return None;
+            }
+            let types =
+                match row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned") {
+                    Ok(types) => types,
+                    Err(wait) => {
+                        drop(state);
+                        drop(lifecycle);
+                        #[cfg(test)]
+                        self.type_publication
+                            .waits
+                            .fetch_add(1, core::sync::atomic::Ordering::Release);
+                        wait.wait();
+                        continue;
+                    }
+                };
+            state.identity.existence = CatalogDdlState::Absent;
+            let (schema, name) = (state.committed.schema, state.committed.name);
+            drop(state);
+            self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+            self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+            self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
+            drop(types);
+            return Some(lifecycle);
+        }
+    }
+
     /// Committed drop (journal replay): rows are retained until checkpoint.
     pub fn drop_table(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let (schema, name) = {
-            let mut state = self.tables[index].definition.write();
-            state.identity.existence = CatalogDdlState::Absent;
-            (state.committed.schema, state.committed.name)
+        let selected = self.tables[index].definition.read().identity;
+        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+            return;
         };
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
@@ -35193,19 +35227,16 @@ impl Storage {
 
     /// Removes the committed table before retiring its rows and dependents.
     pub fn commit_drop(&self, index: usize) {
-        let _lifecycle = self.tables[index].lifecycle();
-        let (schema, name) = {
-            let mut state = self.tables[index].definition.write();
-            assert!(matches!(
-                state.identity.existence,
-                CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
-            ));
-            state.identity.existence = CatalogDdlState::Absent;
-            (state.committed.schema, state.committed.name)
+        let selected = self.tables[index].definition.read().identity;
+        assert!(matches!(
+            selected.existence,
+            CatalogDdlState::Absent
+                | CatalogDdlState::Present
+                | CatalogDdlState::PendingDrop { .. }
+        ));
+        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+            return;
         };
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.reset_relation_statistics(index);
         self.reset_implicit_index_statistics(index);

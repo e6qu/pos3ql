@@ -304,6 +304,16 @@ check still validates rows declared with its child domain. Moving a domain to
 another schema before deleting the old schema preserves outside table columns
 that use the moved domain.
 
+Domain, enum and composite creation use shared storage ownership. Their names
+share a namespace with table, view and materialized-view row types. For example,
+after `CREATE TABLE orders (id integer)`, `CREATE DOMAIN orders AS integer`
+returns `42710`; renaming or moving a type cannot create that collision either.
+The checks and definition installation share catalog ownership, including when
+two creators race. A wait releases partially acquired catalogs. Table name
+checks use the small name views, so an unrelated definition reader need not
+finish first. Removing a table clears its type comments before allowing a new
+type to take the name.
+
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
 and `max_composites`). Statement selection maps and ownership controls are also

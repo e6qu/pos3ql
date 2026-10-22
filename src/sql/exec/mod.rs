@@ -45484,22 +45484,6 @@ fn alter_composite_type(
                 responder.command_complete("ALTER TYPE")?;
                 return sql_ok();
             }
-            if storage
-                .enum_slot(altered.schema.as_str(), new_name, txn.txid)
-                .is_some()
-                || storage
-                    .domain_slot(altered.schema.as_str(), new_name, txn.txid)
-                    .is_some()
-                || storage
-                    .composite_slot(altered.schema.as_str(), new_name, txn.txid)
-                    .is_some_and(|other| other != slot)
-            {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
-                    new_name
-                ));
-            }
             altered.name = match SqlName::parse(new_name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),

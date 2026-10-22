@@ -30,7 +30,7 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{test_budget, test_config};
+    use super::super::tests::{make_def, test_budget, test_config, test_view_definition};
     use super::super::{
         CheckConstraint, ColType, CompositeFieldDef, CompositeSpec, DomainSpec, EnumMember,
         EnumSpec, MAX_COMPOSITE_FIELDS, MAX_DOMAIN_CHECKS, NamedTypeKind, ObjectLockTarget,
@@ -47,6 +47,128 @@ mod tests {
         NamedTypeKind::Enum,
         NamedTypeKind::Composite,
     ];
+
+    #[test]
+    fn shared_type_creation_excludes_racing_table_and_view_names() {
+        for kind in KINDS {
+            for view in [false, true] {
+                let storage = fixture(TransactionMode::Mvcc);
+                let start = std::sync::Barrier::new(2);
+                let (named, row) = std::thread::scope(|scope| {
+                    let named = scope.spawn(|| {
+                        start.wait();
+                        crate::mem::guard::forbid_alloc(|| {
+                            create(&storage, kind, "racing_row_name", 7)
+                        })
+                    });
+                    let row = scope.spawn(|| {
+                        start.wait();
+                        crate::mem::guard::forbid_alloc(|| {
+                            if view {
+                                storage
+                                    .create_view(
+                                        SqlName::parse("public").unwrap(),
+                                        SqlName::parse("racing_row_name").unwrap(),
+                                        test_view_definition(
+                                            super::super::StoredQueryDependencies::EMPTY,
+                                        ),
+                                        false,
+                                        9,
+                                    )
+                                    .map(|(slot, replaced)| {
+                                        assert!(replaced.is_none());
+                                        slot
+                                    })
+                            } else {
+                                storage.create_table_in(
+                                    make_def("racing_row_name", &[("id", ColType::Int4, false)]),
+                                    9,
+                                )
+                            }
+                        })
+                    });
+                    (named.join().unwrap(), row.join().unwrap())
+                });
+                match (named, row) {
+                    (Ok(created), Err(error)) => {
+                        assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+                        storage.finish_type_ddl(created, TypeDdlDecision::Rollback);
+                    }
+                    (Err(error), Ok(slot)) => {
+                        assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+                        if view {
+                            storage.rollback_view_create(slot);
+                        } else {
+                            storage.rollback_create(slot);
+                        }
+                    }
+                    outcomes => panic!(
+                        "unexpected namespace outcomes for {kind:?}, view={view}: {outcomes:?}"
+                    ),
+                }
+                let retry = create(&storage, kind, "racing_row_name", 11).unwrap();
+                storage.finish_type_ddl(retry, TypeDdlDecision::Rollback);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_type_creation_uses_names_without_waiting_for_unrelated_definitions() {
+        for kind in KINDS {
+            let mut storage = fixture(TransactionMode::Mvcc);
+            let table = storage
+                .create_table(make_def("unrelated_name", &[("id", ColType::Int4, false)]))
+                .unwrap();
+            let Ok(held) = storage.tables[table].definition.test_write() else {
+                panic!("fixture definition owner");
+            };
+            let (finished, received) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let created = crate::mem::guard::forbid_alloc(|| {
+                        create(&storage, kind, "independent_name", 7)
+                    });
+                    finished.send(()).unwrap();
+                    created
+                });
+                let progress = received.recv_timeout(Duration::from_secs(5));
+                drop(held);
+                let created = writer.join().unwrap().unwrap();
+                assert!(progress.is_ok());
+                storage.finish_type_ddl(created, TypeDdlDecision::Rollback);
+            });
+        }
+    }
+
+    #[test]
+    fn shared_type_creation_waits_for_retired_relation_comment_cleanup() {
+        for kind in KINDS {
+            let mut storage = fixture(TransactionMode::Mvcc);
+            let table = storage
+                .create_table(make_def("cleanup_name", &[("id", ColType::Int4, false)]))
+                .unwrap();
+            let comments = storage.comments.lock().unwrap();
+            let before = storage.type_publication.waits.load(Ordering::Acquire);
+            std::thread::scope(|scope| {
+                let dropper =
+                    scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_drop(table)));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while storage.tables[table].live() && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let removed = !storage.tables[table].live();
+                let writer = scope.spawn(|| {
+                    crate::mem::guard::forbid_alloc(|| create(&storage, kind, "cleanup_name", 7))
+                });
+                let waited = saw_wait(&storage, before);
+                drop(comments);
+                dropper.join().unwrap();
+                let created = writer.join().unwrap().unwrap();
+                assert!(removed && waited);
+                storage.finish_type_ddl(created, TypeDdlDecision::Rollback);
+            });
+        }
+    }
 
     fn fixture(mode: TransactionMode) -> Storage {
         let mut config = test_config();

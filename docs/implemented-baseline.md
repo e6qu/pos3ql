@@ -313,6 +313,8 @@ two creators race. A wait releases partially acquired catalogs. Table name
 checks use the small name views, so an unrelated definition reader need not
 finish first. Removing a table clears its type comments before allowing a new
 type to take the name.
+Renaming to the existing name returns PostgreSQL's duplicate error; moving to
+the current schema succeeds without changing the object.
 
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`

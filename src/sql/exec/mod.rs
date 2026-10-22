@@ -36904,10 +36904,6 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            if new_name == current_name.as_str() {
-                responder.command_complete("ALTER VIEW")?;
-                return sql_ok();
-            }
             if storage.relation_name_taken(schema.as_str(), new_name, txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_TABLE,
@@ -41723,6 +41719,10 @@ pub fn alter_domain(
             _ => unreachable!(),
         };
         if current.schema == schema && current.name == domain_name {
+            if matches!(action, A::SetSchema(_)) {
+                responder.command_complete("ALTER DOMAIN")?;
+                return sql_ok();
+            }
             return sql_fail(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "type \"{}\" already exists",
@@ -45168,8 +45168,11 @@ pub fn alter_type(
             let current_schema = current.schema;
             let current_name = current.name;
             if current.name.as_str() == *new_name {
-                responder.command_complete("ALTER TYPE")?;
-                return sql_ok();
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "type \"{}\" already exists",
+                    new_name
+                ));
             }
             if storage
                 .enum_slot(current.schema.as_str(), new_name, txn.txid)
@@ -45250,11 +45253,8 @@ pub fn alter_type(
                 Err(error) => return sql_fail(error),
             };
             if current.schema == schema {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
-                    current.name.as_str()
-                ));
+                responder.command_complete("ALTER TYPE")?;
+                return sql_ok();
             }
             if storage
                 .domain_slot(schema.as_str(), current.name.as_str(), txn.txid)
@@ -45455,11 +45455,8 @@ fn alter_composite_type(
                 Err(error) => return sql_fail(error),
             };
             if altered.schema == schema {
-                return sql_fail(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "type \"{}\" already exists",
-                    altered.name.as_str()
-                ));
+                responder.command_complete("ALTER TYPE")?;
+                return sql_ok();
             }
             if storage
                 .domain_slot(schema.as_str(), altered.name.as_str(), txn.txid)
@@ -45481,8 +45478,11 @@ fn alter_composite_type(
         }
         A::RenameTo(new_name) => {
             if altered.name.as_str() == *new_name {
-                responder.command_complete("ALTER TYPE")?;
-                return sql_ok();
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    new_name
+                ));
             }
             altered.name = match SqlName::parse(new_name) {
                 Ok(name) => name,

@@ -35,7 +35,7 @@ wait, and keep old row, index and backup data until their readers have finished.
 The current combined batch covers sequence edits and restarts, routine body
 and name publication, materialized-view creation and deletion, and table-drop
 cleanup. Finish exact catalog and backing-table identities through journal,
-checkpoint and prepared-transaction recovery. Verify stale undo, comment and
+checkpoint, database-template and prepared-transaction recovery. Verify stale undo, comment and
 permission cleanup, savepoints and exhaustion together before opening its PR.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The

@@ -1346,6 +1346,7 @@ pub(crate) enum WalOp<'a> {
     CreateDatabase {
         oid: i32,
         template_oid: i32,
+        positions: crate::storage::WalDatabaseClonePositions<'a>,
         definition: crate::storage::DatabaseDefinition,
         owner: u16,
     },
@@ -3349,7 +3350,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropTablespace { name } => 1 + name.len(),
         WalOp::CreateAccessMethod { name, .. } => 8 + 1 + name.len() + 1,
         WalOp::DropAccessMethod { name } => 1 + name.len(),
-        WalOp::CreateDatabase { definition, .. } => 10 + database_definition_len(*definition),
+        WalOp::CreateDatabase {
+            definition,
+            positions,
+            ..
+        } => 10 + database_definition_len(*definition) + positions.encoded_len(),
         WalOp::AlterDatabase { definition, .. } => 6 + database_definition_len(*definition),
         WalOp::DropDatabase { .. } => 4,
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
@@ -3357,8 +3362,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             name,
             new_name,
-            ..
-        } => 10 + 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
         WalOp::RenameSchema { name, new_name } => 1 + name.len() + 1 + new_name.len(),
@@ -5389,6 +5393,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::CreateDatabase {
             oid,
             template_oid,
+            positions,
             definition,
             owner,
         } => {
@@ -5396,6 +5401,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&template_oid.to_le_bytes())
                 && append_database_definition(buffer, *definition)
                 && buffer.append(&owner.to_le_bytes())
+                && positions.append(buffer)
         }
         WalOp::AlterDatabase {
             oid,
@@ -9461,9 +9467,12 @@ fn decode_op_inner<'a>(
             let definition = decode_database_definition(payload, &mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let positions = crate::storage::DatabaseClonePositions::decode(payload.get(at..)?)?;
+            at = payload.len();
             (at == payload.len()).then_some(WalOp::CreateDatabase {
                 oid,
                 template_oid,
+                positions: crate::storage::WalDatabaseClonePositions::Encoded(positions),
                 definition,
                 owner,
             })

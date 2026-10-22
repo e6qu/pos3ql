@@ -18,7 +18,7 @@ object or its comments. Materialized-view changes retain the backing relation's
 lifetime as well. A failed undo-log attachment must release the staged
 change; identity restarts use the same ownership checks as sequence edits.
 Recovery must preserve saved catalog positions and creation identities, including
-gaps left by rolled-back creations. Prepared sequence restarts retain their
+gaps left by rolled-back creations and the positions of copied template objects. Prepared sequence restarts retain their
 private values; rollback must preserve the committed counter.
 Materialized-view readability follows transaction and savepoint rollback.
 A pending login commit must yield without repeating triggers. Synchronous

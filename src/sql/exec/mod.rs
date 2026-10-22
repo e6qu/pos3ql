@@ -50289,6 +50289,7 @@ pub fn create_database(
     let slot = match storage.create_database(
         requested_oid,
         template_oid,
+        crate::storage::DatabaseCloneAllocation::New,
         definition,
         owner as u16,
         txn.txid,
@@ -50304,6 +50305,10 @@ pub fn create_database(
         &WalOp::CreateDatabase {
             oid: oid.get(),
             template_oid: template_oid.get(),
+            positions: crate::storage::WalDatabaseClonePositions::Captured {
+                storage,
+                database: oid,
+            },
             definition,
             owner: owner as u16,
         },

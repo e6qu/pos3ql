@@ -22828,6 +22828,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::CreateDatabase {
             oid,
             template_oid,
+            positions,
             definition,
             owner,
         } => {
@@ -22846,7 +22847,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     "journal template database does not exist"
                 ));
             }
-            let slot = storage.create_database(Some(oid), template_oid, definition, owner, 0)?;
+            let crate::storage::WalDatabaseClonePositions::Encoded(positions) = positions else {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal database clone positions were not decoded"
+                ));
+            };
+            let slot = storage.create_database(
+                Some(oid),
+                template_oid,
+                crate::storage::DatabaseCloneAllocation::Restore(positions),
+                definition,
+                owner,
+                0,
+            )?;
             storage.commit_database_create(slot);
         }
         WalOp::AlterDatabase {

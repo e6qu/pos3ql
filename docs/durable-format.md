@@ -376,6 +376,16 @@ For example, restarting at 50 and calling `nextval` in a prepared transaction mu
 not replace the committed value 10 if that transaction is later rolled back.
 Ordinary `nextval` advances remain nontransactional.
 
+Database creation journal records also retain a copy inventory: a four-byte
+count followed by eleven bytes per copied table, named type, sequence, view,
+rewrite rule, materialized view or routine. Each entry has a one-byte kind and
+the ten-byte catalog position. Entries are ordered by kind and slot; unknown
+kinds, duplicate slots, missing source lifetimes, unavailable positions and
+unused entries are errors. The source lifetime selects each copied object,
+so unrelated rolled-back creations cannot change its recovered slot. Encoding
+uses the existing fixed journal buffers and adds no startup allocation.
+`max_rules`, like other catalog slot capacities, cannot exceed 65,535.
+
 The added binary positions are included in the common journal size calculation;
 restart presence costs one byte, plus eight when present. Manifest records grow
 by at most 22 bytes per table, 27 per sequence, 7 per routine and 54 per

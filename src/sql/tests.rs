@@ -8,6 +8,83 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollback() {
+    fn positions(engine: &Engine) -> Vec<u8> {
+        let mut budget = Budget::new(4096);
+        let mut bytes = crate::mem::FixedBuf::new(&mut budget, "clone positions", 4096).unwrap();
+        let image = crate::storage::WalDatabaseClonePositions::Captured {
+            storage: &engine.storage,
+            database: engine.storage.current_database_oid(),
+        };
+        crate::mem::guard::forbid_alloc(|| assert!(image.append(&mut bytes)));
+        bytes.readable().to_vec()
+    }
+    const DEFINITION: &str = "CREATE DOMAIN code AS integer; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("metadata-copy-recovery-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            engine
+                .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                .unwrap();
+            let mut retained =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            retained.success(&mut engine, DEFINITION, false);
+            engine
+                .select_database(crate::storage::DatabaseOid::POSTGRES)
+                .unwrap();
+            let mut discarded =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+            discarded.success(&mut engine, &format!("BEGIN; {DEFINITION}"), false);
+            retained.success(
+                &mut engine,
+                "CREATE DATABASE copied_orders TEMPLATE template1",
+                false,
+            );
+            discarded.success(&mut engine, "ROLLBACK", false);
+            let copied = engine
+                .storage
+                .database_slot("copied_orders", 0)
+                .map(|slot| engine.storage.database(slot).oid)
+                .unwrap();
+            engine.select_database(copied).unwrap();
+            let original = positions(&engine);
+            retained.success(&mut engine, "ALTER SEQUENCE order_counter RENAME TO copied_counter; CREATE OR REPLACE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; REFRESH MATERIALIZED VIEW saved_report", false);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(discarded);
+            drop(retained);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            cold.select_database(copied).unwrap();
+            assert_eq!(
+                positions(&cold),
+                original,
+                "checkpoint={checkpoint}, mode={mode:?}"
+            );
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT nextval('copied_counter'); SELECT order_body(); SELECT id FROM saved_report; SELECT id FROM order_report; SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'p'", false)), ["10", "2", "7", "7", "primary key"]);
+        }
+    }
+}
+
+#[test]
 fn metadata_materialized_template_keeps_its_copied_backing_table() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

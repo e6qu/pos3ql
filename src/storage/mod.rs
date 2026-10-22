@@ -6,6 +6,10 @@
 //! are fixed at startup.
 
 mod catalog_sources;
+mod database_clone_positions;
+pub(crate) use database_clone_positions::{
+    DatabaseCloneAllocation, DatabaseCloneKind, DatabaseClonePositions, WalDatabaseClonePositions,
+};
 mod matview_lifecycles;
 mod query_lifecycles;
 mod routine_lifecycles;
@@ -20287,13 +20291,14 @@ impl Storage {
         &mut self,
         requested_oid: Option<DatabaseOid>,
         template: DatabaseOid,
+        allocation: DatabaseCloneAllocation<'_>,
         definition: DatabaseDefinition,
         owner: u16,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let slot = self.reserve_database(requested_oid, definition, owner, txid)?;
         let oid = self.database(slot).oid;
-        if let Err(error) = self.clone_database_catalog(template, oid, txid) {
+        if let Err(error) = self.clone_database_catalog(template, oid, allocation, txid) {
             self.clear_database_catalog(oid);
             self.retire_database(slot, true);
             return Err(error);
@@ -20437,6 +20442,7 @@ impl Storage {
         &mut self,
         source: DatabaseOid,
         target: DatabaseOid,
+        allocation: DatabaseCloneAllocation<'_>,
         txid: u32,
     ) -> Result<(), SqlError> {
         let prior_database = current_database();
@@ -20544,19 +20550,21 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .domains
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Domain(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "domain catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Domain,
+                    definition.created_at,
+                    type_catalog
+                        .domains
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent
+                                && !self
+                                    .type_definition_images
+                                    .retains(NamedTypeSlot::Domain(slot)))
+                            .then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20572,19 +20580,21 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .enums
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Enum(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "enum catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Enum,
+                    definition.created_at,
+                    type_catalog
+                        .enums
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent
+                                && !self
+                                    .type_definition_images
+                                    .retains(NamedTypeSlot::Enum(slot)))
+                            .then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20606,22 +20616,20 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = type_catalog
-                    .composites
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, candidate)| {
-                        candidate.ddl_state == CatalogDdlState::Absent
-                            && !self
-                                .type_definition_images
-                                .retains(NamedTypeSlot::Composite(slot))
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "composite catalog is full"
-                        )
-                    })?;
+                let target_slot =
+                    allocation.select(
+                        DatabaseCloneKind::Composite,
+                        definition.created_at,
+                        type_catalog.composites.iter().enumerate().filter_map(
+                            |(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent
+                                    && !self
+                                        .type_definition_images
+                                        .retains(NamedTypeSlot::Composite(slot)))
+                                .then_some(slot)
+                            },
+                        ),
+                    )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20695,7 +20703,7 @@ impl Storage {
                 let target_slot = table_creation::allocate(
                     self,
                     definition,
-                    CatalogAllocation::New,
+                    allocation.table(created_at)?,
                     TableCreation::Pending(txid),
                 )?;
                 {
@@ -20758,13 +20766,15 @@ impl Storage {
                     continue;
                 }
                 let mut definition = source_definition;
-                let target_slot = sequence_catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "sequence catalog is full")
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Sequence,
+                    definition.created_at,
+                    sequence_catalog.definitions.iter().enumerate().filter_map(
+                        |(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        },
+                    ),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -20785,13 +20795,17 @@ impl Storage {
                         continue;
                     }
                     let mut definition = source_definition;
-                    let target_slot = catalog
-                        .views
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::View,
+                        definition.created_at,
+                        catalog
+                            .views
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            }),
+                    )?;
                     definition.database = target;
                     definition.ownership = definition.ownership.committed();
                     definition.pending_definition = None;
@@ -20853,16 +20867,17 @@ impl Storage {
                             ));
                         }
                     };
-                    let target_slot = catalog
-                        .rules
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "rewrite-rule catalog is full"
-                            )
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::Rule,
+                        rule.created_at,
+                        catalog
+                            .rules
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            }),
+                    )?;
                     rule.database = target;
                     rule.pending = None;
                     rule.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -20912,16 +20927,16 @@ impl Storage {
                     })?;
                 definition.backing_table = backing as u16;
                 definition.backing_created_at = self.table(backing).created_at();
-                let target_slot = self
-                    .matview_catalog()
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "materialized-view catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::MaterializedView,
+                    definition.created_at,
+                    self.matview_catalog()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -20941,12 +20956,13 @@ impl Storage {
                     {
                         continue;
                     }
-                    let target_slot = routines
-                        .iter()
-                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                        .ok_or_else(|| {
-                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "routine catalog is full")
-                        })?;
+                    let target_slot = allocation.select(
+                        DatabaseCloneKind::Routine,
+                        definition.created_at,
+                        routines.iter().enumerate().filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                    )?;
                     definition.database = target;
                     definition.ownership = definition.ownership.committed();
                     definition.pending_identity = None;
@@ -21680,6 +21696,36 @@ impl Storage {
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full")
                     })?;
+                if entry.class == CommentClass::Constraint {
+                    let source_table = self
+                        .tables
+                        .get(entry.subid as usize)
+                        .filter(|table| table.database() == source)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "template constraint comment has no source table"
+                            )
+                        })?;
+                    entry.subid = self
+                        .tables
+                        .iter()
+                        .take(self.table_count())
+                        .enumerate()
+                        .find_map(|(slot, table)| {
+                            let identity = table.identity();
+                            (identity.database == target
+                                && identity.created_at == source_table.created_at()
+                                && identity.existence.visible_to(txid))
+                            .then_some(slot as u32)
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template constraint comment table was not cloned"
+                            )
+                        })?;
+                }
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
@@ -21726,7 +21772,7 @@ impl Storage {
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
-            Ok(())
+            allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
         result
@@ -53366,6 +53412,7 @@ mod tests {
                 .create_database(
                     None,
                     DatabaseOid::POSTGRES,
+                    DatabaseCloneAllocation::New,
                     test_database_definition("cloned_orders"),
                     0,
                     17,
@@ -53428,6 +53475,7 @@ mod tests {
                     .create_database(
                         None,
                         DatabaseOid::TEMPLATE1,
+                        DatabaseCloneAllocation::New,
                         test_database_definition("retired_database"),
                         0,
                         17,
@@ -53500,6 +53548,7 @@ mod tests {
                     .create_database(
                         None,
                         DatabaseOid::POSTGRES,
+                        DatabaseCloneAllocation::New,
                         test_database_definition("failed_clone"),
                         0,
                         19

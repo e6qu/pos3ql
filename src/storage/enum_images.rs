@@ -905,6 +905,7 @@ mod tests {
                     .create_database(
                         None,
                         DatabaseOid::POSTGRES,
+                        crate::storage::DatabaseCloneAllocation::New,
                         test_database_definition("enum_clone"),
                         0,
                         77,

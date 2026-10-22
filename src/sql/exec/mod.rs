@@ -12638,7 +12638,6 @@ pub(crate) fn drop_schema(
                 (schema_rank(storage, schema.as_str()), created_at, 0)
             }
             SchemaObject::Sequence(sequence) => {
-                let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 (
                     schema_rank(storage, sequence.schema.as_str()),
@@ -12800,7 +12799,6 @@ pub(crate) fn drop_schema(
                 write_rel(out, &def.schema, &def.name);
             }
             SchemaObject::Sequence(sequence) => {
-                let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let _ = write!(out, "sequence ");
                 write_rel(out, &sequence.schema, &sequence.name);

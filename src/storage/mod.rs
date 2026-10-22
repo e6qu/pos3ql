@@ -20892,6 +20892,26 @@ impl Storage {
                     continue;
                 }
                 let mut definition = source_definition;
+                let backing = self
+                    .tables
+                    .iter()
+                    .take(self.table_count())
+                    .enumerate()
+                    .find_map(|(slot, table)| {
+                        let identity = table.identity();
+                        (identity.database == target
+                            && identity.created_at == definition.backing_created_at
+                            && identity.existence.visible_to(txid))
+                        .then_some(slot)
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template materialized-view backing table was not cloned"
+                        )
+                    })?;
+                definition.backing_table = backing as u16;
+                definition.backing_created_at = self.table(backing).created_at();
                 let target_slot = self
                     .matview_catalog()
                     .iter()

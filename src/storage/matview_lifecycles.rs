@@ -70,7 +70,9 @@ impl Storage {
             && self.table(backing).created_at() == view.backing_created_at
             && {
                 let definition = self.table_def(backing, transaction);
-                definition.schema.as_str() == schema && definition.name.as_str() == name
+                definition.identity().database == current_database()
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
             }
         {
             Ok(position.slot())

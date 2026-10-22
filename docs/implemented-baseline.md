@@ -774,6 +774,35 @@ A read and an update of an existing order can progress while table creation
 waits for its reservation guard; this storage-level test does not enable
 parallel SQL execution.
 
+### Changing sequences and routines
+
+Sequence edits, function bodies and names retain the object and revision selected
+before a wait. Savepoint rollback and a full transaction rollback restore the
+corresponding definitions and comments. Old undo cannot alter an object created
+later in the same slot. A full undo log rejects the command with `54000` and
+releases the staged change. The undo images occupy the startup-reserved log.
+
+```sql
+CREATE SEQUENCE order_numbers START 10;
+SELECT nextval('order_numbers'); -- 10
+BEGIN;
+ALTER SEQUENCE order_numbers RESTART WITH 50;
+SELECT nextval('order_numbers'); -- 50
+ROLLBACK;
+SELECT nextval('order_numbers'); -- 11
+```
+
+An ordinary `nextval` is not rolled back. A restart keeps private values until
+commit, including when a prepared transaction survives loss of the local disk.
+Sequence names share PostgreSQL's relation/type namespace: creating a sequence
+with an existing enum's name fails with `42710` and leaves that type unchanged.
+
+Function replacement publishes its body, signature and saved dependencies together
+with its pending name. Routine comments follow the function's identifier, so
+renaming one overload cannot rename another overload's comments. Dropping and
+recreating a table, sequence, routine or materialized view starts a new lifetime
+without inheriting the previous object's comment or permissions.
+
 ### Replacing views and refreshing saved results
 
 `CREATE OR REPLACE VIEW` changes the query in place. The view, its row type,
@@ -819,6 +848,11 @@ preserve view, row-type, array-type and internal rule identifiers, including
 gaps left by rolled-back creation. Tests delete the entire local data directory
 before reopening from object storage; committed refresh results and prepared
 commit or rollback decisions retain the corresponding readable state.
+Tables, sequences, routines and materialized-view catalogs also retain their
+exact saved positions and creation identities. A materialized view retains the
+backing table's lifetime; a database template copy selects its copied table.
+Unknown or occupied saved positions fail recovery rather than selecting a
+replacement. See the [current stored formats](durable-format.md).
 
 ### Changing rewrite rules
 

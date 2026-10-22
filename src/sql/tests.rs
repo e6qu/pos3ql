@@ -8,6 +8,70 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_materialized_template_keeps_its_copied_backing_table() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-materialized-template-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let template = engine
+            .storage
+            .database_slot("template1", 0)
+            .map(|slot| engine.storage.database(slot).oid)
+            .unwrap();
+        engine.select_database(template).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE MATERIALIZED VIEW saved_report AS SELECT 7 AS value; COMMENT ON MATERIALIZED VIEW saved_report IS 'copied report'", true);
+        let source = engine
+            .storage
+            .matview_slot("public", "saved_report", 0)
+            .unwrap();
+        let source_table = engine.storage.matview_table(source);
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        session.success(
+            &mut engine,
+            "CREATE DATABASE copied_reports TEMPLATE template1",
+            true,
+        );
+        let copied = engine
+            .storage
+            .database_slot("copied_reports", 0)
+            .map(|slot| engine.storage.database(slot).oid)
+            .unwrap();
+        engine.select_database(copied).unwrap();
+        let target = engine
+            .storage
+            .matview_slot("public", "saved_report", 0)
+            .unwrap();
+        let target_table = engine.storage.matview_table(target);
+        assert_ne!(target_table, source_table);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM saved_report; SELECT obj_description('saved_report'::regclass)",
+                true
+            )),
+            ["7", "copied report"]
+        );
+        session.success(&mut engine, "DROP MATERIALIZED VIEW saved_report", true);
+        engine.select_database(template).unwrap();
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM saved_report; SELECT obj_description('saved_report'::regclass)",
+                true
+            )),
+            ["7", "copied report"]
+        );
+    }
+}
+
+#[test]
 fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
     for checkpoint in [false, true] {
         for commit in [false, true] {
@@ -51,15 +115,15 @@ fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
                     .storage
                     .sequence_slot("public", "retained_counter", 0)
                     .unwrap();
-                let committed = cold.storage.sequence_for(counter, 0);
-                assert_eq!((committed.last_value, committed.is_called), (10, true));
+                let committed = cold.storage.sequence_value_for(counter, 0);
+                assert_eq!(committed, (10, true));
                 assert_eq!(
                     cold.storage
                         .sequence_slot("public", "pending_counter", transaction),
                     Some(counter)
                 );
-                let pending = cold.storage.sequence_for(counter, transaction);
-                assert_eq!((pending.last_value, pending.is_called), (50, true));
+                let pending = cold.storage.sequence_value_for(counter, transaction);
+                assert_eq!(pending, (50, true));
                 let routine = cold
                     .storage
                     .routine_slot_by_name_unambiguous("public", "retained_body", 0)

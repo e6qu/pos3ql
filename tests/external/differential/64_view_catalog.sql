@@ -138,6 +138,21 @@ SELECT obj_description('view_replacement_identity'::regclass) IS NULL;
 COMMENT ON VIEW view_replacement_identity IS 'new view comment';
 COMMIT;
 SELECT obj_description('view_replacement_identity'::regclass);
+BEGIN;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 5 AS value;
+COMMENT ON VIEW view_replacement_identity IS 'second lifetime';
+SAVEPOINT before_second_drop;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 6 AS value;
+SELECT obj_description('view_replacement_identity'::regclass) IS NULL;
+COMMENT ON VIEW view_replacement_identity IS 'third lifetime';
+ROLLBACK TO before_second_drop;
+SELECT value, obj_description('view_replacement_identity'::regclass)
+  FROM view_replacement_identity;
+ROLLBACK;
+SELECT value, obj_description('view_replacement_identity'::regclass)
+  FROM view_replacement_identity;
 CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
 BEGIN;
 DROP RULE remembered_view_rule ON view_replacement_identity;

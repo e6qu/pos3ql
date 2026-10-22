@@ -139,6 +139,90 @@ fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
 }
 
 #[test]
+fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recovery() {
+    for checkpoint in [false, true] {
+        for decision in ["COMMIT", "COMMIT PREPARED", "ROLLBACK PREPARED"] {
+            let name = format!("query-lifecycle-cold-{checkpoint}-{decision}");
+            let mut config = test_config(&name);
+            config.max_prepared_transactions = 1;
+            config.max_ddl_per_transaction = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine, "CREATE TABLE lifecycle_base(value integer); INSERT INTO lifecycle_base VALUES (7); CREATE VIEW lifecycle_view AS SELECT 1 AS value; CREATE VIEW lifecycle_dependent AS SELECT value FROM lifecycle_view; COMMENT ON VIEW lifecycle_view IS 'retained comment'; CREATE MATERIALIZED VIEW lifecycle_mat AS SELECT value FROM lifecycle_base WITH NO DATA", true);
+            let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid, relation.relowner FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'lifecycle_view' AND rewrite.rulename = '_RETURN'";
+            let identity = data_rows(&session.success(&mut engine, identity_sql, true));
+            assert_eq!(identity.len(), 1);
+            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING", true);
+            if decision == "COMMIT" {
+                session.success(&mut engine, "COMMIT", true);
+            } else {
+                session.success(&mut engine, "PREPARE TRANSACTION 'query-lifecycle'", true);
+            }
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            if decision != "COMMIT" {
+                assert_eq!(
+                    data_rows(&cold_session.success(
+                        &mut cold,
+                        "SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'query-lifecycle'",
+                        true
+                    )),
+                    ["1"]
+                );
+                cold_session.success(&mut cold, &format!("{decision} 'query-lifecycle'"), true);
+            }
+            let committed = decision != "ROLLBACK PREPARED";
+            assert_eq!(
+                data_rows(&cold_session.success(&mut cold, identity_sql, true)),
+                identity
+            );
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT value FROM lifecycle_view; SELECT value FROM lifecycle_dependent; SELECT obj_description('lifecycle_view'::regclass)", true)), if committed { vec!["2", "2", "retained comment"] } else { vec!["1", "1", "retained comment"] });
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT relispopulated FROM pg_class WHERE relname = 'lifecycle_mat'; SELECT ispopulated FROM pg_matviews WHERE matviewname = 'lifecycle_mat'; SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_rule'", true)), if committed { vec!["t", "t", "1"] } else { vec!["f", "f", "0"] });
+            if committed {
+                assert_eq!(
+                    data_rows(&cold_session.success(
+                        &mut cold,
+                        "SELECT value FROM lifecycle_mat",
+                        true
+                    )),
+                    ["7"]
+                );
+            } else {
+                let error =
+                    cold_session.execute(&mut cold, "SELECT count(*) FROM lifecycle_mat", true);
+                assert!(String::from_utf8_lossy(&error).contains("C55000\0"));
+            }
+            assert_eq!(
+                data_rows(&cold_session.success(
+                    &mut cold,
+                    "SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'query-lifecycle'",
+                    true
+                )),
+                ["0"]
+            );
+            drop(cold_session);
+            drop(cold);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn query_lifecycle_parent_rollback_preserves_earlier_rule_deletion() {
     for (kind, creation) in [
         ("TABLE", "CREATE TABLE rule_parent(id integer)"),

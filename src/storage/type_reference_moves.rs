@@ -1465,7 +1465,7 @@ mod tests {
                         crate::mem::guard::forbid_alloc(|| {
                             storage.finish_view_publication(
                                 publication_unrelated,
-                                super::super::crate::storage::QueryDdlDecision::Commit,
+                                crate::storage::QueryDdlDecision::Commit,
                             )
                         });
                         finished.send(()).unwrap();

@@ -56428,6 +56428,7 @@ mod tests {
                 .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 7)
                 .unwrap();
             let b = publication_b.slot();
+            assert_ne!(a, b);
             let prior_b = storage.begin_rule_history(target, 7).unwrap();
             assert_eq!(prior_b, Some(7));
             storage.finish_rule_publication(publication_b, prior_b, QueryDdlDecision::Rollback);

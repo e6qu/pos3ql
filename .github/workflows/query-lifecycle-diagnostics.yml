@@ -39,7 +39,12 @@ jobs:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
-          CARGO_PROFILE_RELEASE_DEBUG: "1"
-          COVERAGE_SHARD: run:proto,dur
+          COVERAGE_SHARD: run:proto
           COVERAGE_LCOV: ${{ github.workspace }}/query-lifecycle-diagnostics.lcov
-        run: sh tools/coverage.sh
+        run: |
+          sh tools/coverage.sh
+          for attempt in $(seq 2 12); do
+            echo "=== fresh-server protocol attempt $attempt of 12 ==="
+            POS3QL_BIN="$PWD/target/release/pos3ql" POS3QL_RUN_GROUPS=proto \
+              bash tests/external/run.sh
+          done

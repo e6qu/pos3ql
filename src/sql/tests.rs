@@ -78,7 +78,7 @@ fn metadata_materialized_undo_exhaustion_restores_backing_and_catalog() {
             assert!(
                 engine
                     .storage
-                    .find_matview("public", "retained_materialized", transaction)
+                    .find_matview("public", "retained_materialized", 0)
                     .is_some(),
                 "{statement}"
             );

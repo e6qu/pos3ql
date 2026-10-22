@@ -27,10 +27,12 @@ CREATE TYPE metadata_shared_name AS ENUM ('value');
 COMMENT ON TYPE metadata_shared_name IS 'type comment';
 DO $body$
 BEGIN
+  BEGIN
     EXECUTE 'CREATE SEQUENCE metadata_shared_name';
     RAISE EXCEPTION 'sequence creation accepted a conflicting type name';
 EXCEPTION WHEN SQLSTATE '42710' THEN
     NULL;
+  END;
 END
 $body$;
 SELECT obj_description('metadata_shared_name'::regtype, 'pg_type');

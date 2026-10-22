@@ -8,6 +8,46 @@ use super::{
 use crate::sql_err;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViewCatalogIdentity {
+    slot: u16,
+    created_at: u64,
+    return_rule: u16,
+    return_rule_created_at: u64,
+}
+
+impl ViewCatalogIdentity {
+    pub(crate) const ENCODED_BYTES: usize = 20;
+
+    pub(crate) fn new(
+        slot: u16,
+        created_at: u64,
+        return_rule: u16,
+        return_rule_created_at: u64,
+    ) -> Option<Self> {
+        (created_at != 0 && return_rule_created_at != 0 && created_at != return_rule_created_at)
+            .then_some(Self {
+                slot,
+                created_at,
+                return_rule,
+                return_rule_created_at,
+            })
+    }
+
+    pub(crate) fn slot(self) -> usize {
+        usize::from(self.slot)
+    }
+    pub(crate) fn created_at(self) -> u64 {
+        self.created_at
+    }
+    pub(crate) fn return_rule_slot(self) -> usize {
+        usize::from(self.return_rule)
+    }
+    pub(crate) fn return_rule_created_at(self) -> u64 {
+        self.return_rule_created_at
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueryCatalogSlot {
     View(usize),
     Rule(usize),
@@ -196,6 +236,178 @@ impl MatviewPopulationUndo {
 }
 
 impl Storage {
+    pub(crate) fn view_catalog_identity(&self, slot: usize) -> ViewCatalogIdentity {
+        let catalog = self.view_rule_catalog();
+        let view = catalog.views[slot];
+        let rule = catalog.rules[usize::from(view.return_rule)];
+        ViewCatalogIdentity::new(
+            slot as u16,
+            view.created_at,
+            view.return_rule,
+            rule.created_at,
+        )
+        .expect("live view and return rule have distinct identities")
+    }
+
+    pub(crate) fn replay_view(
+        &mut self,
+        identity: ViewCatalogIdentity,
+        schema: super::SqlName,
+        name: super::SqlName,
+        definition: super::ViewDefinition,
+    ) -> Result<(), SqlError> {
+        let slot = identity.slot();
+        let rule_slot = identity.return_rule_slot();
+        let initial_owner = self.initial_ownership(0)?;
+        let mut owners = self.catalog_dependency_owners(
+            &self.view_rule_catalog,
+            super::type_contracts::CatalogPublicationInput::ViewDefinition,
+            None,
+        );
+        let view = owners.catalog.views.get(slot).copied().ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal view slot is out of range"
+            )
+        })?;
+        let rule = owners
+            .catalog
+            .rules
+            .get(rule_slot)
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal return-rule slot is out of range"
+                )
+            })?;
+        let replacing = view.ddl_state != CatalogDdlState::Absent;
+        if replacing
+            && (view.database != current_database()
+                || view.created_at != identity.created_at()
+                || view.return_rule != rule_slot as u16
+                || view.schema != schema
+                || view.name != name
+                || view.ddl_state != CatalogDdlState::Present
+                || view.pending_definition.is_some())
+            || if replacing {
+                rule.database != current_database()
+                    || rule.created_at != identity.return_rule_created_at()
+                    || rule.ddl_state != CatalogDdlState::Present
+                    || rule.pending.is_some()
+                    || !rule.definition.is_view_return()
+                    || rule.definition.target != super::RuleTarget::View(slot as u16)
+            } else {
+                rule.ddl_state != CatalogDdlState::Absent
+            }
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal view identity is unavailable"
+            ));
+        }
+        if owners
+            .catalog
+            .views
+            .iter()
+            .enumerate()
+            .any(|(other, view)| {
+                other != slot
+                    && view.database == current_database()
+                    && view.ddl_state != CatalogDdlState::Absent
+                    && view.schema == schema
+                    && view.name == name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal contains a duplicate view name"
+            ));
+        }
+        if owners
+            .catalog
+            .rules
+            .iter()
+            .enumerate()
+            .any(|(other, rule)| {
+                other != rule_slot
+                    && rule.database == current_database()
+                    && rule.ddl_state != CatalogDdlState::Absent
+                    && rule.created_at == identity.return_rule_created_at()
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal contains a duplicate return-rule identity"
+            ));
+        }
+        self.require_row_type_name(
+            owners.types.as_deref().expect("view recovery owns types"),
+            schema,
+            name,
+            0,
+            replacing.then_some(super::RuleTarget::View(slot as u16)),
+            Some(&owners.catalog),
+        )?;
+        owners.write_query_image(
+            self,
+            self.committed_dependency_image(super::StoredQueryDependencyOwner::Rule(
+                rule_slot as u16,
+            )),
+            definition.query.dependencies.view(),
+            0,
+        )?;
+        if !replacing {
+            Self::clear_object_acl_entries_locked(
+                owners
+                    .permissions
+                    .as_mut()
+                    .expect("view recovery owns permissions"),
+                super::AccessObject {
+                    class: super::AccessClass::View,
+                    slot: slot as u16,
+                },
+            );
+        }
+        let mut rule_definition = super::RuleDefinition::view_return(slot, &definition.query);
+        if replacing {
+            rule_definition.enabled = rule.definition.enabled;
+        }
+        owners.catalog.rules[rule_slot] = super::RuleDef {
+            database: current_database(),
+            created_at: identity.return_rule_created_at(),
+            version: identity.return_rule_created_at(),
+            ddl_version: identity.return_rule_created_at(),
+            pending_parent_drop_txid: None,
+            definition: rule_definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        owners.catalog.views[slot] = super::ViewDef {
+            database: current_database(),
+            created_at: identity.created_at(),
+            schema,
+            name,
+            persistence: definition.persistence,
+            return_rule: rule_slot as u16,
+            options: definition.options,
+            columns: definition.columns,
+            ownership: if replacing {
+                view.ownership
+            } else {
+                initial_owner
+            },
+            version: identity.created_at(),
+            ddl_version: identity.created_at(),
+            pending_definition: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        drop(owners);
+        self.catalog_sequence
+            .observe(identity.created_at().max(identity.return_rule_created_at()));
+        Ok(())
+    }
+
     pub(super) fn stage_query_comment_drop_in(
         &self,
         owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
@@ -1766,6 +1978,64 @@ mod tests {
                 transaction,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn query_lifecycle_replay_preserves_positions_and_rejects_reused_identities() {
+        let mut storage = fixture(3);
+        let identity = ViewCatalogIdentity::new(2, 7, 2, 8).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .replay_view(
+                    identity,
+                    name("public"),
+                    name("restored_view"),
+                    test_view_definition(StoredQueryDependencies::EMPTY),
+                )
+                .unwrap();
+            for invalid in [
+                ViewCatalogIdentity::new(2, 11, 2, 12).unwrap(),
+                ViewCatalogIdentity::new(2, 7, 1, 8).unwrap(),
+                ViewCatalogIdentity::new(3, 7, 2, 8).unwrap(),
+                ViewCatalogIdentity::new(2, 7, 3, 8).unwrap(),
+            ] {
+                assert_eq!(
+                    storage
+                        .replay_view(
+                            invalid,
+                            name("public"),
+                            name("restored_view"),
+                            test_view_definition(StoredQueryDependencies::EMPTY)
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(storage.view_catalog_identity(2), identity);
+                assert_eq!(storage.view_sql(2).as_str(), "SELECT 1");
+            }
+            assert_eq!(
+                storage
+                    .replay_view(
+                        ViewCatalogIdentity::new(1, 9, 1, 8).unwrap(),
+                        name("public"),
+                        name("duplicate_rule_identity"),
+                        test_view_definition(StoredQueryDependencies::EMPTY)
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.view(1).ddl_state, CatalogDdlState::Absent);
+            let mut replacement = test_view_definition(StoredQueryDependencies::EMPTY);
+            replacement.query.sql = crate::util::StackStr::from_str("SELECT 2");
+            storage
+                .replay_view(identity, name("public"), name("restored_view"), replacement)
+                .unwrap();
+            assert_eq!(storage.view_catalog_identity(2), identity);
+            assert_eq!(storage.view_sql(2).as_str(), "SELECT 2");
+            assert_eq!(storage.view(0).ddl_state, CatalogDdlState::Absent);
+        });
     }
 
     #[test]

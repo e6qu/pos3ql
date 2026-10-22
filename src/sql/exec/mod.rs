@@ -36400,6 +36400,7 @@ pub fn create_view(
                     txn.txid,
                     lsn,
                     &WalOp::CreateView {
+                        identity: storage.view_catalog_identity(new_slot),
                         schema: schema.as_str(),
                         name: name.name,
                         columns: crate::wal::WalViewColumns::Captured(&columns),
@@ -37070,8 +37071,9 @@ fn rewrite_view_column_dependents(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
-                    schema: view.schema.as_str(),
-                    name: view.name.as_str(),
+                    identity: storage.view_catalog_identity(new_slot),
+                    schema: view.schema_for(txn.txid).as_str(),
+                    name: view.name_for(txn.txid).as_str(),
                     columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
@@ -46499,8 +46501,9 @@ fn rewrite_composite_dependent_views(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
-                    schema: view.schema.as_str(),
-                    name: view.name.as_str(),
+                    identity: storage.view_catalog_identity(new_slot),
+                    schema: view.schema_for(txn.txid).as_str(),
+                    name: view.name_for(txn.txid).as_str(),
                     columns: crate::wal::WalViewColumns::Captured(&view.columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),

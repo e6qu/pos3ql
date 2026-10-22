@@ -5,8 +5,7 @@ belong here. Fix every other defect, including CI regressions, in the PR that
 finds it. Keep repaired defects and their evidence in the implementing PR.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
-The repair below is waiting for explicit approval after automatic review rejected
-the durable recovery change. Its failing regression remains enabled.
+No defects currently meet this blocked-only boundary.
 
 A configured capacity limit may reject work explicitly. Partial changes, lost
 reader data, hidden runtime allocation or leaked ownership are defects. Waiting,
@@ -27,4 +26,3 @@ change instead of keeping a resolved-work journal.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|
-| B-VIEW-IDENTITY | blocked | 2026-10-22 | Cold recovery changes view and internal `_RETURN` rule identifiers, including after rolled-back creation leaves a catalog gap. | The `query_lifecycle_` recovery tests; native run `39727555750` on `c211887d`: view identifier `100001` becomes `100000`, and the refresh/replacement test's return-rule identifier `26003` becomes `26018`. | Automatic approval review rejected the durable identity placement refactor because an incorrect change could corrupt catalog recovery; user approval is pending. This PR must pass both retained regressions before merging. |

@@ -9,7 +9,7 @@ mod catalog_sources;
 mod query_lifecycles;
 pub(crate) use query_lifecycles::{
     MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, RuleAlterUndo, RulePublication,
-    ViewPublication,
+    ViewCatalogIdentity, ViewPublication,
 };
 mod role_dependencies;
 pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
@@ -4804,6 +4804,29 @@ pub(crate) struct RuleDefinition {
 }
 
 impl RuleDefinition {
+    fn view_return(slot: usize, query: &StoredQueryDefinition) -> Self {
+        Self {
+            name: SqlName::parse("_RETURN").expect("fixed name fits"),
+            target: RuleTarget::View(slot as u16),
+            event: RewriteEvent::Select,
+            mode: RewriteMode::Instead,
+            enabled: RuleEnabled::Origin,
+            source: query.sql,
+            condition: None,
+            actions: {
+                let mut actions = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS];
+                actions[0] = RuleTextSpan {
+                    start: 0,
+                    len: query.sql.as_str().len() as u16,
+                };
+                actions
+            },
+            action_count: 1,
+            returning_action: None,
+            creation_path: query.creation_path,
+        }
+    }
+
     const EMPTY: Self = Self {
         name: SqlName::EMPTY,
         target: RuleTarget::Table(u16::MAX),
@@ -40602,26 +40625,7 @@ impl Storage {
                     )
                 })?,
         };
-        let rule_definition = RuleDefinition {
-            name: SqlName::parse("_RETURN").expect("fixed name fits"),
-            target: RuleTarget::View(new as u16),
-            event: RewriteEvent::Select,
-            mode: RewriteMode::Instead,
-            enabled: RuleEnabled::Origin,
-            source: definition.query.sql,
-            condition: None,
-            actions: {
-                let mut actions = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS];
-                actions[0] = RuleTextSpan {
-                    start: 0,
-                    len: definition.query.sql.as_str().len() as u16,
-                };
-                actions
-            },
-            action_count: 1,
-            returning_action: None,
-            creation_path: definition.query.creation_path,
-        };
+        let rule_definition = RuleDefinition::view_return(new, &definition.query);
         if let Some(slot) = existing {
             let target = self.view_edit_target(slot, &owners.catalog.views[slot], txid);
             let undo = self.replace_view_in(&mut owners, target, definition, txid)?;
@@ -40676,57 +40680,6 @@ impl Storage {
             version: created_at,
             prior_version: 0,
         }))
-    }
-
-    /// Restores a checkpointed view at its durable catalog slot. View OIDs and
-    /// relation-target comment identities are slot-derived, so compacting a
-    /// replacement-created hole during recovery would corrupt both.
-    pub(crate) fn restore_view_at(
-        &mut self,
-        slot: usize,
-        schema: SqlName,
-        name: SqlName,
-        definition: ViewDefinition,
-    ) -> Result<(), SqlError> {
-        if slot >= self.view_count() || self.view(slot).ddl_state != CatalogDdlState::Absent {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "checkpoint view slot is unavailable"
-            ));
-        }
-        if self.find_view(schema.as_str(), name.as_str(), 0).is_some() {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "checkpoint contains a duplicate view"
-            ));
-        }
-        let ViewPublication::Created(mut undo) =
-            self.create_view(schema, name, definition, false, 0)?
-        else {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "checkpoint view unexpectedly replaced an object"
-            ));
-        };
-        let created = undo.slot();
-        if created != slot {
-            let mut catalog = self.view_rule_catalog();
-            catalog.views[slot] = catalog.views[created];
-            catalog.views[created] = ViewDef::EMPTY;
-            let return_rule = usize::from(catalog.views[slot].return_rule);
-            catalog.rules[return_rule].definition.target = RuleTarget::View(slot as u16);
-            if let Some(pending) = &mut catalog.rules[return_rule].pending {
-                pending.definition.target = RuleTarget::View(slot as u16);
-            }
-        }
-        let view = self.view(slot);
-        undo.source = self.query_identity(
-            query_lifecycles::QueryCatalogSlot::View(slot),
-            view.database,
-            view.created_at,
-        );
-        self.finish_view_publication(ViewPublication::Created(undo), QueryDdlDecision::Commit);
-        Ok(())
     }
 
     /// Overlays a pending DROP on a slot: the owner's own pending-create
@@ -50378,40 +50331,23 @@ impl Storage {
                 "journal rewrite rule duplicates an existing identity"
             ));
         }
-        // Recovery may relocate a view's return rule to preserve durable rule
-        // slots. Validate the new image before touching that existing graph.
         StoredQueryDependencyCatalog::validate_image_size(
             dependencies.view(),
             self.stored_query_dependencies_per_image,
         )?;
-        if catalog.rules[slot].ddl_state != CatalogDdlState::Absent {
-            let occupied = catalog.rules[slot];
-            let occupied_definition = occupied.definition;
-            if occupied_definition.target != definition.target
-                || occupied_definition.name != definition.name
-            {
-                let free = catalog
-                    .rules
-                    .iter()
-                    .position(|rule| rule.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "rewrite-rule catalog is full during recovery"
-                        )
-                    })?;
-                catalog.rules[free] = occupied;
-                owners.dependencies.copy_image(
-                    self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)),
-                    self.committed_dependency_image(StoredQueryDependencyOwner::Rule(free as u16)),
-                    self.stored_query_dependencies_per_image,
-                );
-                if let RuleTarget::View(view) = occupied_definition.target
-                    && catalog.views[usize::from(view)].return_rule == slot as u16
-                {
-                    catalog.views[usize::from(view)].return_rule = free as u16;
-                }
-            }
+        let occupied = catalog.rules[slot];
+        if occupied.ddl_state != CatalogDdlState::Absent
+            && (occupied.database != current_database()
+                || occupied.created_at != created_at
+                || occupied.ddl_state != CatalogDdlState::Present
+                || occupied.pending.is_some()
+                || occupied.definition.target != definition.target
+                || occupied.definition.name != definition.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal rewrite-rule identity is unavailable"
+            ));
         }
         owners.write_query_image(
             self,
@@ -55253,8 +55189,8 @@ mod tests {
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("test_view").unwrap();
         storage
-            .restore_view_at(
-                2,
+            .replay_view(
+                ViewCatalogIdentity::new(2, 7, 2, 8).unwrap(),
                 schema,
                 name,
                 test_view_definition(StoredQueryDependencies::EMPTY),
@@ -55264,8 +55200,8 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 storage
-                    .restore_view_at(
-                        1,
+                    .replay_view(
+                        ViewCatalogIdentity::new(1, 9, 1, 10).unwrap(),
                         schema,
                         name,
                         test_view_definition(StoredQueryDependencies::EMPTY)
@@ -55306,7 +55242,12 @@ mod tests {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies.push(StoredQueryDependency::EMPTY).unwrap();
         storage
-            .restore_view_at(0, schema, name, test_view_definition(dependencies))
+            .replay_view(
+                ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
+                schema,
+                name,
+                test_view_definition(dependencies),
+            )
             .unwrap();
         let definition = RuleDefinition {
             name: SqlName::parse("replayed_rule").unwrap(),
@@ -55329,16 +55270,23 @@ mod tests {
                 &[StoredQueryDependency::EMPTY]
             );
             assert!(!storage.table_has_rules(table, 0));
+            assert_eq!(
+                storage
+                    .replay_rule(0, 42, definition, StoredQueryDependencies::EMPTY)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             storage
-                .replay_rule(0, 42, definition, StoredQueryDependencies::EMPTY)
+                .replay_rule(1, 42, definition, StoredQueryDependencies::EMPTY)
                 .unwrap();
-            assert_eq!(storage.view_return_rule(0), 1);
+            assert_eq!(storage.view_return_rule(0), 0);
             assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
             assert_eq!(
-                storage.rule_dependencies(1, 0).entries(),
+                storage.rule_dependencies(0, 0).entries(),
                 &[StoredQueryDependency::EMPTY]
             );
-            assert!(storage.rule_dependencies(0, 0).entries().is_empty());
+            assert!(storage.rule_dependencies(1, 0).entries().is_empty());
             assert!(storage.table_has_rules(table, 0));
         });
     }

@@ -21291,6 +21291,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.remove_committed(index, rowid, lsn)?;
         }
         WalOp::CreateView {
+            identity,
             schema,
             name,
             columns,
@@ -21315,7 +21316,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let _ = write!(creation_path, "{path}");
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
-            let publication = storage.create_view(
+            storage.replay_view(
+                identity,
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 crate::storage::ViewDefinition {
@@ -21356,10 +21358,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         },
                     },
                 },
-                true,
-                0,
             )?;
-            storage.finish_view_publication(publication, crate::storage::QueryDdlDecision::Commit);
         }
         WalOp::DropView { schema, name } => {
             if let Some(slot) = storage.drop_view(schema, name, 0)? {

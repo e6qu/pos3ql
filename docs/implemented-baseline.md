@@ -1257,8 +1257,8 @@ Image counters and controls are charged at startup. Exhaustion returns 54000,
 "enum member-image pool is exhausted", without changing the published
 definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
-different image when readers retain the old one. Type creation and some engine
-metadata preparation still require exclusive access.
+different image when readers retain the old one. Named-type creation uses shared
+storage access; some engine metadata preparation still requires exclusive access.
 
 Transaction-wide catalog coordination, remaining table rewrites and SQL execution
 workers remain open.

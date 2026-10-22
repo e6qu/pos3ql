@@ -20,7 +20,7 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v19` | yes | yes | Requires durable role and type identities and their counters, plus a completed type-loading boundary; retains typed blocks and enum member identities. |
+| Checkpoint manifest | `pos3ql-manifest-v20` | yes | yes | Retains durable role and type identities and counters, typed blocks, enum members, and exact view and return-rule catalog positions and creation stamps. |
 | Journal record | Version `6` at header byte 17; bytes 18–23 are zero | yes | yes | Retains durable account identifiers. View replacement preserves object identifiers; materialized-view refresh state follows its transaction. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -346,6 +346,14 @@ is version 6; earlier frames are rejected. Replayed view replacement edits the
 existing view and return rule, preserving their object identifiers. A
 materialized-view refresh publishes its population flag with the transaction's
 rows; prepared recovery must retain that pending decision.
+
+CREATE VIEW records start with a 20-byte identity: the view's two-byte catalog
+position and eight-byte creation stamp, then the return rule's two-byte position
+and eight-byte creation stamp, all little endian. Creation stamps are nonzero
+and distinct. Checkpoint `vw13` records carry the same four fields before the
+encoded query. Recovery rejects unavailable positions and mismatched identities;
+it never relocates an existing object to make room. This preserves identifiers
+when an aborted creation leaves a gap in either catalog.
 
 ## Reader changes
 

@@ -995,6 +995,7 @@ pub(crate) enum WalOp<'a> {
         content: &'a [u8],
     },
     CreateView {
+        identity: crate::storage::ViewCatalogIdentity,
         schema: &'a str,
         name: &'a str,
         columns: WalViewColumns<'a>,
@@ -2983,6 +2984,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             prefix, content, ..
         } => 1 + 8 + 4 + 2 + prefix.len() + 4 + content.len(),
         WalOp::CreateView {
+            identity: _,
             schema,
             name,
             columns,
@@ -2993,7 +2995,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             check_option: _,
             dependencies,
         } => {
-            1 + name.len()
+            crate::storage::ViewCatalogIdentity::ENCODED_BYTES
+                + 1
+                + name.len()
                 + columns.encoded_len()
                 + 3
                 + sql.len()
@@ -4732,6 +4736,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(content)
         }
         WalOp::CreateView {
+            identity,
             schema,
             name,
             columns,
@@ -4742,7 +4747,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             check_option,
             dependencies,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&(identity.slot() as u16).to_le_bytes())
+                && buffer.append(&identity.created_at().to_le_bytes())
+                && buffer.append(&(identity.return_rule_slot() as u16).to_le_bytes())
+                && buffer.append(&identity.return_rule_created_at().to_le_bytes())
+                && name_bytes(buffer, name)
                 && columns.append(buffer)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
@@ -7913,6 +7922,21 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 | KIND_CREATE_VIEW_BOUND => decode_large_op(|| {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let return_rule = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let return_rule_created_at =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let identity = crate::storage::ViewCatalogIdentity::new(
+                slot,
+                created_at,
+                return_rule,
+                return_rule_created_at,
+            )?;
             let wide_columns = kind != KIND_CREATE_VIEW;
             let name = take_name(&mut at)?;
             let columns_start = at;
@@ -7977,6 +8001,7 @@ fn decode_op_inner<'a>(
             at = payload.len();
             let dependencies = WalStoredQueryDependencies::Encoded(encoded);
             (at == payload.len()).then_some(WalOp::CreateView {
+                identity,
                 schema,
                 name,
                 columns,
@@ -13262,6 +13287,7 @@ mod tests {
             (
                 KIND_CREATE_VIEW_BOUND,
                 WalOp::CreateView {
+                    identity: crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
                     schema: "public",
                     name: "states",
                     columns: WalViewColumns::Captured(&columns),
@@ -14212,6 +14238,49 @@ mod tests {
     }
 
     #[test]
+    fn view_catalog_identity_rejects_missing_zero_and_reused_stamps() {
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "view identity codec", 2048).unwrap();
+        let columns = crate::storage::ViewColumns::from_names(&["value"]).unwrap();
+        let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        let identity = crate::storage::ViewCatalogIdentity::new(2, 7, 3, 8).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateView {
+                    identity,
+                    schema: "public",
+                    name: "retained_view",
+                    columns: WalViewColumns::Captured(&columns),
+                    sql: "SELECT 1 AS value",
+                    path: "public",
+                    security_invoker: false,
+                    security_barrier: 0,
+                    check_option: 0,
+                    dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                }
+            ));
+            let Some(WalOp::CreateView {
+                identity: decoded, ..
+            }) = decode_op(KIND_CREATE_VIEW_V2, payload.readable())
+            else {
+                panic!("view identity did not decode");
+            };
+            assert_eq!(decoded, identity);
+            for end in 0..crate::storage::ViewCatalogIdentity::ENCODED_BYTES {
+                assert!(decode_op(KIND_CREATE_VIEW_V2, &payload.readable()[..end]).is_none());
+            }
+            payload.filled_mut()[2..10].fill(0);
+            assert!(decode_op(KIND_CREATE_VIEW_V2, payload.readable()).is_none());
+            payload.filled_mut()[2..10].copy_from_slice(&7u64.to_le_bytes());
+            payload.filled_mut()[12..20].fill(0);
+            assert!(decode_op(KIND_CREATE_VIEW_V2, payload.readable()).is_none());
+            payload.filled_mut()[12..20].copy_from_slice(&7u64.to_le_bytes());
+            assert!(decode_op(KIND_CREATE_VIEW_V2, payload.readable()).is_none());
+        });
+    }
+
+    #[test]
     fn policy_and_view_security_payloads_roundtrip() {
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "security payload", 4096).unwrap();
@@ -14284,6 +14353,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateView {
+                identity: crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
                 schema: "public",
                 name: "reader_view",
                 columns: WalViewColumns::Captured(&create_columns),
@@ -14296,6 +14366,7 @@ mod tests {
             },
         ));
         let Some(WalOp::CreateView {
+            identity,
             security_invoker,
             security_barrier,
             check_option,
@@ -14305,6 +14376,10 @@ mod tests {
         else {
             panic!("view payload did not decode");
         };
+        assert_eq!(
+            identity,
+            crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap()
+        );
         let columns = columns.materialize().unwrap();
         assert!(security_invoker);
         assert_eq!(security_barrier, 1);

@@ -19,7 +19,8 @@ lifetime as well. A failed undo-log attachment must release the staged
 change; identity restarts use the same ownership checks as sequence edits.
 Recovery must preserve saved catalog positions and creation identities, including
 gaps left by rolled-back creations and the positions of copied template objects. Prepared sequence restarts retain their
-private values; rollback must preserve the committed counter.
+private values; rollback must preserve the committed counter. Catalog checkpoints
+keep committed definitions while deletion is only pending or prepared.
 Materialized-view readability follows transaction and savepoint rollback.
 A pending login commit must yield without repeating triggers. Synchronous
 journal completion must not wait for credential installation by its own caller.

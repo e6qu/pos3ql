@@ -54,5 +54,5 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Metadata lifetime regressions
         run: >-
-          cargo test --release --lib --locked -- sequence routine metadata_ query_lifecycle matview materialized_view table_lifecycle table_catalog_lifecycle table_retirement wal:: checkpoint:: durable_catalog_position prepared_transaction database_clone_positions typed_catalog_capacities
+          cargo test --release --lib --locked -- sequence routine metadata_ query_lifecycle matview materialized_view table_lifecycle table_catalog_lifecycle table_retirement wal:: checkpoint:: durable_catalog_position prepared_transaction database_clone_positions typed_catalog_capacities catalog_ddl_state
           --test-threads=1

@@ -899,6 +899,10 @@ restart and recovery without local caches. Saved commit and rollback decisions
 release the transaction's private rows and catalog entries before replay, so
 recovery cannot wait on its own unfinished table or sequence creation. Live
 resolution, startup recovery, and savepoint rollback share catalog undo.
+A checkpoint keeps the committed definitions of objects waiting for a prepared
+deletion. For example, preparing `DROP MATERIALIZED VIEW report` must not erase
+its saved definition: `ROLLBACK PREPARED` still needs the original report.
+The same committed-existence rule applies to catalog snapshot filters.
 A transaction listed as prepared in a checkpoint may have committed or rolled
 back later. Recovery verifies its original saved batch and identities before
 applying later decisions; a missing or mismatched batch still rejects startup.

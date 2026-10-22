@@ -3743,6 +3743,10 @@ pub enum CatalogDdlState {
 }
 
 impl CatalogDdlState {
+    pub(crate) const fn committed_exists(self) -> bool {
+        matches!(self, Self::Present | Self::PendingDrop { .. })
+    }
+
     pub const fn visible_to(self, txid: u32) -> bool {
         match self {
             Self::Absent => false,
@@ -13821,7 +13825,7 @@ impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
             self.next_slot += 1;
             let entry = (self.entry)(&catalog, slot);
             let visible = if self.checkpoint {
-                entry.ddl_state == CatalogDdlState::Present
+                entry.ddl_state.committed_exists()
             } else {
                 self.database == Some(entry.database) && entry.visible_to(self.txid)
             };
@@ -13960,7 +13964,7 @@ impl Iterator for MatviewIter<'_> {
             let definition = *catalog.get(slot)?;
             self.next_slot += 1;
             let visible = if self.checkpoint {
-                definition.ddl_state == CatalogDdlState::Present
+                definition.ddl_state.committed_exists()
             } else {
                 self.database == Some(definition.database) && definition.visible_to(self.txid)
             };
@@ -23608,7 +23612,7 @@ impl Storage {
             catalog: &self.schemas,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, DomainDef)> + '_ {
@@ -23616,7 +23620,7 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {
@@ -23624,7 +23628,7 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_composites(&self) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
@@ -23632,12 +23636,12 @@ impl Storage {
             catalog: &self.type_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
         self.view_entries().accepting(0, |value, _| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && value.persistence != RelationPersistence::Temporary
         })
     }
@@ -23649,7 +23653,7 @@ impl Storage {
             catalog: &self.publications,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_replication_slots(
@@ -23670,8 +23674,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
-                || value.cleanup != SubscriptionCleanup::None
+            value.ddl_state.committed_exists() || value.cleanup != SubscriptionCleanup::None
         })
     }
 
@@ -23693,7 +23696,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value, _, _, _)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && value.persistence != RelationPersistence::Temporary
         })
     }
@@ -23703,7 +23706,7 @@ impl Storage {
             catalog: &self.casts,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, CollationDef)> + '_ {
@@ -23711,7 +23714,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_text_search_objects(
@@ -23721,7 +23724,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_conversions(
@@ -23731,7 +23734,7 @@ impl Storage {
             catalog: &self.text_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_event_triggers(
@@ -23741,7 +23744,7 @@ impl Storage {
             catalog: &self.event_triggers,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_rules(&self) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
@@ -23749,7 +23752,7 @@ impl Storage {
             .map(|(_, entry)| entry)
             .enumerate()
             .filter(|(_, rule)| {
-                rule.ddl_state == CatalogDdlState::Present
+                rule.ddl_state.committed_exists()
                     && !rule.definition.is_view_return()
                     && !matches!(
                         rule.definition.target,
@@ -23771,7 +23774,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_operator_families(
@@ -23781,7 +23784,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_operator_classes(
@@ -23791,7 +23794,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_access_methods(
@@ -23801,7 +23804,7 @@ impl Storage {
             catalog: &self.operator_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_triggers(&self) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
@@ -23810,7 +23813,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && !matches!(
                     value.target,
                     TriggerTarget::Table(table)
@@ -23834,7 +23837,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && self.table_def(usize::from(value.table), 0).persistence
                     != RelationPersistence::Temporary
         })
@@ -23846,7 +23849,7 @@ impl Storage {
             next_slot: 0,
         }
         .filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && self.table_def(usize::from(value.table), 0).persistence
                     != RelationPersistence::Temporary
         })
@@ -23857,7 +23860,7 @@ impl Storage {
             catalog: &self.extension_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_extension_dependencies(
@@ -23882,7 +23885,7 @@ impl Storage {
 
     pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, IndexDef)> + '_ {
         self.matching_indexes(|value| {
-            value.ddl_state == CatalogDdlState::Present
+            value.ddl_state.committed_exists()
                 && !self.tables.iter().any(|table| {
                     table.database() == value.database
                         && table.live()
@@ -59768,6 +59771,11 @@ mod tests {
 
     #[test]
     fn catalog_ddl_state_has_one_visibility_rule() {
+        for transaction in [0, 1] {
+            assert!(CatalogDdlState::PendingDrop { txid: transaction }.committed_exists());
+            assert!(!CatalogDdlState::PendingCreate { txid: transaction }.committed_exists());
+            assert!(!CatalogDdlState::PendingCreateDrop { txid: transaction }.committed_exists());
+        }
         assert!(!CatalogDdlState::Absent.visible_to(1));
         assert!(CatalogDdlState::Present.visible_to(1));
         assert!(CatalogDdlState::PendingCreate { txid: 1 }.visible_to(1));

@@ -208,8 +208,8 @@ fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, "CREATE SEQUENCE retained_counter START 10; SELECT nextval('retained_counter'); CREATE FUNCTION retained_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW retained_report AS SELECT 7 AS value", false);
-                session.success(&mut engine, "BEGIN; ALTER SEQUENCE retained_counter RESTART WITH 50; SELECT nextval('retained_counter'); ALTER SEQUENCE retained_counter RENAME TO pending_counter; ALTER FUNCTION retained_body() RENAME TO pending_body; CREATE OR REPLACE FUNCTION pending_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; DROP MATERIALIZED VIEW retained_report; CREATE MATERIALIZED VIEW pending_report AS SELECT 9 AS value; CREATE SEQUENCE pending_created_counter; CREATE FUNCTION pending_created_body() RETURNS integer LANGUAGE SQL AS 'SELECT 3'; PREPARE TRANSACTION 'metadata-pending'", false);
+                session.success(&mut engine, "CREATE SEQUENCE retained_counter START 10; SELECT nextval('retained_counter'); CREATE FUNCTION retained_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW retained_report AS SELECT 7 AS value; CREATE SEQUENCE deleted_counter START 30; CREATE FUNCTION deleted_body() RETURNS integer LANGUAGE SQL AS 'SELECT 4'", false);
+                session.success(&mut engine, "BEGIN; DROP SEQUENCE deleted_counter; DROP FUNCTION deleted_body(); ALTER SEQUENCE retained_counter RESTART WITH 50; SELECT nextval('retained_counter'); ALTER SEQUENCE retained_counter RENAME TO pending_counter; ALTER FUNCTION retained_body() RENAME TO pending_body; CREATE OR REPLACE FUNCTION pending_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; DROP MATERIALIZED VIEW retained_report; CREATE MATERIALIZED VIEW pending_report AS SELECT 9 AS value; CREATE SEQUENCE pending_created_counter; CREATE FUNCTION pending_created_body() RETURNS integer LANGUAGE SQL AS 'SELECT 3'; PREPARE TRANSACTION 'metadata-pending'", false);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -304,6 +304,28 @@ fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
                         .unwrap()
                         .is_some()
                 );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", 0)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", transaction)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", 0)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", transaction)
+                        .unwrap()
+                        .is_none()
+                );
                 let mut resolved = ConfiguredTransactionSession::new(&config, &mut cold_budget);
                 resolved.success(
                     &mut cold,
@@ -313,6 +335,19 @@ fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
                         "ROLLBACK PREPARED 'metadata-pending'"
                     },
                     false,
+                );
+                assert_eq!(
+                    cold.storage
+                        .sequence_slot("public", "deleted_counter", 0)
+                        .is_none(),
+                    commit
+                );
+                assert_eq!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "deleted_body", 0)
+                        .unwrap()
+                        .is_none(),
+                    commit
                 );
                 let statement = if commit {
                     "SELECT nextval('pending_counter'); SELECT pending_body(); SELECT value FROM pending_report; SELECT pending_created_body()"

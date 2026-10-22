@@ -1243,7 +1243,7 @@ impl ForeignCatalog {
         self.wrappers
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.ddl_state == CatalogDdlState::Present)
+            .filter(|(_, entry)| entry.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_servers(
@@ -1252,7 +1252,7 @@ impl ForeignCatalog {
         self.servers
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.ddl_state == CatalogDdlState::Present)
+            .filter(|(_, entry)| entry.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_wrapper(

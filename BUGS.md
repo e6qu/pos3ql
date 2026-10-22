@@ -13,7 +13,8 @@ rollback, connection identity, permission checks, ownership across databases,
 recovery and slot reuse must preserve valid data and selected source identities.
 An unfinished metadata reference must prevent account deletion until its
 transaction commits or rolls back, including after prepared recovery.
-View and rule undo must not change a replacement object or its comments.
+View, materialized-view and rule undo must not change a replacement object or
+its comments.
 Materialized-view readability follows transaction and savepoint rollback.
 Keep detailed contracts in the
 [current behavior guide](docs/implemented-baseline.md) and regression evidence in

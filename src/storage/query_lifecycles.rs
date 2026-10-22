@@ -448,6 +448,18 @@ impl Storage {
             .comments
             .as_mut()
             .expect("query retirement owns comments");
+        self.stage_query_comment_drop(comments, source, schema, name, rule_subid, transaction)
+    }
+
+    fn stage_query_comment_drop(
+        &self,
+        comments: &mut super::CommentCatalog,
+        source: QueryIdentity,
+        schema: super::SqlName,
+        name: super::SqlName,
+        rule_subid: Option<u32>,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
         let matches = |comment: &super::CommentEntry| {
             let class_matches = match rule_subid {
                 Some(subid) => comment.class == super::CommentClass::Rule && comment.subid == subid,
@@ -512,6 +524,57 @@ impl Storage {
                 .is_some_and(|pending| pending.txid == transaction && pending.source == source)
         }) {
             comment.pending_drop = None;
+        }
+    }
+
+    pub(super) fn stage_matview_comment_drop(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let view = self.matview(slot);
+        let source = self.query_identity(
+            QueryCatalogSlot::MaterializedView(slot),
+            view.database,
+            view.created_at,
+        );
+        let definition = self.table_def(usize::from(view.backing_table), transaction);
+        self.stage_query_comment_drop(
+            &mut self.comment_catalog(),
+            source,
+            definition.schema,
+            definition.name,
+            None,
+            transaction,
+        )
+    }
+
+    pub(super) fn finish_matview_comment_drop(
+        &self,
+        slot: usize,
+        transaction: u32,
+        decision: QueryDdlDecision,
+    ) {
+        let view = self.matview(slot);
+        let source = self.query_identity(
+            QueryCatalogSlot::MaterializedView(slot),
+            view.database,
+            view.created_at,
+        );
+        let mut comments = self.comment_catalog();
+        match decision {
+            QueryDdlDecision::Commit => {
+                for comment in comments.entries.iter_mut().filter(|comment| {
+                    comment.pending_drop.is_some_and(|pending| {
+                        pending.txid == transaction && pending.source == source
+                    })
+                }) {
+                    *comment = super::CommentEntry::empty();
+                }
+            }
+            QueryDdlDecision::Rollback => {
+                self.rollback_query_comment_drop_in(&mut comments, source, transaction);
+            }
         }
     }
 

@@ -139,6 +139,62 @@ fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
 }
 
 #[test]
+fn materialized_view_recreation_keeps_comments_with_their_original_object() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("materialized-comment-reuse-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let comment = "SELECT obj_description('commented_matview'::regclass)";
+        session.success(&mut engine, "CREATE MATERIALIZED VIEW commented_matview AS SELECT 1 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'original'; BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 2 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT obj_description('commented_matview'::regclass) IS NULL",
+                true
+            )),
+            ["t"]
+        );
+        session.success(&mut engine, "COMMENT ON MATERIALIZED VIEW commented_matview IS 'replacement'; SAVEPOINT retained; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 3 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT obj_description('commented_matview'::regclass) IS NULL",
+                true
+            )),
+            ["t"]
+        );
+        session.success(
+            &mut engine,
+            "COMMENT ON MATERIALIZED VIEW commented_matview IS 'discarded'; ROLLBACK TO retained",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        session.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        session.success(&mut engine, "BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 4 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'rolled back'; ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM commented_matview", true)),
+            ["2"]
+        );
+    }
+}
+
+#[test]
 fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recovery() {
     for checkpoint in [false, true] {
         for decision in ["COMMIT", "COMMIT PREPARED", "ROLLBACK PREPARED"] {

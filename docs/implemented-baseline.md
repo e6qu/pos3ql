@@ -794,7 +794,8 @@ SELECT total FROM report; -- 1
 View and rule edits retain the selected object and revision through waits and
 undo. A stale edit cannot modify a replacement in the same catalog slot. Dropping
 and recreating a name starts with no comment; rollback restores the old object's
-comment. Savepoints preserve this distinction through repeated reuse.
+comment. This also applies to materialized views. Savepoints preserve this
+distinction through repeated reuse.
 
 A materialized view stores query results. `WITH NO DATA` leaves it unreadable:
 ordinary reads return `55000`, including `LIMIT 0`. A constant-false `WHERE`

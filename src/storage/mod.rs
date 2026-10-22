@@ -37742,6 +37742,7 @@ impl Storage {
         }) else {
             return Ok(None);
         };
+        self.stage_matview_comment_drop(i, txid)?;
         self.pending_drop_matview(i, txid);
         Ok(Some(i))
     }
@@ -37758,9 +37759,12 @@ impl Storage {
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
-        let definition = *self.tables[usize::from(self.matview(slot).backing_table)].definition();
-        let (schema, name) = (definition.schema, definition.name);
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
+        let transaction = self
+            .matview(slot)
+            .ddl_state
+            .pending_drop_txid()
+            .expect("materialized-view retirement follows a pending drop");
+        self.finish_matview_comment_drop(slot, transaction, QueryDdlDecision::Commit);
         self.matview_catalog()[slot] = MatviewDef::EMPTY;
         let image = self.matview_dependency_image(slot);
         self.clear_dependency_image(image);
@@ -37777,6 +37781,7 @@ impl Storage {
     }
 
     pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
+        self.finish_matview_comment_drop(slot, txid, QueryDdlDecision::Rollback);
         let mut matviews = self.matview_catalog();
         let m = &mut matviews[slot];
         m.ddl_state = m.ddl_state.rollback_drop(txid);

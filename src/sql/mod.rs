@@ -8029,8 +8029,13 @@ impl Engine {
             .as_ref()
             .and_then(|pending| pending.retry_at)
             .or_else(|| {
-                (self.inflight_publication.is_none() && self.wal.pending_batch_bytes() != 0)
-                    .then(std::time::Instant::now)
+                (self.inflight_publication.is_none()
+                    && self.wal.pending_batch_bytes() != 0
+                    && !self
+                        .ckpt
+                        .as_ref()
+                        .is_some_and(Checkpointer::credential_install_pending))
+                .then(std::time::Instant::now)
             });
         [
             journal,

@@ -1242,6 +1242,9 @@ impl Server {
                     .and_then(|probe| probe.deadline())
                     .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                 self.buffered_subscription_work().then_some(Duration::ZERO),
+                // A coalesced reload must not need another socket event after installation.
+                (RELOAD_REQUESTED.load(Ordering::SeqCst) && !self.credential_reload_pending)
+                    .then_some(Duration::ZERO),
                 (self.engine.read_capacity_generation() != self.read_capacity_generation)
                     .then_some(Duration::ZERO),
                 self.engine

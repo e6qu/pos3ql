@@ -53,7 +53,7 @@ mod tests {
         #[derive(Debug)]
         enum RowCreation {
             Table(usize),
-            View(super::super::QueryDdlUndo),
+            View(super::super::CatalogDdlUndo),
         }
         for kind in KINDS {
             for view in [false, true] {
@@ -113,7 +113,7 @@ mod tests {
                         match row {
                             RowCreation::View(undo) => storage.finish_view_publication(
                                 super::super::ViewPublication::Created(undo),
-                                super::super::QueryDdlDecision::Rollback,
+                                super::super::CatalogDdlDecision::Rollback,
                             ),
                             RowCreation::Table(slot) => storage.rollback_create(slot),
                         }

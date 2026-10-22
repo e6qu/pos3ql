@@ -32,6 +32,9 @@ When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
+The next combined batch covers sequence edits and identity restarts, routine
+replacement, and materialized-view creation and deletion. Check stale undo,
+comment and permission cleanup, savepoints, exhaustion, and recovery together.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The
 [current behavior guide](docs/implemented-baseline.md) owns the implemented

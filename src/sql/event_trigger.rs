@@ -803,9 +803,16 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
             (ObjectRef::MaterializedView(undo.slot()), Mutation::Alter)
         }
         MatviewDropped(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Drop),
-        SequenceCreated(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Create),
-        SequenceDropped(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Drop),
-        SequenceAltered { slot, .. } => (ObjectRef::Sequence(slot as usize), Mutation::Alter),
+        SequenceChanged(change) => (
+            ObjectRef::Sequence(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else if change.is_drop() {
+                Mutation::Drop
+            } else {
+                Mutation::Alter
+            },
+        ),
         DomainCreated(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Create),
         DomainDropped(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Drop),
         DomainAltered(undo) => (ObjectRef::Domain(undo.slot()), Mutation::Alter),

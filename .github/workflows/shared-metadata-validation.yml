@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  baseline:
+  focused:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -39,17 +39,9 @@ jobs:
           assert output == ["fresh", "replacement"], output
           print("PostgreSQL reference:", output)
           PYTHON
-      - name: Prove the original sequence-comment failure
-        run: |
-          set +e
-          cargo test --release --lib --locked \
-            sql::tests::metadata_sequence_comment_reuse_keeps_replacement -- --exact \
-            > "$RUNNER_TEMP/metadata-baseline.log" 2>&1
-          result=$?
-          set -e
-          cat "$RUNNER_TEMP/metadata-baseline.log"
-          test "$result" -eq 101
-          grep -F 'test sql::tests::metadata_sequence_comment_reuse_keeps_replacement ... FAILED' "$RUNNER_TEMP/metadata-baseline.log"
-          grep -F 'left: ["retiring", "missing"]' "$RUNNER_TEMP/metadata-baseline.log"
-          grep -F 'right: ["fresh", "replacement"]' "$RUNNER_TEMP/metadata-baseline.log"
-          grep -F 'test result: FAILED. 0 passed; 1 failed; 0 ignored;' "$RUNNER_TEMP/metadata-baseline.log"
+      - name: Sequence and saved-query lifetime regressions
+        run: >-
+          cargo test --release --lib --locked -- sequence query_lifecycle
+          --test-threads=1
+      - name: All-target compilation and lint
+        run: cargo clippy --all-targets --locked -- -D warnings

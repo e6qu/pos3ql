@@ -1022,7 +1022,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
         }
         DdlUndo::MatviewCreated(slot) => (AccessClass::MaterializedView, slot),
         DdlUndo::RoutineCreated(slot) => (AccessClass::Routine, slot),
-        DdlUndo::SequenceCreated(slot) => (AccessClass::Sequence, slot),
+        DdlUndo::SequenceChanged(change) if change.is_creation() => {
+            (AccessClass::Sequence, change.slot() as u32)
+        }
         DdlUndo::DomainCreated(undo) => (AccessClass::Domain, undo.slot() as u32),
         DdlUndo::EnumCreated(undo) => (AccessClass::Enum, undo.slot() as u32),
         DdlUndo::CompositeCreated(undo) => (AccessClass::Composite, undo.slot() as u32),
@@ -5418,6 +5420,9 @@ impl Engine {
             ));
         }
         let query_validation = txn.ddl().iter().try_for_each(|undo| match undo {
+            DdlUndo::SequenceChanged(change) => {
+                self.storage.validate_sequence_change(*change, txn.txid)
+            }
             DdlUndo::ViewChanged(publication) => self
                 .storage
                 .validate_view_publication(*publication, txn.txid),
@@ -5962,10 +5967,12 @@ impl Engine {
                     class: crate::storage::AccessClass::MaterializedView,
                     slot: slot as u16,
                 }),
-                DdlUndo::SequenceCreated(slot) => Some(crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Sequence,
-                    slot: slot as u16,
-                }),
+                DdlUndo::SequenceChanged(change) if change.is_creation() => {
+                    Some(crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Sequence,
+                        slot: change.slot() as u16,
+                    })
+                }
                 DdlUndo::DomainCreated(undo) => Some(crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Domain,
                     slot: undo.slot() as u16,
@@ -6732,19 +6739,19 @@ impl Engine {
                 DdlUndo::TableAltered(_) => {}
                 DdlUndo::ViewChanged(publication) => self.storage.finish_view_publication(
                     *publication,
-                    crate::storage::QueryDdlDecision::Commit,
+                    crate::storage::CatalogDdlDecision::Commit,
                 ),
                 DdlUndo::ViewDropped(undo) => self.storage.commit_view_drop(*undo),
                 DdlUndo::MatviewPopulationChanged(undo) => self
                     .storage
-                    .finish_matview_population(*undo, crate::storage::QueryDdlDecision::Commit),
+                    .finish_matview_population(*undo, crate::storage::CatalogDdlDecision::Commit),
                 DdlUndo::RuleChanged {
                     publication,
                     prior_table_rule_txid,
                 } => self.storage.finish_rule_publication(
                     *publication,
                     *prior_table_rule_txid,
-                    crate::storage::QueryDdlDecision::Commit,
+                    crate::storage::CatalogDdlDecision::Commit,
                 ),
                 DdlUndo::RuleAltered(undo) => self.storage.commit_rule_alter(*undo),
                 DdlUndo::RuleDropped(undo) => self.storage.commit_rule_drop(*undo),
@@ -6973,17 +6980,9 @@ impl Engine {
                     );
                 }
                 DdlUndo::MatviewDropped(slot) => self.storage.commit_matview_drop(*slot as usize),
-                DdlUndo::SequenceCreated(slot) => {
-                    self.storage.commit_sequence_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::Sequence,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
-                }
-                DdlUndo::SequenceDropped(slot) => self.storage.commit_sequence_drop(*slot as usize),
+                DdlUndo::SequenceChanged(change) => self
+                    .storage
+                    .finish_sequence_change(*change, crate::storage::CatalogDdlDecision::Commit),
                 DdlUndo::LargeObjectCreated(slot) => {
                     self.storage.commit_large_object_create(*slot as usize);
                     self.storage.commit_object_owner(
@@ -6996,9 +6995,6 @@ impl Engine {
                 }
                 DdlUndo::LargeObjectDropped(slot) => {
                     self.storage.commit_large_object_drop(*slot as usize)
-                }
-                DdlUndo::SequenceAltered { slot, .. } => {
-                    self.storage.commit_sequence_alter(*slot as usize, txn.txid)
                 }
                 DdlUndo::DomainCreated(undo) => {
                     self.storage
@@ -7087,7 +7083,7 @@ impl Engine {
                 }
                 DdlUndo::DatabaseDropped(slot) => self.storage.commit_database_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
-                DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
+                DdlUndo::SequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => {
                     self.storage.commit_schema_create(*slot as usize);
                 }
@@ -19684,11 +19680,10 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::TableAltered(slot) => {
             storage.rollback_table_def(slot as usize, txid);
         }
-        DdlUndo::ViewChanged(publication) => {
-            storage.finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback)
-        }
+        DdlUndo::ViewChanged(publication) => storage
+            .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback),
         DdlUndo::MatviewPopulationChanged(undo) => {
-            storage.finish_matview_population(undo, crate::storage::QueryDdlDecision::Rollback)
+            storage.finish_matview_population(undo, crate::storage::CatalogDdlDecision::Rollback)
         }
         DdlUndo::RuleChanged {
             publication,
@@ -19696,7 +19691,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         } => storage.finish_rule_publication(
             publication,
             prior_table_rule_txid,
-            crate::storage::QueryDdlDecision::Rollback,
+            crate::storage::CatalogDdlDecision::Rollback,
         ),
         DdlUndo::RuleAltered(undo) => storage.rollback_rule_alter(undo),
         DdlUndo::RuleDropped(undo) => storage.rollback_rule_drop(undo),
@@ -19871,14 +19866,8 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::MatviewDropped(slot) => {
             storage.rollback_matview_drop(slot as usize, txid);
         }
-        DdlUndo::SequenceCreated(slot) => {
-            storage.rollback_sequence_create(slot as usize);
-        }
-        DdlUndo::SequenceDropped(slot) => {
-            storage.rollback_sequence_drop(slot as usize, txid);
-        }
-        DdlUndo::SequenceAltered { slot, prior } => {
-            storage.rollback_sequence_alter(slot as usize, prior);
+        DdlUndo::SequenceChanged(change) => {
+            storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
         }
         DdlUndo::LargeObjectCreated(slot) => storage.rollback_large_object_create(slot as usize),
         DdlUndo::LargeObjectDropped(slot) => {
@@ -19964,9 +19953,6 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             prior,
         } => {
             storage.set_table_serial_value(table as usize, column as usize, prior);
-        }
-        DdlUndo::OwnedSequenceReset { sequence, prior } => {
-            storage.restore_sequence_value(sequence as usize, prior);
         }
         DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
         DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
@@ -20266,7 +20252,7 @@ fn replay_transaction_batches(
                                 storage.sequence_slot(schema, name, transaction_id)
                             {
                                 let prior = storage.stage_sequence_alter(
-                                    sequence,
+                                    storage.prepare_sequence_edit(sequence, transaction_id)?,
                                     crate::storage::SequenceAlteration {
                                         schema: crate::storage::SqlName::parse(schema)?,
                                         name: crate::storage::SqlName::parse(name)?,
@@ -20278,12 +20264,10 @@ fn replay_transaction_batches(
                                     },
                                     transaction_id,
                                 )?;
-                                prepared.slot_mut(slot).transaction.record_ddl(
-                                    DdlUndo::SequenceAltered {
-                                        slot: sequence as u32,
-                                        prior,
-                                    },
-                                )?;
+                                prepared
+                                    .slot_mut(slot)
+                                    .transaction
+                                    .record_sequence_change(storage, prior)?;
                             } else {
                                 let sequence = storage.create_sequence(
                                     crate::storage::SequenceCreateSpec {
@@ -20299,7 +20283,7 @@ fn replay_transaction_batches(
                                 prepared
                                     .slot_mut(slot)
                                     .transaction
-                                    .record_ddl(DdlUndo::SequenceCreated(sequence as u32))?;
+                                    .record_sequence_change(storage, sequence)?;
                             }
                         }
                         WalOp::PreparedLocks {
@@ -22046,8 +22030,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // An ALTER replays as CreateSequence: if the sequence already exists,
             // redefine it in place; otherwise create it.
             if let Some(slot) = storage.sequence_slot(schema, name, 0) {
-                storage.stage_sequence_alter(
-                    slot,
+                let change = storage.stage_sequence_alter(
+                    storage.prepare_sequence_edit(slot, 0)?,
                     crate::storage::SequenceAlteration {
                         schema: crate::storage::SqlName::parse(schema)?,
                         name: crate::storage::SqlName::parse(name)?,
@@ -22059,7 +22043,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     },
                     0,
                 )?;
-                storage.commit_sequence_alter(slot, 0);
+                storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Commit);
             } else {
                 let slot = storage.create_sequence(
                     crate::storage::SequenceCreateSpec {
@@ -22072,12 +22056,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     },
                     0,
                 )?;
-                storage.commit_sequence_create(slot);
+                storage.finish_sequence_change(slot, crate::storage::CatalogDdlDecision::Commit);
             }
         }
         WalOp::DropSequence { schema, name } => {
             if let Some(slot) = storage.drop_sequence(schema, name, 0)? {
-                storage.commit_sequence_drop(slot);
+                storage.finish_sequence_change(slot, crate::storage::CatalogDdlDecision::Commit);
             }
         }
         WalOp::SequenceAdvance {
@@ -22760,8 +22744,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 cache: current.cache,
                 cycle: current.cycle,
             };
-            storage.stage_sequence_alter(
-                slot,
+            let change = storage.stage_sequence_alter(
+                storage.prepare_sequence_edit(slot, 0)?,
                 crate::storage::SequenceAlteration {
                     schema: crate::storage::SqlName::parse(new_schema)?,
                     name: current.name,
@@ -22773,7 +22757,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
-            storage.commit_sequence_alter(slot, 0);
+            storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Commit);
         }
         WalOp::RenameSequence {
             schema,
@@ -22797,8 +22781,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 cache: current.cache,
                 cycle: current.cycle,
             };
-            storage.stage_sequence_alter(
-                slot,
+            let change = storage.stage_sequence_alter(
+                storage.prepare_sequence_edit(slot, 0)?,
                 crate::storage::SequenceAlteration {
                     schema: current.schema,
                     name: crate::storage::SqlName::parse(new_name)?,
@@ -22810,7 +22794,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 },
                 0,
             )?;
-            storage.commit_sequence_alter(slot, 0);
+            storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Commit);
         }
         WalOp::SetViewSchema {
             schema,

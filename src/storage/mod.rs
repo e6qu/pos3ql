@@ -7,12 +7,15 @@
 
 mod catalog_sources;
 mod query_lifecycles;
+mod sequence_lifecycles;
 pub(crate) use query_lifecycles::{
-    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, RuleAlterUndo, RulePublication,
-    ViewCatalogIdentity, ViewPublication,
+    MatviewPopulationUndo, RuleAlterUndo, RulePublication, ViewCatalogIdentity, ViewPublication,
 };
+pub(crate) use sequence_lifecycles::SequenceChange;
 mod role_dependencies;
-pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
+pub(crate) use catalog_sources::{
+    CatalogDdlDecision, CatalogDdlUndo, RoleOid, SessionIdentity, SessionRole,
+};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -9873,6 +9876,8 @@ impl SeqType {
 pub struct SequenceDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
+    version: u64,
+    ddl_version: u64,
     cache_generation: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -9902,6 +9907,8 @@ impl SequenceDef {
     const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
+        version: 0,
+        ddl_version: 0,
         cache_generation: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -9978,6 +9985,7 @@ pub(crate) struct SequenceCacheIdentity {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingSequenceDefinition {
     pub txid: u32,
+    pub(super) version: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub spec: SeqSpec,
@@ -9990,26 +9998,6 @@ pub(crate) struct PendingSequenceDefinition {
     /// A staged RESTART owns its temporary value image. Other definition
     /// changes do not make `nextval` transactional.
     pub restarted: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SequenceValueState {
-    Committed {
-        last_value: i64,
-        is_called: bool,
-        log_count: i64,
-        dirty: bool,
-        generation: u64,
-        staged_generation: u64,
-    },
-    Pending {
-        last_value: i64,
-        is_called: bool,
-        log_count: i64,
-        dirty: bool,
-        generation: u64,
-        staged_generation: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10094,6 +10082,7 @@ impl SequenceDef {
             .map_or_else(
                 || *self,
                 |pending| Self {
+                    version: pending.version,
                     schema: pending.schema,
                     name: pending.name,
                     data_type: pending.spec.data_type,
@@ -12777,7 +12766,7 @@ pub struct CommentEntry {
 #[derive(Clone, Copy, Debug)]
 struct PendingCommentDrop {
     txid: u32,
-    source: query_lifecycles::QueryIdentity,
+    source: catalog_sources::CatalogObjectIdentity,
 }
 
 struct CommentCatalog {
@@ -16581,8 +16570,8 @@ impl Storage {
                 && self.view(slot).schema == schema
             {
                 let view = self.view(slot);
-                let source = self.query_identity(
-                    query_lifecycles::QueryCatalogSlot::View(slot),
+                let source = self.catalog_object_identity(
+                    catalog_sources::CatalogObjectSlot::View(slot),
                     view.database,
                     view.created_at,
                 );
@@ -16619,11 +16608,11 @@ impl Storage {
                 && sequence.persistence == RelationPersistence::Temporary
                 && sequence.schema == schema
             {
-                let mut catalog = self.sequence_catalog();
-                catalog.definitions[slot].ddl_state =
-                    catalog.definitions[slot].ddl_state.drop_by(0);
-                drop(catalog);
-                self.commit_sequence_drop(slot);
+                self.retire_temporary_sequence_source(self.catalog_object_identity(
+                    catalog_sources::CatalogObjectSlot::Sequence(slot),
+                    sequence.database,
+                    sequence.created_at,
+                ));
             }
         }
     }
@@ -16671,11 +16660,11 @@ impl Storage {
                                 owner.table_schema == schema && owner.table == table
                             })
                         {
-                            let mut catalog = self.sequence_catalog();
-                            catalog.definitions[sequence].ddl_state =
-                                catalog.definitions[sequence].ddl_state.drop_by(0);
-                            drop(catalog);
-                            self.commit_sequence_drop(sequence);
+                            self.retire_temporary_sequence_source(self.catalog_object_identity(
+                                catalog_sources::CatalogObjectSlot::Sequence(sequence),
+                                definition.database,
+                                definition.created_at,
+                            ));
                         }
                     }
                     self.commit_drop(slot);
@@ -27419,20 +27408,39 @@ impl Storage {
         new_name: SqlName,
         txid: u32,
     ) {
+        self.stage_object_comment_identity_locked(
+            &mut self.comment_catalog(),
+            class,
+            old_schema,
+            old_name,
+            new_schema,
+            new_name,
+            txid,
+        );
+    }
+
+    fn stage_object_comment_identity_locked(
+        &self,
+        comments: &mut CommentCatalog,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+        txid: u32,
+    ) {
         let database = Some(current_database());
-        let mut comments = self.comment_catalog();
         for comment in comments.entries.iter_mut().filter(|comment| {
-            comment.used
-                && comment.database == database
-                && comment.class == class
-                && ((comment.schema == old_schema && comment.name == old_name)
-                    || comment.pending_identity.is_some_and(|identity| {
-                        identity.txid == txid
-                            && identity.schema == old_schema
-                            && identity.name == old_name
-                    }))
+            comment.matches_to(
+                database,
+                class,
+                old_schema.as_str(),
+                old_name.as_str(),
+                comment.subid,
+                txid,
+            )
         }) {
-            let changed = old_schema != new_schema || old_name != new_name;
+            let changed = comment.schema != new_schema || comment.name != new_name;
             comment.pending_identity = changed.then_some(PendingCommentIdentity {
                 txid,
                 schema: new_schema,
@@ -27448,10 +27456,29 @@ impl Storage {
         old_name: SqlName,
         txid: u32,
     ) {
+        self.commit_object_comment_identity_locked(
+            &mut self.comment_catalog(),
+            class,
+            old_schema,
+            old_name,
+            txid,
+        );
+    }
+
+    fn commit_object_comment_identity_locked(
+        &self,
+        comments: &mut CommentCatalog,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        txid: u32,
+    ) {
         let database = Some(current_database());
-        let mut comments = self.comment_catalog();
         for comment in comments.entries.iter_mut().filter(|comment| {
             comment.used
+                && comment
+                    .pending_drop
+                    .is_none_or(|pending| pending.txid != txid)
                 && comment.database == database
                 && comment.class == class
                 && comment.schema == old_schema
@@ -28592,7 +28619,14 @@ impl Storage {
     }
 
     fn clear_extension_dependencies_for_object(&self, object: AccessObject) {
-        for dependency in self.extension_catalog().dependencies.iter_mut() {
+        Self::clear_extension_dependencies_for_object_locked(&mut self.extension_catalog(), object);
+    }
+
+    fn clear_extension_dependencies_for_object_locked(
+        catalog: &mut ExtensionCatalog,
+        object: AccessObject,
+    ) {
+        for dependency in catalog.dependencies.iter_mut() {
             if dependency.object == object {
                 *dependency = ExtensionDependency::EMPTY;
             }
@@ -37764,7 +37798,7 @@ impl Storage {
             .ddl_state
             .pending_drop_txid()
             .expect("materialized-view retirement follows a pending drop");
-        self.finish_matview_comment_drop(slot, transaction, QueryDdlDecision::Commit);
+        self.finish_matview_comment_drop(slot, transaction, CatalogDdlDecision::Commit);
         self.matview_catalog()[slot] = MatviewDef::EMPTY;
         let image = self.matview_dependency_image(slot);
         self.clear_dependency_image(image);
@@ -37781,7 +37815,7 @@ impl Storage {
     }
 
     pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
-        self.finish_matview_comment_drop(slot, txid, QueryDdlDecision::Rollback);
+        self.finish_matview_comment_drop(slot, txid, CatalogDdlDecision::Rollback);
         let mut matviews = self.matview_catalog();
         let m = &mut matviews[slot];
         m.ddl_state = m.ddl_state.rollback_drop(txid);
@@ -37973,238 +38007,8 @@ impl Storage {
         self.relation_kind_in(schema, name, txid).is_some()
     }
 
-    /// Registers a sequence as an uncommitted CREATE owned by `txid`. The caller
-    /// has already validated options and checked the name is free.
-    pub(crate) fn create_sequence(
-        &mut self,
-        create: SequenceCreateSpec,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let SequenceCreateSpec {
-            schema,
-            name,
-            spec,
-            owner,
-            generator_for,
-            persistence,
-        } = create;
-        self.require_schema_create(schema.as_str(), txid)?;
-        let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
-        let mut catalog = self.sequence_catalog();
-        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
-            (s.database == current_database()
-                && s.schema.as_str() == schema.as_str()
-                && s.name.as_str() == name.as_str())
-            .then_some(s.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            drop(catalog);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        let Some(new) = catalog
-            .definitions
-            .iter()
-            .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many sequences (limit {})",
-                catalog.definitions.len()
-            ));
-        };
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Sequence,
-            slot: new as u16,
-        });
-        catalog.definitions[new] = SequenceDef {
-            database: current_database(),
-            created_at,
-            cache_generation: 0,
-            schema,
-            name,
-            ownership,
-            data_type: spec.data_type,
-            increment: spec.increment,
-            min_value: spec.min_value,
-            max_value: spec.max_value,
-            start_value: spec.start_value,
-            cache: spec.cache,
-            cycle: spec.cycle,
-            persistence,
-            owner,
-            generator_for,
-            pending_definition: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        catalog.values[new] = SequenceValues::initial(spec.start_value);
-        drop(catalog);
-        if persistence == RelationPersistence::Temporary {
-            self.mark_temporary_transaction(txid);
-        }
-        Ok(new)
-    }
-
     pub(crate) fn sequence_for(&self, slot: usize, txid: u32) -> SequenceDef {
         self.sequence_catalog().definitions[slot].definition_for(txid)
-    }
-
-    pub(crate) fn stage_sequence_alter(
-        &mut self,
-        slot: usize,
-        alteration: SequenceAlteration,
-        txid: u32,
-    ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
-        let mut catalog = self.sequence_catalog();
-        let current_identity = catalog.definitions[slot].definition_for(txid);
-        let pending = catalog.definitions[slot].pending_definition;
-        if let Some(pending) = pending
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "sequence \"{}\" is being altered by another transaction",
-                catalog.definitions[slot].name.as_str()
-            ));
-        }
-        let sequence_values = &mut catalog.values[slot];
-        let prior = pending.map(|pending| PendingSequenceDefinition {
-            last_value: sequence_values.pending.last_value,
-            is_called: sequence_values.pending.is_called,
-            log_count: sequence_values.pending.log_count,
-            ..pending
-        });
-        let active = if pending.is_some_and(|pending| pending.txid == txid) {
-            sequence_values.pending
-        } else {
-            sequence_values.committed
-        };
-        let (last_value, is_called) = alteration
-            .restart
-            .map_or((active.last_value, active.is_called), |value| {
-                (value, false)
-            });
-        let restarted = pending.is_some_and(|pending| pending.txid == txid && pending.restarted)
-            || alteration.restart.is_some();
-        sequence_values.pending = SequenceValue {
-            last_value,
-            is_called,
-            log_count: 0,
-            dirty: alteration.restart.is_some(),
-            generation: sequence_values.pending.generation.wrapping_add(1),
-            staged_generation: 0,
-        };
-        catalog.definitions[slot].pending_definition = Some(PendingSequenceDefinition {
-            txid,
-            schema: alteration.schema,
-            name: alteration.name,
-            spec: alteration.spec,
-            owner: alteration.owner,
-            generator_for: alteration.generator_for,
-            persistence: alteration.persistence,
-            last_value,
-            is_called,
-            log_count: 0,
-            restarted,
-        });
-        drop(catalog);
-        if current_identity.schema != alteration.schema || current_identity.name != alteration.name
-        {
-            self.stage_object_comment_identity(
-                CommentClass::Relation,
-                current_identity.schema,
-                current_identity.name,
-                alteration.schema,
-                alteration.name,
-                txid,
-            );
-        }
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_sequence_alter(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.sequence_catalog();
-        if catalog.definitions[slot]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .is_some()
-        {
-            let old_schema = catalog.definitions[slot].schema;
-            let old_name = catalog.definitions[slot].name;
-            let definition = catalog.definitions[slot].definition_for(txid);
-            catalog.definitions[slot] = definition;
-            let values = &mut catalog.values[slot];
-            values.committed = values.pending;
-            values.committed.dirty = false;
-            values.committed.staged_generation = 0;
-            values.pending.dirty = false;
-            values.pending.staged_generation = 0;
-            if old_schema != catalog.definitions[slot].schema
-                || old_name != catalog.definitions[slot].name
-            {
-                let new_schema = catalog.definitions[slot].schema;
-                let new_name = catalog.definitions[slot].name;
-                drop(catalog);
-                self.commit_object_comment_identity(
-                    CommentClass::Relation,
-                    old_schema,
-                    old_name,
-                    txid,
-                );
-                self.rename_stored_query_dependency(
-                    DependencyClass::Sequence,
-                    slot,
-                    None,
-                    new_schema,
-                    new_name,
-                );
-            }
-        }
-    }
-
-    pub(crate) fn rollback_sequence_alter(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingSequenceDefinition>,
-    ) {
-        let mut catalog = self.sequence_catalog();
-        let current = catalog.definitions[slot].pending_definition;
-        let txid = current.map(|pending| pending.txid);
-        let old_identity = current.map(|pending| (pending.schema, pending.name));
-        // ALTER SEQUENCE's definition is transactional, but an advance made
-        // under an ordinary staged definition is not.  Only RESTART owns a
-        // temporary value image that rollback may discard.
-        catalog.definitions[slot].pending_definition = prior;
-        let values = &mut catalog.values[slot];
-        if current.is_some_and(|pending| !pending.restarted) {
-            values.committed = values.pending;
-        }
-        if let Some(prior) = prior {
-            values.pending = SequenceValue {
-                last_value: prior.last_value,
-                is_called: prior.is_called,
-                log_count: prior.log_count,
-                dirty: false,
-                generation: values.pending.generation.wrapping_add(1),
-                staged_generation: 0,
-            };
-        } else {
-            values.pending.dirty = false;
-        }
-        if let (Some(txid), Some((old_schema, old_name))) = (txid, old_identity) {
-            let visible = catalog.definitions[slot].definition_for(txid);
-            if old_schema != visible.schema || old_name != visible.name {
-                drop(catalog);
-                self.stage_object_comment_identity(
-                    CommentClass::Relation,
-                    old_schema,
-                    old_name,
-                    visible.schema,
-                    visible.name,
-                    txid,
-                );
-            }
-        }
     }
 
     pub(crate) fn reserve_sequence_values(
@@ -38349,160 +38153,6 @@ impl Storage {
             value.dirty = false;
             value.staged_generation = 0;
         }
-    }
-
-    pub(crate) fn reset_sequence_value(
-        &self,
-        slot: usize,
-        txid: u32,
-        value: i64,
-    ) -> SequenceValueState {
-        let mut catalog = self.sequence_catalog();
-        let sequence = catalog.definitions[slot];
-        let pending = sequence
-            .pending_definition
-            .is_some_and(|pending| pending.txid == txid);
-        if pending {
-            let state = &mut catalog.values[slot].pending;
-            let prior = SequenceValueState::Pending {
-                last_value: state.last_value,
-                is_called: state.is_called,
-                log_count: state.log_count,
-                dirty: state.dirty,
-                generation: state.generation,
-                staged_generation: state.staged_generation,
-            };
-            *state = SequenceValue {
-                last_value: value,
-                is_called: false,
-                log_count: 0,
-                dirty: true,
-                generation: state.generation.wrapping_add(1),
-                staged_generation: state.staged_generation,
-            };
-            return prior;
-        }
-        let state = &mut catalog.values[slot].committed;
-        let prior = SequenceValueState::Committed {
-            last_value: state.last_value,
-            is_called: state.is_called,
-            log_count: state.log_count,
-            dirty: state.dirty,
-            generation: state.generation,
-            staged_generation: state.staged_generation,
-        };
-        *state = SequenceValue {
-            last_value: value,
-            is_called: false,
-            log_count: 0,
-            dirty: true,
-            generation: state.generation.wrapping_add(1),
-            staged_generation: state.staged_generation,
-        };
-        prior
-    }
-
-    pub(crate) fn restore_sequence_value(&self, slot: usize, prior: SequenceValueState) {
-        let mut catalog = self.sequence_catalog();
-        match prior {
-            SequenceValueState::Committed {
-                last_value,
-                is_called,
-                log_count,
-                dirty,
-                generation,
-                staged_generation,
-            } => {
-                catalog.values[slot].committed = SequenceValue {
-                    last_value,
-                    is_called,
-                    log_count,
-                    dirty,
-                    generation,
-                    staged_generation,
-                };
-            }
-            SequenceValueState::Pending {
-                last_value,
-                is_called,
-                log_count,
-                dirty,
-                generation,
-                staged_generation,
-            } => {
-                catalog.values[slot].pending = SequenceValue {
-                    last_value,
-                    is_called,
-                    log_count,
-                    dirty,
-                    generation,
-                    staged_generation,
-                };
-            }
-        }
-    }
-
-    pub fn drop_sequence(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let mut catalog = self.sequence_catalog();
-        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
-            let definition = s.definition_for(txid);
-            (s.database == current_database()
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name)
-                .then_some(s.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            drop(catalog);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(i) = catalog.definitions.iter().position(|s| {
-            let definition = s.definition_for(txid);
-            s.database == current_database()
-                && s.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-        }) else {
-            return Ok(None);
-        };
-        let sequence = &mut catalog.definitions[i];
-        sequence.ddl_state = sequence.ddl_state.drop_by(txid);
-        Ok(Some(i))
-    }
-
-    pub fn commit_sequence_create(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
-    }
-
-    pub fn commit_sequence_drop(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        let (schema, name) = (
-            catalog.definitions[slot].schema,
-            catalog.definitions[slot].name,
-        );
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
-        catalog.definitions[slot] = SequenceDef::EMPTY;
-        catalog.values[slot] = SequenceValues::initial(1);
-        drop(catalog);
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-    }
-
-    pub fn rollback_sequence_create(&mut self, slot: usize) {
-        let mut catalog = self.sequence_catalog();
-        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.rollback_create();
-        catalog.definitions[slot] = SequenceDef::EMPTY;
-        catalog.values[slot] = SequenceValues::initial(1);
-    }
-
-    pub fn rollback_sequence_drop(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.sequence_catalog();
-        let sequence = &mut catalog.definitions[slot];
-        sequence.ddl_state = sequence.ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn restore_sequence_value_image(
@@ -40674,14 +40324,14 @@ impl Storage {
         if definition.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
-        Ok(ViewPublication::Created(QueryDdlUndo {
-            source: self.query_identity(
-                query_lifecycles::QueryCatalogSlot::View(new),
+        Ok(ViewPublication::Created(CatalogDdlUndo {
+            source: self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::View(new),
                 current_database(),
                 created_at,
             ),
             transaction: txid,
-            operation: query_lifecycles::QueryDdlOperation::Create,
+            operation: catalog_sources::CatalogDdlOperation::Create,
             version: created_at,
             prior_version: 0,
         }))
@@ -40703,7 +40353,7 @@ impl Storage {
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
-    fn retire_view_source(&mut self, source: query_lifecycles::QueryIdentity) {
+    fn retire_view_source(&mut self, source: catalog_sources::CatalogObjectIdentity) {
         let Some(slot) = source.view_slot() else {
             return;
         };
@@ -49994,9 +49644,9 @@ impl Storage {
             });
             let rule = owners.catalog.rules[slot];
             return Ok(RulePublication::Altered(RuleAlterUndo {
-                target: query_lifecycles::QueryEditTarget {
-                    source: self.query_identity(
-                        query_lifecycles::QueryCatalogSlot::Rule(slot),
+                target: catalog_sources::CatalogEditTarget {
+                    source: self.catalog_object_identity(
+                        catalog_sources::CatalogObjectSlot::Rule(slot),
                         rule.database,
                         rule.created_at,
                     ),
@@ -50008,14 +49658,14 @@ impl Storage {
         }
         let slot = self.create_new_rule_in(&mut owners, definition, dependencies, txid)?;
         let rule = owners.catalog.rules[slot];
-        Ok(RulePublication::Created(QueryDdlUndo {
-            source: self.query_identity(
-                query_lifecycles::QueryCatalogSlot::Rule(slot),
+        Ok(RulePublication::Created(CatalogDdlUndo {
+            source: self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Rule(slot),
                 rule.database,
                 rule.created_at,
             ),
             transaction: txid,
-            operation: query_lifecycles::QueryDdlOperation::Create,
+            operation: catalog_sources::CatalogDdlOperation::Create,
             version: rule.ddl_version,
             prior_version: 0,
         }))
@@ -50064,7 +49714,7 @@ impl Storage {
 
     pub(crate) fn alter_rule(
         &self,
-        selected_target: query_lifecycles::QueryEditTarget,
+        selected_target: catalog_sources::CatalogEditTarget,
         change: RuleMetadataChange,
         txid: u32,
     ) -> Result<(RuleAlterUndo, RuleDefinition), SqlError> {
@@ -50204,7 +49854,7 @@ impl Storage {
         }
         Ok((
             RuleAlterUndo {
-                target: query_lifecycles::QueryEditTarget {
+                target: catalog_sources::CatalogEditTarget {
                     version,
                     ..selected_target
                 },
@@ -54753,12 +54403,12 @@ mod tests {
                             if iteration == 15 {
                                 storage.finish_view_publication(
                                     publication_slot,
-                                    crate::storage::QueryDdlDecision::Commit,
+                                    crate::storage::CatalogDdlDecision::Commit,
                                 );
                             } else {
                                 storage.finish_view_publication(
                                     publication_slot,
-                                    crate::storage::QueryDdlDecision::Rollback,
+                                    crate::storage::CatalogDdlDecision::Rollback,
                                 );
                             }
                         }
@@ -54880,7 +54530,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(prior.prior.is_none());
-            storage.finish_rule_publication(publication_slot, None, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_slot, None, CatalogDdlDecision::Rollback);
             assert_eq!(storage.rule(slot).created_at, 0);
             assert!(storage.rule(slot).pending.is_none());
             assert!(
@@ -54897,7 +54547,7 @@ mod tests {
                 .unwrap();
             let reused = publication_reused.slot();
             assert_eq!(reused, slot);
-            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(publication_reused, None, CatalogDdlDecision::Commit);
             let dropped = storage
                 .drop_rule(storage.prepare_rule_edit(reused, 8).unwrap(), 8)
                 .unwrap();
@@ -55086,7 +54736,7 @@ mod tests {
             let slot = publication_slot.slot();
             storage.finish_view_publication(
                 publication_slot,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             assert_eq!(
                 storage
@@ -55117,7 +54767,7 @@ mod tests {
             assert_ne!(filler, slot);
             storage.finish_view_publication(
                 publication_filler,
-                crate::storage::QueryDdlDecision::Commit,
+                crate::storage::CatalogDdlDecision::Commit,
             );
             let mut replacement = test_view_definition(StoredQueryDependencies::EMPTY);
             replacement.query.sql = StackStr::from_str("SELECT 2");
@@ -55150,7 +54800,7 @@ mod tests {
                 storage.rule(0).definition_for(8).source.as_str(),
                 "SELECT 2"
             );
-            storage.finish_view_publication(publication, QueryDdlDecision::Rollback);
+            storage.finish_view_publication(publication, CatalogDdlDecision::Rollback);
             assert!(storage.view(slot).pending_definition.is_none());
             assert!(storage.rule(0).pending.is_none());
             assert_eq!(storage.view(2).created_at, 0);
@@ -55176,7 +54826,7 @@ mod tests {
             assert_eq!(reused, slot);
             storage.finish_view_publication(
                 publication_reused,
-                crate::storage::QueryDdlDecision::Rollback,
+                crate::storage::CatalogDdlDecision::Rollback,
             );
             assert_eq!(storage.view(slot).created_at, 0);
             assert_eq!(storage.view(slot).return_rule, u16::MAX);
@@ -55316,7 +54966,8 @@ mod tests {
             )
             .unwrap();
         let slot = publication_slot.slot();
-        storage.finish_view_publication(publication_slot, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_slot, crate::storage::CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let prior = storage
                 .stage_view_rename(storage.prepare_view_edit(slot, 8).unwrap(), new, 8)
@@ -55346,7 +54997,7 @@ mod tests {
             assert_ne!(publication_reused_name.slot(), slot);
             storage.finish_view_publication(
                 publication_reused_name,
-                crate::storage::QueryDdlDecision::Rollback,
+                crate::storage::CatalogDdlDecision::Rollback,
             );
             let dropped = storage.drop_view("public", "new_view", 8).unwrap().unwrap();
             assert_eq!(dropped.slot(), slot);
@@ -55376,7 +55027,8 @@ mod tests {
             )
             .unwrap();
         let slot = publication_slot.slot();
-        storage.finish_view_publication(publication_slot, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_slot, crate::storage::CatalogDdlDecision::Commit);
         let rule = storage.view_return_rule(slot);
         let definition = storage.rule(rule).definition;
         storage
@@ -56396,9 +56048,9 @@ mod tests {
             assert_ne!(a, b);
             let prior_b = storage.begin_rule_history(target, 7).unwrap();
             assert_eq!(prior_b, Some(7));
-            storage.finish_rule_publication(publication_b, prior_b, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_b, prior_b, CatalogDdlDecision::Rollback);
             assert!(storage.table_has_rules(table, 7));
-            storage.finish_rule_publication(publication_a, prior_a, QueryDdlDecision::Rollback);
+            storage.finish_rule_publication(publication_a, prior_a, CatalogDdlDecision::Rollback);
             assert!(!storage.table_has_rules(table, 7));
             assert_eq!(storage.tables[table].ddl_locked_by_other(8), None);
             let publication_reused = storage
@@ -56407,7 +56059,7 @@ mod tests {
             let reused = publication_reused.slot();
             assert_eq!(reused, a);
             assert_eq!(storage.begin_rule_history(target, 8).unwrap(), None);
-            storage.finish_rule_publication(publication_reused, None, QueryDdlDecision::Commit);
+            storage.finish_rule_publication(publication_reused, None, CatalogDdlDecision::Commit);
             assert!(storage.table_has_rules(table, 0));
             assert_eq!(
                 storage.tables[table]
@@ -56550,7 +56202,8 @@ mod tests {
             )
             .unwrap();
         let view = publication_view.slot();
-        storage.finish_view_publication(publication_view, crate::storage::QueryDdlDecision::Commit);
+        storage
+            .finish_view_publication(publication_view, crate::storage::CatalogDdlDecision::Commit);
         let mut encoded = FixedBuf::new(&mut budget, "prepared relation locks", 512).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage
@@ -59145,8 +58798,8 @@ mod tests {
                 0,
             )
             .unwrap();
-        storage.commit_sequence_create(sequence);
-        assert_eq!(sequence, 0);
+        storage.finish_sequence_change(sequence, CatalogDdlDecision::Commit);
+        assert_eq!(sequence.slot(), 0);
         let catalog = &storage.sequence_catalog;
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -59534,8 +59187,8 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            storage.commit_sequence_create(slot);
-            slot
+            storage.finish_sequence_change(slot, CatalogDdlDecision::Commit);
+            slot.slot()
         });
 
         std::thread::scope(|scope| {
@@ -60298,7 +59951,7 @@ mod tests {
                 scope.spawn(move || {
                     let target = storage.prepare_matview_population(slot, 0).unwrap();
                     let undo = storage.stage_matview_population(target, true, 0).unwrap();
-                    storage.finish_matview_population(undo, QueryDdlDecision::Commit);
+                    storage.finish_matview_population(undo, CatalogDdlDecision::Commit);
                 });
             }
         });
@@ -60916,7 +60569,7 @@ mod tests {
             .unwrap();
         let rule = publication_rule.slot();
         storage.begin_rule_history(target, 7).unwrap();
-        storage.finish_rule_publication(publication_rule, None, QueryDdlDecision::Commit);
+        storage.finish_rule_publication(publication_rule, None, CatalogDdlDecision::Commit);
         let held = storage.table_def(first, 7);
         assert_eq!(held.name.as_str(), "held_pending_cleanup");
         let (sent, received) = std::sync::mpsc::sync_channel(1);

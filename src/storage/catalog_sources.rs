@@ -1,12 +1,13 @@
-//! Connections retain a user's identity across renames and catalog slot reuse.
+//! Catalog edits and connections retain their selected object lifetimes.
 
 use core::num::{NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::type_references::CatalogOrigin;
-use super::{ObjectLockTarget, SqlName, Storage};
+use super::{CatalogDdlState, DatabaseOid, ObjectLockTarget, SqlName, Storage, current_database};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
 
 /// A durable PostgreSQL role identifier, independent of catalog slot placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,5 +458,219 @@ mod tests {
                 assert_eq!(counter.load(Ordering::Relaxed), i32::MAX as u64);
             }
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatalogObjectSlot {
+    View(usize),
+    Rule(usize),
+    MaterializedView(usize),
+    Sequence(usize),
+    Routine(usize),
+}
+
+impl CatalogObjectSlot {
+    fn index(self) -> usize {
+        match self {
+            Self::View(slot)
+            | Self::Rule(slot)
+            | Self::MaterializedView(slot)
+            | Self::Sequence(slot)
+            | Self::Routine(slot) => slot,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CatalogObjectIdentity {
+    origin: CatalogOrigin,
+    database: DatabaseOid,
+    slot: CatalogObjectSlot,
+    created_at: u64,
+}
+
+impl CatalogObjectIdentity {
+    pub(super) fn slot(self) -> CatalogObjectSlot {
+        self.slot
+    }
+
+    pub(super) fn view_slot(self) -> Option<usize> {
+        match self.slot {
+            CatalogObjectSlot::View(slot) => Some(slot),
+            _ => None,
+        }
+    }
+
+    pub(super) fn matches(
+        self,
+        storage: &Storage,
+        database: DatabaseOid,
+        created_at: u64,
+        state: CatalogDdlState,
+    ) -> bool {
+        self.origin == storage.catalog_sources.origin()
+            && self.database == current_database()
+            && self.database == database
+            && self.created_at == created_at
+            && state != CatalogDdlState::Absent
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CatalogEditTarget {
+    pub(super) source: CatalogObjectIdentity,
+    pub(super) transaction: u32,
+    pub(super) version: u64,
+}
+
+impl CatalogEditTarget {
+    pub(crate) fn slot(self) -> usize {
+        self.source.slot.index()
+    }
+
+    pub(super) fn view_slot(self) -> Result<usize, SqlError> {
+        match self.source.slot {
+            CatalogObjectSlot::View(slot) => Ok(slot),
+            _ => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "edit source is not a view"
+            )),
+        }
+    }
+
+    pub(super) fn sequence_slot(self) -> Result<usize, SqlError> {
+        match self.source.slot {
+            CatalogObjectSlot::Sequence(slot) => Ok(slot),
+            _ => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "edit source is not a sequence"
+            )),
+        }
+    }
+
+    pub(super) fn routine_slot(self) -> Result<usize, SqlError> {
+        match self.source.slot {
+            CatalogObjectSlot::Routine(slot) => Ok(slot),
+            _ => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "edit source is not a routine"
+            )),
+        }
+    }
+
+    pub(super) fn rule_slot(self) -> Result<usize, SqlError> {
+        match self.source.slot {
+            CatalogObjectSlot::Rule(slot) => Ok(slot),
+            _ => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "edit source is not a rule"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatalogDdlOperation {
+    Create,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CatalogDdlUndo {
+    pub(super) source: CatalogObjectIdentity,
+    pub(super) transaction: u32,
+    pub(super) operation: CatalogDdlOperation,
+    pub(super) version: u64,
+    pub(super) prior_version: u64,
+}
+
+impl CatalogDdlUndo {
+    pub(crate) fn slot(self) -> usize {
+        self.source.slot.index()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogDdlDecision {
+    Commit,
+    Rollback,
+}
+
+impl Storage {
+    pub(super) fn catalog_object_identity(
+        &self,
+        slot: CatalogObjectSlot,
+        database: DatabaseOid,
+        created_at: u64,
+    ) -> CatalogObjectIdentity {
+        CatalogObjectIdentity {
+            origin: self.catalog_sources.origin(),
+            database,
+            slot,
+            created_at,
+        }
+    }
+}
+
+impl Storage {
+    pub(super) fn stage_catalog_comment_drop(
+        &self,
+        comments: &mut super::CommentCatalog,
+        source: CatalogObjectIdentity,
+        transaction: u32,
+        matches: impl Fn(&super::CommentEntry) -> bool,
+    ) -> Result<(), SqlError> {
+        if comments
+            .entries
+            .iter()
+            .filter(|comment| matches(comment))
+            .any(|comment| {
+                comment
+                    .pending
+                    .is_some_and(|pending| pending.txid != transaction)
+                    || comment
+                        .pending_identity
+                        .is_some_and(|identity| identity.txid != transaction)
+                    || comment
+                        .pending_drop
+                        .is_some_and(|pending| pending.txid != transaction)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "object comment is owned by another transaction"
+            ));
+        }
+        for comment in comments
+            .entries
+            .iter_mut()
+            .filter(|comment| matches(comment))
+        {
+            comment.pending_drop = Some(super::PendingCommentDrop {
+                txid: transaction,
+                source,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_catalog_comment_drop(
+        &self,
+        comments: &mut super::CommentCatalog,
+        source: CatalogObjectIdentity,
+        transaction: u32,
+        decision: CatalogDdlDecision,
+    ) {
+        for comment in comments.entries.iter_mut().filter(|comment| {
+            comment
+                .pending_drop
+                .is_some_and(|pending| pending.txid == transaction && pending.source == source)
+        }) {
+            match decision {
+                CatalogDdlDecision::Commit => *comment = super::CommentEntry::empty(),
+                CatalogDdlDecision::Rollback => comment.pending_drop = None,
+            }
+        }
     }
 }

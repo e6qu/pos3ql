@@ -7166,9 +7166,10 @@ impl Checkpointer {
                                 e.message.as_str()
                             ))
                         })?;
-                    storage.commit_sequence_create(slot);
+                    storage
+                        .finish_sequence_change(slot, crate::storage::CatalogDdlDecision::Commit);
                     storage.restore_sequence_value_image(
-                        slot,
+                        slot.slot(),
                         last_value,
                         is_called != 0,
                         log_count,

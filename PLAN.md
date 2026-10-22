@@ -13,22 +13,11 @@ One server owns the right to publish changes to a prefix. That does not require
 performing every storage request one at a time. SQL execution on several CPU
 workers is separate from overlapping network requests.
 
-SQL execution still uses one CPU worker. [PR #680](https://github.com/e6qu/pos3ql/pull/680)
-completed concurrent and batched storage I/O, ordered durable commits, aligned
-column groups and explicit MVCC/locking modes. State-changing statements use a
+SQL execution still uses one CPU worker. Object-store I/O overlaps and batches
+requests; commits retain durable order. State-changing statements use a
 separate synchronous read client where replay could repeat effects. Metadata
 capture and some maintenance reads also remain synchronous. Same-host MinIO
 and SeaweedFS checks establish portability; they do not prove production speed.
-
-Heap capture, copying, row-address updates and saved-row cleanup now use bounded
-turns. Queries retain readable bytes across a heap switch. Eligible writing
-commands can wait for an active reclaim task before their effects; reads and
-cancellation continue. Explicit CHECKPOINT and shutdown finish synchronously.
-Waiting preserves statement deadlines, and recovered maintenance errors do not
-poison later writes.
-Saved row files now have stable identities. Merging adjacent files publishes
-their replacement without walking every current and historical row reference;
-reports retain the files they selected before the merge.
 See the [current contract and examples](docs/implemented-baseline.md).
 
 ## Remaining work
@@ -55,8 +44,6 @@ When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
-Finish shared named-type creation and cleanup, including account-reference
-locks, name checks, failed creation and prepared-lock recovery.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion.
 

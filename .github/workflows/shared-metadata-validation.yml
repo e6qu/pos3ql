@@ -32,7 +32,7 @@ jobs:
           python3 - <<'PYTHON'
           import os, pathlib, subprocess
           fixtures = {
-              "09_metadata_object_descriptions.sql": ["function|function", "table|table", "t", "type|type"],
+              "09_metadata_object_descriptions.sql": ["function|function", "table|table", "t", "type|type", "t", "1215|26 19", "1348|26"],
               "06_metadata_comment_lifetimes.sql": ["fresh", "replacement"],
               "08_metadata_relation_replacements.sql": ["fresh", "replacement", "fresh", "2", "replacement", "type comment"],
               "07_metadata_savepoints.sql": ["10", "50", "11", "12", "changed", "changed", "2", "original", "2", "original", "changed", "9", "replacement"],

@@ -1064,6 +1064,14 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 1348,
+        name: "obj_description",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 1387,
         name: "pg_get_constraintdef",
         result_oid: 25,

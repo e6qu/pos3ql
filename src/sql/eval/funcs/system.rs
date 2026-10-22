@@ -2143,6 +2143,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(name) => name,
                     _ => return Ok(Datum::Null),
                 };
+                if !matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
+                    return Ok(Datum::Null);
+                }
                 Ok(cat
                     .comment(Some(catalog_name), oid, 0, arena)?
                     .map(Datum::Text)

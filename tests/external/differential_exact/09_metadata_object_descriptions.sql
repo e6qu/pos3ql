@@ -12,4 +12,6 @@ SELECT obj_description('description_table'::regclass),
 SELECT obj_description('description_table'::regclass, 'missing_catalog') IS NULL;
 SELECT obj_description('description_type'::regtype),
        obj_description('description_type'::regtype, 'pg_type');
+SELECT shobj_description('description_function()'::regprocedure, 'pg_proc') IS NULL;
+SELECT oid, proargtypes FROM pg_proc WHERE proname = 'obj_description' ORDER BY oid;
 ROLLBACK;

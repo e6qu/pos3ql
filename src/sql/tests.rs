@@ -22,7 +22,15 @@ fn metadata_object_descriptions_select_the_actual_catalog() {
             ),
             true
         )),
-        ["function|function", "table|table", "t", "type|type"]
+        [
+            "function|function",
+            "table|table",
+            "t",
+            "type|type",
+            "t",
+            "1215|26 19",
+            "1348|26"
+        ]
     );
     for statement in [
         "SELECT obj_description()",

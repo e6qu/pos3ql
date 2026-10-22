@@ -3,6 +3,8 @@
 use super::*;
 use crate::mem::FixedBuf;
 
+const CLONE_POSITION_BYTES: usize = 1 + CatalogPosition::ENCODED_BYTES;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub(crate) enum DatabaseCloneKind {
@@ -40,16 +42,14 @@ pub(crate) struct DatabaseClonePositions<'bytes> {
 }
 
 impl<'bytes> DatabaseClonePositions<'bytes> {
-    const RECORD_BYTES: usize = 1 + CatalogPosition::ENCODED_BYTES;
-
     pub(crate) fn decode(bytes: &'bytes [u8]) -> Option<Self> {
         let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
         let records = bytes.get(4..)?;
-        if count.checked_mul(Self::RECORD_BYTES)? != records.len() {
+        if count.checked_mul(CLONE_POSITION_BYTES)? != records.len() {
             return None;
         }
         let mut previous = None;
-        for record in records.as_chunks::<{ Self::RECORD_BYTES }>().0 {
+        for record in records.as_chunks::<CLONE_POSITION_BYTES>().0 {
             let kind = DatabaseCloneKind::decode(record[0])?;
             let position = CatalogPosition::decode(&record[1..])?;
             let key = (kind, position.slot());
@@ -67,7 +67,7 @@ impl<'bytes> DatabaseClonePositions<'bytes> {
         created_at: u64,
     ) -> Result<CatalogPosition, SqlError> {
         let mut matched = None;
-        for record in self.records.as_chunks::<{ Self::RECORD_BYTES }>().0 {
+        for record in self.records.as_chunks::<CLONE_POSITION_BYTES>().0 {
             let position = CatalogPosition::decode(&record[1..]).expect("validated clone position");
             if record[0] == kind as u8
                 && position.created_at() == created_at
@@ -142,7 +142,7 @@ impl DatabaseCloneAllocation<'_> {
             count += 1;
             valid &= positions.position(kind, position.created_at()).ok() == Some(position);
         });
-        if valid && count == positions.records.len() / DatabaseClonePositions::RECORD_BYTES {
+        if valid && count == positions.records.len() / CLONE_POSITION_BYTES {
             Ok(())
         } else {
             Err(sql_err!(
@@ -178,7 +178,7 @@ impl WalDatabaseClonePositions<'_> {
             Self::Captured { storage, database } => {
                 let mut count = 0;
                 storage.visit_database_clone_positions(database, |_, _| count += 1);
-                4 + count * DatabaseClonePositions::RECORD_BYTES
+                4 + count * CLONE_POSITION_BYTES
             }
         }
     }
@@ -187,12 +187,11 @@ impl WalDatabaseClonePositions<'_> {
         match self {
             Self::Encoded(positions) => {
                 output.append(
-                    &((positions.records.len() / DatabaseClonePositions::RECORD_BYTES) as u32)
-                        .to_le_bytes(),
+                    &((positions.records.len() / CLONE_POSITION_BYTES) as u32).to_le_bytes(),
                 ) && output.append(positions.records)
             }
             Self::Captured { storage, database } => {
-                let count = (self.encoded_len() - 4) / DatabaseClonePositions::RECORD_BYTES;
+                let count = (self.encoded_len() - 4) / CLONE_POSITION_BYTES;
                 let mut complete = output.append(&(count as u32).to_le_bytes());
                 storage.visit_database_clone_positions(database, |kind, position| {
                     complete &= output.append(&[kind as u8]) && output.append(&position.encode());

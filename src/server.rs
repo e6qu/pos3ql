@@ -1253,7 +1253,10 @@ impl Server {
             .min();
             let n = self.reactor.poll(timeout)?;
             let before_durable = self.engine.durable_lsn();
-            let mut publication_error = self.engine.advance_wal_publication(Instant::now()).err();
+            let mut publication_error = self
+                .engine
+                .advance_wal_publication(Instant::now(), crate::sql::CommitProgressMode::Reactor)
+                .err();
             if self.engine.fatal_commit_failure().is_some() {
                 self.shutdown();
                 return Err(std::io::Error::from(std::io::ErrorKind::Other));
@@ -1319,7 +1322,10 @@ impl Server {
                 // socket readiness or a resource-generation change.
                 self.wake_lock_waiters();
             }
-            if let Err(error) = self.engine.advance_wal_publication(Instant::now()) {
+            if let Err(error) = self
+                .engine
+                .advance_wal_publication(Instant::now(), crate::sql::CommitProgressMode::Reactor)
+            {
                 publication_error = Some(error);
             }
             self.durability_ready = !self.engine.publication_failed();
@@ -1635,6 +1641,7 @@ impl Server {
                     retry_io_waiters,
                 } => self.slots[dispatch.owner].conn.retry_parked(
                     &mut self.engine,
+                    &self.cancel_key,
                     lock_generation,
                     retry_io_waiters,
                 ),

@@ -87039,7 +87039,10 @@ fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_r
     let mut published = false;
     for _ in 0..64 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         match engine.checkpoint_beat() {
             CheckpointBeat::Advanced => {}
@@ -87156,7 +87159,10 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let mut failed = false;
     for _ in 0..64 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         match engine.checkpoint_beat() {
             CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
@@ -88706,7 +88712,10 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
             // The simulator allocates its remote object fixtures; production
             // upload ownership is covered separately under the allocation guard.
             if engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap()
             {
                 return;
@@ -89994,7 +90003,10 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
         let mut completed = false;
         for _ in 0..128 {
             engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap();
             let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
                 crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
@@ -90108,7 +90120,10 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
         let mut completed = false;
         for _ in 0..128 {
             engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap();
             let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
                 crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
@@ -90425,7 +90440,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             break;
         }
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
     }
@@ -90452,7 +90470,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     let mut published = false;
     for _ in 0..128 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         if engine.checkpoint_beat() == CheckpointBeat::Durable {
             published = true;
@@ -90480,7 +90501,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     let mut finished = false;
     for _ in 0..512 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
         if engine
@@ -90557,7 +90581,10 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     let mut saved = false;
     for _ in 0..128 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         if engine.checkpoint_beat() == CheckpointBeat::Durable {
             saved = true;
@@ -90644,7 +90671,10 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     let mut completed = false;
     for _ in 0..256 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
         if engine

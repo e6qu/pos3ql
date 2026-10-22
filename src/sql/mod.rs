@@ -485,7 +485,7 @@ impl CheckpointBeat {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CommitProgressMode {
+pub(crate) enum CommitProgressMode {
     Inline,
     Reactor,
 }
@@ -7871,7 +7871,9 @@ impl Engine {
             pending.retry_at = None;
         }
         loop {
-            if self.advance_wal_publication(std::time::Instant::now())? {
+            if self
+                .advance_wal_publication(std::time::Instant::now(), CommitProgressMode::Inline)?
+            {
                 return Ok(());
             }
             if let Some(checkpointer) = self.ckpt.as_mut() {
@@ -7907,6 +7909,7 @@ impl Engine {
     pub(crate) fn advance_wal_publication(
         &mut self,
         now: std::time::Instant,
+        progress: CommitProgressMode,
     ) -> Result<bool, SqlError> {
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.advance_background_uploads(now);
@@ -7928,19 +7931,24 @@ impl Engine {
             }
             pending.retry_at = None;
         } else {
-            if self
-                .ckpt
-                .as_ref()
-                .is_some_and(Checkpointer::credential_install_pending)
-            {
-                return Ok(false);
-            }
             let Some(batch) = self.wal.last_committed_batch() else {
                 return Ok(true);
             };
             if batch.byte_len() == 0 {
                 self.wal.clear_batch_marker();
                 return Ok(true);
+            }
+            // Reactor publication yields while credentials drain. An inline
+            // boundary must finish its accepted journal range before returning
+            // to the reactor that installs credentials. Every request keeps the
+            // installed credentials until its owner completes.
+            if progress == CommitProgressMode::Reactor
+                && self
+                    .ckpt
+                    .as_ref()
+                    .is_some_and(Checkpointer::credential_install_pending)
+            {
+                return Ok(false);
             }
             self.inflight_publication = Some(InflightPublication {
                 batch,
@@ -14505,14 +14513,11 @@ impl Engine {
                     responder,
                 },
             )?;
-            match self.commit_txn_with_triggers(txn, guc, arena, responder) {
-                Err(error)
-                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        && txn.staged_commit().is_some() => {}
-                result => result?,
+            self.commit_txn_with_triggers(txn, guc, arena, responder)?;
+            if self.commit_progress == CommitProgressMode::Inline {
+                self.commit_wal()?;
             }
-            self.commit_wal()?;
-            self.finish_staged_transaction(txn, guc)
+            Ok(())
         })();
         if result.is_err() && txn.is_active() && txn.staged_commit().is_none() {
             self.rollback_txn(txn, guc);

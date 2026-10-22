@@ -14,7 +14,8 @@ performing every storage request one at a time. SQL execution on several CPU
 workers is separate from overlapping network requests.
 
 SQL execution still uses one CPU worker. Object-store I/O overlaps and batches
-requests; commits retain durable order. State-changing statements use a
+requests; commits retain durable order. Login-trigger commits yield while waiting
+for durability and run their triggers once. State-changing statements use a
 separate synchronous read client where replay could repeat effects. Metadata
 capture and some maintenance reads also remain synchronous. Same-host MinIO
 and SeaweedFS checks establish portability; they do not prove production speed.

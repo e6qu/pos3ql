@@ -41,10 +41,20 @@ jobs:
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           COVERAGE_SHARD: run:proto
           COVERAGE_LCOV: ${{ github.workspace }}/query-lifecycle-diagnostics.lcov
+        run: sh tools/coverage.sh
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Format and lint
         run: |
-          sh tools/coverage.sh
-          for attempt in $(seq 2 12); do
-            echo "=== fresh-server protocol attempt $attempt of 12 ==="
-            POS3QL_BIN="$PWD/target/release/pos3ql" POS3QL_RUN_GROUPS=proto \
-              bash tests/external/run.sh
-          done
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Native protocol and login tests
+        run: |
+          cargo test --release --lib --locked pg::conn::tests::
+          cargo test --release --lib --locked sql::tests::login_event_triggers_commit_or_reject_the_login_atomically -- --exact

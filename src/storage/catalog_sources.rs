@@ -9,6 +9,60 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// A saved object's catalog position and nonzero creation stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogPosition {
+    slot: u16,
+    created_at: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CatalogAllocation {
+    New,
+    Restore(CatalogPosition),
+}
+
+impl CatalogPosition {
+    pub(crate) const ENCODED_BYTES: usize = 10;
+
+    pub(crate) fn new(slot: usize, created_at: u64) -> Result<Self, SqlError> {
+        let slot = u16::try_from(slot).ok();
+        let created_at = NonZeroU64::new(created_at);
+        match (slot, created_at) {
+            (Some(slot), Some(created_at)) => Ok(Self { slot, created_at }),
+            _ => Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid durable catalog position"
+            )),
+        }
+    }
+
+    pub(crate) fn slot(self) -> usize {
+        usize::from(self.slot)
+    }
+    pub(crate) fn created_at(self) -> u64 {
+        self.created_at.get()
+    }
+
+    pub(crate) fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut output = [0; Self::ENCODED_BYTES];
+        output[..2].copy_from_slice(&self.slot.to_le_bytes());
+        output[2..].copy_from_slice(&self.created_at.get().to_le_bytes());
+        output
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_BYTES {
+            return None;
+        }
+        Self::new(
+            usize::from(u16::from_le_bytes(bytes[..2].try_into().ok()?)),
+            u64::from_le_bytes(bytes[2..].try_into().ok()?),
+        )
+        .ok()
+    }
+}
+
 /// A durable PostgreSQL role identifier, independent of catalog slot placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RoleOid(NonZeroU32);
@@ -429,38 +483,6 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn catalog_creation_role_oid_boundary_rejects_unreserved_identifiers() {
-        for value in [i32::MIN, -1, 0, 1, 9, 11, 16_384] {
-            assert!(RoleOid::parse(value).is_none());
-        }
-        for value in [10, 16_385, i32::MAX] {
-            assert_eq!(RoleOid::parse(value).unwrap().get(), value);
-        }
-    }
-
-    #[test]
-    fn catalog_creation_role_lifetimes_reject_exhaustion_without_reuse() {
-        let counter = AtomicU64::new(i32::MAX as u64 - 1);
-        crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(
-                CatalogSources::reserve(&counter, "role").unwrap().get(),
-                i32::MAX as u64
-            );
-            for _ in 0..2 {
-                let error = CatalogSources::reserve(&counter, "role").unwrap_err();
-                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                assert_eq!(error.message.as_str(), "role identity space exhausted");
-                assert_eq!(counter.load(Ordering::Relaxed), i32::MAX as u64);
-            }
-        });
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CatalogObjectSlot {
     Table(usize),
@@ -674,5 +696,37 @@ impl Storage {
                 CatalogDdlDecision::Rollback => comment.pending_drop = None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_creation_role_oid_boundary_rejects_unreserved_identifiers() {
+        for value in [i32::MIN, -1, 0, 1, 9, 11, 16_384] {
+            assert!(RoleOid::parse(value).is_none());
+        }
+        for value in [10, 16_385, i32::MAX] {
+            assert_eq!(RoleOid::parse(value).unwrap().get(), value);
+        }
+    }
+
+    #[test]
+    fn catalog_creation_role_lifetimes_reject_exhaustion_without_reuse() {
+        let counter = AtomicU64::new(i32::MAX as u64 - 1);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                CatalogSources::reserve(&counter, "role").unwrap().get(),
+                i32::MAX as u64
+            );
+            for _ in 0..2 {
+                let error = CatalogSources::reserve(&counter, "role").unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(error.message.as_str(), "role identity space exhausted");
+                assert_eq!(counter.load(Ordering::Relaxed), i32::MAX as u64);
+            }
+        });
     }
 }

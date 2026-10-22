@@ -172,7 +172,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v20";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v21";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -3700,11 +3700,16 @@ impl Checkpointer {
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
-        // manifest table index → live slot index
+        // Validated source table positions; current records retain their original slots.
         let mut slot_of: Vec<Option<usize>> = Vec::new();
-        // (mindex, def, cols_seen, per-column sequence positions)
-        let mut pending_def: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])> =
-            None;
+        // (source slot, creation stamp, definition, columns seen, sequence values)
+        let mut pending_def: Option<(
+            usize,
+            u64,
+            TableDef,
+            usize,
+            [i64; crate::storage::MAX_COLUMNS],
+        )> = None;
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut value_indexes: Vec<LoadedValueIndex> = Vec::new();
@@ -3817,9 +3822,15 @@ impl Checkpointer {
                         })?;
                     storage.commit_access_method_create(slot);
                 }
-                Some("table") => {
+                Some("table2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mindex: usize = parse_field(words.next(), "table index")?;
+                    let created_at: u64 = parse_field(words.next(), "table source creation")?;
+                    if created_at > metadata.catalog_sequence {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "table source exceeds saved identity allocator",
+                        ));
+                    }
                     let n_cols: usize = parse_field(words.next(), "table columns")?;
                     if n_cols > MAX_RELATION_COLUMNS {
                         return Err(CheckpointSetupError::Corrupt("too many columns"));
@@ -3908,10 +3919,16 @@ impl Checkpointer {
                         },
                         ..TableDef::empty()
                     };
-                    pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
+                    pending_def = Some((
+                        mindex,
+                        created_at,
+                        def,
+                        0,
+                        [0i64; crate::storage::MAX_COLUMNS],
+                    ));
                 }
                 Some("persist") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("persist outside table"));
                     };
                     let code = words
@@ -3929,7 +3946,7 @@ impl Checkpointer {
                     def.persistence = code;
                 }
                 Some("col4") => {
-                    let Some((_, def, seen, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, seen, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
@@ -4375,7 +4392,7 @@ impl Checkpointer {
                     entry.base_frequency_bits = bits;
                 }
                 Some("tsch") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("tsch outside table"));
                     };
                     let hex = words
@@ -4384,13 +4401,13 @@ impl Checkpointer {
                     def.schema = sql_name(&decode_hex_name(hex)?)?;
                 }
                 Some("part") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("part outside table"));
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
                 Some("rls") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("rls outside table"));
                     };
                     def.row_level_security = crate::storage::RowLevelSecurityState {
@@ -5199,7 +5216,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("seq") => {
-                    let Some((_, _, _, serials)) = pending_def.as_mut() else {
+                    let Some((_, _, _, _, serials)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("seq outside table"));
                     };
                     let column: usize = parse_field(words.next(), "seq column")?;
@@ -5210,7 +5227,7 @@ impl Checkpointer {
                     serials[column] = last;
                 }
                 Some("ukey") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("ukey outside table"));
                     };
                     if def.n_uniques >= crate::storage::MAX_UNIQUES {
@@ -5239,7 +5256,7 @@ impl Checkpointer {
                     def.n_uniques += 1;
                 }
                 Some("chk") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
                     if def.n_checks >= crate::storage::MAX_CHECKS {
@@ -5267,7 +5284,7 @@ impl Checkpointer {
                     def.n_checks += 1;
                 }
                 Some("fkey") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("fkey outside table"));
                     };
                     if def.n_fkeys >= crate::storage::MAX_FKEYS {
@@ -5319,7 +5336,7 @@ impl Checkpointer {
                     def.n_fkeys += 1;
                 }
                 Some("excl") => {
-                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
                     if def.n_exclusions >= crate::storage::MAX_EXCLUSIONS {
@@ -5662,9 +5679,9 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line)?;
                 }
-                Some("mv5") => {
+                Some("mv6") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    load_matview(storage, line)?;
+                    load_matview(storage, line, metadata.catalog_sequence)?;
                 }
                 Some("pub") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -5682,9 +5699,9 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_subscription_relation(storage, line)?;
                 }
-                Some("rtn") => {
+                Some("rtn2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at: u64 = parse_field(words.next(), "routine created_at")?;
+                    let position = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let owner = decode_hex_name(
                         words
                             .next()
@@ -6004,7 +6021,7 @@ impl Checkpointer {
                         .create_routine(
                             crate::storage::RoutineSpec {
                                 identity: crate::storage::RoutineIdentity::Preserve {
-                                    created_at,
+                                    position,
                                     ownership: crate::storage::Ownership {
                                         owner: owner as u16,
                                         pending: None,
@@ -7075,7 +7092,7 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_policy(storage, line)?;
                 }
-                tag @ (Some("sq5") | Some("sq6")) => {
+                Some("sq7") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
@@ -7087,32 +7104,37 @@ impl Checkpointer {
                                 }
                             })
                     };
-                    let schema = read_hex(words.next(), "sq5 schema missing")?;
-                    let name = read_hex(words.next(), "sq5 name missing")?;
-                    let persistence = if tag == Some("sq6") {
-                        words
-                            .next()
-                            .and_then(|word| word.as_bytes().first().copied())
-                            .and_then(crate::storage::RelationPersistence::from_code)
-                            .ok_or(CheckpointSetupError::Corrupt("sq6 persistence missing"))?
-                    } else {
-                        crate::storage::RelationPersistence::Permanent
-                    };
+                    let position = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let schema = read_hex(words.next(), "sequence schema missing")?;
+                    let name = read_hex(words.next(), "sequence name missing")?;
+                    let persistence = words
+                        .next()
+                        .filter(|word| word.len() == 1)
+                        .and_then(|word| word.as_bytes().first().copied())
+                        .and_then(crate::storage::RelationPersistence::from_code)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid sequence persistence",
+                        ))?;
                     if persistence == crate::storage::RelationPersistence::Temporary {
                         return Err(CheckpointSetupError::Corrupt(
                             "temporary sequence in manifest",
                         ));
                     }
-                    let data_type: u8 = parse_field(words.next(), "sq5 type")?;
-                    let increment: i64 = parse_field(words.next(), "sq5 increment")?;
-                    let min_value: i64 = parse_field(words.next(), "sq5 min")?;
-                    let max_value: i64 = parse_field(words.next(), "sq5 max")?;
-                    let start_value: i64 = parse_field(words.next(), "sq5 start")?;
-                    let cache: i64 = parse_field(words.next(), "sq5 cache")?;
-                    let cycle: u8 = parse_field(words.next(), "sq5 cycle")?;
-                    let last_value: i64 = parse_field(words.next(), "sq5 last")?;
-                    let is_called: u8 = parse_field(words.next(), "sq5 is_called")?;
-                    let log_count: i64 = parse_field(words.next(), "sq5 log_count")?;
+                    let data_type: u8 = parse_field(words.next(), "sequence type")?;
+                    let increment: i64 = parse_field(words.next(), "sequence increment")?;
+                    let min_value: i64 = parse_field(words.next(), "sequence min")?;
+                    let max_value: i64 = parse_field(words.next(), "sequence max")?;
+                    let start_value: i64 = parse_field(words.next(), "sequence start")?;
+                    let cache: i64 = parse_field(words.next(), "sequence cache")?;
+                    let cycle: u8 = parse_field(words.next(), "sequence cycle")?;
+                    let last_value: i64 = parse_field(words.next(), "sequence last")?;
+                    let is_called: u8 = parse_field(words.next(), "sequence is_called")?;
+                    let log_count: i64 = parse_field(words.next(), "sequence log_count")?;
+                    if cycle > 1 || is_called > 1 || log_count < 0 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid sequence value image",
+                        ));
+                    }
                     let read_link = |words: &mut core::str::Split<'_, char>,
                                      label: &'static str|
                      -> Result<
@@ -7128,8 +7150,18 @@ impl Checkpointer {
                         let owner_schema = read_owner(words.next(), label)?;
                         let owner_table = read_owner(words.next(), label)?;
                         let owner_column = read_owner(words.next(), label)?;
-                        if owner_schema.is_empty() {
+                        if owner_schema.is_empty()
+                            && owner_table.is_empty()
+                            && owner_column.is_empty()
+                        {
                             Ok(None)
+                        } else if owner_schema.is_empty()
+                            || owner_table.is_empty()
+                            || owner_column.is_empty()
+                        {
+                            Err(CheckpointSetupError::Corrupt(
+                                "incomplete sequence ownership link",
+                            ))
                         } else {
                             Ok(Some(crate::storage::SequenceOwner {
                                 table_schema: sql_name(&owner_schema)?,
@@ -7140,13 +7172,19 @@ impl Checkpointer {
                     };
                     let owner = read_link(&mut words, "sequence owner missing")?;
                     let generator_for = read_link(&mut words, "sequence generator missing")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing sequence fields"));
+                    }
                     let slot = storage
                         .create_sequence(
                             crate::storage::SequenceCreateSpec {
+                                allocation: crate::storage::CatalogAllocation::Restore(position),
                                 schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
                                 spec: crate::storage::SeqSpec {
-                                    data_type: crate::storage::SeqType::from_u8(data_type),
+                                    data_type: crate::storage::SeqType::from_u8(data_type).ok_or(
+                                        CheckpointSetupError::Corrupt("invalid sequence type"),
+                                    )?,
                                     increment,
                                     min_value,
                                     max_value,
@@ -9742,11 +9780,12 @@ impl Checkpointer {
                 identity.database,
             )?;
             // Table + columns into the manifest.
-            let mut table_line = StackStr::<256>::new();
+            let mut table_line = StackStr::<278>::new();
             use core::fmt::Write as _;
             write!(
                 table_line,
-                "table {slot} {} {} {} {} {} {} {}",
+                "table2 {slot} {} {} {} {} {} {} {} {}",
+                identity.created_at,
                 definition.n_columns,
                 u8::from(definition.has_toast),
                 u8::from(definition.has_rules),
@@ -10766,7 +10805,11 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "mv5 {} {} {} {} {} {}",
+                    "mv6 {} {} {} {} {} {} {} {} {} {}",
+                    matview_slot,
+                    mv.created_at,
+                    mv.backing_table,
+                    storage.table(usize::from(mv.backing_table)).created_at(),
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
@@ -10779,7 +10822,8 @@ impl Checkpointer {
         // Sequences: hex schema/name, then the numeric parameters and the live
         // value state. A sequence stores no rows, so
         // this line is its whole durable form.
-        for (_, seq, last_value, is_called, log_count) in storage.checkpoint_sequences_with_slots()
+        for (sequence_slot, seq, last_value, is_called, log_count) in
+            storage.checkpoint_sequences_with_slots()
         {
             write_database_context(
                 &mut self.manifest_output,
@@ -10834,7 +10878,9 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "sq6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "sq7 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    sequence_slot,
+                    seq.created_at,
                     hschema.as_str(),
                     hname.as_str(),
                     seq.persistence.code() as char,
@@ -10927,7 +10973,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
+                    "rtn2 {} {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
+                    slot,
                     routine.created_at,
                     owner.as_str(),
                     match routine.kind {
@@ -16963,9 +17010,15 @@ fn verify_extension_object_key(
 fn finish_pending(
     storage: &mut Storage,
     slot_of: &mut Vec<Option<usize>>,
-    pending: &mut Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>,
+    pending: &mut Option<(
+        usize,
+        u64,
+        TableDef,
+        usize,
+        [i64; crate::storage::MAX_COLUMNS],
+    )>,
 ) -> Result<(), CheckpointSetupError> {
-    if let Some((manifest_index, definition, seen, serials)) = pending.take() {
+    if let Some((manifest_index, created_at, definition, seen, serials)) = pending.take() {
         if seen != definition.n_columns {
             return Err(CheckpointSetupError::Corrupt(
                 "manifest column count mismatch",
@@ -16978,6 +17031,7 @@ fn finish_pending(
                 let slot = storage.large_object_page_table();
                 let expected = &*storage.table(slot).definition();
                 if manifest_index != slot
+                    || created_at != 0
                     || definition.schema != expected.schema
                     || definition.name != expected.name
                     || definition.n_columns != expected.n_columns
@@ -16996,13 +17050,29 @@ fn finish_pending(
                 }
                 slot
             } else {
-                storage.create_table(definition).map_err(|error| {
-                    CheckpointSetupError::ObjectStore(format!(
-                        "manifest table rejected: {}",
-                        error.message.as_str()
-                    ))
-                })?
+                let position = crate::storage::CatalogPosition::new(manifest_index, created_at)
+                    .map_err(|_| CheckpointSetupError::Corrupt("invalid table source identity"))?;
+                storage
+                    .restore_table(
+                        position,
+                        definition,
+                        crate::storage::TableCreation::Committed,
+                    )
+                    .map_err(|error| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "manifest table rejected: {}",
+                            error.message.as_str()
+                        ))
+                    })?
             };
+        if slot_of
+            .get(manifest_index)
+            .is_some_and(|entry| entry.is_some())
+        {
+            return Err(CheckpointSetupError::Corrupt(
+                "duplicate table source position",
+            ));
+        }
         storage.install_table_serial_values(slot, serials);
         if slot_of.len() <= manifest_index {
             slot_of.resize(manifest_index + 1, None);
@@ -18011,32 +18081,67 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
 }
 
 #[inline(never)]
-fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+fn parse_catalog_position(
+    words: &mut core::str::Split<'_, char>,
+    catalog_sequence: u64,
+) -> Result<crate::storage::CatalogPosition, CheckpointSetupError> {
+    let slot = parse_field(words.next(), "catalog source slot")?;
+    let created_at = parse_field(words.next(), "catalog source creation")?;
+    if created_at > catalog_sequence {
+        return Err(CheckpointSetupError::Corrupt(
+            "catalog source exceeds saved identity allocator",
+        ));
+    }
+    crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))
+}
+
+#[inline(never)]
+fn load_matview(
+    storage: &mut Storage,
+    line: &str,
+    catalog_sequence: u64,
+) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
     let _tag = words.next();
+    let position = parse_catalog_position(&mut words, catalog_sequence)?;
+    let backing = parse_catalog_position(&mut words, catalog_sequence)?;
     let read_hex = |word: Option<&str>, what: &'static str| {
         word.ok_or(CheckpointSetupError::Corrupt(what))
             .and_then(decode_hex_name)
     };
-    let sql = read_hex(words.next(), "mv2 sql missing")?;
-    let schema = read_hex(words.next(), "mv2 schema missing")?;
-    let path = read_hex(words.next(), "mv2 path missing")?;
-    let name = read_hex(words.next(), "mv2 name missing")?;
-    let populated: u8 = parse_field(words.next(), "mv2 populated")?;
+    let sql = read_hex(words.next(), "materialized-view sql missing")?;
+    let schema = read_hex(words.next(), "materialized-view schema missing")?;
+    let path = read_hex(words.next(), "materialized-view path missing")?;
+    let name = read_hex(words.next(), "materialized-view name missing")?;
+    let populated: u8 = parse_field(words.next(), "materialized-view populated")?;
     let dependencies = parse_stored_query_dependencies(&mut words)?;
+    if populated > 1 || words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt(
+            "invalid materialized-view fields",
+        ));
+    }
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
     let mut path_buffer = StackStr::<128>::new();
     let _ = write!(path_buffer, "{path}");
-    let backing_table =
-        storage
-            .find_visible(&schema, &name, 0)
-            .ok_or(CheckpointSetupError::Corrupt(
-                "materialized-view backing relation",
-            ))?;
+    let backing_table = backing.slot();
+    if backing_table >= storage.table_count()
+        || !storage.table_slot_visible_to(backing_table, 0)
+        || storage.table(backing_table).created_at() != backing.created_at()
+        || {
+            let definition = storage.table_def(backing_table, 0);
+            definition.schema.as_str() != schema || definition.name.as_str() != name
+        }
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "materialized-view backing relation identity",
+        ));
+    }
     let slot = storage
         .create_matview(
+            crate::storage::CatalogAllocation::Restore(position),
             backing_table,
             crate::storage::StoredQueryDefinition {
                 sql: buffer,
@@ -19275,7 +19380,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v20\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19679,7 +19784,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v20\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19705,7 +19810,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v20\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19714,7 +19819,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v20\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -19879,7 +19984,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v18",
                 "pos3ql-manifest-v19",
                 "pos3ql-manifest-v21",
-                "pos3ql-manifest-v20 trailing",
+                "pos3ql-manifest-v21 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -19961,11 +20066,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v20\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v20\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20202,7 +20307,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v20\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

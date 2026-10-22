@@ -8,6 +8,85 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_recovery_keeps_catalog_positions_after_concurrent_creation_rollback() {
+    fn identities(engine: &Engine) -> [(usize, u64); 4] {
+        let sequence = engine
+            .storage
+            .sequence_slot("public", "retained_sequence", 0)
+            .unwrap();
+        let routine = engine
+            .storage
+            .routine_slot_by_name_unambiguous("public", "retained_function", 0)
+            .unwrap()
+            .unwrap();
+        let materialized = engine
+            .storage
+            .matview_slot("public", "retained_materialized", 0)
+            .unwrap();
+        let table = engine.storage.matview_table(materialized);
+        [
+            (sequence, engine.storage.sequence(sequence).created_at),
+            (routine, engine.storage.routine(routine).created_at),
+            (
+                materialized,
+                engine.storage.matview(materialized).created_at,
+            ),
+            (table, engine.storage.table(table).created_at()),
+        ]
+    }
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("metadata-catalog-recovery-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_sequences = 2;
+            config.max_routines = 2;
+            config.max_materialized_views = 2;
+            config.max_ddl_per_transaction = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut discarded =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+            let mut retained =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            discarded.success(&mut engine, "BEGIN; CREATE SEQUENCE discarded_sequence; CREATE FUNCTION discarded_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW discarded_materialized AS SELECT 1 AS value", false);
+            retained.success(&mut engine, "CREATE SEQUENCE retained_sequence START 10; CREATE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 7'; CREATE MATERIALIZED VIEW retained_materialized AS SELECT 7 AS value; COMMENT ON SEQUENCE retained_sequence IS 'sequence'; COMMENT ON FUNCTION retained_function() IS 'routine'; COMMENT ON MATERIALIZED VIEW retained_materialized IS 'materialized'", false);
+            discarded.success(&mut engine, "ROLLBACK", false);
+            retained.success(&mut engine, "SELECT nextval('retained_sequence')", false);
+            let original = identities(&engine);
+            assert_eq!(original[0].0, 1);
+            assert_eq!(original[1].0, 1);
+            assert_eq!(original[2].0, 1);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(discarded);
+            drop(retained);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            assert_eq!(
+                identities(&cold),
+                original,
+                "checkpoint={checkpoint}, mode={mode:?}"
+            );
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT retained_function(); SELECT value FROM retained_materialized; SELECT nextval('retained_sequence'); SELECT obj_description('retained_sequence'::regclass); SELECT obj_description('retained_function()'::regprocedure); SELECT obj_description('retained_materialized'::regclass)", false)), ["7", "7", "11", "sequence", "routine", "materialized"]);
+        }
+    }
+}
+
+#[test]
 fn metadata_relation_replacements_preserve_comments_for_the_selected_object() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -89,18 +168,40 @@ fn metadata_materialized_undo_exhaustion_restores_backing_and_catalog() {
                     .is_none(),
                 "{statement}"
             );
-            let backing = engine.storage.find_visible("public", "overflow_materialized", transaction);
+            let backing =
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", transaction);
             if statement.starts_with("CREATE") {
-                let backing = backing.expect("the aborted transaction owns its earlier backing-table undo");
+                let backing =
+                    backing.expect("the aborted transaction owns its earlier backing-table undo");
                 assert!(session.transaction.ddl().iter().any(|undo| matches!(undo,
                     DdlUndo::Created(slot) if *slot as usize == backing)));
             } else {
                 assert!(backing.is_none(), "{statement}");
             }
-            assert!(engine.storage.find_visible("public", "overflow_materialized", 0).is_none(), "{statement}");
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
             session.success(&mut engine, "ROLLBACK", true);
-            assert!(engine.storage.find_visible("public", "overflow_materialized", 0).is_none(), "{statement}");
-            assert!(engine.storage.find_matview("public", "overflow_materialized", 0).is_none(), "{statement}");
+            assert!(
+                engine
+                    .storage
+                    .find_visible("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .find_matview("public", "overflow_materialized", 0)
+                    .is_none(),
+                "{statement}"
+            );
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
@@ -77732,7 +77833,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v20\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v21\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -77921,7 +78022,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v20\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v21\n"))
     );
     drop(recovered);
 

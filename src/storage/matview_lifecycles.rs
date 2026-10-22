@@ -30,98 +30,6 @@ impl MatviewDdlUndo {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::{make_def, test_budget, test_config, test_view_definition};
-
-    #[test]
-    fn matview_lifecycle_undo_rejects_reused_catalog_and_backing_lifetimes() {
-        let mut config = test_config();
-        config.max_materialized_views = 1;
-        config.max_tables = 1;
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage
-            .create_table(make_def(
-                "original_materialized",
-                &[("value", ColType::Int4, true)],
-            ))
-            .unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let original = storage
-                .create_matview(
-                    table,
-                    test_view_definition(StoredQueryDependencies::EMPTY).query,
-                    false,
-                    7,
-                )
-                .unwrap();
-            let selected = storage.prepare_matview_edit(original.slot(), 7).unwrap();
-            storage.finish_matview_change(original, CatalogDdlDecision::Rollback);
-            let replacement = storage
-                .create_matview(
-                    table,
-                    test_view_definition(StoredQueryDependencies::EMPTY).query,
-                    false,
-                    9,
-                )
-                .unwrap();
-            assert_eq!(original.slot(), replacement.slot());
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_matview_change(original, decision);
-            }
-            assert_eq!(
-                storage.drop_matview(selected, 7).unwrap_err().sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            storage.finish_matview_change(replacement, CatalogDdlDecision::Commit);
-            let first = storage
-                .drop_matview(
-                    storage
-                        .prepare_matview_edit(replacement.slot(), 11)
-                        .unwrap(),
-                    11,
-                )
-                .unwrap();
-            storage.finish_matview_change(first, CatalogDdlDecision::Rollback);
-            let second = storage
-                .drop_matview(
-                    storage
-                        .prepare_matview_edit(replacement.slot(), 11)
-                        .unwrap(),
-                    11,
-                )
-                .unwrap();
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_matview_change(first, decision);
-            }
-            assert!(!storage.matview(replacement.slot()).visible_to(11));
-            storage.finish_matview_change(second, CatalogDdlDecision::Rollback);
-            storage.commit_drop(table);
-            let reused = storage
-                .create_table(make_def(
-                    "replacement_table",
-                    &[("value", ColType::Int4, true)],
-                ))
-                .unwrap();
-            assert_eq!(table, reused);
-            assert_eq!(
-                storage
-                    .prepare_matview_edit(replacement.slot(), 13)
-                    .err()
-                    .unwrap()
-                    .sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            assert_eq!(
-                storage.table(reused).definition().name.as_str(),
-                "replacement_table"
-            );
-        });
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct MatviewEditTarget {
     catalog: CatalogEditTarget,
@@ -130,6 +38,49 @@ pub(crate) struct MatviewEditTarget {
 }
 
 impl Storage {
+    pub(crate) fn matview_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.matview(slot).created_at)
+            .expect("materialized-view position selects a live object")
+    }
+
+    pub(crate) fn matview_replay_slot(
+        &self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+    ) -> Result<usize, SqlError> {
+        let view = self
+            .matview_catalog()
+            .get(position.slot())
+            .copied()
+            .filter(|view| {
+                view.database == current_database()
+                    && view.ddl_state == CatalogDdlState::Present
+                    && view.created_at == position.created_at()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal materialized-view source identity does not match"
+                )
+            })?;
+        let backing = usize::from(view.backing_table);
+        if backing < self.table_count()
+            && self.table(backing).created_at() == view.backing_created_at
+            && {
+                let definition = self.table_def(backing, 0);
+                definition.schema.as_str() == schema && definition.name.as_str() == name
+            }
+        {
+            Ok(position.slot())
+        } else {
+            Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal materialized-view backing identity or name does not match"
+            ))
+        }
+    }
+
     pub(crate) fn prepare_matview_edit(
         &self,
         slot: usize,
@@ -267,19 +218,14 @@ impl Storage {
         })
     }
 
-    pub(crate) fn replay_drop_matview(&mut self, schema: &str, name: &str) -> Result<(), SqlError> {
-        let (slot, view) = self
-            .matviews_visible_to(0)
-            .find(|(_, view)| {
-                let definition = self.table_def(usize::from(view.backing_table), 0);
-                definition.schema.as_str() == schema && definition.name.as_str() == name
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "journal drops an unknown materialized view"
-                )
-            })?;
+    pub(crate) fn replay_drop_matview(
+        &mut self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+    ) -> Result<(), SqlError> {
+        let slot = self.matview_replay_slot(position, schema, name)?;
+        let view = self.matview(slot);
         let backing = self.query_table_target(
             usize::from(view.backing_table),
             0,
@@ -442,6 +388,7 @@ impl Storage {
     /// table's own creation, so no `find_table`/`or_replace` handling is needed.
     pub(crate) fn create_matview(
         &self,
+        allocation: CatalogAllocation,
         backing_table: usize,
         query: StoredQueryDefinition,
         populated: bool,
@@ -476,18 +423,41 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let new = owners
-            .catalog
-            .iter()
-            .position(|m| m.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many materialized views (limit {})",
-                    owners.catalog.len()
-                )
-            })?;
-        let created_at = self.catalog_sequence.next()?;
+        let (new, created_at) = match allocation {
+            CatalogAllocation::New => {
+                let slot = owners
+                    .catalog
+                    .iter()
+                    .position(|view| view.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many materialized views (limit {})",
+                            owners.catalog.len()
+                        )
+                    })?;
+                (slot, self.catalog_sequence.next()?)
+            }
+            CatalogAllocation::Restore(position) => {
+                if owners
+                    .catalog
+                    .get(position.slot())
+                    .is_none_or(|view| view.ddl_state != CatalogDdlState::Absent)
+                    || owners.catalog.iter().any(|view| {
+                        view.database == current_database()
+                            && view.ddl_state != CatalogDdlState::Absent
+                            && view.created_at == position.created_at()
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "saved materialized-view position is unavailable or its creation identity is already used"
+                    ));
+                }
+                self.catalog_sequence.observe(position.created_at());
+                (position.slot(), position.created_at())
+            }
+        };
         let image = self.matview_dependency_image(new);
         owners.write_query_image(self, image, query.dependencies.view(), txid)?;
         owners.catalog[new] = MatviewDef {
@@ -528,5 +498,99 @@ impl Storage {
             },
             backing: target,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{make_def, test_budget, test_config, test_view_definition};
+
+    #[test]
+    fn matview_lifecycle_undo_rejects_reused_catalog_and_backing_lifetimes() {
+        let mut config = test_config();
+        config.max_materialized_views = 1;
+        config.max_tables = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "original_materialized",
+                &[("value", ColType::Int4, true)],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let original = storage
+                .create_matview(
+                    crate::storage::CatalogAllocation::New,
+                    table,
+                    test_view_definition(StoredQueryDependencies::EMPTY).query,
+                    false,
+                    7,
+                )
+                .unwrap();
+            let selected = storage.prepare_matview_edit(original.slot(), 7).unwrap();
+            storage.finish_matview_change(original, CatalogDdlDecision::Rollback);
+            let replacement = storage
+                .create_matview(
+                    crate::storage::CatalogAllocation::New,
+                    table,
+                    test_view_definition(StoredQueryDependencies::EMPTY).query,
+                    false,
+                    9,
+                )
+                .unwrap();
+            assert_eq!(original.slot(), replacement.slot());
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_matview_change(original, decision);
+            }
+            assert_eq!(
+                storage.drop_matview(selected, 7).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            storage.finish_matview_change(replacement, CatalogDdlDecision::Commit);
+            let first = storage
+                .drop_matview(
+                    storage
+                        .prepare_matview_edit(replacement.slot(), 11)
+                        .unwrap(),
+                    11,
+                )
+                .unwrap();
+            storage.finish_matview_change(first, CatalogDdlDecision::Rollback);
+            let second = storage
+                .drop_matview(
+                    storage
+                        .prepare_matview_edit(replacement.slot(), 11)
+                        .unwrap(),
+                    11,
+                )
+                .unwrap();
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_matview_change(first, decision);
+            }
+            assert!(!storage.matview(replacement.slot()).visible_to(11));
+            storage.finish_matview_change(second, CatalogDdlDecision::Rollback);
+            storage.commit_drop(table);
+            let reused = storage
+                .create_table(make_def(
+                    "replacement_table",
+                    &[("value", ColType::Int4, true)],
+                ))
+                .unwrap();
+            assert_eq!(table, reused);
+            assert_eq!(
+                storage
+                    .prepare_matview_edit(replacement.slot(), 13)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                storage.table(reused).definition().name.as_str(),
+                "replacement_table"
+            );
+        });
     }
 }

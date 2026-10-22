@@ -1397,7 +1397,13 @@ mod tests {
                     .committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)))
             }
             SavedQueryKind::MaterializedView => storage
-                .create_matview(related, definition.query, false, 7)
+                .create_matview(
+                    crate::storage::CatalogAllocation::New,
+                    related,
+                    definition.query,
+                    false,
+                    7,
+                )
                 .map(|change| storage.matview_dependency_image(change.slot())),
             SavedQueryKind::Policy => storage
                 .create_policy(

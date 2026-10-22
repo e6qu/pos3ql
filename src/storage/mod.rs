@@ -17,9 +17,11 @@ pub(crate) use query_lifecycles::{
 };
 pub(crate) use routine_lifecycles::{RoutineChange, RoutineDependencies};
 pub(crate) use sequence_lifecycles::SequenceChange;
+pub(crate) use table_creation::TableCreation;
 mod role_dependencies;
 pub(crate) use catalog_sources::{
-    CatalogDdlDecision, CatalogDdlUndo, RoleOid, SessionIdentity, SessionRole,
+    CatalogAllocation, CatalogDdlDecision, CatalogDdlUndo, CatalogPosition, RoleOid,
+    SessionIdentity, SessionRole,
 };
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
@@ -8471,7 +8473,7 @@ impl RoutineCallKind {
 pub(crate) enum RoutineIdentity {
     Allocate,
     Preserve {
-        created_at: u64,
+        position: CatalogPosition,
         ownership: Ownership,
     },
 }
@@ -9898,11 +9900,12 @@ impl SeqType {
         }
     }
 
-    pub fn from_u8(v: u8) -> SeqType {
-        match v {
-            0 => SeqType::Smallint,
-            1 => SeqType::Integer,
-            _ => SeqType::Bigint,
+    pub(crate) const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Smallint),
+            1 => Some(Self::Integer),
+            2 => Some(Self::Bigint),
+            _ => None,
         }
     }
 }
@@ -10084,6 +10087,7 @@ pub(crate) struct SeqSpec {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCreateSpec {
+    pub allocation: CatalogAllocation,
     pub schema: SqlName,
     pub name: SqlName,
     pub spec: SeqSpec,
@@ -27752,6 +27756,29 @@ impl Storage {
         self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP)
     }
 
+    pub(crate) fn table_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.table(slot).created_at())
+            .expect("table position selects a user relation")
+    }
+
+    pub(crate) fn restore_table(
+        &mut self,
+        position: CatalogPosition,
+        mut definition: TableDef,
+        creation: TableCreation,
+    ) -> Result<usize, SqlError> {
+        definition.has_toast |= definition
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
+        table_creation::allocate(
+            self,
+            definition,
+            CatalogAllocation::Restore(position),
+            creation,
+        )
+    }
+
     /// Transactional create: the schema exists only for `txid` until commit.
     pub fn create_schema_in(&self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
         let role = self.current_role_slot(txid).ok_or_else(|| {
@@ -35125,7 +35152,8 @@ impl Storage {
             .columns()
             .iter()
             .any(|column| column.ctype.typlen() == -1);
-        let slot = table_creation::allocate(self, def, None)?;
+        let slot =
+            table_creation::allocate(self, def, CatalogAllocation::New, TableCreation::Committed)?;
         Ok(slot)
     }
 
@@ -35160,10 +35188,22 @@ impl Storage {
 
     /// Completes a pending ALTER TABLE replay when its final definition arrives.
     /// Returns false when the definition is an ordinary CREATE TABLE.
-    pub fn complete_replay_table_rewrite(&mut self, mut def: TableDef) -> Result<bool, SqlError> {
+    pub(crate) fn complete_replay_table_rewrite(
+        &mut self,
+        position: CatalogPosition,
+        mut def: TableDef,
+    ) -> Result<bool, SqlError> {
         let Some(rewrite) = self.replay_table_rewrite.take() else {
             return Ok(false);
         };
+        if rewrite.table != position.slot()
+            || self.table(rewrite.table).created_at() != position.created_at()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal table rewrite source identity does not match"
+            ));
+        }
         self.bind_user_type_columns(&mut def)?;
         let mut column_mapping = [None; MAX_COLUMNS];
         for (old_column, &target_column) in rewrite.column_mapping.iter().enumerate() {
@@ -35222,7 +35262,12 @@ impl Storage {
             .iter()
             .any(|column| column.ctype.typlen() == -1);
         self.require_schema_create(def.schema.as_str(), txid)?;
-        let slot = table_creation::allocate(self, def, Some(txid))?;
+        let slot = table_creation::allocate(
+            self,
+            def,
+            CatalogAllocation::New,
+            TableCreation::Pending(txid),
+        )?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -37712,14 +37757,18 @@ impl Storage {
 
     pub(crate) fn restore_matview_population(
         &mut self,
-        slot: usize,
+        position: CatalogPosition,
         populated: bool,
     ) -> Result<(), SqlError> {
         let version = self.catalog_sequence.next()?;
         let mut catalog = self.matview_catalog();
         let view = catalog
-            .get_mut(slot)
-            .filter(|view| view.database == current_database() && view.visible_to(0))
+            .get_mut(position.slot())
+            .filter(|view| {
+                view.database == current_database()
+                    && view.visible_to(0)
+                    && view.created_at == position.created_at()
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
@@ -38089,26 +38138,38 @@ impl Storage {
 
     /// Applies a replayed/absolute `SequenceAdvance`: set value state directly,
     /// without marking dirty (replay must not re-journal).
-    pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
+    pub(crate) fn apply_sequence_advance(
+        &mut self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+        last: i64,
+        is_called: bool,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let slot = self.sequence_replay_slot(position, schema, name, transaction)?;
         let catalog = self
             .sequence_catalog
             .get_mut()
             .expect("sequence catalog lock poisoned");
-        if let Some(i) = catalog.definitions.iter().position(|s| {
-            s.database == current_database()
-                && s.ddl_state != CatalogDdlState::Absent
-                && s.schema.as_str() == schema
-                && s.name.as_str() == name
-        }) {
-            catalog.values[i].committed = SequenceValue {
-                last_value: last,
-                is_called,
-                log_count: 0,
-                dirty: false,
-                generation: 0,
-                staged_generation: 0,
-            };
-        }
+        let sequence = catalog.definitions[slot];
+        let value = if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == transaction)
+        {
+            &mut catalog.values[slot].pending
+        } else {
+            &mut catalog.values[slot].committed
+        };
+        *value = SequenceValue {
+            last_value: last,
+            is_called,
+            log_count: 0,
+            dirty: false,
+            generation: 0,
+            staged_generation: 0,
+        };
+        Ok(())
     }
 
     // --- Domains (`CREATE DOMAIN`) ---------------------------------------
@@ -43239,56 +43300,61 @@ impl Storage {
 
     pub(crate) fn replay_create_routine(
         &mut self,
+        position: CatalogPosition,
         mut definition: RoutineDef,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
-        definition.ownership = definition.ownership.committed();
-        if let Some(slot) = self.routine_slot_by_declared_signature(
-            definition.schema.as_str(),
-            definition.name.as_str(),
-            definition.arguments(),
-            0,
-        ) {
-            // CREATE OR REPLACE keeps its routine object identifier.  WAL uses
-            // the complete post-change definition for both creates and
-            // replacements, so the matching durable identity selects an
-            // in-place replay rather than a drop/reallocate cycle.
-            if self.routine(slot).created_at == definition.created_at {
-                let mut owners = self.catalog_dependency_owners(
-                    &self.routines,
-                    type_contracts::CatalogPublicationInput::RoutineContract,
-                    None,
-                );
-                owners.bind_routine_contract(
-                    &mut definition.arguments[..definition.argument_count],
-                    &mut definition.parameters[..definition.parameter_count],
-                    &mut definition.result_columns[..definition.result_column_count],
-                    &mut definition.kind,
-                    0,
-                )?;
-                owners.write_query_image(
-                    self,
-                    self.committed_dependency_image(StoredQueryDependencyOwner::Routine(
-                        slot as u16,
-                    )),
-                    dependencies.view(),
-                    0,
-                )?;
-                definition.pending_identity = None;
-                definition.pending_definition = None;
-                definition.ddl_state = CatalogDdlState::Present;
-                owners.catalog[slot] = definition;
-                return Ok(());
-            }
+        if definition.created_at != position.created_at() || position.slot() >= self.routine_count()
+        {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "journal routine identity collides with an existing routine"
+                "journal routine source identity is invalid"
             ));
+        }
+        definition.database = current_database();
+        definition.ownership = definition.ownership.committed();
+        let slot = position.slot();
+        let current = self.routine(slot);
+        if current.ddl_state != CatalogDdlState::Absent {
+            if current.database != current_database()
+                || current.created_at != position.created_at()
+                || current.ddl_state != CatalogDdlState::Present
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal routine position belongs to a different source"
+                ));
+            }
+            let mut owners = self.catalog_dependency_owners(
+                &self.routines,
+                type_contracts::CatalogPublicationInput::RoutineContract,
+                None,
+            );
+            owners.bind_routine_contract(
+                &mut definition.arguments[..definition.argument_count],
+                &mut definition.parameters[..definition.parameter_count],
+                &mut definition.result_columns[..definition.result_column_count],
+                &mut definition.kind,
+                0,
+            )?;
+            owners.write_query_image(
+                self,
+                self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
+                dependencies.view(),
+                0,
+            )?;
+            definition.pending_identity = None;
+            definition.pending_definition = None;
+            definition.ddl_state = CatalogDdlState::Present;
+            definition.version = self.catalog_sequence.next()?;
+            definition.ddl_version = current.ddl_version;
+            owners.catalog[slot] = definition;
+            return Ok(());
         }
         let slot = self.create_routine(
             RoutineSpec {
                 identity: RoutineIdentity::Preserve {
-                    created_at: definition.created_at,
+                    position,
                     ownership: definition.ownership,
                 },
                 schema: definition.schema,
@@ -58147,6 +58213,7 @@ mod tests {
         let sequence = storage
             .create_sequence(
                 SequenceCreateSpec {
+                    allocation: crate::storage::CatalogAllocation::New,
                     schema: SqlName::parse("public").unwrap(),
                     name: SqlName::parse("concurrent_sequence").unwrap(),
                     spec: SeqSpec {
@@ -58536,6 +58603,7 @@ mod tests {
             let slot = storage
                 .create_sequence(
                     SequenceCreateSpec {
+                        allocation: crate::storage::CatalogAllocation::New,
                         schema: SqlName::parse("public").unwrap(),
                         name: SqlName::parse(sequence_names[worker]).unwrap(),
                         spec: SeqSpec {
@@ -59345,6 +59413,7 @@ mod tests {
         storage.finish_matview_change(retired, CatalogDdlDecision::Commit);
         let created = storage
             .create_matview(
+                crate::storage::CatalogAllocation::New,
                 0,
                 test_view_definition(StoredQueryDependencies::EMPTY).query,
                 false,

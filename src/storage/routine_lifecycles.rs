@@ -41,6 +41,34 @@ pub(crate) enum RoutineDependencies<'input> {
 }
 
 impl Storage {
+    pub(crate) fn routine_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.routine(slot).created_at)
+            .expect("routine position selects a live object")
+    }
+
+    pub(crate) fn routine_replay_slot(
+        &self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+        arguments: &[RoutineArgumentDef],
+    ) -> Result<usize, SqlError> {
+        if self.routine_at(position.slot()).is_some_and(|routine| {
+            routine.database == current_database()
+                && routine.ddl_state == CatalogDdlState::Present
+                && routine.created_at == position.created_at()
+        }) && self.routine_slot_by_declared_signature(schema, name, arguments, 0)
+            == Some(position.slot())
+        {
+            Ok(position.slot())
+        } else {
+            Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal routine source identity or signature does not match"
+            ))
+        }
+    }
+
     pub(crate) fn prepare_routine_edit(
         &self,
         slot: usize,
@@ -806,15 +834,34 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(slot) = routines
-            .iter()
-            .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many routines (limit {})",
-                routines.len()
-            ));
+        let slot = match identity {
+            RoutineIdentity::Allocate => routines
+                .iter()
+                .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many routines (limit {})",
+                        routines.len()
+                    )
+                })?,
+            RoutineIdentity::Preserve { position, .. } => {
+                if routines
+                    .get(position.slot())
+                    .is_none_or(|routine| routine.ddl_state != CatalogDdlState::Absent)
+                    || routines.iter().any(|routine| {
+                        routine.database == current_database()
+                            && routine.ddl_state != CatalogDdlState::Absent
+                            && routine.created_at == position.created_at()
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "saved routine position is unavailable or its creation identity is already used"
+                    ));
+                }
+                position.slot()
+            }
         };
         let (created_at, ownership) = match identity {
             RoutineIdentity::Allocate => (
@@ -822,11 +869,11 @@ impl Storage {
                 allocated_ownership.expect("allocated routine ownership was prepared"),
             ),
             RoutineIdentity::Preserve {
-                created_at,
+                position,
                 ownership,
             } => {
-                self.catalog_sequence.observe(created_at);
-                (created_at, ownership)
+                self.catalog_sequence.observe(position.created_at());
+                (position.created_at(), ownership)
             }
         };
         owners.write_query_image(

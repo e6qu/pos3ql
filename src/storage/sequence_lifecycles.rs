@@ -17,246 +17,6 @@ pub(crate) struct SequenceAlterUndo {
     pub(super) prior: Option<PendingSequenceDefinition>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::{test_budget, test_config};
-    use crate::storage::{RelationPersistence, SeqSpec, SeqType, SqlName};
-
-    fn fixture() -> Storage {
-        let mut config = test_config();
-        config.max_sequences = 1;
-        let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
-    }
-
-    fn create(storage: &mut Storage, name: &str, transaction: u32) -> SequenceChange {
-        storage
-            .create_sequence(
-                SequenceCreateSpec {
-                    schema: SqlName::parse("public").unwrap(),
-                    name: SqlName::parse(name).unwrap(),
-                    spec: SeqSpec {
-                        data_type: SeqType::Bigint,
-                        increment: 1,
-                        min_value: 1,
-                        max_value: i64::MAX,
-                        start_value: 1,
-                        cache: 1,
-                        cycle: false,
-                    },
-                    owner: None,
-                    generator_for: None,
-                    persistence: RelationPersistence::Permanent,
-                },
-                transaction,
-            )
-            .unwrap()
-    }
-
-    fn alteration(
-        storage: &Storage,
-        slot: usize,
-        name: &str,
-        transaction: u32,
-    ) -> SequenceAlteration {
-        let definition = storage.sequence_for(slot, transaction);
-        SequenceAlteration {
-            schema: definition.schema,
-            name: SqlName::parse(name).unwrap(),
-            spec: SeqSpec {
-                data_type: definition.data_type,
-                increment: definition.increment,
-                min_value: definition.min_value,
-                max_value: definition.max_value,
-                start_value: definition.start_value,
-                cache: definition.cache,
-                cycle: definition.cycle,
-            },
-            owner: definition.owner,
-            generator_for: definition.generator_for,
-            persistence: definition.persistence,
-            restart: None,
-        }
-    }
-
-    #[test]
-    fn sequence_lifecycle_stale_edits_and_finalizers_cannot_touch_reused_slots() {
-        let mut storage = fixture();
-        crate::mem::guard::forbid_alloc(|| {
-            let original = create(&mut storage, "original_sequence", 7);
-            let selected = storage.prepare_sequence_edit(original.slot(), 7).unwrap();
-            storage.finish_sequence_change(original, CatalogDdlDecision::Rollback);
-            let replacement = create(&mut storage, "replacement_sequence", 9);
-            assert_eq!(original.slot(), replacement.slot());
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_sequence_change(original, decision);
-            }
-            assert_eq!(
-                storage
-                    .stage_sequence_alter(
-                        selected,
-                        alteration(&storage, replacement.slot(), "stolen_name", 9),
-                        7,
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_TABLE
-            );
-            assert!(
-                storage
-                    .sequence_slot("public", "replacement_sequence", 9)
-                    .is_some()
-            );
-            assert!(
-                storage
-                    .sequence_slot("public", "replacement_sequence", 0)
-                    .is_none()
-            );
-            storage.finish_sequence_change(replacement, CatalogDdlDecision::Commit);
-            let first = storage
-                .drop_sequence("public", "replacement_sequence", 11)
-                .unwrap()
-                .unwrap();
-            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
-            let second = storage
-                .drop_sequence("public", "replacement_sequence", 11)
-                .unwrap()
-                .unwrap();
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_sequence_change(first, decision);
-            }
-            assert!(
-                storage
-                    .sequence_slot("public", "replacement_sequence", 11)
-                    .is_none()
-            );
-            storage.finish_sequence_change(second, CatalogDdlDecision::Rollback);
-            assert!(
-                storage
-                    .sequence_slot("public", "replacement_sequence", 0)
-                    .is_some()
-            );
-        });
-    }
-
-    #[test]
-    fn sequence_lifecycle_edits_follow_revision_and_savepoint_order() {
-        let mut storage = fixture();
-        let created = create(&mut storage, "original_sequence", 7);
-        storage.finish_sequence_change(created, CatalogDdlDecision::Commit);
-        crate::mem::guard::forbid_alloc(|| {
-            let selected = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
-            let first = storage
-                .stage_sequence_alter(
-                    selected,
-                    alteration(&storage, created.slot(), "first_sequence", 9),
-                    9,
-                )
-                .unwrap();
-            assert_eq!(
-                storage
-                    .stage_sequence_alter(
-                        selected,
-                        alteration(&storage, created.slot(), "stale_sequence", 9),
-                        9,
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            let current = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
-            let second = storage
-                .stage_sequence_alter(
-                    current,
-                    alteration(&storage, created.slot(), "second_sequence", 9),
-                    9,
-                )
-                .unwrap();
-            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
-            assert!(
-                storage
-                    .sequence_slot("public", "second_sequence", 9)
-                    .is_some()
-            );
-            storage.finish_sequence_change(second, CatalogDdlDecision::Rollback);
-            assert!(
-                storage
-                    .sequence_slot("public", "first_sequence", 9)
-                    .is_some()
-            );
-            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
-            assert!(
-                storage
-                    .sequence_slot("public", "original_sequence", 9)
-                    .is_some()
-            );
-            let current = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
-            let third = storage
-                .stage_sequence_alter(
-                    current,
-                    alteration(&storage, created.slot(), "third_sequence", 9),
-                    9,
-                )
-                .unwrap();
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_sequence_change(second, decision);
-            }
-            assert!(
-                storage
-                    .sequence_slot("public", "third_sequence", 9)
-                    .is_some()
-            );
-            storage.finish_sequence_change(third, CatalogDdlDecision::Commit);
-            assert!(
-                storage
-                    .sequence_slot("public", "third_sequence", 0)
-                    .is_some()
-            );
-        });
-    }
-
-    #[test]
-    fn sequence_lifecycle_source_rejects_cross_storage_and_transaction_reuse() {
-        let mut storage = fixture();
-        let mut other = fixture();
-        let original = create(&mut storage, "source_sequence", 7);
-        let replacement = create(&mut other, "other_sequence", 7);
-        let selected = storage.prepare_sequence_edit(original.slot(), 7).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(
-                other
-                    .stage_sequence_alter(
-                        selected,
-                        alteration(&other, replacement.slot(), "stolen_name", 7),
-                        7,
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_TABLE
-            );
-            assert_eq!(
-                storage
-                    .stage_sequence_alter(
-                        selected,
-                        alteration(&storage, original.slot(), "stolen_name", 7),
-                        9,
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_TABLE
-            );
-            other.finish_sequence_change(original, CatalogDdlDecision::Rollback);
-            assert!(other.sequence_slot("public", "other_sequence", 7).is_some());
-            assert!(
-                storage
-                    .sequence_slot("public", "source_sequence", 7)
-                    .is_some()
-            );
-        });
-    }
-}
-
 impl SequenceAlterUndo {
     pub(crate) fn slot(self) -> usize {
         self.target.slot()
@@ -289,6 +49,95 @@ impl SequenceChange {
 }
 
 impl Storage {
+    pub(crate) fn sequence_position(&self, slot: usize) -> super::CatalogPosition {
+        let sequence = self.sequence(slot);
+        super::CatalogPosition::new(slot, sequence.created_at)
+            .expect("sequence position selects a live object")
+    }
+
+    pub(crate) fn sequence_replay_slot(
+        &self,
+        position: super::CatalogPosition,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Result<usize, SqlError> {
+        let catalog = self.sequence_catalog();
+        let valid = catalog
+            .definitions
+            .get(position.slot())
+            .is_some_and(|sequence| {
+                let definition = sequence.definition_for(transaction);
+                sequence.database == current_database()
+                    && sequence.visible_to(transaction)
+                    && sequence.created_at == position.created_at()
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+            });
+        if valid {
+            Ok(position.slot())
+        } else {
+            Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal sequence source identity or name does not match"
+            ))
+        }
+    }
+
+    pub(crate) fn replay_sequence_definition(
+        &mut self,
+        create: SequenceCreateSpec,
+        restart: Option<i64>,
+        transaction: u32,
+    ) -> Result<SequenceChange, SqlError> {
+        let super::CatalogAllocation::Restore(position) = create.allocation else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "sequence replay requires a durable catalog identity"
+            ));
+        };
+        let existing = self
+            .sequence_catalog()
+            .definitions
+            .get(position.slot())
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "saved sequence position exceeds configured capacity"
+                )
+            })?;
+        if existing.ddl_state == CatalogDdlState::Absent {
+            if restart.is_some() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal restarts an absent sequence"
+                ));
+            }
+            return self.create_sequence(create, transaction);
+        }
+        let slot = self.sequence_replay_slot(
+            position,
+            create.schema.as_str(),
+            create.name.as_str(),
+            transaction,
+        )?;
+        let target = self.prepare_sequence_edit(slot, transaction)?;
+        self.stage_sequence_alter(
+            target,
+            SequenceAlteration {
+                schema: create.schema,
+                name: create.name,
+                spec: create.spec,
+                owner: create.owner,
+                generator_for: create.generator_for,
+                persistence: create.persistence,
+                restart,
+            },
+            transaction,
+        )
+    }
+
     pub(crate) fn prepare_sequence_edit(
         &self,
         slot: usize,
@@ -577,6 +426,7 @@ impl Storage {
         transaction: u32,
     ) -> Result<SequenceChange, SqlError> {
         let SequenceCreateSpec {
+            allocation,
             schema,
             name,
             spec,
@@ -630,19 +480,43 @@ impl Storage {
                 }
             }
         }
-        let slot = owners
-            .catalog
-            .definitions
-            .iter()
-            .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many sequences (limit {})",
-                    owners.catalog.definitions.len()
-                )
-            })?;
-        let created_at = self.catalog_sequence.next()?;
+        let (slot, created_at) = match allocation {
+            super::CatalogAllocation::New => {
+                let slot = owners
+                    .catalog
+                    .definitions
+                    .iter()
+                    .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many sequences (limit {})",
+                            owners.catalog.definitions.len()
+                        )
+                    })?;
+                (slot, self.catalog_sequence.next()?)
+            }
+            super::CatalogAllocation::Restore(position) => {
+                if owners
+                    .catalog
+                    .definitions
+                    .get(position.slot())
+                    .is_none_or(|sequence| sequence.ddl_state != CatalogDdlState::Absent)
+                    || owners.catalog.definitions.iter().any(|sequence| {
+                        sequence.database == current_database()
+                            && sequence.ddl_state != CatalogDdlState::Absent
+                            && sequence.created_at == position.created_at()
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "saved sequence position is unavailable or its creation identity is already used"
+                    ));
+                }
+                self.catalog_sequence.observe(position.created_at());
+                (position.slot(), position.created_at())
+            }
+        };
         Self::clear_object_acl_entries_locked(
             owners
                 .permissions
@@ -982,5 +856,246 @@ impl Storage {
                 CatalogDdlDecision::Rollback => self.rollback_sequence_alter(undo),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{test_budget, test_config};
+    use crate::storage::{RelationPersistence, SeqSpec, SeqType, SqlName};
+
+    fn fixture() -> Storage {
+        let mut config = test_config();
+        config.max_sequences = 1;
+        let mut budget = test_budget(&config);
+        Storage::new(&config, &mut budget).unwrap()
+    }
+
+    fn create(storage: &mut Storage, name: &str, transaction: u32) -> SequenceChange {
+        storage
+            .create_sequence(
+                SequenceCreateSpec {
+                    allocation: crate::storage::CatalogAllocation::New,
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse(name).unwrap(),
+                    spec: SeqSpec {
+                        data_type: SeqType::Bigint,
+                        increment: 1,
+                        min_value: 1,
+                        max_value: i64::MAX,
+                        start_value: 1,
+                        cache: 1,
+                        cycle: false,
+                    },
+                    owner: None,
+                    generator_for: None,
+                    persistence: RelationPersistence::Permanent,
+                },
+                transaction,
+            )
+            .unwrap()
+    }
+
+    fn alteration(
+        storage: &Storage,
+        slot: usize,
+        name: &str,
+        transaction: u32,
+    ) -> SequenceAlteration {
+        let definition = storage.sequence_for(slot, transaction);
+        SequenceAlteration {
+            schema: definition.schema,
+            name: SqlName::parse(name).unwrap(),
+            spec: SeqSpec {
+                data_type: definition.data_type,
+                increment: definition.increment,
+                min_value: definition.min_value,
+                max_value: definition.max_value,
+                start_value: definition.start_value,
+                cache: definition.cache,
+                cycle: definition.cycle,
+            },
+            owner: definition.owner,
+            generator_for: definition.generator_for,
+            persistence: definition.persistence,
+            restart: None,
+        }
+    }
+
+    #[test]
+    fn sequence_lifecycle_stale_edits_and_finalizers_cannot_touch_reused_slots() {
+        let mut storage = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            let original = create(&mut storage, "original_sequence", 7);
+            let selected = storage.prepare_sequence_edit(original.slot(), 7).unwrap();
+            storage.finish_sequence_change(original, CatalogDdlDecision::Rollback);
+            let replacement = create(&mut storage, "replacement_sequence", 9);
+            assert_eq!(original.slot(), replacement.slot());
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_sequence_change(original, decision);
+            }
+            assert_eq!(
+                storage
+                    .stage_sequence_alter(
+                        selected,
+                        alteration(&storage, replacement.slot(), "stolen_name", 9),
+                        7,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_TABLE
+            );
+            assert!(
+                storage
+                    .sequence_slot("public", "replacement_sequence", 9)
+                    .is_some()
+            );
+            assert!(
+                storage
+                    .sequence_slot("public", "replacement_sequence", 0)
+                    .is_none()
+            );
+            storage.finish_sequence_change(replacement, CatalogDdlDecision::Commit);
+            let first = storage
+                .drop_sequence("public", "replacement_sequence", 11)
+                .unwrap()
+                .unwrap();
+            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
+            let second = storage
+                .drop_sequence("public", "replacement_sequence", 11)
+                .unwrap()
+                .unwrap();
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_sequence_change(first, decision);
+            }
+            assert!(
+                storage
+                    .sequence_slot("public", "replacement_sequence", 11)
+                    .is_none()
+            );
+            storage.finish_sequence_change(second, CatalogDdlDecision::Rollback);
+            assert!(
+                storage
+                    .sequence_slot("public", "replacement_sequence", 0)
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn sequence_lifecycle_edits_follow_revision_and_savepoint_order() {
+        let mut storage = fixture();
+        let created = create(&mut storage, "original_sequence", 7);
+        storage.finish_sequence_change(created, CatalogDdlDecision::Commit);
+        crate::mem::guard::forbid_alloc(|| {
+            let selected = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
+            let first = storage
+                .stage_sequence_alter(
+                    selected,
+                    alteration(&storage, created.slot(), "first_sequence", 9),
+                    9,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .stage_sequence_alter(
+                        selected,
+                        alteration(&storage, created.slot(), "stale_sequence", 9),
+                        9,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let current = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
+            let second = storage
+                .stage_sequence_alter(
+                    current,
+                    alteration(&storage, created.slot(), "second_sequence", 9),
+                    9,
+                )
+                .unwrap();
+            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
+            assert!(
+                storage
+                    .sequence_slot("public", "second_sequence", 9)
+                    .is_some()
+            );
+            storage.finish_sequence_change(second, CatalogDdlDecision::Rollback);
+            assert!(
+                storage
+                    .sequence_slot("public", "first_sequence", 9)
+                    .is_some()
+            );
+            storage.finish_sequence_change(first, CatalogDdlDecision::Rollback);
+            assert!(
+                storage
+                    .sequence_slot("public", "original_sequence", 9)
+                    .is_some()
+            );
+            let current = storage.prepare_sequence_edit(created.slot(), 9).unwrap();
+            let third = storage
+                .stage_sequence_alter(
+                    current,
+                    alteration(&storage, created.slot(), "third_sequence", 9),
+                    9,
+                )
+                .unwrap();
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_sequence_change(second, decision);
+            }
+            assert!(
+                storage
+                    .sequence_slot("public", "third_sequence", 9)
+                    .is_some()
+            );
+            storage.finish_sequence_change(third, CatalogDdlDecision::Commit);
+            assert!(
+                storage
+                    .sequence_slot("public", "third_sequence", 0)
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn sequence_lifecycle_source_rejects_cross_storage_and_transaction_reuse() {
+        let mut storage = fixture();
+        let mut other = fixture();
+        let original = create(&mut storage, "source_sequence", 7);
+        let replacement = create(&mut other, "other_sequence", 7);
+        let selected = storage.prepare_sequence_edit(original.slot(), 7).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                other
+                    .stage_sequence_alter(
+                        selected,
+                        alteration(&other, replacement.slot(), "stolen_name", 7),
+                        7,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_TABLE
+            );
+            assert_eq!(
+                storage
+                    .stage_sequence_alter(
+                        selected,
+                        alteration(&storage, original.slot(), "stolen_name", 7),
+                        9,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_TABLE
+            );
+            other.finish_sequence_change(original, CatalogDdlDecision::Rollback);
+            assert!(other.sequence_slot("public", "other_sequence", 7).is_some());
+            assert!(
+                storage
+                    .sequence_slot("public", "source_sequence", 7)
+                    .is_some()
+            );
+        });
     }
 }

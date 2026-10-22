@@ -161,7 +161,7 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid, relation.relowner FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'lifecycle_view' AND rewrite.rulename = '_RETURN'";
             let identity = data_rows(&session.success(&mut engine, identity_sql, true));
             assert_eq!(identity.len(), 1);
-            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING", true);
+            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING; ALTER TABLE lifecycle_view DISABLE RULE lifecycle_rule; CREATE OR REPLACE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING", true);
             if decision == "COMMIT" {
                 session.success(&mut engine, "COMMIT", false);
             } else {
@@ -193,7 +193,7 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
                 identity
             );
             assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT value FROM lifecycle_view; SELECT value FROM lifecycle_dependent; SELECT obj_description('lifecycle_view'::regclass)", false)), if committed { vec!["2", "2", "retained comment"] } else { vec!["1", "1", "retained comment"] });
-            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT relispopulated FROM pg_class WHERE relname = 'lifecycle_mat'; SELECT ispopulated FROM pg_matviews WHERE matviewname = 'lifecycle_mat'; SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_rule'", true)), if committed { vec!["t", "t", "1"] } else { vec!["f", "f", "0"] });
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT relispopulated FROM pg_class WHERE relname = 'lifecycle_mat'; SELECT ispopulated FROM pg_matviews WHERE matviewname = 'lifecycle_mat'; SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_rule'; SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'lifecycle_rule'", true)), if committed { vec!["t", "t", "1", "D"] } else { vec!["f", "f", "0"] });
             if committed {
                 assert_eq!(
                     data_rows(&cold_session.success(

@@ -154,6 +154,24 @@ ROLLBACK;
 SELECT value, obj_description('view_replacement_identity'::regclass)
   FROM view_replacement_identity;
 CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+COMMENT ON RULE remembered_view_rule ON view_replacement_identity IS 'original rule comment';
+ALTER RULE remembered_view_rule ON view_replacement_identity RENAME TO remembered_view_rule;
+ALTER RULE "_RETURN" ON view_replacement_identity RENAME TO renamed_return;
+BEGIN;
+ALTER TABLE view_replacement_identity DISABLE RULE remembered_view_rule;
+CREATE OR REPLACE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+SELECT ev_enabled, obj_description(oid, 'pg_rewrite') FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
+ROLLBACK;
+BEGIN;
+DROP RULE remembered_view_rule ON view_replacement_identity;
+CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+SELECT obj_description(oid, 'pg_rewrite') IS NULL FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
+COMMENT ON RULE remembered_view_rule ON view_replacement_identity IS 'new rule comment';
+COMMIT;
+SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
 BEGIN;
 DROP RULE remembered_view_rule ON view_replacement_identity;
 SAVEPOINT before_view_drop;

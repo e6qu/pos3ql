@@ -13253,11 +13253,11 @@ pub(crate) fn drop_schema(
                     Ok(d) => d,
                     Err(e) => return sql_fail(e),
                 };
-                if let Some(undo) = dropped {
-                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
-                        storage.rollback_view_drop(undo);
-                        return sql_fail(error);
-                    }
+                if let Some(undo) = dropped
+                    && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+                {
+                    storage.rollback_view_drop(undo);
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Routine(routine) => {
@@ -37635,7 +37635,8 @@ pub fn create_rule(
         } else {
             None
         };
-    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+    let installed = storage.rule(slot).definition_for(txn.txid);
+    if let Err(error) = stage_rule(storage, wal, txn, slot, installed) {
         storage.finish_rule_publication(
             publication,
             prior_table_rule_txid,
@@ -44904,11 +44905,11 @@ fn drop_view_slot(
             },
         )?;
     }
-    if let Some(undo) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
-            storage.rollback_view_drop(undo);
-            return Err(error);
-        }
+    if let Some(undo) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)?
+        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+    {
+        storage.rollback_view_drop(undo);
+        return Err(error);
     }
     Ok(())
 }
@@ -47129,11 +47130,11 @@ pub fn drop_view(
                 Ok(d) => d,
                 Err(e) => return sql_fail(e),
             };
-            if let Some(undo) = dropped {
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo)) {
-                    storage.rollback_view_drop(undo);
-                    return sql_fail(error);
-                }
+            if let Some(undo) = dropped
+                && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+            {
+                storage.rollback_view_drop(undo);
+                return sql_fail(error);
             }
         } else if if_exists {
             responder.notice(

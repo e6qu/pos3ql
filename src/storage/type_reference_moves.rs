@@ -1773,6 +1773,7 @@ mod tests {
                     RuleDefinition {
                         name,
                         target,
+                        event: crate::storage::RewriteEvent::Insert,
                         ..RuleDefinition::EMPTY
                     },
                     dependencies.view(),

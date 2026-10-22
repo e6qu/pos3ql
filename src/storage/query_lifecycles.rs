@@ -1903,6 +1903,7 @@ mod tests {
         let definition = super::super::RuleDefinition {
             name: name("first_rule"),
             target: super::super::RuleTarget::View(view.slot() as u16),
+            event: super::super::RewriteEvent::Insert,
             ..super::super::RuleDefinition::EMPTY
         };
         let dependencies = StoredQueryDependencies::EMPTY;

@@ -50022,6 +50022,8 @@ impl Storage {
             let previous = prior
                 .filter(|pending| pending.txid == txid)
                 .map(|pending| pending.dependency_slot);
+            let mut definition = definition;
+            definition.enabled = catalog.rules[slot].definition_for(txid).enabled;
             let version = self.catalog_sequence.next()?;
             let dependency_slot = owners.allocate_query_image(
                 self,
@@ -50157,7 +50159,7 @@ impl Storage {
             .iter()
             .enumerate()
             .any(|(other, rule)| {
-                other != slot
+                (other != slot || matches!(change, RuleMetadataChange::Rename(_)))
                     && rule.database == current_database()
                     && rule.visible_to(txid)
                     && rule.definition_for(txid).target == definition.target
@@ -50168,6 +50170,20 @@ impl Storage {
                 sqlstate::DUPLICATE_OBJECT,
                 "rule already exists for relation"
             ));
+        }
+        if matches!(change, RuleMetadataChange::Rename(_)) {
+            if old.event == RewriteEvent::Select {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "renaming an ON SELECT rule is not allowed"
+                ));
+            }
+            if definition.name.as_str() == "_RETURN" {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "non-view rule must not be named \"_RETURN\""
+                ));
+            }
         }
         let comments = owners
             .comments

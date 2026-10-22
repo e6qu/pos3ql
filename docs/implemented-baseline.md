@@ -835,6 +835,9 @@ through `pg_rewrite`.
 After a view is renamed inside a transaction, rule listings use its new name.
 View changes and removal use those names too. The same names are recorded for
 restart; rollback restores the old names.
+Replacing a rule preserves its enable mode. Rule renames reject an already used
+name, including the rule's current name; the internal `_RETURN` rule cannot be
+renamed.
 
 Tables, views and accounts have distinct lock identities. Account locks use
 durable identifiers, so they do not transfer to a reused catalog position.

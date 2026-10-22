@@ -8541,6 +8541,7 @@ impl Checkpointer {
                                 name: sql_name(&name)?,
                                 pending_name: None,
                                 table: sql_name(&table)?,
+                                table_binding: None,
                                 method,
                                 ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,

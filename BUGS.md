@@ -12,7 +12,8 @@ and [storage format guide](docs/durable-format.md). Keep regression evidence in
 the implementing PR.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
-exact blocker. Publication, recovery, slot reuse and capacity failures follow the same rule.
+exact blocker. Publication, recovery, slot reuse, column bindings and capacity
+failures follow the same rule.
 Remove repaired entries; preserve their evidence in the implementing
 change instead of keeping a resolved-work journal.
 

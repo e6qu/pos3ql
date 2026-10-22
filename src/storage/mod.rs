@@ -31,6 +31,8 @@ mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod definition_pool;
+mod index_bindings;
+use index_bindings::IndexTableBinding;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
@@ -3921,7 +3923,10 @@ pub(crate) fn row_heap_image_capacity(config: &Config) -> usize {
 #[derive(Debug, Clone, Copy)]
 struct PendingTableDef {
     pub txid: u32,
+    pub revision: u64,
     pub def: TableDef,
+    /// Immediately preceding definition ordinal -> this definition ordinal.
+    pub transition: [u16; MAX_COLUMNS],
     /// Committed-definition column index → latest column name. `None` means
     /// the committed column was dropped. This composes across ALTER commands
     /// and lets sequence ownership rebind once, atomically, at commit.
@@ -10776,6 +10781,7 @@ pub struct IndexDef {
     pub name: SqlName,
     pub(crate) pending_name: Option<PendingIndexName>,
     pub table: SqlName,
+    pub(crate) table_binding: Option<IndexTableBinding>,
     pub method: crate::sql::ast::IndexAccessMethod,
     pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
@@ -10813,6 +10819,7 @@ impl IndexDef {
         name: SqlName::EMPTY,
         pending_name: None,
         table: SqlName::EMPTY,
+        table_binding: None,
         method: crate::sql::ast::IndexAccessMethod::Btree,
         ownership: Ownership::BOOTSTRAP,
         columns: [0; MAX_INDEX_COLS],
@@ -21172,6 +21179,25 @@ impl Storage {
                 definition.pending_name = None;
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                let copied_table = self
+                    .tables
+                    .iter()
+                    .enumerate()
+                    .find_map(|(slot, table)| {
+                        let state = table.definition.read();
+                        (state.identity.database == target
+                            && state.identity.existence.visible_to(txid)
+                            && state.committed.schema == definition.schema
+                            && state.committed.name == definition.table)
+                            .then_some(slot)
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template index table was not cloned"
+                        )
+                    })?;
+                definition.table_binding = Some(self.capture_index_binding(copied_table, txid));
                 for collation in definition.collations.iter_mut().take(definition.n_cols) {
                     if let Collation::Catalog(source) = *collation {
                         let target = collation_slots[usize::from(source)];
@@ -35159,6 +35185,7 @@ impl Storage {
             let definition = self.tables[index].definition();
             definition.has_rules
         };
+        self.promote_private_index_bindings(index, txid);
         self.set_table_def(index, definition, &pending.column_mapping);
         self.clear_pending_table_defs(index);
         self.commit_constraint_comment_identities(index, txid);
@@ -44107,12 +44134,15 @@ impl Storage {
     }
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        let slot = self.index_catalog().iter().position(|index| {
-            index.database == current_database()
-                && index.visible_to(txid)
-                && index.schema.as_str() == schema
-                && index.name_for(txid).as_str() == name
-        });
+        let slot = self
+            .matching_indexes(|index| {
+                index.database == current_database() && index.visible_to(txid)
+            })
+            .find_map(|(slot, index)| {
+                let projected = self.project_index_binding(index, txid)?;
+                (projected.schema.as_str() == schema && projected.name_for(txid).as_str() == name)
+                    .then_some(slot)
+            });
         if slot.is_some_and(|slot| {
             self.index_table_slot_to(slot, txid).is_some_and(|table| {
                 self.table_def(table, txid).persistence == RelationPersistence::Temporary
@@ -44158,15 +44188,14 @@ impl Storage {
     /// caller from retaining a catalog borrow across cache reconstruction.
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
         let index = self
-            .index_catalog()
-            .iter()
-            .find(|index| {
-                index.database == current_database()
-                    && index.visible_to(txid)
-                    && index.schema.as_str() == schema
-                    && index.name_for(txid).as_str() == name
+            .matching_indexes(|index| {
+                index.database == current_database() && index.visible_to(txid)
             })
-            .copied();
+            .find_map(|(_, index)| {
+                let projected = self.project_index_binding(index, txid)?;
+                (projected.schema.as_str() == schema && projected.name_for(txid).as_str() == name)
+                    .then_some(projected)
+            });
         if let Some(index) = index
             && self
                 .find_visible(index.schema.as_str(), index.table.as_str(), txid)
@@ -44505,6 +44534,16 @@ impl Storage {
             0
         };
         let ownership = self.initial_ownership(txid)?;
+        let table = self
+            .find_visible(def.schema.as_str(), def.table.as_str(), txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    def.table.as_str()
+                )
+            })?;
+        def.table_binding = Some(self.capture_index_binding(table, txid));
         if self
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
@@ -44911,7 +44950,7 @@ impl Storage {
     /// use this form so a just-created table is not mistaken for corruption.
     pub(crate) fn index_table_slot_to(&self, slot: usize, txid: u32) -> Option<usize> {
         let index = self.index_catalog().get(slot).copied()?;
-        self.find_visible(index.schema.as_str(), index.table.as_str(), txid)
+        self.index_binding_table(index, txid)
     }
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
@@ -44937,27 +44976,12 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let committed_binding = self.find_visible(schema, table, txid).map(|slot| {
-            (
-                {
-                    let definition = self.tables[slot].definition();
-                    definition.schema
-                },
-                {
-                    let definition = self.tables[slot].definition();
-                    definition.name
-                },
-            )
-        });
-        self.matching_indexes(move |x| {
-            x.database == current_database()
-                && x.visible_to(txid)
-                && ((x.schema.as_str() == schema && x.table.as_str() == table)
-                    || committed_binding.is_some_and(|(old_schema, old_table)| {
-                        x.schema == old_schema && x.table == old_table
-                    }))
-        })
-        .map(move |(_, index)| self.project_index_binding(index, txid))
+        let selected = self.find_visible(schema, table, txid);
+        self.matching_indexes(move |x| x.database == current_database() && x.visible_to(txid))
+            .filter(move |(_, index)| {
+                selected.is_some_and(|table| self.index_binding_matches(*index, table))
+            })
+            .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }
 
     pub fn unique_indexes_for<'a>(
@@ -45004,71 +45028,14 @@ impl Storage {
         let index = self.index_catalog().get(slot).copied();
         index
             .filter(|index| index.database == current_database())
-            .map(|index| self.project_index_binding(index, txid))
+            .and_then(|index| self.project_index_binding(index, txid))
     }
 
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {
         let index = self.index_catalog().get(slot).copied();
         index
             .filter(|index| index.database == current_database() && index.visible_to(txid))
-            .map(|index| self.project_index_binding(index, txid))
-    }
-
-    /// Projects committed index column ordinals through this transaction's
-    /// pending table shape. A visible index that names a removed column is an
-    /// executor invariant violation: DROP COLUMN must mark it pending-drop
-    /// before publishing the pending table definition.
-    fn project_index_binding(&self, mut index: IndexDef, txid: u32) -> IndexDef {
-        // A transaction-private CREATE INDEX is already expressed against the
-        // table shape visible at its creation point. Committed indexes alone
-        // need projection from their committed table binding.
-        if index.ddl_state != CatalogDdlState::Present {
-            return index;
-        }
-        let Some(table_slot) = self.tables.iter().position(|table| {
-            table.database() == index.database
-                && {
-                    let definition = table.definition();
-                    definition.schema
-                } == index.schema
-                && {
-                    let definition = table.definition();
-                    definition.name
-                } == index.table
-        }) else {
-            return index;
-        };
-        let Some(pending) = self
-            .pending_table_def(table_slot)
-            .filter(|pending| pending.txid == txid)
-        else {
-            return index;
-        };
-        for key in 0..index.n_cols {
-            if index.expressions[key].is_some() {
-                continue;
-            }
-            let committed = usize::from(index.columns[key]);
-            let target_name = pending.column_mapping[committed]
-                .expect("visible index key cannot reference a dropped column");
-            index.columns[key] = pending
-                .def
-                .column_index(target_name.as_str())
-                .expect("pending index key name must exist in pending table definition")
-                as u16;
-        }
-        for column in &mut index.include_columns[..index.n_include_cols] {
-            let target_name = pending.column_mapping[usize::from(*column)]
-                .expect("visible included index column cannot reference a dropped column");
-            *column = pending
-                .def
-                .column_index(target_name.as_str())
-                .expect("pending included column name must exist in pending table definition")
-                as u16;
-        }
-        index.schema = pending.def.schema;
-        index.table = pending.def.name;
-        index
+            .and_then(|index| self.project_index_binding(index, txid))
     }
 
     pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
@@ -53755,6 +53722,9 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage
+            .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
+            .unwrap();
         let slot = storage
             .create_index(test_index_definition("local_index"), 17)
             .unwrap();

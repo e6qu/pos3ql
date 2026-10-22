@@ -144,11 +144,25 @@ impl<'storage> TableDefinitionEdit<'storage> {
         // Acquire the selected definition before the shared comment catalog
         // or version allocator. Waiting for its readers never reserves either.
         comment_identity.ensure_available(&comments)?;
+        let mut transition = [u16::MAX; MAX_COLUMNS];
+        for (column, target) in column_mapping.iter().enumerate().take(current.n_columns) {
+            if let Some(target) = target {
+                transition[column] = definition.column_index(target.as_str()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "table column mapping references an absent target"
+                    )
+                })? as u16;
+            }
+        }
+        let revision = self.storage.catalog_sequence.next()?;
         self.storage.pending_table_defs.stage_locked(
             &mut self.definition,
             PendingTableDef {
                 txid: transaction,
+                revision,
                 def: definition,
+                transition,
                 column_mapping: composed,
                 rewrites_rows: rewrites_rows
                     || prior.as_ref().is_some_and(|version| version.rewrites_rows),
@@ -491,7 +505,9 @@ mod tests {
                     &storage.tables[first].definition,
                     PendingTableDef {
                         txid: 8,
+                        revision: 1,
                         def: changed,
+                        transition: [u16::MAX; MAX_COLUMNS],
                         column_mapping: mapping("id"),
                         rewrites_rows: false,
                     },

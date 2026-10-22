@@ -1,0 +1,48 @@
+name: Table and index validation
+
+on:
+  push:
+    branches: [finish-table-index-publication]
+
+concurrency:
+  group: table-index-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: PostgreSQL reference behavior
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess
+          sql = pathlib.Path("tests/external/differential_exact/10_private_index_bindings.sql").read_bytes()
+          observed = subprocess.check_output([
+              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+              "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+          ], input=sql).decode().splitlines()
+          assert observed == ["payload|7", "10|payload|7", "payload|7", "1"], observed
+          print("PostgreSQL reference:", observed)
+          PYTHON
+      - name: All-target compilation and lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Table and index lifecycle regressions
+        run: >-
+          cargo test --release --lib --locked -- private_index_bindings table_name pending_table_definition
+          index_catalog index_slot index_rename metadata_database_copy wal:: checkpoint::
+          --test-threads=1

@@ -863,10 +863,12 @@ before a later creation reuses the saved position. For example, repeatedly
 running `pg_restore --clean` against populated tables must leave the final rows
 readable after restart. See the [current stored formats](durable-format.md).
 
-When a committed index follows a table rename or schema move, its key and
-included columns also follow the transaction's composed column mapping. Dropping
-an earlier column and renaming the table in one transaction must keep the index
-bound to its original key and payload columns.
+When an index follows a table rename or schema move, its key and included columns
+follow the table definition it selected. This includes an index created before
+or between changes in the same transaction, and a key column added by that
+transaction. Savepoint rollback restores the earlier binding. For example,
+creating an index on `added`, then removing an earlier column, must keep the
+index on `added` through commit and restart.
 
 ### Changing rewrite rules
 

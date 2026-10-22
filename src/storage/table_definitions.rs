@@ -412,6 +412,56 @@ impl DefinitionVersions {
             .map(|head| self.read(head.tail as usize).version)
     }
 
+    pub(super) fn selected_revision(&self, state: &DefinitionState, transaction: u32) -> u64 {
+        state
+            .pending
+            .filter(|head| head.transaction == transaction)
+            .map_or(0, |head| self.read(head.tail as usize).version.revision)
+    }
+
+    pub(super) fn project_columns(
+        &self,
+        state: &DefinitionState,
+        transaction: u32,
+        source_revision: u64,
+        columns: &mut [u16],
+    ) -> bool {
+        let mut tail = state
+            .pending
+            .filter(|head| head.transaction == transaction)
+            .map(|head| head.tail);
+        let mut mapping = core::array::from_fn::<_, MAX_COLUMNS, _>(|column| column as u16);
+        let mut found = source_revision == 0;
+        while let Some(slot) = tail {
+            let image = self.read(slot as usize);
+            if image.version.revision == source_revision {
+                found = true;
+                break;
+            }
+            let mut previous = [u16::MAX; MAX_COLUMNS];
+            for (column, target) in image.version.transition.iter().copied().enumerate() {
+                if target != u16::MAX {
+                    previous[column] = mapping[usize::from(target)];
+                }
+            }
+            mapping = previous;
+            tail = image.previous;
+        }
+        if !found
+            || columns.iter().any(|column| {
+                mapping
+                    .get(usize::from(*column))
+                    .is_none_or(|target| *target == u16::MAX)
+            })
+        {
+            return false;
+        }
+        for column in columns {
+            *column = mapping[usize::from(*column)];
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(super) fn rollback(&self, definition: &TableDefinition, transaction: u32) -> bool {
         self.rollback_locked(&mut definition.write(), transaction)
@@ -602,7 +652,9 @@ mod tests {
     fn pending(epoch: usize, transaction: u32) -> PendingTableDef {
         PendingTableDef {
             txid: transaction,
+            revision: epoch as u64 + 1,
             def: definition(epoch),
+            transition: [u16::MAX; MAX_COLUMNS],
             column_mapping: [None; MAX_COLUMNS],
             rewrites_rows: false,
         }

@@ -35,8 +35,12 @@ wait, and keep old row, index and backup data until their readers have finished.
 Next connect table-shape changes and schema moves to complete transaction
 publication, including indexes, captured column mappings and comments. Check
 reader and backup retention while old files are replaced. Index bindings must
-remain valid through composed table-name and column changes. Recovery may retain
-exclusive startup access; ordinary publication must allow unrelated operations
+remain valid through composed table-name and column changes.
+Index creation must retain its selected table shape through later changes,
+savepoint rollback, commit and recovery, including columns added in the same
+transaction. Validate private and committed bindings at the same read boundary.
+Recovery may retain exclusive startup access; ordinary publication must allow
+unrelated operations
 to progress under their own owners.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The

@@ -4667,7 +4667,7 @@ fn rename_dependency_schema(entries: &mut [StoredQueryDependency], old: SqlName,
 /// Keeping these fields together makes it impossible for a catalog creation
 /// path to pass SQL text without its binding context.
 #[derive(Clone)]
-pub struct StoredQueryDefinition {
+pub(crate) struct StoredQueryDefinition {
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub dependencies: StoredQueryDependencies,

@@ -45,9 +45,9 @@ jobs:
               assert output == expected, (filename, output)
               print("PostgreSQL reference:", filename, output)
           PYTHON
+      - name: All-target compilation and lint
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Metadata lifetime regressions
         run: >-
           cargo test --release --lib --locked -- sequence routine metadata_ query_lifecycle matview materialized_view table_lifecycle table_catalog_lifecycle table_retirement
           --test-threads=1
-      - name: All-target compilation and lint
-        run: cargo clippy --all-targets --locked -- -D warnings

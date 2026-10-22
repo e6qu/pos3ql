@@ -89,14 +89,18 @@ fn metadata_materialized_undo_exhaustion_restores_backing_and_catalog() {
                     .is_none(),
                 "{statement}"
             );
-            assert!(
-                engine
-                    .storage
-                    .find_visible("public", "overflow_materialized", transaction)
-                    .is_none(),
-                "{statement}"
-            );
+            let backing = engine.storage.find_visible("public", "overflow_materialized", transaction);
+            if statement.starts_with("CREATE") {
+                let backing = backing.expect("the aborted transaction owns its earlier backing-table undo");
+                assert!(session.transaction.ddl().iter().any(|undo| matches!(undo,
+                    DdlUndo::Created(slot) if *slot as usize == backing)));
+            } else {
+                assert!(backing.is_none(), "{statement}");
+            }
+            assert!(engine.storage.find_visible("public", "overflow_materialized", 0).is_none(), "{statement}");
             session.success(&mut engine, "ROLLBACK", true);
+            assert!(engine.storage.find_visible("public", "overflow_materialized", 0).is_none(), "{statement}");
+            assert!(engine.storage.find_matview("public", "overflow_materialized", 0).is_none(), "{statement}");
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,

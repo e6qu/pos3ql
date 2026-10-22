@@ -27,9 +27,9 @@ CREATE TYPE metadata_shared_name AS ENUM ('value');
 COMMENT ON TYPE metadata_shared_name IS 'type comment';
 DO $body$
 BEGIN
-    CREATE SEQUENCE metadata_shared_name;
+    EXECUTE 'CREATE SEQUENCE metadata_shared_name';
     RAISE EXCEPTION 'sequence creation accepted a conflicting type name';
-EXCEPTION WHEN duplicate_object THEN
+EXCEPTION WHEN SQLSTATE '42710' THEN
     NULL;
 END
 $body$;

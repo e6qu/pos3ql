@@ -1020,7 +1020,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
         DdlUndo::ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
             (AccessClass::View, undo.slot() as u32)
         }
-        DdlUndo::MatviewCreated(slot) => (AccessClass::MaterializedView, slot),
+        DdlUndo::MatviewChanged(change) if change.is_creation() => {
+            (AccessClass::MaterializedView, change.slot() as u32)
+        }
         DdlUndo::RoutineChanged(change) if change.is_creation() => {
             (AccessClass::Routine, change.slot() as u32)
         }
@@ -5422,6 +5424,9 @@ impl Engine {
             ));
         }
         let query_validation = txn.ddl().iter().try_for_each(|undo| match undo {
+            DdlUndo::MatviewChanged(change) => {
+                self.storage.validate_matview_change(*change, txn.txid)
+            }
             DdlUndo::RoutineChanged(change) => {
                 self.storage.validate_routine_change(*change, txn.txid)
             }
@@ -5968,10 +5973,12 @@ impl Engine {
                         slot: undo.slot() as u16,
                     })
                 }
-                DdlUndo::MatviewCreated(slot) => Some(crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::MaterializedView,
-                    slot: slot as u16,
-                }),
+                DdlUndo::MatviewChanged(change) if change.is_creation() => {
+                    Some(crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::MaterializedView,
+                        slot: change.slot() as u16,
+                    })
+                }
                 DdlUndo::SequenceChanged(change) if change.is_creation() => {
                     Some(crate::storage::AccessObject {
                         class: crate::storage::AccessClass::Sequence,
@@ -6967,17 +6974,9 @@ impl Engine {
                 DdlUndo::SubscriptionRenamed { slot, .. } => self
                     .storage
                     .commit_subscription_rename(*slot as usize, txn.txid),
-                DdlUndo::MatviewCreated(slot) => {
-                    self.storage.commit_matview_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::MaterializedView,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
-                }
-                DdlUndo::MatviewDropped(slot) => self.storage.commit_matview_drop(*slot as usize),
+                DdlUndo::MatviewChanged(change) => self
+                    .storage
+                    .finish_matview_change(*change, crate::storage::CatalogDdlDecision::Commit),
                 DdlUndo::SequenceChanged(change) => self
                     .storage
                     .finish_sequence_change(*change, crate::storage::CatalogDdlDecision::Commit),
@@ -19855,9 +19854,8 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::SubscriptionRenamed { slot, prior } => {
             storage.rollback_subscription_rename(slot as usize, prior)
         }
-        DdlUndo::MatviewCreated(slot) => storage.rollback_matview_create(slot as usize),
-        DdlUndo::MatviewDropped(slot) => {
-            storage.rollback_matview_drop(slot as usize, txid);
+        DdlUndo::MatviewChanged(change) => {
+            storage.finish_matview_change(change, crate::storage::CatalogDdlDecision::Rollback);
         }
         DdlUndo::SequenceChanged(change) => {
             storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
@@ -21981,12 +21979,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 populated,
                 0,
             )?;
-            storage.commit_matview_create(slot);
+            storage.finish_matview_change(slot, crate::storage::CatalogDdlDecision::Commit);
         }
         WalOp::DropMatview { schema, name } => {
-            if let Some(slot) = storage.drop_matview(schema, name, 0)? {
-                storage.commit_matview_drop(slot);
-            }
+            storage.replay_drop_matview(schema, name)?;
         }
         WalOp::SetMatviewPopulated {
             schema,

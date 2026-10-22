@@ -18052,7 +18052,7 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 error.message.as_str()
             ))
         })?;
-    storage.commit_matview_create(slot);
+    storage.finish_matview_change(slot, crate::storage::CatalogDdlDecision::Commit);
     Ok(())
 }
 

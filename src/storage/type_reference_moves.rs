@@ -1398,7 +1398,7 @@ mod tests {
             }
             SavedQueryKind::MaterializedView => storage
                 .create_matview(related, definition.query, false, 7)
-                .map(|slot| storage.matview_dependency_image(slot)),
+                .map(|change| storage.matview_dependency_image(change.slot())),
             SavedQueryKind::Policy => storage
                 .create_policy(
                     PolicySpec {

@@ -116,7 +116,7 @@ impl ViewPublication {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PendingMatviewPopulation {
     pub(super) transaction: u32,
-    version: u64,
+    pub(super) version: u64,
     pub(super) populated: bool,
 }
 
@@ -393,48 +393,6 @@ impl Storage {
         }) {
             comment.pending_drop = None;
         }
-    }
-
-    pub(super) fn stage_matview_comment_drop(
-        &self,
-        slot: usize,
-        transaction: u32,
-    ) -> Result<(), SqlError> {
-        let view = self.matview(slot);
-        let source = self.catalog_object_identity(
-            CatalogObjectSlot::MaterializedView(slot),
-            view.database,
-            view.created_at,
-        );
-        let definition = self.table_def(usize::from(view.backing_table), transaction);
-        self.stage_query_comment_drop(
-            &mut self.comment_catalog(),
-            source,
-            definition.schema,
-            definition.name,
-            None,
-            transaction,
-        )
-    }
-
-    pub(super) fn finish_matview_comment_drop(
-        &self,
-        slot: usize,
-        transaction: u32,
-        decision: CatalogDdlDecision,
-    ) {
-        let view = self.matview(slot);
-        let source = self.catalog_object_identity(
-            CatalogObjectSlot::MaterializedView(slot),
-            view.database,
-            view.created_at,
-        );
-        self.finish_catalog_comment_drop(
-            &mut self.comment_catalog(),
-            source,
-            transaction,
-            decision,
-        );
     }
 
     fn rule_ddl_matches(&self, rule: &super::RuleDef, undo: CatalogDdlUndo) -> bool {

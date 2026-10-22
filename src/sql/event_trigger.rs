@@ -803,11 +803,17 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         | SubscriptionRenamed { slot, .. } => {
             (ObjectRef::Subscription(slot as usize), Mutation::Alter)
         }
-        MatviewCreated(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Create),
+        MatviewChanged(change) => (
+            ObjectRef::MaterializedView(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else {
+                Mutation::Drop
+            },
+        ),
         MatviewPopulationChanged(undo) => {
             (ObjectRef::MaterializedView(undo.slot()), Mutation::Alter)
         }
-        MatviewDropped(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Drop),
         SequenceChanged(change) => (
             ObjectRef::Sequence(change.slot()),
             if change.is_creation() {

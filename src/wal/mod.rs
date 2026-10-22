@@ -9645,8 +9645,6 @@ fn decode_op_inner<'a>(
             let definition = crate::storage::DomainDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
                 created_at,
-                version: created_at,
-                ddl_version: created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 ownership: crate::storage::Ownership::BOOTSTRAP,
@@ -10099,6 +10097,8 @@ fn decode_op_inner<'a>(
             let definition = crate::storage::RoutineDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
                 created_at,
+                version: created_at,
+                ddl_version: created_at,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
                 pending_identity: None,

@@ -6,8 +6,10 @@
 //! are fixed at startup.
 
 mod catalog_sources;
+mod matview_lifecycles;
 mod query_lifecycles;
 mod routine_lifecycles;
+pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
 pub(crate) use query_lifecycles::{
     MatviewPopulationUndo, RuleAlterUndo, RulePublication, ViewCatalogIdentity, ViewPublication,
@@ -6283,6 +6285,8 @@ pub struct MatviewDef {
     /// The physical relation that owns the materialized rows and the sole
     /// source of this catalog object's relation identity.
     pub(crate) backing_table: u16,
+    backing_created_at: u64,
+    ddl_version: u64,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub ownership: Ownership,
@@ -6298,6 +6302,8 @@ impl MatviewDef {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
         backing_table: u16::MAX,
+        backing_created_at: 0,
+        ddl_version: 0,
         sql: StackStr::new(),
         creation_path: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
@@ -37709,148 +37715,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Registers a materialized view as an uncommitted CREATE owned by `txid`.
-    /// Unlike `create_view`, the name-vs-table collision is owned by the backing
-    /// table's own creation, so no `find_table`/`or_replace` handling is needed.
-    pub fn create_matview(
-        &self,
-        backing_table: usize,
-        query: StoredQueryDefinition,
-        populated: bool,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let target = self.query_table_target(backing_table, txid)?;
-        let name = self.table_def(backing_table, txid).name;
-        let ownership = self.initial_ownership(txid)?;
-        let mut owners = self.catalog_dependency_owners(
-            &self.matviews,
-            type_contracts::CatalogPublicationInput::QueryDefinition(query.dependencies.view()),
-            Some(target),
-        );
-        owners.validate_target(txid)?;
-        if let Some(existing) = owners.catalog.iter().find(|m| {
-            m.database == current_database()
-                && m.ddl_state != CatalogDdlState::Absent
-                && usize::from(m.backing_table) == backing_table
-        }) {
-            if let Some(blocker) = existing
-                .ddl_state
-                .pending_txid()
-                .filter(|&owner| owner != txid)
-            {
-                drop(owners);
-                return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-            }
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_TABLE,
-                "materialized view \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        let new = owners
-            .catalog
-            .iter()
-            .position(|m| m.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many materialized views (limit {})",
-                    owners.catalog.len()
-                )
-            })?;
-        let created_at = self.catalog_sequence.next()?;
-        let image = self.matview_dependency_image(new);
-        owners.write_query_image(self, image, query.dependencies.view(), txid)?;
-        owners.catalog[new] = MatviewDef {
-            database: current_database(),
-            created_at,
-            backing_table: backing_table as u16,
-            sql: query.sql,
-            creation_path: query.creation_path,
-            ownership,
-            populated,
-            population_version: created_at,
-            pending_population: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        drop(owners);
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::MaterializedView,
-            slot: new as u16,
-        });
-        Ok(new)
-    }
-
-    pub fn drop_matview(
-        &mut self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let blocker = self.matview_catalog().iter().find_map(|m| {
-            (m.database == current_database() && m.ddl_state != CatalogDdlState::Absent && {
-                let table = self.table_def(usize::from(m.backing_table), txid);
-                table.schema.as_str() == schema && table.name.as_str() == name
-            })
-            .then_some(m.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        });
-        if let Some(blocker) = blocker {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name));
-        }
-        let Some(i) = self.matview_catalog().iter().position(|m| {
-            m.database == current_database() && m.visible_to(txid) && {
-                let table = self.table_def(usize::from(m.backing_table), txid);
-                table.schema.as_str() == schema && table.name.as_str() == name
-            }
-        }) else {
-            return Ok(None);
-        };
-        self.stage_matview_comment_drop(i, txid)?;
-        self.pending_drop_matview(i, txid);
-        Ok(Some(i))
-    }
-
-    fn pending_drop_matview(&mut self, slot: usize, txid: u32) {
-        let mut matviews = self.matview_catalog();
-        let m = &mut matviews[slot];
-        m.ddl_state = m.ddl_state.drop_by(txid);
-    }
-
-    pub fn commit_matview_create(&mut self, slot: usize) {
-        let mut matviews = self.matview_catalog();
-        matviews[slot].ddl_state = matviews[slot].ddl_state.commit_create();
-    }
-
-    pub fn commit_matview_drop(&mut self, slot: usize) {
-        let transaction = self
-            .matview(slot)
-            .ddl_state
-            .pending_drop_txid()
-            .expect("materialized-view retirement follows a pending drop");
-        self.finish_matview_comment_drop(slot, transaction, CatalogDdlDecision::Commit);
-        self.matview_catalog()[slot] = MatviewDef::EMPTY;
-        let image = self.matview_dependency_image(slot);
-        self.clear_dependency_image(image);
-        self.clear_extension_dependencies_for_object(AccessObject {
-            class: AccessClass::MaterializedView,
-            slot: slot as u16,
-        });
-    }
-
-    pub fn rollback_matview_create(&mut self, slot: usize) {
-        self.matview_catalog()[slot] = MatviewDef::EMPTY;
-        let image = self.matview_dependency_image(slot);
-        self.clear_dependency_image(image);
-    }
-
-    pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
-        self.finish_matview_comment_drop(slot, txid, CatalogDdlDecision::Rollback);
-        let mut matviews = self.matview_catalog();
-        let m = &mut matviews[slot];
-        m.ddl_state = m.ddl_state.rollback_drop(txid);
-    }
-
     // --- Sequences -------------------------------------------------------
 
     pub fn live_sequences(&self) -> impl Iterator<Item = SequenceDef> + '_ {
@@ -42147,14 +42011,15 @@ impl Storage {
                 "table slot exceeds policy catalog capacity"
             )
         })?;
-        let target = self.query_table_target(spec.table, txid)?;
+        let target =
+            self.query_table_target(spec.table, txid, type_contracts::QueryTargetUse::Read)?;
         Self::validate_policy_role_image(self.policy_roles_per_image, spec.roles)?;
         let mut owners = self.catalog_dependency_owners(
             &self.policy_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(target),
         );
-        owners.validate_target(txid)?;
+        owners.validate_target(txid, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
         if catalog.definitions.iter().any(|policy| {
             policy.database == current_database()
@@ -42240,13 +42105,17 @@ impl Storage {
             ));
         }
         Self::validate_policy_role_image(self.policy_roles_per_image, roles)?;
-        let target = self.query_table_target(usize::from(selected.table), txid)?;
+        let target = self.query_table_target(
+            usize::from(selected.table),
+            txid,
+            type_contracts::QueryTargetUse::Read,
+        )?;
         let mut owners = self.catalog_dependency_owners(
             &self.policy_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(target),
         );
-        owners.validate_target(txid)?;
+        owners.validate_target(txid, type_contracts::QueryTargetUse::Read)?;
         let current = &owners.catalog.definitions[slot];
         if current.database != selected.database
             || current.created_at != selected.created_at
@@ -42428,7 +42297,8 @@ impl Storage {
                 "policy role count exceeds durable representation"
             )
         })?;
-        let publication_target = self.query_table_target(spec.table, 0)?;
+        let publication_target =
+            self.query_table_target(spec.table, 0, type_contracts::QueryTargetUse::Read)?;
         let scratch_start = self.policy_role_replay_image * self.policy_roles_per_image;
         let mut catalog = self
             .policy_catalog
@@ -42479,7 +42349,7 @@ impl Storage {
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies.view()),
             Some(publication_target),
         );
-        owners.validate_target(0)?;
+        owners.validate_target(0, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
         let existing = catalog.definitions.iter().position(|policy| {
             policy.database == current_database()
@@ -54980,6 +54850,8 @@ mod tests {
                 database: _,
                 created_at: _,
                 backing_table: _,
+                backing_created_at: _,
+                ddl_version: _,
                 sql: _,
                 creation_path: _,
                 ownership: _,
@@ -59393,6 +59265,16 @@ mod tests {
         config.max_materialized_views = WORKERS;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        for name in [
+            "materialized_a",
+            "materialized_b",
+            "materialized_c",
+            "materialized_d",
+        ] {
+            storage
+                .create_table(make_def(name, &[("value", ColType::Int4, true)]))
+                .unwrap();
+        }
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -59404,6 +59286,8 @@ mod tests {
                         database: current_database(),
                         created_at,
                         backing_table: worker as u16,
+                        backing_created_at: storage.table(worker).created_at(),
+                        ddl_version: created_at,
                         sql: StackStr::from_str("SELECT 1"),
                         creation_path: StackStr::from_str("public"),
                         ownership: Ownership::BOOTSTRAP,
@@ -59439,15 +59323,18 @@ mod tests {
                 .all(|definition| definition.populated)
         );
 
-        {
-            let mut catalog = storage.matview_catalog();
-            catalog[0].ddl_state = CatalogDdlState::PendingCreate { txid: 10 };
-            catalog[0].ownership.pending = Some(PendingOwnership {
-                txid: 10,
-                owner: BOOTSTRAP_ROLE,
-            });
-        }
-        storage.rollback_matview_create(0);
+        let selected = storage.prepare_matview_edit(0, 10).unwrap();
+        let retired = storage.drop_matview(selected, 10).unwrap();
+        storage.finish_matview_change(retired, CatalogDdlDecision::Commit);
+        let created = storage
+            .create_matview(
+                0,
+                test_view_definition(StoredQueryDependencies::EMPTY).query,
+                false,
+                10,
+            )
+            .unwrap();
+        storage.finish_matview_change(created, CatalogDdlDecision::Rollback);
         let empty = storage.matview(0);
         assert_eq!(empty.database, DatabaseOid::POSTGRES);
         assert_eq!(empty.created_at, 0);

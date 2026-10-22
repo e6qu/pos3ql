@@ -521,9 +521,8 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingSubscriptionName>,
     },
     /// CREATE MATERIALIZED VIEW at this slot — undo by dropping it.
-    MatviewCreated(u32),
+    MatviewChanged(crate::storage::MatviewDdlUndo),
     /// DROP MATERIALIZED VIEW at this slot — undo by reviving it.
-    MatviewDropped(u32),
     /// Sequence definitions and transactional restarts retain their selected source.
     SequenceChanged(crate::storage::SequenceChange),
     LargeObjectCreated(u32),
@@ -2385,6 +2384,19 @@ impl TxnState {
         while self.subscription_advances.len() > mark {
             self.subscription_advances.pop();
         }
+    }
+
+    pub(crate) fn record_matview_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        change: crate::storage::MatviewDdlUndo,
+    ) -> Result<(), SqlError> {
+        storage.validate_matview_change(change, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::MatviewChanged(change)) {
+            storage.finish_matview_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_routine_change(

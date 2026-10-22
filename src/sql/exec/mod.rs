@@ -13396,17 +13396,16 @@ pub(crate) fn drop_schema(
                 ) {
                     return sql_fail(error);
                 }
-                match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
-                    Ok(Some(slot)) => {
-                        debug_assert_eq!(slot, *catalog);
-                        if let Err(error) =
-                            txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))
-                        {
-                            return sql_fail(error);
-                        }
-                    }
-                    Ok(None) => {}
+                let target = match storage.prepare_matview_edit(*catalog, txn.txid) {
+                    Ok(target) => target,
                     Err(error) => return sql_fail(error),
+                };
+                let change = match storage.drop_matview(target, txn.txid) {
+                    Ok(change) => change,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Err(error) = txn.record_matview_change(storage, change) {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Sequence(sequence) => {
@@ -39335,7 +39334,8 @@ pub fn create_table_as(
             with_data,
             txn.txid,
         ) {
-            Ok(slot) => {
+            Ok(change) => {
+                let slot = change.slot();
                 let lsn = storage.bump_lsn();
                 let wal_result = {
                     let dependencies = storage.matview_dependencies(slot);
@@ -39355,11 +39355,13 @@ pub fn create_table_as(
                     )
                 };
                 if let Err(e) = wal_result {
-                    storage.rollback_matview_create(slot);
+                    storage.finish_matview_change(
+                        change,
+                        crate::storage::CatalogDdlDecision::Rollback,
+                    );
                     return sql_fail(e);
                 }
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewCreated(slot as u32)) {
-                    storage.rollback_matview_create(slot);
+                if let Err(e) = txn.record_matview_change(storage, change) {
                     return sql_fail(e);
                 }
                 if let Err(error) = apply_default_privileges_to_new_object(
@@ -39769,14 +39771,22 @@ pub fn drop_materialized_view(
         ) {
             return sql_fail(e);
         }
-        match storage.drop_matview(def.schema.as_str(), def.name.as_str(), txn.txid) {
-            Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32)) {
-                    return sql_fail(e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => return sql_fail(e),
+        let Some(slot) = storage.matview_slot_for_table(idx, txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "materialized-view catalog entry no longer exists"
+            ));
+        };
+        let target = match storage.prepare_matview_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_matview(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_matview_change(storage, change) {
+            return sql_fail(error);
         }
     }
     responder.command_complete("DROP MATERIALIZED VIEW")?;
@@ -44995,9 +45005,9 @@ fn drop_matview_slot(
             name: name.as_str(),
         },
     )?;
-    if let Some(slot) = storage.drop_matview(schema.as_str(), name.as_str(), txn.txid)? {
-        txn.record_ddl(super::txn::DdlUndo::MatviewDropped(slot as u32))?;
-    }
+    let target = storage.prepare_matview_edit(slot, txn.txid)?;
+    let change = storage.drop_matview(target, txn.txid)?;
+    txn.record_matview_change(storage, change)?;
     Ok(())
 }
 

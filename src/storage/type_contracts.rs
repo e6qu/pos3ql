@@ -209,6 +209,7 @@ pub(super) enum CatalogPublicationInput<'input> {
     CatalogLifecycle,
     CatalogRetirement,
     QueryDefinition(super::StoredQueryDependencyView<'input>),
+    QueryCreation(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
 }
 
@@ -216,6 +217,35 @@ pub(super) enum CatalogPublicationInput<'input> {
 pub(super) struct QueryTableTarget {
     slot: usize,
     identity: super::table_definitions::TableIdentity,
+}
+
+impl QueryTableTarget {
+    pub(super) fn slot(self) -> usize {
+        self.slot
+    }
+    pub(super) fn created_at(self) -> u64 {
+        self.identity.created_at
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QueryTargetUse {
+    Read,
+    Retirement,
+    JournalRetirement,
+}
+
+impl QueryTargetUse {
+    fn accepts(self, existence: super::CatalogDdlState, transaction: u32) -> bool {
+        existence.visible_to(transaction)
+            || match self {
+                Self::Read => false,
+                Self::Retirement => existence.pending_drop_txid() == Some(transaction),
+                Self::JournalRetirement => {
+                    transaction == 0 && existence == super::CatalogDdlState::Absent
+                }
+            }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +290,7 @@ impl CatalogPublicationInput<'_> {
             Self::MetadataCommit => (false, false, true, false),
             Self::CatalogLifecycle => (false, true, true, false),
             Self::CatalogRetirement => (false, true, true, true),
-            Self::QueryDefinition(dependencies) => (
+            Self::QueryDefinition(dependencies) | Self::QueryCreation(dependencies) => (
                 dependencies.entries().iter().any(|dependency| {
                     matches!(
                         dependency.class,
@@ -269,8 +299,8 @@ impl CatalogPublicationInput<'_> {
                             | super::DependencyClass::Composite
                     )
                 }),
-                false,
-                false,
+                matches!(self, Self::QueryCreation(_)),
+                matches!(self, Self::QueryCreation(_)),
                 false,
             ),
         };
@@ -327,12 +357,16 @@ impl<Catalog: CatalogPublicationDestination> CatalogDependencyOwners<'_, Catalog
         Ok(slot)
     }
 
-    pub(super) fn validate_target(&self, transaction: u32) -> Result<(), SqlError> {
+    pub(super) fn validate_target(
+        &self,
+        transaction: u32,
+        usage: QueryTargetUse,
+    ) -> Result<(), SqlError> {
         if let Some(target) = &self.target {
             let current = target.definition.identity;
             if current.database != target.selected.identity.database
                 || current.created_at != target.selected.identity.created_at
-                || !current.existence.visible_to(transaction)
+                || !usage.accepts(current.existence, transaction)
                 || current
                     .existence
                     .pending_drop_txid()
@@ -345,6 +379,23 @@ impl<Catalog: CatalogPublicationDestination> CatalogDependencyOwners<'_, Catalog
             }
         }
         Ok(())
+    }
+
+    pub(super) fn target_names(
+        &self,
+        transaction: u32,
+    ) -> Option<(super::SqlName, super::SqlName)> {
+        let target = self.target.as_ref()?;
+        let definition = &target.definition;
+        Some(
+            definition
+                .pending
+                .filter(|pending| pending.transaction == transaction)
+                .map_or(
+                    (definition.committed.schema, definition.committed.name),
+                    |pending| (pending.schema, pending.name),
+                ),
+        )
     }
 
     pub(super) fn write_query_image(
@@ -467,7 +518,7 @@ impl CatalogDependencyOwners<'_, super::ViewRuleCatalog> {
         transaction: u32,
     ) -> Result<(), SqlError> {
         match selected {
-            QueryRuleTarget::Table(_) => self.validate_target(transaction),
+            QueryRuleTarget::Table(_) => self.validate_target(transaction, QueryTargetUse::Read),
             QueryRuleTarget::View {
                 slot,
                 database,
@@ -520,7 +571,7 @@ impl Storage {
     ) -> Result<QueryRuleTarget, SqlError> {
         match target {
             super::RuleTarget::Table(slot) => self
-                .query_table_target(usize::from(slot), transaction)
+                .query_table_target(usize::from(slot), transaction, QueryTargetUse::Read)
                 .map(QueryRuleTarget::Table),
             super::RuleTarget::View(slot) => {
                 let catalog = self.view_rule_catalog();
@@ -549,6 +600,7 @@ impl Storage {
         &self,
         slot: usize,
         transaction: u32,
+        usage: QueryTargetUse,
     ) -> Result<QueryTableTarget, SqlError> {
         let table = self.tables.get(slot).ok_or_else(|| {
             crate::sql_err!(
@@ -558,7 +610,7 @@ impl Storage {
         })?;
         let state = table.definition.read();
         if state.identity.database != super::current_database()
-            || !state.identity.existence.visible_to(transaction)
+            || !usage.accepts(state.identity.existence, transaction)
         {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::UNDEFINED_TABLE,

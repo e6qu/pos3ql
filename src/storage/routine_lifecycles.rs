@@ -435,7 +435,7 @@ impl Storage {
         let slot = self.validate_routine_edit_in(&owners.catalog, target, transaction)?;
         let routine = owners.catalog[slot];
         let definition = routine.definition_for(transaction);
-        for (other, candidate) in owners
+        for (_, candidate) in owners
             .catalog
             .iter()
             .enumerate()

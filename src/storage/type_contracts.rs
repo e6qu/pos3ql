@@ -201,7 +201,7 @@ pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
     ViewDefinition,
     ViewMetadataEdit,
-    ViewMetadataCommit,
+    QueryMetadataCommit,
     ViewLifecycle,
     QueryDefinition(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
@@ -245,7 +245,7 @@ impl CatalogPublicationInput<'_> {
             | Self::RuleMetadataEdit
             | Self::ViewDefinition
             | Self::ViewMetadataEdit => true,
-            Self::ViewMetadataCommit | Self::ViewLifecycle => false,
+            Self::QueryMetadataCommit | Self::ViewLifecycle => false,
             Self::QueryDefinition(dependencies) => {
                 dependencies.entries().iter().any(|dependency| {
                     matches!(
@@ -558,7 +558,7 @@ impl Storage {
             input,
             CatalogPublicationInput::RuleMetadataEdit
                 | CatalogPublicationInput::ViewMetadataEdit
-                | CatalogPublicationInput::ViewMetadataCommit
+                | CatalogPublicationInput::QueryMetadataCommit
                 | CatalogPublicationInput::ViewLifecycle
         );
         let requires_permissions = matches!(

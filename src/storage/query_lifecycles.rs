@@ -14,260 +14,6 @@ pub(super) enum QueryCatalogSlot {
     MaterializedView(usize),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::{test_budget, test_config, test_view_definition};
-    use crate::storage::{SqlName, StoredQueryDependencies};
-
-    fn fixture(views: usize) -> Storage {
-        let mut config = test_config();
-        config.max_views = views;
-        config.max_rules = views;
-        let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
-    }
-
-    fn name(value: &str) -> SqlName {
-        SqlName::parse(value).unwrap()
-    }
-
-    fn create(storage: &Storage, value: &str, transaction: u32) -> ViewPublication {
-        storage
-            .create_view(
-                name("public"),
-                name(value),
-                test_view_definition(StoredQueryDependencies::EMPTY),
-                false,
-                transaction,
-            )
-            .unwrap()
-    }
-
-    #[test]
-    fn query_lifecycle_view_creation_and_edit_do_not_touch_reused_slots() {
-        let storage = fixture(1);
-        let original = create(&storage, "original_view", 7);
-        let selected = storage.prepare_view_edit(original.slot(), 7).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
-            let replacement = create(&storage, "replacement_view", 9);
-            assert_eq!(replacement.slot(), original.slot());
-            storage.finish_view_publication(original, QueryDdlDecision::Commit);
-            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
-            assert!(storage.find_view("public", "replacement_view", 9).is_some());
-            assert!(storage.find_view("public", "replacement_view", 0).is_none());
-            assert_eq!(
-                storage
-                    .stage_view_rename(selected, name("stolen_name"), 7)
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_TABLE
-            );
-            assert!(storage.find_view("public", "replacement_view", 9).is_some());
-            storage.finish_view_publication(replacement, QueryDdlDecision::Commit);
-            assert!(storage.find_view("public", "replacement_view", 0).is_some());
-        });
-    }
-
-    #[test]
-    fn query_lifecycle_view_edits_and_undo_follow_one_revision() {
-        let storage = fixture(1);
-        let created = create(&storage, "original_view", 7);
-        storage.finish_view_publication(created, QueryDdlDecision::Commit);
-        crate::mem::guard::forbid_alloc(|| {
-            let selected = storage.prepare_view_edit(created.slot(), 9).unwrap();
-            let first = storage
-                .stage_view_rename(selected, name("first_view"), 9)
-                .unwrap();
-            assert_eq!(
-                storage
-                    .stage_view_rename(selected, name("stale_view"), 9)
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
-            let second = storage
-                .stage_view_rename(current, name("second_view"), 9)
-                .unwrap();
-            storage.rollback_view_alter(first);
-            assert!(storage.find_view("public", "second_view", 9).is_some());
-            storage.rollback_view_alter(second);
-            assert!(storage.find_view("public", "first_view", 9).is_some());
-            storage.rollback_view_alter(first);
-            assert!(storage.find_view("public", "original_view", 9).is_some());
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
-            let third = storage
-                .stage_view_rename(current, name("third_view"), 9)
-                .unwrap();
-            storage.rollback_view_alter(second);
-            storage.commit_view_alter(second);
-            assert!(storage.find_view("public", "third_view", 9).is_some());
-            storage.commit_view_alter(third);
-            assert!(storage.find_view("public", "third_view", 0).is_some());
-        });
-    }
-
-    #[test]
-    fn query_lifecycle_view_drop_undo_cannot_finalize_a_later_drop() {
-        let mut storage = fixture(1);
-        let created = create(&storage, "original_view", 7);
-        storage.finish_view_publication(created, QueryDdlDecision::Commit);
-        crate::mem::guard::forbid_alloc(|| {
-            let first = storage
-                .drop_view("public", "original_view", 9)
-                .unwrap()
-                .unwrap();
-            storage.rollback_view_drop(first);
-            let second = storage
-                .drop_view("public", "original_view", 9)
-                .unwrap()
-                .unwrap();
-            storage.commit_view_drop(first);
-            storage.rollback_view_drop(first);
-            assert!(storage.find_view("public", "original_view", 0).is_some());
-            assert!(storage.find_view("public", "original_view", 9).is_none());
-            storage.commit_view_drop(second);
-            let replacement = create(&storage, "replacement_view", 11);
-            assert_eq!(replacement.slot(), created.slot());
-            storage.commit_view_drop(second);
-            storage.rollback_view_drop(second);
-            assert!(
-                storage
-                    .find_view("public", "replacement_view", 11)
-                    .is_some()
-            );
-            storage.finish_view_publication(replacement, QueryDdlDecision::Rollback);
-        });
-    }
-
-    #[test]
-    fn query_lifecycle_foreign_view_handles_reject_different_catalog_bounds() {
-        let first = fixture(2);
-        let _filler = create(&first, "filler_view", 7);
-        let selected = create(&first, "selected_view", 9);
-        let target = first.prepare_view_edit(selected.slot(), 9).unwrap();
-        let mut second = fixture(1);
-        let replacement = create(&second, "replacement_view", 11);
-        crate::mem::guard::forbid_alloc(|| {
-            second.finish_view_publication(selected, QueryDdlDecision::Commit);
-            second.finish_view_publication(selected, QueryDdlDecision::Rollback);
-            assert_eq!(
-                second
-                    .stage_view_rename(target, name("foreign_view"), 9)
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_TABLE
-            );
-            let dropped = first
-                .drop_view("public", "selected_view", 9)
-                .unwrap()
-                .unwrap();
-            second.commit_view_drop(dropped);
-            second.rollback_view_drop(dropped);
-            assert!(second.find_view("public", "replacement_view", 11).is_some());
-            second.finish_view_publication(replacement, QueryDdlDecision::Rollback);
-        });
-    }
-
-    #[test]
-    fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
-        let mut storage = fixture(2);
-        let view = create(&storage, "rule_parent", 7);
-        storage.finish_view_publication(view, QueryDdlDecision::Commit);
-        let definition = super::super::RuleDefinition {
-            name: name("first_rule"),
-            target: super::super::RuleTarget::View(view.slot() as u16),
-            ..super::super::RuleDefinition::EMPTY
-        };
-        let dependencies = StoredQueryDependencies::EMPTY;
-        crate::mem::guard::forbid_alloc(|| {
-            let created = storage
-                .create_rule(definition, dependencies.view(), false, 9)
-                .unwrap();
-            let stale = storage.prepare_rule_edit(created.slot(), 9).unwrap();
-            storage.finish_rule_publication(created, None, QueryDdlDecision::Rollback);
-            let replacement = storage
-                .create_rule(definition, dependencies.view(), false, 11)
-                .unwrap();
-            assert_eq!(replacement.slot(), created.slot());
-            storage.finish_rule_publication(created, None, QueryDdlDecision::Commit);
-            storage.discard_rule_create(created);
-            assert_eq!(
-                storage
-                    .alter_rule(
-                        stale,
-                        super::super::RuleMetadataChange::Rename(name("stolen_rule")),
-                        9
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::UNDEFINED_OBJECT
-            );
-            storage.finish_rule_publication(replacement, None, QueryDdlDecision::Commit);
-            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
-            let (first, _) = storage
-                .alter_rule(
-                    selected,
-                    super::super::RuleMetadataChange::Rename(name("second_rule")),
-                    13,
-                )
-                .unwrap();
-            assert_eq!(
-                storage
-                    .alter_rule(
-                        selected,
-                        super::super::RuleMetadataChange::Rename(name("stale_rule")),
-                        13
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
-            let (second, _) = storage
-                .alter_rule(
-                    selected,
-                    super::super::RuleMetadataChange::Rename(name("third_rule")),
-                    13,
-                )
-                .unwrap();
-            storage.rollback_rule_alter(first);
-            assert_eq!(
-                storage.rule(replacement.slot()).definition_for(13).name,
-                name("third_rule")
-            );
-            storage.rollback_rule_alter(second);
-            storage.rollback_rule_alter(first);
-            let dropped = storage
-                .drop_rule(
-                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
-                    13,
-                )
-                .unwrap();
-            storage.rollback_rule_drop(dropped);
-            let current = storage
-                .drop_rule(
-                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
-                    13,
-                )
-                .unwrap();
-            storage.commit_rule_drop(dropped);
-            storage.rollback_rule_drop(dropped);
-            assert!(!storage.rule(replacement.slot()).visible_to(13));
-            storage.commit_rule_drop(current);
-            let final_rule = storage
-                .create_rule(definition, dependencies.view(), false, 15)
-                .unwrap();
-            storage.commit_rule_drop(current);
-            storage.rollback_rule_alter(second);
-            assert!(storage.rule(final_rule.slot()).visible_to(15));
-            storage.finish_rule_publication(final_rule, None, QueryDdlDecision::Rollback);
-        });
-    }
-}
-
 impl QueryCatalogSlot {
     fn index(self) -> usize {
         match self {
@@ -620,7 +366,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         if owners
@@ -654,7 +400,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let Some(rule) = owners
@@ -699,7 +445,7 @@ impl Storage {
     ) -> Result<QueryDdlUndo, SqlError> {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -725,7 +471,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         if undo.operation == QueryDdlOperation::Drop
@@ -745,7 +491,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -951,7 +697,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
@@ -986,7 +732,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let Some(rule) = owners.catalog.rules.get(slot).copied().filter(|rule| {
@@ -1144,7 +890,7 @@ impl Storage {
     ) -> Result<Option<QueryDdlUndo>, SqlError> {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -1260,7 +1006,7 @@ impl Storage {
     pub(crate) fn rollback_view_drop(&self, undo: QueryDdlUndo) {
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -1781,7 +1527,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let Some(view) = owners.catalog.views.get(slot).copied() else {
@@ -1947,7 +1693,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            super::type_contracts::CatalogPublicationInput::ViewMetadataCommit,
+            super::type_contracts::CatalogPublicationInput::QueryMetadataCommit,
             None,
         );
         let Some(view) = owners.catalog.views.get(slot).copied() else {
@@ -1989,5 +1735,259 @@ impl Storage {
             restored.names_for(target.transaction),
             target.transaction,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{test_budget, test_config, test_view_definition};
+    use crate::storage::{SqlName, StoredQueryDependencies};
+
+    fn fixture(views: usize) -> Storage {
+        let mut config = test_config();
+        config.max_views = views;
+        config.max_rules = views;
+        let mut budget = test_budget(&config);
+        Storage::new(&config, &mut budget).unwrap()
+    }
+
+    fn name(value: &str) -> SqlName {
+        SqlName::parse(value).unwrap()
+    }
+
+    fn create(storage: &Storage, value: &str, transaction: u32) -> ViewPublication {
+        storage
+            .create_view(
+                name("public"),
+                name(value),
+                test_view_definition(StoredQueryDependencies::EMPTY),
+                false,
+                transaction,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn query_lifecycle_view_creation_and_edit_do_not_touch_reused_slots() {
+        let storage = fixture(1);
+        let original = create(&storage, "original_view", 7);
+        let selected = storage.prepare_view_edit(original.slot(), 7).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
+            let replacement = create(&storage, "replacement_view", 9);
+            assert_eq!(replacement.slot(), original.slot());
+            storage.finish_view_publication(original, QueryDdlDecision::Commit);
+            storage.finish_view_publication(original, QueryDdlDecision::Rollback);
+            assert!(storage.find_view("public", "replacement_view", 9).is_some());
+            assert!(storage.find_view("public", "replacement_view", 0).is_none());
+            assert_eq!(
+                storage
+                    .stage_view_rename(selected, name("stolen_name"), 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_TABLE
+            );
+            assert!(storage.find_view("public", "replacement_view", 9).is_some());
+            storage.finish_view_publication(replacement, QueryDdlDecision::Commit);
+            assert!(storage.find_view("public", "replacement_view", 0).is_some());
+        });
+    }
+
+    #[test]
+    fn query_lifecycle_view_edits_and_undo_follow_one_revision() {
+        let storage = fixture(1);
+        let created = create(&storage, "original_view", 7);
+        storage.finish_view_publication(created, QueryDdlDecision::Commit);
+        crate::mem::guard::forbid_alloc(|| {
+            let selected = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let first = storage
+                .stage_view_rename(selected, name("first_view"), 9)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .stage_view_rename(selected, name("stale_view"), 9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let second = storage
+                .stage_view_rename(current, name("second_view"), 9)
+                .unwrap();
+            storage.rollback_view_alter(first);
+            assert!(storage.find_view("public", "second_view", 9).is_some());
+            storage.rollback_view_alter(second);
+            assert!(storage.find_view("public", "first_view", 9).is_some());
+            storage.rollback_view_alter(first);
+            assert!(storage.find_view("public", "original_view", 9).is_some());
+            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let third = storage
+                .stage_view_rename(current, name("third_view"), 9)
+                .unwrap();
+            storage.rollback_view_alter(second);
+            storage.commit_view_alter(second);
+            assert!(storage.find_view("public", "third_view", 9).is_some());
+            storage.commit_view_alter(third);
+            assert!(storage.find_view("public", "third_view", 0).is_some());
+        });
+    }
+
+    #[test]
+    fn query_lifecycle_view_drop_undo_cannot_finalize_a_later_drop() {
+        let mut storage = fixture(1);
+        let created = create(&storage, "original_view", 7);
+        storage.finish_view_publication(created, QueryDdlDecision::Commit);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = storage
+                .drop_view("public", "original_view", 9)
+                .unwrap()
+                .unwrap();
+            storage.rollback_view_drop(first);
+            let second = storage
+                .drop_view("public", "original_view", 9)
+                .unwrap()
+                .unwrap();
+            storage.commit_view_drop(first);
+            storage.rollback_view_drop(first);
+            assert!(storage.find_view("public", "original_view", 0).is_some());
+            assert!(storage.find_view("public", "original_view", 9).is_none());
+            storage.commit_view_drop(second);
+            let replacement = create(&storage, "replacement_view", 11);
+            assert_eq!(replacement.slot(), created.slot());
+            storage.commit_view_drop(second);
+            storage.rollback_view_drop(second);
+            assert!(
+                storage
+                    .find_view("public", "replacement_view", 11)
+                    .is_some()
+            );
+            storage.finish_view_publication(replacement, QueryDdlDecision::Rollback);
+        });
+    }
+
+    #[test]
+    fn query_lifecycle_foreign_view_handles_reject_different_catalog_bounds() {
+        let first = fixture(2);
+        let _filler = create(&first, "filler_view", 7);
+        let selected = create(&first, "selected_view", 9);
+        let target = first.prepare_view_edit(selected.slot(), 9).unwrap();
+        let mut second = fixture(1);
+        let replacement = create(&second, "replacement_view", 11);
+        crate::mem::guard::forbid_alloc(|| {
+            second.finish_view_publication(selected, QueryDdlDecision::Commit);
+            second.finish_view_publication(selected, QueryDdlDecision::Rollback);
+            assert_eq!(
+                second
+                    .stage_view_rename(target, name("foreign_view"), 9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_TABLE
+            );
+            let dropped = first
+                .drop_view("public", "selected_view", 9)
+                .unwrap()
+                .unwrap();
+            second.commit_view_drop(dropped);
+            second.rollback_view_drop(dropped);
+            assert!(second.find_view("public", "replacement_view", 11).is_some());
+            second.finish_view_publication(replacement, QueryDdlDecision::Rollback);
+        });
+    }
+
+    #[test]
+    fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
+        let mut storage = fixture(2);
+        let view = create(&storage, "rule_parent", 7);
+        storage.finish_view_publication(view, QueryDdlDecision::Commit);
+        let definition = super::super::RuleDefinition {
+            name: name("first_rule"),
+            target: super::super::RuleTarget::View(view.slot() as u16),
+            ..super::super::RuleDefinition::EMPTY
+        };
+        let dependencies = StoredQueryDependencies::EMPTY;
+        crate::mem::guard::forbid_alloc(|| {
+            let created = storage
+                .create_rule(definition, dependencies.view(), false, 9)
+                .unwrap();
+            let stale = storage.prepare_rule_edit(created.slot(), 9).unwrap();
+            storage.finish_rule_publication(created, None, QueryDdlDecision::Rollback);
+            let replacement = storage
+                .create_rule(definition, dependencies.view(), false, 11)
+                .unwrap();
+            assert_eq!(replacement.slot(), created.slot());
+            storage.finish_rule_publication(created, None, QueryDdlDecision::Commit);
+            storage.discard_rule_create(created);
+            assert_eq!(
+                storage
+                    .alter_rule(
+                        stale,
+                        super::super::RuleMetadataChange::Rename(name("stolen_rule")),
+                        9
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_OBJECT
+            );
+            storage.finish_rule_publication(replacement, None, QueryDdlDecision::Commit);
+            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
+            let (first, _) = storage
+                .alter_rule(
+                    selected,
+                    super::super::RuleMetadataChange::Rename(name("second_rule")),
+                    13,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .alter_rule(
+                        selected,
+                        super::super::RuleMetadataChange::Rename(name("stale_rule")),
+                        13
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let selected = storage.prepare_rule_edit(replacement.slot(), 13).unwrap();
+            let (second, _) = storage
+                .alter_rule(
+                    selected,
+                    super::super::RuleMetadataChange::Rename(name("third_rule")),
+                    13,
+                )
+                .unwrap();
+            storage.rollback_rule_alter(first);
+            assert_eq!(
+                storage.rule(replacement.slot()).definition_for(13).name,
+                name("third_rule")
+            );
+            storage.rollback_rule_alter(second);
+            storage.rollback_rule_alter(first);
+            let dropped = storage
+                .drop_rule(
+                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
+                    13,
+                )
+                .unwrap();
+            storage.rollback_rule_drop(dropped);
+            let current = storage
+                .drop_rule(
+                    storage.prepare_rule_edit(replacement.slot(), 13).unwrap(),
+                    13,
+                )
+                .unwrap();
+            storage.commit_rule_drop(dropped);
+            storage.rollback_rule_drop(dropped);
+            assert!(!storage.rule(replacement.slot()).visible_to(13));
+            storage.commit_rule_drop(current);
+            let final_rule = storage
+                .create_rule(definition, dependencies.view(), false, 15)
+                .unwrap();
+            storage.commit_rule_drop(current);
+            storage.rollback_rule_alter(second);
+            assert!(storage.rule(final_rule.slot()).visible_to(15));
+            storage.finish_rule_publication(final_rule, None, QueryDdlDecision::Rollback);
+        });
     }
 }

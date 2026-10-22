@@ -148,6 +148,8 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             config.max_ddl_per_transaction = 16;
             config.object_store_on = true;
             config.object_store_sim = true;
+            // Simulator uploads grow fixture vectors; keep commit and prepare
+            // outside allocation guards while guarding transactional edits and reads.
             config.wal_upload = true;
             config.wal_upload_sync = true;
             config.object_store_bucket = format!("{name}-{}", std::process::id());
@@ -155,15 +157,15 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-            session.success(&mut engine, "CREATE TABLE lifecycle_base(value integer); INSERT INTO lifecycle_base VALUES (7); CREATE VIEW lifecycle_view AS SELECT 1 AS value; CREATE VIEW lifecycle_dependent AS SELECT value FROM lifecycle_view; COMMENT ON VIEW lifecycle_view IS 'retained comment'; CREATE MATERIALIZED VIEW lifecycle_mat AS SELECT value FROM lifecycle_base WITH NO DATA", true);
+            session.success(&mut engine, "CREATE TABLE lifecycle_base(value integer); INSERT INTO lifecycle_base VALUES (7); CREATE VIEW lifecycle_view AS SELECT 1 AS value; CREATE VIEW lifecycle_dependent AS SELECT value FROM lifecycle_view; COMMENT ON VIEW lifecycle_view IS 'retained comment'; CREATE MATERIALIZED VIEW lifecycle_mat AS SELECT value FROM lifecycle_base WITH NO DATA", false);
             let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid, relation.relowner FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'lifecycle_view' AND rewrite.rulename = '_RETURN'";
             let identity = data_rows(&session.success(&mut engine, identity_sql, true));
             assert_eq!(identity.len(), 1);
             session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING", true);
             if decision == "COMMIT" {
-                session.success(&mut engine, "COMMIT", true);
+                session.success(&mut engine, "COMMIT", false);
             } else {
-                session.success(&mut engine, "PREPARE TRANSACTION 'query-lifecycle'", true);
+                session.success(&mut engine, "PREPARE TRANSACTION 'query-lifecycle'", false);
             }
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
@@ -183,7 +185,7 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
                     )),
                     ["1"]
                 );
-                cold_session.success(&mut cold, &format!("{decision} 'query-lifecycle'"), true);
+                cold_session.success(&mut cold, &format!("{decision} 'query-lifecycle'"), false);
             }
             let committed = decision != "ROLLBACK PREPARED";
             assert_eq!(

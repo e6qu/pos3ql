@@ -774,6 +774,49 @@ A read and an update of an existing order can progress while table creation
 waits for its reservation guard; this storage-level test does not enable
 parallel SQL execution.
 
+### Replacing views and refreshing saved results
+
+`CREATE OR REPLACE VIEW` changes the query in place. The view, its row type,
+array type and internal `_RETURN` rule keep their object identifiers. Owners,
+permissions, comments and dependent views stay attached. Replacement works when
+`max_views` and `max_rules` are already full; its pending definition and saved
+dependencies still need their configured startup reservations.
+
+```sql
+CREATE VIEW report AS SELECT 1 AS total;
+BEGIN;
+CREATE OR REPLACE VIEW report AS SELECT 2 AS total;
+SELECT total FROM report; -- 2
+ROLLBACK;
+SELECT total FROM report; -- 1
+```
+
+View and rule edits retain the selected object and revision through waits and
+undo. A stale edit cannot modify a replacement in the same catalog slot. Dropping
+and recreating a name starts with no comment; rollback restores the old object's
+comment. Savepoints preserve this distinction through repeated reuse.
+
+A materialized view stores query results. `WITH NO DATA` leaves it unreadable:
+ordinary reads return `55000`, including `LIMIT 0`. A constant-false `WHERE`
+removes the scan and returns no rows. Direct `COPY` returns `0A000` instead.
+`REFRESH MATERIALIZED VIEW` requires `MAINTAIN`, runs its saved query as the
+view's owner, and retains its exclusive relation lock until transaction end.
+The caller's account is restored after success or failure.
+
+```sql
+CREATE MATERIALIZED VIEW totals AS SELECT 7 AS total WITH NO DATA;
+BEGIN;
+REFRESH MATERIALIZED VIEW totals;
+SELECT total FROM totals; -- 7
+ROLLBACK;
+SELECT total FROM totals; -- 55000: the refresh was rolled back
+```
+
+`pg_class.relispopulated`, `pg_matviews.ispopulated` and readable rows follow
+transaction and savepoint rollback together. Journal and checkpoint recovery,
+including prepared commit and rollback, preserve these identities and results
+without the server's local caches.
+
 ### Changing rewrite rules
 
 A rewrite rule changes what a command does before it runs. For example, a rule

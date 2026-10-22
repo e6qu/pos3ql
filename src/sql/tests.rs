@@ -7793,7 +7793,7 @@ fn rewrite_rule_lifecycle_catalogs_and_transactionality() {
 }
 
 #[test]
-fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
+fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
@@ -7818,7 +7818,6 @@ fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
          INSERT INTO rule_mode_source VALUES (5); \
          SELECT id FROM rule_mode_audit ORDER BY id; \
          CREATE VIEW rule_mode_view AS SELECT id FROM rule_mode_source; \
-         ALTER TABLE rule_mode_view DISABLE RULE \"_RETURN\"; \
          SELECT ev_enabled FROM pg_rewrite WHERE rulename = '_RETURN' \
            AND ev_class = 'rule_mode_view'::regclass; \
          SELECT id FROM rule_mode_view WHERE id = 5",
@@ -7827,8 +7826,19 @@ fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["D", "R", "A", "3", "4", "3", "4", "5", "D", "5"],
+        ["D", "R", "A", "3", "4", "3", "4", "5", "O", "5"],
         "{text}"
+    );
+
+    let view = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE rule_mode_view DISABLE RULE \"_RETURN\"",
+    );
+    assert!(
+        String::from_utf8_lossy(&view).contains("C42809\0"),
+        "{}",
+        String::from_utf8_lossy(&view)
     );
 
     let missing = run_with(

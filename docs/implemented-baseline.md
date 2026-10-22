@@ -845,8 +845,10 @@ Enable-mode commands for rules and triggers use `ALTER TABLE` on a table;
 applying them to a view returns `42809` as in PostgreSQL. Ownership is checked
 first (`42501` for a non-owner). A rule-mode command then waits for existing
 readers and can hit its configured lock timeout (`55P03`) before the type check.
-A trigger-mode command takes a lock compatible with ordinary readers, so those
-readers do not delay its `42809` rejection.
+A trigger-mode command takes a lock compatible with ordinary readers and row
+locks from `SELECT ... FOR UPDATE`. Those readers do not delay its `42809`
+rejection on a view or a valid trigger-mode change on a table. Materialized
+views reject both rule and trigger enable-mode commands with `42809`.
 
 Tables, views and accounts have distinct lock identities. Account locks use
 durable identifiers, so they do not transfer to a reused catalog position.

@@ -18,6 +18,8 @@ DROP VIEW catalog_view;
 -- A materialized view captures the query's rows at creation time.
 CREATE MATERIALIZED VIEW mv AS SELECT id, v * 2 AS dbl FROM base WHERE v > 15;
 SELECT * FROM mv ORDER BY id;
+ALTER TABLE mv DISABLE RULE missing_rule;
+ALTER TABLE mv DISABLE TRIGGER missing_trigger;
 
 -- Base changes are NOT reflected until REFRESH.
 INSERT INTO base VALUES (4, 40);

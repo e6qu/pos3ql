@@ -32,6 +32,17 @@ CREATE DOMAIN cmt_domain AS int CHECK (VALUE > 0);
 CREATE FOREIGN DATA WRAPPER cmt_fdw NO HANDLER NO VALIDATOR;
 CREATE SERVER cmt_server FOREIGN DATA WRAPPER cmt_fdw;
 CREATE FOREIGN TABLE cmt_foreign_table (id integer) SERVER cmt_server;
+ALTER FOREIGN TABLE cmt_foreign_table DISABLE RULE missing_rule;
+ALTER FOREIGN TABLE cmt_foreign_table DISABLE TRIGGER missing_trigger;
+CREATE ROLE cmt_non_owner;
+GRANT USAGE ON SCHEMA public TO cmt_non_owner;
+SET ROLE cmt_non_owner;
+ALTER FOREIGN TABLE cmt_foreign_table ALTER COLUMN id SET STATISTICS 1;
+ALTER FOREIGN TABLE cmt_foreign_table DISABLE RULE missing_rule;
+ALTER FOREIGN TABLE cmt_foreign_table DISABLE TRIGGER missing_trigger;
+RESET ROLE;
+DROP OWNED BY cmt_non_owner;
+DROP ROLE cmt_non_owner;
 CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
 CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value';
 CREATE FUNCTION cmt_sum_state(state bigint, value integer) RETURNS bigint LANGUAGE SQL

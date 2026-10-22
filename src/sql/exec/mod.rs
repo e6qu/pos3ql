@@ -2593,6 +2593,13 @@ pub(crate) fn alter_foreign_table(
             }
             None => return sql_fail(undefined_qual(&statement.table)),
         };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "foreign table",
+    ) {
+        return sql_fail(error);
+    }
     let Some((binding_slot, mut binding)) = storage.foreign_table(table as u16, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -2689,22 +2696,13 @@ pub(crate) fn alter_foreign_table(
             Ok(Ok(())) => {}
             other => return other,
         }
-    } else {
-        if let Err(error) = storage.lock_table(
-            txn.txid,
-            table,
-            crate::sql::ast::TableLockMode::AccessExclusive,
-            false,
-        ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage.require_owner(
-            storage.table_access_object(table, txn.txid),
-            txn.txid,
-            "foreign table",
-        ) {
-            return sql_fail(error);
-        }
+    } else if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
     }
     if binding_changed {
         let prior = match storage.alter_foreign_table_binding(binding_slot, binding, txn.txid) {
@@ -65362,7 +65360,18 @@ fn alter_table_relation(
             }
             _ => return sql_fail(undefined_qual(&statement.table)),
         };
-    let lock_mode = if matches!(
+    if emit_completion
+        && let Err(error) = storage.require_owner(
+            storage.table_access_object(table_index, txn.txid),
+            txn.txid,
+            "table",
+        )
+    {
+        return sql_fail(error);
+    }
+    let lock_mode = if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) {
+        crate::sql::ast::TableLockMode::ShareRowExclusive
+    } else if matches!(
         statement.actions,
         [AlterAction::DetachPartition {
             mode: crate::sql::ast::PartitionDetachMode::Concurrent
@@ -65390,14 +65399,19 @@ fn alter_table_relation(
             }
         ));
     }
-    if emit_completion
-        && let Err(error) = storage.require_owner(
-            storage.table_access_object(table_index, txn.txid),
-            txn.txid,
-            "table",
-        )
+    let changes_rule_mode = matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]);
+    let changes_trigger_mode = matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]);
+    if (changes_rule_mode || changes_trigger_mode)
+        && (storage
+            .matview_slot_for_table(table_index, txn.txid)
+            .is_some()
+            || changes_rule_mode && def.kind == crate::storage::TableKind::Foreign)
     {
-        return sql_fail(error);
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a table",
+            statement.table.name
+        ));
     }
 
     // The composite owns the physical attribute list of a typed table. Letting
@@ -65436,13 +65450,13 @@ fn alter_table_relation(
         return sql_fail(error);
     }
 
-    // The ACCESS EXCLUSIVE acquisition above waits for ordinary readers and
-    // writers. This verifies the row-version invariant at the rewrite
-    // boundary as a corruption guard.
-    if storage
-        .resident_rows(table_index)
-        .iter()
-        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
+    // Rewrites own ACCESS EXCLUSIVE. Metadata-only commands with a weaker
+    // lock must not reject compatible row locks held by another transaction.
+    if lock_mode == crate::sql::ast::TableLockMode::AccessExclusive
+        && storage
+            .resident_rows(table_index)
+            .iter()
+            .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,

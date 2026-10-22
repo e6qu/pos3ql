@@ -7910,7 +7910,7 @@ fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
 }
 
 #[test]
-fn view_mode_rejection_checks_permissions_and_uses_the_command_lock() {
+fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -7923,7 +7923,25 @@ fn view_mode_rejection_checks_permissions_and_uses_the_command_lock() {
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
         let mut writer =
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        reader.success(&mut engine, "CREATE VIEW locked_rule_view AS SELECT 1 AS value; CREATE ROLE denied_view_mode; GRANT USAGE ON SCHEMA public TO denied_view_mode; BEGIN; SELECT value FROM locked_rule_view", true);
+        reader.success(
+            &mut engine,
+            "CREATE VIEW locked_rule_view AS SELECT 1 AS value; \
+             CREATE TABLE locked_mode_table(value integer); \
+             INSERT INTO locked_mode_table VALUES (1); \
+             CREATE FUNCTION locked_mode_trigger() RETURNS trigger LANGUAGE plpgsql \
+               AS 'BEGIN RETURN NEW; END'; \
+             CREATE TRIGGER locked_mode_trigger BEFORE INSERT ON locked_mode_table \
+               FOR EACH ROW EXECUTE FUNCTION locked_mode_trigger(); \
+             CREATE MATERIALIZED VIEW locked_mode_mat AS SELECT 1 AS value WITH NO DATA; \
+             CREATE FOREIGN DATA WRAPPER locked_mode_fdw NO HANDLER NO VALIDATOR; \
+             CREATE SERVER locked_mode_server FOREIGN DATA WRAPPER locked_mode_fdw; \
+             CREATE FOREIGN TABLE locked_mode_foreign(value integer) SERVER locked_mode_server; \
+             CREATE ROLE denied_view_mode; \
+             GRANT USAGE ON SCHEMA public TO denied_view_mode; \
+             BEGIN; SELECT value FROM locked_rule_view; \
+             SELECT value FROM locked_mode_table FOR UPDATE",
+            true,
+        );
         writer.success(
             &mut engine,
             "SET lock_timeout = '1ms'; SET ROLE denied_view_mode",
@@ -7933,7 +7951,13 @@ fn view_mode_rejection_checks_permissions_and_uses_the_command_lock() {
             "ALTER TABLE locked_rule_view DISABLE RULE \"_RETURN\"",
             "ALTER TABLE locked_rule_view DISABLE TRIGGER missing_trigger",
         ];
-        for command in commands {
+        for command in commands.into_iter().chain([
+            "ALTER TABLE locked_mode_table DISABLE RULE missing_rule",
+            "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE RULE missing_rule",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE TRIGGER missing_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign ALTER COLUMN value SET STATISTICS 1",
+        ]) {
             let denied = writer.execute(&mut engine, command, true);
             assert!(
                 String::from_utf8_lossy(&denied).contains("C42501\0"),
@@ -7942,14 +7966,48 @@ fn view_mode_rejection_checks_permissions_and_uses_the_command_lock() {
             );
         }
         writer.success(&mut engine, "RESET ROLE", true);
-        for (command, state) in commands.into_iter().zip(["C55P03\0", "C42809\0"]) {
-            let blocked = writer.execute(&mut engine, command, true);
-            assert!(
-                String::from_utf8_lossy(&blocked).contains(state),
-                "{}",
-                String::from_utf8_lossy(&blocked)
-            );
+        let blocked = writer.execute(&mut engine, commands[0], true);
+        assert!(blocked.is_empty(), "a waiting command emits no response");
+        // Deliver the scheduler's timeout notification to the parked command.
+        let completed = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                commands[0],
+                0,
+                &writer.arena,
+                &mut writer.transaction,
+                &mut writer.pool,
+                &mut writer.cursors,
+                &mut writer.guc,
+                &mut Responder::new(&mut writer.send),
+                writer.connection_id,
+                true,
+            )
+        })
+        .unwrap();
+        assert_eq!(completed, ExecutionStatus::Complete);
+        assert!(String::from_utf8_lossy(writer.send.readable()).contains("C55P03\0"));
+        let rejected = writer.execute(&mut engine, commands[1], true);
+        assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
+        let changed = writer.success(
+            &mut engine,
+            "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger",
+            true,
+        );
+        assert!(String::from_utf8_lossy(&changed).contains("ALTER TABLE"));
+        for command in [
+            "ALTER TABLE locked_mode_mat DISABLE RULE missing_rule",
+            "ALTER TABLE locked_mode_mat DISABLE TRIGGER missing_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE RULE missing_rule",
+        ] {
+            let rejected = writer.execute(&mut engine, command, true);
+            assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
         }
+        let missing = writer.execute(
+            &mut engine,
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE TRIGGER missing_trigger",
+            true,
+        );
+        assert!(String::from_utf8_lossy(&missing).contains("C42704\0"));
         reader.success(&mut engine, "ROLLBACK", true);
         for command in commands {
             let rejected = writer.execute(&mut engine, command, true);

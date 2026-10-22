@@ -233,6 +233,10 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "Undo stays inline inside allocation-forbidden tests"
+    )]
     enum NameUndo {
         Domain(super::super::DomainAlterUndo),
         Enum(super::super::EnumAlterUndo),

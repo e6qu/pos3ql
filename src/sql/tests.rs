@@ -19304,6 +19304,129 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
 }
 
 #[test]
+fn catalog_creation_prepared_type_owner_locks_survive_disposable_disk_recovery() {
+    for (kind, definition, removal) in [
+        (
+            "domain",
+            "CREATE DOMAIN public.prepared_owned AS integer",
+            "DROP DOMAIN public.prepared_owned",
+        ),
+        (
+            "enum",
+            "CREATE TYPE public.prepared_owned AS ENUM ('ready')",
+            "DROP TYPE public.prepared_owned",
+        ),
+        (
+            "composite",
+            "CREATE TYPE public.prepared_owned AS (value integer)",
+            "DROP TYPE public.prepared_owned",
+        ),
+    ] {
+        for checkpoint in [false, true] {
+            for decision in ["COMMIT", "ROLLBACK"] {
+                let name = format!("prepared-type-lock-{kind}-{checkpoint}-{decision}");
+                let mut config = test_config(&name);
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.transaction_mode = crate::config::TransactionMode::Mvcc;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                config.max_prepared_transactions = 2;
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let output = run_with(
+                    &mut engine,
+                    &mut budget,
+                    &format!(
+                        "CREATE ROLE prepared_type_owner SUPERUSER; SET ROLE prepared_type_owner; BEGIN; {definition}; PREPARE TRANSACTION 'type-owner-lock'"
+                    ),
+                );
+                assert!(
+                    !message_types(&output).contains(&b'E'),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                drop(engine);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut recovered_budget =
+                    test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+                let owner = recovered.storage.find_role("prepared_type_owner").unwrap();
+                let target =
+                    crate::storage::ObjectLockTarget::Role(recovered.storage.role(owner).oid());
+                let error = recovered
+                    .storage
+                    .lock_object(
+                        1000,
+                        target,
+                        crate::sql::ast::TableLockMode::AccessExclusive,
+                        true,
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlstate,
+                    crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE
+                );
+                let output = run_with(
+                    &mut recovered,
+                    &mut recovered_budget,
+                    &format!("{decision} PREPARED 'type-owner-lock'"),
+                );
+                assert!(
+                    !message_types(&output).contains(&b'E'),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                recovered
+                    .storage
+                    .lock_object(
+                        1000,
+                        target,
+                        crate::sql::ast::TableLockMode::AccessExclusive,
+                        true,
+                    )
+                    .unwrap();
+                recovered.storage.release_object_locks(1000);
+                let output = run_with(
+                    &mut recovered,
+                    &mut recovered_budget,
+                    "SELECT owner.rolname FROM pg_type definition JOIN pg_roles owner ON owner.oid = definition.typowner WHERE definition.typname = 'prepared_owned'",
+                );
+                if decision == "COMMIT" {
+                    assert_eq!(data_rows(&output), ["prepared_type_owner"]);
+                    let output = run_with(&mut recovered, &mut recovered_budget, removal);
+                    assert!(
+                        !message_types(&output).contains(&b'E'),
+                        "{}",
+                        String::from_utf8_lossy(&output)
+                    );
+                } else {
+                    assert!(data_rows(&output).is_empty());
+                }
+                let output = run_with(
+                    &mut recovered,
+                    &mut recovered_budget,
+                    "DROP ROLE prepared_type_owner",
+                );
+                assert!(
+                    !message_types(&output).contains(&b'E'),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                drop(recovered);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+        }
+    }
+}
+
+#[test]
 fn catalog_creation_prepared_owner_keeps_role_slots_after_checkpoint() {
     let mut config = test_config("relocated-role-owner");
     config.object_store_on = true;
@@ -52904,7 +53027,7 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
 fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
     let config = test_config("enum-identity-key-hashes");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let engine = Engine::new(&config, &mut budget).unwrap();
     let members = [
         crate::storage::EnumMember {
             label: crate::storage::SqlName::parse("new").unwrap(),

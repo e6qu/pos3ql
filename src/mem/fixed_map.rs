@@ -358,7 +358,7 @@ mod tests {
                     let keep = |key: usize| match pattern {
                         0 => false,
                         1 => true,
-                        2 => key % 2 == 0,
+                        2 => key.is_multiple_of(2),
                         3 => key == 0,
                         _ => key + 1 == count,
                     };

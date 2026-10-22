@@ -53694,7 +53694,7 @@ mod tests {
     fn catalog_creation_role_dependencies_wait_for_pending_owners() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         let (role, _) = storage
             .create_role(
                 SqlName::parse("pending_owner").unwrap(),
@@ -57470,7 +57470,7 @@ mod tests {
         config.max_enum_labels_per_type = WORKERS;
         config.max_composites = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {

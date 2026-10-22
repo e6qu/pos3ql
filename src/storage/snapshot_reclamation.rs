@@ -399,7 +399,7 @@ mod tests {
             assert_eq!(held.get(&1).unwrap().history.len(), 1);
             // Force the pruning stage itself to contend, after it attempted
             // registry and version ownership, rather than blocking capture.
-            let wait = storage.try_snapshot_row_owners(first).err().unwrap();
+            let _wait = storage.try_snapshot_row_owners(first).err().unwrap();
             assert!(storage.snapshots.try_lock().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
 
@@ -409,7 +409,6 @@ mod tests {
                 .unwrap();
             storage.restore_pending(second, 1, 10, undo);
             assert!(storage.tables[second].rows.is_empty());
-            drop(wait);
             drop(held);
 
             assert!(

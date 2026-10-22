@@ -333,6 +333,7 @@ mod tests {
                 );
             }
             storage.release_object_locks(15);
+            storage.finish_transaction_identity(15, false);
             for (owner, transaction) in [(first, 8), (second, 9)] {
                 let dropped = storage.drop_role_in(owner, transaction).unwrap();
                 storage.rollback_role_change(owner, dropped);

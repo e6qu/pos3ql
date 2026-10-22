@@ -240,6 +240,7 @@ mod tests {
             let mut mutex = Mutex::new([1, 2]);
             let erased: &mut Mutex<[i32]> = &mut mutex;
             erased.get_mut().unwrap()[0] = 3;
+            let erased: &Mutex<[i32]> = erased;
             {
                 let mut guard: super::MutexGuard<'_, [i32]> = erased.lock().unwrap();
                 guard[1] = 4;

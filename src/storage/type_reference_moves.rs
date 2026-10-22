@@ -623,6 +623,10 @@ mod tests {
         TypeReferenceKind::Composite,
     ];
 
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "Undo stays inline inside allocation-forbidden tests"
+    )]
     enum MoveUndo {
         Domain(super::super::DomainAlterUndo),
         Enum(super::super::EnumAlterUndo),

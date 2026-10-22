@@ -38,7 +38,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v18 and older manifests are rejected before their references are used.
+Manifest v19 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through

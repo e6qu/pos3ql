@@ -27,29 +27,14 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Readers retain selected table, routine and named-type definitions. Type changes
-recheck the selected edit after waits and include newly submitted dependent
-tables before changing their references together. The
-[current behavior guide](docs/implemented-baseline.md) owns the detailed contracts.
-Connections retain their authenticated and selected accounts through renames,
-savepoints and account replacement. Object creation rejects a missing account
-before changing catalogs; connection limits and query permissions distinguish
-the account that originally logged in from a replacement. Durable role
-identifiers keep prepared transaction ownership distinct through recovery.
-Role deletion waits for unfinished ownership and permission changes. Dependency
-checks cover every database, and recovery preserves role catalog positions so
-saved owners cannot become a different account after an aborted creation.
-
 When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
 Some metadata capture and maintenance reads still block the worker. Raising
-memory limits is not a completion criterion.
-
-Preserve view and internal `_RETURN` rule identifiers through journal and
-checkpoint recovery, including gaps left by rolled-back creation. Keep this
-identity check passing before completing the shared-query publication batch.
+memory limits is not a completion criterion. The
+[current behavior guide](docs/implemented-baseline.md) owns the implemented
+table, routine, type, account and saved-query guarantees.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

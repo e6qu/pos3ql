@@ -813,9 +813,11 @@ SELECT total FROM totals; -- 55000: the refresh was rolled back
 ```
 
 `pg_class.relispopulated`, `pg_matviews.ispopulated` and readable rows follow
-transaction and savepoint rollback together. Cold recovery qualification remains
-open: the new restart test detects a changed `_RETURN` rule identifier.
-The [plan](../PLAN.md) retains this repair as a completion requirement.
+transaction and savepoint rollback together. Journal and checkpoint recovery
+preserve view, row-type, array-type and internal rule identifiers, including
+gaps left by rolled-back creation. Tests delete the entire local data directory
+before reopening from object storage; committed refresh results and prepared
+commit or rollback decisions retain the corresponding readable state.
 
 ### Changing rewrite rules
 

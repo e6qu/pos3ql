@@ -7966,33 +7966,47 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
             );
         }
         writer.success(&mut engine, "RESET ROLE", true);
-        let blocked = writer.execute(&mut engine, commands[0], true);
-        assert!(blocked.is_empty(), "a waiting command emits no response");
-        // Deliver the scheduler's timeout notification to the parked command.
-        let completed = crate::mem::guard::forbid_alloc(|| {
-            engine.execute_simple_from(
-                commands[0],
-                0,
-                &writer.arena,
-                &mut writer.transaction,
-                &mut writer.pool,
-                &mut writer.cursors,
-                &mut writer.guc,
-                &mut Responder::new(&mut writer.send),
-                writer.connection_id,
-                true,
-            )
-        })
-        .unwrap();
-        assert_eq!(completed, ExecutionStatus::Complete);
-        assert!(String::from_utf8_lossy(writer.send.readable()).contains("C55P03\0"));
-        let rejected = writer.execute(&mut engine, commands[1], true);
-        assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
-        let changed = writer.success(
-            &mut engine,
-            "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger",
-            true,
-        );
+        let table_command = "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger";
+        let locking = mode == crate::config::TransactionMode::Locking;
+        for (command, waits, completion) in [
+            (commands[0], true, "C42809\0"),
+            (commands[1], locking, "C42809\0"),
+            (table_command, locking, "ALTER TABLE"),
+        ] {
+            let initial = writer.execute(&mut engine, command, true);
+            if waits {
+                assert!(initial.is_empty(), "{mode:?}: {command}: {initial:?}");
+                // Deliver the scheduler's timeout notification to the parked command.
+                let completed = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        command,
+                        0,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &mut writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        true,
+                    )
+                })
+                .unwrap();
+                assert_eq!(completed, ExecutionStatus::Complete);
+                assert!(
+                    String::from_utf8_lossy(writer.send.readable()).contains("C55P03\0"),
+                    "{mode:?}: {command}: {:?}",
+                    writer.send.readable()
+                );
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&initial).contains(completion),
+                    "{mode:?}: {command}: {initial:?}"
+                );
+            }
+        }
+        reader.success(&mut engine, "ROLLBACK", true);
+        let changed = writer.success(&mut engine, table_command, true);
         assert!(String::from_utf8_lossy(&changed).contains("ALTER TABLE"));
         for command in [
             "ALTER TABLE locked_mode_mat DISABLE RULE missing_rule",
@@ -8000,15 +8014,20 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
             "ALTER FOREIGN TABLE locked_mode_foreign DISABLE RULE missing_rule",
         ] {
             let rejected = writer.execute(&mut engine, command, true);
-            assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
+            assert!(
+                String::from_utf8_lossy(&rejected).contains("C42809\0"),
+                "{mode:?}: {command}: {rejected:?}"
+            );
         }
         let missing = writer.execute(
             &mut engine,
             "ALTER FOREIGN TABLE locked_mode_foreign DISABLE TRIGGER missing_trigger",
             true,
         );
-        assert!(String::from_utf8_lossy(&missing).contains("C42704\0"));
-        reader.success(&mut engine, "ROLLBACK", true);
+        assert!(
+            String::from_utf8_lossy(&missing).contains("C42704\0"),
+            "{mode:?}: {missing:?}"
+        );
         for command in commands {
             let rejected = writer.execute(&mut engine, command, true);
             assert!(

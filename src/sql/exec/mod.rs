@@ -63849,12 +63849,11 @@ fn stage_partition_trigger_mode(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn alter_trigger_enabled(
+fn alter_table_trigger_enabled(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    target: crate::storage::TriggerTarget,
-    target_kind: crate::wal::TriggerTargetKind,
+    table: usize,
     schema: &str,
     relation: &str,
     trigger_target: crate::sql::ast::TriggerEnableTarget<'_>,
@@ -63864,6 +63863,7 @@ fn alter_trigger_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    let target = crate::storage::TriggerTarget::Table(table as u16);
     let mode = match enabled {
         crate::sql::ast::TriggerEnableMode::Origin => crate::storage::TriggerEnabled::Origin,
         crate::sql::ast::TriggerEnableMode::Replica => crate::storage::TriggerEnabled::Replica,
@@ -63878,17 +63878,10 @@ fn alter_trigger_enabled(
             .nth(ordinal)
             .expect("trigger catalog count remains stable during a state change");
         let direct = trigger.target == target;
-        let inherited = match (target, trigger.target) {
-            (
-                crate::storage::TriggerTarget::Table(table),
-                crate::storage::TriggerTarget::Table(parent),
-            ) => {
+        let inherited = match trigger.target {
+            crate::storage::TriggerTarget::Table(parent) => {
                 matches!(trigger.level, TriggerLevel::Row)
-                    && storage.partition_descends_from(
-                        usize::from(table),
-                        usize::from(parent),
-                        txn.txid,
-                    )
+                    && storage.partition_descends_from(table, usize::from(parent), txn.txid)
             }
             _ => false,
         };
@@ -63901,56 +63894,51 @@ fn alter_trigger_enabled(
             continue;
         }
         matched = true;
-        if let crate::storage::TriggerTarget::Table(table) = target {
-            let table = usize::from(table);
-            if inherited {
-                let prior_mode = storage.partition_trigger_enabled_to(slot, table, txn.txid);
-                for descendant in 0..storage.table_count() {
-                    if storage.table(descendant).visible_to(txn.txid)
-                        && storage.partition_descends_from(descendant, table, txn.txid)
-                    {
-                        if recurse {
-                            if let Err(error) = stage_partition_trigger_mode(
-                                storage, wal, txn, slot, descendant, mode,
-                            ) {
-                                return sql_fail(error);
-                            }
-                        } else if let Err(error) = stage_partition_trigger_mode(
-                            storage, wal, txn, slot, descendant, prior_mode,
-                        ) {
+        if inherited {
+            let prior_mode = storage.partition_trigger_enabled_to(slot, table, txn.txid);
+            for descendant in 0..storage.table_count() {
+                if storage.table(descendant).visible_to(txn.txid)
+                    && storage.partition_descends_from(descendant, table, txn.txid)
+                {
+                    if recurse {
+                        if let Err(error) =
+                            stage_partition_trigger_mode(storage, wal, txn, slot, descendant, mode)
+                        {
                             return sql_fail(error);
                         }
-                    }
-                }
-                if let Err(error) =
-                    stage_partition_trigger_mode(storage, wal, txn, slot, table, mode)
-                {
-                    return sql_fail(error);
-                }
-                continue;
-            }
-            if matches!(trigger.level, TriggerLevel::Row) {
-                for descendant in 0..storage.table_count() {
-                    if !storage.table(descendant).visible_to(txn.txid)
-                        || !storage.partition_descends_from(descendant, table, txn.txid)
-                    {
-                        continue;
-                    }
-                    let descendant_mode = if recurse {
-                        mode
-                    } else {
-                        storage.partition_trigger_enabled_to(slot, descendant, txn.txid)
-                    };
-                    if let Err(error) = stage_partition_trigger_mode(
-                        storage,
-                        wal,
-                        txn,
-                        slot,
-                        descendant,
-                        descendant_mode,
+                    } else if let Err(error) = stage_partition_trigger_mode(
+                        storage, wal, txn, slot, descendant, prior_mode,
                     ) {
                         return sql_fail(error);
                     }
+                }
+            }
+            if let Err(error) = stage_partition_trigger_mode(storage, wal, txn, slot, table, mode) {
+                return sql_fail(error);
+            }
+            continue;
+        }
+        if matches!(trigger.level, TriggerLevel::Row) {
+            for descendant in 0..storage.table_count() {
+                if !storage.table(descendant).visible_to(txn.txid)
+                    || !storage.partition_descends_from(descendant, table, txn.txid)
+                {
+                    continue;
+                }
+                let descendant_mode = if recurse {
+                    mode
+                } else {
+                    storage.partition_trigger_enabled_to(slot, descendant, txn.txid)
+                };
+                if let Err(error) = stage_partition_trigger_mode(
+                    storage,
+                    wal,
+                    txn,
+                    slot,
+                    descendant,
+                    descendant_mode,
+                ) {
+                    return sql_fail(error);
                 }
             }
         }
@@ -63971,7 +63959,7 @@ fn alter_trigger_enabled(
                 lsn,
                 &WalOp::AlterTrigger {
                     name: trigger.name_to(txn.txid).as_str(),
-                    target: target_kind,
+                    target: crate::wal::TriggerTargetKind::Table,
                     table_schema: schema,
                     table: relation,
                     new_name: trigger.name_to(txn.txid).as_str(),
@@ -65320,24 +65308,10 @@ fn alter_table_relation(
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
             Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]) =>
-            {
-                if let Err(error) = storage.lock_object(
-                    txn.txid,
-                    crate::storage::ObjectLockTarget::View(view),
-                    crate::sql::ast::TableLockMode::AccessExclusive,
-                    false,
-                ) {
-                    return sql_fail(error);
-                }
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a table",
-                    statement.table.name
-                ));
-            }
-            Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) =>
+                if matches!(
+                    statement.actions,
+                    [AlterAction::SetRuleEnabled { .. } | AlterAction::SetTriggerEnabled { .. }]
+                ) =>
             {
                 if emit_completion
                     && let Err(error) = storage.require_owner(
@@ -65351,28 +65325,25 @@ fn alter_table_relation(
                 {
                     return sql_fail(error);
                 }
-                let (schema, relation) = {
-                    let definition = storage.view(view);
-                    (definition.schema, definition.name)
+                let lock_mode = if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }])
+                {
+                    crate::sql::ast::TableLockMode::AccessExclusive
+                } else {
+                    crate::sql::ast::TableLockMode::ShareRowExclusive
                 };
-                return match statement.actions {
-                    [AlterAction::SetTriggerEnabled { target, enabled }] => alter_trigger_enabled(
-                        storage,
-                        wal,
-                        txn,
-                        crate::storage::TriggerTarget::View(view as u16),
-                        crate::wal::TriggerTargetKind::View,
-                        schema.as_str(),
-                        relation.as_str(),
-                        *target,
-                        *enabled,
-                        !statement.only,
-                        responder,
-                        emit_completion,
-                        tag,
-                    ),
-                    _ => unreachable!("view ALTER TABLE action was checked above"),
-                };
+                if let Err(error) = storage.lock_object(
+                    txn.txid,
+                    crate::storage::ObjectLockTarget::View(view),
+                    lock_mode,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    statement.table.name
+                ));
             }
             None if statement.if_exists => {
                 responder.notice(
@@ -65570,12 +65541,11 @@ fn alter_table_relation(
     }
 
     if let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions {
-        return alter_trigger_enabled(
+        return alter_table_trigger_enabled(
             storage,
             wal,
             txn,
-            crate::storage::TriggerTarget::Table(table_index as u16),
-            crate::wal::TriggerTargetKind::Table,
+            table_index,
             def.schema.as_str(),
             def.name.as_str(),
             *target,

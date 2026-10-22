@@ -996,6 +996,7 @@ def rule_publication_transcript(reader, writer) -> list[str]:
             ("rename", "ALTER VIEW rule_publication_view_diff RENAME TO renamed_view"),
             ("drop", "DROP VIEW rule_publication_view_diff"),
             ("disable-rule", "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"),
+            ("disable-trigger", "ALTER TABLE rule_publication_view_diff DISABLE TRIGGER missing_trigger"),
         ]:
             results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
         reader.execute("ROLLBACK")

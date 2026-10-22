@@ -841,10 +841,12 @@ restart; rollback restores the old names.
 Replacing a rule preserves its enable mode. Rule renames reject an already used
 name, including the rule's current name; the internal `_RETURN` rule cannot be
 renamed.
-Enable-mode commands use `ALTER TABLE` on a table; applying them to a view
-returns `42809` as in PostgreSQL. The command first waits for the view's exclusive
-relation lock. If another connection is still reading the view, a configured
-lock timeout can therefore return `55P03` before the type check.
+Enable-mode commands for rules and triggers use `ALTER TABLE` on a table;
+applying them to a view returns `42809` as in PostgreSQL. Ownership is checked
+first (`42501` for a non-owner). A rule-mode command then waits for existing
+readers and can hit its configured lock timeout (`55P03`) before the type check.
+A trigger-mode command takes a lock compatible with ordinary readers, so those
+readers do not delay its `42809` rejection.
 
 Tables, views and accounts have distinct lock identities. Account locks use
 durable identifiers, so they do not transfer to a reused catalog position.

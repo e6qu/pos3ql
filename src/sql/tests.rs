@@ -7910,7 +7910,7 @@ fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
 }
 
 #[test]
-fn rewrite_rule_view_type_rejection_waits_for_reader_lock() {
+fn view_mode_rejection_checks_permissions_and_uses_the_command_lock() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -7923,22 +7923,42 @@ fn rewrite_rule_view_type_rejection_waits_for_reader_lock() {
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
         let mut writer =
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        reader.success(&mut engine, "CREATE VIEW locked_rule_view AS SELECT 1 AS value; BEGIN; SELECT value FROM locked_rule_view", true);
-        writer.success(&mut engine, "SET lock_timeout = '1ms'", true);
-        let command = "ALTER TABLE locked_rule_view DISABLE RULE \"_RETURN\"";
-        let blocked = writer.execute(&mut engine, command, true);
-        assert!(
-            String::from_utf8_lossy(&blocked).contains("C55P03\0"),
-            "{}",
-            String::from_utf8_lossy(&blocked)
+        reader.success(&mut engine, "CREATE VIEW locked_rule_view AS SELECT 1 AS value; CREATE ROLE denied_view_mode; GRANT USAGE ON SCHEMA public TO denied_view_mode; BEGIN; SELECT value FROM locked_rule_view", true);
+        writer.success(
+            &mut engine,
+            "SET lock_timeout = '1ms'; SET ROLE denied_view_mode",
+            true,
         );
+        let commands = [
+            "ALTER TABLE locked_rule_view DISABLE RULE \"_RETURN\"",
+            "ALTER TABLE locked_rule_view DISABLE TRIGGER missing_trigger",
+        ];
+        for command in commands {
+            let denied = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&denied).contains("C42501\0"),
+                "{}",
+                String::from_utf8_lossy(&denied)
+            );
+        }
+        writer.success(&mut engine, "RESET ROLE", true);
+        for (command, state) in commands.into_iter().zip(["C55P03\0", "C42809\0"]) {
+            let blocked = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&blocked).contains(state),
+                "{}",
+                String::from_utf8_lossy(&blocked)
+            );
+        }
         reader.success(&mut engine, "ROLLBACK", true);
-        let rejected = writer.execute(&mut engine, command, true);
-        assert!(
-            String::from_utf8_lossy(&rejected).contains("C42809\0"),
-            "{}",
-            String::from_utf8_lossy(&rejected)
-        );
+        for command in commands {
+            let rejected = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&rejected).contains("C42809\0"),
+                "{}",
+                String::from_utf8_lossy(&rejected)
+            );
+        }
         assert_eq!(
             data_rows(&writer.success(&mut engine, "SELECT ev_enabled FROM pg_rewrite WHERE ev_class = 'locked_rule_view'::regclass AND rulename = '_RETURN'", true)),
             ["O"]
@@ -12439,25 +12459,30 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
          CREATE RULE recovered_view_rule AS ON DELETE TO recovered_view DO ALSO NOTHING; \
          COMMENT ON TRIGGER recovered_view_trigger ON recovered_view IS 'recovered trigger'; \
          COMMENT ON RULE recovered_view_rule ON recovered_view IS 'recovered rule'; \
-         CREATE OR REPLACE VIEW recovered_view AS SELECT id, value FROM recovered_view_base; \
-         ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger;",
+         CREATE OR REPLACE VIEW recovered_view AS SELECT id, value FROM recovered_view_base;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
     let mut restarted_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
-    let disabled = run_with(
+    let rejected = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "INSERT INTO recovered_view VALUES (7, 70)",
+        "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger",
     );
-    assert!(String::from_utf8_lossy(&disabled).contains("55000"));
+    assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
     let recovered = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
+        "SELECT tgenabled FROM pg_trigger WHERE tgname = 'recovered_view_trigger'; \
              SELECT obj_description(oid, 'pg_trigger') FROM pg_trigger \
                WHERE tgname = 'recovered_view_trigger'; \
              SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
@@ -12473,7 +12498,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     );
     assert_eq!(
         data_rows(&recovered),
-        ["recovered trigger", "recovered rule", "7|77", "7", "0"],
+        ["O", "recovered trigger", "recovered rule", "7|77", "7", "0"],
         "{}",
         String::from_utf8_lossy(&recovered)
     );

@@ -730,9 +730,11 @@ SQL execution or replace the remaining durable-commit coordinator.
 
 Table cleanup and existence changes use a lock belonging to the selected table.
 Waiting for that table's retained definition does not reserve unrelated tables
-or the shared definition pool. Committed removal marks the table absent before
-releasing its rows and dependent metadata. Journal replay retains rows until
-checkpoint, as before.
+or the shared definition pool. Removal keeps the table name reserved until
+comment, permission and extension cleanup can complete under their owners.
+Unrelated type creation can proceed while that cleanup waits. The table becomes
+absent before its rows and remaining dependents are released. Journal replay
+retains rows until checkpoint.
 
 Row cleanup releases the shared version pools and row map after at most 64 map
 scan/removal steps, then continues from its saved position. It preserves lookups

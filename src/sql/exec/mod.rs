@@ -52126,7 +52126,15 @@ pub fn copy_begin(
                 ));
             }
         }
-        storage.require_populated_materialized_view(table_index, txid)?;
+        if storage.matviews_visible_to(txid).any(|(_, view)| {
+            usize::from(view.backing_table) == table_index && !view.populated_for(txid)
+        }) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot copy from unpopulated materialized view \"{}\"",
+                def.name.as_str()
+            ));
+        }
     }
     // Direction-only options are refused as PostgreSQL does.
     let opts = &statement.options;

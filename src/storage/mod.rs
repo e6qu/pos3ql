@@ -8,8 +8,7 @@
 mod catalog_sources;
 mod query_lifecycles;
 pub(crate) use query_lifecycles::{
-    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, QueryEditTarget, RuleAlterUndo,
-    ViewAlterUndo, ViewPublication,
+    MatviewPopulationUndo, QueryDdlDecision, QueryDdlUndo, ViewPublication,
 };
 mod role_dependencies;
 pub(crate) use catalog_sources::{RoleOid, SessionIdentity, SessionRole};
@@ -20723,7 +20722,7 @@ impl Storage {
                         })?;
                     definition.database = target;
                     definition.ownership = definition.ownership.committed();
-                    definition.pending_schema = None;
+                    definition.pending_definition = None;
                     definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                     catalog.views[target_slot] = definition;
                 }
@@ -27939,7 +27938,7 @@ impl Storage {
                     && definition.ddl_state != CatalogDdlState::Absent
             }) {
                 rename_schema_name(&mut definition.schema, prior, name);
-                if let Some(pending) = &mut definition.pending_schema {
+                if let Some(pending) = &mut definition.pending_definition {
                     rename_schema_name(&mut pending.schema, prior, name);
                 }
             }
@@ -55378,7 +55377,7 @@ mod tests {
         config.max_views = 2;
         config.max_rules = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let old = SqlName::parse("old_view").unwrap();
         let new = SqlName::parse("new_view").unwrap();

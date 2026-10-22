@@ -963,7 +963,7 @@ impl Storage {
         };
         let mut owners = self.catalog_dependency_owners(
             &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineCreation,
+            type_contracts::CatalogPublicationInput::TypedCatalogCreation,
             None,
         );
         owners.bind_routine_contract(

@@ -202,7 +202,7 @@ impl<Catalog: CatalogPublicationDestination> CatalogTypeOwners<'_, Catalog> {
 
 pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
-    RoutineCreation,
+    TypedCatalogCreation,
     ViewDefinition,
     ViewMetadataEdit,
     MetadataCommit,
@@ -284,7 +284,7 @@ impl CatalogPublicationInput<'_> {
     fn requirements(&self) -> CatalogOwnerRequirements {
         let (types, permissions, comments, extensions) = match self {
             Self::RoutineContract => (true, false, true, false),
-            Self::RoutineCreation => (true, true, true, false),
+            Self::TypedCatalogCreation => (true, true, true, false),
             Self::ViewDefinition => (true, true, false, false),
             Self::ViewMetadataEdit | Self::RuleMetadataEdit => (true, false, true, false),
             Self::MetadataCommit => (false, false, true, false),

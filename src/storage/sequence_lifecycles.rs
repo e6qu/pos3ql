@@ -588,9 +588,20 @@ impl Storage {
         let ownership = self.initial_ownership(transaction)?;
         let mut owners = self.catalog_dependency_owners(
             &self.sequence_catalog,
-            CatalogPublicationInput::CatalogLifecycle,
+            CatalogPublicationInput::TypedCatalogCreation,
             None,
         );
+        self.require_row_type_name(
+            owners
+                .types
+                .as_ref()
+                .expect("sequence creation owns type names"),
+            schema,
+            name,
+            transaction,
+            None,
+            None,
+        )?;
         for sequence in owners.catalog.definitions.iter().filter(|sequence| {
             sequence.database == current_database() && sequence.ddl_state != CatalogDdlState::Absent
         }) {

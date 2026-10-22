@@ -25,12 +25,13 @@ DROP MATERIALIZED VIEW metadata_replaced_materialized;
 
 CREATE TYPE metadata_shared_name AS ENUM ('value');
 COMMENT ON TYPE metadata_shared_name IS 'type comment';
-CREATE SEQUENCE metadata_shared_name;
-COMMENT ON SEQUENCE metadata_shared_name IS 'sequence comment';
-BEGIN;
-DROP SEQUENCE metadata_shared_name;
-CREATE SEQUENCE metadata_shared_name;
-COMMIT;
+DO $body$
+BEGIN
+    CREATE SEQUENCE metadata_shared_name;
+    RAISE EXCEPTION 'sequence creation accepted a conflicting type name';
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END
+$body$;
 SELECT obj_description('metadata_shared_name'::regtype, 'pg_type');
-DROP SEQUENCE metadata_shared_name;
 DROP TYPE metadata_shared_name;

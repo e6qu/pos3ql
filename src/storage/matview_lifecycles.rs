@@ -48,6 +48,7 @@ impl Storage {
         position: CatalogPosition,
         schema: &str,
         name: &str,
+        transaction: u32,
     ) -> Result<usize, SqlError> {
         let view = self
             .matview_catalog()
@@ -55,7 +56,7 @@ impl Storage {
             .copied()
             .filter(|view| {
                 view.database == current_database()
-                    && view.ddl_state == CatalogDdlState::Present
+                    && view.visible_to(transaction)
                     && view.created_at == position.created_at()
             })
             .ok_or_else(|| {
@@ -68,7 +69,7 @@ impl Storage {
         if backing < self.table_count()
             && self.table(backing).created_at() == view.backing_created_at
             && {
-                let definition = self.table_def(backing, 0);
+                let definition = self.table_def(backing, transaction);
                 definition.schema.as_str() == schema && definition.name.as_str() == name
             }
         {
@@ -224,7 +225,7 @@ impl Storage {
         schema: &str,
         name: &str,
     ) -> Result<(), SqlError> {
-        let slot = self.matview_replay_slot(position, schema, name)?;
+        let slot = self.matview_replay_slot(position, schema, name, 0)?;
         let view = self.matview(slot);
         let backing = self.query_table_target(
             usize::from(view.backing_table),

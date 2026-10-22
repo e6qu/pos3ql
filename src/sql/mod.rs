@@ -20280,6 +20280,309 @@ fn replay_transaction_batches(
                                 .transaction
                                 .record_sequence_change(storage, change)?;
                         }
+                        WalOp::DropTable {
+                            identity,
+                            schema,
+                            name,
+                        } => {
+                            let table = storage.table_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                transaction_id,
+                            )?;
+                            let change = storage.drop_table_in(table, transaction_id)?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_table_drop(storage, change)?;
+                            storage.drop_indexes_for(schema, name, transaction_id);
+                        }
+                        WalOp::RestoreRoutine {
+                            payload,
+                            wide_results,
+                        } => {
+                            let (position, definition, dependencies) =
+                                crate::wal::decode_routine_payload(payload, wide_results)
+                                    .ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::DATA_EXCEPTION,
+                                            "prepared routine definition is corrupt"
+                                        )
+                                    })?;
+                            let change = storage.replay_routine_definition(
+                                position,
+                                definition,
+                                dependencies.materialize()?,
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_routine_change(storage, change)?;
+                        }
+                        WalOp::DropRoutine {
+                            identity,
+                            schema,
+                            name,
+                            argument_signature,
+                        } => {
+                            let (arguments, count) =
+                                decode_wal_routine_signature(argument_signature)?;
+                            let selected = storage.routine_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                &arguments[..count],
+                                transaction_id,
+                            )?;
+                            let change = storage.drop_routine(
+                                storage.prepare_routine_edit(selected, transaction_id)?,
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_routine_change(storage, change)?;
+                        }
+                        WalOp::AlterRoutineIdentity {
+                            identity,
+                            schema,
+                            name,
+                            argument_signature,
+                            new_schema,
+                            new_name,
+                        } => {
+                            let (arguments, count) =
+                                decode_wal_routine_signature(argument_signature)?;
+                            let selected = storage.routine_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                &arguments[..count],
+                                transaction_id,
+                            )?;
+                            let change = storage.alter_routine_identity(
+                                storage.prepare_routine_edit(selected, transaction_id)?,
+                                crate::storage::SqlName::parse(new_schema)?,
+                                crate::storage::SqlName::parse(new_name)?,
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_routine_change(storage, change)?;
+                        }
+                        WalOp::DropSequence {
+                            identity,
+                            schema,
+                            name,
+                        } => {
+                            storage.sequence_replay_slot(identity, schema, name, transaction_id)?;
+                            let change = storage
+                                .drop_sequence(schema, name, transaction_id)?
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "journal sequence drop source disappeared"
+                                    )
+                                })?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_sequence_change(storage, change)?;
+                        }
+                        WalOp::SetSequenceSchema {
+                            identity,
+                            schema,
+                            name,
+                            new_schema,
+                        } => {
+                            let selected = storage.sequence_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                transaction_id,
+                            )?;
+                            let current = storage.sequence_for(selected, transaction_id);
+                            let spec = crate::storage::SeqSpec {
+                                data_type: current.data_type,
+                                increment: current.increment,
+                                min_value: current.min_value,
+                                max_value: current.max_value,
+                                start_value: current.start_value,
+                                cache: current.cache,
+                                cycle: current.cycle,
+                            };
+                            let change = storage.stage_sequence_alter(
+                                storage.prepare_sequence_edit(selected, transaction_id)?,
+                                crate::storage::SequenceAlteration {
+                                    schema: crate::storage::SqlName::parse(new_schema)?,
+                                    name: current.name,
+                                    spec,
+                                    owner: current.owner,
+                                    generator_for: current.generator_for,
+                                    persistence: current.persistence,
+                                    restart: None,
+                                },
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_sequence_change(storage, change)?;
+                        }
+                        WalOp::RenameSequence {
+                            identity,
+                            schema,
+                            name,
+                            new_name,
+                        } => {
+                            let selected = storage.sequence_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                transaction_id,
+                            )?;
+                            let current = storage.sequence_for(selected, transaction_id);
+                            let spec = crate::storage::SeqSpec {
+                                data_type: current.data_type,
+                                increment: current.increment,
+                                min_value: current.min_value,
+                                max_value: current.max_value,
+                                start_value: current.start_value,
+                                cache: current.cache,
+                                cycle: current.cycle,
+                            };
+                            let change = storage.stage_sequence_alter(
+                                storage.prepare_sequence_edit(selected, transaction_id)?,
+                                crate::storage::SequenceAlteration {
+                                    schema: current.schema,
+                                    name: crate::storage::SqlName::parse(new_name)?,
+                                    spec,
+                                    owner: current.owner,
+                                    generator_for: current.generator_for,
+                                    persistence: current.persistence,
+                                    restart: None,
+                                },
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_sequence_change(storage, change)?;
+                        }
+                        WalOp::CreateMatview {
+                            identity,
+                            backing,
+                            schema,
+                            name,
+                            sql,
+                            path,
+                            dependencies,
+                            populated,
+                        } => {
+                            use core::fmt::Write;
+                            let mut buffer =
+                                crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
+                            let _ = write!(buffer, "{sql}");
+                            let mut creation_path = crate::util::StackStr::<128>::new();
+                            let _ = write!(creation_path, "{path}");
+                            let dependencies = storage.rebind_stored_query_dependencies(
+                                dependencies.materialize()?,
+                                transaction_id,
+                            )?;
+                            let backing_table = backing.slot();
+                            if backing_table >= storage.table_count()
+                                || !storage.table_slot_visible_to(backing_table, transaction_id)
+                                || storage.table(backing_table).created_at() != backing.created_at()
+                                || {
+                                    let definition =
+                                        storage.table_def(backing_table, transaction_id);
+                                    definition.schema.as_str() != schema
+                                        || definition.name.as_str() != name
+                                }
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "journal materialized-view backing source does not match"
+                                ));
+                            }
+                            let change = storage.create_matview(
+                                crate::storage::CatalogAllocation::Restore(identity),
+                                backing_table,
+                                crate::storage::StoredQueryDefinition {
+                                    sql: buffer,
+                                    creation_path,
+                                    dependencies,
+                                },
+                                populated,
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_matview_change(storage, change)?;
+                        }
+                        WalOp::DropMatview {
+                            identity,
+                            schema,
+                            name,
+                        } => {
+                            let selected = storage.matview_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                transaction_id,
+                            )?;
+                            let change = storage.drop_matview(
+                                storage.prepare_matview_edit(selected, transaction_id)?,
+                                transaction_id,
+                            )?;
+                            prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_matview_change(storage, change)?;
+                        }
+                        WalOp::SetMatviewPopulated {
+                            identity,
+                            schema,
+                            name,
+                            populated,
+                        } => {
+                            let selected = storage.matview_replay_slot(
+                                identity,
+                                schema,
+                                name,
+                                transaction_id,
+                            )?;
+                            let view = storage.matview(selected);
+                            if !storage.table_slot_visible_to(
+                                usize::from(view.backing_table),
+                                transaction_id,
+                            ) {
+                                return Err(sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "prepared population backing table is absent"
+                                ));
+                            }
+                            let undo = storage.stage_matview_population(
+                                storage.prepare_matview_population(selected, transaction_id)?,
+                                populated,
+                                transaction_id,
+                            )?;
+                            if let Err(error) = prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_ddl(DdlUndo::MatviewPopulationChanged(undo))
+                            {
+                                storage.finish_matview_population(
+                                    undo,
+                                    crate::storage::CatalogDdlDecision::Rollback,
+                                );
+                                return Err(error);
+                            }
+                        }
                         WalOp::PreparedLocks {
                             transaction_id: lock_owner,
                             encoded,
@@ -20520,7 +20823,10 @@ fn apply_routine_wal_payload(
     let (position, definition, dependencies) =
         crate::wal::decode_routine_payload(payload, wide_results)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid routine journal payload"))?;
-    storage.replay_create_routine(position, definition, dependencies.materialize()?)
+    let change =
+        storage.replay_routine_definition(position, definition, dependencies.materialize()?, 0)?;
+    storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Commit);
+    Ok(())
 }
 
 #[inline(never)]
@@ -21217,13 +21523,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.retire_legacy_extended_statistics_hash(slot);
             }
         }
-        WalOp::DropTable { schema, name } => {
-            let Some(index) = storage.find_table(schema, name) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal drops unknown table \"{}\"", name),
-                });
-            };
+        WalOp::DropTable {
+            identity,
+            schema,
+            name,
+        } => {
+            let index = storage.table_replay_slot(identity, schema, name, 0)?;
             storage.drop_table(index);
             storage.drop_indexes_for(schema, name, 0);
             storage.commit_indexes_for(schema, name, 0);
@@ -21996,8 +22301,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             populated,
         } => {
-            storage.matview_replay_slot(identity, schema, name)?;
-            storage.restore_matview_population(identity, populated)?;
+            let slot = storage.matview_replay_slot(identity, schema, name, 0)?;
+            let view = storage.matview(slot);
+            if !storage.table_slot_visible_to(usize::from(view.backing_table), 0) {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal population source backing table is absent"
+                ));
+            }
+            let undo = storage.stage_matview_population(
+                storage.prepare_matview_population(slot, 0)?,
+                populated,
+                0,
+            )?;
+            storage.finish_matview_population(undo, crate::storage::CatalogDdlDecision::Commit);
         }
         WalOp::CreateSequence {
             identity,
@@ -22140,7 +22457,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             argument_signature,
         } => {
             let (arguments, count) = decode_wal_routine_signature(argument_signature)?;
-            let slot = storage.routine_replay_slot(identity, schema, name, &arguments[..count])?;
+            let slot =
+                storage.routine_replay_slot(identity, schema, name, &arguments[..count], 0)?;
             let change = storage.drop_routine(storage.prepare_routine_edit(slot, 0)?, 0)?;
             storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Commit);
         }
@@ -22153,7 +22471,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             new_name,
         } => {
             let (arguments, count) = decode_wal_routine_signature(argument_signature)?;
-            let slot = storage.routine_replay_slot(identity, schema, name, &arguments[..count])?;
+            let slot =
+                storage.routine_replay_slot(identity, schema, name, &arguments[..count], 0)?;
             let change = storage.alter_routine_identity(
                 storage.prepare_routine_edit(slot, 0)?,
                 crate::storage::SqlName::parse(new_schema)?,

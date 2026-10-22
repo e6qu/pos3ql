@@ -20692,7 +20692,12 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics.committed();
                 let serial_values = self.table_serial_values(source_slot);
-                let target_slot = table_creation::allocate(self, definition, Some(txid))?;
+                let target_slot = table_creation::allocate(
+                    self,
+                    definition,
+                    CatalogAllocation::New,
+                    TableCreation::Pending(txid),
+                )?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
@@ -37755,32 +37760,6 @@ impl Storage {
         })
     }
 
-    pub(crate) fn restore_matview_population(
-        &mut self,
-        position: CatalogPosition,
-        populated: bool,
-    ) -> Result<(), SqlError> {
-        let version = self.catalog_sequence.next()?;
-        let mut catalog = self.matview_catalog();
-        let view = catalog
-            .get_mut(position.slot())
-            .filter(|view| {
-                view.database == current_database()
-                    && view.visible_to(0)
-                    && view.created_at == position.created_at()
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "journal changes an absent materialized view"
-                )
-            })?;
-        view.populated = populated;
-        view.population_version = version;
-        view.pending_population = None;
-        Ok(())
-    }
-
     // --- Sequences -------------------------------------------------------
 
     pub fn live_sequences(&self) -> impl Iterator<Item = SequenceDef> + '_ {
@@ -43298,12 +43277,13 @@ impl Storage {
             catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
-    pub(crate) fn replay_create_routine(
+    pub(crate) fn replay_routine_definition(
         &mut self,
         position: CatalogPosition,
-        mut definition: RoutineDef,
+        definition: RoutineDef,
         dependencies: StoredQueryDependencies,
-    ) -> Result<(), SqlError> {
+        transaction: u32,
+    ) -> Result<RoutineChange, SqlError> {
         if definition.created_at != position.created_at() || position.slot() >= self.routine_count()
         {
             return Err(sql_err!(
@@ -43311,51 +43291,45 @@ impl Storage {
                 "journal routine source identity is invalid"
             ));
         }
-        definition.database = current_database();
-        definition.ownership = definition.ownership.committed();
         let slot = position.slot();
         let current = self.routine(slot);
         if current.ddl_state != CatalogDdlState::Absent {
             if current.database != current_database()
                 || current.created_at != position.created_at()
-                || current.ddl_state != CatalogDdlState::Present
+                || !current.visible_to(transaction)
             {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "journal routine position belongs to a different source"
                 ));
             }
-            let mut owners = self.catalog_dependency_owners(
-                &self.routines,
-                type_contracts::CatalogPublicationInput::RoutineContract,
-                None,
+            return self.replace_routine(
+                self.prepare_routine_edit(slot, transaction)?,
+                RoutineDefinition {
+                    arguments: definition.arguments,
+                    argument_count: definition.argument_count,
+                    parameters: definition.parameters,
+                    parameter_count: definition.parameter_count,
+                    kind: definition.kind,
+                    result_columns: definition.result_columns,
+                    result_column_count: definition.result_column_count,
+                    language: definition.language,
+                    attributes: definition.attributes,
+                    configs: definition.configs,
+                    config_count: definition.config_count,
+                    body_kind: definition.body_kind,
+                    body: definition.body,
+                    creation_path: definition.creation_path,
+                },
+                RoutineDependencies::Replace(dependencies.view()),
+                transaction,
             );
-            owners.bind_routine_contract(
-                &mut definition.arguments[..definition.argument_count],
-                &mut definition.parameters[..definition.parameter_count],
-                &mut definition.result_columns[..definition.result_column_count],
-                &mut definition.kind,
-                0,
-            )?;
-            owners.write_query_image(
-                self,
-                self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
-                dependencies.view(),
-                0,
-            )?;
-            definition.pending_identity = None;
-            definition.pending_definition = None;
-            definition.ddl_state = CatalogDdlState::Present;
-            definition.version = self.catalog_sequence.next()?;
-            definition.ddl_version = current.ddl_version;
-            owners.catalog[slot] = definition;
-            return Ok(());
         }
-        let slot = self.create_routine(
+        self.create_routine(
             RoutineSpec {
                 identity: RoutineIdentity::Preserve {
                     position,
-                    ownership: definition.ownership,
+                    ownership: definition.ownership.committed(),
                 },
                 schema: definition.schema,
                 name: definition.name,
@@ -43375,10 +43349,8 @@ impl Storage {
                 creation_path: definition.creation_path,
                 dependencies,
             },
-            0,
-        )?;
-        self.finish_routine_change(slot, CatalogDdlDecision::Commit);
-        Ok(())
+            transaction,
+        )
     }
 
     pub(crate) fn extended_statistics_count(&self) -> usize {
@@ -52711,7 +52683,8 @@ mod tests {
             assert_missing_creation_actor(table_creation::allocate(
                 &storage,
                 make_def("unowned_table", &[("id", ColType::Int4, false)]),
-                Some(7),
+                CatalogAllocation::New,
+                TableCreation::Pending(7),
             ));
             assert_eq!(storage.catalog_sequence.current(), sequence);
             assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
@@ -59715,7 +59688,10 @@ mod tests {
         );
         assert!(
             storage
-                .complete_replay_table_rewrite(make_def("t", &[("id", ColType::Int4, true)]))
+                .complete_replay_table_rewrite(
+                    storage.table_position(0),
+                    make_def("t", &[("id", ColType::Int4, true)])
+                )
                 .unwrap()
         );
         storage.ensure_no_pending_replay_table_rewrite().unwrap();

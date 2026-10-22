@@ -6078,6 +6078,7 @@ fn drop_table_kind(
                             txn.txid,
                             lsn,
                             &WalOp::DropTable {
+                                identity: storage.table_position(index),
                                 schema: def.schema.as_str(),
                                 name: def.name.as_str(),
                             },
@@ -12799,6 +12800,7 @@ pub(crate) fn drop_schema(
                 write_rel(out, &def.schema, &def.name);
             }
             SchemaObject::Sequence(sequence) => {
+                let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let _ = write!(out, "sequence ");
                 write_rel(out, &sequence.schema, &sequence.name);
@@ -13390,6 +13392,7 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
+                        identity: storage.table_position(*table),
                         schema: def.schema.as_str(),
                         name: def.name.as_str(),
                     },
@@ -13429,6 +13432,7 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::Sequence(sequence) => {
+                let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let (schema, name) = (sequence.schema, sequence.name);
                 let lsn = storage.bump_lsn();
@@ -13436,7 +13440,7 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropSequence {
-                        identity: identity,
+                        identity,
                         schema: schema.as_str(),
                         name: name.as_str(),
                     },
@@ -13677,6 +13681,7 @@ pub(crate) fn drop_schema(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
+                        identity: storage.table_position(*t),
                         schema: def.schema.as_str(),
                         name: def.name.as_str(),
                     },
@@ -39796,6 +39801,7 @@ pub fn drop_materialized_view(
             txn.txid,
             lsn,
             &WalOp::DropTable {
+                identity: storage.table_position(idx),
                 schema: def.schema.as_str(),
                 name: def.name.as_str(),
             },
@@ -40547,7 +40553,7 @@ pub fn alter_sequence(
             }
         } else {
             WalOp::CreateSequence {
-                restart: restart,
+                restart,
                 identity: storage.sequence_position(slot),
                 schema: schema.as_str(),
                 name: sname.as_str(),
@@ -45063,6 +45069,7 @@ fn drop_matview_slot(
         txn.txid,
         lsn,
         &WalOp::DropTable {
+            identity: storage.table_position(table),
             schema: schema.as_str(),
             name: name.as_str(),
         },

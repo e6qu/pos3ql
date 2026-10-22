@@ -52,12 +52,13 @@ impl Storage {
         schema: &str,
         name: &str,
         arguments: &[RoutineArgumentDef],
+        transaction: u32,
     ) -> Result<usize, SqlError> {
         if self.routine_at(position.slot()).is_some_and(|routine| {
             routine.database == current_database()
-                && routine.ddl_state == CatalogDdlState::Present
+                && routine.visible_to(transaction)
                 && routine.created_at == position.created_at()
-        }) && self.routine_slot_by_declared_signature(schema, name, arguments, 0)
+        }) && self.routine_slot_by_declared_signature(schema, name, arguments, transaction)
             == Some(position.slot())
         {
             Ok(position.slot())

@@ -4,6 +4,26 @@ use super::catalog_sources::{CatalogDdlOperation, CatalogObjectSlot};
 use super::*;
 
 impl Storage {
+    pub(crate) fn table_replay_slot(
+        &self,
+        position: CatalogPosition,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Result<usize, SqlError> {
+        if position.slot() < self.table_count()
+            && self.table(position.slot()).created_at() == position.created_at()
+            && self.find_visible(schema, name, transaction) == Some(position.slot())
+        {
+            Ok(position.slot())
+        } else {
+            Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal table source identity or name does not match"
+            ))
+        }
+    }
+
     pub(crate) fn drop_table_in(
         &self,
         index: usize,

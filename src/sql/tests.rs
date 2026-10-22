@@ -8,6 +8,170 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_prepared_restart_and_definitions_survive_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        for commit in [false, true] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let name = format!("metadata-prepared-recovery-{checkpoint}-{commit}-{mode:?}");
+                let mut config = test_config(&name);
+                config.transaction_mode = mode;
+                config.max_prepared_transactions = 1;
+                config.max_ddl_per_transaction = 16;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE SEQUENCE retained_counter START 10; SELECT nextval('retained_counter'); CREATE FUNCTION retained_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW retained_report AS SELECT 7 AS value", false);
+                session.success(&mut engine, "BEGIN; ALTER SEQUENCE retained_counter RESTART WITH 50; SELECT nextval('retained_counter'); ALTER SEQUENCE retained_counter RENAME TO pending_counter; ALTER FUNCTION retained_body() RENAME TO pending_body; CREATE OR REPLACE FUNCTION pending_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; DROP MATERIALIZED VIEW retained_report; CREATE MATERIALIZED VIEW pending_report AS SELECT 9 AS value; CREATE SEQUENCE pending_created_counter; CREATE FUNCTION pending_created_body() RETURNS integer LANGUAGE SQL AS 'SELECT 3'; PREPARE TRANSACTION 'metadata-pending'", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                drop(session);
+                drop(engine);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut cold_budget =
+                    test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+                let gid = ast::PreparedTransactionId::parse("metadata-pending").unwrap();
+                let prepared = cold.prepared_transactions.find(gid).unwrap();
+                let transaction = cold
+                    .prepared_transactions
+                    .slot(prepared)
+                    .metadata()
+                    .transaction_id;
+                let counter = cold
+                    .storage
+                    .sequence_slot("public", "retained_counter", 0)
+                    .unwrap();
+                let committed = cold.storage.sequence_for(counter, 0);
+                assert_eq!((committed.last_value, committed.is_called), (10, true));
+                assert_eq!(
+                    cold.storage
+                        .sequence_slot("public", "pending_counter", transaction),
+                    Some(counter)
+                );
+                let pending = cold.storage.sequence_for(counter, transaction);
+                assert_eq!((pending.last_value, pending.is_called), (50, true));
+                let routine = cold
+                    .storage
+                    .routine_slot_by_name_unambiguous("public", "retained_body", 0)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    cold.storage.routine_for(routine, 0).body.as_str(),
+                    "SELECT 1"
+                );
+                assert_eq!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "pending_body", transaction)
+                        .unwrap(),
+                    Some(routine)
+                );
+                assert_eq!(
+                    cold.storage.routine_for(routine, transaction).body.as_str(),
+                    "SELECT 2"
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "retained_report", 0)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "retained_report", transaction)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "pending_report", 0)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .find_matview("public", "pending_report", transaction)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "pending_created_counter", 0)
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .sequence_slot("public", "pending_created_counter", transaction)
+                        .is_some()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous("public", "pending_created_body", 0)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    cold.storage
+                        .routine_slot_by_name_unambiguous(
+                            "public",
+                            "pending_created_body",
+                            transaction
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+                let mut resolved = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+                resolved.success(
+                    &mut cold,
+                    if commit {
+                        "COMMIT PREPARED 'metadata-pending'"
+                    } else {
+                        "ROLLBACK PREPARED 'metadata-pending'"
+                    },
+                    false,
+                );
+                let statement = if commit {
+                    "SELECT nextval('pending_counter'); SELECT pending_body(); SELECT value FROM pending_report; SELECT pending_created_body()"
+                } else {
+                    "SELECT nextval('retained_counter'); SELECT retained_body(); SELECT value FROM retained_report"
+                };
+                let expected: &[&str] = if commit {
+                    &["51", "2", "9", "3"]
+                } else {
+                    &["11", "1", "7"]
+                };
+                assert_eq!(
+                    data_rows(&resolved.success(&mut cold, statement, false)),
+                    expected
+                );
+                drop(resolved);
+                drop(cold);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut replay_budget =
+                    test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+                let mut replay_session =
+                    ConfiguredTransactionSession::new(&config, &mut replay_budget);
+                let expected: &[&str] = if commit {
+                    &["52", "2", "9", "3"]
+                } else {
+                    &["12", "1", "7"]
+                };
+                assert_eq!(
+                    data_rows(&replay_session.success(&mut replayed, statement, false)),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn metadata_recovery_keeps_catalog_positions_after_concurrent_creation_rollback() {
     fn identities(engine: &Engine) -> [(usize, u64); 4] {
         let sequence = engine

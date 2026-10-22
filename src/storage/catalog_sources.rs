@@ -701,6 +701,24 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_catalog_position_rejects_zero_and_unrepresentable_sources() {
+        crate::mem::guard::forbid_alloc(|| {
+            for (slot, created_at) in [(0, 1), (u16::MAX as usize, u64::MAX)] {
+                let position = super::CatalogPosition::new(slot, created_at).unwrap();
+                let bytes = position.encode();
+                assert_eq!(super::CatalogPosition::decode(&bytes), Some(position));
+                for end in 0..bytes.len() {
+                    assert!(super::CatalogPosition::decode(&bytes[..end]).is_none());
+                }
+            }
+            assert!(super::CatalogPosition::new(u16::MAX as usize + 1, 1).is_err());
+            assert!(super::CatalogPosition::new(0, 0).is_err());
+            assert!(super::CatalogPosition::decode(&[0; 10]).is_none());
+            assert!(super::CatalogPosition::decode(&[1; 11]).is_none());
+        });
+    }
+
     use super::*;
 
     #[test]

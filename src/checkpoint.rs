@@ -5677,7 +5677,7 @@ impl Checkpointer {
                 }
                 Some("vw13") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    load_view(storage, line)?;
+                    load_view(storage, line, metadata.catalog_sequence)?;
                 }
                 Some("mv6") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -17923,7 +17923,11 @@ fn load_subscription_relation(
 }
 
 #[inline(never)]
-fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
+fn load_view(
+    storage: &mut Storage,
+    line: &str,
+    catalog_sequence: u64,
+) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
     if words.next() != Some("vw13") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
@@ -17937,6 +17941,13 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
     .ok_or(CheckpointSetupError::Corrupt(
         "invalid view catalog identity",
     ))?;
+    if identity.created_at() > catalog_sequence
+        || identity.return_rule_created_at() > catalog_sequence
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "view source exceeds saved identity allocator",
+        ));
+    }
     let read_hex = |word: Option<&str>, what: &'static str| {
         word.ok_or(CheckpointSetupError::Corrupt(what))
             .and_then(decode_hex_name)

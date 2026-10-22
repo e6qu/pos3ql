@@ -55,6 +55,8 @@ When a transaction commits, publish its related changes together. Protect the
 remaining metadata creation, deletion and table-rewrite paths before running
 statements on several CPU workers. Preserve the definitions selected before a
 wait, and keep old row, index and backup data until their readers have finished.
+Finish shared named-type creation and cleanup, including account-reference
+locks, name checks, failed creation and prepared-lock recovery.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion.
 

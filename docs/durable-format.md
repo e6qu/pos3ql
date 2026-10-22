@@ -21,7 +21,7 @@ they never select a guessed decoder.
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v19` | yes | yes | Requires durable role and type identities and their counters, plus a completed type-loading boundary; retains typed blocks and enum member identities. |
-| Journal record | Version `4` at header byte 17; bytes 18–23 are zero | yes | yes | Role definitions and prepared transaction owners carry durable role identifiers. Older framing is rejected even when its checksum is valid. |
+| Journal record | Version `5` at header byte 17; bytes 18–23 are zero | yes | yes | Role definitions, prepared transaction owners and prepared account locks carry durable role identifiers. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -327,21 +327,22 @@ or class owner edit must not restore an old input or result name during replay.
 The field inventory is shared with database-scoped type moves. Existing record
 grammars are unchanged.
 
-### Prepared relation locks
+### Prepared transaction locks
 
-Prepared-transaction lock payloads identify each entry with a kind byte. Readers
-retain kinds 0 (stored-table relation lock), 1 (row lock), and 2 (advisory lock),
-and also accept kind 3 for a view relation lock. Writers use kind 3 only for
-views; its remaining fields retain the mode and qualified relation name grammar.
-Recovery resolves the view's current catalog slot before reinstalling the lock.
-Unknown kinds and invalid modes stop recovery explicitly.
+Each entry starts with a kind byte: 0 for a stored table, 1 for a row, 2 for an
+advisory lock, 3 for a view, and 4 for an account. Table and view entries retain
+the mode and qualified relation name; recovery resolves the current catalog slot.
+Account entries store the durable role identifier in the eight-byte identity
+field, with empty schema and name fields. Only AccessShare (mode 0) and
+AccessExclusive (mode 7) are valid for accounts. Zero, reserved identifiers,
+the protected bootstrap account, identifiers above `i32::MAX`, nonempty names,
+unknown kinds and invalid modes stop recovery explicitly.
 
-For example, a prepared transaction that read a view continues to block a
-conflicting rule change after the server loses its local caches. Committing or
-rolling back that prepared transaction releases the recovered lock. A binary
-that predates kind 3 cannot recover a prepared transaction containing a view
-lock; resolve those transactions before downgrading. Old table, row, and
-advisory lock payloads remain readable without rewriting their records.
+For example, a prepared transaction that created a type keeps its owner from
+being deleted after the server loses its local caches. A prepared view read
+continues to block a conflicting rule change. Committing or rolling back the
+prepared transaction releases its recovered locks. The current journal framing
+is version 5; earlier frames are rejected.
 
 ## Reader changes
 

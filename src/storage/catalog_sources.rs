@@ -4,7 +4,7 @@ use core::num::{NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::type_references::CatalogOrigin;
-use super::{SqlName, Storage};
+use super::{ObjectLockTarget, SqlName, Storage};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
 
@@ -203,6 +203,55 @@ impl Storage {
             let owner = pending.txid;
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(transaction, owner, "role reference"));
+        }
+        let source = role.oid();
+        drop(catalog);
+        if transaction != 0 && source != RoleOid::BOOTSTRAP {
+            self.lock_object(
+                transaction,
+                ObjectLockTarget::Role(source),
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )?;
+            let catalog = self
+                .role_catalog
+                .lock()
+                .expect("role catalog lock poisoned");
+            if !catalog.roles[slot].visible_to(transaction) || catalog.roles[slot].oid() != source {
+                return Err(crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "referenced role no longer exists"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lock_role_for_drop(&self, slot: usize, transaction: u32) -> Result<(), SqlError> {
+        let source = self.role(slot).oid();
+        if source == RoleOid::BOOTSTRAP {
+            return Err(crate::sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop role because it is required by the database system"
+            ));
+        }
+        if transaction != 0 {
+            self.lock_object(
+                transaction,
+                ObjectLockTarget::Role(source),
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            )?;
+        }
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if !catalog.roles[slot].visible_to(transaction) || catalog.roles[slot].oid() != source {
+            return Err(crate::sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role selected for deletion no longer exists"
+            ));
         }
         Ok(())
     }

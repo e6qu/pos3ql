@@ -53,6 +53,11 @@ the deleted account's identifier.
 
 Deleting a role waits for another transaction's unfinished ownership or permission
 changes. Renaming the account can proceed while its table creation is unfinished.
+Metadata changes retain a shared account lock until commit or rollback; deleting
+that account needs an exclusive lock. Creating objects for the same account can
+overlap. Savepoint rollback releases locks acquired after that savepoint, and
+prepared transactions keep their account locks through recovery. `pg_locks`
+reports these as object locks using the account's durable identifier.
 For example, if `orders_app` has created a table inside
 `BEGIN`, an administrator's `DROP ROLE orders_app` waits for that transaction.
 After commit, the table prevents deletion; after rollback, deletion can proceed
@@ -775,8 +780,10 @@ After a view is renamed inside a transaction, rule listings use its new name.
 View changes and removal use those names too. The same names are recorded for
 restart; rollback restores the old names.
 
-Table and view slots have distinct lock identities. The lock registry reserves
-space at startup for each transaction's tables and views; exhaustion returns
+Tables, views and accounts have distinct lock identities. Account locks use
+durable identifiers, so they do not transfer to a reused catalog position.
+The lock registry reserves `(max_connections + max_prepared_transactions) ×
+(max_tables + 1 + max_views + max_roles)` entries at startup; exhaustion returns
 `54000` naming the registry. Prepared transactions retain view locks through
 restart and recovery without local caches. Saved commit and rollback decisions
 release the transaction's private rows and catalog entries before replay, so

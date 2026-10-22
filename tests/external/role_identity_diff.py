@@ -42,6 +42,8 @@ def exercise(host, port, administrator):
         try:
             admin.execute(f"CREATE ROLE {OLD} LOGIN")
             original_oid = admin.execute("SELECT oid FROM pg_roles WHERE rolname = %s", (OLD,)).fetchone()[0]
+            observations.append(["protected_drop_owned", result(admin, f"DROP OWNED BY {administrator}")])
+            observations.append(["protected_reassign_owned", result(admin, f"REASSIGN OWNED BY {administrator} TO {OLD}")])
             admin.execute(f"GRANT CREATE ON SCHEMA public TO {OLD}")
             with psycopg.connect(**settings, user=OLD) as actor:
                 actor.execute("SET statement_timeout = '5s'")
@@ -55,6 +57,7 @@ def exercise(host, port, administrator):
                 def change_with_pending_creation(label, statement, revoke_create):
                     actor.execute("BEGIN")
                     actor.execute(f"CREATE TABLE public.{PENDING_TABLE} (id integer)")
+                    observations.append([label + "_owner_lock", result(admin, f"SELECT locktype::text, database = 0, relation IS NULL, classid = 1260, objid = {original_oid}, objsubid, mode::text, granted FROM pg_locks WHERE pid = {actor_pid} AND locktype = 'object' AND classid = 1260 AND objid = {original_oid} ORDER BY mode")])
                     if revoke_create:
                         admin.execute(f"REVOKE ALL ON SCHEMA public FROM {RENAMED}")
                     admin_pid = admin.execute("SELECT pg_backend_pid()").fetchone()[0]
@@ -75,6 +78,7 @@ def exercise(host, port, administrator):
                                 actor.execute("ROLLBACK")
                             observations.append([label + "_waited", ["ok", [(waited,)]]])
                             observations.append([label + "_result", future.result(timeout=5)])
+                            observations.append([label + "_released_owner_lock", result(admin, f"SELECT count(*) FROM pg_locks WHERE pid = {actor_pid} AND locktype = 'object' AND classid = 1260 AND objid = {original_oid}")])
 
                 observe("login", "SELECT current_user::text, session_user::text")
                 change_with_pending_creation("alter_pending_creator", f"ALTER ROLE {OLD} CONNECTION LIMIT 8", False)

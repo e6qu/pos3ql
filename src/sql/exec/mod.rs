@@ -7886,6 +7886,9 @@ pub fn drop_role(
                 "current user cannot be dropped"
             ));
         }
+        if let Err(error) = storage.lock_role_for_drop(slot, txn.txid) {
+            return sql_fail(error);
+        }
         let membership_count = (0..storage.role_membership_count())
             .filter(|membership_slot| {
                 let membership = storage.role_membership(*membership_slot);
@@ -9012,6 +9015,13 @@ fn resolve_owned_roles(
                 "permission denied to drop objects"
             ));
         }
+        if storage.role(role).oid() == crate::storage::RoleOid::BOOTSTRAP {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot change objects owned by a role required by the database system"
+            ));
+        }
+        storage.role_reference_ready(role, txid)?;
         let role = role as u16;
         if !output[..count].contains(&role) {
             output[count] = role;
@@ -13210,9 +13220,9 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
-                if let Err(error) = storage.lock_relation(
+                if let Err(error) = storage.lock_object(
                     txn.txid,
-                    crate::storage::RelationLockTarget::View(*v),
+                    crate::storage::ObjectLockTarget::View(*v),
                     crate::sql::ast::TableLockMode::AccessExclusive,
                     false,
                 ) {
@@ -36221,9 +36231,9 @@ pub fn create_view(
                 .then_some(slot)
         })
     {
-        if let Err(error) = storage.lock_relation(
+        if let Err(error) = storage.lock_object(
             txn.txid,
-            crate::storage::RelationLockTarget::View(slot),
+            crate::storage::ObjectLockTarget::View(slot),
             crate::sql::ast::TableLockMode::AccessExclusive,
             false,
         ) {
@@ -36533,9 +36543,9 @@ pub fn alter_view(
             },
         );
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
-        crate::storage::RelationLockTarget::View(slot),
+        crate::storage::ObjectLockTarget::View(slot),
         crate::sql::ast::TableLockMode::AccessExclusive,
         false,
     ) {
@@ -37632,7 +37642,7 @@ pub fn create_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37709,7 +37719,7 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37768,7 +37778,7 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -37832,7 +37842,7 @@ pub fn drop_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = storage.lock_relation(
+    if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -44863,9 +44873,9 @@ fn drop_view_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    storage.lock_relation(
+    storage.lock_object(
         txn.txid,
-        crate::storage::RelationLockTarget::View(slot),
+        crate::storage::ObjectLockTarget::View(slot),
         crate::sql::ast::TableLockMode::AccessExclusive,
         false,
     )?;
@@ -47030,9 +47040,9 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
-            if let Err(error) = storage.lock_relation(
+            if let Err(error) = storage.lock_object(
                 txn.txid,
-                crate::storage::RelationLockTarget::View(slot),
+                crate::storage::ObjectLockTarget::View(slot),
                 crate::sql::ast::TableLockMode::AccessExclusive,
                 false,
             ) {

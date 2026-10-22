@@ -26860,7 +26860,7 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         }
     });
     let row_capacity = advisory_count
-        .checked_add(storage.table_lock_view_count())
+        .checked_add(storage.object_lock_view_count())
         .ok_or_else(|| catalog_capacity_exceeded("pg_locks"))?;
     let rows = arena
         .alloc_slice_with(row_capacity, |_| &[] as &[Datum])
@@ -26908,7 +26908,7 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         count += 1;
     }
     let mut table_error = None;
-    storage.visit_table_locks(|_, owner, relation, mode| {
+    storage.visit_object_locks(|_, owner, relation, mode| {
         if table_error.is_some() {
             return;
         }
@@ -26922,26 +26922,44 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             crate::sql::ast::TableLockMode::Exclusive => "ExclusiveLock",
             crate::sql::ast::TableLockMode::AccessExclusive => "AccessExclusiveLock",
         };
-        let (relation_database, relation_oid) = match relation {
-            crate::storage::RelationLockTarget::Table(slot) => {
-                (storage.table(slot).database(), user_table_oid(slot))
-            }
-            crate::storage::RelationLockTarget::View(slot) => {
-                (storage.view(slot).database, view_oid(slot))
-            }
+        let (lock_type, database, relation, class, object, subobject) = match relation {
+            crate::storage::ObjectLockTarget::Table(slot) => (
+                "relation",
+                Datum::Oid(storage.table(slot).database().get() as u32),
+                Datum::Oid(user_table_oid(slot) as u32),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+            ),
+            crate::storage::ObjectLockTarget::View(slot) => (
+                "relation",
+                Datum::Oid(storage.view(slot).database.get() as u32),
+                Datum::Oid(view_oid(slot) as u32),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+            ),
+            crate::storage::ObjectLockTarget::Role(oid) => (
+                "object",
+                Datum::Oid(0),
+                Datum::Null,
+                Datum::Oid(1260),
+                Datum::Oid(oid.get() as u32),
+                Datum::Int2(0),
+            ),
         };
         let virtual_transaction = virtual_transaction(owner);
         let values = [
-            Datum::Text("relation"),
-            Datum::Oid(relation_database.get() as u32),
-            Datum::Oid(relation_oid as u32),
+            Datum::Text(lock_type),
+            database,
+            relation,
             Datum::Null,
             Datum::Null,
             Datum::Null,
             Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
+            class,
+            object,
+            subobject,
             match virtual_transaction.as_ref() {
                 Some(value) => match arena.alloc_str(value.as_str()) {
                     Ok(value) => Datum::Text(value),

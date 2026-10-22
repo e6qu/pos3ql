@@ -3,57 +3,6 @@
 use super::catalog_sources::{CatalogDdlOperation, CatalogObjectSlot};
 use super::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::{make_def, test_budget, test_config};
-
-    #[test]
-    fn table_lifecycle_drop_undo_cannot_finalize_later_drop_or_reused_slot() {
-        let mut config = test_config();
-        config.max_tables = 1;
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let slot = storage
-            .create_table(make_def("original_table", &[]))
-            .unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let first = storage.drop_table_in(slot, 7).unwrap();
-            assert!(
-                storage
-                    .finish_table_drop(first, CatalogDdlDecision::Rollback)
-                    .is_some()
-            );
-            let second = storage.drop_table_in(slot, 7).unwrap();
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                assert!(storage.finish_table_drop(first, decision).is_none());
-            }
-            assert!(!storage.table(slot).visible_to(7));
-            assert!(
-                storage
-                    .finish_table_drop(second, CatalogDdlDecision::Commit)
-                    .is_some()
-            );
-            let replacement = storage
-                .create_table(make_def("replacement_table", &[]))
-                .unwrap();
-            assert_eq!(slot, replacement);
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                assert!(storage.finish_table_drop(second, decision).is_none());
-            }
-            assert!(storage.table(replacement).visible_to(0));
-            assert_eq!(
-                storage.table(replacement).definition().name.as_str(),
-                "replacement_table"
-            );
-            assert_eq!(
-                storage.validate_table_drop(second, 7).unwrap_err().sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-        });
-    }
-}
-
 impl Storage {
     pub(crate) fn drop_table_in(
         &self,
@@ -265,5 +214,56 @@ impl Storage {
                 return Some(names);
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{make_def, test_budget, test_config};
+
+    #[test]
+    fn table_lifecycle_drop_undo_cannot_finalize_later_drop_or_reused_slot() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let slot = storage
+            .create_table(make_def("original_table", &[]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = storage.drop_table_in(slot, 7).unwrap();
+            assert!(
+                storage
+                    .finish_table_drop(first, CatalogDdlDecision::Rollback)
+                    .is_some()
+            );
+            let second = storage.drop_table_in(slot, 7).unwrap();
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                assert!(storage.finish_table_drop(first, decision).is_none());
+            }
+            assert!(!storage.table(slot).visible_to(7));
+            assert!(
+                storage
+                    .finish_table_drop(second, CatalogDdlDecision::Commit)
+                    .is_some()
+            );
+            let replacement = storage
+                .create_table(make_def("replacement_table", &[]))
+                .unwrap();
+            assert_eq!(slot, replacement);
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                assert!(storage.finish_table_drop(second, decision).is_none());
+            }
+            assert!(storage.table(replacement).visible_to(0));
+            assert_eq!(
+                storage.table(replacement).definition().name.as_str(),
+                "replacement_table"
+            );
+            assert_eq!(
+                storage.validate_table_drop(second, 7).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+        });
     }
 }

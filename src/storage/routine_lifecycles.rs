@@ -40,211 +40,6 @@ pub(crate) enum RoutineDependencies<'input> {
     Preserve,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::tests::{test_budget, test_config};
-
-    fn fixture() -> Storage {
-        let mut config = test_config();
-        config.max_routines = 1;
-        let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
-    }
-
-    fn name(value: &str) -> SqlName {
-        SqlName::parse(value).unwrap()
-    }
-
-    fn create(storage: &mut Storage, value: &str, transaction: u32) -> RoutineChange {
-        storage
-            .create_routine(
-                RoutineSpec {
-                    identity: RoutineIdentity::Allocate,
-                    schema: name("public"),
-                    name: name(value),
-                    arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
-                    argument_count: 0,
-                    parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
-                    parameter_count: 0,
-                    kind: RoutineKind::Function {
-                        result: RoutineResult::TEXT,
-                    },
-                    result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
-                    result_column_count: 0,
-                    language: RoutineLanguage::Sql,
-                    attributes: RoutineAttributes::DEFAULT,
-                    configs: [RoutineConfig::EMPTY; MAX_ROUTINE_CONFIGS],
-                    config_count: 0,
-                    body_kind: RoutineBodyKind::String,
-                    body: StackStr::from_str("SELECT 'original'"),
-                    creation_path: StackStr::from_str("public"),
-                    dependencies: StoredQueryDependencies::EMPTY,
-                },
-                transaction,
-            )
-            .unwrap()
-    }
-
-    fn replacement(storage: &Storage, slot: usize, transaction: u32) -> RoutineDefinition {
-        let definition = storage.routine_for(slot, transaction);
-        RoutineDefinition {
-            arguments: definition.arguments,
-            argument_count: definition.argument_count,
-            parameters: definition.parameters,
-            parameter_count: definition.parameter_count,
-            kind: definition.kind,
-            result_columns: definition.result_columns,
-            result_column_count: definition.result_column_count,
-            language: definition.language,
-            attributes: definition.attributes,
-            configs: definition.configs,
-            config_count: definition.config_count,
-            body_kind: definition.body_kind,
-            body: StackStr::from_str("SELECT 'replacement'"),
-            creation_path: definition.creation_path,
-        }
-    }
-
-    #[test]
-    fn routine_lifecycle_name_body_and_dependencies_follow_one_revision() {
-        let mut storage = fixture();
-        let created = create(&mut storage, "original_routine", 7);
-        storage.finish_routine_change(created, CatalogDdlDecision::Commit);
-        let birth = storage.routine(created.slot()).created_at;
-        crate::mem::guard::forbid_alloc(|| {
-            let selected = storage.prepare_routine_edit(created.slot(), 9).unwrap();
-            let renamed = storage
-                .alter_routine_identity(selected, name("public"), name("renamed_routine"), 9)
-                .unwrap();
-            assert_eq!(
-                storage
-                    .replace_routine(
-                        selected,
-                        replacement(&storage, created.slot(), 9),
-                        RoutineDependencies::Preserve,
-                        9
-                    )
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
-            let replaced = storage
-                .replace_routine(
-                    current,
-                    replacement(&storage, created.slot(), 9),
-                    RoutineDependencies::Preserve,
-                    9,
-                )
-                .unwrap();
-            storage.finish_routine_change(renamed, CatalogDdlDecision::Rollback);
-            assert_eq!(
-                storage.routine_for(created.slot(), 9).name,
-                name("renamed_routine")
-            );
-            assert_eq!(
-                storage.routine_for(created.slot(), 9).body.as_str(),
-                "SELECT 'replacement'"
-            );
-            storage.finish_routine_change(replaced, CatalogDdlDecision::Rollback);
-            assert_eq!(
-                storage.routine_for(created.slot(), 9).body.as_str(),
-                "SELECT 'original'"
-            );
-            storage.finish_routine_change(renamed, CatalogDdlDecision::Rollback);
-            assert_eq!(
-                storage.routine_for(created.slot(), 9).name,
-                name("original_routine")
-            );
-            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
-            let renamed = storage
-                .alter_routine_identity(current, name("public"), name("committed_routine"), 9)
-                .unwrap();
-            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
-            let replaced = storage
-                .replace_routine(
-                    current,
-                    replacement(&storage, created.slot(), 9),
-                    RoutineDependencies::Preserve,
-                    9,
-                )
-                .unwrap();
-            storage.finish_routine_change(renamed, CatalogDdlDecision::Commit);
-            assert_eq!(
-                storage.routine_for(created.slot(), 0).name,
-                name("original_routine")
-            );
-            storage.finish_routine_change(replaced, CatalogDdlDecision::Commit);
-            assert_eq!(
-                storage.routine_for(created.slot(), 0).name,
-                name("committed_routine")
-            );
-            assert_eq!(
-                storage.routine_for(created.slot(), 0).body.as_str(),
-                "SELECT 'replacement'"
-            );
-            assert_eq!(storage.routine(created.slot()).created_at, birth);
-            assert!(storage.routine(created.slot()).pending_definition.is_none());
-            assert!(
-                storage
-                    .stored_query_dependencies
-                    .lock()
-                    .unwrap()
-                    .pending
-                    .iter()
-                    .all(|image| !image.used)
-            );
-        });
-    }
-
-    #[test]
-    fn routine_lifecycle_stale_drop_and_creation_cannot_retire_replacement() {
-        let mut storage = fixture();
-        crate::mem::guard::forbid_alloc(|| {
-            let original = create(&mut storage, "original_routine", 7);
-            let stale = storage.prepare_routine_edit(original.slot(), 7).unwrap();
-            storage.finish_routine_change(original, CatalogDdlDecision::Rollback);
-            let replacement = create(&mut storage, "replacement_routine", 9);
-            assert_eq!(original.slot(), replacement.slot());
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_routine_change(original, decision);
-            }
-            assert_eq!(
-                storage.drop_routine(stale, 7).unwrap_err().sqlstate,
-                sqlstate::UNDEFINED_FUNCTION
-            );
-            storage.finish_routine_change(replacement, CatalogDdlDecision::Commit);
-            let first = storage
-                .drop_routine(
-                    storage
-                        .prepare_routine_edit(replacement.slot(), 11)
-                        .unwrap(),
-                    11,
-                )
-                .unwrap();
-            storage.finish_routine_change(first, CatalogDdlDecision::Rollback);
-            let second = storage
-                .drop_routine(
-                    storage
-                        .prepare_routine_edit(replacement.slot(), 11)
-                        .unwrap(),
-                    11,
-                )
-                .unwrap();
-            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
-                storage.finish_routine_change(first, decision);
-            }
-            assert!(!storage.routine(replacement.slot()).visible_to(11));
-            storage.finish_routine_change(second, CatalogDdlDecision::Rollback);
-            assert_eq!(
-                storage.routine_for(replacement.slot(), 0).name,
-                name("replacement_routine")
-            );
-        });
-    }
-}
-
 impl Storage {
     pub(crate) fn prepare_routine_edit(
         &self,
@@ -1084,5 +879,210 @@ impl Storage {
             version: created_at,
             prior_version: 0,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{test_budget, test_config};
+
+    fn fixture() -> Storage {
+        let mut config = test_config();
+        config.max_routines = 1;
+        let mut budget = test_budget(&config);
+        Storage::new(&config, &mut budget).unwrap()
+    }
+
+    fn name(value: &str) -> SqlName {
+        SqlName::parse(value).unwrap()
+    }
+
+    fn create(storage: &mut Storage, value: &str, transaction: u32) -> RoutineChange {
+        storage
+            .create_routine(
+                RoutineSpec {
+                    identity: RoutineIdentity::Allocate,
+                    schema: name("public"),
+                    name: name(value),
+                    arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                    argument_count: 0,
+                    parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                    parameter_count: 0,
+                    kind: RoutineKind::Function {
+                        result: RoutineResult::TEXT,
+                    },
+                    result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
+                    result_column_count: 0,
+                    language: RoutineLanguage::Sql,
+                    attributes: RoutineAttributes::DEFAULT,
+                    configs: [RoutineConfig::EMPTY; MAX_ROUTINE_CONFIGS],
+                    config_count: 0,
+                    body_kind: RoutineBodyKind::String,
+                    body: StackStr::from_str("SELECT 'original'"),
+                    creation_path: StackStr::from_str("public"),
+                    dependencies: StoredQueryDependencies::EMPTY,
+                },
+                transaction,
+            )
+            .unwrap()
+    }
+
+    fn replacement(storage: &Storage, slot: usize, transaction: u32) -> RoutineDefinition {
+        let definition = storage.routine_for(slot, transaction);
+        RoutineDefinition {
+            arguments: definition.arguments,
+            argument_count: definition.argument_count,
+            parameters: definition.parameters,
+            parameter_count: definition.parameter_count,
+            kind: definition.kind,
+            result_columns: definition.result_columns,
+            result_column_count: definition.result_column_count,
+            language: definition.language,
+            attributes: definition.attributes,
+            configs: definition.configs,
+            config_count: definition.config_count,
+            body_kind: definition.body_kind,
+            body: StackStr::from_str("SELECT 'replacement'"),
+            creation_path: definition.creation_path,
+        }
+    }
+
+    #[test]
+    fn routine_lifecycle_name_body_and_dependencies_follow_one_revision() {
+        let mut storage = fixture();
+        let created = create(&mut storage, "original_routine", 7);
+        storage.finish_routine_change(created, CatalogDdlDecision::Commit);
+        let birth = storage.routine(created.slot()).created_at;
+        crate::mem::guard::forbid_alloc(|| {
+            let selected = storage.prepare_routine_edit(created.slot(), 9).unwrap();
+            let renamed = storage
+                .alter_routine_identity(selected, name("public"), name("renamed_routine"), 9)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .replace_routine(
+                        selected,
+                        replacement(&storage, created.slot(), 9),
+                        RoutineDependencies::Preserve,
+                        9
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
+            let replaced = storage
+                .replace_routine(
+                    current,
+                    replacement(&storage, created.slot(), 9),
+                    RoutineDependencies::Preserve,
+                    9,
+                )
+                .unwrap();
+            storage.finish_routine_change(renamed, CatalogDdlDecision::Rollback);
+            assert_eq!(
+                storage.routine_for(created.slot(), 9).name,
+                name("renamed_routine")
+            );
+            assert_eq!(
+                storage.routine_for(created.slot(), 9).body.as_str(),
+                "SELECT 'replacement'"
+            );
+            storage.finish_routine_change(replaced, CatalogDdlDecision::Rollback);
+            assert_eq!(
+                storage.routine_for(created.slot(), 9).body.as_str(),
+                "SELECT 'original'"
+            );
+            storage.finish_routine_change(renamed, CatalogDdlDecision::Rollback);
+            assert_eq!(
+                storage.routine_for(created.slot(), 9).name,
+                name("original_routine")
+            );
+            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
+            let renamed = storage
+                .alter_routine_identity(current, name("public"), name("committed_routine"), 9)
+                .unwrap();
+            let current = storage.prepare_routine_edit(created.slot(), 9).unwrap();
+            let replaced = storage
+                .replace_routine(
+                    current,
+                    replacement(&storage, created.slot(), 9),
+                    RoutineDependencies::Preserve,
+                    9,
+                )
+                .unwrap();
+            storage.finish_routine_change(renamed, CatalogDdlDecision::Commit);
+            assert_eq!(
+                storage.routine_for(created.slot(), 0).name,
+                name("original_routine")
+            );
+            storage.finish_routine_change(replaced, CatalogDdlDecision::Commit);
+            assert_eq!(
+                storage.routine_for(created.slot(), 0).name,
+                name("committed_routine")
+            );
+            assert_eq!(
+                storage.routine_for(created.slot(), 0).body.as_str(),
+                "SELECT 'replacement'"
+            );
+            assert_eq!(storage.routine(created.slot()).created_at, birth);
+            assert!(storage.routine(created.slot()).pending_definition.is_none());
+            assert!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .all(|image| !image.used)
+            );
+        });
+    }
+
+    #[test]
+    fn routine_lifecycle_stale_drop_and_creation_cannot_retire_replacement() {
+        let mut storage = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            let original = create(&mut storage, "original_routine", 7);
+            let stale = storage.prepare_routine_edit(original.slot(), 7).unwrap();
+            storage.finish_routine_change(original, CatalogDdlDecision::Rollback);
+            let replacement = create(&mut storage, "replacement_routine", 9);
+            assert_eq!(original.slot(), replacement.slot());
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_routine_change(original, decision);
+            }
+            assert_eq!(
+                storage.drop_routine(stale, 7).unwrap_err().sqlstate,
+                sqlstate::UNDEFINED_FUNCTION
+            );
+            storage.finish_routine_change(replacement, CatalogDdlDecision::Commit);
+            let first = storage
+                .drop_routine(
+                    storage
+                        .prepare_routine_edit(replacement.slot(), 11)
+                        .unwrap(),
+                    11,
+                )
+                .unwrap();
+            storage.finish_routine_change(first, CatalogDdlDecision::Rollback);
+            let second = storage
+                .drop_routine(
+                    storage
+                        .prepare_routine_edit(replacement.slot(), 11)
+                        .unwrap(),
+                    11,
+                )
+                .unwrap();
+            for decision in [CatalogDdlDecision::Commit, CatalogDdlDecision::Rollback] {
+                storage.finish_routine_change(first, decision);
+            }
+            assert!(!storage.routine(replacement.slot()).visible_to(11));
+            storage.finish_routine_change(second, CatalogDdlDecision::Rollback);
+            assert_eq!(
+                storage.routine_for(replacement.slot(), 0).name,
+                name("replacement_routine")
+            );
+        });
     }
 }

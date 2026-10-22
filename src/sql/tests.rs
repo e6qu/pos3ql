@@ -22070,10 +22070,15 @@ fn advisory_locks_cover_session_transaction_wait_and_catalog_boundaries() {
         &mut budget,
         &mut second,
         22,
-        "CREATE TABLE advisory_lock_object(id integer); BEGIN; \
+        "CREATE TABLE advisory_lock_relation(id integer); BEGIN; \
          LOCK TABLE advisory_lock_relation IN SHARE MODE; \
          SELECT locktype,relation='advisory_lock_relation'::regclass,mode,granted, \
                 pid=pg_backend_pid() FROM pg_locks WHERE locktype='relation'; ROLLBACK",
+    );
+    assert!(
+        !message_types(&relation_lock).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&relation_lock)
     );
     assert_eq!(data_rows(&relation_lock), ["relation|t|ShareLock|t|t"]);
 

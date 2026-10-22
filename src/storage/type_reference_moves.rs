@@ -1430,6 +1430,16 @@ mod tests {
                 let database = storage.current_database_oid();
                 let dependency = query_dependency(&storage, movement);
                 let identity = dependency.identity;
+                let (unrelated, _) = storage
+                    .create_view(
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("builtin_submission").unwrap(),
+                        test_view_definition(StoredQueryDependencies::EMPTY),
+                        false,
+                        9,
+                    )
+                    .unwrap();
+                let (finished, received) = std::sync::mpsc::sync_channel(1);
                 let mut source = storage.type_catalog.lock().unwrap();
                 std::thread::scope(|scope| {
                     let storage = &storage;
@@ -1447,15 +1457,13 @@ mod tests {
                         && storage.stored_query_dependencies.try_lock().is_ok()
                         && storage.tables[related].lifecycle.try_lock().is_ok()
                         && storage.tables[related].definition.test_write().is_ok();
-                    let unrelated = crate::mem::guard::forbid_alloc(|| {
-                        storage.create_view(
-                            SqlName::parse("public").unwrap(),
-                            SqlName::parse("builtin_submission").unwrap(),
-                            test_view_definition(StoredQueryDependencies::EMPTY),
-                            false,
-                            9,
-                        )
+                    let unrelated_writer = scope.spawn(move || {
+                        crate::sql::set_execution_database_oid(database);
+                        crate::mem::guard::forbid_alloc(|| storage.commit_view_create(unrelated));
+                        finished.send(()).unwrap();
                     });
+                    let unrelated_progress =
+                        received.recv_timeout(std::time::Duration::from_secs(5));
                     match movement.identity.slot() {
                         NamedTypeSlot::Domain(slot) => {
                             source.domains[slot].name = movement.current.name
@@ -1469,12 +1477,17 @@ mod tests {
                     }
                     drop(source);
                     let image = writer.join().unwrap().unwrap();
+                    unrelated_writer.join().unwrap();
                     assert!(waiting, "submission did not reach the source wait");
                     assert!(
                         available,
                         "source wait retained a destination or dependency owner"
                     );
-                    unrelated.unwrap();
+                    assert!(unrelated_progress.is_ok(), "unrelated publication stalled");
+                    assert_eq!(
+                        storage.view(unrelated).ddl_state,
+                        super::super::CatalogDdlState::Present
+                    );
                     let submitted = storage.stored_query_dependencies.lock().unwrap();
                     let entries = submitted.image(
                         image,

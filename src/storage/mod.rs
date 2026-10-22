@@ -57066,7 +57066,8 @@ mod tests {
         assert_eq!(locks.table.len(), 4);
         assert_eq!(
             locks.table.capacity(),
-            transaction_capacity * (table_slot_capacity(&config) + config.max_views)
+            transaction_capacity
+                * (table_slot_capacity(&config) + config.max_views + config.max_roles)
         );
         assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
     }

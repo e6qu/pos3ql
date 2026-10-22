@@ -263,6 +263,8 @@ impl SequenceAlterUndo {
     }
 }
 
+// Undo stays inline in the startup-reserved transaction pool.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SequenceChange {
     Lifecycle(CatalogDdlUndo),
@@ -445,10 +447,8 @@ impl Storage {
                     .as_mut()
                     .expect("sequence edits own comments"),
                 CommentClass::Relation,
-                current_identity.schema,
-                current_identity.name,
-                alteration.schema,
-                alteration.name,
+                (current_identity.schema, current_identity.name),
+                (alteration.schema, alteration.name),
                 transaction,
             );
         }
@@ -564,10 +564,8 @@ impl Storage {
                     .as_mut()
                     .expect("sequence rollback owns comments"),
                 CommentClass::Relation,
-                current.schema,
-                current.name,
-                visible.schema,
-                visible.name,
+                (current.schema, current.name),
+                (visible.schema, visible.name),
                 undo.target.transaction,
             );
         }
@@ -700,15 +698,15 @@ impl Storage {
             sequence.database == current_database() && sequence.ddl_state != CatalogDdlState::Absent
         }) {
             let visible = sequence.definition_for(transaction);
-            if visible.schema.as_str() == schema && visible.name.as_str() == name {
-                if let Some(blocker) = sequence
+            if visible.schema.as_str() == schema
+                && visible.name.as_str() == name
+                && let Some(blocker) = sequence
                     .ddl_state
                     .pending_txid()
                     .or_else(|| sequence.pending_definition.map(|pending| pending.txid))
                     .filter(|blocker| *blocker != transaction)
-                {
-                    return Err(self.catalog_ddl_wait_error(transaction, blocker, name));
-                }
+            {
+                return Err(self.catalog_ddl_wait_error(transaction, blocker, name));
             }
         }
         let Some(slot) = owners.catalog.definitions.iter().position(|sequence| {

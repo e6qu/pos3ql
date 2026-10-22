@@ -1021,7 +1021,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
             (AccessClass::View, undo.slot() as u32)
         }
         DdlUndo::MatviewCreated(slot) => (AccessClass::MaterializedView, slot),
-        DdlUndo::RoutineCreated(slot) => (AccessClass::Routine, slot),
+        DdlUndo::RoutineChanged(change) if change.is_creation() => {
+            (AccessClass::Routine, change.slot() as u32)
+        }
         DdlUndo::SequenceChanged(change) if change.is_creation() => {
             (AccessClass::Sequence, change.slot() as u32)
         }
@@ -5420,6 +5422,9 @@ impl Engine {
             ));
         }
         let query_validation = txn.ddl().iter().try_for_each(|undo| match undo {
+            DdlUndo::RoutineChanged(change) => {
+                self.storage.validate_routine_change(*change, txn.txid)
+            }
             DdlUndo::SequenceChanged(change) => {
                 self.storage.validate_sequence_change(*change, txn.txid)
             }
@@ -6755,13 +6760,9 @@ impl Engine {
                 ),
                 DdlUndo::RuleAltered(undo) => self.storage.commit_rule_alter(*undo),
                 DdlUndo::RuleDropped(undo) => self.storage.commit_rule_drop(*undo),
-                DdlUndo::RoutineCreated(slot) => {
-                    self.storage.commit_routine_create(*slot as usize, txn.txid)
-                }
-                DdlUndo::RoutineDropped(slot) => self.storage.commit_routine_drop(*slot as usize),
-                DdlUndo::RoutineReplaced { slot, .. } => self
+                DdlUndo::RoutineChanged(change) => self
                     .storage
-                    .commit_routine_replace(*slot as usize, txn.txid),
+                    .finish_routine_change(*change, crate::storage::CatalogDdlDecision::Commit),
                 DdlUndo::CastCreated(slot) => self.storage.commit_cast_create(*slot as usize),
                 DdlUndo::CastDropped(slot) => self.storage.commit_cast_drop(*slot as usize),
                 DdlUndo::OperatorCreated(slot) => {
@@ -6858,9 +6859,6 @@ impl Engine {
                 DdlUndo::StatisticsKeysAltered { slot, .. } => self
                     .storage
                     .commit_extended_statistics_alter(*slot as usize, txn.txid),
-                DdlUndo::RoutineIdentityAltered { slot, .. } => self
-                    .storage
-                    .commit_routine_identity(*slot as usize, txn.txid),
                 DdlUndo::PublicationCreated(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_publication_create(slot);
@@ -19695,10 +19693,8 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         ),
         DdlUndo::RuleAltered(undo) => storage.rollback_rule_alter(undo),
         DdlUndo::RuleDropped(undo) => storage.rollback_rule_drop(undo),
-        DdlUndo::RoutineCreated(slot) => storage.rollback_routine_create(slot as usize),
-        DdlUndo::RoutineDropped(slot) => storage.rollback_routine_drop(slot as usize, txid),
-        DdlUndo::RoutineReplaced { slot, prior } => {
-            storage.rollback_routine_replace(slot as usize, prior)
+        DdlUndo::RoutineChanged(change) => {
+            storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Rollback)
         }
         DdlUndo::CastCreated(slot) => storage.rollback_cast_create(slot as usize),
         DdlUndo::CastDropped(slot) => storage.rollback_cast_drop(slot as usize, txid),
@@ -19771,9 +19767,6 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         }
         DdlUndo::StatisticsKeysAltered { slot, prior } => {
             storage.rollback_extended_statistics_keys(slot as usize, prior)
-        }
-        DdlUndo::RoutineIdentityAltered { slot, prior } => {
-            storage.restore_routine_identity(slot as usize, prior)
         }
         DdlUndo::ViewDropped(undo) => {
             storage.rollback_view_drop(undo);
@@ -22153,8 +22146,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if let Some(slot) =
                 storage.routine_slot_by_declared_signature(schema, name, &arguments[..count], 0)
             {
-                storage.drop_routine(slot, 0);
-                storage.commit_routine_drop(slot);
+                let change = storage.drop_routine(storage.prepare_routine_edit(slot, 0)?, 0)?;
+                storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Commit);
             }
         }
         WalOp::AlterRoutineIdentity {
@@ -22174,13 +22167,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         name
                     )
                 })?;
-            storage.alter_routine_identity(
-                slot,
+            let change = storage.alter_routine_identity(
+                storage.prepare_routine_edit(slot, 0)?,
                 crate::storage::SqlName::parse(new_schema)?,
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_routine_identity(slot, 0);
+            storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Commit);
         }
         WalOp::CreateEnum {
             slot,

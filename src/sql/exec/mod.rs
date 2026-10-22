@@ -10240,9 +10240,15 @@ pub(crate) fn drop_owned(
         ) {
             return sql_fail(error);
         }
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_routine(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_routine_change(storage, change) {
             return sql_fail(error);
         }
     }
@@ -33352,10 +33358,9 @@ pub fn create_routine(
             ));
         }
     }
-    let slot = match replaced {
+    let (slot, creation) = match replaced {
         Some(slot) => {
-            let pending = crate::storage::PendingRoutineDefinition {
-                txid: txn.txid,
+            let pending = crate::storage::RoutineDefinition {
                 arguments,
                 argument_count,
                 parameters,
@@ -33370,9 +33375,17 @@ pub fn create_routine(
                 body_kind,
                 body,
                 creation_path,
-                dependency_slot: u32::MAX,
             };
-            let prior = match storage.replace_routine(slot, pending, dependencies.view()) {
+            let target = match storage.prepare_routine_edit(slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.replace_routine(
+                target,
+                pending,
+                crate::storage::RoutineDependencies::Replace(dependencies.view()),
+                txn.txid,
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -33392,17 +33405,13 @@ pub fn create_routine(
                 )
             };
             if let Err(error) = wal_result {
-                storage.rollback_routine_replace(slot, prior);
+                storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_routine_replace(slot, prior);
+            if let Err(error) = txn.record_routine_change(storage, prior) {
                 return sql_fail(error);
             }
-            slot
+            (slot, None)
         }
         None => match storage.create_routine(
             RoutineSpec {
@@ -33427,11 +33436,11 @@ pub fn create_routine(
             },
             txn.txid,
         ) {
-            Ok(slot) => slot,
+            Ok(change) => (change.slot(), Some(change)),
             Err(error) => return sql_fail(error),
         },
     };
-    if replaced.is_none() {
+    if let Some(created) = creation {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         let wal_result = {
@@ -33448,11 +33457,10 @@ pub fn create_routine(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_create(slot);
+            storage.finish_routine_change(created, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
-            storage.rollback_routine_create(slot);
+        if let Err(error) = txn.record_routine_change(storage, created) {
             return sql_fail(error);
         }
     }
@@ -34146,10 +34154,9 @@ pub fn create_aggregate(
         }
     }
     let body = StackStr::new();
-    let slot = match replaced {
+    let (slot, creation) = match replaced {
         Some(slot) => {
-            let pending = crate::storage::PendingRoutineDefinition {
-                txid: txn.txid,
+            let pending = crate::storage::RoutineDefinition {
                 arguments,
                 argument_count: total_arguments,
                 parameters,
@@ -34165,12 +34172,18 @@ pub fn create_aggregate(
                 body_kind: crate::storage::RoutineBodyKind::String,
                 body,
                 creation_path: StackStr::new(),
-                dependency_slot: u32::MAX,
+            };
+            let target = match storage.prepare_routine_edit(slot, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
             };
             let prior = match storage.replace_routine(
-                slot,
+                target,
                 pending,
-                crate::storage::StoredQueryDependencies::EMPTY.view(),
+                crate::storage::RoutineDependencies::Replace(
+                    crate::storage::StoredQueryDependencies::EMPTY.view(),
+                ),
+                txn.txid,
             ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
@@ -34191,17 +34204,13 @@ pub fn create_aggregate(
                 )
             };
             if let Err(error) = wal_result {
-                storage.rollback_routine_replace(slot, prior);
+                storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_routine_replace(slot, prior);
+            if let Err(error) = txn.record_routine_change(storage, prior) {
                 return sql_fail(error);
             }
-            slot
+            (slot, None)
         }
         None => match storage.create_routine(
             RoutineSpec {
@@ -34227,11 +34236,11 @@ pub fn create_aggregate(
             },
             txn.txid,
         ) {
-            Ok(slot) => slot,
+            Ok(change) => (change.slot(), Some(change)),
             Err(error) => return sql_fail(error),
         },
     };
-    if replaced.is_none() {
+    if let Some(created) = creation {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         let wal_result = {
@@ -34248,11 +34257,10 @@ pub fn create_aggregate(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_create(slot);
+            storage.finish_routine_change(created, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
-            storage.rollback_routine_create(slot);
+        if let Err(error) = txn.record_routine_change(storage, created) {
             return sql_fail(error);
         }
         if let Err(error) = apply_default_privileges_to_new_object(
@@ -35358,8 +35366,7 @@ pub fn alter_routine(
                 _ => unreachable!("definition action set is closed above"),
             }
         }
-        let pending = crate::storage::PendingRoutineDefinition {
-            txid: txn.txid,
+        let pending = crate::storage::RoutineDefinition {
             arguments: routine.arguments,
             argument_count: routine.argument_count,
             parameters: routine.parameters,
@@ -35374,9 +35381,17 @@ pub fn alter_routine(
             body_kind: routine.body_kind,
             body: routine.body,
             creation_path: routine.creation_path,
-            dependency_slot: u32::MAX,
         };
-        let prior = match storage.replace_routine_preserving_dependencies(slot, pending) {
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let prior = match storage.replace_routine(
+            target,
+            pending,
+            crate::storage::RoutineDependencies::Preserve,
+            txn.txid,
+        ) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -35396,14 +35411,10 @@ pub fn alter_routine(
             )
         };
         if let Err(error) = wal_result {
-            storage.rollback_routine_replace(slot, prior);
+            storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_routine_replace(slot, prior);
+        if let Err(error) = txn.record_routine_change(storage, prior) {
             return sql_fail(error);
         }
         responder.command_complete(match kind {
@@ -35547,7 +35558,11 @@ pub fn alter_routine(
         Ok(signature) => signature,
         Err(error) => return sql_fail(error),
     };
-    let prior = match storage.alter_routine_identity(slot, new_schema, new_name, txn.txid) {
+    let target = match storage.prepare_routine_edit(slot, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    let prior = match storage.alter_routine_identity(target, new_schema, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -35563,14 +35578,10 @@ pub fn alter_routine(
             new_name: new_name.as_str(),
         },
     ) {
-        storage.restore_routine_identity(slot, prior);
+        storage.finish_routine_change(prior, crate::storage::CatalogDdlDecision::Rollback);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineIdentityAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.restore_routine_identity(slot, prior);
+    if let Err(error) = txn.record_routine_change(storage, prior) {
         return sql_fail(error);
     }
     responder.command_complete(match kind {
@@ -35976,11 +35987,15 @@ pub fn drop_routine(
             ) {
                 return sql_fail(error);
             }
-            storage.drop_routine(dependent, txn.txid);
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::RoutineDropped(dependent as u32))
-            {
-                storage.rollback_routine_drop(dependent, txn.txid);
+            let target = match storage.prepare_routine_edit(dependent, txn.txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let change = match storage.drop_routine(target, txn.txid) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_routine_change(storage, change) {
                 return sql_fail(error);
             }
         }
@@ -36076,9 +36091,15 @@ pub fn drop_routine(
         ) {
             return sql_fail(error);
         }
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
+        let target = match storage.prepare_routine_edit(slot, txn.txid) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let change = match storage.drop_routine(target, txn.txid) {
+            Ok(change) => change,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_routine_change(storage, change) {
             return sql_fail(error);
         }
     }
@@ -41288,8 +41309,9 @@ fn drop_type_dependent_routines(
                 argument_signature: signature,
             },
         )?;
-        storage.drop_routine(slot, txn.txid);
-        txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32))?;
+        let change =
+            storage.drop_routine(storage.prepare_routine_edit(slot, txn.txid)?, txn.txid)?;
+        txn.record_routine_change(storage, change)?;
     }
     Ok(())
 }
@@ -44799,11 +44821,9 @@ fn drop_selected_stored_queries(
                 argument_signature: signature,
             },
         )?;
-        storage.drop_routine(slot, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
-            storage.rollback_routine_drop(slot, txn.txid);
-            return Err(error);
-        }
+        let change =
+            storage.drop_routine(storage.prepare_routine_edit(slot, txn.txid)?, txn.txid)?;
+        txn.record_routine_change(storage, change)?;
     }
     Ok(())
 }

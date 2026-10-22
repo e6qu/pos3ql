@@ -8,6 +8,140 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_undo_exhaustion_releases_sequence_and_routine_changes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-undo-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 1;
+        config.max_sequences = 2;
+        config.max_routines = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SEQUENCE retained_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            true,
+        );
+        for statement in [
+            "CREATE SEQUENCE overflow_sequence",
+            "DROP SEQUENCE retained_sequence",
+            "ALTER SEQUENCE retained_sequence RENAME TO overflow_sequence",
+            "CREATE FUNCTION overflow_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+            "DROP FUNCTION retained_function()",
+            "ALTER FUNCTION retained_function() RENAME TO overflow_function",
+            "CREATE OR REPLACE FUNCTION retained_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+        ] {
+            session.success(
+                &mut engine,
+                "BEGIN; COMMENT ON SEQUENCE retained_sequence IS 'reserved'",
+                true,
+            );
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let transaction = session.transaction.txid;
+            assert!(
+                engine
+                    .storage
+                    .sequence_slot("public", "retained_sequence", transaction)
+                    .is_some(),
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .sequence_slot("public", "overflow_sequence", transaction)
+                    .is_none(),
+                "{statement}"
+            );
+            let routine = engine
+                .storage
+                .routine_slot_by_name_unambiguous("public", "retained_function", transaction)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                engine
+                    .storage
+                    .routine_for(routine, transaction)
+                    .body
+                    .as_str(),
+                "SELECT 1",
+                "{statement}"
+            );
+            assert!(
+                engine
+                    .storage
+                    .routine_slot_by_name_unambiguous("public", "overflow_function", transaction)
+                    .unwrap()
+                    .is_none(),
+                "{statement}"
+            );
+            session.success(&mut engine, "ROLLBACK", true);
+        }
+        session.success(&mut engine, "CREATE SEQUENCE overflow_sequence", true);
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION overflow_function() RETURNS integer LANGUAGE SQL AS 'SELECT 9'",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT retained_function(), overflow_function()",
+                true
+            )),
+            ["1|9"]
+        );
+    }
+}
+
+#[test]
+fn metadata_savepoints_keep_sequence_values_and_routine_comments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-savepoints-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential_exact/07_metadata_savepoints.sql"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "10",
+                "50",
+                "11",
+                "12",
+                "changed",
+                "changed",
+                "2",
+                "original",
+                "2",
+                "original",
+                "changed",
+                "9",
+                "replacement",
+            ]
+        );
+    }
+}
+
+#[test]
 fn metadata_sequence_comment_reuse_keeps_replacement() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

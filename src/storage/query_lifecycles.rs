@@ -5,7 +5,7 @@ use super::catalog_sources::{
     CatalogObjectIdentity, CatalogObjectSlot,
 };
 use super::{
-    CatalogDdlState, DatabaseOid, PendingRuleDefinition, PendingViewDefinition, SqlError, Storage,
+    CatalogDdlState, PendingRuleDefinition, PendingViewDefinition, SqlError, Storage,
     current_database, sqlstate,
 };
 use crate::sql_err;

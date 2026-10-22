@@ -31,17 +31,22 @@ jobs:
         run: |
           python3 - <<'PYTHON'
           import os, pathlib, subprocess
-          sql = pathlib.Path("tests/external/differential_exact/06_metadata_comment_lifetimes.sql").read_bytes()
-          output = subprocess.check_output([
-              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
-              "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
-          ], input=sql).decode().splitlines()
-          assert output == ["fresh", "replacement"], output
-          print("PostgreSQL reference:", output)
+          fixtures = {
+              "06_metadata_comment_lifetimes.sql": ["fresh", "replacement"],
+              "07_metadata_savepoints.sql": ["10", "50", "11", "12", "changed", "changed", "2", "original", "2", "original", "changed", "9", "replacement"],
+          }
+          for filename, expected in fixtures.items():
+              sql = (pathlib.Path("tests/external/differential_exact") / filename).read_bytes()
+              output = subprocess.check_output([
+                  "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+                  "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+              ], input=sql).decode().splitlines()
+              assert output == expected, (filename, output)
+              print("PostgreSQL reference:", filename, output)
           PYTHON
-      - name: Sequence and saved-query lifetime regressions
+      - name: Metadata lifetime regressions
         run: >-
-          cargo test --release --lib --locked -- sequence query_lifecycle
+          cargo test --release --lib --locked -- sequence routine metadata_ query_lifecycle
           --test-threads=1
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings

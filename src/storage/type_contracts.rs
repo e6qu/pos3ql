@@ -69,10 +69,11 @@ impl CatalogTypes<'_> {
                 )?;
                 if let Some(pending) = &mut definition.pending_definition {
                     routine_type_fields(
-                        &mut pending.arguments[..pending.argument_count],
-                        &mut pending.parameters[..pending.parameter_count],
-                        &mut pending.result_columns[..pending.result_column_count],
-                        &mut pending.kind,
+                        &mut pending.definition.arguments[..pending.definition.argument_count],
+                        &mut pending.definition.parameters[..pending.definition.parameter_count],
+                        &mut pending.definition.result_columns
+                            [..pending.definition.result_column_count],
+                        &mut pending.definition.kind,
                         &mut visit,
                     )?;
                 }
@@ -201,6 +202,7 @@ impl<Catalog: CatalogPublicationDestination> CatalogTypeOwners<'_, Catalog> {
 
 pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
+    RoutineCreation,
     ViewDefinition,
     ViewMetadataEdit,
     MetadataCommit,
@@ -251,7 +253,8 @@ struct CatalogOwnerRequirements {
 impl CatalogPublicationInput<'_> {
     fn requirements(&self) -> CatalogOwnerRequirements {
         let (types, permissions, comments, extensions) = match self {
-            Self::RoutineContract => (true, false, false, false),
+            Self::RoutineContract => (true, false, true, false),
+            Self::RoutineCreation => (true, true, true, false),
             Self::ViewDefinition => (true, true, false, false),
             Self::ViewMetadataEdit | Self::RuleMetadataEdit => (true, false, true, false),
             Self::MetadataCommit => (false, false, true, false),

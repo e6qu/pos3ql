@@ -6036,7 +6036,7 @@ impl Checkpointer {
                                 error.message.as_str()
                             ))
                         })?;
-                    storage.commit_routine_create(slot, 0);
+                    storage.finish_routine_change(slot, crate::storage::CatalogDdlDecision::Commit);
                 }
                 Some("evt") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;

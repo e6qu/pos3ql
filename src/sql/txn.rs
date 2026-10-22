@@ -364,13 +364,7 @@ pub(crate) enum DdlUndo {
     },
     RuleAltered(crate::storage::RuleAlterUndo),
     RuleDropped(crate::storage::CatalogDdlUndo),
-    /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
-    RoutineCreated(u32),
-    RoutineDropped(u32),
-    RoutineReplaced {
-        slot: u32,
-        prior: Option<crate::storage::PendingRoutineDefinition>,
-    },
+    RoutineChanged(crate::storage::RoutineChange),
     CastCreated(u32),
     CastDropped(u32),
     OperatorCreated(u32),
@@ -440,10 +434,6 @@ pub(crate) enum DdlUndo {
     StatisticsKeysAltered {
         slot: u32,
         prior: Option<crate::storage::PendingExtendedStatisticsKeys>,
-    },
-    RoutineIdentityAltered {
-        slot: u32,
-        prior: Option<crate::storage::PendingRoutineIdentity>,
     },
     /// CREATE PUBLICATION at this slot.
     PublicationCreated(u32),
@@ -2395,6 +2385,19 @@ impl TxnState {
         while self.subscription_advances.len() > mark {
             self.subscription_advances.pop();
         }
+    }
+
+    pub(crate) fn record_routine_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        change: crate::storage::RoutineChange,
+    ) -> Result<(), SqlError> {
+        storage.validate_routine_change(change, self.txid)?;
+        if let Err(error) = self.record_ddl(DdlUndo::RoutineChanged(change)) {
+            storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_sequence_change(

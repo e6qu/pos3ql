@@ -7,10 +7,12 @@
 
 mod catalog_sources;
 mod query_lifecycles;
+mod routine_lifecycles;
 mod sequence_lifecycles;
 pub(crate) use query_lifecycles::{
     MatviewPopulationUndo, RuleAlterUndo, RulePublication, ViewCatalogIdentity, ViewPublication,
 };
+pub(crate) use routine_lifecycles::{RoutineChange, RoutineDependencies};
 pub(crate) use sequence_lifecycles::SequenceChange;
 mod role_dependencies;
 pub(crate) use catalog_sources::{
@@ -8481,6 +8483,8 @@ impl RoutineArgumentDef {
 pub(crate) struct RoutineDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
+    pub(crate) version: u64,
+    pub(crate) ddl_version: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub(crate) pending_identity: Option<PendingRoutineIdentity>,
@@ -8508,7 +8512,14 @@ pub(crate) struct RoutineDef {
 /// an old result contract (or vice versa).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingRoutineDefinition {
-    pub(crate) txid: u32,
+    pub(super) txid: u32,
+    pub(super) version: u64,
+    pub(super) dependency_slot: u32,
+    pub(super) definition: RoutineDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoutineDefinition {
     pub(crate) arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) argument_count: usize,
     pub(crate) parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
@@ -8523,13 +8534,14 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) body_kind: RoutineBodyKind,
     pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
     pub(crate) creation_path: StackStr<128>,
-    pub(crate) dependency_slot: u32,
 }
 
 impl RoutineDef {
     pub(crate) const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
+        version: 0,
+        ddl_version: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         pending_identity: None,
@@ -8553,6 +8565,17 @@ impl RoutineDef {
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
     };
+
+    pub(super) fn revision_for(&self, transaction: u32) -> u64 {
+        self.pending_definition
+            .filter(|pending| pending.txid == transaction)
+            .map_or(self.version, |pending| pending.version)
+            .max(
+                self.pending_identity
+                    .filter(|pending| pending.txid == transaction)
+                    .map_or(self.version, |pending| pending.version),
+            )
+    }
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -8590,12 +8613,12 @@ impl RoutineDef {
 
     fn kind_for(&self, txid: u32) -> RoutineKind {
         self.pending_definition_for(txid)
-            .map_or(self.kind, |pending| pending.kind)
+            .map_or(self.kind, |pending| pending.definition.kind)
     }
 
     fn attributes_for(&self, txid: u32) -> RoutineAttributes {
         self.pending_definition_for(txid)
-            .map_or(self.attributes, |pending| pending.attributes)
+            .map_or(self.attributes, |pending| pending.definition.attributes)
     }
 
     fn accepts_input_arity_for(&self, arity: usize, txid: u32) -> bool {
@@ -8606,8 +8629,8 @@ impl RoutineDef {
             ),
             |pending| {
                 (
-                    pending.argument_count,
-                    &pending.parameters[..pending.parameter_count],
+                    pending.definition.argument_count,
+                    &pending.definition.parameters[..pending.definition.parameter_count],
                 )
             },
         );
@@ -8736,26 +8759,34 @@ impl RoutineDef {
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
-        self.pending_definition
+        let mut definition = self
+            .pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
-                arguments: pending.arguments,
-                argument_count: pending.argument_count,
-                parameters: pending.parameters,
-                parameter_count: pending.parameter_count,
-                kind: pending.kind,
-                result_columns: pending.result_columns,
-                result_column_count: pending.result_column_count,
-                language: pending.language,
-                attributes: pending.attributes,
-                configs: pending.configs,
-                config_count: pending.config_count,
-                body_kind: pending.body_kind,
-                body: pending.body,
-                creation_path: pending.creation_path,
+                version: self.revision_for(txid),
+                arguments: pending.definition.arguments,
+                argument_count: pending.definition.argument_count,
+                parameters: pending.definition.parameters,
+                parameter_count: pending.definition.parameter_count,
+                kind: pending.definition.kind,
+                result_columns: pending.definition.result_columns,
+                result_column_count: pending.definition.result_column_count,
+                language: pending.definition.language,
+                attributes: pending.definition.attributes,
+                configs: pending.definition.configs,
+                config_count: pending.definition.config_count,
+                body_kind: pending.definition.body_kind,
+                body: pending.definition.body,
+                creation_path: pending.definition.creation_path,
                 pending_definition: None,
                 ..*self
-            })
+            });
+        definition.version = self.revision_for(txid);
+        definition.schema = self.schema_for(txid);
+        definition.name = self.name_for(txid);
+        definition.pending_identity = None;
+        definition.pending_definition = None;
+        definition
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
@@ -9348,6 +9379,7 @@ impl TriggerDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingRoutineIdentity {
     pub txid: u32,
+    pub(super) version: u64,
     pub schema: SqlName,
     pub name: SqlName,
 }
@@ -27411,10 +27443,8 @@ impl Storage {
         self.stage_object_comment_identity_locked(
             &mut self.comment_catalog(),
             class,
-            old_schema,
-            old_name,
-            new_schema,
-            new_name,
+            (old_schema, old_name),
+            (new_schema, new_name),
             txid,
         );
     }
@@ -27423,12 +27453,12 @@ impl Storage {
         &self,
         comments: &mut CommentCatalog,
         class: CommentClass,
-        old_schema: SqlName,
-        old_name: SqlName,
-        new_schema: SqlName,
-        new_name: SqlName,
+        old: (SqlName, SqlName),
+        new: (SqlName, SqlName),
         txid: u32,
     ) {
+        let (old_schema, old_name) = old;
+        let (new_schema, new_name) = new;
         let database = Some(current_database());
         for comment in comments.entries.iter_mut().filter(|comment| {
             comment.matches_to(
@@ -27907,9 +27937,9 @@ impl Storage {
             let mut body = definition.body;
             rename_schema_qualified_sql(&mut body, prior, name)?;
             if let Some(pending) = definition.pending_definition {
-                let mut path = pending.creation_path;
+                let mut path = pending.definition.creation_path;
                 rename_schema_path(&mut path, prior, name)?;
-                let mut body = pending.body;
+                let mut body = pending.definition.body;
                 rename_schema_qualified_sql(&mut body, prior, name)?;
             }
         }
@@ -28137,26 +28167,26 @@ impl Storage {
             rename_schema_qualified_sql(&mut definition.body, prior, name)?;
             if let Some(pending) = &mut definition.pending_definition {
                 rename_routine_arguments_schema(
-                    &mut pending.arguments,
-                    pending.argument_count,
+                    &mut pending.definition.arguments,
+                    pending.definition.argument_count,
                     prior,
                     name,
                 );
                 rename_routine_parameters_schema(
-                    &mut pending.parameters,
-                    pending.parameter_count,
+                    &mut pending.definition.parameters,
+                    pending.definition.parameter_count,
                     prior,
                     name,
                 );
                 rename_routine_arguments_schema(
-                    &mut pending.result_columns,
-                    pending.result_column_count,
+                    &mut pending.definition.result_columns,
+                    pending.definition.result_column_count,
                     prior,
                     name,
                 );
-                rename_routine_kind_schema(&mut pending.kind, prior, name);
-                rename_schema_path(&mut pending.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut pending.body, prior, name)?;
+                rename_routine_kind_schema(&mut pending.definition.kind, prior, name);
+                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut pending.definition.body, prior, name)?;
             }
         }
         drop(routines);
@@ -41885,95 +41915,6 @@ impl Storage {
         Ok(found)
     }
 
-    pub(crate) fn alter_routine_identity(
-        &mut self,
-        slot: usize,
-        schema: SqlName,
-        name: SqlName,
-        txid: u32,
-    ) -> Result<Option<PendingRoutineIdentity>, SqlError> {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        let routine = routines[slot];
-        if let Some(pending) = routine.pending_identity
-            && pending.txid != txid
-        {
-            drop(routines);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, routine.name.as_str()));
-        }
-        if routines.iter().enumerate().any(|(other, candidate)| {
-            other != slot
-                && candidate.database == current_database()
-                && candidate.visible_to(txid)
-                && candidate.schema_for(txid) == schema
-                && candidate.name_for(txid) == name
-                && candidate.argument_count == routine.argument_count
-                && candidate
-                    .arguments()
-                    .iter()
-                    .zip(routine.arguments())
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    })
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_FUNCTION,
-                "routine \"{}\" already exists with same argument types",
-                name.as_str()
-            ));
-        }
-        if let Some(blocker) = routines.iter().enumerate().find_map(|(other, candidate)| {
-            (other != slot)
-                .then_some(candidate.pending_identity)
-                .flatten()
-                .filter(|pending| {
-                    pending.txid != txid
-                        && pending.schema == schema
-                        && pending.name == name
-                        && candidate.argument_count == routine.argument_count
-                        && candidate.arguments().iter().zip(routine.arguments()).all(
-                            |(left, right)| {
-                                left.ctype == right.ctype && left.user_type == right.user_type
-                            },
-                        )
-                })
-                .map(|pending| pending.txid)
-        }) {
-            drop(routines);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        let prior = routines[slot].pending_identity;
-        routines[slot].pending_identity = Some(PendingRoutineIdentity { txid, schema, name });
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_routine_identity(&mut self, slot: usize, txid: u32) {
-        let changed = {
-            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-            let routine = &mut routines[slot];
-            if let Some(pending) = routine.pending_identity
-                && pending.txid == txid
-            {
-                routine.schema = pending.schema;
-                routine.name = pending.name;
-                routine.pending_identity = None;
-                Some((pending.schema, pending.name))
-            } else {
-                None
-            }
-        };
-        if let Some((schema, name)) = changed {
-            self.rename_stored_query_dependency(DependencyClass::Routine, slot, None, schema, name);
-        }
-    }
-
-    pub(crate) fn restore_routine_identity(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingRoutineIdentity>,
-    ) {
-        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_identity = prior;
-    }
-
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
         AccessObject {
             class: AccessClass::Routine,
@@ -42012,472 +41953,6 @@ impl Storage {
             self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16))
         };
         self.snapshot_dependency_image(image, arena)
-    }
-
-    pub(crate) fn create_routine(
-        &mut self,
-        spec: RoutineSpec,
-        txid: u32,
-    ) -> Result<usize, SqlError> {
-        let RoutineSpec {
-            identity,
-            schema,
-            name,
-            mut arguments,
-            argument_count,
-            mut parameters,
-            parameter_count,
-            mut kind,
-            mut result_columns,
-            result_column_count,
-            language,
-            attributes,
-            configs,
-            config_count,
-            body_kind,
-            body,
-            creation_path,
-            dependencies,
-        } = spec;
-        if config_count > configs.len()
-            || configs[..config_count]
-                .iter()
-                .enumerate()
-                .any(|(index, config)| {
-                    configs[..index]
-                        .iter()
-                        .any(|prior| prior.name == config.name)
-                })
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "routine configuration contract is invalid"
-            ));
-        }
-        if parameter_count > parameters.len()
-            || parameters[..parameter_count]
-                .iter()
-                .filter(|parameter| parameter.mode.is_input())
-                .count()
-                != argument_count
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "routine parameter contract does not match its input signature"
-            ));
-        }
-        let output_parameter_count = parameters[..parameter_count]
-            .iter()
-            .filter(|parameter| parameter.mode.is_output())
-            .count();
-        let mut saw_default = false;
-        let mut saw_variadic = false;
-        for parameter in &parameters[..parameter_count] {
-            if saw_variadic && !matches!(parameter.mode, RoutineParameterMode::Out) {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "VARIADIC parameter must be the last input parameter"
-                ));
-            }
-            if parameter.mode.is_input() {
-                if parameter.mode.default().is_some() {
-                    saw_default = true;
-                } else if saw_default {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "input parameters after one with a default value must also have defaults"
-                    ));
-                }
-            }
-            saw_variadic |= matches!(parameter.mode, RoutineParameterMode::Variadic { .. });
-        }
-        match kind {
-            RoutineKind::TableFunction => {
-                if result_column_count == 0 || result_column_count > result_columns.len() {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "record-returning function must have between one and {} result columns",
-                        result_columns.len()
-                    ));
-                }
-                if result_columns[..result_column_count]
-                    .iter()
-                    .enumerate()
-                    .any(|(index, column)| {
-                        result_columns[..index]
-                            .iter()
-                            .any(|prior| prior.name == column.name)
-                    })
-                {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "routine result column names must be distinct"
-                    ));
-                }
-            }
-            RoutineKind::RecordFunction { .. }
-                if result_column_count < 2
-                    || result_column_count != output_parameter_count
-                    || result_column_count > result_columns.len() =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "record function result contract does not match its output parameters"
-                ));
-            }
-            RoutineKind::RecordFunction { .. } => {}
-            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. }
-                if result_column_count != 0
-                    && (result_column_count != 1 || output_parameter_count != 1) =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "scalar function result contract does not match its output parameter"
-                ));
-            }
-            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. } => {}
-            RoutineKind::Trigger
-            | RoutineKind::EventTrigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_)
-                if result_column_count != 0 =>
-            {
-                return Err(sql_err!(
-                    sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "routine kind cannot define result columns"
-                ));
-            }
-            RoutineKind::Trigger
-            | RoutineKind::EventTrigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_) => {}
-        }
-        type_contracts::routine_type_fields(
-            &mut arguments[..argument_count],
-            &mut parameters[..parameter_count],
-            &mut result_columns[..result_column_count],
-            &mut kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        self.require_schema_create(schema.as_str(), txid)?;
-        let allocated_ownership = if matches!(identity, RoutineIdentity::Allocate) {
-            Some(self.initial_ownership(txid)?)
-        } else {
-            None
-        };
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        owners.bind_routine_contract(
-            &mut arguments[..argument_count],
-            &mut parameters[..parameter_count],
-            &mut result_columns[..result_column_count],
-            &mut kind,
-            txid,
-        )?;
-        owners.validate_dependencies(dependencies.view(), txid)?;
-        let routines = &mut owners.catalog;
-        if let Some(blocker) = routines.iter().find_map(|routine| {
-            (routine.database == current_database()
-                && routine.schema_for(txid) == schema
-                && routine.name_for(txid) == name
-                && routine.argument_count == argument_count
-                && routine.arguments()[..argument_count]
-                    .iter()
-                    .zip(&arguments[..argument_count])
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    }))
-            .then_some(routine.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if routines.iter().any(|routine| {
-            routine.database == current_database()
-                && routine.visible_to(txid)
-                && routine.schema_for(txid) == schema
-                && routine.name_for(txid) == name
-                && routine.argument_count == argument_count
-                && routine.arguments()[..argument_count]
-                    .iter()
-                    .zip(&arguments[..argument_count])
-                    .all(|(left, right)| {
-                        left.ctype == right.ctype && left.user_type == right.user_type
-                    })
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_FUNCTION,
-                "function \"{}\" already exists with same argument types",
-                name.as_str()
-            ));
-        }
-        let Some(slot) = routines
-            .iter()
-            .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many routines (limit {})",
-                routines.len()
-            ));
-        };
-        let (created_at, ownership) = match identity {
-            RoutineIdentity::Allocate => (
-                self.catalog_sequence.next()?,
-                allocated_ownership.expect("allocated routine ownership was prepared"),
-            ),
-            RoutineIdentity::Preserve {
-                created_at,
-                ownership,
-            } => {
-                self.catalog_sequence.observe(created_at);
-                (created_at, ownership)
-            }
-        };
-        owners.write_query_image(
-            self,
-            self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
-            dependencies.view(),
-            txid,
-        )?;
-        owners.catalog[slot] = RoutineDef {
-            database: current_database(),
-            created_at,
-            schema,
-            name,
-            pending_identity: None,
-            pending_definition: None,
-            arguments,
-            argument_count,
-            parameters,
-            parameter_count,
-            kind,
-            result_columns,
-            result_column_count,
-            language,
-            attributes,
-            configs,
-            config_count,
-            body_kind,
-            body,
-            creation_path,
-            ownership,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        drop(owners);
-        self.clear_object_acl_entries(Self::routine_access_object(slot));
-        Ok(slot)
-    }
-
-    pub(crate) fn commit_routine_create(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.commit_create();
-        let ownership = &mut routines[slot].ownership;
-        if let Some(pending) = ownership.pending
-            && pending.txid == txid
-        {
-            ownership.owner = pending.owner;
-            ownership.pending = None;
-        }
-    }
-
-    pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
-        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
-    }
-
-    pub(crate) fn replace_routine(
-        &mut self,
-        slot: usize,
-        mut definition: PendingRoutineDefinition,
-        dependencies: StoredQueryDependencyView<'_>,
-    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        type_contracts::routine_type_fields(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, definition.txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        let routine = self.routine(slot);
-        let name = routine.name;
-        if let Some(pending) = routine.pending_definition
-            && pending.txid != definition.txid
-        {
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        if owners.catalog[slot].database != routine.database
-            || owners.catalog[slot].created_at != routine.created_at
-            || !owners.catalog[slot].visible_to(definition.txid)
-        {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "routine changed before its definition could be published"
-            ));
-        }
-        owners.bind_routine_contract(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            definition.txid,
-        )?;
-        let prior = owners.catalog[slot].pending_definition;
-        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let previous = prior.map(|pending| pending.dependency_slot);
-        definition.dependency_slot = owners.allocate_query_image(
-            self,
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            previous,
-            dependencies,
-            definition.txid,
-        )?;
-        owners.catalog[slot].pending_definition = Some(definition);
-        Ok(prior)
-    }
-
-    pub(crate) fn replace_routine_preserving_dependencies(
-        &mut self,
-        slot: usize,
-        mut definition: PendingRoutineDefinition,
-    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        type_contracts::routine_type_fields(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            &mut |result| {
-                *result = self.bind_routine_result(*result, definition.txid)?;
-                Ok::<(), SqlError>(())
-            },
-        )?;
-        let routine = self.routine(slot);
-        let name = routine.name;
-        if let Some(pending) = routine.pending_definition
-            && pending.txid != definition.txid
-        {
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let mut owners = self.catalog_dependency_owners(
-            &self.routines,
-            type_contracts::CatalogPublicationInput::RoutineContract,
-            None,
-        );
-        if owners.catalog[slot].database != routine.database
-            || owners.catalog[slot].created_at != routine.created_at
-            || !owners.catalog[slot].visible_to(definition.txid)
-        {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "routine changed before its definition could be published"
-            ));
-        }
-        owners.bind_routine_contract(
-            &mut definition.arguments[..definition.argument_count],
-            &mut definition.parameters[..definition.parameter_count],
-            &mut definition.result_columns[..definition.result_column_count],
-            &mut definition.kind,
-            definition.txid,
-        )?;
-        let prior = owners.catalog[slot].pending_definition;
-        if let Some(pending) = prior.filter(|pending| pending.txid != definition.txid) {
-            drop(owners);
-            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
-        }
-        let previous = prior.map(|pending| pending.dependency_slot);
-        definition.dependency_slot = owners.allocate_preserved_query_image(
-            self,
-            StoredQueryDependencyOwner::Routine(slot as u16),
-            previous,
-            definition.txid,
-        )?;
-        owners.catalog[slot].pending_definition = Some(definition);
-        Ok(prior)
-    }
-
-    pub(crate) fn commit_routine_replace(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.routine(slot).pending_definition
-            && pending.txid == txid
-        {
-            self.commit_pending_dependencies(
-                StoredQueryDependencyOwner::Routine(slot as u16),
-                pending.dependency_slot,
-            );
-            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-            let routine = &mut routines[slot];
-            routine.arguments = pending.arguments;
-            routine.argument_count = pending.argument_count;
-            routine.parameters = pending.parameters;
-            routine.parameter_count = pending.parameter_count;
-            routine.kind = pending.kind;
-            routine.result_columns = pending.result_columns;
-            routine.result_column_count = pending.result_column_count;
-            routine.language = pending.language;
-            routine.attributes = pending.attributes;
-            routine.configs = pending.configs;
-            routine.config_count = pending.config_count;
-            routine.body_kind = pending.body_kind;
-            routine.body = pending.body;
-            routine.creation_path = pending.creation_path;
-            routine.pending_definition = None;
-        }
-    }
-
-    pub(crate) fn rollback_routine_replace(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingRoutineDefinition>,
-    ) {
-        if let Some(current) = self.routine(slot).pending_definition {
-            self.release_pending_dependencies(current.dependency_slot);
-        }
-        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_definition =
-            prior;
-    }
-
-    pub(crate) fn drop_routine(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.drop_by(txid);
-    }
-
-    pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
-        let routine = self.routine(slot);
-        let routine_oid = routine_oid(&routine);
-        let oid = routine_oid as u32;
-        let pending = routine
-            .pending_definition
-            .map(|pending| pending.dependency_slot);
-        self.reset_function_statistics(routine_oid);
-        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
-        let object = Self::routine_access_object(slot);
-        self.clear_object_acl_entries(object);
-        self.clear_extension_dependencies_for_object(object);
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
-        self.drop_comments_by_subid(CommentClass::Routine, oid);
-        self.clear_pending_dependency_chain(pending);
-    }
-
-    pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        routines[slot].ddl_state = routines[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn policy(&self, slot: usize) -> PolicyDef {
@@ -43918,8 +43393,10 @@ impl Storage {
                 owners.catalog[slot] = definition;
                 return Ok(());
             }
-            self.drop_routine(slot, 0);
-            self.commit_routine_drop(slot);
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal routine identity collides with an existing routine"
+            ));
         }
         let slot = self.create_routine(
             RoutineSpec {
@@ -43947,7 +43424,7 @@ impl Storage {
             },
             0,
         )?;
-        self.commit_routine_create(slot, 0);
+        self.finish_routine_change(slot, CatalogDdlDecision::Commit);
         Ok(())
     }
 
@@ -56918,6 +56395,7 @@ mod tests {
             }
             catalog[1].pending_identity = Some(PendingRoutineIdentity {
                 txid: 7,
+                version: 1,
                 schema: SqlName::parse("public").unwrap(),
                 name: SqlName::parse("renamed").unwrap(),
             });

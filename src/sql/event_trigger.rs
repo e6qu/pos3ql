@@ -728,11 +728,16 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         ViewChanged(crate::storage::ViewPublication::Altered(undo)) => {
             (ObjectRef::View(undo.slot()), Mutation::Alter)
         }
-        RoutineCreated(slot) => (ObjectRef::Routine(slot as usize), Mutation::Create),
-        RoutineDropped(slot) => (ObjectRef::Routine(slot as usize), Mutation::Drop),
-        RoutineReplaced { slot, .. } | RoutineIdentityAltered { slot, .. } => {
-            (ObjectRef::Routine(slot as usize), Mutation::Alter)
-        }
+        RoutineChanged(change) => (
+            ObjectRef::Routine(change.slot()),
+            if change.is_creation() {
+                Mutation::Create
+            } else if change.is_drop() {
+                Mutation::Drop
+            } else {
+                Mutation::Alter
+            },
+        ),
         CastCreated(slot) => (ObjectRef::Cast(slot as usize), Mutation::Create),
         CastDropped(slot) => (ObjectRef::Cast(slot as usize), Mutation::Drop),
         OperatorCreated(slot) => (ObjectRef::Operator(slot as usize), Mutation::Create),

@@ -869,6 +869,13 @@ or between changes in the same transaction, and a key column added by that
 transaction. Savepoint rollback restores the earlier binding. For example,
 creating an index on `added`, then removing an earlier column, must keep the
 index on `added` through commit and restart.
+Index reads select the table lifetime directly instead of searching for a table
+by its old name. Installation waits recheck both that lifetime and the selected
+definition; a changed source returns `40001`. Unrelated tables remain available.
+Each reserved pending-definition slot includes a 16-bit column transition map
+and a revision number; each index slot includes its table binding. Startup
+accounting uses the complete slot sizes, including padding. These controls do
+not change durable formats or grow at runtime.
 
 ### Changing rewrite rules
 

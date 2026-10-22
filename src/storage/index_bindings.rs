@@ -5,8 +5,27 @@ use super::*;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexTableBinding {
-    source: CatalogObjectIdentity,
+    pub(super) source: CatalogObjectIdentity,
     revision: u64,
+}
+
+impl IndexTableBinding {
+    pub(super) fn matches_selected(
+        self,
+        storage: &Storage,
+        state: &table_definitions::DefinitionState,
+        transaction: u32,
+    ) -> bool {
+        self.source.matches(
+            storage,
+            state.identity.database,
+            state.identity.created_at,
+            state.identity.existence,
+        ) && self.revision
+            == storage
+                .pending_table_defs
+                .selected_revision(state, transaction)
+    }
 }
 
 impl Storage {
@@ -24,20 +43,6 @@ impl Storage {
                 identity.existence,
             ))
         .then_some(table)
-    }
-
-    pub(super) fn index_binding_matches(&self, index: IndexDef, table: usize) -> bool {
-        let Some(binding) = index.table_binding else {
-            return false;
-        };
-        let identity = self.tables[table].identity();
-        binding.source.slot() == CatalogObjectSlot::Table(table)
-            && binding.source.matches(
-                self,
-                identity.database,
-                identity.created_at,
-                identity.existence,
-            )
     }
 
     pub(super) fn capture_index_binding(
@@ -190,8 +195,10 @@ mod tests {
             storage.commit_index_create(slot);
             let captured = storage.index(slot);
             assert!(other.project_index_binding(captured, 0).is_none());
+            let selected_indexes = storage.indexes_for("public", "binding_source", 0);
             storage.commit_drop(table);
-            let replacement = storage.create_table(definition).unwrap();
+            let replacement = storage.create_table_in(definition, 9).unwrap();
+            storage.commit_create(replacement);
             assert_eq!(replacement, table);
             assert!(storage.index_visible_to(slot, 0).is_none());
             assert!(storage.index_table_slot(slot).is_none());
@@ -204,7 +211,115 @@ mod tests {
                 storage.indexes_for("public", "binding_source", 0).count(),
                 0
             );
+            storage
+                .create_index(index("replacement_index", "binding_source", 0, 1), 0)
+                .unwrap();
+            assert_eq!(selected_indexes.count(), 0);
+            assert_eq!(
+                storage.indexes_for("public", "binding_source", 0).count(),
+                1
+            );
         });
+    }
+
+    #[test]
+    fn private_index_bindings_revalidate_lifetime_and_shape_after_installation_waits() {
+        for replace in [false, true] {
+            let config = test_config();
+            let mut budget = test_budget(&config);
+            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let definition = make_def(
+                "binding_source",
+                &[
+                    ("key", ColType::Int4, false),
+                    ("payload", ColType::Int4, false),
+                ],
+            );
+            let table = storage.create_table(definition).unwrap();
+            storage
+                .create_table(make_def(
+                    "unrelated_source",
+                    &[
+                        ("key", ColType::Int4, false),
+                        ("payload", ColType::Int4, false),
+                    ],
+                ))
+                .unwrap();
+            let held = storage.tables[table].lifecycle();
+            let waits = storage
+                .type_publication
+                .waits
+                .load(core::sync::atomic::Ordering::Acquire);
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let storage = &storage;
+                let selected = scope.spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.create_index(index("selected_index", "binding_source", 0, 1), 7)
+                    })
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while storage
+                    .type_publication
+                    .waits
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    == waits
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                let waited = storage
+                    .type_publication
+                    .waits
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    > waits;
+                scope.spawn(move || {
+                    let result = crate::mem::guard::forbid_alloc(|| {
+                        storage.create_index(index("unrelated_index", "unrelated_source", 0, 1), 8)
+                    });
+                    send.send(result).unwrap();
+                });
+                let progress = receive.recv_timeout(std::time::Duration::from_secs(5));
+                if replace {
+                    storage.tables[table].definition.write().identity.created_at += 1;
+                } else {
+                    let mut mapping = [None; MAX_COLUMNS];
+                    mapping[0] = Some(SqlName::parse("key").unwrap());
+                    mapping[1] = Some(SqlName::parse("payload").unwrap());
+                    storage
+                        .pending_table_defs
+                        .stage(
+                            &storage.tables[table].definition,
+                            PendingTableDef {
+                                txid: 7,
+                                revision: 999,
+                                def: definition,
+                                transition: core::array::from_fn(|column| column as u16),
+                                column_mapping: mapping,
+                                rewrites_rows: false,
+                            },
+                            storage.max_catalog_versions_per_object,
+                        )
+                        .unwrap();
+                }
+                drop(held);
+                let selected = selected.join().unwrap();
+                assert!(
+                    waited,
+                    "index installation did not reach its selected lifecycle wait"
+                );
+                assert!(
+                    progress.is_ok(),
+                    "an unrelated index waited for the selected table"
+                );
+                assert!(progress.unwrap().is_ok());
+                assert_eq!(
+                    selected.unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                assert!(storage.index_slot("public", "selected_index", 7).is_none());
+            });
+        }
     }
 
     #[test]

@@ -44136,7 +44136,9 @@ impl Storage {
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         let slot = self
             .matching_indexes(|index| {
-                index.database == current_database() && index.visible_to(txid)
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.name_for(txid).as_str() == name
             })
             .find_map(|(slot, index)| {
                 let projected = self.project_index_binding(index, txid)?;
@@ -44189,7 +44191,9 @@ impl Storage {
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
         let index = self
             .matching_indexes(|index| {
-                index.database == current_database() && index.visible_to(txid)
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.name_for(txid).as_str() == name
             })
             .find_map(|(_, index)| {
                 let projected = self.project_index_binding(index, txid)?;
@@ -44543,7 +44547,22 @@ impl Storage {
                     def.table.as_str()
                 )
             })?;
-        let table_lifecycle = self.tables[table].lifecycle();
+        let selected_binding = self.capture_index_binding(table, txid);
+        let table_lifecycle = loop {
+            match row_ownership::try_mutex(
+                &self.tables[table].lifecycle,
+                "table lifecycle lock poisoned",
+            ) {
+                Ok(owner) => break owner,
+                Err(wait) => {
+                    #[cfg(test)]
+                    self.type_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                }
+            }
+        };
         let state = self.tables[table].definition.read();
         let selected_names = state
             .pending
@@ -44551,7 +44570,10 @@ impl Storage {
             .map_or((state.committed.schema, state.committed.name), |head| {
                 (head.schema, head.name)
             });
-        if !state.identity.existence.visible_to(txid) || selected_names != (def.schema, def.table) {
+        if !state.identity.existence.visible_to(txid)
+            || selected_names != (def.schema, def.table)
+            || !selected_binding.matches_selected(self, &state, txid)
+        {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "index source table changed before installation"
@@ -44564,7 +44586,7 @@ impl Storage {
         }
         drop(state);
         let _table_lifecycle = table_lifecycle;
-        def.table_binding = Some(self.capture_index_binding(table, txid));
+        def.table_binding = Some(selected_binding);
         if self
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
@@ -44997,10 +45019,19 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let selected = self.find_visible(schema, table, txid);
+        let selected = self.find_visible(schema, table, txid).map(|slot| {
+            let identity = self.tables[slot].identity();
+            self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(slot),
+                identity.database,
+                identity.created_at,
+            )
+        });
         self.matching_indexes(move |x| x.database == current_database() && x.visible_to(txid))
             .filter(move |(_, index)| {
-                selected.is_some_and(|table| self.index_binding_matches(*index, table))
+                index
+                    .table_binding
+                    .is_some_and(|binding| Some(binding.source) == selected)
             })
             .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }

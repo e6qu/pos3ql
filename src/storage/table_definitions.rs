@@ -427,6 +427,9 @@ impl DefinitionVersions {
         source_revision: u64,
         columns: &mut [u16],
     ) -> bool {
+        if self.selected_revision(state, transaction) == source_revision {
+            return true;
+        }
         let mut tail = state
             .pending
             .filter(|head| head.transaction == transaction)

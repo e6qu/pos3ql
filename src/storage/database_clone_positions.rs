@@ -49,7 +49,7 @@ impl<'bytes> DatabaseClonePositions<'bytes> {
             return None;
         }
         let mut previous = None;
-        for record in records.chunks_exact(Self::RECORD_BYTES) {
+        for record in records.as_chunks::<{ Self::RECORD_BYTES }>().0 {
             let kind = DatabaseCloneKind::decode(record[0])?;
             let position = CatalogPosition::decode(&record[1..])?;
             let key = (kind, position.slot());
@@ -67,7 +67,7 @@ impl<'bytes> DatabaseClonePositions<'bytes> {
         created_at: u64,
     ) -> Result<CatalogPosition, SqlError> {
         let mut matched = None;
-        for record in self.records.chunks_exact(Self::RECORD_BYTES) {
+        for record in self.records.as_chunks::<{ Self::RECORD_BYTES }>().0 {
             let position = CatalogPosition::decode(&record[1..]).expect("validated clone position");
             if record[0] == kind as u8
                 && position.created_at() == created_at

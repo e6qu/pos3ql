@@ -1501,7 +1501,7 @@ pub trait CatalogAccess {
     /// `obj_description`/`col_description`.
     fn comment<'a>(
         &self,
-        catalog_name: &str,
+        catalog_name: Option<&str>,
         oid: u32,
         subid: i32,
         arena: &'a Arena,

@@ -3900,7 +3900,7 @@ impl Checkpointer {
                     if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
-                    let name = rest_of(line, 11 + inheritance_count)?;
+                    let name = rest_of(line, 12 + inheritance_count)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,

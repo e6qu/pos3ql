@@ -2079,10 +2079,11 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Null)
             }
             "obj_description" => {
+                if !(1..=2).contains(&args.len()) || star {
+                    arity(1)?;
+                }
                 // obj_description(objoid [, catalog]): the object's comment.
-                // The optional catalog selects the object's catalog class. The
-                // deprecated one-argument form keeps the historical pg_class
-                // default used by clients.
+                // The one-argument form searches local descriptions across catalogs.
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -2092,13 +2093,16 @@ pub(crate) fn dispatch<'a>(
                 };
                 let catalog_name = if args.len() >= 2 {
                     match eval_full(args[1], arena, params, row, hooks)? {
-                        Datum::Text(name) => name,
+                        Datum::Text(name) => Some(name),
                         _ => return Ok(Datum::Null),
                     }
                 } else {
-                    "pg_class"
+                    None
                 };
-                if matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
+                if matches!(
+                    catalog_name,
+                    Some("pg_database" | "pg_tablespace" | "pg_authid")
+                ) {
                     return Ok(Datum::Null);
                 }
                 Ok(cat
@@ -2122,7 +2126,7 @@ pub(crate) fn dispatch<'a>(
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
-                    .comment("pg_class", oid, col, arena)?
+                    .comment(Some("pg_class"), oid, col, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2140,7 +2144,7 @@ pub(crate) fn dispatch<'a>(
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
-                    .comment(catalog_name, oid, 0, arena)?
+                    .comment(Some(catalog_name), oid, 0, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

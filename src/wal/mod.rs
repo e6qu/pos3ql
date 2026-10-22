@@ -5770,7 +5770,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             let mut ok = identity.created_at() == def.created_at
                 && buffer.append(&identity.encode())
-                && buffer.append(&def.ownership.owner.to_le_bytes())
+                && buffer.append(&def.ownership.committed().owner.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
                 && buffer.append(&[def.argument_count as u8]);
@@ -15843,6 +15843,10 @@ mod tests {
             body: crate::util::StackStr::from_str("SELECT 1"),
             creation_path: crate::util::StackStr::from_str("public"),
             ddl_state: crate::storage::CatalogDdlState::Present,
+            ownership: crate::storage::Ownership {
+                owner: 0,
+                pending: Some(crate::storage::PendingOwnership { txid: 7, owner: 42 }),
+            },
             ..crate::storage::RoutineDef::EMPTY
         };
         let operation = WalOp::CreateRoutine {
@@ -15861,6 +15865,8 @@ mod tests {
         .unwrap();
         assert!(append_payload(&mut payload, &operation));
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_some());
+        let (_, restored, _) = decode_routine_payload(payload.readable(), false).unwrap();
+        assert_eq!(restored.ownership.owner, 42);
         let last = payload.len() - 1;
         payload.filled_mut()[last] = 0xff;
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_none());

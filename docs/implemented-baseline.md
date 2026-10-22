@@ -802,6 +802,10 @@ with its pending name. Routine comments follow the function's identifier, so
 renaming one overload cannot rename another overload's comments. Dropping and
 recreating a table, sequence, routine or materialized view starts a new lifetime
 without inheriting the previous object's comment or permissions.
+For example, `obj_description('order_total()'::regprocedure, 'pg_proc')`
+reads a function comment. The one-argument form searches local object comments
+across catalogs; an unknown explicit catalog returns NULL. Shared account and
+database comments use `shobj_description`.
 
 ### Replacing views and refreshing saved results
 

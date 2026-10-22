@@ -8,6 +8,36 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_object_descriptions_select_the_actual_catalog() {
+    let mut config = test_config("metadata-object-descriptions");
+    config.max_ddl_per_transaction = 16;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/09_metadata_object_descriptions.sql"
+            ),
+            true
+        )),
+        ["function|function", "table|table", "t", "type|type"]
+    );
+    for statement in [
+        "SELECT obj_description()",
+        "SELECT obj_description(1, 'pg_class', 0)",
+        "SELECT obj_description(*)",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, statement, true)),
+            ["42883"],
+            "{statement}"
+        );
+    }
+}
+
+#[test]
 fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollback() {
     fn positions(engine: &Engine) -> Vec<u8> {
         let mut budget = Budget::new(4096);
@@ -43378,7 +43408,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut config = test_config("sequence_journal_retry");
     // Reserve the durable transaction marker as well as the CREATE record;
     // this remains too small for the later absolute sequence retry record.
-    config.wal_bytes = 192;
+    config.wal_bytes = 192 + crate::storage::CatalogPosition::ENCODED_BYTES;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");

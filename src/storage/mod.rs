@@ -56909,7 +56909,7 @@ mod tests {
                 .lock_table(capacity as u32 + 1, 0, TableLockMode::AccessShare, false)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(error.message.as_str().contains("table-lock registry"));
+            assert!(error.message.as_str().contains("object-lock registry"));
             assert_eq!(storage.lock_state().table.len(), capacity);
             storage.release_object_locks(1);
             storage

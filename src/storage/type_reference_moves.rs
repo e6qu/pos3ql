@@ -1951,6 +1951,14 @@ mod tests {
                         Some(oids[index])
                     );
                 }
+                assert_eq!(
+                    storage
+                        .write_table_def(table, 9, captured, &mapping("id"), false)
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT
+                );
+                captured.name = SqlName::parse("late_edit").unwrap();
                 storage
                     .write_table_def(table, 9, captured, &mapping("id"), false)
                     .unwrap();

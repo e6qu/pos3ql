@@ -40,8 +40,11 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Verify native debugger
-        run: gdb --version
+      - name: Install native debugger
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gdb
+          gdb --version
       - name: Python environment
         uses: ./.github/actions/python-test-environment
       - name: Expose PostgreSQL 18 client

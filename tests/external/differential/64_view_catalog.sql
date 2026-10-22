@@ -1,5 +1,7 @@
 -- View metadata must derive from the same transactional identities that drive
 -- execution, dependency checks, WAL recovery, and client-tool catalog reads.
+DROP VIEW IF EXISTS view_replacement_identity;
+DROP TABLE IF EXISTS view_replacement_identifiers;
 DROP VIEW IF EXISTS view_catalog_joined;
 DROP VIEW IF EXISTS view_catalog_predicate;
 DROP VIEW IF EXISTS view_catalog_simple;
@@ -93,6 +95,107 @@ SELECT d.deptype, c.relname
    AND d.objid = (SELECT oid FROM pg_rewrite
                   WHERE ev_class = 'view_catalog_simple'::regclass)
  ORDER BY d.deptype, c.relname;
+
+CREATE VIEW view_replacement_identity AS SELECT 1 AS value;
+CREATE TABLE view_replacement_identifiers AS
+  SELECT relation.oid AS relation_oid, relation.reltype AS type_oid,
+         row_type.typarray AS array_oid, rewrite.oid AS rule_oid,
+         relation.relowner AS owner_oid
+    FROM pg_class relation
+    JOIN pg_type row_type ON row_type.oid = relation.reltype
+    JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
+   WHERE relation.relname = 'view_replacement_identity'
+     AND rewrite.rulename = '_RETURN';
+BEGIN;
+CREATE OR REPLACE VIEW view_replacement_identity AS SELECT 2 AS value;
+SELECT relation.oid = saved.relation_oid, relation.reltype = saved.type_oid,
+       row_type.typarray = saved.array_oid, rewrite.oid = saved.rule_oid,
+       relation.relowner = saved.owner_oid
+  FROM view_replacement_identifiers saved
+  JOIN pg_class relation ON relation.relname = 'view_replacement_identity'
+  JOIN pg_type row_type ON row_type.oid = relation.reltype
+  JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
+ WHERE rewrite.rulename = '_RETURN';
+SAVEPOINT before_replacement;
+CREATE OR REPLACE VIEW view_replacement_identity AS SELECT 3 AS value;
+SELECT value FROM view_replacement_identity;
+ROLLBACK TO before_replacement;
+SELECT value FROM view_replacement_identity;
+ROLLBACK;
+SELECT value FROM view_replacement_identity;
+SELECT relation.oid = saved.relation_oid, relation.reltype = saved.type_oid,
+       row_type.typarray = saved.array_oid, rewrite.oid = saved.rule_oid
+  FROM view_replacement_identifiers saved
+  JOIN pg_class relation ON relation.relname = 'view_replacement_identity'
+  JOIN pg_type row_type ON row_type.oid = relation.reltype
+  JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
+ WHERE rewrite.rulename = '_RETURN';
+COMMENT ON VIEW view_replacement_identity IS 'original view comment';
+BEGIN;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 4 AS value;
+SELECT obj_description('view_replacement_identity'::regclass) IS NULL;
+COMMENT ON VIEW view_replacement_identity IS 'new view comment';
+COMMIT;
+SELECT obj_description('view_replacement_identity'::regclass);
+BEGIN;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 5 AS value;
+COMMENT ON VIEW view_replacement_identity IS 'second lifetime';
+SAVEPOINT before_second_drop;
+DROP VIEW view_replacement_identity;
+CREATE VIEW view_replacement_identity AS SELECT 6 AS value;
+SELECT obj_description('view_replacement_identity'::regclass) IS NULL;
+COMMENT ON VIEW view_replacement_identity IS 'third lifetime';
+ROLLBACK TO before_second_drop;
+SELECT value, obj_description('view_replacement_identity'::regclass)
+  FROM view_replacement_identity;
+ROLLBACK;
+SELECT value, obj_description('view_replacement_identity'::regclass)
+  FROM view_replacement_identity;
+CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+CREATE RULE retained_enabled_rule AS ON INSERT TO view_catalog_source DO INSTEAD NOTHING;
+ALTER TABLE view_catalog_source DISABLE RULE retained_enabled_rule;
+CREATE OR REPLACE RULE retained_enabled_rule AS ON INSERT TO view_catalog_source DO INSTEAD NOTHING;
+SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'retained_enabled_rule';
+DROP RULE retained_enabled_rule ON view_catalog_source;
+COMMENT ON RULE remembered_view_rule ON view_replacement_identity IS 'original rule comment';
+ALTER RULE remembered_view_rule ON view_replacement_identity RENAME TO remembered_view_rule;
+ALTER RULE "_RETURN" ON view_replacement_identity RENAME TO renamed_return;
+CREATE ROLE denied_view_mode;
+GRANT USAGE ON SCHEMA public TO denied_view_mode;
+SET ROLE denied_view_mode;
+ALTER TABLE view_replacement_identity DISABLE RULE remembered_view_rule;
+ALTER TABLE view_replacement_identity DISABLE TRIGGER ALL;
+RESET ROLE;
+DROP OWNED BY denied_view_mode;
+DROP ROLE denied_view_mode;
+ALTER TABLE view_replacement_identity DISABLE TRIGGER ALL;
+BEGIN;
+ALTER TABLE view_replacement_identity DISABLE RULE remembered_view_rule;
+CREATE OR REPLACE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+SELECT ev_enabled, obj_description(oid, 'pg_rewrite') FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
+ROLLBACK;
+BEGIN;
+DROP RULE remembered_view_rule ON view_replacement_identity;
+CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+SELECT obj_description(oid, 'pg_rewrite') IS NULL FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
+COMMENT ON RULE remembered_view_rule ON view_replacement_identity IS 'new rule comment';
+COMMIT;
+SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite
+ WHERE rulename = 'remembered_view_rule';
+BEGIN;
+DROP RULE remembered_view_rule ON view_replacement_identity;
+SAVEPOINT before_view_drop;
+DROP VIEW view_replacement_identity;
+ROLLBACK TO before_view_drop;
+SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_view_rule';
+ROLLBACK;
+SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_view_rule';
+DROP VIEW view_replacement_identity;
+DROP TABLE view_replacement_identifiers;
 
 DROP VIEW view_catalog_joined;
 DROP VIEW view_catalog_predicate;

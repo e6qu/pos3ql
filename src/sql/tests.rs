@@ -8,6 +8,363 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn view_replacement_preserves_identity_without_spare_catalog_slots() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("view-replacement-identity-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_views = 1;
+        config.max_rules = 1;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE VIEW retained_view AS SELECT 1 AS value",
+            true,
+        );
+        let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, \
+                            rewrite.oid, relation.relowner \
+                            FROM pg_class relation \
+                            JOIN pg_type row_type ON row_type.oid = relation.reltype \
+                            JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid \
+                            WHERE relation.relname = 'retained_view' \
+                              AND rewrite.rulename = '_RETURN'";
+        let original = data_rows(&session.success(&mut engine, identity_sql, true));
+        assert_eq!(original.len(), 1);
+        for value in 2..=4 {
+            session.success(
+                &mut engine,
+                &format!("CREATE OR REPLACE VIEW retained_view AS SELECT {value} AS value"),
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, identity_sql, true)),
+                original
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+                [value.to_string()]
+            );
+        }
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_replace; CREATE OR REPLACE VIEW retained_view AS SELECT 5 AS value; ROLLBACK TO before_replace", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+            ["4"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, identity_sql, true)),
+            original
+        );
+        session.success(
+            &mut engine,
+            "CREATE OR REPLACE VIEW retained_view AS SELECT 6 AS value; ROLLBACK",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM retained_view", true)),
+            ["4"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, identity_sql, true)),
+            original
+        );
+        session.success(&mut engine, "DROP VIEW retained_view; BEGIN; CREATE VIEW discarded_view AS SELECT 1 AS value; DROP VIEW discarded_view; COMMIT; CREATE VIEW final_view AS SELECT 1 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM final_view", true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
+fn materialized_view_population_follows_transaction_and_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("materialized-population-rollback-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE TABLE population_source(value integer); INSERT INTO population_source VALUES (1); CREATE MATERIALIZED VIEW population_view AS SELECT value FROM population_source WITH NO DATA", true);
+        let population_sql =
+            "SELECT relispopulated FROM pg_class WHERE relname = 'population_view'";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, population_sql, true)),
+            ["f"]
+        );
+        let unreadable = session.execute(&mut engine, "SELECT count(*) FROM population_view", true);
+        assert!(
+            String::from_utf8_lossy(&unreadable).contains("C55000\0"),
+            "{}",
+            String::from_utf8_lossy(&unreadable)
+        );
+        for rollback in ["ROLLBACK TO before_refresh", "ROLLBACK"] {
+            session.success(
+                &mut engine,
+                "BEGIN; SAVEPOINT before_refresh; REFRESH MATERIALIZED VIEW population_view",
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, population_sql, true)),
+                ["t"]
+            );
+            session.success(&mut engine, rollback, true);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, population_sql, true)),
+                ["f"]
+            );
+            if rollback.starts_with("ROLLBACK TO") {
+                session.success(&mut engine, "COMMIT", true);
+            }
+        }
+        session.success(
+            &mut engine,
+            "REFRESH MATERIALIZED VIEW population_view",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, population_sql, true)),
+            ["t"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM population_view", true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
+fn materialized_view_recreation_keeps_comments_with_their_original_object() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("materialized-comment-reuse-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let comment = "SELECT obj_description('commented_matview'::regclass)";
+        session.success(&mut engine, "CREATE MATERIALIZED VIEW commented_matview AS SELECT 1 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'original'; BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 2 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT obj_description('commented_matview'::regclass) IS NULL",
+                true
+            )),
+            ["t"]
+        );
+        session.success(&mut engine, "COMMENT ON MATERIALIZED VIEW commented_matview IS 'replacement'; SAVEPOINT retained; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 3 AS value", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT obj_description('commented_matview'::regclass) IS NULL",
+                true
+            )),
+            ["t"]
+        );
+        session.success(
+            &mut engine,
+            "COMMENT ON MATERIALIZED VIEW commented_matview IS 'discarded'; ROLLBACK TO retained",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        session.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        session.success(&mut engine, "BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 4 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'rolled back'; ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, comment, true)),
+            ["replacement"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT value FROM commented_matview", true)),
+            ["2"]
+        );
+    }
+}
+
+#[test]
+fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recovery() {
+    for checkpoint in [false, true] {
+        for decision in ["COMMIT", "COMMIT PREPARED", "ROLLBACK PREPARED"] {
+            let name = format!("query-lifecycle-cold-{checkpoint}-{decision}");
+            let mut config = test_config(&name);
+            config.max_prepared_transactions = 1;
+            config.max_ddl_per_transaction = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            // Simulator uploads grow fixture vectors. Guard transactional edits
+            // and direct reads; commit, prepare and view materialization upload blocks.
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine, "CREATE TABLE lifecycle_base(value integer); INSERT INTO lifecycle_base VALUES (7); CREATE VIEW lifecycle_view AS SELECT 1 AS value; CREATE VIEW lifecycle_dependent AS SELECT value FROM lifecycle_view; COMMENT ON VIEW lifecycle_view IS 'retained comment'; CREATE MATERIALIZED VIEW lifecycle_mat AS SELECT value FROM lifecycle_base WITH NO DATA", false);
+            let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid, relation.relowner FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'lifecycle_view' AND rewrite.rulename = '_RETURN'";
+            let identity = data_rows(&session.success(&mut engine, identity_sql, true));
+            assert_eq!(identity.len(), 1);
+            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_base DO INSTEAD NOTHING; ALTER TABLE lifecycle_base DISABLE RULE lifecycle_rule; CREATE OR REPLACE RULE lifecycle_rule AS ON INSERT TO lifecycle_base DO INSTEAD NOTHING", true);
+            if decision == "COMMIT" {
+                session.success(&mut engine, "COMMIT", false);
+            } else {
+                session.success(&mut engine, "PREPARE TRANSACTION 'query-lifecycle'", false);
+            }
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            if decision != "COMMIT" {
+                assert_eq!(
+                    data_rows(&cold_session.success(
+                        &mut cold,
+                        "SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'query-lifecycle'",
+                        true
+                    )),
+                    ["1"]
+                );
+                cold_session.success(&mut cold, &format!("{decision} 'query-lifecycle'"), false);
+            }
+            let committed = decision != "ROLLBACK PREPARED";
+            assert_eq!(
+                data_rows(&cold_session.success(&mut cold, identity_sql, true)),
+                identity
+            );
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT value FROM lifecycle_view; SELECT value FROM lifecycle_dependent; SELECT obj_description('lifecycle_view'::regclass)", false)), if committed { vec!["2", "2", "retained comment"] } else { vec!["1", "1", "retained comment"] });
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT relispopulated FROM pg_class WHERE relname = 'lifecycle_mat'; SELECT ispopulated FROM pg_matviews WHERE matviewname = 'lifecycle_mat'; SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_rule'; SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'lifecycle_rule'", true)), if committed { vec!["t", "t", "1", "D"] } else { vec!["f", "f", "0"] });
+            if committed {
+                assert_eq!(
+                    data_rows(&cold_session.success(
+                        &mut cold,
+                        "SELECT value FROM lifecycle_mat",
+                        true
+                    )),
+                    ["7"]
+                );
+            } else {
+                let error =
+                    cold_session.execute(&mut cold, "SELECT count(*) FROM lifecycle_mat", true);
+                assert!(String::from_utf8_lossy(&error).contains("C55000\0"));
+            }
+            assert_eq!(
+                data_rows(&cold_session.success(
+                    &mut cold,
+                    "SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'query-lifecycle'",
+                    true
+                )),
+                ["0"]
+            );
+            drop(cold_session);
+            drop(cold);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn query_lifecycle_recovery_keeps_view_slots_left_between_rolled_back_creations() {
+    for checkpoint in [false, true] {
+        let mut config = test_config(&format!("view-catalog-gap-{checkpoint}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket =
+            format!("view-catalog-gap-{checkpoint}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut first =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut second =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        first.success(
+            &mut engine,
+            "BEGIN; CREATE VIEW rolled_back_view AS SELECT 1 AS value",
+            true,
+        );
+        second.success(
+            &mut engine,
+            "CREATE VIEW retained_gap_view AS SELECT 2 AS value",
+            false,
+        );
+        first.success(&mut engine, "ROLLBACK", false);
+        let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'retained_gap_view' AND rewrite.rulename = '_RETURN'";
+        let original = data_rows(&second.success(&mut engine, identity_sql, true));
+        assert_eq!(original.len(), 1);
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(first);
+        drop(second);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(
+            data_rows(&session.success(&mut cold, identity_sql, true)),
+            original,
+            "checkpoint={checkpoint}"
+        );
+        drop(session);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn query_lifecycle_parent_rollback_preserves_earlier_rule_deletion() {
+    for (kind, creation) in [
+        ("TABLE", "CREATE TABLE rule_parent(id integer)"),
+        ("VIEW", "CREATE VIEW rule_parent AS SELECT 1 AS id"),
+    ] {
+        let mut config = test_config(&format!("rule-parent-rollback-{kind}"));
+        config.transaction_mode = crate::config::TransactionMode::Mvcc;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, creation, true);
+        session.success(&mut engine, "CREATE RULE remembered_rule AS ON INSERT TO rule_parent DO INSTEAD NOTHING; BEGIN; DROP RULE remembered_rule ON rule_parent; SAVEPOINT before_parent_drop", true);
+        session.success(
+            &mut engine,
+            &format!("DROP {kind} rule_parent; ROLLBACK TO before_parent_drop"),
+            true,
+        );
+        let rule_count = "SELECT count(*) FROM pg_rewrite WHERE rulename = 'remembered_rule'";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, rule_count, true)),
+            ["0"]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, rule_count, true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
 fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     let mut config = test_config("retained-row-walk-sst");
     config.object_store_on = true;
@@ -418,7 +775,7 @@ fn shared_log_positions_catalog_exhaustion_preserves_compound_view_creation_and_
             "CREATE VIEW catalog_position_rejected_view AS SELECT 2 AS id",
         ),
         (
-            1,
+            0,
             "CREATE OR REPLACE VIEW catalog_position_view AS SELECT 2 AS id",
         ),
         (
@@ -2743,7 +3100,7 @@ fn regcollation_values_and_dependencies_survive_object_cold_recovery() {
         .views_visible_to(0)
         .find_map(|(slot, view)| (view.name.as_str() == "durable_collation_view").then_some(slot))
         .unwrap();
-    let dependency = engine.storage.view_dependencies(view_slot).entries()[0];
+    let dependency = engine.storage.view_dependencies(view_slot, 0).entries()[0];
     assert_eq!(dependency.schema.as_str(), "durable_collations");
     assert_eq!(dependency.name.as_str(), "byte_order_v2");
     engine.commit_wal().unwrap();
@@ -7492,7 +7849,7 @@ fn rewrite_rule_lifecycle_catalogs_and_transactionality() {
 }
 
 #[test]
-fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
+fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
@@ -7517,7 +7874,6 @@ fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
          INSERT INTO rule_mode_source VALUES (5); \
          SELECT id FROM rule_mode_audit ORDER BY id; \
          CREATE VIEW rule_mode_view AS SELECT id FROM rule_mode_source; \
-         ALTER TABLE rule_mode_view DISABLE RULE \"_RETURN\"; \
          SELECT ev_enabled FROM pg_rewrite WHERE rulename = '_RETURN' \
            AND ev_class = 'rule_mode_view'::regclass; \
          SELECT id FROM rule_mode_view WHERE id = 5",
@@ -7526,8 +7882,19 @@ fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["D", "R", "A", "3", "4", "3", "4", "5", "D", "5"],
+        ["D", "R", "A", "3", "4", "3", "4", "5", "O", "5"],
         "{text}"
+    );
+
+    let view = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE rule_mode_view DISABLE RULE \"_RETURN\"",
+    );
+    assert!(
+        String::from_utf8_lossy(&view).contains("C42809\0"),
+        "{}",
+        String::from_utf8_lossy(&view)
     );
 
     let missing = run_with(
@@ -7540,6 +7907,140 @@ fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
         "{}",
         String::from_utf8_lossy(&missing)
     );
+}
+
+#[test]
+fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("view-rule-rejection-lock-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        reader.success(
+            &mut engine,
+            "CREATE VIEW locked_rule_view AS SELECT 1 AS value; \
+             CREATE TABLE locked_mode_table(value integer); \
+             INSERT INTO locked_mode_table VALUES (1); \
+             CREATE FUNCTION locked_mode_trigger() RETURNS trigger LANGUAGE plpgsql \
+               AS 'BEGIN RETURN NEW; END'; \
+             CREATE TRIGGER locked_mode_trigger BEFORE INSERT ON locked_mode_table \
+               FOR EACH ROW EXECUTE FUNCTION locked_mode_trigger(); \
+             CREATE MATERIALIZED VIEW locked_mode_mat AS SELECT 1 AS value WITH NO DATA; \
+             CREATE FOREIGN DATA WRAPPER locked_mode_fdw NO HANDLER NO VALIDATOR; \
+             CREATE SERVER locked_mode_server FOREIGN DATA WRAPPER locked_mode_fdw; \
+             CREATE FOREIGN TABLE locked_mode_foreign(value integer) SERVER locked_mode_server; \
+             CREATE ROLE denied_view_mode; \
+             GRANT USAGE ON SCHEMA public TO denied_view_mode; \
+             BEGIN; SELECT value FROM locked_rule_view; \
+             SELECT value FROM locked_mode_table FOR UPDATE",
+            true,
+        );
+        writer.success(
+            &mut engine,
+            "SET lock_timeout = '1ms'; SET ROLE denied_view_mode",
+            true,
+        );
+        let commands = [
+            "ALTER TABLE locked_rule_view DISABLE RULE \"_RETURN\"",
+            "ALTER TABLE locked_rule_view DISABLE TRIGGER missing_trigger",
+        ];
+        for command in commands.into_iter().chain([
+            "ALTER TABLE locked_mode_table DISABLE RULE missing_rule",
+            "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE RULE missing_rule",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE TRIGGER missing_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign ALTER COLUMN value SET STATISTICS 1",
+        ]) {
+            let denied = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&denied).contains("C42501\0"),
+                "{}",
+                String::from_utf8_lossy(&denied)
+            );
+        }
+        writer.success(&mut engine, "RESET ROLE", true);
+        let table_command = "ALTER TABLE locked_mode_table DISABLE TRIGGER locked_mode_trigger";
+        let locking = mode == crate::config::TransactionMode::Locking;
+        for (command, waits, completion) in [
+            (commands[0], true, "C42809\0"),
+            (commands[1], locking, "C42809\0"),
+            (table_command, locking, "ALTER TABLE"),
+        ] {
+            let initial = writer.execute(&mut engine, command, true);
+            if waits {
+                assert!(initial.is_empty(), "{mode:?}: {command}: {initial:?}");
+                // Deliver the scheduler's timeout notification to the parked command.
+                let completed = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        command,
+                        0,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &mut writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        true,
+                    )
+                })
+                .unwrap();
+                assert_eq!(completed, ExecutionStatus::Complete);
+                assert!(
+                    String::from_utf8_lossy(writer.send.readable()).contains("C55P03\0"),
+                    "{mode:?}: {command}: {:?}",
+                    writer.send.readable()
+                );
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&initial).contains(completion),
+                    "{mode:?}: {command}: {initial:?}"
+                );
+            }
+        }
+        reader.success(&mut engine, "ROLLBACK", true);
+        let changed = writer.success(&mut engine, table_command, true);
+        assert!(String::from_utf8_lossy(&changed).contains("ALTER TABLE"));
+        for command in [
+            "ALTER TABLE locked_mode_mat DISABLE RULE missing_rule",
+            "ALTER TABLE locked_mode_mat DISABLE TRIGGER missing_trigger",
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE RULE missing_rule",
+        ] {
+            let rejected = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&rejected).contains("C42809\0"),
+                "{mode:?}: {command}: {rejected:?}"
+            );
+        }
+        let missing = writer.execute(
+            &mut engine,
+            "ALTER FOREIGN TABLE locked_mode_foreign DISABLE TRIGGER missing_trigger",
+            true,
+        );
+        assert!(
+            String::from_utf8_lossy(&missing).contains("C42704\0"),
+            "{mode:?}: {missing:?}"
+        );
+        for command in commands {
+            let rejected = writer.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&rejected).contains("C42809\0"),
+                "{}",
+                String::from_utf8_lossy(&rejected)
+            );
+        }
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, "SELECT ev_enabled FROM pg_rewrite WHERE ev_class = 'locked_rule_view'::regclass AND rulename = '_RETURN'", true)),
+            ["O"]
+        );
+    }
 }
 
 #[test]
@@ -12035,25 +12536,30 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
          CREATE RULE recovered_view_rule AS ON DELETE TO recovered_view DO ALSO NOTHING; \
          COMMENT ON TRIGGER recovered_view_trigger ON recovered_view IS 'recovered trigger'; \
          COMMENT ON RULE recovered_view_rule ON recovered_view IS 'recovered rule'; \
-         CREATE OR REPLACE VIEW recovered_view AS SELECT id, value FROM recovered_view_base; \
-         ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger;",
+         CREATE OR REPLACE VIEW recovered_view AS SELECT id, value FROM recovered_view_base;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
     let mut restarted_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
-    let disabled = run_with(
+    let rejected = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "INSERT INTO recovered_view VALUES (7, 70)",
+        "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger",
     );
-    assert!(String::from_utf8_lossy(&disabled).contains("55000"));
+    assert!(String::from_utf8_lossy(&rejected).contains("C42809\0"));
     let recovered = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
+        "SELECT tgenabled FROM pg_trigger WHERE tgname = 'recovered_view_trigger'; \
              SELECT obj_description(oid, 'pg_trigger') FROM pg_trigger \
                WHERE tgname = 'recovered_view_trigger'; \
              SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
@@ -12069,7 +12575,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     );
     assert_eq!(
         data_rows(&recovered),
-        ["recovered trigger", "recovered rule", "7|77", "7", "0"],
+        ["O", "recovered trigger", "recovered rule", "7|77", "7", "0"],
         "{}",
         String::from_utf8_lossy(&recovered)
     );
@@ -67454,7 +67960,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67466,7 +67972,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67478,7 +67984,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_search_view)
+            .view_dependencies(cloned_search_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -67507,7 +68013,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     assert!(
         engine
             .storage
-            .view_dependencies(cloned_view)
+            .view_dependencies(cloned_view, 0)
             .entries()
             .iter()
             .any(|dependency| {
@@ -76932,7 +77438,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v19\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v20\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -76962,7 +77468,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v14",
         "pos3ql-manifest-v15",
         "pos3ql-manifest-v18",
-        "pos3ql-manifest-v20",
+        "pos3ql-manifest-v19",
+        "pos3ql-manifest-v21",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -77120,7 +77627,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v19\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v20\n"))
     );
     drop(recovered);
 
@@ -86532,7 +87039,10 @@ fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_r
     let mut published = false;
     for _ in 0..64 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         match engine.checkpoint_beat() {
             CheckpointBeat::Advanced => {}
@@ -86649,7 +87159,10 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let mut failed = false;
     for _ in 0..64 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         match engine.checkpoint_beat() {
             CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
@@ -88199,7 +88712,10 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
             // The simulator allocates its remote object fixtures; production
             // upload ownership is covered separately under the allocation guard.
             if engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap()
             {
                 return;
@@ -89487,7 +90003,10 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
         let mut completed = false;
         for _ in 0..128 {
             engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap();
             let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
                 crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
@@ -89601,7 +90120,10 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
         let mut completed = false;
         for _ in 0..128 {
             engine
-                .advance_wal_publication(std::time::Instant::now())
+                .advance_wal_publication(
+                    std::time::Instant::now(),
+                    crate::sql::CommitProgressMode::Reactor,
+                )
                 .unwrap();
             let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
                 crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
@@ -89918,7 +90440,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             break;
         }
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
     }
@@ -89945,7 +90470,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     let mut published = false;
     for _ in 0..128 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         if engine.checkpoint_beat() == CheckpointBeat::Durable {
             published = true;
@@ -89973,7 +90501,10 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     let mut finished = false;
     for _ in 0..512 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
         if engine
@@ -90050,7 +90581,10 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     let mut saved = false;
     for _ in 0..128 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         if engine.checkpoint_beat() == CheckpointBeat::Durable {
             saved = true;
@@ -90137,7 +90671,10 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     let mut completed = false;
     for _ in 0..256 {
         engine
-            .advance_wal_publication(std::time::Instant::now())
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
             .unwrap();
         assert!(!engine.checkpoint_beat().failed());
         if engine

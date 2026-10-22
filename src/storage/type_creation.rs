@@ -50,6 +50,11 @@ mod tests {
 
     #[test]
     fn shared_type_creation_excludes_racing_table_and_view_names() {
+        #[derive(Debug)]
+        enum RowCreation {
+            Table(usize),
+            View(super::super::QueryDdlUndo),
+        }
         for kind in KINDS {
             for view in [false, true] {
                 let storage = fixture(TransactionMode::Mvcc);
@@ -75,15 +80,24 @@ mod tests {
                                         false,
                                         9,
                                     )
-                                    .map(|(slot, replaced)| {
-                                        assert!(replaced.is_none());
-                                        slot
+                                    .map(|publication| match publication {
+                                        super::super::ViewPublication::Created(undo) => {
+                                            RowCreation::View(undo)
+                                        }
+                                        super::super::ViewPublication::Altered(_) => {
+                                            panic!("creation replaced a view")
+                                        }
                                     })
                             } else {
-                                storage.create_table_in(
-                                    make_def("racing_row_name", &[("id", ColType::Int4, false)]),
-                                    9,
-                                )
+                                storage
+                                    .create_table_in(
+                                        make_def(
+                                            "racing_row_name",
+                                            &[("id", ColType::Int4, false)],
+                                        ),
+                                        9,
+                                    )
+                                    .map(RowCreation::Table)
                             }
                         })
                     });
@@ -94,12 +108,14 @@ mod tests {
                         assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
                         storage.finish_type_ddl(created, TypeDdlDecision::Rollback);
                     }
-                    (Err(error), Ok(slot)) => {
+                    (Err(error), Ok(row)) => {
                         assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
-                        if view {
-                            storage.rollback_view_create(slot);
-                        } else {
-                            storage.rollback_create(slot);
+                        match row {
+                            RowCreation::View(undo) => storage.finish_view_publication(
+                                super::super::ViewPublication::Created(undo),
+                                super::super::QueryDdlDecision::Rollback,
+                            ),
+                            RowCreation::Table(slot) => storage.rollback_create(slot),
                         }
                     }
                     outcomes => panic!(

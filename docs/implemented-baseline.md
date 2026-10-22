@@ -774,6 +774,52 @@ A read and an update of an existing order can progress while table creation
 waits for its reservation guard; this storage-level test does not enable
 parallel SQL execution.
 
+### Replacing views and refreshing saved results
+
+`CREATE OR REPLACE VIEW` changes the query in place. The view, its row type,
+array type and internal `_RETURN` rule keep their object identifiers. Owners,
+permissions, comments and dependent views stay attached. Replacement works when
+`max_views` and `max_rules` are already full; its pending definition and saved
+dependencies still need their configured startup reservations.
+
+```sql
+CREATE VIEW report AS SELECT 1 AS total;
+BEGIN;
+CREATE OR REPLACE VIEW report AS SELECT 2 AS total;
+SELECT total FROM report; -- 2
+ROLLBACK;
+SELECT total FROM report; -- 1
+```
+
+View and rule edits retain the selected object and revision through waits and
+undo. A stale edit cannot modify a replacement in the same catalog slot. Dropping
+and recreating a name starts with no comment; rollback restores the old object's
+comment. This also applies to materialized views. Savepoints preserve this
+distinction through repeated reuse.
+
+A materialized view stores query results. `WITH NO DATA` leaves it unreadable:
+ordinary reads return `55000`, including `LIMIT 0`. A constant-false `WHERE`
+removes the scan and returns no rows. Direct `COPY` returns `0A000` instead.
+`REFRESH MATERIALIZED VIEW` requires `MAINTAIN`, runs its saved query as the
+view's owner, and retains its exclusive relation lock until transaction end.
+The caller's account is restored after success or failure.
+
+```sql
+CREATE MATERIALIZED VIEW totals AS SELECT 7 AS total WITH NO DATA;
+BEGIN;
+REFRESH MATERIALIZED VIEW totals;
+SELECT total FROM totals; -- 7
+ROLLBACK;
+SELECT total FROM totals; -- 55000: the refresh was rolled back
+```
+
+`pg_class.relispopulated`, `pg_matviews.ispopulated` and readable rows follow
+transaction and savepoint rollback together. Journal and checkpoint recovery
+preserve view, row-type, array-type and internal rule identifiers, including
+gaps left by rolled-back creation. Tests delete the entire local data directory
+before reopening from object storage; committed refresh results and prepared
+commit or rollback decisions retain the corresponding readable state.
+
 ### Changing rewrite rules
 
 A rewrite rule changes what a command does before it runs. For example, a rule
@@ -792,6 +838,19 @@ through `pg_rewrite`.
 After a view is renamed inside a transaction, rule listings use its new name.
 View changes and removal use those names too. The same names are recorded for
 restart; rollback restores the old names.
+Replacing a rule preserves its enable mode. Rule renames reject an already used
+name, including the rule's current name; the internal `_RETURN` rule cannot be
+renamed.
+Enable-mode commands for rules and triggers use `ALTER TABLE` on a table;
+applying them to a view returns `42809` as in PostgreSQL. Ownership is checked
+first (`42501` for a non-owner). A rule-mode command then waits for existing
+readers and can hit its configured lock timeout (`55P03`) before the type check.
+With MVCC enabled, a trigger-mode command takes a lock compatible with ordinary
+readers and row locks from `SELECT ... FOR UPDATE`. Those readers do not delay
+its `42809` rejection on a view or a valid trigger-mode change on a table.
+Locking mode deliberately takes stronger locks; conflicting commands wait
+until the reader finishes. Materialized views reject both rule and trigger
+enable-mode commands with `42809`.
 
 Tables, views and accounts have distinct lock identities. Account locks use
 durable identifiers, so they do not transfer to a reused catalog position.
@@ -1209,8 +1268,8 @@ Image counters and controls are charged at startup. Exhaustion returns 54000,
 "enum member-image pool is exhausted", without changing the published
 definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
-different image when readers retain the old one. Type creation and some engine
-metadata preparation still require exclusive access.
+different image when readers retain the old one. Named-type creation uses shared
+storage access; some engine metadata preparation still requires exclusive access.
 
 Transaction-wide catalog coordination, remaining table rewrites and SQL execution
 workers remain open.

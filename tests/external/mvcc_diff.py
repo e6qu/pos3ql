@@ -989,6 +989,7 @@ def rule_publication_transcript(reader, writer) -> list[str]:
         results.append(f"rule_view_rewrite_catalog={all_rules}")
         reader.execute("BEGIN")
         reader.execute("SELECT * FROM rule_publication_view_diff")
+        reader.execute("SELECT id FROM rule_publication_diff FOR UPDATE")
         view_locks = reader.execute("SELECT mode, database=(SELECT oid FROM pg_database WHERE datname=current_database()) FROM pg_locks WHERE pid=pg_backend_pid() AND relation='rule_publication_view_diff'::regclass ORDER BY mode").fetchall()
         results.append(f"rule_view_lock_identity={view_locks}")
         for label, statement in [
@@ -996,9 +997,14 @@ def rule_publication_transcript(reader, writer) -> list[str]:
             ("rename", "ALTER VIEW rule_publication_view_diff RENAME TO renamed_view"),
             ("drop", "DROP VIEW rule_publication_view_diff"),
             ("disable-rule", "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"),
+            ("disable-trigger", "ALTER TABLE rule_publication_view_diff DISABLE TRIGGER missing_trigger"),
+            ("table-trigger-mode", "ALTER TABLE rule_publication_diff DISABLE TRIGGER missing_trigger"),
         ]:
             results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
         reader.execute("ROLLBACK")
+        results.append("view_after_reader_disable-rule=" + str(sqlstate(
+            writer, "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"
+        )))
         writer.execute("BEGIN")
         writer.execute("ALTER VIEW rule_publication_view_diff RENAME TO rule_publication_renamed_diff")
         renamed_rules = writer.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename IN ('rule_publication_view_diff','rule_publication_renamed_diff') ORDER BY tablename,rulename").fetchall()

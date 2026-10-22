@@ -18,6 +18,8 @@ DROP VIEW catalog_view;
 -- A materialized view captures the query's rows at creation time.
 CREATE MATERIALIZED VIEW mv AS SELECT id, v * 2 AS dbl FROM base WHERE v > 15;
 SELECT * FROM mv ORDER BY id;
+ALTER TABLE mv DISABLE RULE missing_rule;
+ALTER TABLE mv DISABLE TRIGGER missing_trigger;
 
 -- Base changes are NOT reflected until REFRESH.
 INSERT INTO base VALUES (4, 40);
@@ -78,8 +80,37 @@ DROP SCHEMA mv_life_target;
 -- WITH NO DATA creates it unpopulated; REFRESH fills it.
 CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM base WITH NO DATA;
 SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+SELECT relispopulated FROM pg_class WHERE relname = 'mv2';
+SELECT count(*) FROM mv2;
+SELECT id FROM mv2 LIMIT 0;
+SELECT id FROM mv2 WHERE false;
+COPY mv2 TO STDOUT;
+BEGIN;
+SAVEPOINT before_refresh;
+REFRESH MATERIALIZED VIEW mv2;
+SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+ROLLBACK TO before_refresh;
+SELECT ispopulated FROM pg_matviews WHERE matviewname = 'mv2';
+COMMIT;
+BEGIN;
+REFRESH MATERIALIZED VIEW mv2;
+ROLLBACK;
+SELECT relispopulated FROM pg_class WHERE relname = 'mv2';
+SELECT count(*) FROM mv2;
 REFRESH MATERIALIZED VIEW mv2;
 SELECT count(*) FROM mv2;
+CREATE ROLE materialized_maintainer;
+GRANT USAGE ON SCHEMA public TO materialized_maintainer;
+SET ROLE materialized_maintainer;
+REFRESH MATERIALIZED VIEW mv2;
+RESET ROLE;
+GRANT MAINTAIN ON mv2 TO materialized_maintainer;
+SET ROLE materialized_maintainer;
+REFRESH MATERIALIZED VIEW mv2;
+SELECT current_user::text;
+RESET ROLE;
+DROP OWNED BY materialized_maintainer;
+DROP ROLE materialized_maintainer;
 
 -- A materialized view over a set-operation body.
 CREATE MATERIALIZED VIEW mv3 AS SELECT id FROM base WHERE id = 1 UNION SELECT id FROM base WHERE id = 4;
@@ -100,3 +131,29 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS mvx AS SELECT 2 AS a;
 SELECT a FROM mvx;
 DROP MATERIALIZED VIEW IF EXISTS mvx;
 DROP MATERIALIZED VIEW IF EXISTS mvx;
+
+-- Reusing a name does not transfer a dropped object's comment to its successor.
+CREATE MATERIALIZED VIEW commented_matview AS SELECT 1 AS value;
+COMMENT ON MATERIALIZED VIEW commented_matview IS 'original';
+BEGIN;
+DROP MATERIALIZED VIEW commented_matview;
+CREATE MATERIALIZED VIEW commented_matview AS SELECT 2 AS value;
+SELECT obj_description('commented_matview'::regclass) IS NULL;
+COMMENT ON MATERIALIZED VIEW commented_matview IS 'replacement';
+SAVEPOINT retained;
+DROP MATERIALIZED VIEW commented_matview;
+CREATE MATERIALIZED VIEW commented_matview AS SELECT 3 AS value;
+SELECT obj_description('commented_matview'::regclass) IS NULL;
+COMMENT ON MATERIALIZED VIEW commented_matview IS 'discarded';
+ROLLBACK TO retained;
+SELECT obj_description('commented_matview'::regclass);
+COMMIT;
+SELECT obj_description('commented_matview'::regclass);
+BEGIN;
+DROP MATERIALIZED VIEW commented_matview;
+CREATE MATERIALIZED VIEW commented_matview AS SELECT 4 AS value;
+COMMENT ON MATERIALIZED VIEW commented_matview IS 'rolled back';
+ROLLBACK;
+SELECT obj_description('commented_matview'::regclass);
+SELECT value FROM commented_matview;
+DROP MATERIALIZED VIEW commented_matview;

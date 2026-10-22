@@ -200,6 +200,9 @@ impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
 pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
     ViewDefinition,
+    ViewMetadataEdit,
+    QueryMetadataCommit,
+    ViewLifecycle,
     QueryDefinition(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
 }
@@ -238,7 +241,11 @@ struct QueryTableOwners<'storage> {
 impl CatalogPublicationInput<'_> {
     fn requires_catalog(&self) -> bool {
         match self {
-            Self::RoutineContract | Self::RuleMetadataEdit | Self::ViewDefinition => true,
+            Self::RoutineContract
+            | Self::RuleMetadataEdit
+            | Self::ViewDefinition
+            | Self::ViewMetadataEdit => true,
+            Self::QueryMetadataCommit | Self::ViewLifecycle => false,
             Self::QueryDefinition(dependencies) => {
                 dependencies.entries().iter().any(|dependency| {
                     matches!(
@@ -257,6 +264,7 @@ pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogTypeDestinat
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
     pub(super) types: Option<MutexGuard<'storage, TypeCatalog>>,
+    pub(super) permissions: Option<MutexGuard<'storage, super::AclCatalog>>,
     target: Option<QueryTableOwners<'storage>>,
     pub(super) comments: Option<MutexGuard<'storage, super::CommentCatalog>>,
 }
@@ -301,6 +309,10 @@ impl<Catalog: CatalogTypeDestination> CatalogDependencyOwners<'_, Catalog> {
             if current.database != target.selected.identity.database
                 || current.created_at != target.selected.identity.created_at
                 || !current.existence.visible_to(transaction)
+                || current
+                    .existence
+                    .pending_drop_txid()
+                    .is_some_and(|owner| owner != transaction)
             {
                 return Err(crate::sql_err!(
                     crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
@@ -445,6 +457,10 @@ impl CatalogDependencyOwners<'_, super::ViewRuleCatalog> {
                         view.database == database
                             && view.created_at == created_at
                             && view.visible_to(transaction)
+                            && view
+                                .ddl_state
+                                .pending_drop_txid()
+                                .is_none_or(|owner| owner == transaction)
                     })
                 {
                     Ok(())
@@ -538,9 +554,27 @@ impl Storage {
         target: Option<QueryTableTarget>,
     ) -> CatalogDependencyOwners<'storage, Catalog> {
         let requires_types = input.requires_catalog();
-        let requires_comments = matches!(input, CatalogPublicationInput::RuleMetadataEdit);
+        let requires_comments = matches!(
+            input,
+            CatalogPublicationInput::RuleMetadataEdit
+                | CatalogPublicationInput::ViewMetadataEdit
+                | CatalogPublicationInput::QueryMetadataCommit
+                | CatalogPublicationInput::ViewLifecycle
+        );
+        let requires_permissions = matches!(
+            input,
+            CatalogPublicationInput::ViewDefinition | CatalogPublicationInput::ViewLifecycle
+        );
         loop {
             let attempt: Result<_, super::row_ownership::LockWait<'storage>> = (|| {
+                let permissions = if requires_permissions {
+                    Some(super::row_ownership::try_mutex(
+                        &self.acl_catalog,
+                        "ACL catalog lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
                 let target = match target {
                     Some(selected) => {
                         let table = &self.tables[selected.slot];
@@ -584,6 +618,7 @@ impl Storage {
                 Ok(CatalogDependencyOwners {
                     catalog,
                     types,
+                    permissions,
                     dependencies,
                     target,
                     comments,

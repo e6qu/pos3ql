@@ -142,6 +142,9 @@ Coverage stops at a failed build or instrumentation setup and retains its
 diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort
 addresses with the runner's `addr2line`, so the log names the allocating code.
+The wire suite stops at its first transport timeout and captures the live Linux
+server stack and operational state before cleaning up the failed connection.
+Stack arguments are omitted; protocol coverage installs its debugger explicitly.
 
 PostgreSQL service and client containers use Docker's official image from
 [Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),

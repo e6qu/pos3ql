@@ -355,42 +355,15 @@ pub(crate) enum DdlUndo {
     /// ALTER TABLE appended one pending table-definition version. Row-image
     /// undo is carried by the ordinary touched-row log.
     TableAltered(u32),
-    /// CREATE VIEW at this slot — undo by dropping it.
-    ViewCreated(u32),
-    /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
-    /// undo by reviving it.
-    ViewDropped(u32),
-    /// CREATE OR REPLACE VIEW moved the old view's internal dependents to the
-    /// replacement slot. Commit retires `old`; rollback moves them back.
-    ViewReplaced {
-        old: u32,
-        new: u32,
-    },
-    ViewSchemaChanged {
-        slot: u32,
-        prior: Option<crate::storage::PendingObjectSchema>,
-    },
-    ViewRenamed {
-        slot: u32,
-        prior: Option<crate::storage::PendingViewName>,
-    },
-    ViewOptionsChanged {
-        slot: u32,
-        prior: Option<crate::storage::PendingViewOptions>,
-    },
-    ViewColumnsChanged {
-        slot: u32,
-        prior: Option<crate::storage::PendingViewColumns>,
-    },
-    RuleCreated {
-        slot: u32,
+    ViewChanged(crate::storage::ViewPublication),
+    ViewDropped(crate::storage::QueryDdlUndo),
+    MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
+    RuleChanged {
+        publication: crate::storage::RulePublication,
         prior_table_rule_txid: Option<u32>,
     },
-    RuleAltered {
-        slot: u32,
-        prior: Option<crate::storage::PendingRuleDefinition>,
-    },
-    RuleDropped(u32),
+    RuleAltered(crate::storage::RuleAlterUndo),
+    RuleDropped(crate::storage::QueryDdlUndo),
     /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
     RoutineCreated(u32),
     RoutineDropped(u32),

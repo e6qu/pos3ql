@@ -380,7 +380,9 @@ done
 
 step "raw wire-protocol probes (SSLRequest, negotiation, framing)"
 restart_main_server wire
-if POS3QL_PORT=$PG_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
+if POS3QL_PORT=$PG_PORT POS3QL_SERVER_PID=$SERVER_PID \
+    POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
+    python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else
   bad "wire probes"

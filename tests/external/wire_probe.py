@@ -8,9 +8,11 @@ BackendKeyData cancel-key lengths, empty queries, oversized messages,
 unknown message types, and CancelRequest handling.
 """
 
+import http.client
 import os
 import socket
 import struct
+import subprocess
 import sys
 import time
 import traceback
@@ -19,6 +21,38 @@ HOST = os.environ.get("POS3QL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("POS3QL_PORT", "5433"))
 
 failures = []
+
+
+def capture_stalled_server():
+    pid = os.environ.get("POS3QL_SERVER_PID")
+    if not sys.platform.startswith("linux") or not pid or not pid.isdecimal():
+        print("native stack unavailable: Linux and POS3QL_SERVER_PID are required", flush=True)
+    else:
+        print("native stack at first timeout (arguments omitted)", flush=True)
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "timeout", "--signal=TERM", "--kill-after=1s", "8s",
+                 "gdb", "--nx", "--nh", "--quiet", "--batch",
+                 "-ex", "set pagination off", "-ex", "set print frame-arguments none",
+                 "-ex", "set print entry-values no", "-ex", "thread apply all bt", "-p", pid],
+                stdout=sys.stdout, stderr=sys.stderr, close_fds=True, timeout=12, check=False,
+            )
+            if result.returncode:
+                print(f"native stack capture failed with exit code {result.returncode}", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"native stack capture failed: {error}", flush=True)
+    operations_port = os.environ.get("POS3QL_OPERATIONS_PORT")
+    if operations_port:
+        for endpoint in ("healthz", "readyz", "metrics"):
+            connection = http.client.HTTPConnection("127.0.0.1", int(operations_port), timeout=1)
+            try:
+                connection.request("GET", f"/{endpoint}")
+                response = connection.getresponse()
+                print(endpoint, response.status, response.read(16384).decode(), flush=True)
+            except (OSError, http.client.HTTPException) as error:
+                print(f"{endpoint} diagnostic unavailable: {error}", flush=True)
+            finally:
+                connection.close()
 
 
 def check(name, cond, detail=""):
@@ -2560,35 +2594,47 @@ def test_database_force_terminates_live_backends_with_fatal():
 
 
 def test_configuration_reload_updates_existing_unoverridden_sessions():
-    admin = connect()
-    observer = connect()
-    for connection in (admin, observer):
-        connection.sendall(startup_payload(0))
-        drain_startup(connection)
+    for cycle in range(32):
+        print(f"reload/startup cycle {cycle}", flush=True)
+        admin = connect()
+        observer = connect()
+        for connection in (admin, observer):
+            connection.sendall(startup_payload(0))
+            drain_startup(connection)
 
-    changed = simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-one'")
-    reloaded = simple_query(admin, "SELECT pg_reload_conf()")
-    observed = simple_query(observer, "SHOW application_name")
-    check(
-        "raw wire: reload reaches an existing session after the command boundary",
-        not any(kind == b"E" for kind, _ in changed + reloaded + observed)
-        and any(kind == b"D" and b"wire-cluster-one" in payload for kind, payload in observed),
-        observed,
-    )
+        changed = simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-one'")
+        reloaded = simple_query(admin, "SELECT pg_reload_conf()")
+        observed = simple_query(observer, "SHOW application_name")
+        check(
+            "raw wire: reload reaches an existing session after the command boundary",
+            not any(kind == b"E" for kind, _ in changed + reloaded + observed)
+            and any(kind == b"D" and b"wire-cluster-one" in payload for kind, payload in observed),
+            observed,
+        )
 
-    simple_query(observer, "SET application_name = 'wire-session'")
-    simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-two'")
-    simple_query(admin, "SELECT pg_reload_conf()")
-    observed = simple_query(observer, "SHOW application_name")
-    check(
-        "raw wire: reload preserves an explicit session SET",
-        any(kind == b"D" and b"wire-session" in payload for kind, payload in observed),
-        observed,
-    )
-    simple_query(admin, "ALTER SYSTEM RESET application_name")
-    simple_query(admin, "SELECT pg_reload_conf()")
-    observer.close()
-    admin.close()
+        simple_query(observer, "SET application_name = 'wire-session'")
+        simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-two'")
+        simple_query(admin, "SELECT pg_reload_conf()")
+        observed = simple_query(observer, "SHOW application_name")
+        check(
+            "raw wire: reload preserves an explicit session SET",
+            any(kind == b"D" and b"wire-session" in payload for kind, payload in observed),
+            observed,
+        )
+        simple_query(admin, "ALTER SYSTEM RESET application_name")
+        simple_query(admin, "SELECT pg_reload_conf()")
+        observer.close()
+        admin.close()
+
+        fresh = connect()
+        fresh.sendall(startup_payload(0))
+        drain_startup(fresh)
+        observed = simple_query(fresh, "SELECT 1")
+        check(
+            "raw wire: startup remains responsive after reload clients retire",
+            first_text_row(observed) == "1", observed,
+        )
+        fresh.close()
 
 
 def test_transaction_configuration_crosses_wire_message_boundaries():
@@ -6094,6 +6140,10 @@ def main():
         except Exception as error:
             traceback.print_exc()
             check(f"{t.__name__} raised {type(error).__name__}", False, str(error))
+            if isinstance(error, TimeoutError):
+                capture_stalled_server()
+                print("stopping at the first transport timeout; inspect the server diagnostics", flush=True)
+                break
     if failures:
         print(f"\n{len(failures)} wire probe(s) FAILED: {failures}")
         sys.exit(1)

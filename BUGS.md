@@ -13,6 +13,11 @@ rollback, connection identity, permission checks, ownership across databases,
 recovery and slot reuse must preserve valid data and selected source identities.
 An unfinished metadata reference must prevent account deletion until its
 transaction commits or rolls back, including after prepared recovery.
+View, materialized-view and rule undo must not change a replacement object or
+its comments.
+Materialized-view readability follows transaction and savepoint rollback.
+A pending login commit must yield without repeating triggers. Synchronous
+journal completion must not wait for credential installation by its own caller.
 Keep detailed contracts in the
 [current behavior guide](docs/implemented-baseline.md) and regression evidence in
 the implementing PR.

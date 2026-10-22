@@ -172,6 +172,8 @@ pub enum Phase {
     AwaitSaslInit,
     /// SASL in flight; waiting for SASLResponse (client-final).
     AwaitSaslFinal,
+    /// Login triggers have run; their commit awaits object storage.
+    AwaitLoginCommit,
     /// Normal message flow.
     Ready,
     /// Extended-protocol error recovery: discard until Sync.
@@ -987,6 +989,7 @@ impl Conn {
                 | Phase::AwaitMd5
                 | Phase::AwaitSaslInit
                 | Phase::AwaitSaslFinal => self.process_auth(engine, cancel_key, auth),
+                Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
                 Phase::Ready | Phase::SkipToSync => self.process_message(engine),
             };
             match after {
@@ -1004,6 +1007,7 @@ impl Conn {
     pub(crate) fn retry_parked(
         &mut self,
         engine: &mut Engine,
+        cancel_key: &[u8],
         generation: u64,
         retry_waiters: bool,
     ) -> Option<PendingResponse> {
@@ -1028,7 +1032,11 @@ impl Conn {
         self.parked = false;
         let output_mark = self.send.mark();
         let after = loop {
-            match self.process_message(engine) {
+            let step = match self.phase {
+                Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
+                _ => self.process_message(engine),
+            };
+            match step {
                 Step::Close => break After::Close,
                 Step::NeedMoreData | Step::Parked => break After::Continue,
                 Step::Continue if self.is_terminating() || self.replication_completion_pending => {
@@ -1467,6 +1475,42 @@ impl Conn {
             self.authenticated_role = Some(login);
             self.authenticated_database = Some(database.slot);
         }
+        let login_trigger_result = if self.phase == Phase::AwaitLoginCommit {
+            engine.finish_staged_transaction(&mut self.txn, &self.guc)
+        } else {
+            self.arena.reset();
+            let mut responder = Responder::new(&mut self.send);
+            engine.execute_login_event_triggers(
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &mut self.guc,
+                &self.arena,
+                &mut responder,
+            )
+        };
+        if let Err(error) = login_trigger_result {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && self.txn.staged_commit().is_some() {
+                // Retain the login transaction without re-running its triggers.
+                // Credential installation and journal publication need reactor turns.
+                self.phase = Phase::AwaitLoginCommit;
+                self.park(
+                    crate::sql::StatementWait::ObjectIo,
+                    engine.lock_generation(),
+                );
+                return Step::Parked;
+            }
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(error.sqlstate, error.message.as_str());
+            if let Some(role) = self.authenticated_role.take() {
+                engine.release_role_connection(role);
+            }
+            if let Some(database) = self.authenticated_database.take() {
+                engine.release_database_connection(database);
+            }
+            return Step::Close;
+        }
+        self.finish_lock_wait();
         let minor = self.minor;
         let id = self.id;
         let client_encoding = self
@@ -1481,29 +1525,6 @@ impl Conn {
             .guc
             .get_owned("timezone")
             .unwrap_or_else(|| StackStr::from_str("UTC"));
-        self.arena.reset();
-        let login_trigger_result = {
-            let mut responder = Responder::new(&mut self.send);
-            engine.execute_login_event_triggers(
-                &mut self.txn,
-                &mut self.sqlprep,
-                &mut self.cursors,
-                &mut self.guc,
-                &self.arena,
-                &mut responder,
-            )
-        };
-        if let Err(error) = login_trigger_result {
-            let mut responder = Responder::new(&mut self.send);
-            let _ = responder.error(error.sqlstate, error.message.as_str());
-            if let Some(role) = self.authenticated_role.take() {
-                engine.release_role_connection(role);
-            }
-            if let Some(database) = self.authenticated_database.take() {
-                engine.release_database_connection(database);
-            }
-            return Step::Close;
-        }
         let (client_addr, client_port) = self
             .stream
             .as_ref()
@@ -5729,7 +5750,7 @@ mod tests {
                 let journal_lsn = engine.journal_lsn();
                 for _ in 0..2 {
                     let pending = crate::mem::guard::forbid_alloc(|| {
-                        conn.retry_parked(&mut engine, 0, true).unwrap()
+                        conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
                     });
                     assert_eq!(pending.after, After::Continue);
                     assert!(conn.parked);
@@ -5740,7 +5761,7 @@ mod tests {
                 // Simulator uploads allocate their remote fixture objects.
                 engine.commit_wal().unwrap();
                 let pending = crate::mem::guard::forbid_alloc(|| {
-                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                    conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
                 });
                 assert_eq!(pending.after, After::Continue);
                 assert!(!conn.parked);
@@ -5917,8 +5938,13 @@ mod tests {
             assert!(!conn.lock_timeout_expired());
             let prefix = conn.send.readable().to_vec();
             assert!(
-                crate::mem::guard::forbid_alloc(|| conn.retry_parked(&mut engine, u64::MAX, true))
-                    .is_none()
+                crate::mem::guard::forbid_alloc(|| conn.retry_parked(
+                    &mut engine,
+                    &[0; 16],
+                    u64::MAX,
+                    true
+                ))
+                .is_none()
             );
             assert_eq!(conn.send.readable(), prefix);
             request(&mut other, &mut engine, "SELECT count(*) FROM cache_orders");
@@ -5930,7 +5956,7 @@ mod tests {
                 );
                 assert_eq!(conn.parked_wait_remaining(), Some(Duration::ZERO));
                 let pending = crate::mem::guard::forbid_alloc(|| {
-                    conn.retry_parked(&mut engine, conn.parked_generation, false)
+                    conn.retry_parked(&mut engine, &[0; 16], conn.parked_generation, false)
                 })
                 .unwrap();
                 assert_eq!(pending.after, After::Continue);
@@ -5959,11 +5985,16 @@ mod tests {
                     + config.memtable_bytes / (64 << 10) * 4;
                 for _ in 0..turn_bound {
                     let before_durable = engine.durable_lsn();
-                    engine.advance_wal_publication(Instant::now()).unwrap();
+                    engine
+                        .advance_wal_publication(
+                            Instant::now(),
+                            crate::sql::CommitProgressMode::Reactor,
+                        )
+                        .unwrap();
                     let durable_advanced = engine.durable_lsn() > before_durable;
                     assert!(!engine.checkpoint_beat().failed());
                     if let Some(pending) = crate::mem::guard::forbid_alloc(|| {
-                        conn.retry_parked(&mut engine, 0, durable_advanced)
+                        conn.retry_parked(&mut engine, &[0; 16], 0, durable_advanced)
                     }) {
                         assert_eq!(pending.after, After::Continue);
                     }
@@ -6094,7 +6125,7 @@ mod tests {
                 wire::MSG_ERROR_RESPONSE
             ));
             let pending = crate::mem::guard::forbid_alloc(|| {
-                conn.retry_parked(&mut engine, 0, true).unwrap()
+                conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
             });
             assert_eq!(pending.after, After::Continue);
             assert!(conn.parked, "an early wakeup must retain the same request");
@@ -6138,7 +6169,10 @@ mod tests {
                 let mut saved = false;
                 for _ in 0..128 {
                     engine
-                        .advance_wal_publication(std::time::Instant::now())
+                        .advance_wal_publication(
+                            std::time::Instant::now(),
+                            crate::sql::CommitProgressMode::Reactor,
+                        )
                         .unwrap();
                     if engine.checkpoint_beat() == crate::sql::CheckpointBeat::Durable {
                         saved = true;
@@ -6147,7 +6181,7 @@ mod tests {
                 }
                 assert!(saved);
                 let pending = crate::mem::guard::forbid_alloc(|| {
-                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                    conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
                 });
                 assert_eq!(pending.after, After::Continue);
                 assert!(!conn.parked && conn.recv.is_empty());
@@ -6197,7 +6231,7 @@ mod tests {
                         assert!(conn.txn.staged_commit().is_some());
                         for _ in 0..2 {
                             let waiting = crate::mem::guard::forbid_alloc(|| {
-                                conn.retry_parked(engine, 0, true).unwrap()
+                                conn.retry_parked(engine, &[0; 16], 0, true).unwrap()
                             });
                             assert_eq!(waiting.after, After::Continue);
                             assert!(conn.parked && conn.txn.staged_commit().is_some());
@@ -6209,7 +6243,7 @@ mod tests {
                         // The simulated remote store may allocate fixture objects.
                         engine.commit_wal().unwrap();
                         let pending = crate::mem::guard::forbid_alloc(|| {
-                            conn.retry_parked(engine, 0, true).unwrap()
+                            conn.retry_parked(engine, &[0; 16], 0, true).unwrap()
                         });
                         assert_eq!(
                             pending.after,
@@ -7493,6 +7527,159 @@ mod tests {
         drop(connection);
         drop(engine);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn login_commit_yields_without_repeating_triggers_or_acknowledging_early() {
+        const CANCEL_KEY: &[u8; 16] = b"login-commit-key";
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("login-commit-{mode:?}-{}", std::process::id());
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.transaction_mode = mode;
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 4;
+            config.table_rows = 16;
+            config.max_connections = 2;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 16;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut administrator = Conn::new(&config, &mut budget).unwrap();
+            administrator.phase = Phase::Ready;
+            assert!(administrator.recv.append(&frontend(
+                wire::FMSG_QUERY,
+                b"CREATE TABLE login_commit_audit(username text); \
+                  CREATE FUNCTION record_login_commit() RETURNS event_trigger LANGUAGE plpgsql AS \
+                    'BEGIN INSERT INTO login_commit_audit VALUES (current_user); RETURN; END'; \
+                  CREATE EVENT TRIGGER login_commit_record ON login \
+                    EXECUTE FUNCTION record_login_commit()\0"
+            )));
+            assert!(matches!(
+                administrator.process_message(&mut engine),
+                Step::Continue
+            ));
+            assert!(!has_backend_message(
+                administrator.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            engine.commit_wal().unwrap();
+            engine.enable_async_durability();
+            let mut connection = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            server.set_nonblocking(true).unwrap();
+            connection.open(server, 73);
+            let auth = AuthContext {
+                mode: AuthMode::Trust,
+                password: String::new(),
+                scram: None,
+            };
+            let parameters = b"user\0postgres\0database\0postgres\0\0";
+            let mut startup = ((8 + parameters.len()) as i32).to_be_bytes().to_vec();
+            startup.extend_from_slice(&wire::PROTOCOL_3_2.to_be_bytes());
+            startup.extend_from_slice(parameters);
+            assert!(connection.recv.append(&startup));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| connection.process_startup(
+                    &mut engine,
+                    CANCEL_KEY,
+                    &auth,
+                    None
+                )),
+                Step::Parked
+            ));
+            assert!(connection.recv.is_empty());
+            for _ in 0..3 {
+                assert_eq!(connection.phase, Phase::AwaitLoginCommit);
+                assert!(connection.parked && connection.txn.staged_commit().is_some());
+                assert!(!connection.wants_read());
+                assert!(!has_backend_message(
+                    connection.send.readable(),
+                    wire::MSG_AUTHENTICATION
+                ));
+                assert!(!has_backend_message(
+                    connection.send.readable(),
+                    wire::MSG_READY_FOR_QUERY
+                ));
+                assert!(!crate::mem::guard::forbid_alloc(|| {
+                    connection.cancel_parked(&mut engine)
+                }));
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    connection
+                        .retry_parked(&mut engine, CANCEL_KEY, 0, true)
+                        .unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+            }
+            // Simulator uploads may allocate their remote fixture objects.
+            engine.commit_wal().unwrap();
+            let pending = crate::mem::guard::forbid_alloc(|| {
+                connection
+                    .retry_parked(&mut engine, CANCEL_KEY, 0, true)
+                    .unwrap()
+            });
+            assert_eq!(pending.after, After::Continue);
+            assert_eq!(connection.phase, Phase::Ready);
+            assert!(!connection.parked && connection.txn.staged_commit().is_none());
+            assert!(connection.wants_read());
+            assert!(has_backend_message(
+                connection.send.readable(),
+                wire::MSG_AUTHENTICATION
+            ));
+            assert!(has_backend_message(
+                connection.send.readable(),
+                wire::MSG_READY_FOR_QUERY
+            ));
+            assert!(
+                connection
+                    .send
+                    .readable()
+                    .windows(CANCEL_KEY.len())
+                    .any(|bytes| bytes == CANCEL_KEY)
+            );
+            administrator.send.clear();
+            assert!(administrator.recv.append(&frontend(
+                wire::FMSG_QUERY,
+                b"SELECT count(*) FROM login_commit_audit\0"
+            )));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| administrator.process_message(&mut engine)),
+                Step::Continue
+            ));
+            assert!(
+                administrator
+                    .send
+                    .readable()
+                    .windows(12)
+                    .any(|bytes| bytes == b"D\0\0\0\x0b\0\x01\0\0\0\x011")
+            );
+            engine.drop_connection(73);
+            drop(connection);
+            drop(administrator);
+            drop(client);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
     }
 
     #[test]

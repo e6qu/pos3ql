@@ -20,8 +20,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v19` | yes | yes | Requires durable role and type identities and their counters, plus a completed type-loading boundary; retains typed blocks and enum member identities. |
-| Journal record | Version `5` at header byte 17; bytes 18–23 are zero | yes | yes | Role definitions, prepared transaction owners and prepared account locks carry durable role identifiers. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v20` | yes | yes | Retains durable role and type identities and counters, typed blocks, enum members, and exact view and return-rule catalog positions and creation stamps. |
+| Journal record | Version `6` at header byte 17; bytes 18–23 are zero | yes | yes | Retains durable account identifiers. View replacement preserves object identifiers; materialized-view refresh state follows its transaction. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -38,7 +38,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v18 and older manifests are rejected before their references are used.
+Manifest v19 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -238,7 +238,7 @@ identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-current journal records or manifest v19. Kind 153 applies to ordinary row writes
+current journal records or manifest v20. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
 Journal routine type references identify their saved source lifetime. Replay
@@ -342,7 +342,18 @@ For example, a prepared transaction that created a type keeps its owner from
 being deleted after the server loses its local caches. A prepared view read
 continues to block a conflicting rule change. Committing or rolling back the
 prepared transaction releases its recovered locks. The current journal framing
-is version 5; earlier frames are rejected.
+is version 6; earlier frames are rejected. Replayed view replacement edits the
+existing view and return rule, preserving their object identifiers. A
+materialized-view refresh publishes its population flag with the transaction's
+rows; prepared recovery must retain that pending decision.
+
+CREATE VIEW records start with a 20-byte identity: the view's two-byte catalog
+position and eight-byte creation stamp, then the return rule's two-byte position
+and eight-byte creation stamp, all little endian. Creation stamps are nonzero
+and distinct. Checkpoint `vw13` records carry the same four fields before the
+encoded query. Recovery rejects unavailable positions and mismatched identities;
+it never relocates an existing object to make room. This preserves identifiers
+when an aborted creation leaves a gap in either catalog.
 
 ## Reader changes
 

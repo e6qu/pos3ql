@@ -102,10 +102,15 @@ Nonblocking reads have a 30-second deadline. Each upload attempt has a
 stored object, including its length, before accepting an uncertain prior
 success. A different mutable root remains a writer conflict.
 
-A procedure's internal `COMMIT`, login hooks and standalone catalog commands
-retain explicit synchronous completion boundaries. They cannot replay their
-call stack after a commit. The concurrent path for ordinary client commits and
-streaming subscription apply uses the fixed commit queue.
+Login triggers use the fixed commit queue. If a login trigger records an audit
+row, authentication waits for that row to become durable while the server can
+handle other connections. Waking the login again does not repeat its triggers.
+
+A procedure's internal `COMMIT` and standalone catalog commands retain explicit
+synchronous completion boundaries: their call stack cannot be replayed after a
+commit. During credential rotation they finish accepted journal work with the
+installed credentials; replacement waits for active requests to finish. Ordinary
+client commits and streaming subscription apply use the fixed commit queue.
 
 Saved query results are collected in one scan within the fixed statement arena.
 They do not run expressions a second time to discover the result size. For

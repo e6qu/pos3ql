@@ -2593,6 +2593,13 @@ pub(crate) fn alter_foreign_table(
             }
             None => return sql_fail(undefined_qual(&statement.table)),
         };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "foreign table",
+    ) {
+        return sql_fail(error);
+    }
     let Some((binding_slot, mut binding)) = storage.foreign_table(table as u16, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -2689,22 +2696,13 @@ pub(crate) fn alter_foreign_table(
             Ok(Ok(())) => {}
             other => return other,
         }
-    } else {
-        if let Err(error) = storage.lock_table(
-            txn.txid,
-            table,
-            crate::sql::ast::TableLockMode::AccessExclusive,
-            false,
-        ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage.require_owner(
-            storage.table_access_object(table, txn.txid),
-            txn.txid,
-            "foreign table",
-        ) {
-            return sql_fail(error);
-        }
+    } else if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
     }
     if binding_changed {
         let prior = match storage.alter_foreign_table_binding(binding_slot, binding, txn.txid) {
@@ -13253,10 +13251,11 @@ pub(crate) fn drop_schema(
                     Ok(d) => d,
                     Err(e) => return sql_fail(e),
                 };
-                if let Some(slot) = dropped
-                    && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+                if let Some(undo) = dropped
+                    && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
                 {
-                    return sql_fail(e);
+                    storage.rollback_view_drop(undo);
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Routine(routine) => {
@@ -36367,25 +36366,26 @@ pub fn create_view(
         or_replace,
         txn.txid,
     ) {
-        Ok((new_slot, old_slot)) => {
+        Ok(publication) => {
+            let new_slot = publication.slot();
             if check_option.is_some() {
                 match super::query::resolve_view_for_dml(storage, *name, txn.txid, arena) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        storage.rollback_view_create(new_slot);
-                        if let Some(old_slot) = old_slot {
-                            storage.rollback_view_drop(old_slot, txn.txid);
-                        }
+                        storage.finish_view_publication(
+                            publication,
+                            crate::storage::QueryDdlDecision::Rollback,
+                        );
                         return sql_fail(sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "newly created view is absent during check option validation"
                         ));
                     }
                     Err(error) => {
-                        storage.rollback_view_create(new_slot);
-                        if let Some(old_slot) = old_slot {
-                            storage.rollback_view_drop(old_slot, txn.txid);
-                        }
+                        storage.finish_view_publication(
+                            publication,
+                            crate::storage::QueryDdlDecision::Rollback,
+                        );
                         return sql_fail(error);
                     }
                 }
@@ -36398,6 +36398,7 @@ pub fn create_view(
                     txn.txid,
                     lsn,
                     &WalOp::CreateView {
+                        identity: storage.view_catalog_identity(new_slot),
                         schema: schema.as_str(),
                         name: name.name,
                         columns: crate::wal::WalViewColumns::Captured(&columns),
@@ -36414,50 +36415,34 @@ pub fn create_view(
                             super::ast::ViewCheckOption::Cascaded => 2,
                         }),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            storage.view_dependencies(new_slot).view(),
+                            storage.view_dependencies(new_slot, txn.txid).view(),
                         ),
                     },
                 )
             };
             if let Err(e) = staged {
                 // The journal rejected the record; undo the in-memory apply.
-                storage.rollback_view_create(new_slot);
-                if let Some(o) = old_slot {
-                    storage.rollback_view_drop(o, txn.txid);
-                }
+                storage.finish_view_publication(
+                    publication,
+                    crate::storage::QueryDdlDecision::Rollback,
+                );
                 return sql_fail(e);
             }
-            // Rollback undo: drop the new view; revive any superseded one.
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32)) {
-                return sql_fail(e);
-            }
-            let new_object = crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: new_slot as u16,
-            };
-            if let Some(old_slot) = old_slot {
-                let old_object = crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::View,
-                    slot: old_slot as u16,
-                };
-                let owner = storage.object_owner(old_object, txn.txid);
-                storage.set_object_owner(new_object, owner, txn.txid);
-                if let Err(error) = preserve_object_acl(storage, txn, old_object, new_object) {
-                    return sql_fail(error);
-                }
-            } else if let Err(error) =
-                apply_default_privileges_to_new_object(storage, txn, new_object)
-            {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+                storage.finish_view_publication(
+                    publication,
+                    crate::storage::QueryDdlDecision::Rollback,
+                );
                 return sql_fail(error);
             }
-            if let Some(old) = old_slot {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-                    old: old as u32,
-                    new: new_slot as u32,
-                }) {
-                    return sql_fail(e);
+            if matches!(publication, crate::storage::ViewPublication::Created(_)) {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: new_slot as u16,
+                };
+                if let Err(error) = apply_default_privileges_to_new_object(storage, txn, object) {
+                    return sql_fail(error);
                 }
-                storage.retarget_view_dependents(old, new_slot);
             }
         }
         Err(e) => return sql_fail(e),
@@ -36543,6 +36528,10 @@ pub fn alter_view(
             },
         );
     };
+    let edit_target = match storage.prepare_view_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     if let Err(error) = storage.lock_object(
         txn.txid,
         crate::storage::ObjectLockTarget::View(slot),
@@ -36601,7 +36590,7 @@ pub fn alter_view(
             Ok(target) => target,
             Err(error) => return sql_fail(error),
         };
-        let prior = match storage.stage_view_schema(slot, target, txn.txid) {
+        let prior = match storage.stage_view_schema(edit_target, target, txn.txid) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -36618,14 +36607,13 @@ pub fn alter_view(
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_schema(slot, prior);
+            storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSchemaChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_schema(slot, prior);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+            crate::storage::ViewPublication::Altered(prior),
+        )) {
+            storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
         responder.command_complete("ALTER VIEW")?;
@@ -36744,7 +36732,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36765,14 +36753,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36795,7 +36782,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36816,14 +36803,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36851,7 +36837,7 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36872,14 +36858,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_columns(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_columns(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             if let Err(error) = rewrite_view_column_dependents(
@@ -36915,7 +36900,7 @@ pub fn alter_view(
                 Ok(target) => target,
                 Err(error) => return sql_fail(error),
             };
-            let prior = match storage.stage_view_rename(slot, target, txn.txid) {
+            let prior = match storage.stage_view_rename(edit_target, target, txn.txid) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -36936,14 +36921,13 @@ pub fn alter_view(
                 )
             };
             if let Err(error) = staged {
-                storage.rollback_view_rename(slot, prior);
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_view_rename(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+                crate::storage::ViewPublication::Altered(prior),
+            )) {
+                storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -36959,7 +36943,7 @@ pub fn alter_view(
         let view = storage.view(slot);
         view.names_for(txn.txid)
     };
-    let prior = match storage.stage_view_options(slot, options, txn.txid) {
+    let prior = match storage.stage_view_options(edit_target, options, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -36983,14 +36967,13 @@ pub fn alter_view(
         )
     };
     if let Err(error) = staged {
-        storage.rollback_view_options(slot, prior);
+        storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewOptionsChanged {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_view_options(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
+        crate::storage::ViewPublication::Altered(prior),
+    )) {
+        storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
     responder.command_complete("ALTER VIEW")?;
@@ -37019,16 +37002,15 @@ fn rewrite_view_column_dependents(
         {
             continue;
         }
-        let references_column =
-            storage
-                .view_dependencies(view_slot)
-                .entries()
-                .iter()
-                .any(|dependency| {
-                    dependency.class == crate::storage::DependencyClass::View
-                        && usize::from(dependency.slot) == source_view
-                        && dependency.referenced_columns.contains(source_column)
-                });
+        let references_column = storage
+            .view_dependencies(view_slot, txn.txid)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::View
+                    && usize::from(dependency.slot) == source_view
+                    && dependency.referenced_columns.contains(source_column)
+            });
         if !references_column {
             continue;
         }
@@ -37061,9 +37043,8 @@ fn rewrite_view_column_dependents(
         }
 
         let dependent_columns = view.columns.with_aliases(true);
-        let (new_slot, old_slot) = storage.create_view(
-            view.schema,
-            view.name,
+        let undo = storage.replace_view_definition(
+            storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
                 columns: dependent_columns,
@@ -37076,9 +37057,10 @@ fn rewrite_view_column_dependents(
                     ..view.options_for(txn.txid)
                 },
             },
-            true,
             txn.txid,
         )?;
+        let publication = crate::storage::ViewPublication::Altered(undo);
+        let new_slot = publication.slot();
         let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
             Ok(())
         } else {
@@ -37087,8 +37069,9 @@ fn rewrite_view_column_dependents(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
-                    schema: view.schema.as_str(),
-                    name: view.name.as_str(),
+                    identity: storage.view_catalog_identity(new_slot),
+                    schema: view.schema_for(txn.txid).as_str(),
+                    name: view.name_for(txn.txid).as_str(),
                     columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
@@ -37101,41 +37084,21 @@ fn rewrite_view_column_dependents(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot).view(),
+                        storage.view_dependencies(new_slot, txn.txid).view(),
                     ),
                 },
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_create(new_slot);
-            if let Some(old_slot) = old_slot {
-                storage.rollback_view_drop(old_slot, txn.txid);
-            }
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
             return Err(error);
         }
-        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
-        let old_slot = old_slot.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "dependent view replacement lost its prior definition"
-            )
-        })?;
-        let old_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: old_slot as u16,
-        };
-        let new_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: new_slot as u16,
-        };
-        let owner = storage.object_owner(old_object, txn.txid);
-        storage.set_object_owner(new_object, owner, txn.txid);
-        preserve_object_acl(storage, txn, old_object, new_object)?;
-        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-            old: old_slot as u32,
-            new: new_slot as u32,
-        })?;
-        storage.retarget_view_dependents(old_slot, new_slot);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -37654,48 +37617,42 @@ pub fn create_rule(
             Ok(definition) => definition,
             Err(error) => return sql_fail(error),
         };
-    let existing = storage.rule_slot(target, rule.name, txn.txid);
-    let (slot, prior) =
+    let publication =
         match storage.create_rule(definition, dependencies.view(), rule.or_replace, txn.txid) {
-            Ok(created) => created,
+            Ok(publication) => publication,
             Err(error) => return sql_fail(error),
         };
-    let prior_table_rule_txid = if existing.is_none() {
-        match storage.begin_rule_history(target, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => {
-                storage.discard_rule_create(slot);
-                return sql_fail(error);
+    let slot = publication.slot();
+    let prior_table_rule_txid =
+        if matches!(publication, crate::storage::RulePublication::Created(_)) {
+            match storage.begin_rule_history(target, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => {
+                    storage.discard_rule_create(publication);
+                    return sql_fail(error);
+                }
             }
-        }
-    } else {
-        None
-    };
-    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        if existing.is_some() {
-            storage.rollback_rule_alter(slot, prior);
         } else {
-            storage.rollback_rule_create(slot, prior_table_rule_txid);
-        }
+            None
+        };
+    let installed = storage.rule(slot).definition_for(txn.txid);
+    if let Err(error) = stage_rule(storage, wal, txn, slot, installed) {
+        storage.finish_rule_publication(
+            publication,
+            prior_table_rule_txid,
+            crate::storage::QueryDdlDecision::Rollback,
+        );
         return sql_fail(error);
     }
-    let undo = if existing.is_some() {
-        super::txn::DdlUndo::RuleAltered {
-            slot: slot as u32,
-            prior,
-        }
-    } else {
-        super::txn::DdlUndo::RuleCreated {
-            slot: slot as u32,
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleChanged {
+        publication,
+        prior_table_rule_txid,
+    }) {
+        storage.finish_rule_publication(
+            publication,
             prior_table_rule_txid,
-        }
-    };
-    if let Err(error) = txn.record_ddl(undo) {
-        if existing.is_some() {
-            storage.rollback_rule_alter(slot, prior);
-        } else {
-            storage.rollback_rule_create(slot, prior_table_rule_txid);
-        }
+            crate::storage::QueryDdlDecision::Rollback,
+        );
         return sql_fail(error);
     }
     responder.command_complete("CREATE RULE")?;
@@ -37738,8 +37695,12 @@ pub fn alter_rule(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let (prior, definition) = match storage.alter_rule(
-        slot,
+        selected,
         crate::storage::RuleMetadataChange::Rename(new_name),
         txn.txid,
     ) {
@@ -37747,14 +37708,11 @@ pub fn alter_rule(
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        storage.rollback_rule_alter(slot, prior);
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_rule_alter(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
     responder.command_complete("ALTER RULE")?;
@@ -37766,7 +37724,7 @@ fn alter_table_rule_enabled(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    target: crate::storage::RuleTarget,
+    table: usize,
     relation: &str,
     name: &str,
     enabled: crate::sql::ast::TriggerEnableMode,
@@ -37774,6 +37732,7 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    let target = crate::storage::RuleTarget::Table(table as u16);
     if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
@@ -37796,8 +37755,12 @@ fn alter_table_rule_enabled(
         crate::sql::ast::TriggerEnableMode::Always => crate::storage::RuleEnabled::Always,
         crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::RuleEnabled::Disabled,
     };
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
     let (prior, definition) = match storage.alter_rule(
-        slot,
+        selected,
         crate::storage::RuleMetadataChange::SetEnabled(enabled),
         txn.txid,
     ) {
@@ -37805,14 +37768,11 @@ fn alter_table_rule_enabled(
         Err(error) => return sql_fail(error),
     };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
-        storage.rollback_rule_alter(slot, prior);
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_rule_alter(slot, prior);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+        storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
     if emit_completion {
@@ -37878,7 +37838,14 @@ pub fn drop_rule(
             table.name
         ));
     }
-    storage.drop_rule(slot, txn.txid);
+    let selected = match storage.prepare_rule_edit(slot, txn.txid) {
+        Ok(selected) => selected,
+        Err(error) => return sql_fail(error),
+    };
+    let dropped = match storage.drop_rule(selected, txn.txid) {
+        Ok(undo) => undo,
+        Err(error) => return sql_fail(error),
+    };
     let (schema, relation) = storage.rule_target_names(target, txn.txid);
     let target_kind = match target {
         crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
@@ -37897,12 +37864,12 @@ pub fn drop_rule(
                 name,
             },
         ) {
-            storage.rollback_rule_drop(slot, txn.txid);
+            storage.rollback_rule_drop(dropped);
             return sql_fail(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32)) {
-        storage.rollback_rule_drop(slot, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+        storage.rollback_rule_drop(dropped);
         return sql_fail(error);
     }
     responder.command_complete("DROP RULE")?;
@@ -39440,6 +39407,26 @@ pub fn refresh_materialized_view(
             name.name
         ));
     };
+    let population_target = match storage.prepare_matview_population(slot, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = require_table_privilege(
+        storage,
+        table_index,
+        crate::storage::PrivilegeSet::MAINTAIN,
+        txn.txid,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table_index,
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     // Copy the stored query out before mutating storage.
     let matview = storage.matview(slot);
     let sql = match arena.alloc_str(matview.sql.as_str()) {
@@ -39451,8 +39438,14 @@ pub fn refresh_materialized_view(
             ));
         }
     };
-    let user = super::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(matview.creation_path.as_str(), user.as_str(), txn.txid);
+    let owner = match storage
+        .capture_role_slot(usize::from(matview.ownership.owner_to(txn.txid)), txn.txid)
+    {
+        Ok(owner) => crate::storage::SessionIdentity::bound(owner),
+        Err(error) => return sql_fail(error),
+    };
+    let _owner = super::eval::funcs::system::enter_current_user(owner);
+    let path = storage.compute_path(matview.creation_path.as_str(), owner.as_str(), txn.txid);
     let select = match crate::sql::parser::parse_query(sql, arena) {
         Ok(select) => select,
         Err(error) => return sql_fail(error),
@@ -39578,8 +39571,14 @@ pub fn refresh_materialized_view(
             return sql_fail(e);
         }
     }
-    // Mark it populated (durably).
-    storage.set_matview_populated(slot, true);
+    let population = match storage.stage_matview_population(population_target, true, txn.txid) {
+        Ok(undo) => undo,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::MatviewPopulationChanged(population)) {
+        storage.finish_matview_population(population, crate::storage::QueryDdlDecision::Rollback);
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(e) = wal.stage_reserved(
         txn.txid,
@@ -43525,7 +43524,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .snapshot_view_dependencies(slot, arena)?
+                .snapshot_view_dependencies(slot, txid, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -44301,7 +44300,10 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0usize;
-            for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries() {
+            for dependency in storage
+                .snapshot_view_dependencies(slot, txid, arena)?
+                .entries()
+            {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View => view_depth[dependency.slot as usize]
@@ -44606,7 +44608,9 @@ fn report_stored_query_dependents(
                             let _ = write!(parent, "{}", root.suffix.as_str());
                         }
                     } else {
-                        for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries()
+                        for dependency in storage
+                            .snapshot_view_dependencies(slot, txid, arena)?
+                            .entries()
                         {
                             if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
@@ -44749,8 +44753,11 @@ fn drop_selected_stored_queries(
             continue;
         }
         stage_rule_drop(storage, wal, txn, definition)?;
-        storage.drop_rule(slot, txn.txid);
-        txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32))?;
+        let dropped = storage.drop_rule(storage.prepare_rule_edit(slot, txn.txid)?, txn.txid)?;
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+            storage.rollback_rule_drop(dropped);
+            return Err(error);
+        }
     }
     // Dependents are already closed transitively. Reverse slot order avoids
     // immediately reusing a just-freed low slot while this plan is executing.
@@ -44899,8 +44906,11 @@ fn drop_view_slot(
             },
         )?;
     }
-    if let Some(slot) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
-        txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))?;
+    if let Some(undo) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)?
+        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+    {
+        storage.rollback_view_drop(undo);
+        return Err(error);
     }
     Ok(())
 }
@@ -46463,9 +46473,8 @@ fn rewrite_composite_dependent_views(
             path,
             arena,
         )?;
-        let (new_slot, old_slot) = storage.create_view(
-            view.schema,
-            view.name,
+        let undo = storage.replace_view_definition(
+            storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
                 columns: view.columns,
@@ -46478,9 +46487,10 @@ fn rewrite_composite_dependent_views(
                     ..view.options_for(txn.txid)
                 },
             },
-            true,
             txn.txid,
         )?;
+        let publication = crate::storage::ViewPublication::Altered(undo);
+        let new_slot = publication.slot();
         let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
             Ok(())
         } else {
@@ -46489,8 +46499,9 @@ fn rewrite_composite_dependent_views(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
-                    schema: view.schema.as_str(),
-                    name: view.name.as_str(),
+                    identity: storage.view_catalog_identity(new_slot),
+                    schema: view.schema_for(txn.txid).as_str(),
+                    name: view.name_for(txn.txid).as_str(),
                     columns: crate::wal::WalViewColumns::Captured(&view.columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
@@ -46503,41 +46514,21 @@ fn rewrite_composite_dependent_views(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot).view(),
+                        storage.view_dependencies(new_slot, txn.txid).view(),
                     ),
                 },
             )
         };
         if let Err(error) = staged {
-            storage.rollback_view_create(new_slot);
-            if let Some(old_slot) = old_slot {
-                storage.rollback_view_drop(old_slot, txn.txid);
-            }
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
             return Err(error);
         }
-        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
-        let new_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: new_slot as u16,
-        };
-        let old_slot = old_slot.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "stored view replacement lost its prior definition"
-            )
-        })?;
-        let old_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: old_slot as u16,
-        };
-        let owner = storage.object_owner(old_object, txn.txid);
-        storage.set_object_owner(new_object, owner, txn.txid);
-        preserve_object_acl(storage, txn, old_object, new_object)?;
-        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
-            old: old_slot as u32,
-            new: new_slot as u32,
-        })?;
-        storage.retarget_view_dependents(old_slot, new_slot);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+            storage
+                .finish_view_publication(publication, crate::storage::QueryDdlDecision::Rollback);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -47141,10 +47132,11 @@ pub fn drop_view(
                 Ok(d) => d,
                 Err(e) => return sql_fail(e),
             };
-            if let Some(slot) = dropped
-                && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
+            if let Some(undo) = dropped
+                && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
             {
-                return sql_fail(e);
+                storage.rollback_view_drop(undo);
+                return sql_fail(error);
             }
         } else if if_exists {
             responder.notice(
@@ -52142,9 +52134,9 @@ pub fn copy_begin(
                 ));
             }
         }
-        if let Some(slot) = storage.matview_slot_for_table(table_index, txid)
-            && !storage.matview(slot).populated
-        {
+        if storage.matviews_visible_to(txid).any(|(_, view)| {
+            usize::from(view.backing_table) == table_index && !view.populated_for(txid)
+        }) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot copy from unpopulated materialized view \"{}\"",
@@ -63855,12 +63847,11 @@ fn stage_partition_trigger_mode(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn alter_trigger_enabled(
+fn alter_table_trigger_enabled(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    target: crate::storage::TriggerTarget,
-    target_kind: crate::wal::TriggerTargetKind,
+    table: usize,
     schema: &str,
     relation: &str,
     trigger_target: crate::sql::ast::TriggerEnableTarget<'_>,
@@ -63870,6 +63861,7 @@ fn alter_trigger_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    let target = crate::storage::TriggerTarget::Table(table as u16);
     let mode = match enabled {
         crate::sql::ast::TriggerEnableMode::Origin => crate::storage::TriggerEnabled::Origin,
         crate::sql::ast::TriggerEnableMode::Replica => crate::storage::TriggerEnabled::Replica,
@@ -63884,17 +63876,10 @@ fn alter_trigger_enabled(
             .nth(ordinal)
             .expect("trigger catalog count remains stable during a state change");
         let direct = trigger.target == target;
-        let inherited = match (target, trigger.target) {
-            (
-                crate::storage::TriggerTarget::Table(table),
-                crate::storage::TriggerTarget::Table(parent),
-            ) => {
+        let inherited = match trigger.target {
+            crate::storage::TriggerTarget::Table(parent) => {
                 matches!(trigger.level, TriggerLevel::Row)
-                    && storage.partition_descends_from(
-                        usize::from(table),
-                        usize::from(parent),
-                        txn.txid,
-                    )
+                    && storage.partition_descends_from(table, usize::from(parent), txn.txid)
             }
             _ => false,
         };
@@ -63907,56 +63892,51 @@ fn alter_trigger_enabled(
             continue;
         }
         matched = true;
-        if let crate::storage::TriggerTarget::Table(table) = target {
-            let table = usize::from(table);
-            if inherited {
-                let prior_mode = storage.partition_trigger_enabled_to(slot, table, txn.txid);
-                for descendant in 0..storage.table_count() {
-                    if storage.table(descendant).visible_to(txn.txid)
-                        && storage.partition_descends_from(descendant, table, txn.txid)
-                    {
-                        if recurse {
-                            if let Err(error) = stage_partition_trigger_mode(
-                                storage, wal, txn, slot, descendant, mode,
-                            ) {
-                                return sql_fail(error);
-                            }
-                        } else if let Err(error) = stage_partition_trigger_mode(
-                            storage, wal, txn, slot, descendant, prior_mode,
-                        ) {
+        if inherited {
+            let prior_mode = storage.partition_trigger_enabled_to(slot, table, txn.txid);
+            for descendant in 0..storage.table_count() {
+                if storage.table(descendant).visible_to(txn.txid)
+                    && storage.partition_descends_from(descendant, table, txn.txid)
+                {
+                    if recurse {
+                        if let Err(error) =
+                            stage_partition_trigger_mode(storage, wal, txn, slot, descendant, mode)
+                        {
                             return sql_fail(error);
                         }
-                    }
-                }
-                if let Err(error) =
-                    stage_partition_trigger_mode(storage, wal, txn, slot, table, mode)
-                {
-                    return sql_fail(error);
-                }
-                continue;
-            }
-            if matches!(trigger.level, TriggerLevel::Row) {
-                for descendant in 0..storage.table_count() {
-                    if !storage.table(descendant).visible_to(txn.txid)
-                        || !storage.partition_descends_from(descendant, table, txn.txid)
-                    {
-                        continue;
-                    }
-                    let descendant_mode = if recurse {
-                        mode
-                    } else {
-                        storage.partition_trigger_enabled_to(slot, descendant, txn.txid)
-                    };
-                    if let Err(error) = stage_partition_trigger_mode(
-                        storage,
-                        wal,
-                        txn,
-                        slot,
-                        descendant,
-                        descendant_mode,
+                    } else if let Err(error) = stage_partition_trigger_mode(
+                        storage, wal, txn, slot, descendant, prior_mode,
                     ) {
                         return sql_fail(error);
                     }
+                }
+            }
+            if let Err(error) = stage_partition_trigger_mode(storage, wal, txn, slot, table, mode) {
+                return sql_fail(error);
+            }
+            continue;
+        }
+        if matches!(trigger.level, TriggerLevel::Row) {
+            for descendant in 0..storage.table_count() {
+                if !storage.table(descendant).visible_to(txn.txid)
+                    || !storage.partition_descends_from(descendant, table, txn.txid)
+                {
+                    continue;
+                }
+                let descendant_mode = if recurse {
+                    mode
+                } else {
+                    storage.partition_trigger_enabled_to(slot, descendant, txn.txid)
+                };
+                if let Err(error) = stage_partition_trigger_mode(
+                    storage,
+                    wal,
+                    txn,
+                    slot,
+                    descendant,
+                    descendant_mode,
+                ) {
+                    return sql_fail(error);
                 }
             }
         }
@@ -63977,7 +63957,7 @@ fn alter_trigger_enabled(
                 lsn,
                 &WalOp::AlterTrigger {
                     name: trigger.name_to(txn.txid).as_str(),
-                    target: target_kind,
+                    target: crate::wal::TriggerTargetKind::Table,
                     table_schema: schema,
                     table: relation,
                     new_name: trigger.name_to(txn.txid).as_str(),
@@ -65328,7 +65308,7 @@ fn alter_table_relation(
             Some(crate::storage::ResolvedRelation::View(view))
                 if matches!(
                     statement.actions,
-                    [AlterAction::SetTriggerEnabled { .. } | AlterAction::SetRuleEnabled { .. }]
+                    [AlterAction::SetRuleEnabled { .. } | AlterAction::SetTriggerEnabled { .. }]
                 ) =>
             {
                 if emit_completion
@@ -65343,40 +65323,25 @@ fn alter_table_relation(
                 {
                     return sql_fail(error);
                 }
-                let (schema, relation) = {
-                    let definition = storage.view(view);
-                    (definition.schema, definition.name)
+                let lock_mode = if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }])
+                {
+                    crate::sql::ast::TableLockMode::AccessExclusive
+                } else {
+                    crate::sql::ast::TableLockMode::ShareRowExclusive
                 };
-                return match statement.actions {
-                    [AlterAction::SetTriggerEnabled { target, enabled }] => alter_trigger_enabled(
-                        storage,
-                        wal,
-                        txn,
-                        crate::storage::TriggerTarget::View(view as u16),
-                        crate::wal::TriggerTargetKind::View,
-                        schema.as_str(),
-                        relation.as_str(),
-                        *target,
-                        *enabled,
-                        !statement.only,
-                        responder,
-                        emit_completion,
-                        tag,
-                    ),
-                    [AlterAction::SetRuleEnabled { name, enabled }] => alter_table_rule_enabled(
-                        storage,
-                        wal,
-                        txn,
-                        crate::storage::RuleTarget::View(view as u16),
-                        relation.as_str(),
-                        name,
-                        *enabled,
-                        responder,
-                        emit_completion,
-                        tag,
-                    ),
-                    _ => unreachable!("view ALTER TABLE action was checked above"),
-                };
+                if let Err(error) = storage.lock_object(
+                    txn.txid,
+                    crate::storage::ObjectLockTarget::View(view),
+                    lock_mode,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    statement.table.name
+                ));
             }
             None if statement.if_exists => {
                 responder.notice(
@@ -65395,7 +65360,18 @@ fn alter_table_relation(
             }
             _ => return sql_fail(undefined_qual(&statement.table)),
         };
-    let lock_mode = if matches!(
+    if emit_completion
+        && let Err(error) = storage.require_owner(
+            storage.table_access_object(table_index, txn.txid),
+            txn.txid,
+            "table",
+        )
+    {
+        return sql_fail(error);
+    }
+    let lock_mode = if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) {
+        crate::sql::ast::TableLockMode::ShareRowExclusive
+    } else if matches!(
         statement.actions,
         [AlterAction::DetachPartition {
             mode: crate::sql::ast::PartitionDetachMode::Concurrent
@@ -65423,14 +65399,19 @@ fn alter_table_relation(
             }
         ));
     }
-    if emit_completion
-        && let Err(error) = storage.require_owner(
-            storage.table_access_object(table_index, txn.txid),
-            txn.txid,
-            "table",
-        )
+    let changes_rule_mode = matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]);
+    let changes_trigger_mode = matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]);
+    if (changes_rule_mode || changes_trigger_mode)
+        && (storage
+            .matview_slot_for_table(table_index, txn.txid)
+            .is_some()
+            || changes_rule_mode && def.kind == crate::storage::TableKind::Foreign)
     {
-        return sql_fail(error);
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a table",
+            statement.table.name
+        ));
     }
 
     // The composite owns the physical attribute list of a typed table. Letting
@@ -65469,13 +65450,13 @@ fn alter_table_relation(
         return sql_fail(error);
     }
 
-    // The ACCESS EXCLUSIVE acquisition above waits for ordinary readers and
-    // writers. This verifies the row-version invariant at the rewrite
-    // boundary as a corruption guard.
-    if storage
-        .resident_rows(table_index)
-        .iter()
-        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
+    // Rewrites own ACCESS EXCLUSIVE. Metadata-only commands with a weaker
+    // lock must not reject compatible row locks held by another transaction.
+    if lock_mode == crate::sql::ast::TableLockMode::AccessExclusive
+        && storage
+            .resident_rows(table_index)
+            .iter()
+            .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
@@ -65574,12 +65555,11 @@ fn alter_table_relation(
     }
 
     if let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions {
-        return alter_trigger_enabled(
+        return alter_table_trigger_enabled(
             storage,
             wal,
             txn,
-            crate::storage::TriggerTarget::Table(table_index as u16),
-            crate::wal::TriggerTargetKind::Table,
+            table_index,
             def.schema.as_str(),
             def.name.as_str(),
             *target,
@@ -65596,7 +65576,7 @@ fn alter_table_relation(
             storage,
             wal,
             txn,
-            crate::storage::RuleTarget::Table(table_index as u16),
+            table_index,
             def.name.as_str(),
             name,
             *enabled,

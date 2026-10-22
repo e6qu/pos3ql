@@ -721,9 +721,13 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         Created(slot) => (ObjectRef::Table(slot as usize), Mutation::Create),
         Dropped(slot) => (ObjectRef::Table(slot as usize), Mutation::Drop),
         TableAltered(slot) => (ObjectRef::Table(slot as usize), Mutation::Alter),
-        ViewCreated(slot) => (ObjectRef::View(slot as usize), Mutation::Create),
-        ViewDropped(slot) => (ObjectRef::View(slot as usize), Mutation::Drop),
-        ViewSchemaChanged { slot, .. } => (ObjectRef::View(slot as usize), Mutation::Alter),
+        ViewChanged(crate::storage::ViewPublication::Created(undo)) => {
+            (ObjectRef::View(undo.slot()), Mutation::Create)
+        }
+        ViewDropped(undo) => (ObjectRef::View(undo.slot()), Mutation::Drop),
+        ViewChanged(crate::storage::ViewPublication::Altered(undo)) => {
+            (ObjectRef::View(undo.slot()), Mutation::Alter)
+        }
         RoutineCreated(slot) => (ObjectRef::Routine(slot as usize), Mutation::Create),
         RoutineDropped(slot) => (ObjectRef::Routine(slot as usize), Mutation::Drop),
         RoutineReplaced { slot, .. } | RoutineIdentityAltered { slot, .. } => {
@@ -761,9 +765,15 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         TriggerCreated(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Create),
         TriggerDropped(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Drop),
         TriggerAltered { slot, .. } => (ObjectRef::Trigger(slot as usize), Mutation::Alter),
-        RuleCreated { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Create),
-        RuleDropped(slot) => (ObjectRef::Rule(slot as usize), Mutation::Drop),
-        RuleAltered { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Alter),
+        RuleChanged { publication, .. } => (
+            ObjectRef::Rule(publication.slot()),
+            match publication {
+                crate::storage::RulePublication::Created(_) => Mutation::Create,
+                crate::storage::RulePublication::Altered(_) => Mutation::Alter,
+            },
+        ),
+        RuleDropped(undo) => (ObjectRef::Rule(undo.slot()), Mutation::Drop),
+        RuleAltered(undo) => (ObjectRef::Rule(undo.slot()), Mutation::Alter),
         PolicyCreated(slot) => (ObjectRef::Policy(slot as usize), Mutation::Create),
         PolicyDropped(slot) => (ObjectRef::Policy(slot as usize), Mutation::Drop),
         PolicyAltered { slot, .. } => (ObjectRef::Policy(slot as usize), Mutation::Alter),
@@ -789,6 +799,9 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
             (ObjectRef::Subscription(slot as usize), Mutation::Alter)
         }
         MatviewCreated(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Create),
+        MatviewPopulationChanged(undo) => {
+            (ObjectRef::MaterializedView(undo.slot()), Mutation::Alter)
+        }
         MatviewDropped(slot) => (ObjectRef::MaterializedView(slot as usize), Mutation::Drop),
         SequenceCreated(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Create),
         SequenceDropped(slot) => (ObjectRef::Sequence(slot as usize), Mutation::Drop),

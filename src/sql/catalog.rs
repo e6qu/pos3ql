@@ -18650,32 +18650,30 @@ fn pg_class<'a>(
         } else {
             0
         };
+        let materialized = storage
+            .matviews_visible_to(txid)
+            .find(|(_, view)| usize::from(view.backing_table) == slot);
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
         let relkind = if table_def.kind == crate::storage::TableKind::Foreign {
             "f"
         } else if table_def.partition.is_partitioned() {
             "p"
-        } else if storage
-            .find_matview(table_def.schema.as_str(), table_def.name.as_str(), txid)
-            .is_some()
-        {
+        } else if materialized.is_some() {
             "m"
         } else {
             "r"
         };
-        let relation_object = storage
-            .matview_slot(table_def.schema.as_str(), table_def.name.as_str(), txid)
-            .map_or(
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Table,
-                    slot: slot as u16,
-                },
-                |matview| crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::MaterializedView,
-                    slot: matview as u16,
-                },
-            );
+        let relation_object = materialized.map_or(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Table,
+                slot: slot as u16,
+            },
+            |(matview, _)| crate::storage::AccessObject {
+                class: crate::storage::AccessClass::MaterializedView,
+                slot: matview as u16,
+            },
+        );
         let relation_owner = storage.role_oid(storage.object_owner(relation_object, txid));
         let reloptions = match table_def.storage_options.fillfactor {
             Some(fillfactor) => Datum::Array {
@@ -18724,7 +18722,8 @@ fn pg_class<'a>(
                     0
                 }),
                 text(
-                    core::str::from_utf8(&[table_def.persistence.code()]).unwrap_or("p"),
+                    core::str::from_utf8(&[table_def.persistence.code()])
+                        .expect("persistence code is ASCII"),
                     arena,
                 )?,
                 text(
@@ -18744,7 +18743,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 reloptions,
-                Datum::Bool(true),
+                Datum::Bool(materialized.is_none_or(|(_, view)| view.populated_for(txid))),
                 table_def
                     .partition
                     .attachment
@@ -20326,7 +20325,7 @@ fn pg_depend<'a>(
         .sum::<usize>();
     let view_dependencies = storage
         .views_visible_to(txid)
-        .map(|(slot, _)| 1 + dependency_capacity(storage.view_dependencies(slot).entries()))
+        .map(|(slot, _)| 1 + dependency_capacity(storage.view_dependencies(slot, txid).entries()))
         .sum::<usize>();
     let rule_dependencies = storage
         .rules_visible_to(txid)
@@ -20786,7 +20785,7 @@ fn pg_depend<'a>(
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
         push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
         for dependency in storage
-            .snapshot_view_dependencies(view_slot, arena)?
+            .snapshot_view_dependencies(view_slot, txid, arena)?
             .entries()
         {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
@@ -30386,7 +30385,7 @@ fn pg_matviews<'a>(
                         .iter()
                         .any(|index| index.table_slot == storage.matview_table(slot)),
                 ),
-                Datum::Bool(mv.populated),
+                Datum::Bool(mv.populated_for(txid)),
                 text(
                     arena
                         .alloc_str(mv.sql.as_str())
@@ -31268,7 +31267,7 @@ fn info_view_table_usage<'a>(
     let mut count = 0usize;
     for (view_slot, _) in storage.views_visible_to(txid) {
         for dependency in storage
-            .snapshot_view_dependencies(view_slot, arena)?
+            .snapshot_view_dependencies(view_slot, txid, arena)?
             .entries()
         {
             if matches!(
@@ -31287,7 +31286,7 @@ fn info_view_table_usage<'a>(
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
         for dependency in storage
-            .snapshot_view_dependencies(view_slot, arena)?
+            .snapshot_view_dependencies(view_slot, txid, arena)?
             .entries()
         {
             let (schema, name): (SqlName, SqlName) = match dependency.class {
@@ -31343,7 +31342,7 @@ fn info_view_column_usage<'a>(
     let def = schema::require("view_column_usage", true);
     let mut count = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+        let dependencies = storage.snapshot_view_dependencies(view_slot, txid, arena)?;
         for dependency in dependencies.entries() {
             if dependency.class == crate::storage::DependencyClass::Table {
                 let table_slot = dependency.slot as usize;
@@ -31400,7 +31399,7 @@ fn info_view_column_usage<'a>(
         .map_err(|_| arena_full())?;
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+        let dependencies = storage.snapshot_view_dependencies(view_slot, txid, arena)?;
         for dependency in dependencies.entries() {
             match dependency.class {
                 crate::storage::DependencyClass::Table => {

@@ -8,6 +8,29 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn metadata_sequence_comment_reuse_keeps_replacement() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("metadata-sequence-comments-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_sequences = 2;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!(
+                "../../tests/external/differential_exact/06_metadata_comment_lifetimes.sql"
+            ),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["fresh", "replacement"]);
+    }
+}
+
+#[test]
 fn view_replacement_preserves_identity_without_spare_catalog_slots() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

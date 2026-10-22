@@ -1,0 +1,55 @@
+name: Shared metadata validation
+
+on:
+  push:
+    branches: [finish-shared-metadata-lifetimes]
+
+concurrency:
+  group: shared-metadata-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify PostgreSQL reference behavior
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess
+          sql = pathlib.Path("tests/external/differential_exact/06_metadata_comment_lifetimes.sql").read_bytes()
+          output = subprocess.check_output([
+              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+              "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+          ], input=sql).decode().splitlines()
+          assert output == ["fresh", "replacement"], output
+          print("PostgreSQL reference:", output)
+          PYTHON
+      - name: Prove the original sequence-comment failure
+        run: |
+          set +e
+          cargo test --release --lib --locked \
+            sql::tests::metadata_sequence_comment_reuse_keeps_replacement -- --exact \
+            > "$RUNNER_TEMP/metadata-baseline.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/metadata-baseline.log"
+          test "$result" -eq 101
+          grep -F 'test sql::tests::metadata_sequence_comment_reuse_keeps_replacement ... FAILED' "$RUNNER_TEMP/metadata-baseline.log"
+          grep -F 'left: ["retiring", "missing"]' "$RUNNER_TEMP/metadata-baseline.log"
+          grep -F 'right: ["fresh", "replacement"]' "$RUNNER_TEMP/metadata-baseline.log"
+          grep -F 'test result: FAILED. 0 passed; 1 failed; 0 ignored;' "$RUNNER_TEMP/metadata-baseline.log"

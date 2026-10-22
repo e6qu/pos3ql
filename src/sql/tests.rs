@@ -148,8 +148,8 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             config.max_ddl_per_transaction = 16;
             config.object_store_on = true;
             config.object_store_sim = true;
-            // Simulator uploads grow fixture vectors; keep commit and prepare
-            // outside allocation guards while guarding transactional edits and reads.
+            // Simulator uploads grow fixture vectors. Guard transactional edits
+            // and direct reads; commit, prepare and view materialization upload blocks.
             config.wal_upload = true;
             config.wal_upload_sync = true;
             config.object_store_bucket = format!("{name}-{}", std::process::id());
@@ -192,7 +192,7 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
                 data_rows(&cold_session.success(&mut cold, identity_sql, true)),
                 identity
             );
-            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT value FROM lifecycle_view; SELECT value FROM lifecycle_dependent; SELECT obj_description('lifecycle_view'::regclass)", true)), if committed { vec!["2", "2", "retained comment"] } else { vec!["1", "1", "retained comment"] });
+            assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT value FROM lifecycle_view; SELECT value FROM lifecycle_dependent; SELECT obj_description('lifecycle_view'::regclass)", false)), if committed { vec!["2", "2", "retained comment"] } else { vec!["1", "1", "retained comment"] });
             assert_eq!(data_rows(&cold_session.success(&mut cold, "SELECT relispopulated FROM pg_class WHERE relname = 'lifecycle_mat'; SELECT ispopulated FROM pg_matviews WHERE matviewname = 'lifecycle_mat'; SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_rule'", true)), if committed { vec!["t", "t", "1"] } else { vec!["f", "f", "0"] });
             if committed {
                 assert_eq!(

@@ -42,7 +42,11 @@ impl<'storage> TableDefinitionEdit<'storage> {
     ) -> Result<(), SqlError> {
         let (mut comments, _source) = loop {
             let comments = self.storage.comment_catalog();
-            if !definition.requires_type_catalog() {
+            if !definition.requires_type_catalog()
+                && definition.schema == self.definition.committed.schema
+                && definition.name == self.definition.committed.name
+                && self.definition.pending.is_none()
+            {
                 break (comments, None);
             }
             match super::row_ownership::try_mutex(
@@ -50,6 +54,14 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 "type catalog lock poisoned",
             ) {
                 Ok(source) => {
+                    self.storage.require_row_type_name(
+                        &source,
+                        definition.schema,
+                        definition.name,
+                        transaction,
+                        Some(super::RuleTarget::Table(self.table as u16)),
+                        None,
+                    )?;
                     source.bind_table_definition(&mut definition, transaction)?;
                     break (comments, Some(source));
                 }
@@ -144,6 +156,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             self.storage.max_catalog_versions_per_object,
         )?;
         comment_identity.apply(&mut comments);
+        self.definition.publish_names();
         Ok(())
     }
 

@@ -126,6 +126,19 @@ impl TableDefinition {
         Ok(DefinitionWrite::shared(state, &self.names))
     }
 
+    pub(super) fn row_type_name_conflict(
+        &self,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Result<bool, u32> {
+        self.names
+            .read()
+            .expect("table name lock poisoned")
+            .row_type_name_conflict(database, schema, name, transaction)
+    }
+
     pub(super) fn read(&self) -> RwLockReadGuard<'_, DefinitionState> {
         self.state.read().expect("table definition lock poisoned")
     }

@@ -74,31 +74,33 @@ pub(super) fn allocate(
         storage.clear_table_rows(slot);
         let table = &storage.tables[slot];
         let mut state = table.definition.write();
-        let source = if def.requires_type_catalog() {
-            match super::row_ownership::try_mutex(
-                &storage.type_catalog,
-                "type catalog lock poisoned",
-            ) {
-                Ok(source) => Some(source),
-                Err(wait) => {
-                    drop(state);
-                    drop(lifecycle);
-                    drop(names);
-                    #[cfg(test)]
-                    storage
-                        .type_publication
-                        .waits
-                        .fetch_add(1, core::sync::atomic::Ordering::Release);
-                    wait.wait();
-                    continue;
-                }
+        let source = match super::row_ownership::try_mutex(
+            &storage.type_catalog,
+            "type catalog lock poisoned",
+        ) {
+            Ok(source) => source,
+            Err(wait) => {
+                drop(state);
+                drop(lifecycle);
+                drop(names);
+                #[cfg(test)]
+                storage
+                    .type_publication
+                    .waits
+                    .fetch_add(1, core::sync::atomic::Ordering::Release);
+                wait.wait();
+                continue;
             }
-        } else {
-            None
         };
-        if let Some(source) = &source {
-            source.bind_table_definition(&mut def, transaction.unwrap_or(0))?;
-        }
+        storage.require_row_type_name(
+            &source,
+            def.schema,
+            def.name,
+            transaction.unwrap_or(0),
+            Some(super::RuleTarget::Table(slot as u16)),
+            None,
+        )?;
+        source.bind_table_definition(&mut def, transaction.unwrap_or(0))?;
         let created_at = storage.catalog_sequence.next()?;
         state.committed = def;
         state.pending_has_rules_txid = None;

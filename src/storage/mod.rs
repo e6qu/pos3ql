@@ -40466,9 +40466,7 @@ impl Storage {
         let ownership = self.initial_ownership(txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
-            type_contracts::CatalogPublicationInput::QueryDefinition(
-                definition.query.dependencies.view(),
-            ),
+            type_contracts::CatalogPublicationInput::ViewDefinition,
             None,
         );
         let catalog = &mut owners.catalog;
@@ -40495,6 +40493,17 @@ impl Storage {
                 name.as_str()
             ));
         }
+        self.require_row_type_name(
+            owners
+                .types
+                .as_deref()
+                .expect("view creation owns the type catalog"),
+            schema,
+            name,
+            txid,
+            existing.map(|slot| RuleTarget::View(slot as u16)),
+            Some(&**catalog),
+        )?;
         let Some(new) = catalog
             .views
             .iter()
@@ -40767,6 +40776,20 @@ impl Storage {
             let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
+        {
+            let types = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.require_row_type_name(
+                &types,
+                schema,
+                old_name,
+                txid,
+                Some(RuleTarget::View(slot as u16)),
+                None,
+            )?;
+        }
         self.view_rule_catalog().views[slot].pending_schema =
             Some(PendingObjectSchema { txid, schema });
         let visible_schema = self.view(slot).schema_for(txid);
@@ -40858,6 +40881,20 @@ impl Storage {
             let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
+        {
+            let types = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.require_row_type_name(
+                &types,
+                old_schema,
+                name,
+                txid,
+                Some(RuleTarget::View(slot as u16)),
+                None,
+            )?;
+        }
         self.view_rule_catalog().views[slot].pending_name = Some(PendingViewName { txid, name });
         let new_schema = self.view(slot).schema_for(txid);
         let new_name = self.view(slot).name_for(txid);

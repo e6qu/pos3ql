@@ -146,6 +146,20 @@ def exercise_type_namespace(host, port, user):
                                 observations.append((type_name, relation_name, operation, outcome))
                             finally:
                                 connection.execute("ROLLBACK")
+                for type_name, create_type, alter_type in types:
+                    for existing_name, create_existing, _ in types:
+                        connection.execute("BEGIN")
+                        try:
+                            connection.execute(create_existing.format("public.occupied"))
+                            connection.execute(create_type.format("public.source"))
+                            try:
+                                connection.execute(f"ALTER {alter_type} public.source RENAME TO occupied")
+                                outcome = "ok"
+                            except psycopg.Error as error:
+                                outcome = error.sqlstate
+                            observations.append((type_name, "named_" + existing_name, "rename_type", outcome))
+                        finally:
+                            connection.execute("ROLLBACK")
         finally:
             admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
     return observations

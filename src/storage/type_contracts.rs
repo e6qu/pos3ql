@@ -199,6 +199,7 @@ impl<Catalog: CatalogTypeDestination> CatalogTypeOwners<'_, Catalog> {
 
 pub(super) enum CatalogPublicationInput<'input> {
     RoutineContract,
+    ViewDefinition,
     QueryDefinition(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
 }
@@ -237,7 +238,7 @@ struct QueryTableOwners<'storage> {
 impl CatalogPublicationInput<'_> {
     fn requires_catalog(&self) -> bool {
         match self {
-            Self::RoutineContract | Self::RuleMetadataEdit => true,
+            Self::RoutineContract | Self::RuleMetadataEdit | Self::ViewDefinition => true,
             Self::QueryDefinition(dependencies) => {
                 dependencies.entries().iter().any(|dependency| {
                     matches!(
@@ -255,7 +256,7 @@ impl CatalogPublicationInput<'_> {
 pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogTypeDestination> {
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
-    types: Option<MutexGuard<'storage, TypeCatalog>>,
+    pub(super) types: Option<MutexGuard<'storage, TypeCatalog>>,
     target: Option<QueryTableOwners<'storage>>,
     pub(super) comments: Option<MutexGuard<'storage, super::CommentCatalog>>,
 }

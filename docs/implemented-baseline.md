@@ -813,9 +813,9 @@ SELECT total FROM totals; -- 55000: the refresh was rolled back
 ```
 
 `pg_class.relispopulated`, `pg_matviews.ispopulated` and readable rows follow
-transaction and savepoint rollback together. Journal and checkpoint recovery,
-including prepared commit and rollback, preserve these identities and results
-without the server's local caches.
+transaction and savepoint rollback together. Cold recovery qualification remains
+open: the new restart test detects a changed `_RETURN` rule identifier.
+The [plan](../PLAN.md) retains this repair as a completion requirement.
 
 ### Changing rewrite rules
 
@@ -838,6 +838,8 @@ restart; rollback restores the old names.
 Replacing a rule preserves its enable mode. Rule renames reject an already used
 name, including the rule's current name; the internal `_RETURN` rule cannot be
 renamed.
+Enable-mode commands use `ALTER TABLE` on a table; applying them to a view
+returns `42809` as in PostgreSQL.
 
 Tables, views and accounts have distinct lock identities. Account locks use
 durable identifiers, so they do not transfer to a reused catalog position.

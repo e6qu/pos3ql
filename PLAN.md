@@ -47,6 +47,10 @@ wait, and keep old row, index and backup data until their readers have finished.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion.
 
+Preserve view and internal `_RETURN` rule identifiers through journal and
+checkpoint recovery, including gaps left by rolled-back creation. Keep this
+identity check passing before completing the shared-query publication batch.
+
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.

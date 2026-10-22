@@ -161,7 +161,7 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid, relation.relowner FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'lifecycle_view' AND rewrite.rulename = '_RETURN'";
             let identity = data_rows(&session.success(&mut engine, identity_sql, true));
             assert_eq!(identity.len(), 1);
-            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING; ALTER TABLE lifecycle_view DISABLE RULE lifecycle_rule; CREATE OR REPLACE RULE lifecycle_rule AS ON INSERT TO lifecycle_view DO INSTEAD NOTHING", true);
+            session.success(&mut engine, "BEGIN; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 2 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; SAVEPOINT retained; CREATE OR REPLACE VIEW lifecycle_view AS SELECT 99 AS value; REFRESH MATERIALIZED VIEW lifecycle_mat; ROLLBACK TO retained; CREATE RULE lifecycle_rule AS ON INSERT TO lifecycle_base DO INSTEAD NOTHING; ALTER TABLE lifecycle_base DISABLE RULE lifecycle_rule; CREATE OR REPLACE RULE lifecycle_rule AS ON INSERT TO lifecycle_base DO INSTEAD NOTHING", true);
             if decision == "COMMIT" {
                 session.success(&mut engine, "COMMIT", false);
             } else {
@@ -221,6 +221,59 @@ fn query_lifecycle_view_identity_and_refresh_state_survive_disposable_disk_recov
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
         }
+    }
+}
+
+#[test]
+fn query_lifecycle_recovery_keeps_view_slots_left_between_rolled_back_creations() {
+    for checkpoint in [false, true] {
+        let mut config = test_config(&format!("view-catalog-gap-{checkpoint}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket =
+            format!("view-catalog-gap-{checkpoint}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut first =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut second =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        first.success(
+            &mut engine,
+            "BEGIN; CREATE VIEW rolled_back_view AS SELECT 1 AS value",
+            true,
+        );
+        second.success(
+            &mut engine,
+            "CREATE VIEW retained_gap_view AS SELECT 2 AS value",
+            false,
+        );
+        first.success(&mut engine, "ROLLBACK", false);
+        let identity_sql = "SELECT relation.oid, relation.reltype, row_type.typarray, rewrite.oid FROM pg_class relation JOIN pg_type row_type ON row_type.oid = relation.reltype JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid WHERE relation.relname = 'retained_gap_view' AND rewrite.rulename = '_RETURN'";
+        let original = data_rows(&second.success(&mut engine, identity_sql, true));
+        assert_eq!(original.len(), 1);
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(first);
+        drop(second);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(
+            data_rows(&session.success(&mut cold, identity_sql, true)),
+            original,
+            "checkpoint={checkpoint}"
+        );
+        drop(session);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
 }
 

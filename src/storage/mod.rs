@@ -40529,12 +40529,8 @@ impl Storage {
         Ok(slot)
     }
 
-    /// Registers a view as an uncommitted CREATE owned by `txid` (other
-    /// transactions keep seeing the committed catalog until commit).
-    /// `or_replace` marks an existing visible view pending-dropped. Returns
-    /// `(new_slot, replaced_old_slot)`. Errors if the name is taken by a
-    /// table, by a view visible to `txid` (without `or_replace`), or by
-    /// another transaction's uncommitted view DDL.
+    /// Creates a view or stages a replacement while preserving its identities.
+    /// Other transactions retain the committed definition until publication.
     pub(crate) fn create_view(
         &self,
         schema: SqlName,

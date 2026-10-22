@@ -37724,7 +37724,7 @@ fn alter_table_rule_enabled(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    target: crate::storage::RuleTarget,
+    table: usize,
     relation: &str,
     name: &str,
     enabled: crate::sql::ast::TriggerEnableMode,
@@ -37732,6 +37732,7 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    let target = crate::storage::RuleTarget::Table(table as u16);
     if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
@@ -65315,11 +65316,17 @@ fn alter_table_relation(
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
+            Some(crate::storage::ResolvedRelation::View(_))
+                if matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]) =>
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a table",
+                    statement.table.name
+                ));
+            }
             Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(
-                    statement.actions,
-                    [AlterAction::SetTriggerEnabled { .. } | AlterAction::SetRuleEnabled { .. }]
-                ) =>
+                if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) =>
             {
                 if emit_completion
                     && let Err(error) = storage.require_owner(
@@ -65349,18 +65356,6 @@ fn alter_table_relation(
                         *target,
                         *enabled,
                         !statement.only,
-                        responder,
-                        emit_completion,
-                        tag,
-                    ),
-                    [AlterAction::SetRuleEnabled { name, enabled }] => alter_table_rule_enabled(
-                        storage,
-                        wal,
-                        txn,
-                        crate::storage::RuleTarget::View(view as u16),
-                        relation.as_str(),
-                        name,
-                        *enabled,
                         responder,
                         emit_completion,
                         tag,
@@ -65586,7 +65581,7 @@ fn alter_table_relation(
             storage,
             wal,
             txn,
-            crate::storage::RuleTarget::Table(table_index as u16),
+            table_index,
             def.name.as_str(),
             name,
             *enabled,

@@ -154,6 +154,11 @@ ROLLBACK;
 SELECT value, obj_description('view_replacement_identity'::regclass)
   FROM view_replacement_identity;
 CREATE RULE remembered_view_rule AS ON INSERT TO view_replacement_identity DO INSTEAD NOTHING;
+CREATE RULE retained_enabled_rule AS ON INSERT TO view_catalog_source DO INSTEAD NOTHING;
+ALTER TABLE view_catalog_source DISABLE RULE retained_enabled_rule;
+CREATE OR REPLACE RULE retained_enabled_rule AS ON INSERT TO view_catalog_source DO INSTEAD NOTHING;
+SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'retained_enabled_rule';
+DROP RULE retained_enabled_rule ON view_catalog_source;
 COMMENT ON RULE remembered_view_rule ON view_replacement_identity IS 'original rule comment';
 ALTER RULE remembered_view_rule ON view_replacement_identity RENAME TO remembered_view_rule;
 ALTER RULE "_RETURN" ON view_replacement_identity RENAME TO renamed_return;

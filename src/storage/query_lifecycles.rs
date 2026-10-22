@@ -333,10 +333,10 @@ impl Storage {
             .entries
             .iter_mut()
             .filter(|comment| {
-                comment
-                    .pending_drop
-                    .is_none_or(|pending| pending.source == source)
-                    && comment.used
+                comment.pending_drop.map_or_else(
+                    || rule.ddl_state.pending_drop_txid().is_none(),
+                    |pending| pending.source == source,
+                ) && comment.used
                     && comment.database == Some(current_database())
                     && comment.class == super::CommentClass::Rule
                     && comment.name == rule.definition.name

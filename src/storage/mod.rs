@@ -44543,6 +44543,27 @@ impl Storage {
                     def.table.as_str()
                 )
             })?;
+        let table_lifecycle = self.tables[table].lifecycle();
+        let state = self.tables[table].definition.read();
+        let selected_names = state
+            .pending
+            .filter(|head| head.transaction == txid)
+            .map_or((state.committed.schema, state.committed.name), |head| {
+                (head.schema, head.name)
+            });
+        if !state.identity.existence.visible_to(txid) || selected_names != (def.schema, def.table) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index source table changed before installation"
+            ));
+        }
+        if let Some(owner) = state.locked_by_other(txid) {
+            drop(state);
+            drop(table_lifecycle);
+            return Err(self.catalog_ddl_wait_error(txid, owner, def.table.as_str()));
+        }
+        drop(state);
+        let _table_lifecycle = table_lifecycle;
         def.table_binding = Some(self.capture_index_binding(table, txid));
         if self
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)

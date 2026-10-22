@@ -10,7 +10,8 @@ use super::table_names::{
 };
 
 use super::{
-    CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot, TableDef,
+    CatalogDdlState, DatabaseOid, MAX_COLUMNS, Ownership, PendingTableDef, PendingTableDefSlot,
+    TableDef,
 };
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;

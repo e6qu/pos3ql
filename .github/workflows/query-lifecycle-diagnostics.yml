@@ -1,0 +1,64 @@
+name: Query lifecycle diagnostics
+
+on:
+  push:
+    branches: [protect-shared-query-lifecycles]
+
+concurrency:
+  group: query-lifecycle-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+      - name: Verify explicit transaction modes and scheduler waits
+        run: |
+          set -euo pipefail
+          python3 tools/test_command.py cargo test --lib --locked -- --exact \
+            sql::tests::relation_mode_changes_check_ownership_locks_and_relation_kinds \
+            --test-threads=1 | tee "$RUNNER_TEMP/relation-mode-tests.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/relation-mode-tests.log"
+
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Verify native debugger
+        run: gdb --version
+      - name: Python environment
+        uses: ./.github/actions/python-test-environment
+      - name: Expose PostgreSQL 18 client
+        run: |
+          mkdir -p .ci-bin
+          cat > .ci-bin/psql <<'SH'
+          #!/bin/sh
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 psql "$@"
+          SH
+          chmod +x .ci-bin/psql
+          .ci-bin/psql --version
+      - name: Reproduce instrumented protocol and durability behavior
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PGBIN: /usr/lib/postgresql/18/bin
+          POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          COVERAGE_SHARD: run:proto,dur
+          COVERAGE_LCOV: ${{ github.workspace }}/query-lifecycle-diagnostics.lcov
+        run: sh tools/coverage.sh

@@ -6094,6 +6094,9 @@ def main():
         except Exception as error:
             traceback.print_exc()
             check(f"{t.__name__} raised {type(error).__name__}", False, str(error))
+            if isinstance(error, TimeoutError):
+                print("stopping at the first transport timeout; inspect the server diagnostics", flush=True)
+                break
     if failures:
         print(f"\n{len(failures)} wire probe(s) FAILED: {failures}")
         sys.exit(1)

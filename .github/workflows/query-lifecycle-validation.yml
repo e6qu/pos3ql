@@ -33,7 +33,8 @@ jobs:
         run: >-
           python3 tools/test_command.py cargo test --lib --locked -- view_ rule_
           materialized_ type_ catalog_creation_ query_lifecycle_ wal::tests::
-          checkpoint::tests:: --test-threads=1
+          checkpoint::stored_dependency_tests:: current_manifest_cold_recovery_
+          --test-threads=1
       - name: Clippy
         if: always()
         run: cargo clippy --all-targets -- -D warnings

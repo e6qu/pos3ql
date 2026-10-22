@@ -258,6 +258,12 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let slot = identity.slot();
         let rule_slot = identity.return_rule_slot();
+        if self.find_schema_visible(schema.as_str(), 0).is_none() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "journal view schema is unavailable"
+            ));
+        }
         let initial_owner = self.initial_ownership(0)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -1985,6 +1991,19 @@ mod tests {
         let mut storage = fixture(3);
         let identity = ViewCatalogIdentity::new(2, 7, 2, 8).unwrap();
         crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .replay_view(
+                        identity,
+                        name("missing_schema"),
+                        name("restored_view"),
+                        test_view_definition(StoredQueryDependencies::EMPTY)
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.view(2).ddl_state, CatalogDdlState::Absent);
             storage
                 .replay_view(
                     identity,

@@ -238,7 +238,7 @@ identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-current journal records or manifest v19. Kind 153 applies to ordinary row writes
+current journal records or manifest v20. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
 Journal routine type references identify their saved source lifetime. Replay

@@ -6743,12 +6743,12 @@ impl Engine {
                     );
                 }
                 DdlUndo::Dropped(undo) => {
-                    if let Some((schema, name)) = self
+                    if self
                         .storage
                         .finish_table_drop(*undo, crate::storage::CatalogDdlDecision::Commit)
+                        .is_some()
                     {
-                        self.storage
-                            .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+                        self.storage.commit_indexes_for(undo.slot(), txn.txid);
                     }
                 }
                 DdlUndo::TableAltered(_) => {}
@@ -19672,10 +19672,11 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
     match undo {
         DdlUndo::Created(slot) => storage.rollback_create(slot as usize),
         DdlUndo::Dropped(undo) => {
-            if let Some((schema, name)) =
-                storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback)
+            if storage
+                .finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback)
+                .is_some()
             {
-                storage.rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+                storage.rollback_indexes_for(undo.slot(), txid);
             }
         }
         DdlUndo::TableAltered(slot) => {
@@ -20296,7 +20297,7 @@ fn replay_transaction_batches(
                                 .slot_mut(slot)
                                 .transaction
                                 .record_table_drop(storage, change)?;
-                            storage.drop_indexes_for(schema, name, transaction_id);
+                            storage.drop_indexes_for(table, transaction_id);
                         }
                         WalOp::RestoreRoutine {
                             payload,
@@ -21530,8 +21531,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let index = storage.table_replay_slot(identity, schema, name, 0)?;
             storage.commit_drop(index);
-            storage.drop_indexes_for(schema, name, 0);
-            storage.commit_indexes_for(schema, name, 0);
+            storage.drop_indexes_for(index, 0);
+            storage.commit_indexes_for(index, 0);
         }
         WalOp::Upsert {
             schema,
@@ -22674,6 +22675,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     pending_name: None,
                     table: crate::storage::SqlName::parse(table)?,
                     table_binding: None,
+                    pending_table: None,
                     method,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,

@@ -25,24 +25,41 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Formatting
+        id: formatting
+        run: |
+          cargo fmt
+          git diff --binary -- src > "$RUNNER_TEMP/format.patch"
+          test ! -s "$RUNNER_TEMP/format.patch"
+      - name: Retain formatting corrections
+        if: ${{ failure() && steps.formatting.outcome == 'failure' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: table-index-format
+          path: ${{ runner.temp }}/format.patch
       - name: PostgreSQL reference behavior
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
           python3 - <<'PYTHON'
           import os, pathlib, subprocess
-          sql = pathlib.Path("tests/external/differential_exact/10_private_index_bindings.sql").read_bytes()
-          observed = subprocess.check_output([
-              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
-              "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
-          ], input=sql).decode().splitlines()
-          assert observed == ["payload|7", "10|payload|7", "payload|7", "1"], observed
-          print("PostgreSQL reference:", observed)
+          fixtures = {
+              "10_private_index_bindings.sql": ["payload|7", "10|payload|7", "payload|7", "1"],
+              "11_index_schema_names.sql": ["key comment", "key comment", "key comment", "key comment", "fresh", "key comment", "1"],
+          }
+          for filename, expected in fixtures.items():
+              sql = (pathlib.Path("tests/external/differential_exact") / filename).read_bytes()
+              observed = subprocess.check_output([
+                  "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+                  "psql", "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+              ], input=sql).decode().splitlines()
+              assert observed == expected, (filename, observed)
+              print("PostgreSQL reference:", filename, observed)
           PYTHON
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Table and index lifecycle regressions
         run: >-
-          cargo test --release --lib --locked -- private_index_bindings table_name pending_table_definition
-          index_catalog index_slot index_rename metadata_database_copy wal:: checkpoint::
+          cargo test --release --lib --locked -- private_index_ table_name pending_table_definition
+          index_catalog index_slot index_rename metadata_database_copy type_reference_moves type_edits wal:: checkpoint::
           --test-threads=1

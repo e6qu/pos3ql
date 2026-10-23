@@ -876,6 +876,11 @@ Each reserved pending-definition slot includes a 16-bit column transition map
 and a revision number; each index slot includes its table binding. Startup
 accounting uses the complete slot sizes, including padding. These controls do
 not change durable formats or grow at runtime.
+Index names and comments move with their table's schema inside the transaction.
+A conflicting destination name rejects the move before publication. Other
+transactions wait for reserved names; the moving transaction can reuse the old
+name. Savepoints restore both names and comments. Table deletion identifies its
+indexes by the selected table lifetime, including after a rename or schema move.
 
 ### Changing rewrite rules
 

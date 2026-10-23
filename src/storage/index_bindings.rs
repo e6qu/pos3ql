@@ -9,6 +9,246 @@ pub(crate) struct IndexTableBinding {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingIndexTable {
+    pub(super) transaction: u32,
+    pub(super) schema: SqlName,
+    pub(super) table: SqlName,
+}
+
+impl IndexDef {
+    fn pending_owner_other_than(&self, transaction: u32) -> Option<u32> {
+        self.ddl_state
+            .pending_txid()
+            .into_iter()
+            .chain(self.pending_table.map(|pending| pending.transaction))
+            .chain(self.pending_name.map(|pending| pending.txid))
+            .chain(self.pending_definition.map(|pending| pending.txid))
+            .find(|owner| *owner != transaction)
+    }
+
+    pub(super) fn schema_for(self, transaction: u32) -> SqlName {
+        self.pending_table
+            .filter(|pending| pending.transaction == transaction)
+            .map_or(self.schema, |pending| pending.schema)
+    }
+
+    pub(super) fn namespace_blocker(
+        self,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+    ) -> Option<u32> {
+        if self.ddl_state == CatalogDdlState::Absent {
+            return None;
+        }
+        let owner = self
+            .pending_table
+            .map(|pending| pending.transaction)
+            .or(self.pending_name.map(|pending| pending.txid))
+            .or(self.ddl_state.pending_txid())?;
+        (owner != transaction
+            && (self.ddl_state.committed_exists() && self.schema == schema && self.name == name
+                || self.schema_for(owner) == schema && self.name_for(owner) == name))
+            .then_some(owner)
+    }
+}
+
+pub(super) enum IndexNamespaceConflict {
+    Duplicate(SqlName),
+    Wait(u32, SqlName),
+}
+
+impl Storage {
+    pub(super) fn check_index_table_names(
+        indexes: &[IndexDef],
+        source: CatalogObjectIdentity,
+        schema: SqlName,
+        transaction: u32,
+    ) -> Result<(), IndexNamespaceConflict> {
+        for (slot, index) in indexes.iter().enumerate().filter(|(_, index)| {
+            index.ddl_state != CatalogDdlState::Absent
+                && index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == source)
+        }) {
+            if let Some(owner) = index.pending_owner_other_than(transaction) {
+                return Err(IndexNamespaceConflict::Wait(owner, index.name));
+            }
+            if !index.visible_to(transaction) {
+                continue;
+            }
+            let name = index.name_for(transaction);
+            for (_, candidate) in indexes
+                .iter()
+                .enumerate()
+                .filter(|(other, candidate)| *other != slot && candidate.database == index.database)
+            {
+                if let Some(owner) = candidate.namespace_blocker(schema, name, transaction) {
+                    return Err(IndexNamespaceConflict::Wait(owner, name));
+                }
+                if candidate.visible_to(transaction)
+                    && candidate.schema_for(transaction) == schema
+                    && candidate.name_for(transaction) == name
+                {
+                    return Err(IndexNamespaceConflict::Duplicate(name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn move_index_comments(
+        comments: &mut CommentCatalog,
+        before: IndexDef,
+        after: IndexDef,
+        transaction: u32,
+    ) {
+        for comment in comments.entries.iter_mut().filter(|comment| {
+            comment.matches_to(
+                Some(before.database),
+                CommentClass::Relation,
+                before.schema_for(transaction).as_str(),
+                before.name_for(transaction).as_str(),
+                0,
+                transaction,
+            )
+        }) {
+            comment.pending_identity = (comment.schema != after.schema_for(transaction)
+                || comment.name != after.name_for(transaction))
+            .then_some(PendingCommentIdentity {
+                txid: transaction,
+                schema: after.schema_for(transaction),
+                name: after.name_for(transaction),
+            });
+        }
+    }
+
+    pub(super) fn check_index_comment_move(
+        comments: &CommentCatalog,
+        before: IndexDef,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for comment in comments.entries.iter().filter(|comment| {
+            comment.matches_to(
+                Some(before.database),
+                CommentClass::Relation,
+                before.schema_for(transaction).as_str(),
+                before.name_for(transaction).as_str(),
+                0,
+                transaction,
+            )
+        }) {
+            if (schema != before.schema_for(transaction) || name != before.name_for(transaction))
+                && comment
+                    .pending_identity
+                    .is_some_and(|pending| pending.txid != transaction)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index comment identity is owned by another transaction"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_index_table_comments(
+        indexes: &[IndexDef],
+        comments: &CommentCatalog,
+        source: CatalogObjectIdentity,
+        schema: SqlName,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for index in indexes.iter().filter(|index| {
+            index.visible_to(transaction)
+                && index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == source)
+        }) {
+            Self::check_index_comment_move(
+                comments,
+                *index,
+                schema,
+                index.name_for(transaction),
+                transaction,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn stage_index_table_names(
+        indexes: &mut [IndexDef],
+        comments: &mut CommentCatalog,
+        source: CatalogObjectIdentity,
+        schema: SqlName,
+        table: SqlName,
+        transaction: u32,
+    ) {
+        for index in indexes.iter_mut().filter(|index| {
+            index.visible_to(transaction)
+                && index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == source)
+        }) {
+            let before = *index;
+            index.pending_table =
+                (index.schema != schema || index.table != table).then_some(PendingIndexTable {
+                    transaction,
+                    schema,
+                    table,
+                });
+            Self::move_index_comments(comments, before, *index, transaction);
+        }
+    }
+
+    pub(super) fn commit_index_table_names(&self, table: usize, transaction: u32) {
+        let identity = self.tables[table].identity();
+        let source = self.catalog_object_identity(
+            CatalogObjectSlot::Table(table),
+            identity.database,
+            identity.created_at,
+        );
+        let mut comments = self.comment_catalog();
+        let mut indexes = self.index_catalog();
+        for index in indexes.iter_mut().filter(|index| {
+            index
+                .table_binding
+                .is_some_and(|binding| binding.source == source)
+        }) {
+            for comment in comments.entries.iter_mut().filter(|comment| {
+                comment.matches_to(
+                    Some(index.database),
+                    CommentClass::Relation,
+                    index.schema_for(transaction).as_str(),
+                    index.name_for(transaction).as_str(),
+                    0,
+                    transaction,
+                ) && comment
+                    .pending_identity
+                    .is_some_and(|pending| pending.txid == transaction)
+            }) {
+                let pending = comment
+                    .pending_identity
+                    .take()
+                    .expect("selected pending index comment");
+                comment.schema = pending.schema;
+                comment.name = pending.name;
+            }
+            if let Some(pending) = index
+                .pending_table
+                .filter(|pending| pending.transaction == transaction)
+            {
+                index.schema = pending.schema;
+                index.table = pending.table;
+                index.pending_table = None;
+            }
+        }
+    }
+}
+
 impl IndexTableBinding {
     pub(super) fn matches_selected(
         self,
@@ -170,6 +410,51 @@ mod tests {
         definition.columns[0] = column;
         definition.include_columns[0] = included;
         definition
+    }
+
+    #[test]
+    fn private_index_names_reserve_schema_moves_and_restore_comments_without_partial_edits() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let target_schema = SqlName::parse("binding_destination").unwrap();
+        storage.create_schema(target_schema).unwrap();
+        let source = make_def("binding_source", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)]);
+        let table = storage.create_table(source).unwrap();
+        let mut target = make_def("binding_target", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)]);
+        target.schema = target_schema;
+        storage.create_table(target).unwrap();
+        storage.create_table(make_def("binding_replacement", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)])).unwrap();
+        let slot = storage.create_index(index("binding_index", "binding_source", 0, 1), 7).unwrap();
+        storage.commit_index_create(slot);
+        let mut occupied = index("binding_index", "binding_target", 0, 1);
+        occupied.schema = target_schema;
+        let occupied_slot = storage.create_index(occupied, 8).unwrap();
+        storage.commit_index_create(occupied_slot);
+        storage.apply_comment(CommentClass::Relation, source.schema, SqlName::parse("binding_index").unwrap(), 0, Some(StackStr::from_str("index comment"))).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut moved = source;
+            moved.schema = target_schema;
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(SqlName::parse("key").unwrap());
+            mapping[1] = Some(SqlName::parse("payload").unwrap());
+            assert_eq!(storage.write_table_def(table, 7, moved, &mapping, false).unwrap_err().sqlstate, sqlstate::DUPLICATE_TABLE);
+            assert!(storage.pending_table_def(table).is_none());
+            assert!(storage.index(slot).pending_table.is_none());
+            storage.commit_index_drop(occupied_slot);
+            storage.write_table_def(table, 7, moved, &mapping, false).unwrap();
+            assert!(storage.comment_text(CommentClass::Relation, "binding_destination", "binding_index", 0, 7).is_some());
+            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 8).is_some());
+            assert_eq!(storage.create_index(occupied, 8).unwrap_err().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            storage.release_row_locks(8);
+            let replacement = storage.create_index(index("binding_index", "binding_replacement", 0, 1), 7).unwrap();
+            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 7).is_none());
+            storage.rollback_index_create(replacement);
+            storage.rollback_table_def(table, 7);
+            assert!(storage.index(slot).pending_table.is_none());
+            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 7).is_some());
+            assert!(storage.comment_text(CommentClass::Relation, "binding_destination", "binding_index", 0, 7).is_none());
+        });
     }
 
     #[test]

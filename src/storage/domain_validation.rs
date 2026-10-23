@@ -133,6 +133,7 @@ impl Storage {
             edges_needed = edges_needed.checked_add(edges).ok_or_else(full)?;
         }
         let edges = arena.alloc_slice_with(edges_needed, |_| None).map_err(|_| full())?;
+        // Discovery and a possible Value-to-Container upgrade bound each source to two queue entries.
         let queue = arena.alloc_slice_with(count.checked_mul(2).ok_or_else(full)?, |_| 0usize)
             .map_err(|_| full())?;
         {

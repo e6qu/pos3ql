@@ -611,7 +611,9 @@ without scanning old ones. A domain
 whose value is an entire array validates that whole array. Unstored type
 definitions, views and foreign-table columns do not create local values to scan.
 The dependency walk uses statement memory and returns `54000`, "domain dependency
-graph exceeds the statement arena", if that space fills. These rules follow
+graph exceeds the statement arena", if that space fills. Retaining table sources
+can return `54000`, "domain validation table sources exceed the statement arena".
+These rules follow
 [PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The

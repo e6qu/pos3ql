@@ -235,6 +235,12 @@ fn catalog_publication_domain_graph_exhaustion_restores_the_prior_definition() {
         "CREATE DOMAIN capacity_domain AS integer; CREATE TABLE capacity_values (value capacity_domain)", true);
     assert!(error_sqlstates(&created).is_empty());
     assert!(created.windows(12).any(|part| part == b"CREATE TABLE"));
+    for slot in 1..config.max_domains {
+        let sql = format!("CREATE DOMAIN capacity_unused_{slot} AS integer");
+        let output = session.execute(&mut engine, &sql, true);
+        assert!(error_sqlstates(&output).is_empty(), "{sql}: {}", String::from_utf8_lossy(&output));
+    }
+    assert_eq!(engine.storage.domain_count(), config.max_domains);
     let exhausted = session.execute(&mut engine,
         "ALTER DOMAIN capacity_domain ADD CONSTRAINT capacity_positive CHECK (VALUE > 0)", true);
     assert_eq!(error_sqlstates(&exhausted), ["54000"]);

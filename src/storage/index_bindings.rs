@@ -49,7 +49,8 @@ impl IndexDef {
             .or(self.ddl_state.pending_txid())?;
         (owner != transaction
             && self.visible_to(owner)
-            && self.schema_for(owner) == schema && self.name_for(owner) == name
+            && self.schema_for(owner) == schema
+            && self.name_for(owner) == name
             && (!self.ddl_state.committed_exists() || self.schema != schema || self.name != name))
             .then_some(owner)
     }

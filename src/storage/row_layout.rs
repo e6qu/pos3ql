@@ -308,6 +308,79 @@ mod tests {
                 .unwrap();
         });
     }
+
+    #[test]
+    fn row_layout_slot_reuse_resets_layout_without_rebinding_old_readers() {
+        let (mut storage, table, _) = fixture(RelationPersistence::Permanent, 2);
+        crate::mem::guard::forbid_alloc(|| {
+            let original = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    7,
+                )
+                .unwrap()
+                .unwrap();
+            let snapshot = original.snapshot();
+            let rewrite = change(&storage, table, ColType::Int8, true);
+            assert_eq!(storage.commit_table_def(rewrite).unwrap(), Some(true));
+            storage.finish_table_def_commit(table, true);
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def(
+                    "layout_replacement",
+                    &[("note", ColType::Text, false)],
+                ))
+                .unwrap();
+            assert_eq!(replacement, table);
+            let location = storage
+                .heap
+                .append_row(&[Datum::Text("replacement")])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 9))
+                .unwrap();
+            let selected = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    9,
+                )
+                .unwrap()
+                .unwrap();
+            storage
+                .with_row_bytes(table, 1, selected, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Text], &mut values)?;
+                    assert_eq!(values[0], Datum::Text("replacement"));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                storage
+                    .read_row_snapshot(table, 1, snapshot)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            storage
+                .with_row_bytes(table, 1, original, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(11));
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
 }
 
 impl RowLayout {

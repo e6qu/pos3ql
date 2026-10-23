@@ -46110,7 +46110,7 @@ impl Storage {
             if table.database() != database_oid { continue; }
             let definition = table.definition();
             let schema_change = old.schema != def.schema;
-            let follows_schema = schema_change && table.live() && definition.fkeys().iter().any(|key| key.parent_schema == old.schema && key.parent == old.name);
+            let follows_schema = schema_change && definition.identity.live() && definition.fkeys().iter().any(|key| key.parent_schema == old.schema && key.parent == old.name);
             let follows_name = old.name != def.name && definition.fkeys().iter().any(|key| {
                 let schema = if follows_schema && key.parent_schema == old.schema && key.parent == old.name { def.schema } else { key.parent_schema };
                 schema == def.schema && key.parent == old.name

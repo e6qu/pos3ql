@@ -12,6 +12,16 @@ jobs:
   focused:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -49,6 +59,20 @@ jobs:
             ${{ runner.temp }}/validation-fixture-tree
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: PostgreSQL rewrite reference
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess
+          fixture = pathlib.Path("tests/external/differential_exact/18_row_layout.sql").read_text()
+          result = subprocess.run(["docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+              "psql", "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+              input=fixture, text=True, capture_output=True, check=True, timeout=5)
+          expected = ["130|8515|integer", "11|order|bigint", "8|bigint", "replacement"]
+          assert result.stdout.splitlines() == expected, (result.stdout, result.stderr)
+          print("PostgreSQL 18 rewrite, rollback and temporary reuse:", expected)
+          PYTHON
       - name: Row layouts, retained readers, maintenance and transaction recovery
         run: >-
           cargo test --release --lib --locked --

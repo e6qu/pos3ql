@@ -283,6 +283,19 @@ in [PostgreSQL 18's rewrite caveat](https://www.postgresql.org/docs/18/mvcc-cave
 A byte source selected before replacement still reads its original heap or saved
 file. Existing table locks protect SQL reports already reading the affected table.
 
+Finishing a rewrite schedules old history for cleanup instead of walking every
+row during commit. Fresh lookups exclude that history immediately; each background
+cleanup turn visits at most 64 row slots and releases its owners between turns.
+Already selected row bytes remain readable after cleanup. A metadata lookup saved
+before the physical layout changed returns `40001` rather than decoding replacement
+bytes using the old column types. Renames and unrelated row changes do not invalidate
+that lookup. These checks use table publication generations, so temporary changes
+sharing a journal position cannot redirect an old selection to new bytes.
+
+**User example:** deleting most orders and then changing their ID from `integer`
+to `bigint` does not add a second whole-table history sweep to commit. An invoice
+import keeps progressing while old order history is reclaimed in small steps.
+
 Rollback records identify the table's lifetime and the installed definition.
 An old record cannot undo a newer edit or change a replacement table. SQL
 installs the edit and records its undo in one transaction operation, before

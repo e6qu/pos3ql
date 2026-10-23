@@ -1,0 +1,42 @@
+name: Row definition validation
+
+on:
+  push:
+    branches: [bind-row-definition-publication]
+
+concurrency:
+  group: row-definition-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format and record the tested source
+        run: |
+          cargo fmt
+          git diff --binary -- src > "$RUNNER_TEMP/format.patch"
+          git add src
+          git rev-parse HEAD > "$RUNNER_TEMP/validation-head"
+          validation_tree=$(git write-tree)
+          printf '%s\n' "$validation_tree" > "$RUNNER_TEMP/validation-tree"
+          git rev-parse "${validation_tree}:src" > "$RUNNER_TEMP/validation-source-tree"
+      - name: Retain tested source provenance and formatting corrections
+        uses: actions/upload-artifact@v6
+        with:
+          name: row-definition-format
+          path: |
+            ${{ runner.temp }}/format.patch
+            ${{ runner.temp }}/validation-head
+            ${{ runner.temp }}/validation-tree
+            ${{ runner.temp }}/validation-source-tree
+      - name: All-target compilation and lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Row and definition publication regressions
+        run: >-
+          cargo test --release --lib --locked -- row_definition_ row_undo_source_ row_publication:: row_ownership::
+          table_definition_ pending_table_definition type_edits:: query_definition_ copy_ replication_
+          --test-threads=1

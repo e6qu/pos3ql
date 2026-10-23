@@ -52955,8 +52955,8 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let prior_database = current_database();
             crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
-            let foreign = storage
-                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7);
+            let foreign =
+                storage.create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7);
             crate::sql::set_execution_database_oid(prior_database);
             let foreign = foreign.unwrap();
             let local = storage
@@ -52974,7 +52974,10 @@ mod tests {
             let (target, mut renamed) = storage.select_table_definition(foreign, 7);
             renamed.name = SqlName::parse("pending_name").unwrap();
             assert_eq!(
-                storage.write_table_def(target, renamed, &[None; MAX_COLUMNS], false).unwrap_err().sqlstate,
+                storage
+                    .write_table_def(target, renamed, &[None; MAX_COLUMNS], false)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE,
             );
             crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);

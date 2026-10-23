@@ -10,7 +10,10 @@ use crate::mem::mutex::Mutex;
 #[test]
 fn row_definition_writes_survive_rewrite_rollback_replacement_and_cold_recovery() {
     for checkpoint in [false, true] {
-        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
             let name = format!("row-definition-writes-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
@@ -25,21 +28,48 @@ fn row_definition_writes_survive_rewrite_rollback_replacement_and_cold_recovery(
             let mut budget = test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-            assert_eq!(data_rows(&session.success(&mut engine,
-                include_str!("../../tests/external/differential_exact/13_row_definition_writes.sql"), false)),
-                ["1|first|8", "2|second|5", "3|third|9", "1|first|8", "2|second|12", "4|fourth|14"]);
-            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    include_str!(
+                        "../../tests/external/differential_exact/13_row_definition_writes.sql"
+                    ),
+                    false
+                )),
+                [
+                    "1|first|8",
+                    "2|second|5",
+                    "3|third|9",
+                    "1|first|8",
+                    "2|second|12",
+                    "4|fourth|14"
+                ]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
             drop(session);
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             let mut cold_budget = test_engine_budget(&config, 1 << 29);
             let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
-            assert_eq!(data_rows(&session.success(&mut cold,
-                "SELECT id, note, total FROM row_definition_orders ORDER BY id", false)),
-                ["1|first|8", "2|second|12", "4|fourth|14"]);
-            assert_eq!(error_sqlstates(&session.execute(&mut cold,
-                "INSERT INTO row_definition_orders VALUES (2, 'duplicate', 0)", false)), ["23505"]);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    "SELECT id, note, total FROM row_definition_orders ORDER BY id",
+                    false
+                )),
+                ["1|first|8", "2|second|12", "4|fourth|14"]
+            );
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    "INSERT INTO row_definition_orders VALUES (2, 'duplicate', 0)",
+                    false
+                )),
+                ["23505"]
+            );
         }
     }
 }

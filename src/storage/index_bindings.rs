@@ -419,41 +419,116 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let target_schema = SqlName::parse("binding_destination").unwrap();
         storage.create_schema(target_schema).unwrap();
-        let source = make_def("binding_source", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)]);
+        let source = make_def(
+            "binding_source",
+            &[
+                ("key", ColType::Int4, false),
+                ("payload", ColType::Int4, false),
+            ],
+        );
         let table = storage.create_table(source).unwrap();
-        let mut target = make_def("binding_target", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)]);
+        let mut target = make_def(
+            "binding_target",
+            &[
+                ("key", ColType::Int4, false),
+                ("payload", ColType::Int4, false),
+            ],
+        );
         target.schema = target_schema;
         storage.create_table(target).unwrap();
-        storage.create_table(make_def("binding_replacement", &[("key", ColType::Int4, false), ("payload", ColType::Int4, false)])).unwrap();
-        let slot = storage.create_index(index("binding_index", "binding_source", 0, 1), 7).unwrap();
+        storage
+            .create_table(make_def(
+                "binding_replacement",
+                &[
+                    ("key", ColType::Int4, false),
+                    ("payload", ColType::Int4, false),
+                ],
+            ))
+            .unwrap();
+        let slot = storage
+            .create_index(index("binding_index", "binding_source", 0, 1), 7)
+            .unwrap();
         storage.commit_index_create(slot);
         let mut occupied = index("binding_index", "binding_target", 0, 1);
         occupied.schema = target_schema;
         let occupied_slot = storage.create_index(occupied, 8).unwrap();
         storage.commit_index_create(occupied_slot);
-        storage.apply_comment(CommentClass::Relation, source.schema, SqlName::parse("binding_index").unwrap(), 0, Some(StackStr::from_str("index comment"))).unwrap();
+        storage
+            .apply_comment(
+                CommentClass::Relation,
+                source.schema,
+                SqlName::parse("binding_index").unwrap(),
+                0,
+                Some(StackStr::from_str("index comment")),
+            )
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut moved = source;
             moved.schema = target_schema;
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(SqlName::parse("key").unwrap());
             mapping[1] = Some(SqlName::parse("payload").unwrap());
-            assert_eq!(storage.write_table_def(table, 7, moved, &mapping, false).unwrap_err().sqlstate, sqlstate::DUPLICATE_TABLE);
+            assert_eq!(
+                storage
+                    .write_table_def(table, 7, moved, &mapping, false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_TABLE
+            );
             assert!(storage.pending_table_def(table).is_none());
             assert!(storage.index(slot).pending_table.is_none());
             storage.commit_index_drop(occupied_slot);
-            storage.write_table_def(table, 7, moved, &mapping, false).unwrap();
-            assert!(storage.comment_text(CommentClass::Relation, "binding_destination", "binding_index", 0, 7).is_some());
-            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 8).is_some());
-            assert_eq!(storage.create_index(occupied, 8).unwrap_err().sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            storage
+                .write_table_def(table, 7, moved, &mapping, false)
+                .unwrap();
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Relation,
+                        "binding_destination",
+                        "binding_index",
+                        0,
+                        7
+                    )
+                    .is_some()
+            );
+            assert!(
+                storage
+                    .comment_text(CommentClass::Relation, "public", "binding_index", 0, 8)
+                    .is_some()
+            );
+            assert_eq!(
+                storage.create_index(occupied, 8).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
             storage.release_row_locks(8);
-            let replacement = storage.create_index(index("binding_index", "binding_replacement", 0, 1), 7).unwrap();
-            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 7).is_none());
+            let replacement = storage
+                .create_index(index("binding_index", "binding_replacement", 0, 1), 7)
+                .unwrap();
+            assert!(
+                storage
+                    .comment_text(CommentClass::Relation, "public", "binding_index", 0, 7)
+                    .is_none()
+            );
             storage.rollback_index_create(replacement);
             storage.rollback_table_def(table, 7);
             assert!(storage.index(slot).pending_table.is_none());
-            assert!(storage.comment_text(CommentClass::Relation, "public", "binding_index", 0, 7).is_some());
-            assert!(storage.comment_text(CommentClass::Relation, "binding_destination", "binding_index", 0, 7).is_none());
+            assert!(
+                storage
+                    .comment_text(CommentClass::Relation, "public", "binding_index", 0, 7)
+                    .is_some()
+            );
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Relation,
+                        "binding_destination",
+                        "binding_index",
+                        0,
+                        7
+                    )
+                    .is_none()
+            );
         });
     }
 

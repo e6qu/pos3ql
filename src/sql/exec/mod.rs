@@ -5474,7 +5474,14 @@ where
     })?;
     rowenc::encode(&new_values[..def.n_columns], new_bytes);
     let new_image = storage.heap.append_image(new_bytes)?;
-    txn.write_row(storage, row_target, rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked)?;
+    txn.write_row(
+        storage,
+        row_target,
+        rowid,
+        txn.command_id(),
+        Some(new_image),
+        crate::storage::RowWriteStatistics::Tracked,
+    )?;
 
     if referenced_key_changed(
         storage,
@@ -39602,8 +39609,14 @@ pub fn refresh_materialized_view(
             break;
         }
         for &rowid in &rowids[..count] {
-            match txn.write_row(storage, write_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked)
-            {
+            match txn.write_row(
+                storage,
+                write_target,
+                rowid,
+                txn.command_id(),
+                None,
+                crate::storage::RowWriteStatistics::Tracked,
+            ) {
                 Ok(_) => {}
                 Err(e) => return sql_fail(e),
             }
@@ -53104,7 +53117,15 @@ pub(crate) fn apply_replication_insert(
         false,
     )?;
     let (write_target, definition) = storage.select_table_definition(table_index, txn.txid);
-    let mut values = decode_replication_tuple(storage, txn, &definition, binding.remote_to_local(), tuple, arena, false)?;
+    let mut values = decode_replication_tuple(
+        storage,
+        txn,
+        &definition,
+        binding.remote_to_local(),
+        tuple,
+        arena,
+        false,
+    )?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
         explicit[local] = true;
@@ -53357,7 +53378,8 @@ impl<'arena> ReplicationRow<'arena> {
     }
 
     pub(crate) fn definition(&self) -> &TableDef {
-        self.definitions.retained_definition(self.table_slot, self.transaction)
+        self.definitions
+            .retained_definition(self.table_slot, self.transaction)
             .expect("selected replication row retains its definition")
     }
 
@@ -53368,10 +53390,14 @@ impl<'arena> ReplicationRow<'arena> {
         transaction: u32,
     ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {
         if transaction != self.transaction {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
-                "replication row selection belongs to another transaction"));
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "replication row selection belongs to another transaction"
+            ));
         }
-        self.definitions.selection(storage, table, self.transaction).map(|(target, _)| target)
+        self.definitions
+            .selection(storage, table, self.transaction)
+            .map(|(target, _)| target)
     }
 
     pub(crate) fn bytes(&self) -> &'arena [u8] {
@@ -53590,7 +53616,14 @@ fn apply_replication_delete_row(
             MAX_FK_CASCADE_DEPTH,
         )?;
     }
-    txn.write_row(storage, row_target, row.rowid(), txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked)?;
+    txn.write_row(
+        storage,
+        row_target,
+        row.rowid(),
+        txn.command_id(),
+        None,
+        crate::storage::RowWriteStatistics::Tracked,
+    )?;
 
     fire_partition_row_triggers(
         storage,
@@ -53629,7 +53662,15 @@ pub(crate) fn apply_replication_update(
         UpdateIdentity::NewTupleKey => {
             let definitions = storage.table_definition_images();
             let definition = definitions.definition(storage, binding.table_slot(), txn.txid)?;
-            let expected = decode_replication_tuple(storage, txn, definition, binding.remote_to_local(), new, arena, true)?;
+            let expected = decode_replication_tuple(
+                storage,
+                txn,
+                definition,
+                binding.remote_to_local(),
+                new,
+                arena,
+                true,
+            )?;
             for (remote, field) in new.columns().enumerate() {
                 let local = binding.remote_to_local()[remote];
                 if binding.key_local_columns().contains(&local)
@@ -53656,7 +53697,9 @@ pub(crate) fn apply_replication_update(
     let row_table = row.table_slot();
     let logical_target = row.write_target(storage, table_index, txn.txid)?;
     let row_target = row.write_target(storage, row_table, txn.txid)?;
-    let logical_definition = row.definitions.retained_definition(table_index, row.transaction)
+    let logical_definition = row
+        .definitions
+        .retained_definition(table_index, row.transaction)
         .expect("replication selection retains its logical definition");
     let definition = row.definition();
     match storage.acquire_row_lock(
@@ -53677,7 +53720,6 @@ pub(crate) fn apply_replication_update(
     }
     storage.require_subscription_target(row_table, txn.txid)?;
 
-
     let mapping = crate::storage::RelationColumnMap::new(logical_definition, definition, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -53689,7 +53731,15 @@ pub(crate) fn apply_replication_update(
     )?;
     let mut logical_old = [Datum::Null; MAX_COLUMNS];
     mapping.project(&old_values, &mut logical_old);
-    let mut logical_new = decode_replication_tuple(storage, txn, logical_definition, binding.remote_to_local(), new, arena, true)?;
+    let mut logical_new = decode_replication_tuple(
+        storage,
+        txn,
+        logical_definition,
+        binding.remote_to_local(),
+        new,
+        arena,
+        true,
+    )?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
         explicit[local] = true;
@@ -53906,8 +53956,14 @@ pub fn apply_replication_truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Untracked)?;
-
+                txn.write_row(
+                    storage,
+                    row_target,
+                    rowid,
+                    txn.command_id(),
+                    None,
+                    crate::storage::RowWriteStatistics::Untracked,
+                )?;
             }
         }
         if restart_identity {
@@ -57121,7 +57177,7 @@ pub(crate) fn merge<'a>(
             let row_id = ids[j];
             let bytes = target_bytes[j];
             let row_definition = match definitions.definition(storage, row_table, txn.txid) {
-                        Ok(definition) => definition,
+                Ok(definition) => definition,
                 Err(error) => return sql_fail(error),
             };
             let mut row_schema = [ColType::Bool; MAX_COLUMNS];
@@ -57339,7 +57395,8 @@ pub(crate) fn merge<'a>(
                         Err(e) => return sql_fail(e),
                     }
                 }
-                let (row_target, row_definition) = match definitions.selection(storage, target_tables[j], txn.txid) {
+                let (row_target, row_definition) =
+                    match definitions.selection(storage, target_tables[j], txn.txid) {
                         Ok(selection) => selection,
                         Err(error) => return sql_fail(error),
                     };
@@ -57443,7 +57500,14 @@ pub(crate) fn merge<'a>(
                             ) {
                                 return sql_fail(error);
                             }
-                            match txn.write_row(storage, row_target, target_ids[j], txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked) {
+                            match txn.write_row(
+                                storage,
+                                row_target,
+                                target_ids[j],
+                                txn.command_id(),
+                                None,
+                                crate::storage::RowWriteStatistics::Tracked,
+                            ) {
                                 Ok(_) => {}
                                 Err(e) => return sql_fail(e),
                             }
@@ -57664,7 +57728,8 @@ pub(crate) fn merge<'a>(
                             // child-only fields.
                             target_tables[j]
                         };
-                        let (new_target, new_definition) = match definitions.selection(storage, updated_table, txn.txid) {
+                        let (new_target, new_definition) =
+                            match definitions.selection(storage, updated_table, txn.txid) {
                                 Ok(selection) => selection,
                                 Err(error) => return sql_fail(error),
                             };
@@ -57684,7 +57749,7 @@ pub(crate) fn merge<'a>(
                                 txn,
                                 selected_rows[j].expect("local MERGE retains selected row"),
                                 row_target,
-                    row_definition,
+                                row_definition,
                                 target_physical[j],
                                 updated_table,
                                 new_definition,
@@ -57827,17 +57892,30 @@ pub(crate) fn merge<'a>(
                                 Err(e) => return sql_fail(e),
                             };
                             if updated_table == target_tables[j] {
-                                match txn.write_row(storage, new_target, target_ids[j], txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked) {
+                                match txn.write_row(
+                                    storage,
+                                    new_target,
+                                    target_ids[j],
+                                    txn.command_id(),
+                                    Some(image),
+                                    crate::storage::RowWriteStatistics::Tracked,
+                                ) {
                                     Ok(_) => {}
                                     Err(e) => return sql_fail(e),
                                 }
                             } else {
                                 let inserted_rowid = stored_rowid;
-                                match txn.write_row(storage, new_target, inserted_rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked) {
-                                    Ok(_) => {},
+                                match txn.write_row(
+                                    storage,
+                                    new_target,
+                                    inserted_rowid,
+                                    txn.command_id(),
+                                    Some(image),
+                                    crate::storage::RowWriteStatistics::Tracked,
+                                ) {
+                                    Ok(_) => {}
                                     Err(error) => return sql_fail(error),
                                 };
-
                             }
                         }
                         if !foreign_target {
@@ -61237,8 +61315,9 @@ pub(crate) fn update<'a>(
             Ok(b) => b,
             Err(error) => return sql_fail(error),
         };
-        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
-                        Ok(selection) => selection,
+        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid)
+        {
+            Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
         let row_layout = match retained_rows.layout(row_table) {
@@ -61530,10 +61609,11 @@ pub(crate) fn update<'a>(
                     };
                 }
             }
-            (new_target, new_definition) = match definitions.selection(storage, target_table, txn.txid) {
-                Ok(selection) => selection,
-                Err(error) => return sql_fail(error),
-            };
+            (new_target, new_definition) =
+                match definitions.selection(storage, target_table, txn.txid) {
+                    Ok(selection) => selection,
+                    Err(error) => return sql_fail(error),
+                };
             new_layout = match retained_rows.layout(target_table) {
                 Ok(layout) => layout,
                 Err(error) => return sql_fail(error),
@@ -61754,17 +61834,30 @@ pub(crate) fn update<'a>(
             Err(e) => return sql_fail(e),
         };
         if target_table == row_table {
-            match txn.write_row(storage, row_target, rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked) {
+            match txn.write_row(
+                storage,
+                row_target,
+                rowid,
+                txn.command_id(),
+                Some(new_image),
+                crate::storage::RowWriteStatistics::Tracked,
+            ) {
                 Ok(_) => {}
                 Err(e) => return sql_fail(e),
             }
         } else {
             let inserted_rowid = stored_rowid;
-            match txn.write_row(storage, new_target, inserted_rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked) {
-                Ok(_) => {},
+            match txn.write_row(
+                storage,
+                new_target,
+                inserted_rowid,
+                txn.command_id(),
+                Some(new_image),
+                crate::storage::RowWriteStatistics::Tracked,
+            ) {
+                Ok(_) => {}
                 Err(error) => return sql_fail(error),
             };
-
         }
         // With the new parent row in place, apply each referencing key's
         // ON UPDATE action when a referenced column changed (NO ACTION /
@@ -62332,8 +62425,9 @@ pub(crate) fn delete<'a>(
             continue;
         }
         let (row_table, rowid, _) = scratch[i].local_parts();
-        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
-                        Ok(selection) => selection,
+        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid)
+        {
+            Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
         let layout = match retained_rows.layout(row_table) {
@@ -62403,7 +62497,14 @@ pub(crate) fn delete<'a>(
             Ok(false) => continue,
             Err(error) => return sql_fail(error),
         }
-        match txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked) {
+        match txn.write_row(
+            storage,
+            row_target,
+            rowid,
+            txn.command_id(),
+            None,
+            crate::storage::RowWriteStatistics::Tracked,
+        ) {
             Ok(_) => {}
             Err(error) => return sql_fail(error),
         }
@@ -62734,7 +62835,14 @@ pub(crate) fn truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                match txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Untracked) {
+                match txn.write_row(
+                    storage,
+                    row_target,
+                    rowid,
+                    txn.command_id(),
+                    None,
+                    crate::storage::RowWriteStatistics::Untracked,
+                ) {
                     Ok(_) => {}
                     Err(e) => return sql_fail(e),
                 }
@@ -67997,7 +68105,13 @@ fn alter_table_relation(
         }
     }
 
-    let row_write_target = match txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite) {
+    let row_write_target = match txn.write_table_definition(
+        storage,
+        edit_target,
+        new_def,
+        &column_mapping,
+        has_rewrite,
+    ) {
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
@@ -68387,7 +68501,14 @@ fn alter_table_relation(
         let image = rewritten_images[i]
             .take()
             .expect("rewritten input retained");
-        match txn.write_row(storage, row_write_target, rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Untracked) {
+        match txn.write_row(
+            storage,
+            row_write_target,
+            rowid,
+            txn.command_id(),
+            Some(image),
+            crate::storage::RowWriteStatistics::Untracked,
+        ) {
             Ok(_) => {}
             Err(error) => return sql_fail(error),
         }
@@ -69496,7 +69617,14 @@ fn store_row(
         None => storage.next_rowid()?,
     };
     let image = storage.heap.append_row_image(values)?;
-    txn.write_row(storage, target, rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked)?;
+    txn.write_row(
+        storage,
+        target,
+        rowid,
+        txn.command_id(),
+        Some(image),
+        crate::storage::RowWriteStatistics::Tracked,
+    )?;
     Ok(())
 }
 
@@ -71633,7 +71761,8 @@ mod tests {
         config.max_value_indexes = 8;
         config.max_extension_scripts = 8;
         config.extension_script_bytes = 1 << 16;
-        let mut budget = Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config) + (1 << 20));
+        let mut budget =
+            Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config) + (1 << 20));
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let mut definition = TableDef::empty();
         definition.schema = SqlName::parse("public").unwrap();
@@ -71650,28 +71779,67 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let (target, _) = definitions.selection(&storage, table, 7).unwrap();
             let image = storage.heap.append_row_image(&[Datum::Int4(7)]).unwrap();
-            let undo = storage.write_pending_image(target, 1, 2, Some(image), crate::storage::RowWriteStatistics::Tracked).unwrap();
+            let undo = storage
+                .write_pending_image(
+                    target,
+                    1,
+                    2,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Tracked,
+                )
+                .unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-            let home = storage.visible_row_home_at(table, 1, state, 7, crate::storage::SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
+            let home = storage
+                .visible_row_home_at(table, 1, state, 7, crate::storage::SNAPSHOT_ALL, u64::MAX)
+                .unwrap()
+                .unwrap();
             let selected = PhysicalRow::local(table, 1, home.snapshot());
-            let bytes = storage.with_row_bytes(table, 1, home, |bytes| {
-                arena.alloc_slice_copy(bytes).map(|bytes| &*bytes).map_err(|_| arena_full())
-            }).unwrap();
-            let row = ReplicationRow {table_slot: table, rowid: 1, selected, bytes, definitions, transaction: 7};
-            assert_eq!(row.write_target(&storage, table, 8).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            let bytes = storage
+                .with_row_bytes(table, 1, home, |bytes| {
+                    arena
+                        .alloc_slice_copy(bytes)
+                        .map(|bytes| &*bytes)
+                        .map_err(|_| arena_full())
+                })
+                .unwrap();
+            let row = ReplicationRow {
+                table_slot: table,
+                rowid: 1,
+                selected,
+                bytes,
+                definitions,
+                transaction: 7,
+            };
+            assert_eq!(
+                row.write_target(&storage, table, 8).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             assert!(row.definitions.retained_definition(table, 8).is_none());
             let (_, mut changed) = storage.select_table_definition(table, 7);
             changed.columns[0].name = SqlName::parse("renamed").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(changed.columns[0].name);
-            let change = storage.write_table_def(target, changed, &mapping, false).unwrap();
+            let change = storage
+                .write_table_def(target, changed, &mapping, false)
+                .unwrap();
             let original = row.write_target(&storage, table, 7).unwrap();
             let definition = row.definition();
             assert_eq!(original.transaction(), 7);
             assert_eq!(definition.columns()[0].name.as_str(), "id");
             let image = storage.heap.append_row_image(&[Datum::Int4(8)]).unwrap();
-            assert_eq!(storage.write_pending_image(original, 1, 3, Some(image), crate::storage::RowWriteStatistics::Tracked).unwrap_err().sqlstate,
-                sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                storage
+                    .write_pending_image(
+                        original,
+                        1,
+                        3,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Tracked
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             storage.restore_pending(table, 1, 7, undo);
             storage.rollback_table_def(change);
         });

@@ -20615,9 +20615,16 @@ fn replay_transaction_batches(
                             };
                             let image = storage.heap.append_image(row)?;
                             storage.observe_rowid(rowid);
-                            let row_target = storage.select_table_definition(table_slot, transaction_id).0;
+                            let row_target = storage
+                                .select_table_definition(table_slot, transaction_id)
+                                .0;
                             prepared.slot_mut(slot).transaction.write_row(
-                                storage, row_target, rowid, command_id, Some(image), crate::storage::RowWriteStatistics::Untracked
+                                storage,
+                                row_target,
+                                rowid,
+                                command_id,
+                                Some(image),
+                                crate::storage::RowWriteStatistics::Untracked,
                             )?;
                         }
                         WalOp::Delete {
@@ -20632,9 +20639,16 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let row_target = storage.select_table_definition(table_slot, transaction_id).0;
+                            let row_target = storage
+                                .select_table_definition(table_slot, transaction_id)
+                                .0;
                             prepared.slot_mut(slot).transaction.write_row(
-                                storage, row_target, rowid, command_id, None, crate::storage::RowWriteStatistics::Untracked
+                                storage,
+                                row_target,
+                                rowid,
+                                command_id,
+                                None,
+                                crate::storage::RowWriteStatistics::Untracked,
                             )?;
                         }
                         WalOp::SequenceSet {

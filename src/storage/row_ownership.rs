@@ -414,7 +414,13 @@ mod tests {
 
                 let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
                 let undo = storage
-                    .write_pending_image(storage.select_table_definition(other, 9).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(other, 9).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.restore_pending(other, 1, 9, undo);
                 assert!(storage.tables[other].rows.is_empty());

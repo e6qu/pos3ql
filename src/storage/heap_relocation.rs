@@ -1228,7 +1228,13 @@ mod tests {
                     .append_row_image(&[Datum::Int4(id), Datum::Text("later")])
                     .unwrap();
                 storage
-                    .write_pending_image(storage.select_table_definition(table, txid).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(table, txid).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.commit_row(table, 1, txid, lsn).unwrap();
             }
@@ -1377,7 +1383,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(91), Datum::Text("pending")])
                 .unwrap();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(table, 77).0, 65, 1, Some(pending), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 77).0,
+                    65,
+                    1,
+                    Some(pending),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             first.begin(&storage, MaintenanceMode::Background).unwrap();
             reach_heap_cutover(&storage, &mut first);
@@ -1460,7 +1472,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(90), Datum::Text("new")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 77).0, 2, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 77).0,
+                    2,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 2, 77, 9).unwrap();
             storage.remove_row_state(table, 1).unwrap();
@@ -1469,7 +1487,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(91), Datum::Text("reused")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 78).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 78).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 78, 11).unwrap();
             finish_bounded_capture(&storage, &mut work);
@@ -1558,7 +1582,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(20), Datum::Text("reused")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             let other = storage
@@ -1572,7 +1602,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(91), Datum::Text("late")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(other, 10).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(other, 10).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(other, 1, 10, 11).unwrap();
             finish_bounded_capture(&storage, &mut workspace);
@@ -1652,7 +1688,13 @@ mod tests {
                     .append_row_image(&[Datum::Int4(91), Datum::Text("late")])
                     .unwrap();
                 let undo = storage
-                    .write_pending_image(storage.select_table_definition(other, 9).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(other, 9).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.restore_pending(other, 1, 9, undo);
                 finish_bounded_capture(&storage, &mut workspace);
@@ -1737,7 +1779,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(20), Datum::Text("middle")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             workspace
@@ -1761,7 +1809,13 @@ mod tests {
                     .append_row_image(&[Datum::Int4(value), Datum::Text("latest")])
                     .unwrap();
                 storage
-                    .write_pending_image(storage.select_table_definition(at, txid).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(at, txid).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.commit_row(at, 1, txid, lsn).unwrap();
             }
@@ -1826,7 +1880,13 @@ mod tests {
                             .append_row_image(&[Datum::Int4(91), Datum::Text("late")])
                             .unwrap();
                         storage
-                            .write_pending_image(storage.select_table_definition(other, 77).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                            .write_pending_image(
+                                storage.select_table_definition(other, 77).0,
+                                1,
+                                1,
+                                Some(image),
+                                crate::storage::RowWriteStatistics::Untracked,
+                            )
                             .unwrap()
                     })
                 })
@@ -2017,7 +2077,13 @@ mod tests {
                 .unwrap();
             let image = storage.heap.append_row_image(&[Datum::Int4(91)]).unwrap();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(other, 77).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(other, 77).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             while !matches!(
                 workspace
@@ -2260,7 +2326,13 @@ mod tests {
                         .append_row_image(&[Datum::Int4(20), Datum::Text("other")])
                         .unwrap();
                     let undo = storage
-                        .write_pending_image(storage.select_table_definition(other, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Tracked)
+                        .write_pending_image(
+                            storage.select_table_definition(other, 8).0,
+                            1,
+                            1,
+                            Some(image),
+                            crate::storage::RowWriteStatistics::Tracked,
+                        )
                         .unwrap();
                     done.store(true, Ordering::Release);
                     undo
@@ -2307,7 +2379,13 @@ mod tests {
             let job = storage.begin_heap_relocation(&mut entries).unwrap();
             let frontier = job.progress.copy.frontier();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 2, 1, Some(input), crate::storage::RowWriteStatistics::Tracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    2,
+                    1,
+                    Some(input),
+                    crate::storage::RowWriteStatistics::Tracked,
+                )
                 .unwrap();
             let current = location(&storage, table, 2, 8);
             assert_ne!(current, prior);
@@ -2376,7 +2454,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(40), Datum::Text("late")])
                 .unwrap();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 2, 1, Some(input), crate::storage::RowWriteStatistics::Tracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    2,
+                    1,
+                    Some(input),
+                    crate::storage::RowWriteStatistics::Tracked,
+                )
                 .unwrap();
             let HeapRelocationPublication::More(job) = job.try_publish().unwrap() else {
                 panic!("a new tail cannot be published before its bytes are copied")
@@ -2416,7 +2500,13 @@ mod tests {
             let error = storage.begin_heap_relocation(&mut empty).err().unwrap();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             let undo = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 2, 1, Some(image), crate::storage::RowWriteStatistics::Tracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    2,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Tracked,
+                )
                 .unwrap();
             assert_eq!(
                 storage.heap.used(),
@@ -2474,7 +2564,13 @@ mod tests {
             assert_ne!(storage.tables[table].created_at(), stamp);
             let image = storage.heap.append_row_image(&[Datum::Bool(true)]).unwrap();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Tracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Tracked,
+                )
                 .unwrap();
             finish(job);
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
@@ -2510,7 +2606,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(20), Datum::Text("committed")])
                 .unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             let image = storage
@@ -2518,10 +2620,22 @@ mod tests {
                 .append_row_image(&[Datum::Int4(30), Datum::Text("pending")])
                 .unwrap();
             let second = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 2, Some(image.clone()), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    2,
+                    Some(image.clone()),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             let third = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 3, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    3,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             let mut job = storage.begin_heap_relocation(&mut entries).unwrap();
             job.copy_step(NonZeroUsize::MIN).unwrap();
@@ -2531,7 +2645,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(40), Datum::Text("new slot")])
                 .unwrap();
             let fourth = storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 4, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    4,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             finish(job);
             assert_row(&storage, table, 1, 9, 7, 10, "old");
@@ -2568,7 +2688,13 @@ mod tests {
                         .append_row_image(&[Datum::Int4(60), Datum::Text("other")])
                         .unwrap();
                     let undo = storage
-                        .write_pending_image(storage.select_table_definition(other, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Tracked)
+                        .write_pending_image(
+                            storage.select_table_definition(other, 8).0,
+                            1,
+                            1,
+                            Some(image),
+                            crate::storage::RowWriteStatistics::Tracked,
+                        )
                         .unwrap();
                     finish(job);
                     storage.restore_pending(other, 1, 8, undo);

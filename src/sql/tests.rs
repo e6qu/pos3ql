@@ -10,7 +10,10 @@ use crate::mem::mutex::Mutex;
 #[test]
 fn statement_row_paths_survive_partition_moves_cascades_refresh_and_cold_recovery() {
     for checkpoint in [false, true] {
-        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
             let name = format!("statement-row-paths-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
@@ -25,10 +28,27 @@ fn statement_row_paths_survive_partition_moves_cascades_refresh_and_cold_recover
             let mut budget = test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-            assert_eq!(data_rows(&session.success(&mut engine,
-                include_str!("../../tests/external/differential_exact/14_statement_row_paths.sql"), false)),
-                ["1|7|20|10", "2|7|12|6", "1|7|20|10", "2|7|12|6", "1|20|10", "2|12|8", "2"]);
-            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    include_str!(
+                        "../../tests/external/differential_exact/14_statement_row_paths.sql"
+                    ),
+                    false
+                )),
+                [
+                    "1|7|20|10",
+                    "2|7|12|6",
+                    "1|7|20|10",
+                    "2|7|12|6",
+                    "1|20|10",
+                    "2|12|8",
+                    "2"
+                ]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
             drop(session);
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -38,8 +58,14 @@ fn statement_row_paths_survive_partition_moves_cascades_refresh_and_cold_recover
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT id, customer, region, total FROM statement_row_orders ORDER BY id; SELECT id, region, total FROM statement_row_summary ORDER BY id; SELECT id FROM statement_row_customers", false)),
                 ["1|7|20|10", "2|7|12|8", "1|20|10", "2|12|8", "7"]);
-            assert_eq!(error_sqlstates(&session.execute(&mut cold,
-                "INSERT INTO statement_row_orders VALUES (2, 7, 12, 0)", false)), ["23505"]);
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    "INSERT INTO statement_row_orders VALUES (2, 7, 12, 0)",
+                    false
+                )),
+                ["23505"]
+            );
         }
     }
 }
@@ -52,37 +78,104 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
         let mut transition = copy_transition_scratch(&mut budget);
         let arena = Arena::new(&mut budget, "COPY original source", 1 << 18).unwrap();
         let guc = GucState::new();
-        run_txn(&mut engine, &mut budget, &mut transaction, "CREATE TABLE statement_copy_source (id integer)");
-        run_txn(&mut engine, &mut budget, &mut transaction, if binary {
-            "BEGIN; COPY statement_copy_source FROM STDIN (FORMAT binary)"
-        } else { "BEGIN; COPY statement_copy_source FROM STDIN" });
-        let setup = engine.take_pending_copy().expect("COPY setup retains its original table");
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            "CREATE TABLE statement_copy_source (id integer)",
+        );
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            if binary {
+                "BEGIN; COPY statement_copy_source FROM STDIN (FORMAT binary)"
+            } else {
+                "BEGIN; COPY statement_copy_source FROM STDIN"
+            },
+        );
+        let setup = engine
+            .take_pending_copy()
+            .expect("COPY setup retains its original table");
         if binary {
-            copy_binary_row(&mut engine, &mut budget, &setup, &mut transaction, guc.seq_session(), &arena,
-                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7], &mut transition).unwrap();
+            copy_binary_row(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
+                &mut transition,
+            )
+            .unwrap();
         } else {
-            copy_line(&mut engine, &mut budget, &setup, &mut transaction, guc.seq_session(), &arena, b"7", &mut transition).unwrap();
+            copy_line(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                b"7",
+                &mut transition,
+            )
+            .unwrap();
         }
         assert_eq!(transaction.touched().len(), 1);
-        let table = engine.storage.find_visible("public", "statement_copy_source", transaction.txid).unwrap();
-        let (target, mut definition) = engine.storage.select_table_definition(table, transaction.txid);
+        let table = engine
+            .storage
+            .find_visible("public", "statement_copy_source", transaction.txid)
+            .unwrap();
+        let (target, mut definition) = engine
+            .storage
+            .select_table_definition(table, transaction.txid);
         definition.columns[0].name = crate::storage::SqlName::parse("renamed_after_begin").unwrap();
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
-        transaction.write_table_definition(&engine.storage, target, definition, &mapping, false).unwrap();
+        transaction
+            .write_table_definition(&engine.storage, target, definition, &mapping, false)
+            .unwrap();
         let result = if binary {
-            copy_binary_row(&mut engine, &mut budget, &setup, &mut transaction, guc.seq_session(), &arena,
-                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 8], &mut transition)
+            copy_binary_row(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 8],
+                &mut transition,
+            )
         } else {
-            copy_line(&mut engine, &mut budget, &setup, &mut transaction, guc.seq_session(), &arena, b"8", &mut transition)
+            copy_line(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                b"8",
+                &mut transition,
+            )
         };
-        assert_eq!(result.unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+        assert_eq!(
+            result.unwrap_err().sqlstate,
+            sqlstate::SERIALIZATION_FAILURE
+        );
         assert_eq!(transaction.touched().len(), 1);
         engine.copy_abort(&mut transaction, &guc);
         drop(setup);
         run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
-        assert_eq!(data_rows(&run_txn_bytes(&mut engine, &mut budget, &mut transaction,
-            "SELECT count(id) FROM statement_copy_source")), ["0"]);
+        assert_eq!(
+            data_rows(&run_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut transaction,
+                "SELECT count(id) FROM statement_copy_source"
+            )),
+            ["0"]
+        );
     }
 }
 

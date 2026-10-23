@@ -385,7 +385,13 @@ mod tests {
             storage.register_snapshot(99, 7).unwrap();
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(first, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(first, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(first, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -405,7 +411,13 @@ mod tests {
 
             let image = storage.heap.append_row_image(&[Datum::Int4(30)]).unwrap();
             let undo = storage
-                .write_pending_image(storage.select_table_definition(second, 10).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(second, 10).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.restore_pending(second, 1, 10, undo);
             assert!(storage.tables[second].rows.is_empty());
@@ -731,7 +743,13 @@ mod tests {
                     .append_row_image(&[Datum::Int4(value)])
                     .unwrap();
                 storage
-                    .write_pending_image(storage.select_table_definition(table, txid).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(table, txid).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.commit_row(table, 1, txid, lsn).unwrap();
                 storage.observe_lsn(lsn);
@@ -823,7 +841,13 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -965,7 +989,13 @@ mod tests {
                     .unwrap();
                 let lsn = 9 + iteration as u64 * 2;
                 storage
-                    .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                    .write_pending_image(
+                        storage.select_table_definition(table, 8).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
                     .unwrap();
                 storage.commit_row(table, 1, 8, lsn).unwrap();
                 storage.observe_lsn(lsn);
@@ -1075,7 +1105,13 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -1152,7 +1188,13 @@ mod tests {
             storage.register_snapshot(99, 7).unwrap();
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -1231,7 +1273,13 @@ mod tests {
             assert!(!storage.history_pressure());
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -1278,7 +1326,13 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 8).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 8).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
@@ -1287,7 +1341,13 @@ mod tests {
             assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
             let image = storage.heap.append_row_image(&[Datum::Int4(30)]).unwrap();
             storage
-                .write_pending_image(storage.select_table_definition(table, 10).0, 1, 1, Some(image), crate::storage::RowWriteStatistics::Untracked)
+                .write_pending_image(
+                    storage.select_table_definition(table, 10).0,
+                    1,
+                    1,
+                    Some(image),
+                    crate::storage::RowWriteStatistics::Untracked,
+                )
                 .unwrap();
             storage.commit_row(table, 1, 10, 11).unwrap();
             storage.observe_lsn(11);

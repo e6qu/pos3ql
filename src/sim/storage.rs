@@ -14,7 +14,8 @@
 //! - a write whose acknowledgement was lost (a statement or COMMIT that
 //!   returned an error while faults were live) is *uncertain*: afterwards
 //!   the engine must show either the before or the intended state, and
-//!   whichever it shows is adopted as truth — never a third value;
+//!   whichever it shows is adopted as truth — never a third value. All rows
+//!   from one lost COMMIT reply must choose the same outcome;
 //! - a wiped-disk cold start taken after a clean CHECKPOINT reproduces the
 //!   model exactly (nothing was living only on the local disk);
 //! - the bucket never sees an unconditional overwrite that changes an
@@ -90,6 +91,9 @@ struct World {
     model: BTreeMap<i64, Row>,
     /// Writes whose acknowledgement was lost: id → (before, intended).
     uncertain: BTreeMap<i64, (Option<Row>, Option<Row>)>,
+    /// One lost COMMIT response covers a whole transaction, not independent rows.
+    uncertain_transactions: Vec<Vec<i64>>,
+    terminal_restarts: u64,
     next_id: i64,
     steps_taken: u64,
 }
@@ -150,6 +154,8 @@ impl World {
             session: None,
             model: BTreeMap::new(),
             uncertain: BTreeMap::new(),
+            uncertain_transactions: Vec::new(),
+            terminal_restarts: 0,
             next_id: 1,
             steps_taken: 0,
         };
@@ -375,7 +381,11 @@ impl World {
                     }
                 } else {
                     // The commit's acknowledgement was lost; every row it
-                    // touched is now uncertain between its images.
+                    // touched must reach the same before/after outcome.
+                    if !pending.is_empty() {
+                        self.uncertain_transactions
+                            .push(pending.keys().copied().collect());
+                    }
                     for (id, images) in pending {
                         self.uncertain.insert(id, images);
                     }
@@ -387,6 +397,9 @@ impl World {
     /// A CHECKPOINT is allowed to fail under faults; it must never change
     /// SQL-visible state either way.
     fn checkpoint(&mut self, must_succeed: bool) {
+        if must_succeed {
+            self.restart_after_terminal_commit();
+        }
         let outcome = self.run("CHECKPOINT");
         if must_succeed {
             assert!(
@@ -402,6 +415,7 @@ impl World {
     /// the bucket's own watchers. Runs fault-free.
     fn verify(&mut self, context: &str) {
         self.clear_faults();
+        self.restart_after_terminal_commit();
         let outcome = self.run("SELECT id, v, pad FROM t ORDER BY id");
         assert!(
             outcome.ok(),
@@ -410,6 +424,20 @@ impl World {
             outcome.error
         );
         let observed: BTreeMap<i64, Row> = outcome.rows.into_iter().collect();
+        for transaction in &self.uncertain_transactions {
+            let before = transaction
+                .iter()
+                .all(|id| observed.get(id) == self.uncertain.get(id).unwrap().0.as_ref());
+            let after = transaction
+                .iter()
+                .all(|id| observed.get(id) == self.uncertain.get(id).unwrap().1.as_ref());
+            assert!(
+                before || after,
+                "seed {} [{context}]: transaction with a lost COMMIT response recovered only some changes: {transaction:?}",
+                self.seed
+            );
+        }
+        self.uncertain_transactions.clear();
         // Resolve every uncertain write by observation: the engine must
         // show one of the two images, and its answer becomes the truth.
         let uncertain = std::mem::take(&mut self.uncertain);
@@ -443,6 +471,24 @@ impl World {
             "seed {} [{context}]: blind overwrites changed object bytes: {blind:?}",
             self.seed
         );
+    }
+
+    /// A terminal completion error requires a new incarnation. Fault-free
+    /// checkpoints and verification must not reuse a partially installed one.
+    fn restart_after_terminal_commit(&mut self) {
+        if self
+            .session
+            .as_ref()
+            .expect("engine is up")
+            .engine
+            .fatal_commit_failure()
+            .is_none()
+        {
+            return;
+        }
+        self.session = None;
+        self.start_engine();
+        self.terminal_restarts += 1;
     }
 
     /// Drops the engine where it stands — in-RAM state, open transaction
@@ -744,10 +790,11 @@ fn run_storage_vopr(stack_bytes: usize) -> Result<(), String> {
                         }
                         world.cold_start();
                         println!(
-                            "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket",
+                            "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket, {} terminal commit restarts",
                             world.steps_taken,
                             world.model.len(),
                             world.namespace.lock().expect("simulated namespace lock poisoned").object_count(),
+                            world.terminal_restarts,
                         );
                     }
                 })

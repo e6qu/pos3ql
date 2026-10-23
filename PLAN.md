@@ -28,13 +28,14 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Finish coordinating table definitions, rows, index bindings and comments at the
-transaction boundary before several CPU workers run statements. A query must
+Finish coordinating reader capture with table definitions, rows, index bindings
+and comments at the transaction
+boundary before several CPU workers run statements. A query must
 not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
-Connect table edits, schema changes, type retirement and rewrite finalization to
-that transaction publication boundary. Keep a statement's retained definitions and rows consistent with the same
+Connect reader admission, schema changes, type retirement and bounded rewrite
+finalization to that transaction publication boundary. Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
 preparation. Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may
@@ -45,9 +46,10 @@ memory limits is not a completion criterion. The
 [current behavior guide](docs/implemented-baseline.md) owns the implemented
 table, routine, type, account and saved-query guarantees.
 
-Done when failed publication leaves valid state, identity reuse cannot expose
+Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.
+Lost commit replies must resolve to all of the transaction's changes or none.
 Waiting and resuming a command must preserve its effects exactly once, including
 event triggers and sequence values.
 

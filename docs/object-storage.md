@@ -40,6 +40,25 @@ Those uploads can complete out of order. The commit-head update starts only
 after both succeed. Clients retain their transaction outcome until publication
 and ordered in-memory completion finish, including when the client disconnects.
 
+The commit keeps its transaction identity, table and row locks, transaction
+advisory locks, and serializable checks until its rows and definitions are
+installed and its visible journal position advances. Prepared commit and
+rollback decisions keep both transaction owners and the prepared slot through
+that boundary.
+Ordinary rollback restores rows and definitions before releasing its locks.
+Manual completion confirms the object-store journal before installation, just
+as the server's queued completion does. The server continues grouping several
+connections' commits into one upload batch.
+
+**User example:** one transaction updates an order and its invoice. A competing
+change cannot acquire their conflicting locks between the two installations.
+If installation fails after the transaction is durable, the instance stops
+accepting queries and checkpoints. It preserves the original failure and does
+not undo the durable changes; further work returns `08007` and requires restart
+and recovery. This also applies to local-only test mode and manual completion,
+not just the server's background commit queue. Recover and check the order
+before submitting it again. SQL CPU workers remain [planned work](../PLAN.md).
+
 `object_store_block_put_slots` reserves separate clients for immutable row and
 index output. Table slices, paced merges and secondary indexes retain one operation's bytes while
 its uploads overlap; the new file handle stays private until every upload

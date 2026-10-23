@@ -531,6 +531,9 @@ pub struct Engine {
     durable_lsn: u64,
     unpromoted_commits: usize,
     fatal_commit_failure: Option<SqlError>,
+    transaction_publication: commit::PublicationState,
+    #[cfg(test)]
+    publication_observer: Option<(commit::PublicationObserver, u32)>,
     commit_queue: Option<commit::Queue>,
     read_owner: Option<crate::store::ReadOwner>,
     visible_lsn: u64,
@@ -3569,6 +3572,7 @@ impl Engine {
                 crate::storage::row_heap_image_capacity(config),
             )
             + size_of::<Option<LocalCleanup>>()
+            + size_of::<commit::PublicationState>()
             + config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
@@ -3870,6 +3874,10 @@ impl Engine {
             size_of::<Option<LocalCleanup>>(),
             "post-publication cleanup controls",
         )?;
+        budget.draw(
+            size_of::<commit::PublicationState>(),
+            "transaction publication owner",
+        )?;
         Ok(Self {
             storage,
             wal,
@@ -3887,6 +3895,9 @@ impl Engine {
             durable_lsn: recovered_durable_lsn,
             unpromoted_commits: 0,
             fatal_commit_failure: None,
+            transaction_publication: commit::PublicationState::Idle,
+            #[cfg(test)]
+            publication_observer: None,
             commit_queue: if config.object_store_on && config.wal_upload {
                 Some(commit::Queue::new(config, budget)?)
             } else {
@@ -5274,6 +5285,7 @@ impl Engine {
         mode: TxnMode,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         if txn.is_active() {
             txn.activate_transaction_clock();
             if mode == TxnMode::Explicit {
@@ -5305,6 +5317,7 @@ impl Engine {
         retain_snapshot: bool,
         resume_statement: bool,
     ) -> Result<CommandSnapshot, SqlError> {
+        self.check_publication_health()?;
         self.storage.validate_transaction_isolation(txn.isolation)?;
         self.storage.set_foreign_statement_context(
             txn.txid,
@@ -5380,6 +5393,7 @@ impl Engine {
         guc: &GucState,
         target: txn::CommitTarget,
     ) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         if let Some(staged) = txn.staged_commit() {
             if staged.target != target {
                 return Err(sql_err!(
@@ -6499,6 +6513,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         if txn.staged_commit().is_none() {
             return Ok(());
         }
@@ -6531,6 +6546,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         let staged = txn
             .staged_commit()
             .expect("completion owns a staged commit");
@@ -6561,63 +6577,117 @@ impl Engine {
                 "commit is waiting for object storage"
             ));
         }
-        txn.take_staged_commit();
-        let result = match staged.target {
-            txn::CommitTarget::Prepare { slot, .. } => {
-                guc.commit_transaction();
-                let prepared_transaction = txn.txid;
-                self.storage.prepare_transaction_locks(txn.txid);
-                let first_lsn = self
-                    .prepared_transactions
-                    .slot(slot)
-                    .first_lsn()
-                    .expect("prepared transaction owns its database-scope WAL record");
-                self.prepared_transactions
-                    .set_lsn_range(slot, first_lsn, staged.lsn);
-                core::mem::swap(
-                    txn,
-                    &mut self.prepared_transactions.slot_mut(slot).transaction,
-                );
-                txn.clear();
-                self.storage.wake_transaction_waiters(prepared_transaction);
-                Ok(())
+        let prepared = match staged.target {
+            txn::CommitTarget::CommitPrepared { slot, .. } => {
+                Some((self.prepared_transactions.slot(slot).transaction.txid, true))
             }
-            target => {
-                self.storage
-                    .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
-                self.storage.release_serializable(txn.txid);
-                self.storage.release_object_locks(txn.txid);
-                self.storage.release_row_locks(txn.txid);
-                self.storage.release_advisory_transaction_locks(txn.txid);
-                let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
-                match target {
-                    txn::CommitTarget::Ordinary => own,
-                    txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
-                        self.complete_prepared_resolution(slot, true, txn, staged.lsn)
-                    }),
-                    txn::CommitTarget::RollbackPrepared { slot, .. } => own.and_then(|()| {
-                        self.complete_prepared_resolution(slot, false, txn, staged.lsn)
-                    }),
-                    txn::CommitTarget::Prepare { .. } => unreachable!("prepare handled separately"),
-                }
-            }
+            txn::CommitTarget::RollbackPrepared { slot, .. } => Some((
+                self.prepared_transactions.slot(slot).transaction.txid,
+                false,
+            )),
+            _ => None,
         };
-        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
-            self.visible_lsn = self.visible_lsn.max(staged.lsn);
-        }
-        self.unpromoted_commits -= 1;
-        if self.commit_progress == CommitProgressMode::Reactor
-            && let Err(error) = &result
-            && self.fatal_commit_failure.is_none()
+        if let Err(error) = self
+            .transaction_publication
+            .begin(txn.txid, prepared, staged.lsn)
         {
-            crate::logging::error_args(
-                "committed_state_publication_failed",
-                format_args!("{}: {}", error.sqlstate, error.message.as_str()),
-            );
             self.fatal_commit_failure = Some(SqlError {
                 sqlstate: error.sqlstate,
                 message: error.message,
             });
+            return Err(error);
+        }
+        let result = (|| {
+            if self.wal_upload
+                && self.commit_progress == CommitProgressMode::Inline
+                && staged.barrier == txn::CommitBarrier::Journal
+                && staged.lsn > self.durable_lsn
+            {
+                self.commit_wal()?;
+            }
+            match staged.target {
+                txn::CommitTarget::Prepare { slot, .. } => {
+                    txn.take_staged_commit();
+                    guc.commit_transaction();
+                    let prepared_transaction = txn.txid;
+                    self.storage.prepare_transaction_locks(txn.txid);
+                    let first_lsn = self
+                        .prepared_transactions
+                        .slot(slot)
+                        .first_lsn()
+                        .expect("prepared transaction owns its database-scope WAL record");
+                    self.prepared_transactions
+                        .set_lsn_range(slot, first_lsn, staged.lsn);
+                    core::mem::swap(
+                        txn,
+                        &mut self.prepared_transactions.slot_mut(slot).transaction,
+                    );
+                    txn.clear();
+                    self.storage.wake_transaction_waiters(prepared_transaction);
+                    Ok(())
+                }
+                target => {
+                    txn.take_staged_commit();
+                    self.storage.end_transaction_snapshots(
+                        txn.txid,
+                        crate::storage::SnapshotCleanup::Schedule,
+                    );
+                    let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
+                    match target {
+                        txn::CommitTarget::Ordinary => own,
+                        txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
+                            self.complete_prepared_resolution(slot, true, txn, staged.lsn)
+                        }),
+                        txn::CommitTarget::RollbackPrepared { slot, .. } => own.and_then(|()| {
+                            self.complete_prepared_resolution(slot, false, txn, staged.lsn)
+                        }),
+                        txn::CommitTarget::Prepare { .. } => {
+                            unreachable!("prepare handled separately")
+                        }
+                    }
+                }
+            }
+        })();
+        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
+            self.visible_lsn = self.visible_lsn.max(staged.lsn);
+        }
+        #[cfg(test)]
+        let result = result.and_then(|()| {
+            if matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+                Ok(())
+            } else {
+                self.observe_publication(commit::PublicationPoint::Visible)
+            }
+        });
+        if result.is_ok() {
+            if let txn::CommitTarget::CommitPrepared { slot, .. }
+            | txn::CommitTarget::RollbackPrepared { slot, .. } = staged.target
+            {
+                self.prepared_transactions.release(slot);
+            }
+            let publication = self.transaction_publication.complete();
+            debug_assert_eq!(publication.lsn, staged.lsn);
+            if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+                for (transaction, committed) in publication.transactions() {
+                    self.storage
+                        .finish_transaction_identity(transaction, committed);
+                    release_transaction_locks(&self.storage, transaction);
+                }
+            }
+        }
+        self.unpromoted_commits -= 1;
+        if let Err(error) = &result {
+            self.transaction_publication.require_recovery();
+            if self.fatal_commit_failure.is_none() {
+                crate::logging::error_args(
+                    "committed_state_publication_failed",
+                    format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                );
+                self.fatal_commit_failure = Some(SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                });
+            }
         }
         result
     }
@@ -6655,12 +6725,34 @@ impl Engine {
             .as_ref()
             .and_then(commit::Queue::first_staged_lsn)
             .map_or(self.durable_lsn, |lsn| self.durable_lsn.min(lsn - 1));
+        let frontier = self
+            .transaction_publication
+            .pending_lsn()
+            .map_or(frontier, |lsn| frontier.min(lsn.saturating_sub(1)));
         self.visible_lsn = self.visible_lsn.max(frontier);
         Ok(())
     }
 
     pub(crate) fn fatal_commit_failure(&self) -> Option<&SqlError> {
         self.fatal_commit_failure.as_ref()
+    }
+
+    fn check_publication_health(&self) -> Result<(), SqlError> {
+        if self.fatal_commit_failure.is_some() {
+            return Err(sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "commit completion requires recovery; connection must close"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn observe_publication(&self, point: commit::PublicationPoint) -> Result<(), SqlError> {
+        if let Some((observe, transaction)) = self.publication_observer {
+            observe(self, point, transaction)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn staged_commits_pending(&self) -> bool {
@@ -6676,6 +6768,10 @@ impl Engine {
         commit_lsn: u64,
         guc: Option<&GucState>,
     ) -> Result<(), SqlError> {
+        assert!(
+            self.transaction_publication.owns(txn.txid),
+            "durable promotion retains its transaction owner"
+        );
         self.commit_altered_tables.clear();
         self.commit_index_tables.clear();
         for undo in txn.ddl() {
@@ -6697,6 +6793,8 @@ impl Engine {
                 .push((slot, rewrote_rows))
                 .expect("commit table scratch matches transaction DDL capacity");
         }
+        #[cfg(test)]
+        self.observe_publication(commit::PublicationPoint::DefinitionsInstalled)?;
         for &(table, rowid, _) in txn.touched() {
             let table = table as usize;
             if self
@@ -6710,6 +6808,8 @@ impl Engine {
                 self.storage
                     .commit_row(table, rowid, txn.txid, commit_lsn)?;
             }
+            #[cfg(test)]
+            self.observe_publication(commit::PublicationPoint::RowInstalled { table, rowid })?;
         }
         for undo in txn.ddl() {
             match undo {
@@ -7156,11 +7256,8 @@ impl Engine {
         for slot in 0..self.storage.extended_statistics_count() {
             self.storage.commit_extended_statistics_data(slot, txn.txid);
         }
-        // Past the durability point, so these fire iff the transaction really
-        // committed: apply its LISTEN/UNLISTEN to the shared registry and move
-        // its notifications into the delivery outbox. A pool-exhaustion here is
-        // a loud error reported to the client — like a post-commit upload
-        // failure, the data is committed regardless — never a silent drop.
+        // Delivery state installs after durability, under the same owners as
+        // rows and definitions. Failure requires recovery, never row rollback.
         let notify_result = self.flush_committed_notifications(txn);
         let temporary_result = self.storage.apply_temporary_on_commit();
         if let Some(guc) = guc {
@@ -7168,9 +7265,12 @@ impl Engine {
         }
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage.finish_cumulative_transaction(txn.txid, true);
-        self.storage.finish_transaction_identity(txn.txid, true);
         txn.clear();
-        notify_result.and(index_result).and(temporary_result)
+        let result = notify_result.and(index_result).and(temporary_result);
+        #[cfg(test)]
+        let result =
+            result.and_then(|()| self.observe_publication(commit::PublicationPoint::DataInstalled));
+        result
     }
 
     /// Publishes foreign-catalog images before any extension edge that names
@@ -7640,16 +7740,14 @@ impl Engine {
         } else if commit {
             self.storage
                 .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
-            self.storage.release_serializable(txn.txid);
-            self.storage.release_object_locks(txn.txid);
-            self.storage.release_row_locks(txn.txid);
-            self.storage.release_advisory_transaction_locks(txn.txid);
             self.promote_transaction_state(txn, resolution_lsn, None)
         } else {
             self.rollback_transaction_state(txn, false);
             Ok(())
         };
-        self.prepared_transactions.release(slot);
+        #[cfg(test)]
+        let result = result
+            .and_then(|()| self.observe_publication(commit::PublicationPoint::PreparedInstalled));
         result
     }
 
@@ -7703,21 +7801,31 @@ impl Engine {
         }
         foreign::abort_session(&self.storage, txn.txid);
         rollback_transaction_overlays(&mut self.storage, txn);
+        #[cfg(test)]
+        self.observe_publication(commit::PublicationPoint::RollbackRestored)
+            .expect("rollback observation cannot fail");
         self.wal.discard_stage(txn.txid);
-        finish_transaction_cleanup(&mut self.storage, txn, committed);
+        let release = if self.transaction_publication.owns(txn.txid) {
+            TransactionIdentityRelease::AfterPublication
+        } else {
+            TransactionIdentityRelease::Immediate
+        };
+        finish_transaction_cleanup(&mut self.storage, txn, committed, release);
     }
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
         sequence::finish_statement(guc.seq_session());
-        if txn.staged_commit().is_some() {
+        if txn.staged_commit().is_some() || self.transaction_publication.owns(txn.txid) {
             crate::logging::error_args(
                 "rollback_after_commit_boundary",
                 format_args!("transaction {} requires recovery", txn.txid),
             );
-            self.fatal_commit_failure = Some(sql_err!(
-                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
-                "rollback requested after irreversible commit boundary"
-            ));
+            if self.fatal_commit_failure.is_none() {
+                self.fatal_commit_failure = Some(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "rollback requested after irreversible commit boundary"
+                ));
+            }
             return;
         }
         // The next statement starts a fresh transaction clock.
@@ -7845,6 +7953,7 @@ impl Engine {
     /// Publishes every committed journal record accumulated since the prior
     /// protocol flush.  This is the object-store acknowledgement barrier.
     pub fn commit_wal(&mut self) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         // Manual completion explicitly retries now. Reactor turns preserve
         // their backoff deadline and never busy-wait on it.
         if let Some(pending) = &mut self.inflight_publication {
@@ -7891,14 +8000,9 @@ impl Engine {
         now: std::time::Instant,
         progress: CommitProgressMode,
     ) -> Result<bool, SqlError> {
+        self.check_publication_health()?;
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.advance_background_uploads(now);
-        }
-        if self.fatal_commit_failure.is_some() {
-            return Err(sql_err!(
-                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
-                "commit completion requires recovery"
-            ));
         }
         self.wal.commit();
         if !self.wal_upload {
@@ -9072,6 +9176,7 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        self.check_publication_health()?;
         if self.unpromoted_commits != 0 {
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
@@ -9787,6 +9892,9 @@ impl Engine {
     /// Heap and history cleanup use no object client. Publication and merge
     /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
+        if self.fatal_commit_failure.is_some() {
+            return false;
+        }
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.manifest_publication_pending()
         {
@@ -9852,6 +9960,9 @@ impl Engine {
     }
 
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
+        if self.fatal_commit_failure.is_some() {
+            return CheckpointBeat::LocalFailure;
+        }
         if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.manifest_publication_pending()
         {
@@ -20009,10 +20120,6 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
 
 fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
     storage.end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
-    storage.release_serializable(txn.txid);
-    storage.release_object_locks(txn.txid);
-    storage.release_row_locks(txn.txid);
-    storage.release_advisory_transaction_locks(txn.txid);
     // Reverse-replay every write to its prior image (newest first), so a
     // row written multiple times unwinds to its pre-transaction state.
     for &(table, rowid, prior) in txn.touched().iter().rev() {
@@ -20033,10 +20140,31 @@ fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
     }
 }
 
-fn finish_transaction_cleanup(storage: &mut Storage, txn: &mut TxnState, committed: bool) {
+#[derive(Clone, Copy)]
+enum TransactionIdentityRelease {
+    Immediate,
+    AfterPublication,
+}
+
+fn release_transaction_locks(storage: &Storage, transaction: u32) {
+    storage.release_serializable(transaction);
+    storage.release_object_locks(transaction);
+    storage.release_row_locks(transaction);
+    storage.release_advisory_transaction_locks(transaction);
+}
+
+fn finish_transaction_cleanup(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    committed: bool,
+    release: TransactionIdentityRelease,
+) {
     storage.clear_temporary_transaction(txn.txid);
     storage.finish_cumulative_transaction(txn.txid, committed);
-    storage.finish_transaction_identity(txn.txid, committed);
+    if matches!(release, TransactionIdentityRelease::Immediate) {
+        storage.finish_transaction_identity(txn.txid, committed);
+        release_transaction_locks(storage, txn.txid);
+    }
     txn.clear();
 }
 
@@ -20753,6 +20881,7 @@ fn replay_transaction_batches(
                         storage,
                         &mut prepared.slot_mut(slot).transaction,
                         commit,
+                        TransactionIdentityRelease::Immediate,
                     );
                     if commit && *lsn > apply_floor {
                         prepared.slot(slot).visit_records(|_, raw| {

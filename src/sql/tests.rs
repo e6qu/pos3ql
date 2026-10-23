@@ -7,6 +7,8 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod transaction_publication;
+
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
     let mut config = test_config("sequence-session-values");
@@ -10776,23 +10778,23 @@ fn prepared_transaction_publication_failure_recovers_from_object_storage() {
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
-    let failed = run_with(
+    let mut waiting = ConfiguredTransactionSession::new(&config, &mut budget);
+    let failed = waiting.execute(
         &mut engine,
-        &mut budget,
         "BEGIN; UPDATE prepared_publication SET value = 'after' WHERE id = 1; \
          PREPARE TRANSACTION 'publication-failed'",
+        false,
     );
     assert!(
-        String::from_utf8_lossy(&failed).contains("58030"),
+        String::from_utf8_lossy(&failed).contains("08007"),
         "{}",
         String::from_utf8_lossy(&failed)
     );
-    let fenced = run_with(
-        &mut engine,
-        &mut budget,
-        "SELECT count(*) FROM pg_prepared_xacts",
-    );
-    assert!(String::from_utf8_lossy(&fenced).contains("58030"));
+    let fenced = waiting.execute(&mut engine, "SELECT count(*) FROM pg_prepared_xacts", false);
+    assert!(String::from_utf8_lossy(&fenced).contains("08007"));
+    assert_eq!(engine.fatal_commit_failure().unwrap().sqlstate, "58030");
+    assert!(waiting.transaction.staged_commit().is_some());
+    drop(waiting);
     drop(engine);
 
     namespace.borrow_mut().faults.transient_per_mille = 0;
@@ -16235,30 +16237,41 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
 /// Stages one implicit transaction through the same executor entry point as a
 /// connection, deliberately leaving publication to the caller's flush
 /// boundary.
-fn stage_without_publication(engine: &mut Engine, budget: &mut Budget, sql_text: &str) {
-    let mut request_budget = Budget::new(budget.remaining());
-    let budget = &mut request_budget;
-    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
-    let mut txn = TxnState::new(budget, 1024).unwrap();
-    let mut pool = test_pool(budget);
-    let mut cursors = test_cursors(budget);
-    let mut guc = GucState::new();
-    let mut responder = Responder::new(&mut buffer);
-    engine
+fn stage_without_publication(
+    engine: &mut Engine,
+    session: &mut ConfiguredTransactionSession,
+    sql_text: &str,
+) {
+    assert!(engine.commit_progress == CommitProgressMode::Reactor);
+    session.send.clear();
+    session.arena.reset();
+    let status = engine
         .execute_simple_from(
             sql_text,
             0,
-            &arena,
-            &mut txn,
-            &mut pool,
-            &mut cursors,
-            &mut guc,
-            &mut responder,
-            1,
+            &session.arena,
+            &mut session.transaction,
+            &mut session.pool,
+            &mut session.cursors,
+            &mut session.guc,
+            &mut Responder::new(&mut session.send),
+            session.connection_id,
             false,
         )
         .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked {
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
+    assert!(session.transaction.staged_commit().is_some());
+    assert!(
+        error_sqlstates(session.send.readable()).is_empty(),
+        "{sql_text}: {}",
+        String::from_utf8_lossy(session.send.readable())
+    );
 }
 
 /// Runs one simple-query message as a specific connection id (for LISTEN /
@@ -76560,11 +76573,21 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    stage_without_publication(&mut engine, &mut budget, "CREATE TABLE batched (id int)");
-    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (1)");
-    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (2)");
+    let mut first = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut second = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    let mut third = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+    first.success(&mut engine, "CREATE TABLE batched (id int)", false);
+    engine.enable_async_durability();
+    stage_without_publication(&mut engine, &mut first, "INSERT INTO batched VALUES (1)");
+    stage_without_publication(&mut engine, &mut second, "INSERT INTO batched VALUES (2)");
+    stage_without_publication(&mut engine, &mut third, "INSERT INTO batched VALUES (3)");
     assert!(engine.wal.pending_batch_bytes() > 0);
     engine.commit_wal().unwrap();
+    for session in [&mut first, &mut second, &mut third] {
+        engine
+            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .unwrap();
+    }
 
     let mut count = 0;
     engine
@@ -76576,7 +76599,10 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
             count += usize::from(key.ends_with(".batch"))
         })
         .unwrap();
-    assert_eq!(count, 1, "one flush must publish one immutable batch");
+    assert_eq!(
+        count, 2,
+        "table setup plus one batch for three connections' commits"
+    );
 
     let mut first_lsn = None;
     engine
@@ -76589,34 +76615,46 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
                 .strip_prefix("commits/")
                 .and_then(|key| key.strip_suffix(".batch"))
             {
-                first_lsn = Some(
-                    stem.split_once('-')
-                        .expect("commit batch key has its LSN separator")
-                        .0
-                        .parse::<u64>()
-                        .expect("commit batch key has a numeric LSN"),
-                );
+                let candidate = stem
+                    .split_once('-')
+                    .expect("commit batch key has its LSN separator")
+                    .0
+                    .parse::<u64>()
+                    .expect("commit batch key has a numeric LSN");
+                first_lsn = Some(first_lsn.map_or(candidate, |prior: u64| prior.max(candidate)));
             }
         })
         .unwrap();
     let first_lsn = first_lsn.expect("published batch exists");
     let mut replayed = Vec::new();
+    let mut transactions = 0;
     engine
         .ckpt
         .as_mut()
         .unwrap()
-        .replay_commit_batches(first_lsn, |lsn, _| {
+        .replay_commit_batches(first_lsn, |lsn, raw| {
             replayed.push(lsn);
+            transactions += usize::from(matches!(
+                crate::wal::decode_record(raw),
+                Some(WalOp::Commit { .. })
+            ));
             Ok(())
         })
         .unwrap();
+    assert_eq!(
+        transactions, 3,
+        "one immutable batch retains three distinct transaction boundaries"
+    );
     assert!(
         replayed.iter().any(|lsn| *lsn > first_lsn),
         "the boundary batch must replay records after its first LSN"
     );
 
-    stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (3)");
+    stage_without_publication(&mut engine, &mut first, "INSERT INTO batched VALUES (4)");
     engine.commit_wal().unwrap();
+    engine
+        .finish_staged_transaction(&mut first.transaction, &first.guc)
+        .unwrap();
     assert!(engine.checkpoint().unwrap());
     let mut batches = 0;
     let mut descriptors = 0;
@@ -76646,7 +76684,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
             &mut budget,
             "SELECT id FROM batched ORDER BY id"
         )),
-        ["1", "2", "3"]
+        ["1", "2", "3", "4"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -76669,20 +76707,20 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    stage_without_publication(
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
         &mut engine,
-        &mut budget,
         "CREATE TABLE recovered_batches (id integer PRIMARY KEY)",
+        false,
     );
-    engine.commit_wal().unwrap();
     for id in 1..=4 {
-        stage_without_publication(
+        session.success(
             &mut engine,
-            &mut budget,
             &format!("INSERT INTO recovered_batches VALUES ({id})"),
+            false,
         );
-        engine.commit_wal().unwrap();
     }
+    drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
@@ -76827,20 +76865,20 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    stage_without_publication(
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
         &mut engine,
-        &mut budget,
         "CREATE TABLE paced_deletes (id integer PRIMARY KEY)",
+        false,
     );
-    engine.commit_wal().unwrap();
     for id in 1..=4 {
-        stage_without_publication(
+        session.success(
             &mut engine,
-            &mut budget,
             &format!("INSERT INTO paced_deletes VALUES ({id})"),
+            false,
         );
-        engine.commit_wal().unwrap();
     }
+    drop(session);
     for index in 0..3 {
         engine
             .ckpt
@@ -78425,9 +78463,11 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    engine.enable_async_durability();
     stage_without_publication(
         &mut engine,
-        &mut budget,
+        &mut session,
         "CREATE TABLE retry_batch (id int)",
     );
     assert!(engine.wal.pending_batch_bytes() > 0);
@@ -78435,6 +78475,9 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     // Every successful PUT loses its response. Conditional retries must verify
     // the durable bytes and adopt the same batch and root without duplication.
     engine.commit_wal().unwrap();
+    engine
+        .finish_staged_transaction(&mut session.transaction, &session.guc)
+        .unwrap();
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
     assert!(engine.checkpoint().unwrap());
@@ -78473,18 +78516,18 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
 
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    stage_without_publication(
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
         &mut engine,
-        &mut budget,
         "CREATE TABLE maintenance_retry (id integer PRIMARY KEY)",
+        false,
     );
-    engine.commit_wal().unwrap();
-    stage_without_publication(
+    session.success(
         &mut engine,
-        &mut budget,
         "INSERT INTO maintenance_retry VALUES (1)",
+        false,
     );
-    engine.commit_wal().unwrap();
+    drop(session);
     let published_lsn = loop {
         match engine
             .ckpt
@@ -79474,29 +79517,32 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
         "INSERT INTO rc VALUES (1, 'uploaded')",
     );
 
-    // Force the next commit's WAL upload to fail: the row is promoted and
-    // visible (an errored commit's outcome is unknown) but durable only in the
-    // local journal.
+    // The local commit is irreversible, but upload must finish before its row
+    // is installed. Keep its completion state until recovery resolves it.
     namespace.borrow_mut().faults.transient_per_mille = 1000;
-    let failed = run_with(
+    let mut waiting = ConfiguredTransactionSession::new(&config, &mut budget);
+    let failed = waiting.execute(
         &mut engine,
-        &mut budget,
         "INSERT INTO rc VALUES (2, 'unuploaded')",
+        false,
     );
     assert!(
-        String::from_utf8_lossy(&failed).contains("58030"),
-        "the failed upload must surface as an I/O error: {}",
+        String::from_utf8_lossy(&failed).contains("08007"),
+        "an irreversible failed commit requires recovery: {}",
         String::from_utf8_lossy(&failed)
     );
-    let fenced = run_with(&mut engine, &mut budget, "SELECT id FROM rc ORDER BY id");
+    let fenced = waiting.execute(&mut engine, "SELECT id FROM rc ORDER BY id", false);
     assert!(
-        String::from_utf8_lossy(&fenced).contains("58030"),
+        String::from_utf8_lossy(&fenced).contains("08007"),
         "a later statement must not observe a local-only commit: {}",
         String::from_utf8_lossy(&fenced)
     );
+    assert_eq!(engine.fatal_commit_failure().unwrap().sqlstate, "58030");
+    assert!(waiting.transaction.staged_commit().is_some());
     namespace.borrow_mut().faults.transient_per_mille = 0;
     // Crash without any intervening statement (no eager retry): row 2 lives
     // only in the journal.
+    drop(waiting);
     drop(engine);
 
     // Startup reconciliation re-uploads the journaled tail the bucket lacks,
@@ -80109,9 +80155,12 @@ fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body() {
     assert!(!message_types(&setup).contains(&b'E'));
     let backup_lsn = engine.create_backup("timeline").unwrap();
 
+    let mut target = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut later = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    engine.enable_async_durability();
     stage_without_publication(
         &mut engine,
-        &mut budget,
+        &mut target,
         "UPDATE recovery_timeline SET value = 'target' WHERE id = 1",
     );
     let target_lsn = engine.storage.lsn();
@@ -80122,12 +80171,17 @@ fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body() {
     }
     stage_without_publication(
         &mut engine,
-        &mut budget,
+        &mut later,
         "INSERT INTO recovery_timeline VALUES (2, 'too-late')",
     );
     let later_lsn = engine.storage.lsn();
     assert!(later_lsn > target_lsn);
     engine.commit_wal().unwrap();
+    for session in [&mut target, &mut later] {
+        engine
+            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .unwrap();
+    }
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
@@ -89370,41 +89424,41 @@ fn publish_cleanup_fixture(engine: &mut Engine) -> u64 {
 
 #[test]
 fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_prefix() {
-    for covers_pending in [false, true] {
-        let name = if covers_pending {
-            "cleanup-wal-covered"
+    for cleanup_started in [false, true] {
+        let name = if cleanup_started {
+            "cleanup-wal-already-started"
         } else {
-            "cleanup-wal-suffix"
+            "cleanup-wal-starts-after-write"
         };
         let (mut engine, mut budget, config) = sliced_cleanup_fixture_with_wal(name, true, true);
         let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
         let head_key = format!("{}commit-head", config.object_store_prefix);
         let before = namespace.borrow().object_bytes(&head_key).unwrap().to_vec();
-        let before_write = if covers_pending {
-            None
-        } else {
-            Some(publish_cleanup_fixture(&mut engine))
-        };
+        let published = publish_cleanup_fixture(&mut engine);
+        if cleanup_started {
+            engine.begin_checkpoint_cleanup(published);
+        }
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         session.success(
             &mut engine,
             "BEGIN; INSERT INTO cleanup_orders VALUES (81, 'retry')",
             false,
         );
+        engine.enable_async_durability();
         namespace.borrow_mut().faults.fail_from_op = Some(0);
         let failed = session.execute(&mut engine, "COMMIT", false);
         assert_eq!(error_sqlstates(&failed), ["58030"]);
         assert!(engine.durable_retry_pending());
-        let published = if let Some(published) = before_write {
-            published
-        } else {
-            namespace.borrow_mut().faults.fail_from_op = None;
-            let published = publish_cleanup_fixture(&mut engine);
-            namespace.borrow_mut().faults.fail_from_op = Some(0);
-            published
-        };
-        engine.begin_checkpoint_cleanup(published);
-        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::StorageFailure);
+        assert!(session.transaction.staged_commit().is_some());
+        assert!(engine.fatal_commit_failure().is_none());
+        assert_eq!(
+            engine.checkpoint().unwrap_err().sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
+        if !cleanup_started {
+            engine.begin_checkpoint_cleanup(published);
+        }
+        assert_eq!(engine.commit_wal().unwrap_err().sqlstate, "58030");
         assert!(matches!(
             engine.local_cleanup.unwrap().phase,
             LocalCleanupPhase::Prepare
@@ -89422,7 +89476,10 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
             assert_eq!(engine.wal.pending_batch_bytes(), pending_bytes);
         });
         namespace.borrow_mut().faults.fail_from_op = None;
-        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Durable);
+        engine.commit_wal().unwrap();
+        engine
+            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .unwrap();
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
         assert!(engine.maybe_checkpoint());

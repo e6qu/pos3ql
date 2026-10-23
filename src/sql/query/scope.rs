@@ -1852,10 +1852,9 @@ mod tests {
             transaction: 0,
         };
         crate::mem::guard::forbid_alloc(|| {
-            storage
+            let pending_change = storage
                 .write_table_def(
-                    table,
-                    7,
+                    storage.select_table_definition(table, 7).0,
                     definition("pending", 1),
                     &[None; MAX_COLUMNS],
                     false,
@@ -1863,21 +1862,20 @@ mod tests {
                 .unwrap();
             let pending = storage.table_definition_images();
             pending.definition(&storage, table, 7).unwrap();
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(pending_change);
             assert_eq!(
                 pending.retained_definition(table, 7).unwrap().name.as_str(),
                 "pending"
             );
-            storage
+            let published_change = storage
                 .write_table_def(
-                    table,
-                    7,
+                    storage.select_table_definition(table, 7).0,
                     definition("published", 1),
                     &[None; MAX_COLUMNS],
                     false,
                 )
                 .unwrap();
-            storage.commit_table_def(table, 7);
+            assert_eq!(storage.commit_table_def(published_change), Some(false));
             storage.commit_drop(table);
             assert_eq!(
                 storage.create_table(definition("replacement", 1)).unwrap(),
@@ -1951,8 +1949,7 @@ mod tests {
         let table = storage.create_table(definition("source", 1)).unwrap();
         storage
             .write_table_def(
-                table,
-                7,
+                storage.select_table_definition(table, 7).0,
                 definition("source", 2),
                 &[None; MAX_COLUMNS],
                 false,

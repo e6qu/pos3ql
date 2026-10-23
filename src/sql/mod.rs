@@ -6700,10 +6700,10 @@ impl Engine {
         self.commit_altered_tables.clear();
         self.commit_index_tables.clear();
         for undo in txn.ddl() {
-            let DdlUndo::TableAltered(slot) = *undo else {
+            let DdlUndo::TableAltered(change) = *undo else {
                 continue;
             };
-            let slot = slot as usize;
+            let slot = change.table();
             if self
                 .commit_altered_tables
                 .iter()
@@ -6711,7 +6711,9 @@ impl Engine {
             {
                 continue;
             }
-            let rewrote_rows = self.storage.commit_table_def(slot, txn.txid);
+            let Some(rewrote_rows) = self.storage.commit_table_def(change) else {
+                continue;
+            };
             self.commit_altered_tables
                 .push((slot, rewrote_rows))
                 .expect("commit table scratch matches transaction DDL capacity");
@@ -19681,8 +19683,8 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
                 storage.rollback_indexes_for(undo.slot(), txid);
             }
         }
-        DdlUndo::TableAltered(slot) => {
-            storage.rollback_table_def(slot as usize, txid);
+        DdlUndo::TableAltered(change) => {
+            storage.rollback_table_def(change);
         }
         DdlUndo::ViewChanged(publication) => storage
             .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback),
@@ -23038,7 +23040,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal moves unknown table \"{}\"", name),
                 });
             };
-            storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?);
+            let revision = storage.reserve_table_definition_revision()?;
+            storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?, revision);
         }
         WalOp::SetSequenceSchema {
             identity,
@@ -23141,7 +23144,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ),
                 });
             };
-            let _ = storage.drop_fk(index, fk_name);
+            let revision = storage.reserve_table_definition_revision()?;
+            let _ = storage.drop_fk(index, fk_name, revision);
         }
         WalOp::UpsertRole {
             name,

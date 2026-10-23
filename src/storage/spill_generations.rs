@@ -1873,8 +1873,8 @@ impl SpillGenerationImage {
         commit_lsn: u64,
     ) -> Self {
         let mut image = Self::EMPTY;
-        image.persistence = definition.committed.persistence;
-        image.n_columns = definition.committed.schema(&mut image.schema);
+        image.persistence = definition.committed().persistence;
+        image.n_columns = definition.committed().schema(&mut image.schema);
         image.table_slot = table_slot;
         image.created_at = definition.identity.created_at;
         image.data_generation = generation;

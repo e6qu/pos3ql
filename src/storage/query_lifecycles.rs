@@ -526,7 +526,7 @@ impl Storage {
             let mut state = self.tables[usize::from(table)].definition.write();
             match decision {
                 CatalogDdlDecision::Commit => {
-                    state.committed.has_rules = true;
+                    state.mark_rules_present();
                     if state.pending_has_rules_txid == Some(undo.transaction) {
                         state.pending_has_rules_txid = None;
                     }

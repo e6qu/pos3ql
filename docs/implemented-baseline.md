@@ -247,16 +247,31 @@ total keeps those bytes even after its metadata is reclaimed.
 Pending table definitions retain their table and one reserved version slot.
 A reader releases the pool's allocation control before returning the definition;
 another table can publish, roll back, or retire its own versions while that reader
-keeps its selection. Slot controls and version capacity are charged at startup.
-A full pool or version history returns `54000` before changing the published
-head. Rolling back or removing a table releases only its own chain of versions.
-Pending edits and savepoint rollback own only the selected table. They compose
-column mappings from the original committed layout and update comment names with
-the selected shape. Waiting for that table's readers does not reserve the shared
-version allocator or comment catalog. Rule history and pending shapes check all
-transaction owners under the same definition guard. Capacity or comment-ownership
-failure leaves the prior shape and comment names intact. Comment text publication
-preserves name changes owned by another transaction.
+keeps its selection. Controls and version capacity are charged at startup.
+A full pool or version history returns `54000` before changing the published head.
+
+An edit remembers which table and definition it read. Replacing that table or
+changing its definition while the edit waits returns `40001`; inserting a row
+alone does not invalidate the definition. Capturing the definition and its
+version uses one read owner. Waiting releases earlier owners and checks the
+original selection again. Type changes invalidate affected selections using
+the type edit's reserved version; commit does not request another version.
+
+Rollback records identify the table's lifetime and the installed definition.
+An old record cannot undo a newer edit or change a replacement table. SQL
+installs the edit and records its undo in one transaction operation, before
+journal staging continues. A full rollback log returns `54000` and removes only
+the change it could not record. Column mappings compose back to the committed
+layout; table, index and comment names follow the selected shape. Rule history
+and pending shapes check transaction owners under the same definition guard.
+Comment text publication preserves name changes owned by another transaction.
+
+**User example:** create an order table, save a transaction position, then drop
+and recreate that table with different rows. Rolling back to the saved position
+restores the original table and rows. Earlier column changes and a type rename
+also survive commit and recovery with an empty local data directory. The
+[shared PostgreSQL comparison](https://github.com/e6qu/pos3ql/blob/458738f54100c19ff0ed2ac9c7ad92ac57829df7/tests/external/differential_exact/12_table_definition_undo.sql)
+exercises these cases; storage tests also force internal table-number reuse.
 
 Table reads and scalar function contracts capture the complete type chain before
 waiting for row data or running the function body. For

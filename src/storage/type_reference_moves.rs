@@ -472,13 +472,19 @@ impl TypePublication {
                             )
                         })?;
                     }
+                    let revision = match source {
+                        TypePublicationSource::Pending(target) => target.dependent_table_revision(),
+                        TypePublicationSource::Committed { .. } => {
+                            storage.reserve_table_definition_revision()?
+                        }
+                    };
                     install_source(&mut types, &mut members);
                     for owner in owners.slots.iter_mut().flatten() {
-                        assert!(
-                            storage
-                                .pending_table_defs
-                                .move_type_references_locked(&mut owner.definition, movement)
-                        );
+                        assert!(storage.pending_table_defs.move_type_references_locked(
+                            &mut owner.definition,
+                            movement,
+                            revision
+                        ));
                         owner.publication.generation += 1;
                         owner.publication.dirty = true;
                     }
@@ -768,13 +774,12 @@ mod tests {
                             } else {
                                 submitting_storage
                                     .write_table_def(
-                                        unrelated,
-                                        11,
+                                        submitting_storage.select_table_definition(unrelated, 11).0,
                                         definition,
                                         &mapping("id"),
                                         false,
                                     )
-                                    .map(|()| unrelated)
+                                    .map(|_change| unrelated)
                             };
                             if submission == 2 {
                                 submitting_storage.tables[unrelated]
@@ -1209,6 +1214,12 @@ mod tests {
                 assert!(storage.type_catalog.try_lock().is_ok());
                 assert!(storage.tables[related].publication.try_lock().is_ok());
                 storage.tables[related].publication().generation = 0;
+                let (selected_table, selected_definition) =
+                    storage.select_table_definition(related, 7);
+                storage
+                    .catalog_sequence
+                    .0
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                 match kind {
                     TypeReferenceKind::Domain => storage.commit_domain_alter(target),
                     TypeReferenceKind::Enum => storage.commit_enum_alter(target),
@@ -1219,6 +1230,14 @@ mod tests {
                     source_identity(&storage.type_catalog.lock().unwrap(), movement),
                     movement.current
                 );
+                let error = storage
+                    .write_table_def(selected_table, selected_definition, &mapping("id"), false)
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlstate,
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE
+                );
+                assert!(storage.pending_table_def(related).is_none());
             });
         }
     }
@@ -1940,8 +1959,13 @@ mod tests {
                                 storage.create_table_in(definition, 7)
                             } else {
                                 storage
-                                    .write_table_def(related, 7, definition, &mapping("id"), false)
-                                    .map(|()| related)
+                                    .write_table_def(
+                                        storage.select_table_definition(related, 7).0,
+                                        definition,
+                                        &mapping("id"),
+                                        false,
+                                    )
+                                    .map(|_change| related)
                             }
                         })
                     });
@@ -1996,17 +2020,27 @@ mod tests {
                 }
                 assert_eq!(
                     storage
-                        .write_table_def(table, 9, captured, &mapping("id"), false)
+                        .write_table_def(
+                            storage.select_table_definition(table, 9).0,
+                            captured,
+                            &mapping("id"),
+                            false
+                        )
                         .unwrap_err()
                         .sqlstate,
                     crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT
                 );
                 captured.name = SqlName::parse("late_edit").unwrap();
-                storage
-                    .write_table_def(table, 9, captured, &mapping("id"), false)
+                let change = storage
+                    .write_table_def(
+                        storage.select_table_definition(table, 9).0,
+                        captured,
+                        &mapping("id"),
+                        false,
+                    )
                     .unwrap();
                 assert_identity(&storage, table, 9, movement.current);
-                storage.rollback_table_def(table, 9);
+                storage.rollback_table_def(change);
                 assert_identity(&storage, table, 0, movement.current);
             });
         }
@@ -2201,7 +2235,12 @@ mod tests {
                     );
                     assert_eq!(
                         storage
-                            .write_table_def(table, 7, submitted, &mapping("id"), false)
+                            .write_table_def(
+                                storage.select_table_definition(table, 7).0,
+                                submitted,
+                                &mapping("id"),
+                                false
+                            )
                             .unwrap_err()
                             .sqlstate,
                         crate::sql::eval::sqlstate::UNDEFINED_OBJECT
@@ -2527,7 +2566,7 @@ mod tests {
             let mut pending = *storage.table_def(related, 0);
             pending.name = storage.table_def(unrelated, 0).name;
             let blocker = storage.casts.lock().unwrap();
-            std::thread::scope(|scope| {
+            let change = std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
                     crate::mem::guard::forbid_alloc(|| {
                         publish_move(&storage, movement, source);
@@ -2538,18 +2577,24 @@ mod tests {
                     && storage.tables[unrelated].lifecycle.try_lock().is_ok()
                     && storage.comments.try_lock().is_ok();
                 let staged = if waiting && available {
-                    crate::mem::guard::forbid_alloc(|| {
-                        storage.write_table_def(unrelated, 7, pending, &mapping("id"), false)
-                    })
-                    .is_ok()
+                    Some(crate::mem::guard::forbid_alloc(|| {
+                        storage.write_table_def(
+                            storage.select_table_definition(unrelated, 7).0,
+                            pending,
+                            &mapping("id"),
+                            false,
+                        )
+                    }))
                 } else {
-                    false
+                    None
                 };
                 drop(blocker);
                 writer.join().unwrap();
                 assert!(waiting);
                 assert!(available);
-                assert!(staged);
+                staged
+                    .expect("publication released unrelated owners")
+                    .expect("stage unrelated definition")
             });
             crate::mem::guard::forbid_alloc(|| {
                 assert_identity(&storage, unrelated, 7, movement.current);
@@ -2558,7 +2603,7 @@ mod tests {
                         .user_type
                         .is_none()
                 );
-                storage.rollback_table_def(unrelated, 7);
+                storage.rollback_table_def(change);
                 assert!(
                     storage.table_def(unrelated, 7).columns()[0]
                         .user_type
@@ -2672,13 +2717,18 @@ mod tests {
                     movement.identity.slot(),
                 )
                 .unwrap();
-                for name in ["first_id", "second_id"] {
+                let [first_change, second_change] = ["first_id", "second_id"].map(|name| {
                     let mut definition = *storage.table_def(related, 7);
                     definition.columns[0].name = SqlName::parse(name).unwrap();
                     storage
-                        .write_table_def(related, 7, definition, &mapping(name), false)
-                        .unwrap();
-                }
+                        .write_table_def(
+                            storage.select_table_definition(related, 7).0,
+                            definition,
+                            &mapping(name),
+                            false,
+                        )
+                        .unwrap()
+                });
                 let held = storage.table_def(related, if pending_reader { 7 } else { 0 });
                 let (done_send, done_receive) = mpsc::sync_channel(1);
                 let (other_send, other_receive) = mpsc::sync_channel(1);
@@ -2726,16 +2776,15 @@ mod tests {
                             for _ in 0..16 {
                                 let mut definition = *storage.table_def(unrelated, 9);
                                 definition.name = SqlName::parse("other_pending").unwrap();
-                                storage
+                                let change = storage
                                     .write_table_def(
-                                        unrelated,
-                                        9,
+                                        storage.select_table_definition(unrelated, 9).0,
                                         definition,
                                         &mapping("id"),
                                         false,
                                     )
                                     .unwrap();
-                                storage.rollback_table_def(unrelated, 9);
+                                storage.rollback_table_def(change);
                             }
                             storage
                                 .apply_comment(
@@ -2775,13 +2824,13 @@ mod tests {
                         storage.table_def(related, 7).columns()[0].name.as_str(),
                         "second_id"
                     );
-                    storage.rollback_table_def(related, 7);
+                    storage.rollback_table_def(second_change);
                     assert_identity(&storage, related, 7, movement.current);
                     assert_eq!(
                         storage.table_def(related, 7).columns()[0].name.as_str(),
                         "first_id"
                     );
-                    storage.rollback_table_def(related, 7);
+                    storage.rollback_table_def(first_change);
                     assert_identity(&storage, related, 0, movement.current);
                     assert!(storage.pending_table_def(related).is_none());
                     assert!(storage.pending_table_defs.test_write().is_ok());
@@ -2801,15 +2850,21 @@ mod tests {
             .unwrap();
             let pending = *storage.table_def(related, 0);
             {
-                let mut definition = storage.tables[related].definition_mut();
+                let revision = storage.reserve_table_definition_revision().unwrap();
+                let mut definition = storage.tables[related].definition_mut(revision);
                 definition.columns[0].ctype = ColType::Int4;
                 definition.columns[1].ctype = ColType::Array(ArrElem::Int4);
                 for column in definition.columns.iter_mut().take(2) {
                     column.user_type = None;
                 }
             }
-            storage
-                .write_table_def(related, 7, pending, &mapping("id"), false)
+            let change = storage
+                .write_table_def(
+                    storage.select_table_definition(related, 7).0,
+                    pending,
+                    &mapping("id"),
+                    false,
+                )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 publish_move(&storage, movement, source);
@@ -2821,7 +2876,7 @@ mod tests {
                         .iter()
                         .all(|column| column.user_type.is_none())
                 );
-                storage.rollback_table_def(related, 7);
+                storage.rollback_table_def(change);
                 assert!(
                     storage
                         .table_def(related, 0)

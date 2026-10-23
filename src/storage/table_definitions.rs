@@ -1,12 +1,11 @@
 //! Guards retain committed definitions and the pending slots that issued a view.
 
 use core::mem::size_of;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use {crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard};
 
 use super::table_names::{
-    CommittedDefinitionWrite, DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope,
-    TableNames,
+    DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope, TableNames,
 };
 
 use super::{
@@ -20,13 +19,36 @@ use crate::sql_err;
 
 pub(super) struct DefinitionState {
     pub(super) identity: TableIdentity,
-    pub(super) committed: TableDef,
+    committed: TableDef,
+    pub(super) committed_revision: TableDefinitionRevision,
     pub(super) pending: Option<PendingDefinitionHead>,
     /// A CREATE RULE changes the visible history only for its transaction.
     pub(super) pending_has_rules_txid: Option<u32>,
 }
 
 impl DefinitionState {
+    pub(super) fn committed(&self) -> &TableDef {
+        &self.committed
+    }
+
+    pub(super) fn edit_committed(&mut self, revision: TableDefinitionRevision) -> &mut TableDef {
+        self.committed_revision = revision;
+        &mut self.committed
+    }
+
+    pub(super) fn install(&mut self, definition: TableDef, identity: TableIdentity) {
+        self.committed = definition;
+        self.committed_revision = TableDefinitionRevision::INITIAL;
+        self.identity = identity;
+        self.pending = None;
+        self.pending_has_rules_txid = None;
+    }
+
+    pub(super) fn mark_rules_present(&mut self) {
+        // Staging always preserves sticky rule presence from the committed image.
+        self.committed.has_rules = true;
+    }
+
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
         self.identity
             .existence
@@ -81,6 +103,7 @@ impl TableDefinition {
         let state = DefinitionState {
             identity: TableIdentity::EMPTY,
             committed,
+            committed_revision: TableDefinitionRevision::INITIAL,
             pending: None,
             pending_has_rules_txid: None,
         };
@@ -181,8 +204,15 @@ impl TableDefinition {
         )
     }
 
-    pub(super) fn committed_mut(&mut self) -> CommittedDefinitionWrite<'_> {
-        self.exclusive().into_committed()
+    pub(super) fn committed_mut(
+        &mut self,
+        revision: TableDefinitionRevision,
+    ) -> CommittedDefinitionWrite<'_> {
+        self.exclusive().into_committed(revision)
+    }
+
+    pub(super) fn mark_rules_present(&mut self) {
+        self.exclusive().mark_rules_present();
     }
 
     pub(super) fn identity_mut(&mut self) -> IdentityWrite<'_> {
@@ -278,8 +308,9 @@ impl DefinitionVersions {
         &self,
         state: &mut DefinitionState,
         movement: super::type_reference_moves::TypeReferenceMove,
+        revision: TableDefinitionRevision,
     ) -> bool {
-        let mut changed = movement.rewrite_definition(&mut state.committed);
+        let mut changed = movement.rewrite_definition(state.edit_committed(revision));
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
             let mut owner = self.slots[slot as usize]
@@ -420,6 +451,26 @@ impl DefinitionVersions {
             .map_or(0, |head| self.read(head.tail as usize).version.revision)
     }
 
+    pub(super) fn contains_revision(
+        &self,
+        state: &DefinitionState,
+        transaction: u32,
+        revision: u64,
+    ) -> bool {
+        let mut tail = state
+            .pending
+            .filter(|head| head.transaction == transaction)
+            .map(|head| head.tail);
+        while let Some(slot) = tail {
+            let image = self.read(slot as usize);
+            if image.version.revision == revision {
+                return true;
+            }
+            tail = image.previous;
+        }
+        false
+    }
+
     pub(super) fn project_columns(
         &self,
         state: &DefinitionState,
@@ -546,6 +597,57 @@ impl Deref for DefinitionSlotRead<'_> {
 }
 
 /// Table ownership prevents retirement until the selected slot is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableDefinitionRevision(DefinitionRevisionSource);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefinitionRevisionSource {
+    Initial,
+    Catalog(u64),
+    Type {
+        source: super::type_references::TypeIdentity,
+        version: u64,
+    },
+}
+
+impl TableDefinitionRevision {
+    const INITIAL: Self = Self(DefinitionRevisionSource::Initial);
+
+    pub(super) fn catalog(version: u64) -> Self {
+        Self(DefinitionRevisionSource::Catalog(version))
+    }
+
+    pub(super) fn named_type(source: super::type_references::TypeIdentity, version: u64) -> Self {
+        Self(DefinitionRevisionSource::Type { source, version })
+    }
+}
+
+#[must_use]
+pub(crate) struct CommittedDefinitionWrite<'a> {
+    state: DefinitionWrite<'a>,
+    revision: TableDefinitionRevision,
+}
+
+impl<'a> CommittedDefinitionWrite<'a> {
+    pub(super) fn new(state: DefinitionWrite<'a>, revision: TableDefinitionRevision) -> Self {
+        Self { state, revision }
+    }
+}
+
+impl Deref for CommittedDefinitionWrite<'_> {
+    type Target = TableDef;
+    fn deref(&self) -> &Self::Target {
+        &self.state.committed
+    }
+}
+
+impl DerefMut for CommittedDefinitionWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.committed_revision = self.revision;
+        &mut self.state.committed
+    }
+}
+
 pub struct TableDefinitionRead<'a> {
     // Fields drop in order: release the slot before its table ownership.
     pending: Option<DefinitionSlotRead<'a>>,
@@ -565,6 +667,15 @@ impl Deref for TableDefinitionRead<'_> {
 impl<'a> TableDefinitionRead<'a> {
     pub(crate) fn identity(&self) -> TableIdentity {
         self.state.identity
+    }
+
+    pub(super) fn revisions(&self) -> (TableDefinitionRevision, u64) {
+        (
+            self.state.committed_revision,
+            self.pending
+                .as_ref()
+                .map_or(0, |slot| slot.version.revision),
+        )
     }
 
     pub(super) fn current(
@@ -699,8 +810,13 @@ mod tests {
             changed.schema = SqlName::parse("moved").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(SqlName::parse("id").unwrap());
-            storage
-                .write_table_def(table, 7, changed, &mapping, false)
+            let change = storage
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    changed,
+                    &mapping,
+                    false,
+                )
                 .unwrap();
             assert!(
                 storage
@@ -713,7 +829,7 @@ mod tests {
                     )
                     .is_some()
             );
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(change);
             assert!(
                 storage
                     .comment_text(
@@ -963,7 +1079,8 @@ mod tests {
                     let mut state = table.write();
                     versions.clear_locked(&mut state);
                     let stamp = epoch * 2 + 1;
-                    state.committed = definition(stamp);
+                    *state.edit_committed(TableDefinitionRevision::catalog(stamp as u64)) =
+                        definition(stamp);
                     state.identity.created_at = stamp as u64;
                     state.identity.ownership.owner = (stamp % 4) as u16;
                     state.identity.database = if stamp % 4 == 1 {

@@ -56,7 +56,9 @@ mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
+pub(crate) use table_definitions::TableDefinitionRevision;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
+pub(crate) use table_edits::{TableDefinitionChange, TableDefinitionTarget};
 pub(crate) use type_names::{NamedTypeKind, NamedTypeSlot};
 pub(crate) use type_references::StorageSetupError;
 pub(crate) use type_references::TypeReference;
@@ -3991,8 +3993,11 @@ impl Table {
         TableDefinitionRead::committed(&self.definition)
     }
 
-    pub(crate) fn definition_mut(&mut self) -> table_names::CommittedDefinitionWrite<'_> {
-        self.definition.committed_mut()
+    pub(crate) fn definition_mut(
+        &mut self,
+        revision: TableDefinitionRevision,
+    ) -> table_definitions::CommittedDefinitionWrite<'_> {
+        self.definition.committed_mut(revision)
     }
 
     fn pending_definition_transaction(&self) -> Option<u32> {
@@ -18357,8 +18362,10 @@ impl Storage {
             }
             definition.n_columns = 4;
             definition.has_toast = true;
-            *table.definition_mut() = definition;
-            table.identity_mut().existence = CatalogDdlState::Present;
+            let mut state = table.definition.write();
+            let mut identity = state.identity;
+            identity.existence = CatalogDdlState::Present;
+            state.install(definition, identity);
         }
         let mut large_objects = FixedVec::new(budget, "large_objects", config.max_large_objects)?;
         for _ in 0..config.max_large_objects {
@@ -21159,8 +21166,8 @@ impl Storage {
                         let state = table.definition.read();
                         (state.identity.database == target
                             && state.identity.existence.visible_to(txid)
-                            && state.committed.schema == definition.schema
-                            && state.committed.name == definition.table)
+                            && state.committed().schema == definition.schema
+                            && state.committed().name == definition.table)
                             .then_some(slot)
                     })
                     .ok_or_else(|| {
@@ -21761,8 +21768,9 @@ impl Storage {
                             "template partition parent was not cloned"
                         )
                     })?;
+                let revision = self.reserve_table_definition_revision()?;
                 self.tables[target_slot]
-                    .definition_mut()
+                    .definition_mut(revision)
                     .partition
                     .attachment = Some(PartitionAttachment {
                     parent: target_parent as u16,
@@ -28107,6 +28115,7 @@ impl Storage {
             }
         }
 
+        let revision = self.reserve_table_definition_revision()?;
         schemas[slot].name = name;
         drop(schemas);
 
@@ -28118,8 +28127,8 @@ impl Storage {
             if table.existence() == CatalogDdlState::Absent {
                 continue;
             }
-            rename_schema_name(&mut table.definition_mut().schema, prior, name);
-            let mut definition_owner = table.definition_mut();
+            rename_schema_name(&mut table.definition_mut(revision).schema, prior, name);
+            let mut definition_owner = table.definition_mut(revision);
             let definition = &mut *definition_owner;
             for column in definition.columns.iter_mut().take(definition.n_columns) {
                 rename_user_type_schema(&mut column.user_type, prior, name);
@@ -28128,7 +28137,7 @@ impl Storage {
                 rename_schema_name(&mut key.parent_schema, prior, name);
             }
             drop(definition_owner);
-            rename_table_sql_identity(&mut table.definition_mut(), prior, name)?;
+            rename_table_sql_identity(&mut table.definition_mut(revision), prior, name)?;
             table.mark_dirty();
             self.pending_table_defs
                 .rename_schema(&mut table.definition, prior, name)?;
@@ -35092,6 +35101,46 @@ impl Storage {
         )
     }
 
+    pub(crate) fn reserve_table_definition_revision(
+        &self,
+    ) -> Result<TableDefinitionRevision, SqlError> {
+        self.catalog_sequence
+            .next()
+            .map(TableDefinitionRevision::catalog)
+    }
+
+    fn table_definition_target(
+        &self,
+        index: usize,
+        transaction: u32,
+        definition: &TableDefinitionRead<'_>,
+    ) -> TableDefinitionTarget {
+        let identity = definition.identity();
+        let (committed_revision, pending_revision) = definition.revisions();
+        TableDefinitionTarget {
+            source: self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(index),
+                identity.database,
+                identity.created_at,
+            ),
+            transaction,
+            committed_revision,
+            pending_revision,
+        }
+    }
+
+    pub(crate) fn select_table_definition(
+        &self,
+        index: usize,
+        transaction: u32,
+    ) -> (TableDefinitionTarget, TableDef) {
+        let definition = self.table_def(index, transaction);
+        (
+            self.table_definition_target(index, transaction, &definition),
+            *definition,
+        )
+    }
+
     pub(crate) fn table_definition_images(&self) -> TableDefinitionImages {
         TableDefinitionImages::new(&self.table_definition_images)
     }
@@ -35117,35 +35166,59 @@ impl Storage {
     /// Installs the next transaction-owned table shape. `column_mapping`
     /// describes the transition from the previously visible definition to
     /// `def`; the stored mapping is composed back to the committed definition.
-    pub fn write_table_def(
+    pub(crate) fn write_table_def(
         &self,
-        index: usize,
-        txid: u32,
+        target: TableDefinitionTarget,
         def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
-    ) -> Result<(), SqlError> {
-        table_edits::TableDefinitionEdit::new(self, index).stage(
-            txid,
+    ) -> Result<TableDefinitionChange, SqlError> {
+        if self.tables.get(target.table()).is_none() {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table definition source belongs to different storage"
+            ));
+        }
+        table_edits::TableDefinitionEdit::new(self, target.table()).stage(
+            target,
             def,
             column_mapping,
             rewrites_rows,
         )
     }
 
-    pub fn rollback_table_def(&self, index: usize, txid: u32) {
-        table_edits::TableDefinitionEdit::new(self, index).rollback(txid);
+    pub(crate) fn rollback_table_def(&self, change: TableDefinitionChange) {
+        if self.tables.get(change.table()).is_none() {
+            return;
+        }
+        table_edits::TableDefinitionEdit::new(self, change.table()).rollback(change);
     }
 
     /// Promotes the latest pending definition after its WAL batch is durable.
     /// Row images are promoted separately by the transaction coordinator.
-    pub fn commit_table_def(&mut self, index: usize, txid: u32) -> bool {
-        let Some(pending) = self.pending_table_def(index).map(|pending| *pending) else {
-            return false;
-        };
-        if pending.txid != txid {
-            return false;
+    pub(crate) fn commit_table_def(&mut self, change: TableDefinitionChange) -> Option<bool> {
+        let index = change.table();
+        let identity = self.tables.get(index)?.identity();
+        if !change.source.matches(
+            self,
+            identity.database,
+            identity.created_at,
+            identity.existence,
+        ) {
+            return None;
         }
+        {
+            let definition = self.tables[index].definition.read();
+            if !self.pending_table_defs.contains_revision(
+                &definition,
+                change.transaction,
+                change.revision,
+            ) {
+                return None;
+            }
+        }
+        let pending = self.pending_table_def(index).map(|pending| *pending)?;
+        let txid = change.transaction;
         let mut definition = pending.def;
         definition.has_toast |= {
             let definition = self.tables[index].definition();
@@ -35156,11 +35229,16 @@ impl Storage {
             definition.has_rules
         };
         self.promote_private_index_bindings(index, txid);
-        self.set_table_def(index, definition, &pending.column_mapping);
+        self.set_table_def(
+            index,
+            definition,
+            &pending.column_mapping,
+            TableDefinitionRevision::catalog(pending.revision),
+        );
         self.commit_index_table_names(index, txid);
         self.clear_pending_table_defs(index);
         self.commit_constraint_comment_identities(index, txid);
-        pending.rewrites_rows
+        Some(pending.rewrites_rows)
     }
 
     fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
@@ -35303,7 +35381,8 @@ impl Storage {
             let definition = self.tables[index].definition();
             definition.has_rules
         };
-        self.set_table_def(index, def, &column_mapping);
+        let revision = self.reserve_table_definition_revision()?;
+        self.set_table_def(index, def, &column_mapping, revision);
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
             self.tables[index]
@@ -35427,7 +35506,7 @@ impl Storage {
                 selected.created_at,
             );
             let transaction = selected.existence.pending_drop_txid();
-            let (schema, name) = (state.committed.schema, state.committed.name);
+            let (schema, name) = (state.committed().schema, state.committed().name);
             for comment in comments.entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.database == Some(selected.database)
@@ -38889,6 +38968,7 @@ impl Storage {
     }
 
     fn rebind_user_type_declarations_to(&mut self, txid: u32) -> Result<(), SqlError> {
+        let revision = self.reserve_table_definition_revision()?;
         for table in 0..self.tables.len() {
             if self.tables[table].database() != current_database()
                 || !self.tables[table].visible_to(txid)
@@ -38897,7 +38977,7 @@ impl Storage {
             }
             let mut definition = *self.tables[table].definition();
             self.bind_user_type_columns_to(&mut definition, txid)?;
-            *self.tables[table].definition_mut() = definition;
+            *self.tables[table].definition_mut(revision) = definition;
         }
         for composite in 0..self.composite_count() {
             let definition = self.composite_for(composite, txid);
@@ -44564,7 +44644,7 @@ impl Storage {
         let selected_names = state
             .pending
             .filter(|head| head.transaction == txid)
-            .map_or((state.committed.schema, state.committed.name), |head| {
+            .map_or((state.committed().schema, state.committed().name), |head| {
                 (head.schema, head.name)
             });
         if !state.identity.existence.visible_to(txid)
@@ -45806,7 +45886,12 @@ impl Storage {
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
-    pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
+    pub(crate) fn move_table_schema(
+        &mut self,
+        index: usize,
+        new_schema: SqlName,
+        revision: TableDefinitionRevision,
+    ) {
         let database_oid = self.tables[index].database();
         let database = Some(database_oid);
         let old_schema = {
@@ -45817,7 +45902,7 @@ impl Storage {
             let definition = self.tables[index].definition();
             definition.name
         };
-        self.tables[index].definition_mut().schema = new_schema;
+        self.tables[index].definition_mut(revision).schema = new_schema;
         self.tables[index].mark_dirty();
         let mut index_comments = self.comment_catalog();
         for x in self.index_catalog().iter_mut() {
@@ -45872,8 +45957,16 @@ impl Storage {
             if t.database() != database_oid || !t.live() {
                 continue;
             }
+            if !t
+                .definition()
+                .fkeys()
+                .iter()
+                .any(|key| key.parent_schema == old_schema && key.parent == name)
+            {
+                continue;
+            }
             let mut changed = false;
-            let mut definition_owner = t.definition_mut();
+            let mut definition_owner = t.definition_mut(revision);
             let definition = &mut *definition_owner;
             for fk in &mut definition.fkeys[..definition.n_fkeys] {
                 if fk.parent_schema.as_str() == old_schema.as_str()
@@ -45905,8 +45998,13 @@ impl Storage {
     /// Removes one foreign key from a table's definition by constraint name
     /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
     /// transactional undo.
-    pub fn drop_fk(&mut self, index: usize, fk_name: &str) -> Option<ForeignKey> {
-        let mut definition_owner = self.tables[index].definition_mut();
+    pub(crate) fn drop_fk(
+        &mut self,
+        index: usize,
+        fk_name: &str,
+        revision: TableDefinitionRevision,
+    ) -> Option<ForeignKey> {
+        let mut definition_owner = self.tables[index].definition_mut(revision);
         let def = &mut *definition_owner;
         let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
         let removed = def.fkeys[at];
@@ -45920,17 +46018,18 @@ impl Storage {
     }
 
     /// Replaces a table's definition in place (ALTER TABLE).
-    pub fn set_table_def(
+    fn set_table_def(
         &mut self,
         index: usize,
         def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+        revision: TableDefinitionRevision,
     ) {
         let old = *self.tables[index].definition();
         let database_oid = self.tables[index].database();
         let database = Some(database_oid);
         if old.schema != def.schema {
-            self.move_table_schema(index, def.schema);
+            self.move_table_schema(index, def.schema, revision);
         }
         let current = *self.tables[index].definition();
         if current.name != def.name {
@@ -45938,8 +46037,16 @@ impl Storage {
                 if table.database() != database_oid {
                     continue;
                 }
+                if !table
+                    .definition()
+                    .fkeys()
+                    .iter()
+                    .any(|key| key.parent_schema == current.schema && key.parent == current.name)
+                {
+                    continue;
+                }
                 let mut changed = false;
-                let mut definition_owner = table.definition_mut();
+                let mut definition_owner = table.definition_mut(revision);
                 let definition = &mut *definition_owner;
                 for foreign_key in &mut definition.fkeys[..definition.n_fkeys] {
                     if foreign_key.parent_schema == current.schema
@@ -46022,7 +46129,7 @@ impl Storage {
             index_def.schema = def.schema;
             index_def.table = def.name;
         }
-        *self.tables[index].definition_mut() = def;
+        *self.tables[index].definition_mut(revision) = def;
         self.tables[index].mark_dirty();
         self.rename_stored_query_dependency(
             DependencyClass::Table,
@@ -49395,7 +49502,7 @@ impl Storage {
         let mut state = self.tables[usize::from(table)].definition.write();
         let other = state.locked_by_other(txid);
         if let Some(owner) = other {
-            let name = state.committed.name;
+            let name = state.committed().name;
             drop(state);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
@@ -49418,7 +49525,7 @@ impl Storage {
 
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
         let state = self.tables[table].definition.read();
-        state.committed.has_rules || state.pending_has_rules_txid == Some(txid)
+        state.committed().has_rules || state.pending_has_rules_txid == Some(txid)
     }
 
     fn clear_rule_comments(&self, definition: RuleDefinition) {
@@ -49542,7 +49649,9 @@ impl Storage {
         };
         drop(owners);
         if let RuleTarget::Table(table) = definition.target {
-            self.tables[usize::from(table)].definition_mut().has_rules = true;
+            self.tables[usize::from(table)]
+                .definition
+                .mark_rules_present();
         }
         self.catalog_sequence.observe(created_at);
         Ok(())
@@ -52385,7 +52494,8 @@ mod tests {
         let table = storage.create_table(definition).unwrap();
         let selected = storage.tables[table].enforcer(0).unwrap();
         selected.cache.write().insert(41, 99).unwrap();
-        storage.tables[table].definition_mut().columns[1].unique = true;
+        let revision = storage.reserve_table_definition_revision().unwrap();
+        storage.tables[table].definition_mut(revision).columns[1].unique = true;
         crate::mem::guard::forbid_alloc(|| {
             let error = storage.refresh_enforcers(table).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -52841,12 +52951,14 @@ mod tests {
     fn cluster_metadata_table_names_reserve_only_within_their_database() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let foreign = storage
-                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7)
-                .unwrap();
-            storage.tables[foreign].identity_mut().database = DatabaseOid::TEMPLATE1;
+            let prior_database = current_database();
+            crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
+            let foreign =
+                storage.create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7);
+            crate::sql::set_execution_database_oid(prior_database);
+            let foreign = foreign.unwrap();
             let local = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
                 .unwrap();
@@ -52859,12 +52971,20 @@ mod tests {
                 storage.ddl_name_locked_by_other("public", "reserved", 9),
                 None
             );
-            storage.commit_create(foreign);
-            let mut renamed = *storage.tables[foreign].definition();
+            let (target, mut renamed) = storage.select_table_definition(foreign, 7);
             renamed.name = SqlName::parse("pending_name").unwrap();
-            storage
-                .write_table_def(foreign, 7, renamed, &[None; MAX_COLUMNS], false)
-                .unwrap();
+            assert_eq!(
+                storage
+                    .write_table_def(target, renamed, &[None; MAX_COLUMNS], false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE,
+            );
+            crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
+            storage.commit_create(foreign);
+            let change = storage.write_table_def(target, renamed, &[None; MAX_COLUMNS], false);
+            crate::sql::set_execution_database_oid(prior_database);
+            let _change = change.unwrap();
             assert_eq!(
                 storage.ddl_name_locked_by_other("public", "pending_name", 9),
                 None
@@ -54775,10 +54895,9 @@ mod tests {
                 original,
                 committed.definition(&storage, table, 0).unwrap()
             ));
-            storage
+            let first_change = storage
                 .write_table_def(
-                    table,
-                    7,
+                    storage.select_table_definition(table, 7).0,
                     make_def("pending", &[("id", ColType::Int8, true)]),
                     &[None; MAX_COLUMNS],
                     false,
@@ -54795,7 +54914,7 @@ mod tests {
                     .as_str(),
                 "original"
             );
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(first_change);
             assert_eq!(pending_image.name.as_str(), "pending");
             assert!(core::ptr::eq(
                 pending_image,
@@ -54810,16 +54929,15 @@ mod tests {
                     .as_str(),
                 "original"
             );
-            storage
+            let second_change = storage
                 .write_table_def(
-                    table,
-                    7,
+                    storage.select_table_definition(table, 7).0,
                     make_def("published", &[("id", ColType::Int8, true)]),
                     &[None; MAX_COLUMNS],
                     false,
                 )
                 .unwrap();
-            storage.commit_table_def(table, 7);
+            assert_eq!(storage.commit_table_def(second_change), Some(false));
             assert_eq!(original.name.as_str(), "original");
             let published = storage.table_definition_images();
             assert_eq!(
@@ -60106,8 +60224,13 @@ mod tests {
             .unwrap();
         let mut updated = *storage.table_def(first, 7);
         updated.name = SqlName::parse("held_pending_cleanup").unwrap();
-        storage
-            .write_table_def(first, 7, updated, &[None; MAX_COLUMNS], false)
+        let _change = storage
+            .write_table_def(
+                storage.select_table_definition(first, 7).0,
+                updated,
+                &[None; MAX_COLUMNS],
+                false,
+            )
             .unwrap();
         let target = RuleTarget::Table(second as u16);
         let publication_rule = storage

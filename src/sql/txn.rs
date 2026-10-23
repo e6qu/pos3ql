@@ -354,7 +354,7 @@ pub(crate) enum DdlUndo {
     Dropped(crate::storage::CatalogDdlUndo),
     /// ALTER TABLE appended one pending table-definition version. Row-image
     /// undo is carried by the ordinary touched-row log.
-    TableAltered(u32),
+    TableAltered(crate::storage::TableDefinitionChange),
     ViewChanged(crate::storage::ViewPublication),
     ViewDropped(crate::storage::CatalogDdlUndo),
     MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
@@ -2384,6 +2384,28 @@ impl TxnState {
         while self.subscription_advances.len() > mark {
             self.subscription_advances.pop();
         }
+    }
+
+    pub(crate) fn write_table_definition(
+        &mut self,
+        storage: &crate::storage::Storage,
+        target: crate::storage::TableDefinitionTarget,
+        definition: crate::storage::TableDef,
+        column_mapping: &[Option<crate::storage::SqlName>; crate::storage::MAX_COLUMNS],
+        rewrites_rows: bool,
+    ) -> Result<(), SqlError> {
+        if target.transaction() != self.txid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "table definition selection belongs to another transaction"
+            ));
+        }
+        let change = storage.write_table_def(target, definition, column_mapping, rewrites_rows)?;
+        if let Err(error) = self.record_ddl(DdlUndo::TableAltered(change)) {
+            storage.rollback_table_def(change);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_table_drop(

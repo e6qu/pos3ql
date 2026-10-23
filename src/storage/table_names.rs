@@ -3,8 +3,10 @@
 use core::ops::{Deref, DerefMut};
 use std::sync::{RwLock, RwLockWriteGuard};
 
-use super::table_definitions::{DefinitionState, TableIdentity};
-use super::{CatalogDdlState, DatabaseOid, SqlName, TableDef};
+use super::table_definitions::{
+    CommittedDefinitionWrite, DefinitionState, TableDefinitionRevision, TableIdentity,
+};
+use super::{CatalogDdlState, DatabaseOid, SqlName};
 
 #[derive(Clone, Copy)]
 pub(super) enum TableNameScope {
@@ -86,8 +88,8 @@ impl TableNames {
                 created_at: state.identity.created_at,
             },
             existence: state.identity.existence,
-            schema: state.committed.schema,
-            name: state.committed.name,
+            schema: state.committed().schema,
+            name: state.committed().name,
             pending: state
                 .pending
                 .map(|head| (head.transaction, head.schema, head.name)),
@@ -167,8 +169,11 @@ impl<'a> DefinitionWrite<'a> {
         }
     }
 
-    pub(super) fn into_committed(self) -> CommittedDefinitionWrite<'a> {
-        CommittedDefinitionWrite { state: self }
+    pub(super) fn into_committed(
+        self,
+        revision: TableDefinitionRevision,
+    ) -> CommittedDefinitionWrite<'a> {
+        CommittedDefinitionWrite::new(self, revision)
     }
 
     pub(super) fn into_identity(self) -> IdentityWrite<'a> {
@@ -198,24 +203,6 @@ impl DerefMut for DefinitionWrite<'_> {
 impl Drop for DefinitionWrite<'_> {
     fn drop(&mut self) {
         self.publish_names();
-    }
-}
-
-#[must_use]
-pub(crate) struct CommittedDefinitionWrite<'a> {
-    state: DefinitionWrite<'a>,
-}
-
-impl Deref for CommittedDefinitionWrite<'_> {
-    type Target = TableDef;
-    fn deref(&self) -> &Self::Target {
-        &self.state.committed
-    }
-}
-
-impl DerefMut for CommittedDefinitionWrite<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state.committed
     }
 }
 

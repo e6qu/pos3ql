@@ -51,19 +51,29 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[1] = Some(SqlName::parse("key").unwrap());
             mapping[2] = Some(SqlName::parse("payload").unwrap());
-            storage
-                .write_table_def(table, 7, definition, &mapping, true)
+            let first_change = storage
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    definition,
+                    &mapping,
+                    true,
+                )
                 .unwrap();
             let pending = storage.index_visible_to(slot, 7).unwrap();
             assert_eq!((pending.columns[0], pending.include_columns[0]), (0, 1));
             let committed = storage.index_visible_to(slot, 8).unwrap();
             assert_eq!((committed.columns[0], committed.include_columns[0]), (1, 2));
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(first_change);
             assert_eq!(storage.index_visible_to(slot, 7).unwrap().columns[0], 1);
-            storage
-                .write_table_def(table, 7, definition, &mapping, true)
+            let second_change = storage
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    definition,
+                    &mapping,
+                    true,
+                )
                 .unwrap();
-            assert!(storage.commit_table_def(table, 7));
+            assert_eq!(storage.commit_table_def(second_change), Some(true));
             let committed = storage.index_visible_to(slot, 8).unwrap();
             assert_eq!(
                 (committed.schema.as_str(), committed.table.as_str()),
@@ -132,7 +142,9 @@ fn table_name_lookup_skips_same_name_in_another_database() {
     let (storage, unrelated, target) = fixture();
     {
         let mut definition = storage.tables[unrelated].definition.write();
-        definition.committed.name = SqlName::parse("lookup_target").unwrap();
+        definition
+            .edit_committed(storage.reserve_table_definition_revision().unwrap())
+            .name = SqlName::parse("lookup_target").unwrap();
         definition.identity.database = DatabaseOid::TEMPLATE1;
     }
     assert_unrelated_lookup_progress(&storage, unrelated, target);
@@ -157,7 +169,8 @@ fn table_name_lookup_selected_writer_revalidates_name_and_incarnation() {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         let premature = receive.recv_timeout(Duration::from_millis(100));
-        held.committed.name = SqlName::parse("lookup_replacement").unwrap();
+        held.edit_committed(storage.reserve_table_definition_revision().unwrap())
+            .name = SqlName::parse("lookup_replacement").unwrap();
         held.identity.created_at = held.identity.created_at.checked_add(1).unwrap();
         drop(held);
         let result = premature.ok();
@@ -197,25 +210,35 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         assert_eq!(storage.find_table("public", "private_lookup"), None);
         let mut updated = *storage.table_def(created, 7);
         updated.name = SqlName::parse("first_lookup").unwrap();
-        storage
-            .write_table_def(created, 7, updated, &[None; MAX_COLUMNS], false)
+        let first_change = storage
+            .write_table_def(
+                storage.select_table_definition(created, 7).0,
+                updated,
+                &[None; MAX_COLUMNS],
+                false,
+            )
             .unwrap();
         updated.name = SqlName::parse("second_lookup").unwrap();
-        storage
-            .write_table_def(created, 7, updated, &[None; MAX_COLUMNS], false)
+        let second_change = storage
+            .write_table_def(
+                storage.select_table_definition(created, 7).0,
+                updated,
+                &[None; MAX_COLUMNS],
+                false,
+            )
             .unwrap();
         assert_eq!(storage.find_visible("public", "private_lookup", 7), None);
         assert_eq!(
             storage.find_visible("public", "second_lookup", 7),
             Some(created)
         );
-        storage.rollback_table_def(created, 7);
+        storage.rollback_table_def(second_change);
         assert_eq!(storage.find_visible("public", "second_lookup", 7), None);
         assert_eq!(
             storage.find_visible("public", "first_lookup", 7),
             Some(created)
         );
-        storage.rollback_table_def(created, 7);
+        storage.rollback_table_def(first_change);
         storage.commit_create(created);
         assert_eq!(
             storage.find_table("public", "private_lookup"),
@@ -249,8 +272,13 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         committed.name = SqlName::parse("committed_lookup").unwrap();
         let mut mapping = [None; MAX_COLUMNS];
         mapping[0] = Some(SqlName::parse("id").unwrap());
-        storage
-            .write_table_def(target, 9, committed, &mapping, false)
+        let third_change = storage
+            .write_table_def(
+                storage.select_table_definition(target, 9).0,
+                committed,
+                &mapping,
+                false,
+            )
             .unwrap();
         assert_eq!(
             storage.find_visible("public", "lookup_target", 8),
@@ -262,7 +290,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
             storage.find_visible("public", "committed_lookup", 9),
             Some(target)
         );
-        storage.commit_table_def(target, 9);
+        assert_eq!(storage.commit_table_def(third_change), Some(false));
         assert_eq!(storage.find_table("public", "lookup_target"), None);
         assert_eq!(
             storage.find_table("public", "committed_lookup"),
@@ -276,7 +304,8 @@ fn table_name_lookup_exclusive_edits_publish_names_database_and_stamp() {
     let (mut storage, _, target) = fixture();
     crate::mem::guard::forbid_alloc(|| {
         {
-            let mut definition = storage.tables[target].definition_mut();
+            let revision = storage.reserve_table_definition_revision().unwrap();
+            let mut definition = storage.tables[target].definition_mut(revision);
             definition.schema = SqlName::parse("lookup_schema").unwrap();
             definition.name = SqlName::parse("exclusive_lookup").unwrap();
         }

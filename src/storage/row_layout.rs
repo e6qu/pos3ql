@@ -201,17 +201,20 @@ mod tests {
                 assert!(!storage.history_cleanup_pending());
                 assert_eq!(histories(&storage, table), 0);
                 let mut count = 0;
-                scan.for_each_home(&mut |rowid, home| {
-                    storage.with_row_bytes(table, rowid, home, |bytes| {
-                        let mut values = [Datum::Null];
-                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                        assert_eq!(values[0], Datum::Int4(11));
-                        Ok(())
-                    })?;
-                    count += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })
-                .unwrap();
+                assert!(
+                    scan.for_each_home(&mut |rowid, home| {
+                        storage.with_row_bytes(table, rowid, home, |bytes| {
+                            let mut values = [Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values[0], Datum::Int4(11));
+                            Ok(())
+                        })?;
+                        count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap()
+                    .is_continue()
+                );
                 assert_eq!(count, 129);
                 drop(retained_ids);
                 storage

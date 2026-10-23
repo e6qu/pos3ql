@@ -98,7 +98,7 @@ next statement.
 | Transaction identities | One guarded counter serves SQL, maintenance, and recovery. Creating a SQL transaction reserves its ID and registry entry together; capacity errors leave existing transactions valid. | Coordinate journal staging, prepared transactions, and engine publication during concurrent execution. |
 | Journal positions | Checked shared reservations and observations that never move backward; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
-| Catalogs and table definitions | Readers retain selected definitions and identities; tables have separate cleanup owners. Table and routine submission validate type lifetimes under installation owners. Typed tables and saved queries retain source lifetimes through recovery and database cloning. | Engine-wide publication, rewrites, and maintenance integration |
+| Catalogs and table definitions | Readers retain selected definitions and identities; tables have separate cleanup owners. Table and routine submission validate type lifetimes under installation owners. Typed tables and saved queries retain source lifetimes through recovery and database cloning. | Consistent reader capture across transactions and concurrent maintenance |
 | Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Complete shared commit, retirement and remaining metadata preparation before removing the SQL barrier |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
@@ -290,7 +290,8 @@ Already selected row bytes remain readable after cleanup. A metadata lookup save
 before the physical layout changed returns `40001` rather than decoding replacement
 bytes using the old column types. Renames and unrelated row changes do not invalidate
 that lookup. Retained scans also reject newly supplied row images from another
-physical layout, even when their bytes share a heap allocation. These checks use table publication generations, so temporary changes
+physical layout after commit, even when their bytes share a heap allocation.
+These checks use table publication generations, so temporary changes
 sharing a journal position cannot redirect an old selection to new bytes.
 
 **User example:** deleting most orders and then changing their ID from `integer`
@@ -404,8 +405,8 @@ table while an unrelated table definition is being changed. Looking for a table
 that does not exist, or creating a table with a different name, also avoids
 waiting for unrelated definitions. SQL execution
 is still serial; this removes a storage-level dependency before workers are added.
-Committed definition changes, table renames, rewrites and maintenance coordination
-remain in [PLAN.md](../PLAN.md).
+Readers still need one consistent view of a transaction's definitions and rows
+before SQL workers can run together; see [PLAN.md](../PLAN.md).
 
 Client descriptions and data-changing WITH queries use the same DML output
 analysis, including view-column rewriting and original output names. Their target definition comes from

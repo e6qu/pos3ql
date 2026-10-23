@@ -53356,10 +53356,17 @@ impl<'arena> ReplicationRow<'arena> {
         self.rowid
     }
 
-    pub(crate) fn definition(&self) -> &TableDef {
-        self.definitions
-            .retained_definition(self.table_slot, self.transaction)
-            .expect("selected replication row retains its definition")
+    fn selection(
+        &self,
+        storage: &Storage,
+        table: usize,
+        transaction: u32,
+    ) -> Result<(crate::storage::TableDefinitionTarget, &TableDef), SqlError> {
+        if transaction != self.transaction {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
+                "replication row selection belongs to another transaction"));
+        }
+        self.definitions.selection(storage, table, self.transaction)
     }
 
     pub(crate) fn bytes(&self) -> &'arena [u8] {
@@ -53515,6 +53522,7 @@ fn apply_replication_delete_row(
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row_table = row.table_slot();
+    let (row_target, definition) = row.selection(storage, row_table, txn.txid)?;
     storage.require_subscription_target(row_table, txn.txid)?;
     match storage.acquire_row_lock(
         row_table,
@@ -53532,7 +53540,7 @@ fn apply_replication_delete_row(
         }
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
     }
-    let (row_target, definition) = row.definitions.selection(storage, row_table, txn.txid)?;
+
     let bytes = row.bytes();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -53640,6 +53648,8 @@ pub(crate) fn apply_replication_update(
     };
     let table_index = binding.table_slot();
     let row_table = row.table_slot();
+    let (logical_target, logical_definition) = row.selection(storage, table_index, txn.txid)?;
+    let (row_target, definition) = row.selection(storage, row_table, txn.txid)?;
     match storage.acquire_row_lock(
         row_table,
         row.rowid(),
@@ -53657,8 +53667,8 @@ pub(crate) fn apply_replication_update(
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply update waits for its row"),
     }
     storage.require_subscription_target(row_table, txn.txid)?;
-    let (logical_target, logical_definition) = row.definitions.selection(storage, table_index, txn.txid)?;
-    let (row_target, definition) = row.definitions.selection(storage, row_table, txn.txid)?;
+
+
     let mapping = crate::storage::RelationColumnMap::new(logical_definition, definition, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -71601,6 +71611,61 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn statement_row_replication_selection_rejects_another_transaction_without_recapture() {
+        let mut config = crate::config::Config::default_dev();
+        config.memtable_bytes = 1 << 16;
+        config.max_connections = 2;
+        config.max_tables = 2;
+        config.table_rows = 128;
+        config.txn_rows = 128;
+        config.value_index_rows = 512;
+        config.max_value_indexes = 8;
+        config.max_extension_scripts = 8;
+        config.extension_script_bytes = 1 << 16;
+        let mut budget = Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config) + (1 << 20));
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut definition = TableDef::empty();
+        definition.schema = SqlName::parse("public").unwrap();
+        definition.name = SqlName::parse("replication_original_source").unwrap();
+        definition.n_columns = 1;
+        definition.columns[0] = ColumnMeta {
+            name: SqlName::parse("id").unwrap(),
+            ctype: ColType::Int4,
+            ..ColumnMeta::EMPTY
+        };
+        let table = storage.create_table(definition).unwrap();
+        let arena = Arena::new(&mut budget, "replication original row", 4096).unwrap();
+        let definitions = storage.table_definition_images();
+        crate::mem::guard::forbid_alloc(|| {
+            let (target, _) = definitions.selection(&storage, table, 7).unwrap();
+            let image = storage.heap.append_row_image(&[Datum::Int4(7)]).unwrap();
+            let undo = storage.write_pending_image(target, 1, 2, Some(image), crate::storage::RowWriteStatistics::Tracked).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+            let home = storage.visible_row_home(table, 1, state, 7).unwrap().unwrap();
+            let selected = PhysicalRow::local(table, 1, home.snapshot());
+            let bytes = storage.with_row_bytes(table, 1, home, |bytes| {
+                arena.alloc_slice_copy(bytes).map(|bytes| &*bytes).map_err(|_| arena_full())
+            }).unwrap();
+            let row = ReplicationRow {table_slot: table, rowid: 1, selected, bytes, definitions, transaction: 7};
+            assert_eq!(row.selection(&storage, table, 8).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(row.definitions.retained_definition(table, 8).is_none());
+            let (_, mut changed) = storage.select_table_definition(table, 7);
+            changed.columns[0].name = SqlName::parse("renamed").unwrap();
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(changed.columns[0].name);
+            let change = storage.write_table_def(target, changed, &mapping, false).unwrap();
+            let (original, definition) = row.selection(&storage, table, 7).unwrap();
+            assert_eq!(original.transaction(), 7);
+            assert_eq!(definition.columns()[0].name.as_str(), "id");
+            let image = storage.heap.append_row_image(&[Datum::Int4(8)]).unwrap();
+            assert_eq!(storage.write_pending_image(original, 1, 3, Some(image), crate::storage::RowWriteStatistics::Tracked).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE);
+            storage.restore_pending(table, 1, 7, undo);
+            storage.rollback_table_def(change);
+        });
+    }
 
     #[test]
     fn composite_field_rename_rewrites_only_bound_selectors() {

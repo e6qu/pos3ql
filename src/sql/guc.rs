@@ -443,6 +443,7 @@ impl Default for RenderContext {
 /// a shared borrow. Each slot carries the sequence's `created_at` stamp so a
 /// reused catalog slot cannot leak a dropped sequence's value.
 pub struct SeqSession {
+    pub(super) statement_replay: Cell<super::sequence::StatementSequenceReplay>,
     /// Per-slot `(created_at, value)`; `created_at == 0` means undefined.
     currvals: [Cell<(u64, i64)>; INLINE_SEQUENCE_SLOTS],
     /// `(defined, value)` for `lastval` — the last `nextval` of any sequence.
@@ -490,6 +491,7 @@ impl SequenceCache {
 impl SeqSession {
     const fn new() -> Self {
         SeqSession {
+            statement_replay: Cell::new(super::sequence::StatementSequenceReplay::EMPTY),
             currvals: [const { Cell::new((0u64, 0i64)) }; INLINE_SEQUENCE_SLOTS],
             lastval: Cell::new((false, 0)),
             caches: [const { Cell::new(SequenceCache::EMPTY) }; INLINE_SEQUENCE_SLOTS],

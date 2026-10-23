@@ -651,6 +651,15 @@ branch or WHERE condition does not advance it. Filtering a SELECT without FROM
 happens once before evaluating its outputs or expanding a set-returning function.
 Waiting for a nested function does not advance
 it again. SQL function result queries use the connection's sequence state.
+Commands that wait for a lock also retain their completed sequence calls. For
+example, if a schema-drop event trigger inserts an audit row with a serial ID,
+waiting for a report to finish does not consume another ID on each attempt.
+Calls to `nextval`, `currval`, `lastval` and `setval` retain their results in the
+existing statement arena; automatic serial values use the same path. Exhaustion
+returns `54000`, "volatile sequence replay exceeds statement memory", before
+making an unrecorded sequence change. Saved handles reject a reset or replacement
+arena, and a changed source or call order returns `40001`. A private sequence
+recreated by rollback must reproduce its saved result before execution continues.
 The pg_typeof function is stable rather than immutable: an immutable cast of
 its result stays out of planning. A genuinely constant immutable cast can
 still raise a planning error even when WHERE FALSE removes all rows. These

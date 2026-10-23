@@ -112,9 +112,7 @@ impl TableDefinitionImages {
         }
     }
 
-    pub(crate) fn iter(
-        &self,
-    ) -> impl Iterator<Item = (super::TableDefinitionTarget, &TableDef)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (super::TableDefinitionTarget, &TableDef)> {
         let mut slot = self.head.get();
         core::iter::from_fn(move || {
             let index = slot?;

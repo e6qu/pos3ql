@@ -246,7 +246,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         editor.success(&mut engine,
             "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
         editor.success(&mut engine,
-            "CREATE SEQUENCE cascade_wait_calls; CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN PERFORM nextval(''cascade_wait_calls''); RETURN; END'; CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait()", true);
+            "CREATE SEQUENCE cascade_wait_calls; CREATE TABLE cascade_wait_audit(id serial, seen bigint); CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN INSERT INTO cascade_wait_audit(seen) VALUES(nextval(''cascade_wait_calls'')); RETURN; END'; CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait()", true);
         assert_eq!(
             data_rows(&reader.success(&mut engine, "BEGIN; SELECT id FROM cascade_report", true)),
             ["1"]
@@ -256,6 +256,15 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         assert!(editor.transaction.ddl().is_empty());
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT last_value FROM cascade_wait_calls", true)), ["1"]);
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "SELECT count(*) FROM cascade_wait_audit", true)), ["0"]);
+        let waiting = crate::mem::guard::forbid_alloc(|| engine.execute_simple_from(
+            sql, 0, &editor.arena, &mut editor.transaction, &mut editor.pool,
+            &mut editor.cursors, &mut editor.guc, &mut Responder::new(&mut editor.send),
+            editor.connection_id, false,
+        )).unwrap();
+        assert!(matches!(waiting, ExecutionStatus::Blocked { completed_statements: 0, wait: StatementWait::Lock, .. }));
+        assert!(editor.send.readable().is_empty());
         assert!(
             engine
                 .storage
@@ -270,6 +279,8 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
             )),
             ["7"]
         );
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "SELECT nextval('cascade_wait_calls')", true)), ["2"]);
         reader.success(&mut engine, "COMMIT", true);
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
@@ -289,8 +300,12 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         assert_eq!(status, ExecutionStatus::Complete);
         assert!(error_sqlstates(editor.send.readable()).is_empty());
         assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT last_value FROM cascade_wait_calls", true)), ["1"],
+            "SELECT last_value FROM cascade_wait_calls", true)), ["2"],
             "resuming the same statement must not repeat its start trigger");
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "SELECT id, seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq", true)), ["1|1", "1"]);
+        assert_eq!(data_rows(&editor.success(&mut engine,
+            "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq')", true)), ["1|1"]);
         assert!(
             engine
                 .storage
@@ -92565,14 +92580,21 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         .unwrap()
         .finish_maintenance(&engine.storage)
         .unwrap();
-    assert!(
-        error_sqlstates(&run_with(
-            &mut engine,
-            &mut budget,
-            "INSERT INTO failed_checkpoint VALUES(2)"
-        ))
-        .is_empty()
-    );
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = "INSERT INTO failed_checkpoint VALUES(2)";
+    let status = engine.execute_simple(
+        sql,
+        &writer.arena,
+        &mut writer.transaction,
+        &mut writer.pool,
+        &mut writer.cursors,
+        &mut writer.guc,
+        &mut Responder::new(&mut writer.send),
+        writer.connection_id,
+    ).unwrap();
+    assert!(matches!(status, ExecutionStatus::Blocked { completed_statements: 1, wait: StatementWait::ObjectIo, .. }));
+    assert!(writer.transaction.staged_commit().is_some());
+    assert!(error_sqlstates(writer.send.readable()).is_empty());
     for txn in [&mut first, &mut second] {
         assert_eq!(
             engine
@@ -92657,6 +92679,17 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         "one cancelled request cannot discard another request's work"
     );
     assert_eq!(message_types(send.readable()), [b'C']);
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql, 1, &writer.arena, &mut writer.transaction, &mut writer.pool,
+            &mut writer.cursors, &mut writer.guc, &mut Responder::new(&mut writer.send),
+            writer.connection_id, false,
+        )
+    }).unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(writer.transaction.staged_commit().is_none());
+    assert!(!writer.transaction.is_active());
+    assert!(error_sqlstates(writer.send.readable()).is_empty());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

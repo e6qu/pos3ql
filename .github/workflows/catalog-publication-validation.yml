@@ -48,7 +48,7 @@ jobs:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
           python3 - <<'PYTHON'
-          import os, pathlib, select, subprocess
+          import os, pathlib, select, subprocess, time
           command = ["docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"], "psql", "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"]
           fixture = pathlib.Path("tests/external/differential_exact/15_catalog_publication.sql").read_text()
           setup, marker, changes = fixture.partition("-- Changes while another connection retains unrelated work.")
@@ -113,6 +113,38 @@ jobs:
           finally:
               if writer.poll() is None:
                   writer.communicate("ROLLBACK;\n", timeout=5)
+          subprocess.run(command, input="CREATE SCHEMA cascade_reference; CREATE TABLE cascade_reference.orders(id integer); INSERT INTO cascade_reference.orders VALUES(1); CREATE SEQUENCE cascade_reference_calls; CREATE FUNCTION count_cascade_reference() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN PERFORM nextval(''cascade_reference_calls''); RETURN; END'; CREATE EVENT TRIGGER count_cascade_reference_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_reference()", text=True, capture_output=True, check=True, timeout=5)
+          reader = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+          dropper = None
+          try:
+              reader.stdin.write("BEGIN; SELECT 'ready' FROM cascade_reference.orders;\n")
+              reader.stdin.flush()
+              assert select.select([reader.stdout], [], [], 5)[0]
+              assert reader.stdout.readline().strip() == "ready"
+              dropper = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+              dropper.stdin.write("SET application_name = 'catalog_cascade_reference'; SET statement_timeout = '3s'; DROP SCHEMA cascade_reference CASCADE; SELECT 'dropped';\n")
+              dropper.stdin.flush()
+              deadline = time.monotonic() + 3
+              while True:
+                  waiting = subprocess.run(command, input="SELECT count(*) FROM pg_stat_activity WHERE application_name = 'catalog_cascade_reference' AND wait_event_type = 'Lock'", text=True, capture_output=True, check=True, timeout=5)
+                  if waiting.stdout.strip() == "1":
+                      break
+                  assert time.monotonic() < deadline, "reference DROP SCHEMA did not wait"
+                  time.sleep(0.02)
+              calls = subprocess.run(command, input="SELECT last_value FROM cascade_reference_calls", text=True, capture_output=True, check=True, timeout=5)
+              assert calls.stdout.strip() == "1", calls.stdout
+              output, errors = reader.communicate("COMMIT;\n", timeout=5)
+              assert reader.returncode == 0, errors
+              output, errors = dropper.communicate(timeout=5)
+              assert dropper.returncode == 0 and output.splitlines() == ["dropped"], (output, errors)
+              calls = subprocess.run(command, input="SELECT last_value FROM cascade_reference_calls", text=True, capture_output=True, check=True, timeout=5)
+              assert calls.stdout.strip() == "1", calls.stdout
+              print("PostgreSQL waiting DROP SCHEMA fires its sequence-changing start trigger once")
+          finally:
+              if reader.poll() is None:
+                  reader.communicate("ROLLBACK;\n", timeout=5)
+              if dropper is not None and dropper.poll() is None:
+                  dropper.communicate(timeout=5)
           PYTHON
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -122,4 +154,5 @@ jobs:
           named_type_ shared_type_ table_definition_ schema_ copy_ concurrent_partition_detach
           configured_user_type_ statement_arena_scales_event_graphs_
           domains_enforce_and_report parallel_checkpoint_ constraint_validation_reuses_fixed_arena_
+          sequence:: mem::arena::tests::arena_retained_handles
           --test-threads=1

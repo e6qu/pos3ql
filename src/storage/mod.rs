@@ -10039,6 +10039,49 @@ struct SequenceCatalog {
     values: FixedVec<SequenceValues>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SequenceReplaySource {
+    origin: type_references::CatalogOrigin,
+    slot: usize,
+    created_at: u64,
+    database: DatabaseOid,
+    schema: SqlName,
+    name: SqlName,
+    private_version: Option<u64>,
+}
+
+impl SequenceReplaySource {
+    pub(crate) fn created_at(self) -> u64 { self.created_at }
+
+    pub(crate) fn recreates(self, previous: Self) -> bool {
+        self.private_version.is_some()
+            && previous.private_version.is_some()
+            && self.origin == previous.origin
+            && self.database == previous.database
+            && self.schema == previous.schema
+            && self.name == previous.name
+    }
+}
+
+impl Storage {
+    pub(crate) fn sequence_replay_source(&self, slot: usize, transaction: u32) -> SequenceReplaySource {
+        let catalog = self.sequence_catalog();
+        let live = catalog.definitions[slot];
+        let selected = live.definition_for(transaction);
+        let private_version = if live.ddl_state == (CatalogDdlState::PendingCreate { txid: transaction }) {
+            Some(live.created_at)
+        } else {
+            live.pending_definition
+                .filter(|pending| pending.txid == transaction && pending.restarted)
+                .map(|pending| pending.version)
+        };
+        SequenceReplaySource {
+            origin: self.catalog_sources.origin(), slot, created_at: selected.created_at,
+            database: selected.database, schema: selected.schema, name: selected.name, private_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SequenceCacheIdentity {
     created_at: u64,

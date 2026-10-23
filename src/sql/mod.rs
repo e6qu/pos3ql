@@ -23625,37 +23625,14 @@ fn validate_recovered_enabled_subscription(
     connection.require_endpoint_for(subscription).map(|_| ())
 }
 
-// Keep fixture SQL/workspace headroom separate from the retained-storage,
-// enum image, checkpoint workspace and block scratch startup reservations.
+// Reserve the production engine separately from each fixture's session and SQL pools.
 #[cfg(test)]
-pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
+pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budget {
     Budget::new(
-        base + Storage::table_definition_image_budget_bytes(config)
-            + Storage::type_definition_image_budget_bytes(config)
-            + crate::storage::enum_member_budget_bytes(config)
-            + Storage::retained_row_walk_budget_bytes(config)
-            + Storage::retained_row_metadata_budget_bytes(config)
-            + Storage::row_heap_relocation_budget_bytes(config)
-            + if config.object_store_on {
-                Checkpointer::workspace_budget_bytes(config)
-                    + Checkpointer::physical_output_budget_bytes(config)
-                    + Checkpointer::manifest_output_budget_bytes(config)
-                    + Checkpointer::writer_probe_budget_bytes(config)
-                    + Checkpointer::credential_output_budget_bytes(config)
-                    + crate::store::BLOCK_SIZE
-                    + crate::object_store::upload::Uploads::budget_bytes(
-                        config,
-                        config.object_store_put_slots,
-                        config.wal_upload_buffer_bytes,
-                    )
-                    + if config.wal_upload {
-                        commit::Queue::budget_bytes(config)
-                    } else {
-                        0
-                    }
-            } else {
-                0
-            },
+        config.memtable_bytes
+            + config.block_cache_bytes
+            + Engine::extra_budget_bytes(config)
+            + fixture_bytes,
     )
 }
 

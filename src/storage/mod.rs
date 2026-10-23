@@ -18119,17 +18119,6 @@ impl Storage {
         RowWalkPool::budget_bytes(config)
     }
 
-    #[cfg(test)]
-    pub(crate) fn retained_row_metadata_budget_bytes(config: &Config) -> usize {
-        RowVersionPools::metadata_budget_bytes(config)
-            + size_of::<std::sync::Arc<row_reads::RowMetadataPool>>()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn row_heap_relocation_budget_bytes(config: &Config) -> usize {
-        RowHeap::relocation_budget_bytes(config.memtable_bytes)
-    }
-
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + log_positions::LogPositions::budget_bytes()

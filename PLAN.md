@@ -34,8 +34,9 @@ not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
 Connect the remaining table edits, schema moves and rewrites to that publication
-boundary. Preserve definitions selected before a wait and keep old row, index
-and backup data until their readers have finished.
+boundary. Preserve statement definitions through the whole transaction, beyond the
+version checks already used by individual row and definition writes. Keep old
+row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may
 retain exclusive startup access; ordinary publication must let unrelated
 operations progress under their own owners.

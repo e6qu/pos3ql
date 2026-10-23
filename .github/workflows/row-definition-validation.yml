@@ -12,6 +12,16 @@ jobs:
   focused:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -33,6 +43,21 @@ jobs:
             ${{ runner.temp }}/validation-head
             ${{ runner.temp }}/validation-tree
             ${{ runner.temp }}/validation-source-tree
+      - name: PostgreSQL row and definition reference
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess
+          sql = pathlib.Path("tests/external/differential_exact/13_row_definition_writes.sql").read_bytes()
+          observed = subprocess.check_output([
+              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"], "psql", "-U", "postgres",
+              "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+          ], input=sql).decode().splitlines()
+          expected = ["1|first|8", "2|second|5", "3|third|9", "1|first|8", "2|second|12", "4|fourth|14"]
+          assert observed == expected, observed
+          print("PostgreSQL reference:", observed)
+          PYTHON
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Row and definition publication regressions

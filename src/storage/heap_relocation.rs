@@ -2331,7 +2331,13 @@ mod tests {
                 .append_row_image(&[Datum::Int4(10), Datum::Text("new")])
                 .unwrap();
             let changed = storage
-                .pending_change_footprint(table, 1, committed, &next)
+                .pending_change_footprint(
+                    table,
+                    1,
+                    committed,
+                    &next,
+                    &[ColType::Int4, ColType::Text],
+                )
                 .unwrap();
             assert!(!changed.contains(0));
             assert!(changed.contains(1));
@@ -2342,7 +2348,13 @@ mod tests {
             let invalid = storage.heap.append_image(b"").unwrap();
             assert!(
                 storage
-                    .pending_change_footprint(table, 1, committed, &invalid)
+                    .pending_change_footprint(
+                        table,
+                        1,
+                        committed,
+                        &invalid,
+                        &[ColType::Int4, ColType::Text]
+                    )
                     .is_err()
             );
             // A failed comparison must release its old-buffer owner.

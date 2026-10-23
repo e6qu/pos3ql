@@ -621,7 +621,7 @@ mod tests {
         for committed in [false, true] {
             for tracked in [false, true] {
                 for deletion in [false, true] {
-                    let (storage, table) = fixture(&test_config());
+                    let (mut storage, table) = fixture(&test_config());
                     let input = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
                     crate::mem::guard::forbid_alloc(|| {
                         let prepared = storage
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn row_definition_admission_uses_private_column_count_and_allows_unrelated_edits() {
-        let (storage, table) = fixture(&test_config());
+        let (mut storage, table) = fixture(&test_config());
         let other = storage
             .create_table(make_def(
                 "other_definition",
@@ -820,8 +820,96 @@ mod tests {
     }
 
     #[test]
+    fn row_definition_admission_rejects_preparation_from_another_storage_owner() {
+        let (first, table) = fixture(&test_config());
+        let (second, other) = fixture(&test_config());
+        assert_eq!(table, other);
+        crate::mem::guard::forbid_alloc(|| {
+            let a = first.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+            let b = second.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+            let prepared = first
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&a), true)
+                .unwrap();
+            let undo = second.write_pending_image(other, 2, 8, 1, Some(b)).unwrap();
+            assert_eq!(
+                second
+                    .publish_pending_write(prepared)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert!(second.resident_row_state(other, 1).unwrap().is_none());
+            assert_eq!(
+                second
+                    .resident_row_state(other, 2)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            second.restore_pending(other, 2, 8, undo);
+        });
+    }
+
+    #[test]
+    fn row_undo_source_wait_releases_owners_and_preserves_unrelated_progress() {
+        let (mut storage, table) = fixture(&test_config());
+        let other = storage
+            .create_table(make_def("undo_progress", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let image = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+        let undo = storage
+            .write_pending_image(table, 1, 7, 1, Some(image))
+            .unwrap();
+        let held = storage.tables[table].definition.write();
+        let started = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        let progressed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.store(true, Ordering::Release);
+                crate::mem::guard::forbid_alloc(|| storage.restore_pending(table, 1, 7, undo));
+                finished.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let started_in_time = started.load(Ordering::Acquire);
+            let completed_before_release = finished.load(Ordering::Acquire);
+            scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let image = storage.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+                    let undo = storage
+                        .write_pending_image(other, 1, 8, 1, Some(image))
+                        .unwrap();
+                    storage.restore_pending(other, 1, 8, undo);
+                    assert!(storage.tables[other].rows.is_empty());
+                });
+                progressed.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !progressed.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let progress = progressed.load(Ordering::Acquire);
+            drop(held);
+            assert!(started_in_time);
+            assert!(
+                !completed_before_release,
+                "undo bypassed the original definition owner"
+            );
+            assert!(progress);
+        });
+        assert!(finished.load(Ordering::Acquire));
+        assert!(storage.tables[table].rows.is_empty());
+    }
+
+    #[test]
     fn row_undo_source_survives_definition_changes_but_rejects_retirement_and_database_rebinding() {
-        let (storage, table) = fixture(&test_config());
+        let (mut storage, table) = fixture(&test_config());
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
             let undo = storage

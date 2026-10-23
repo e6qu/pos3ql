@@ -3597,6 +3597,7 @@ impl Engine {
             )
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes
+            + config.table_rows * size_of::<(u64, RowHome)>()
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_roles * size_of::<RoleConnections>()
             + config.max_databases * size_of::<u16>()
@@ -3858,6 +3859,7 @@ impl Engine {
         }
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes;
+        budget.draw(upload_buf, "wal_upload_buffer")?;
         let mut database_connections =
             FixedVec::new(budget, "database_connections", config.max_databases)?;
         for _ in 0..config.max_databases {

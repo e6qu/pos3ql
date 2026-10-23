@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use super::row_heap::HeapReadView;
 use super::row_images::RowVersionIdentity;
+#[cfg(test)]
 use super::row_map::RowMap;
 use super::row_versions::{
     RowVersionPools, RowVersionState, committed_history_get, committed_version_at, pending_last,

@@ -381,6 +381,58 @@ mod tests {
                 .unwrap();
         });
     }
+
+    #[test]
+    fn row_layout_rebinding_exhaustion_precedes_all_catalog_changes() {
+        for dependent_exhausted in [false, true] {
+            let (mut storage, table, other) = fixture(RelationPersistence::Permanent, 2);
+            let destination = crate::storage::SqlName::parse("layout_destination").unwrap();
+            storage.create_schema(destination).unwrap();
+            let revision = storage.reserve_table_definition_revision().unwrap();
+            {
+                let original = *storage.table_def(table, 0);
+                let mut dependent = storage.tables[other].definition_mut(revision);
+                dependent.n_fkeys = 1;
+                dependent.fkeys[0] = crate::storage::ForeignKey {
+                    parent_schema: original.schema,
+                    parent: original.name,
+                    n_cols: 1,
+                    n_parent_cols: 1,
+                    ..crate::storage::ForeignKey::EMPTY
+                };
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                let (target, mut definition) = storage.select_table_definition(table, 8);
+                let original_name = definition.name;
+                let original_schema = definition.schema;
+                definition.schema = destination;
+                definition.name = crate::storage::SqlName::parse("layout_renamed").unwrap();
+                definition.columns[0].ctype = ColType::Int8;
+                let mut mapping = [None; crate::storage::MAX_COLUMNS];
+                mapping[0] = Some(definition.columns[0].name);
+                let change = storage
+                    .write_table_def(target, definition, &mapping, true)
+                    .unwrap();
+                let exhausted = if dependent_exhausted { other } else { table };
+                storage.tables[exhausted].publication().generation = u64::MAX - 1;
+                let error = storage.commit_table_def(change).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                let committed = storage.table_def(table, 0);
+                assert_eq!(
+                    (committed.schema, committed.name, committed.columns[0].ctype),
+                    (original_schema, original_name, ColType::Int4)
+                );
+                drop(committed);
+                let dependent = storage.table_def(other, 0);
+                assert_eq!(
+                    (dependent.fkeys[0].parent_schema, dependent.fkeys[0].parent),
+                    (original_schema, original_name)
+                );
+                drop(dependent);
+                storage.rollback_table_def(change);
+            });
+        }
+    }
 }
 
 impl RowLayout {

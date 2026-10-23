@@ -270,6 +270,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
     ] {
         let mut config = test_config(&format!("catalog-cascade-locks-{suffix}"));
         config.transaction_mode = mode;
+        config.max_sequences = 7;
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut editor =
@@ -281,7 +282,8 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         editor.success(&mut engine,
             "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
         editor.success(&mut engine,
-            r#"CREATE SEQUENCE cascade_wait_calls;
+            r#"CREATE SEQUENCE cascade_disposable_source;
+            CREATE SEQUENCE cascade_wait_calls;
             CREATE SEQUENCE cascade_restart_source;
             CREATE SEQUENCE cascade_cached_source CACHE 10;
             CREATE SEQUENCE cascade_prior_source START 51;
@@ -335,8 +337,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         assert!(editor.transaction.ddl().is_empty());
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT last_value FROM cascade_wait_calls", true)), ["1"]);
-        assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT count(*) FROM cascade_wait_audit", true)), ["0"]);
+        assert!(editor.transaction.touched().is_empty(), "{suffix}: waiting attempt retained audit writes");
+        if mode == crate::config::TransactionMode::Mvcc {
+            let audit = other.success(&mut engine, "SELECT count(*) FROM cascade_wait_audit", true);
+            assert_eq!(data_rows(&audit), ["0"], "{suffix}: {}", String::from_utf8_lossy(&audit));
+        }
         assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Err(StatementWait::Lock));
         assert!(editor.send.readable().is_empty());
         assert!(
@@ -357,7 +362,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
             "SELECT nextval('cascade_wait_calls')", true)), ["2"]);
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT nextval('cascade_cached_source')", true)), ["111"]);
-        other.success(&mut engine, "CREATE SEQUENCE cascade_reused_slot", true);
+        other.success(&mut engine, "CREATE SEQUENCE cascade_reused_slot; DROP SEQUENCE cascade_disposable_source", true);
         reader.success(&mut engine, "COMMIT", true);
         assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Ok(()));
         if extended {
@@ -371,7 +376,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
             "SELECT last_value FROM cascade_wait_calls", true)), ["2"],
             "resuming the same statement must not repeat its start trigger");
         assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT id, prior_seen, seen, private_seen, restarted_seen, cached_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source'); SELECT nextval('cascade_cached_source')", true)), ["1|51|1|17|23|101", "1", "18", "24", "112"]);
+            "SELECT id, prior_seen, seen, private_seen, restarted_seen, cached_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source'); SELECT nextval('cascade_cached_source'); SELECT nextval('cascade_reused_slot')", true)), ["1|51|1|17|23|101", "1", "18", "24", "112", "1"]);
         assert_eq!(data_rows(&editor.success(&mut engine,
             "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq'); SELECT nextval('cascade_cached_source')", true)), ["1|1", "102"]);
         assert!(

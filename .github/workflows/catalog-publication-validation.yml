@@ -120,4 +120,5 @@ jobs:
         run: >-
           cargo test --release --lib --locked -- catalog_publication_ alter_domain_ domain_ composite_ type_definitions:: type_edits::
           named_type_ shared_type_ table_definition_ schema_ copy_ concurrent_partition_detach
+          configured_user_type_ statement_arena_scales_event_graphs_
           --test-threads=1

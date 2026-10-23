@@ -80,7 +80,7 @@ jobs:
           snapshot_reclamation:: row_cleanup:: row_publication::
           spill_generations:: table_name_ table_definition_ row_definition_
           statement_row_ transaction_publication:: prepared_transaction
-          --test-threads=1
+          --test-threads=1 --nocapture
       - name: Retain build cache after a failed regression too
         if: always() && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5

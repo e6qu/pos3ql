@@ -334,17 +334,16 @@ mod tests {
             let earlier = storage.captured_row_scan_in(table, 11, &arena).unwrap();
             storage.set_read_snapshot(2);
             let pending_version = {
+                let (generation, row_layout) = {
+                    let publication = storage.table(table).publication();
+                    (publication.generation, publication.row_layout)
+                };
                 let versions = storage.row_versions.read();
                 let state = storage.tables[table].rows.get(&2).unwrap();
-                RowRead::borrowed(
-                    state,
-                    &versions,
-                    storage.table(table).generation(),
-                    storage.table(table).publication().row_layout,
-                )
-                .visible_version_at(11, 2, 7)
-                .unwrap()
-                .0
+                RowRead::borrowed(state, &versions, generation, row_layout)
+                    .visible_version_at(11, 2, 7)
+                    .unwrap()
+                    .0
             };
             let later = storage.captured_row_scan_in(table, 11, &arena).unwrap();
             let index = storage.index_validation_scan_in(table, 11, &arena).unwrap();

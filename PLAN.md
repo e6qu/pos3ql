@@ -28,16 +28,18 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-When a transaction commits, publish its related changes together. Protect the
-remaining metadata creation, deletion and table-rewrite paths before running
-statements on several CPU workers. Preserve the definitions selected before a
-wait, and keep old row, index and backup data until their readers have finished.
-Next connect table-shape changes and schema moves to complete transaction
-publication, including indexes, captured column mappings and comments. Check
-reader and backup retention while old files are replaced. Index bindings must
-remain valid through composed table-name and column changes. Recovery may retain
-exclusive startup access; ordinary publication must allow unrelated operations
-to progress under their own owners.
+Finish coordinating table definitions, rows, index bindings and comments at the
+transaction boundary before several CPU workers run statements. A query must
+not see only half of a confirmed transaction: an order's new state and its
+invoice must appear together when that transaction changes both.
+
+Connect the remaining table edits, schema moves and rewrites to that publication
+boundary. Rollback must change only the table version originally selected,
+including after internal slot reuse. Preserve definitions selected before a
+wait and keep old row, index and backup data until their readers have finished.
+Check reader and backup retention while old files are replaced. Recovery may
+retain exclusive startup access; ordinary publication must let unrelated
+operations progress under their own owners.
 Some metadata capture and maintenance reads still block the worker. Raising
 memory limits is not a completion criterion. The
 [current behavior guide](docs/implemented-baseline.md) owns the implemented

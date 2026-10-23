@@ -6966,13 +6966,16 @@ mod tests {
         config.disk_cache_bytes = 0;
         config.object_store_bucket = format!("binary-char-{}-{suffix}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        config.max_connections = 1;
         config.max_tables = 8;
         config.table_rows = 256;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
-        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let plan = config.memory_plan(0, Engine::extra_budget_bytes(&config));
+        let mut budget = Budget::new(plan.total());
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        assert_eq!(budget.remaining(), 0);
         connection.phase = Phase::Ready;
 
         let mut parse = Vec::new();
@@ -7709,11 +7712,21 @@ mod tests {
     #[test]
     fn connection_copy_transition_state_uses_transaction_row_capacity() {
         let mut config = Config::default_dev();
+        config.max_connections = 1;
         config.txn_rows = 37;
-        let mut budget = Budget::new(256 << 20);
+        let bytes = config.memory_plan(0, 0).connections;
+        let mut budget = Budget::new(bytes);
         let connection = Conn::new(&config, &mut budget).expect("connection budget");
+        assert_eq!(budget.remaining(), 0);
         assert_eq!(connection.copy_transition_scratch.capacity(), 37);
         assert!(connection.copy_transition_scratch.is_empty());
+        let mut short = Budget::new(bytes - 1);
+        let error = match Conn::new(&config, &mut short) {
+            Ok(_) => panic!("connection accepted an incomplete startup reservation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.what, "copy_transition_bytes");
+        assert_eq!(error.requested, error.remaining + 1);
     }
 
     #[test]

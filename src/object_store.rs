@@ -450,7 +450,11 @@ pub(crate) enum Client {
 
 impl Client {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        S3Client::budget_bytes(config)
+        if config.object_store_sim {
+            config.object_store_response_bytes
+        } else {
+            S3Client::budget_bytes(config)
+        }
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, SetupError> {
@@ -684,8 +688,19 @@ mod tests {
         config.object_store_bucket = format!("object-contract-{}", std::process::id());
         sim::drop_namespace(&config.object_store_bucket);
         let _namespace = sim::open_namespace(&config.object_store_bucket, 7);
-        let mut budget = Budget::new(Client::budget_bytes(&config) + 4096);
-        Client::new(&config, &mut budget).unwrap()
+        let bytes = Client::budget_bytes(&config);
+        let mut budget = Budget::new(bytes);
+        let client = Client::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let mut short = Budget::new(bytes - 1);
+        let error = match Client::new(&config, &mut short) {
+            Ok(_) => panic!("simulator accepted an incomplete startup reservation"),
+            Err(SetupError::Budget(error)) => error,
+            Err(error) => panic!("unexpected simulator setup error: {error}"),
+        };
+        assert_eq!(error.what, "object_store_response");
+        assert_eq!(error.requested, error.remaining + 1);
+        client
     }
 
     #[test]

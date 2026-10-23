@@ -8,6 +8,118 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn private_index_schema_names_and_comments_survive_rollback_and_cold_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("private-index-schema-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    include_str!(
+                        "../../tests/external/differential_exact/11_index_schema_names.sql"
+                    ),
+                    false
+                )),
+                [
+                    "key comment",
+                    "key comment",
+                    "key comment",
+                    "key comment",
+                    "fresh",
+                    "key comment",
+                    "1"
+                ]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT obj_description('private_index_destination.private_schema_key'::regclass); SELECT COALESCE(obj_description('public.private_schema_key'::regclass), 'fresh'); SELECT count(*) FROM pg_indexes WHERE schemaname = 'private_index_destination' AND tablename = 'private_schema_source'", false)), ["key comment", "fresh", "1"]);
+        }
+    }
+}
+
+#[test]
+fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("private-index-bindings-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.max_catalog_versions_per_object = 8;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    include_str!(
+                        "../../tests/external/differential_exact/10_private_index_bindings.sql"
+                    ),
+                    false
+                )),
+                ["payload|7", "10|payload|7", "payload|7", "1"]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    "SELECT payload, added FROM private_index_final",
+                    false
+                )),
+                ["payload|7"]
+            );
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    "INSERT INTO private_index_final VALUES ('duplicate', 7)",
+                    false
+                )),
+                ["23505"]
+            );
+        }
+    }
+}
+
+#[test]
 fn metadata_recovery_reuses_populated_retired_table_positions() {
     for checkpoint in [false, true] {
         for mode in [

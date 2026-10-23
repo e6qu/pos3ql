@@ -90,6 +90,12 @@ upload slots and 4 commit queue slots. Size their startup memory reservations ex
 An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
 `commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
 
+The startup memory plan includes cache payloads, their indexes and the RAM needed
+by the disk cache. For example, `disk_cache_bytes = 128MiB` reserves a 128 MiB
+file plus a fixed in-memory slot directory, index and one 256 KiB scratch buffer.
+The file size is reported separately from RAM. Disabled tiers reserve no memory;
+with object storage off, neither object-store cache tier is constructed.
+
 TLS has a separate startup ceiling. `tls_pool_bytes` supplies the object-store
 base; startup adds 128 KiB for each of the two transports per subscription
 worker, plus 128 KiB per server connection when server TLS is enabled. Choose

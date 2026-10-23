@@ -4040,6 +4040,8 @@ fn copy_like_indexes(
                     name,
                     pending_name: None,
                     table: def.name,
+                    table_binding: None,
+                    pending_table: None,
                     method: index.method,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
@@ -6096,7 +6098,7 @@ fn drop_table_kind(
                 }
                 // A table's indexes are dropped with it (no separate journal
                 // record; DropTable replay re-applies this).
-                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+                storage.drop_indexes_for(index, txn.txid);
             }
             _ if statement.if_exists => {
                 // PostgreSQL's skip notice carries SQLSTATE 00000.
@@ -13404,7 +13406,7 @@ pub(crate) fn drop_schema(
                 if let Err(error) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(error);
                 }
-                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+                storage.drop_indexes_for(*table, txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
                     txn.txid,
@@ -13693,7 +13695,7 @@ pub(crate) fn drop_schema(
                 if let Err(e) = txn.record_table_drop(storage, dropped) {
                     return sql_fail(e);
                 }
-                storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+                storage.drop_indexes_for(*t, txn.txid);
             }
         }
     }
@@ -39813,7 +39815,7 @@ pub fn drop_materialized_view(
         if let Err(e) = txn.record_table_drop(storage, dropped) {
             return sql_fail(e);
         }
-        storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
+        storage.drop_indexes_for(idx, txn.txid);
         // Drop the matview catalog entry.
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.stage_reserved(
@@ -45074,7 +45076,7 @@ fn drop_matview_slot(
     )?;
     let dropped = storage.drop_table_in(table, txn.txid)?;
     txn.record_table_drop(storage, dropped)?;
-    storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+    storage.drop_indexes_for(table, txn.txid);
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
@@ -49028,6 +49030,8 @@ pub fn create_index(
         name: sqlname,
         pending_name: None,
         table: tdef.name,
+        table_binding: None,
+        pending_table: None,
         method: command.method,
         ownership: crate::storage::Ownership::BOOTSTRAP,
         columns,
@@ -65692,6 +65696,17 @@ fn alter_table_relation(
                 def.name.as_str(),
                 new_schema
             ));
+        }
+        for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid) {
+            let name = index.name_for(txn.txid);
+            if storage.relation_name_taken(new_schema, name.as_str(), txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists in schema \"{}\"",
+                    name.as_str(),
+                    new_schema
+                ));
+            }
         }
         for sequence_slot in 0..storage.sequence_count() {
             let sequence = storage.sequence_for(sequence_slot, txn.txid);

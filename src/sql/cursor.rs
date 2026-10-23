@@ -345,14 +345,25 @@ impl CursorPool {
         config.max_cursors
             * (config.cursor_bytes * 2
                 + 2048
-                + CURSOR_STATEMENT_BYTES
+                + core::mem::size_of::<CursorSlot>()
                 + row_capacity * 2 * core::mem::size_of::<(u32, u32)>())
+            + row_capacity * core::mem::size_of::<u32>()
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let row_capacity = cursor_row_capacity(config);
+        budget.draw_array(
+            config.max_cursors,
+            core::mem::size_of::<CursorSlot>(),
+            "cursor_slots",
+        )?;
         let mut slots = Vec::with_capacity(config.max_cursors);
         for _ in 0..config.max_cursors {
+            budget.draw_array(
+                row_capacity,
+                2 * core::mem::size_of::<(u32, u32)>(),
+                "cursor_row_spans",
+            )?;
             slots.push(CursorSlot {
                 active: false,
                 name: SqlName::parse("").expect("empty fits"),
@@ -371,6 +382,7 @@ impl CursorPool {
                 position: 0,
             });
         }
+        budget.draw_array(row_capacity, core::mem::size_of::<u32>(), "cursor_emit")?;
         Ok(Self {
             slots,
             emit: Vec::with_capacity(row_capacity),
@@ -732,6 +744,41 @@ impl CursorPool {
         for s in &mut self.slots {
             if s.active && (s.tentative || !s.hold) {
                 s.active = false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_budget_covers_cursor_controls_spans_and_emission() {
+        for max_cursors in [0, 1, 3] {
+            for cursor_bytes in [0, 6, 7, 31] {
+                let mut config = Config::default_dev();
+                config.max_cursors = max_cursors;
+                config.cursor_bytes = cursor_bytes;
+                let bytes = CursorPool::budget_bytes(&config);
+                let mut budget = Budget::new(bytes);
+                let pool = CursorPool::new(&config, &mut budget).expect("exact cursor budget");
+                assert_eq!(budget.remaining(), 0);
+                assert_eq!(pool.slots.len(), max_cursors);
+                assert_eq!(pool.emit.capacity(), cursor_row_capacity(&config));
+                for slot in &pool.slots {
+                    assert_eq!(slot.spans_text.capacity(), cursor_row_capacity(&config));
+                    assert_eq!(slot.spans_binary.capacity(), cursor_row_capacity(&config));
+                }
+                if cursor_row_capacity(&config) != 0 {
+                    let mut short = Budget::new(bytes - 1);
+                    let error = match CursorPool::new(&config, &mut short) {
+                        Ok(_) => panic!("cursor pool accepted an incomplete reservation"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.what, "cursor_emit");
+                    assert_eq!(error.requested, error.remaining + 1);
+                }
             }
         }
     }

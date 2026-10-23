@@ -19,6 +19,40 @@ pub(super) struct TableDefinitionEdit<'storage> {
 }
 
 impl<'storage> TableDefinitionEdit<'storage> {
+    fn after_wait(
+        self,
+        wait: super::row_ownership::LockWait<'storage>,
+        transaction: u32,
+    ) -> Result<Self, SqlError> {
+        let storage = self.storage;
+        let table = self.table;
+        let identity = self.definition.identity;
+        let revision = storage
+            .pending_table_defs
+            .selected_revision(&self.definition, transaction);
+        drop(self);
+        #[cfg(test)]
+        storage
+            .type_publication
+            .waits
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+        wait.wait();
+        let next = Self::new(storage, table);
+        if next.definition.identity.database != identity.database
+            || next.definition.identity.created_at != identity.created_at
+            || storage
+                .pending_table_defs
+                .selected_revision(&next.definition, transaction)
+                != revision
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "pending definition source changed during publication wait"
+            ));
+        }
+        Ok(next)
+    }
+
     pub(super) fn new(storage: &'storage Storage, table: usize) -> Self {
         let lifecycle = storage.tables[table]
             .lifecycle
@@ -40,58 +74,56 @@ impl<'storage> TableDefinitionEdit<'storage> {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        let (mut comments, _source) = loop {
+        let (mut comments, _source, mut indexes) = loop {
             let comments = self.storage.comment_catalog();
-            if !definition.requires_type_catalog()
+            let source = if !definition.requires_type_catalog()
                 && definition.schema == self.definition.committed.schema
                 && definition.name == self.definition.committed.name
                 && self.definition.pending.is_none()
             {
-                break (comments, None);
-            }
-            match super::row_ownership::try_mutex(
-                &self.storage.type_catalog,
-                "type catalog lock poisoned",
-            ) {
-                Ok(source) => {
-                    self.storage.require_row_type_name(
-                        &source,
-                        definition.schema,
-                        definition.name,
-                        transaction,
-                        Some(super::RuleTarget::Table(self.table as u16)),
-                        None,
-                    )?;
-                    source.bind_table_definition(&mut definition, transaction)?;
-                    break (comments, Some(source));
-                }
-                Err(wait) => {
-                    let storage = self.storage;
-                    let table = self.table;
-                    let identity = self.definition.identity;
-                    drop(comments);
-                    drop(self);
-                    #[cfg(test)]
-                    storage
-                        .type_publication
-                        .waits
-                        .fetch_add(1, core::sync::atomic::Ordering::Release);
-                    wait.wait();
-                    self = Self::new(storage, table);
-                    if self.definition.identity.database != identity.database
-                        || self.definition.identity.created_at != identity.created_at
-                    {
-                        return Err(sql_err!(
-                            sqlstate::SERIALIZATION_FAILURE,
-                            "pending definition belongs to a retired table incarnation"
-                        ));
+                None
+            } else {
+                match super::row_ownership::try_mutex(
+                    &self.storage.type_catalog,
+                    "type catalog lock poisoned",
+                ) {
+                    Ok(source) => {
+                        self.storage.require_row_type_name(
+                            &source,
+                            definition.schema,
+                            definition.name,
+                            transaction,
+                            Some(super::RuleTarget::Table(self.table as u16)),
+                            None,
+                        )?;
+                        source.bind_table_definition(&mut definition, transaction)?;
+                        Some(source)
+                    }
+                    Err(wait) => {
+                        drop(comments);
+                        self = self.after_wait(wait, transaction)?;
+                        continue;
                     }
                 }
-            }
+            };
+            let indexes = match super::row_ownership::try_mutex(
+                &self.storage.index_catalog,
+                "index catalog lock poisoned",
+            ) {
+                Ok(indexes) => indexes,
+                Err(wait) => {
+                    drop(source);
+                    drop(comments);
+                    self = self.after_wait(wait, transaction)?;
+                    continue;
+                }
+            };
+            break (comments, source, indexes);
         };
         if let Some(owner) = self.definition.locked_by_other(transaction) {
             let name = self.definition.committed.name;
             let storage = self.storage;
+            drop(indexes);
             drop(_source);
             drop(comments);
             drop(self);
@@ -144,23 +176,92 @@ impl<'storage> TableDefinitionEdit<'storage> {
         // Acquire the selected definition before the shared comment catalog
         // or version allocator. Waiting for its readers never reserves either.
         comment_identity.ensure_available(&comments)?;
+        let source = self.storage.catalog_object_identity(
+            super::catalog_sources::CatalogObjectSlot::Table(self.table),
+            self.definition.identity.database,
+            self.definition.identity.created_at,
+        );
+        Storage::check_index_table_comments(
+            &indexes,
+            &comments,
+            source,
+            definition.schema,
+            transaction,
+        )?;
+        if let Err(conflict) =
+            Storage::check_index_table_names(&indexes, source, definition.schema, transaction)
+        {
+            let storage = self.storage;
+            drop(indexes);
+            drop(_source);
+            drop(comments);
+            drop(self);
+            return Err(match conflict {
+                super::index_bindings::IndexNamespaceConflict::Duplicate(name) => sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    name.as_str()
+                ),
+                super::index_bindings::IndexNamespaceConflict::Wait(owner, name) => {
+                    storage.catalog_ddl_wait_error(transaction, owner, name.as_str())
+                }
+            });
+        }
+        let mut transition = [u16::MAX; MAX_COLUMNS];
+        for (column, target) in column_mapping.iter().enumerate().take(current.n_columns) {
+            if let Some(target) = target {
+                transition[column] = definition.column_index(target.as_str()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "table column mapping references an absent target"
+                    )
+                })? as u16;
+            }
+        }
+        let revision = self.storage.catalog_sequence.next()?;
         self.storage.pending_table_defs.stage_locked(
             &mut self.definition,
             PendingTableDef {
                 txid: transaction,
+                revision,
                 def: definition,
+                transition,
                 column_mapping: composed,
                 rewrites_rows: rewrites_rows
                     || prior.as_ref().is_some_and(|version| version.rewrites_rows),
             },
             self.storage.max_catalog_versions_per_object,
         )?;
+        Storage::stage_index_table_names(
+            &mut indexes,
+            &mut comments,
+            source,
+            definition.schema,
+            definition.name,
+            transaction,
+        );
         comment_identity.apply(&mut comments);
         self.definition.publish_names();
         Ok(())
     }
 
     pub(super) fn rollback(mut self, transaction: u32) {
+        let (mut comments, mut indexes) = loop {
+            let comments = self.storage.comment_catalog();
+            match super::row_ownership::try_mutex(
+                &self.storage.index_catalog,
+                "index catalog lock poisoned",
+            ) {
+                Ok(indexes) => break (comments, indexes),
+                Err(wait) => {
+                    drop(comments);
+                    let Ok(next) = self.after_wait(wait, transaction) else {
+                        return;
+                    };
+                    self = next;
+                }
+            }
+        };
         if !self
             .storage
             .pending_table_defs
@@ -182,7 +283,20 @@ impl<'storage> TableDefinitionEdit<'storage> {
             visible,
             transaction,
         );
-        identity.apply(&mut self.storage.comment_catalog());
+        let source = self.storage.catalog_object_identity(
+            super::catalog_sources::CatalogObjectSlot::Table(self.table),
+            self.definition.identity.database,
+            self.definition.identity.created_at,
+        );
+        Storage::stage_index_table_names(
+            &mut indexes,
+            &mut comments,
+            source,
+            visible.schema,
+            visible.name,
+            transaction,
+        );
+        identity.apply(&mut comments);
     }
 }
 
@@ -491,7 +605,9 @@ mod tests {
                     &storage.tables[first].definition,
                     PendingTableDef {
                         txid: 8,
+                        revision: 1,
                         def: changed,
+                        transition: [u16::MAX; MAX_COLUMNS],
                         column_mapping: mapping("id"),
                         rewrites_rows: false,
                     },

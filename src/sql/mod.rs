@@ -3597,6 +3597,7 @@ impl Engine {
             )
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes
+            + config.table_rows * size_of::<(u64, RowHome)>()
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_roles * size_of::<RoleConnections>()
             + config.max_databases * size_of::<u16>()
@@ -3858,6 +3859,7 @@ impl Engine {
         }
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes;
+        budget.draw(upload_buf, "wal_upload_buffer")?;
         let mut database_connections =
             FixedVec::new(budget, "database_connections", config.max_databases)?;
         for _ in 0..config.max_databases {
@@ -6743,12 +6745,12 @@ impl Engine {
                     );
                 }
                 DdlUndo::Dropped(undo) => {
-                    if let Some((schema, name)) = self
+                    if self
                         .storage
                         .finish_table_drop(*undo, crate::storage::CatalogDdlDecision::Commit)
+                        .is_some()
                     {
-                        self.storage
-                            .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
+                        self.storage.commit_indexes_for(undo.slot(), txn.txid);
                     }
                 }
                 DdlUndo::TableAltered(_) => {}
@@ -19672,10 +19674,11 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
     match undo {
         DdlUndo::Created(slot) => storage.rollback_create(slot as usize),
         DdlUndo::Dropped(undo) => {
-            if let Some((schema, name)) =
-                storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback)
+            if storage
+                .finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback)
+                .is_some()
             {
-                storage.rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+                storage.rollback_indexes_for(undo.slot(), txid);
             }
         }
         DdlUndo::TableAltered(slot) => {
@@ -20296,7 +20299,7 @@ fn replay_transaction_batches(
                                 .slot_mut(slot)
                                 .transaction
                                 .record_table_drop(storage, change)?;
-                            storage.drop_indexes_for(schema, name, transaction_id);
+                            storage.drop_indexes_for(table, transaction_id);
                         }
                         WalOp::RestoreRoutine {
                             payload,
@@ -21530,8 +21533,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let index = storage.table_replay_slot(identity, schema, name, 0)?;
             storage.commit_drop(index);
-            storage.drop_indexes_for(schema, name, 0);
-            storage.commit_indexes_for(schema, name, 0);
+            storage.drop_indexes_for(index, 0);
+            storage.commit_indexes_for(index, 0);
         }
         WalOp::Upsert {
             schema,
@@ -22673,6 +22676,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name: crate::storage::SqlName::parse(name)?,
                     pending_name: None,
                     table: crate::storage::SqlName::parse(table)?,
+                    table_binding: None,
+                    pending_table: None,
                     method,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
@@ -23620,38 +23625,11 @@ fn validate_recovered_enabled_subscription(
     connection.require_endpoint_for(subscription).map(|_| ())
 }
 
-// Keep fixture SQL/workspace headroom separate from the retained-storage,
-// enum image, checkpoint workspace and block scratch startup reservations.
+// Reserve the production engine separately from each fixture's session and SQL pools.
 #[cfg(test)]
-pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
-    Budget::new(
-        base + Storage::table_definition_image_budget_bytes(config)
-            + Storage::type_definition_image_budget_bytes(config)
-            + crate::storage::enum_member_budget_bytes(config)
-            + Storage::retained_row_walk_budget_bytes(config)
-            + Storage::retained_row_metadata_budget_bytes(config)
-            + Storage::row_heap_relocation_budget_bytes(config)
-            + if config.object_store_on {
-                Checkpointer::workspace_budget_bytes(config)
-                    + Checkpointer::physical_output_budget_bytes(config)
-                    + Checkpointer::manifest_output_budget_bytes(config)
-                    + Checkpointer::writer_probe_budget_bytes(config)
-                    + Checkpointer::credential_output_budget_bytes(config)
-                    + crate::store::BLOCK_SIZE
-                    + crate::object_store::upload::Uploads::budget_bytes(
-                        config,
-                        config.object_store_put_slots,
-                        config.wal_upload_buffer_bytes,
-                    )
-                    + if config.wal_upload {
-                        commit::Queue::budget_bytes(config)
-                    } else {
-                        0
-                    }
-            } else {
-                0
-            },
-    )
+pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budget {
+    let plan = config.memory_plan(0, Engine::extra_budget_bytes(config));
+    Budget::new(plan.memtable + plan.tables + plan.block_cache + fixture_bytes)
 }
 
 #[cfg(test)]

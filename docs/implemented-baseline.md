@@ -863,10 +863,26 @@ before a later creation reuses the saved position. For example, repeatedly
 running `pg_restore --clean` against populated tables must leave the final rows
 readable after restart. See the [current stored formats](durable-format.md).
 
-When a committed index follows a table rename or schema move, its key and
-included columns also follow the transaction's composed column mapping. Dropping
-an earlier column and renaming the table in one transaction must keep the index
-bound to its original key and payload columns.
+When an index follows a table rename or schema move, its key and included columns
+follow the table definition it selected. This includes an index created before
+or between changes in the same transaction, and a key column added by that
+transaction. Savepoint rollback restores the earlier binding. For example,
+creating an index on `added`, then removing an earlier column, must keep the
+index on `added` through commit and restart.
+Index reads select the table lifetime directly instead of searching for a table
+by its old name. Installation waits recheck both that lifetime and the selected
+definition; a changed source returns `40001`. Unrelated tables remain available.
+Each reserved pending-definition slot includes a 16-bit column transition map
+and a revision number; each index slot includes its table binding. Startup
+accounting uses the complete slot sizes, including padding. These controls do
+not change durable formats or grow at runtime.
+Index names and comments move with their table's schema inside the transaction.
+A conflicting destination name rejects the move before publication. Other
+transactions still see the committed name as occupied (`42P07`); a request for
+the newly reserved name waits for the move or rename to finish. The moving
+transaction can reuse its old name. Savepoints restore both names and comments.
+Table deletion identifies its
+indexes by the selected table lifetime, including after a rename or schema move.
 
 ### Changing rewrite rules
 

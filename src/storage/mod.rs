@@ -52951,7 +52951,7 @@ mod tests {
     fn cluster_metadata_table_names_reserve_only_within_their_database() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let prior_database = current_database();
             crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);

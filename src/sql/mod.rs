@@ -6660,6 +6660,10 @@ impl Engine {
             }
         });
         if result.is_ok() {
+            if let txn::CommitTarget::CommitPrepared { slot, .. }
+                | txn::CommitTarget::RollbackPrepared { slot, .. } = staged.target {
+                self.prepared_transactions.release(slot);
+            }
             let publication = self.transaction_publication.complete();
             debug_assert_eq!(publication.lsn, staged.lsn);
             if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
@@ -7743,9 +7747,6 @@ impl Engine {
         #[cfg(test)]
         let result = result
             .and_then(|()| self.observe_publication(commit::PublicationPoint::PreparedInstalled));
-        if result.is_ok() {
-            self.prepared_transactions.release(slot);
-        }
         result
     }
 

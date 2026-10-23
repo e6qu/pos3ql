@@ -43,7 +43,8 @@ and ordered in-memory completion finish, including when the client disconnects.
 The commit keeps its transaction identity, table and row locks, transaction
 advisory locks, and serializable checks until its rows and definitions are
 installed and its visible journal position advances. Prepared commit and
-rollback decisions keep both transaction owners through that boundary.
+rollback decisions keep both transaction owners and the prepared slot through
+that boundary.
 Ordinary rollback restores rows and definitions before releasing its locks.
 Manual completion confirms the object-store journal before installation, just
 as the server's queued completion does. The server continues grouping several

@@ -89451,7 +89451,10 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         assert!(engine.durable_retry_pending());
         assert!(session.transaction.staged_commit().is_some());
         assert!(engine.fatal_commit_failure().is_none());
-        assert_eq!(engine.checkpoint().unwrap_err().sqlstate, sqlstate::INTERNAL_IO_WAIT);
+        assert_eq!(
+            engine.checkpoint().unwrap_err().sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
         if !cleanup_started {
             engine.begin_checkpoint_cleanup(published);
         }
@@ -89474,7 +89477,9 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
-        engine.finish_staged_transaction(&mut session.transaction, &session.guc).unwrap();
+        engine
+            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .unwrap();
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
         assert!(engine.maybe_checkpoint());

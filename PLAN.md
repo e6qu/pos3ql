@@ -28,10 +28,8 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Transaction owners now remain held until durable changes are installed and
-visible; installation failure prevents further queries, rollback of those
-changes, and checkpointing until recovery. Finish coordinating reader capture
-with table definitions, rows, index bindings and comments at the transaction
+Finish coordinating reader capture with table definitions, rows, index bindings
+and comments at the transaction
 boundary before several CPU workers run statements. A query must
 not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.

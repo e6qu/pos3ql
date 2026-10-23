@@ -41,6 +41,15 @@ fn transaction_publication_rows_definitions_indexes_and_comments_match_postgresq
 
 fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Result<(), SqlError> {
     if let PublicationState::Installing(publication) = engine.transaction_publication {
+        if publication.transactions().count() == 2 {
+            assert_eq!(
+                engine
+                    .prepared_transactions
+                    .find(ast::PreparedTransactionId::parse("publication-order").unwrap()),
+                Some(0),
+                "prepared slot became reusable before its decision was visible at {point:?}"
+            );
+        }
         if engine.wal_upload {
             assert!(
                 engine.durable_lsn >= publication.lsn,

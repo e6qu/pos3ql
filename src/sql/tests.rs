@@ -10785,7 +10785,7 @@ fn prepared_transaction_publication_failure_recovers_from_object_storage() {
          PREPARE TRANSACTION 'publication-failed'",
     );
     assert!(
-        String::from_utf8_lossy(&failed).contains("58030"),
+        String::from_utf8_lossy(&failed).contains("08007"),
         "{}",
         String::from_utf8_lossy(&failed)
     );
@@ -10794,7 +10794,8 @@ fn prepared_transaction_publication_failure_recovers_from_object_storage() {
         &mut budget,
         "SELECT count(*) FROM pg_prepared_xacts",
     );
-    assert!(String::from_utf8_lossy(&fenced).contains("58030"));
+    assert!(String::from_utf8_lossy(&fenced).contains("08007"));
+    assert_eq!(engine.fatal_commit_failure().unwrap().sqlstate, "58030");
     drop(engine);
 
     namespace.borrow_mut().faults.transient_per_mille = 0;

@@ -17,6 +17,7 @@ pub(super) enum PublicationPoint {
     DefinitionsInstalled,
     RowInstalled { table: usize, rowid: u64 },
     DataInstalled,
+    PreparedInstalled,
     Visible,
     RollbackRestored,
 }
@@ -100,6 +101,15 @@ impl PublicationState {
             Self::Idle => false,
             Self::Installing(publication) | Self::RecoveryRequired(publication) => {
                 publication.owns(transaction)
+            }
+        }
+    }
+
+    pub(super) fn pending_lsn(self) -> Option<u64> {
+        match self {
+            Self::Idle => None,
+            Self::Installing(publication) | Self::RecoveryRequired(publication) => {
+                Some(publication.lsn)
             }
         }
     }

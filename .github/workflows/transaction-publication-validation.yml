@@ -12,18 +12,31 @@ jobs:
   focused:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies and build
-        uses: actions/cache@v5
+        id: cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-transaction-publication-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-transaction-publication-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-transaction-publication-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-cargo-
       - name: Format and record tested source
         run: |
           cargo fmt
@@ -33,6 +46,7 @@ jobs:
           validation_tree=$(git write-tree)
           printf '%s\n' "$validation_tree" > "$RUNNER_TEMP/validation-tree"
           git rev-parse "${validation_tree}:src" > "$RUNNER_TEMP/validation-source-tree"
+          git rev-parse "${validation_tree}:tests/external/differential_exact" > "$RUNNER_TEMP/validation-fixture-tree"
       - uses: actions/upload-artifact@v6
         with:
           name: transaction-publication-format
@@ -41,6 +55,21 @@ jobs:
             ${{ runner.temp }}/validation-head
             ${{ runner.temp }}/validation-tree
             ${{ runner.temp }}/validation-source-tree
+            ${{ runner.temp }}/validation-fixture-tree
+      - name: PostgreSQL transaction reference
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess
+          fixture = pathlib.Path("tests/external/differential_exact/17_transaction_publication.sql").read_text()
+          result = subprocess.run(["docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"],
+              "psql", "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+              input=fixture, text=True, capture_output=True, check=True, timeout=5)
+          expected = ["20|20", "confirmed order", "20|20", "confirmed order", "1"]
+          assert result.stdout.splitlines() == expected, (result.stdout, result.stderr)
+          print("PostgreSQL 18 committed and rolled-back rows, definitions, indexes and comments:", expected)
+          PYTHON
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Publication ownership, durability, prepared transactions and cleanup
@@ -48,4 +77,15 @@ jobs:
           cargo test --release --lib --locked -- transaction_publication::
           parallel_commit_ prepared_transaction prepared_advisory shared_transaction_identity_
           shared_committed_publication commit_makes_writes_visible bounded_local_cleanup_
+          ambiguous_commit configured_commit_chain_ one_protocol_flush_ cold_start_then_commit_
+          login_event_triggers transaction_identities_
           --test-threads=1
+      - name: Retain build cache after a failed regression too
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-transaction-publication-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}

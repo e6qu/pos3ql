@@ -52953,10 +52953,12 @@ mod tests {
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
+            let prior_database = current_database();
+            crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
             let foreign = storage
-                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7)
-                .unwrap();
-            storage.tables[foreign].identity_mut().database = DatabaseOid::TEMPLATE1;
+                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7);
+            crate::sql::set_execution_database_oid(prior_database);
+            let foreign = foreign.unwrap();
             let local = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
                 .unwrap();
@@ -52969,17 +52971,17 @@ mod tests {
                 storage.ddl_name_locked_by_other("public", "reserved", 9),
                 None
             );
-            storage.commit_create(foreign);
-            let mut renamed = *storage.tables[foreign].definition();
+            let (target, mut renamed) = storage.select_table_definition(foreign, 7);
             renamed.name = SqlName::parse("pending_name").unwrap();
-            let _change = storage
-                .write_table_def(
-                    storage.select_table_definition(foreign, 7).0,
-                    renamed,
-                    &[None; MAX_COLUMNS],
-                    false,
-                )
-                .unwrap();
+            assert_eq!(
+                storage.write_table_def(target, renamed, &[None; MAX_COLUMNS], false).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE,
+            );
+            crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
+            storage.commit_create(foreign);
+            let change = storage.write_table_def(target, renamed, &[None; MAX_COLUMNS], false);
+            crate::sql::set_execution_database_oid(prior_database);
+            let _change = change.unwrap();
             assert_eq!(
                 storage.ddl_name_locked_by_other("public", "pending_name", 9),
                 None

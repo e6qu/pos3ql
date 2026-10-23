@@ -613,6 +613,7 @@ fn delete_pages(
 ) -> Result<(), SqlError> {
     loop {
         let table = storage.large_object_page_table();
+        let write_target = storage.select_table_definition(table, txn.txid).0;
         let mut found = [0u64; 256];
         let mut found_count = 0usize;
         storage.for_each_row_state(table, &mut |rowid, state| {
@@ -639,12 +640,14 @@ fn delete_pages(
             break;
         }
         for &rowid in &found[..found_count] {
-            let prior =
-                storage.write_pending_image(table, rowid, txn.txid, txn.command_id(), None)?;
-            if let Err(error) = txn.touch(table as u32, rowid, prior) {
-                storage.restore_pending(table, rowid, txn.txid, prior);
-                return Err(error);
-            }
+            txn.write_row(
+                storage,
+                write_target,
+                rowid,
+                txn.command_id(),
+                None,
+                crate::storage::RowWriteStatistics::Tracked,
+            )?;
         }
     }
     Ok(())
@@ -700,6 +703,8 @@ fn write_page(
     rowid: Option<u64>,
     data: &[u8],
 ) -> Result<(), SqlError> {
+    let table = storage.large_object_page_table();
+    let write_target = storage.select_table_definition(table, txn.txid).0;
     let values = [
         Datum::Oid(storage.current_database_oid().get() as u32),
         Datum::Oid(oid.get()),
@@ -711,13 +716,16 @@ fn write_page(
         None => storage.next_rowid()?,
     };
     let image = storage.heap.append_row_image(&values)?;
-    let table = storage.large_object_page_table();
-    let prior =
-        storage.write_pending_image(table, rowid, txn.txid, txn.command_id(), Some(image))?;
-    if let Err(error) = txn.touch(table as u32, rowid, prior) {
-        storage.restore_pending(table, rowid, txn.txid, prior);
-        return Err(error);
-    }
+
+    txn.write_row(
+        storage,
+        write_target,
+        rowid,
+        txn.command_id(),
+        Some(image),
+        crate::storage::RowWriteStatistics::Tracked,
+    )?;
+
     Ok(())
 }
 

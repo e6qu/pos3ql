@@ -533,8 +533,18 @@ impl CatalogObjectIdentity {
         created_at: u64,
         state: CatalogDdlState,
     ) -> bool {
+        self.database == current_database()
+            && self.matches_lifetime(storage, database, created_at, state)
+    }
+
+    pub(super) fn matches_lifetime(
+        self,
+        storage: &Storage,
+        database: DatabaseOid,
+        created_at: u64,
+        state: CatalogDdlState,
+    ) -> bool {
         self.origin == storage.catalog_sources.origin()
-            && self.database == current_database()
             && self.database == database
             && self.created_at == created_at
             && state != CatalogDdlState::Absent

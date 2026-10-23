@@ -257,18 +257,31 @@ version uses one read owner. Waiting releases earlier owners and checks the
 original selection again. Type changes invalidate affected selections using
 the type edit's reserved version; commit does not request another version.
 
-Row preparation copies the column types and count with the selected definition's
-version. A definition change before the prepared write is installed returns
+Statements retain the table definition used to prepare their values, including
+COPY input, partition routing, foreign-key actions and replication tuples. Row
+installation takes that original selection instead of looking up a fresh layout.
+A rewrite receives its new selection from the operation that installs the new
+definition. Row preparation copies the column types and count with that version. A definition change before the prepared write is installed returns
 `40001`, including after a wait or heap relocation. Another table's definition
 change does not invalidate that write. Rollback records retain their original
 storage and table lifetime; matching counters in another server's storage cannot
-remove its pending row. Undo still works after a column change on the same table.
+remove its pending row. Undo still works after a column change on the same table. Row installation
+and recording its rollback happen in one transaction operation. A full row undo
+log returns `54000` and removes only the write it could not record; a selection
+from another transaction returns `40001` before installation.
 
 **User example:** add an order total, update it, then roll back a later type
 change and delete. The earlier total remains. Committing a subsequent type
 change keeps that value after recovery with an empty local directory. Storage
 regressions separately force a definition change between row preparation and
 installation; they check that it fails before rows or write counts change.
+
+An invoice import can remain open while an order column is physically rewritten.
+The rewrite discards the earlier layout from new row lookups; an older repeatable-read
+transaction that first opens that table after commit sees it as empty, as described
+in [PostgreSQL 18's rewrite caveat](https://www.postgresql.org/docs/18/mvcc-caveats.html).
+A byte source selected before replacement still reads its original heap or saved
+file. Existing table locks protect SQL reports already reading the affected table.
 
 Rollback records identify the table's lifetime and the installed definition.
 An old record cannot undo a newer edit or change a replacement table. SQL
@@ -1031,8 +1044,8 @@ they cannot install into a replacement table. Their controls and reader mappings
 are included in startup memory reservations. Durable file bytes are unchanged.
 
 Paced merges keep the historical baseline, and byte scans skip versions newer than
-the selected snapshot. Complete rewrites with historical object versions remain
-explicitly guarded until a complete historical source exists. Merge scratch
+the selected snapshot. Maintenance that replaces a complete saved history remains
+guarded until that operation retains a complete historical source. Merge scratch
 exhaustion returns `54000`.
 
 A startup-sized registry protects durable and temporary object graphs used by

@@ -36,9 +36,19 @@ pub(crate) struct TableDefinitionChange {
     pub(super) source: super::catalog_sources::CatalogObjectIdentity,
     pub(super) transaction: u32,
     pub(super) revision: u64,
+    pub(super) committed_revision: super::TableDefinitionRevision,
 }
 
 impl TableDefinitionChange {
+    pub(crate) fn row_target(self) -> TableDefinitionTarget {
+        TableDefinitionTarget {
+            source: self.source,
+            transaction: self.transaction,
+            committed_revision: self.committed_revision,
+            pending_revision: self.revision,
+        }
+    }
+
     pub(crate) fn table(self) -> usize {
         match self.source.slot() {
             super::catalog_sources::CatalogObjectSlot::Table(table) => table,
@@ -283,6 +293,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             source: target.source,
             transaction,
             revision,
+            committed_revision: target.committed_revision,
         })
     }
 

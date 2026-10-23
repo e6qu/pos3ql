@@ -7,24 +7,25 @@ use crate::storage::RelationColumnMap;
 
 pub(super) fn with_partition_insert_row<'arena, R>(
     storage: &mut Storage,
-    logical: usize,
+    logical_target: crate::storage::TableDefinitionTarget,
     definition: &TableDef,
     values: &mut [Datum<'arena>; MAX_COLUMNS],
-    txid: u32,
     arena: &'arena Arena,
     operation: impl FnOnce(
         &mut Storage,
-        usize,
+        crate::storage::TableDefinitionTarget,
         &TableDef,
         &mut [Datum<'arena>; MAX_COLUMNS],
         Option<RelationColumnMap<'arena>>,
     ) -> R,
 ) -> Result<R, SqlError> {
+    let logical = logical_target.table();
+    let txid = logical_target.transaction();
     let target =
         storage.partition_target(logical, definition, &values[..definition.n_columns], txid)?;
     if target == logical {
         clear_generated(definition, values);
-        return Ok(operation(storage, target, definition, values, None));
+        return Ok(operation(storage, logical_target, definition, values, None));
     }
     storage.lock_table(
         txid,
@@ -33,12 +34,12 @@ pub(super) fn with_partition_insert_row<'arena, R>(
         false,
     )?;
     let definitions = storage.table_definition_images();
-    let physical_definition = definitions.definition(storage, target, txid)?;
+    let (physical_target, physical_definition) = definitions.selection(storage, target, txid)?;
     if RelationColumnMap::same_order(definition, physical_definition) {
         clear_generated(physical_definition, values);
         return Ok(operation(
             storage,
-            target,
+            physical_target,
             physical_definition,
             values,
             None,
@@ -50,7 +51,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
     clear_generated(physical_definition, &mut physical);
     let result = operation(
         storage,
-        target,
+        physical_target,
         physical_definition,
         &mut physical,
         Some(mapping),

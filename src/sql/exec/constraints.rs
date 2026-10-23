@@ -2674,7 +2674,7 @@ pub(crate) fn apply_fk_parent_actions(
         if !storage.table(child_index).visible_to(txn.txid) {
             continue;
         }
-        let cdef = *storage.table_def(child_index, txn.txid);
+        let (child_target, cdef) = storage.select_table_definition(child_index, txn.txid);
         let mut cschema = [ColType::Bool; MAX_COLUMNS];
         cdef.schema(&mut cschema);
         let cschema = &cschema[..cdef.n_columns];
@@ -2843,17 +2843,15 @@ pub(crate) fn apply_fk_parent_actions(
                         seq_session,
                         depth - 1,
                     )?;
-                    let prior = storage.write_pending_image(
-                        child_index,
+                    txn.write_row(
+                        storage,
+                        child_target,
                         rowid,
-                        txn.txid,
                         txn.command_id(),
                         None,
+                        crate::storage::RowWriteStatistics::Tracked,
                     )?;
-                    if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
-                        storage.restore_pending(child_index, rowid, txn.txid, prior);
-                        return Err(e);
-                    }
+
                     continue;
                 }
                 // The rewriting actions produce a new child row image.
@@ -2954,17 +2952,14 @@ pub(crate) fn apply_fk_parent_actions(
                 })?;
                 rowenc::encode(new_child, out);
                 let new_image = storage.heap.append_image(out)?;
-                let prior = storage.write_pending_image(
-                    child_index,
+                txn.write_row(
+                    storage,
+                    child_target,
                     rowid,
-                    txn.txid,
                     txn.command_id(),
                     Some(new_image),
+                    crate::storage::RowWriteStatistics::Tracked,
                 )?;
-                if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
-                    storage.restore_pending(child_index, rowid, txn.txid, prior);
-                    return Err(e);
-                }
             }
         }
     }

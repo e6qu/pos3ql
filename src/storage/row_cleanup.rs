@@ -364,7 +364,13 @@ mod tests {
             .append_row_image(&[Datum::Int4(value)])
             .unwrap();
         storage
-            .write_pending_image_untracked(table, rowid, txid, 1, Some(image))
+            .write_pending_image(
+                storage.select_table_definition(table, txid).0,
+                rowid,
+                1,
+                Some(image),
+                crate::storage::RowWriteStatistics::Untracked,
+            )
             .unwrap();
         storage.commit_row(table, rowid, txid, lsn).unwrap();
         storage.observe_lsn(lsn);
@@ -802,12 +808,24 @@ mod tests {
                 }
                 if delete_after_save {
                     storage
-                        .write_pending_image_untracked(table, 2, 10, 1, None)
+                        .write_pending_image(
+                            storage.select_table_definition(table, 10).0,
+                            2,
+                            1,
+                            None,
+                            crate::storage::RowWriteStatistics::Untracked,
+                        )
                         .unwrap();
                     storage.commit_row(table, 2, 10, 0).unwrap();
                     let rejected = storage.heap.append_row_image(&[Datum::Int4(99)]).unwrap();
                     let undo = storage
-                        .write_pending_image_untracked(table, 2, 12, 1, Some(rejected))
+                        .write_pending_image(
+                            storage.select_table_definition(table, 12).0,
+                            2,
+                            1,
+                            Some(rejected),
+                            crate::storage::RowWriteStatistics::Untracked,
+                        )
                         .unwrap();
                     storage.restore_pending(table, 2, 12, undo);
                 }

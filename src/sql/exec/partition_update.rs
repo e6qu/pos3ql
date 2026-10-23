@@ -7,6 +7,7 @@ pub(super) fn prepare_move<'arena>(
     storage: &mut Storage,
     txn: &mut TxnState,
     selected: PhysicalRow,
+    old_target: crate::storage::TableDefinitionTarget,
     old_definition: &TableDef,
     old_values: &[Datum<'arena>],
     target: usize,
@@ -41,11 +42,15 @@ pub(super) fn prepare_move<'arena>(
     if !dml_row_available(storage, txn, selected, "updated")? {
         return Ok(false);
     }
-    let prior = storage.write_pending_image(old_table, rowid, txn.txid, txn.command_id(), None)?;
-    if let Err(error) = txn.touch(old_table as u32, rowid, prior) {
-        storage.restore_pending(old_table, rowid, txn.txid, prior);
-        return Err(error);
-    }
+    txn.write_row(
+        storage,
+        old_target,
+        rowid,
+        txn.command_id(),
+        None,
+        crate::storage::RowWriteStatistics::Tracked,
+    )?;
+
     for (column, value) in definition.columns().iter().zip(values.iter_mut()) {
         if column.default.is_generated() {
             *value = Datum::Null;

@@ -357,7 +357,7 @@ impl Storage {
         let (schema, name) = state
             .pending
             .filter(|head| head.transaction == transaction)
-            .map_or((state.committed.schema, state.committed.name), |head| {
+            .map_or((state.committed().schema, state.committed().name), |head| {
                 (head.schema, head.name)
             });
         index.schema = schema;
@@ -472,7 +472,7 @@ mod tests {
             mapping[1] = Some(SqlName::parse("payload").unwrap());
             assert_eq!(
                 storage
-                    .write_table_def(table, 7, moved, &mapping, false)
+                    .write_table_def(storage.select_table_definition(table, 7).0, moved, &mapping, false)
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::DUPLICATE_TABLE
@@ -486,8 +486,8 @@ mod tests {
                 Some(occupied_slot)
             );
             storage.commit_index_drop(occupied_slot);
-            storage
-                .write_table_def(table, 7, moved, &mapping, false)
+            let change = storage
+                .write_table_def(storage.select_table_definition(table, 7).0, moved, &mapping, false)
                 .unwrap();
             let mut second = index("second_binding_index", "binding_source", 0, 1);
             second.schema = target_schema;
@@ -539,7 +539,7 @@ mod tests {
                     .is_none()
             );
             storage.rollback_index_create(replacement);
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(change);
             assert!(storage.index(slot).pending_table.is_none());
             assert!(
                 storage
@@ -740,8 +740,8 @@ mod tests {
             let mut first_mapping = [None; MAX_COLUMNS];
             first_mapping[1] = Some(SqlName::parse("key").unwrap());
             first_mapping[2] = Some(SqlName::parse("payload").unwrap());
-            storage
-                .write_table_def(table, 7, first, &first_mapping, false)
+            let _first_change = storage
+                .write_table_def(storage.select_table_definition(table, 7).0, first, &first_mapping, false)
                 .unwrap();
             let during = storage
                 .create_index(index("during_shape", "binding_source", 2, 1), 7)
@@ -759,8 +759,8 @@ mod tests {
             second_mapping[1] = Some(SqlName::parse("payload").unwrap());
             second_mapping[2] = Some(SqlName::parse("added_renamed").unwrap());
             for commit in [false, true] {
-                storage
-                    .write_table_def(table, 7, second, &second_mapping, false)
+                let second_change = storage
+                    .write_table_def(storage.select_table_definition(table, 7).0, second, &second_mapping, false)
                     .unwrap();
                 for (slot, expected) in [(before, (1, 0)), (during, (2, 0))] {
                     let projected = storage.index_visible_to(slot, 7).unwrap();
@@ -778,9 +778,9 @@ mod tests {
                     2
                 );
                 if commit {
-                    storage.commit_table_def(table, 7);
+                    assert_eq!(storage.commit_table_def(second_change), Some(false));
                 } else {
-                    storage.rollback_table_def(table, 7);
+                    storage.rollback_table_def(second_change);
                     for (slot, expected) in [(before, (0, 1)), (during, (2, 1))] {
                         let reverted = storage.index_visible_to(slot, 7).unwrap();
                         assert_eq!((reverted.columns[0], reverted.include_columns[0]), expected);

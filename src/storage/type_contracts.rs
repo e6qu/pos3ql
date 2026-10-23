@@ -392,7 +392,7 @@ impl<Catalog: CatalogPublicationDestination> CatalogDependencyOwners<'_, Catalog
                 .pending
                 .filter(|pending| pending.transaction == transaction)
                 .map_or(
-                    (definition.committed.schema, definition.committed.name),
+                    (definition.committed().schema, definition.committed().name),
                     |pending| (pending.schema, pending.name),
                 ),
         )

@@ -192,7 +192,7 @@ impl Storage {
             MaintenanceMode::Background => attempt().ok()?,
         };
         let live = definition.identity.live();
-        let temporary = definition.committed.persistence == RelationPersistence::Temporary;
+        let temporary = definition.committed().persistence == RelationPersistence::Temporary;
         let through_lsn = generations.published_through();
         let eligible = match task {
             RowCleanupTask::DurableHistory => live && !temporary && through_lsn.is_some(),

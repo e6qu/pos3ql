@@ -52,7 +52,7 @@ impl Storage {
                 .pending_txid()
                 .filter(|owner| *owner != transaction)
             {
-                let name = state.committed.name;
+                let name = state.committed().name;
                 drop(state);
                 drop(lifecycle);
                 return Err(self.catalog_ddl_wait_error(transaction, owner, name.as_str()));
@@ -88,7 +88,7 @@ impl Storage {
             let (schema, name) = state
                 .pending
                 .filter(|pending| pending.transaction == transaction)
-                .map_or((state.committed.schema, state.committed.name), |pending| {
+                .map_or((state.committed().schema, state.committed().name), |pending| {
                     (pending.schema, pending.name)
                 });
             let version = self.catalog_sequence.next()?;
@@ -194,7 +194,7 @@ impl Storage {
                     }
                     (
                         state.identity,
-                        (state.committed.schema, state.committed.name),
+                        (state.committed().schema, state.committed().name),
                     )
                 };
                 let _lifecycle = self.retire_table_names(slot, selected)?;
@@ -226,7 +226,7 @@ impl Storage {
                 );
                 state.identity.existence = state.identity.existence.rollback_drop(undo.transaction);
                 state.identity.ddl_version = undo.prior_version;
-                let names = (state.committed.schema, state.committed.name);
+                let names = (state.committed().schema, state.committed().name);
                 drop(state);
                 drop(comments);
                 self.view_rule_catalog()

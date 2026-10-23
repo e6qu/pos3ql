@@ -5923,7 +5923,7 @@ fn drop_table_kind(
                     let Some((child, foreign_key)) = inbound else {
                         break;
                     };
-                    let child_definition = *storage.table_def(child, txn.txid);
+                    let (child_target, child_definition) = storage.select_table_definition(child, txn.txid);
                     let constraint = child_definition.fkeys()[foreign_key].name;
                     if !statement.cascade {
                         return sql_fail(sql_err!(
@@ -5959,17 +5959,9 @@ fn drop_table_kind(
                     {
                         *target = Some(child_definition.columns()[column].name);
                     }
-                    if let Err(error) =
-                        storage.write_table_def(child, txn.txid, updated, &identity_mapping, false)
-                    {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) =
-                        txn.record_ddl(super::txn::DdlUndo::TableAltered(child as u32))
-                    {
-                        storage.rollback_table_def(child, txn.txid);
-                        return sql_fail(error);
-                    }
+                    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &identity_mapping, false) {
+            return sql_fail(error);
+        }
                 }
                 // Owned serial/identity sequences are internal dependencies:
                 // dropping their table drops them in the same transaction.
@@ -13201,7 +13193,7 @@ pub(crate) fn drop_schema(
     for o in objects[..n_objects].iter().flatten() {
         match o {
             SchemaObject::InboundFk { table, fk_index } => {
-                let def = *storage.table_def(*table, txn.txid);
+                let (edit_target, def) = storage.select_table_definition(*table, txn.txid);
                 let fk_name = def.fkeys[*fk_index].name;
                 let (schema, tname) = (def.schema, def.name);
                 let lsn = storage.bump_lsn();
@@ -13225,16 +13217,9 @@ pub(crate) fn drop_schema(
                 {
                     *target = Some(def.columns()[column].name);
                 }
-                if let Err(error) =
-                    storage.write_table_def(*table, txn.txid, updated, &identity_mapping, false)
-                {
-                    return sql_fail(error);
-                }
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(*table as u32))
-                {
-                    storage.rollback_table_def(*table, txn.txid);
-                    return sql_fail(error);
-                }
+                if let Err(error) = txn.write_table_definition(storage, edit_target, updated, &identity_mapping, false) {
+            return sql_fail(error);
+        }
             }
             SchemaObject::View(v) => {
                 if let Err(error) = storage.lock_object(
@@ -13386,7 +13371,7 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::Matview { table, catalog } => {
-                let def = *storage.table_def(*table, txn.txid);
+                let (edit_target, def) = storage.select_table_definition(*table, txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
                     txn.txid,
@@ -40257,7 +40242,7 @@ fn rewrite_sequence_default_references(
         if !storage.table(table_slot).visible_to(txn.txid) {
             continue;
         }
-        let current = *storage.table_def(table_slot, txn.txid);
+        let (edit_target, current) = storage.select_table_definition(table_slot, txn.txid);
         let mut altered = current;
         let mut changed = false;
         for column in altered.columns.iter_mut().take(altered.n_columns) {
@@ -40316,7 +40301,7 @@ fn rewrite_sequence_default_references(
             mapping[position] = Some(column.name);
             wal_mapping[position] = position as u16;
         }
-        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
+        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -40337,10 +40322,6 @@ fn rewrite_sequence_default_references(
                 definition: &altered,
             },
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
-            storage.rollback_table_def(table_slot, txn.txid);
-            return Err(error);
-        }
     }
     Ok(())
 }
@@ -46435,7 +46416,7 @@ fn rewrite_composite_dependent_tables(
         if !storage.table(table_slot).visible_to(txn.txid) {
             continue;
         }
-        let current = *storage.table_def(table_slot, txn.txid);
+        let (edit_target, current) = storage.select_table_definition(table_slot, txn.txid);
         let columns = DefCols(&current);
         let mut altered = current;
         let mut changed = false;
@@ -46498,14 +46479,14 @@ fn rewrite_composite_dependent_tables(
         for (position, column) in current.columns().iter().enumerate() {
             mapping[position] = Some(column.name);
         }
-        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
+        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
         if current.persistence != crate::storage::RelationPersistence::Temporary {
             let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
             for (position, target) in wal_mapping.iter_mut().enumerate().take(current.n_columns) {
                 *target = position as u16;
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::BeginTableRewrite {
@@ -46514,26 +46495,16 @@ fn rewrite_composite_dependent_tables(
                     preserve_rows: true,
                     column_mapping: wal_mapping,
                 },
-            ) {
-                storage.rollback_table_def(table_slot, txn.txid);
-                return Err(error);
-            }
+            )?;
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateTable {
                     identity: storage.table_position(table_slot),
                     definition: &altered,
                 },
-            ) {
-                storage.rollback_table_def(table_slot, txn.txid);
-                return Err(error);
-            }
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
-            storage.rollback_table_def(table_slot, txn.txid);
-            return Err(error);
+            )?;
         }
     }
     Ok(())
@@ -49950,13 +49921,13 @@ pub fn alter_tables_tablespace(
         }
     }
     for &table in &tables[..count] {
-        let definition = *storage.table_def(table, txn.txid);
+        let (edit_target, definition) = storage.select_table_definition(table, txn.txid);
         if definition.tablespace == target {
             continue;
         }
         let mut next = definition;
         next.tablespace = target;
-        if let Err(error) = stage_table_definition(storage, wal, txn, table, definition, next) {
+        if let Err(error) = stage_table_definition(storage, wal, txn, edit_target, definition, next) {
             return sql_fail(error);
         }
     }
@@ -49968,10 +49939,11 @@ fn stage_table_definition(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    table: usize,
+    edit_target: crate::storage::TableDefinitionTarget,
     previous: TableDef,
     next: TableDef,
 ) -> Result<(), SqlError> {
+    let table = edit_target.table();
     let mut mapping = [None; MAX_COLUMNS];
     let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
     for column in 0..previous.n_columns {
@@ -50000,11 +49972,7 @@ fn stage_table_definition(
             },
         )?;
     }
-    storage.write_table_def(table, txn.txid, next, &mapping, false)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table as u32)) {
-        storage.rollback_table_def(table, txn.txid);
-        return Err(error);
-    }
+    txn.write_table_definition(storage, edit_target, next, &mapping, false)?;
     Ok(())
 }
 
@@ -63370,7 +63338,7 @@ fn rename_attached_index_constraint(
     index_slot: usize,
     new_name: SqlName,
 ) -> Result<(), SqlError> {
-    let current = *storage.table_def(table_index, txn.txid);
+    let (edit_target, current) = storage.select_table_definition(table_index, txn.txid);
     let index = storage
         .index_visible_to(index_slot, txn.txid)
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
@@ -63425,11 +63393,7 @@ fn rename_attached_index_constraint(
             definition: &altered,
         },
     )?;
-    storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
-        storage.rollback_table_def(table_index, txn.txid);
-        return Err(error);
-    }
+    txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
     Ok(())
 }
 
@@ -63448,10 +63412,11 @@ fn drop_dependent_foreign_keys(
         if !storage.table(table_slot).visible_to(txn.txid) {
             continue;
         }
+        let (edit_target, live_definition) = storage.select_table_definition(table_slot, txn.txid);
         let current = if table_slot == target_table {
             *target
         } else {
-            *storage.table_def(table_slot, txn.txid)
+            live_definition
         };
         let depends = |foreign_key: &crate::storage::ForeignKey| {
             foreign_key.parent_schema == target_schema
@@ -63509,11 +63474,7 @@ fn drop_dependent_foreign_keys(
                 definition: &altered,
             },
         )?;
-        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
-            storage.rollback_table_def(table_slot, txn.txid);
-            return Err(error);
-        }
+        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
     }
     Ok(())
 }
@@ -64525,7 +64486,7 @@ fn alter_table_inheritance(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    child: usize,
+    child_target: crate::storage::TableDefinitionTarget,
     child_definition: TableDef,
     parent_name: QualName<'_>,
     inherit: bool,
@@ -64533,6 +64494,7 @@ fn alter_table_inheritance(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    let child = child_target.table();
     let Some(crate::storage::ResolvedRelation::Table(parent)) =
         storage.resolve_relation(parent_name.schema, parent_name.name, txn.txid)
     else {
@@ -64690,13 +64652,9 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.write_table_def(child, txn.txid, updated, &mapping, false) {
-        return sql_fail(error);
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(child as u32)) {
-        storage.rollback_table_def(child, txn.txid);
-        return sql_fail(error);
-    }
+    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &mapping, false) {
+            return sql_fail(error);
+        }
     if emit_completion {
         responder.command_complete(tag)?;
     }
@@ -64750,7 +64708,7 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    let child_def = *storage.table_def(child, txn.txid);
+    let (child_target, child_def) = storage.select_table_definition(child, txn.txid);
     let child_lock_mode = match (detach_mode, child_def.partition.attachment) {
         (
             Some(crate::sql::ast::PartitionDetachMode::Concurrent),
@@ -65122,13 +65080,9 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.write_table_def(child, txn.txid, new_def, &mapping, false) {
-        return sql_fail(error);
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(child as u32)) {
-        storage.rollback_table_def(child, txn.txid);
-        return sql_fail(error);
-    }
+    if let Err(error) = txn.write_table_definition(storage, child_target, new_def, &mapping, false) {
+            return sql_fail(error);
+        }
     if attaching && child_def.partition.is_partitioned() {
         for depth in 1..=storage.table_count() {
             for descendant in 0..storage.table_count() {
@@ -65137,7 +65091,7 @@ fn alter_partition_attachment(
                 {
                     continue;
                 }
-                let current = *storage.table_def(descendant, txn.txid);
+                let (dependent_target, current) = storage.select_table_definition(descendant, txn.txid);
                 let attachment = current
                     .partition
                     .attachment
@@ -65181,17 +65135,9 @@ fn alter_partition_attachment(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) =
-                    storage.write_table_def(descendant, txn.txid, dependent, &mapping, false)
-                {
-                    return sql_fail(error);
-                }
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::TableAltered(descendant as u32))
-                {
-                    storage.rollback_table_def(descendant, txn.txid);
-                    return sql_fail(error);
-                }
+                if let Err(error) = txn.write_table_definition(storage, dependent_target, dependent, &mapping, false) {
+            return sql_fail(error);
+        }
             }
         }
     }
@@ -65582,7 +65528,11 @@ fn alter_table_relation(
     if let Err(error) = storage.lock_table(txn.txid, table_index, lock_mode, false) {
         return sql_fail(error);
     }
-    let def = *storage.table_def(table_index, txn.txid);
+    let definitions = storage.table_definition_images();
+    let (edit_target, def) = match definitions.definition_for_edit(storage, table_index, txn.txid) {
+        Ok((target, definition)) => (target, *definition),
+        Err(error) => return sql_fail(error),
+    };
     if expected_kind.is_some_and(|kind| def.kind != kind) {
         return sql_fail(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -65747,12 +65697,7 @@ fn alter_table_relation(
         for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
             *target = Some(def.columns()[column].name);
         }
-        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
-        {
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
-            storage.rollback_table_def(table_index, txn.txid);
+        if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &mapping, false) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -65809,7 +65754,7 @@ fn alter_table_relation(
                 new_def.row_level_security.forced = false;
             }
         }
-        if let Err(error) = stage_table_definition(storage, wal, txn, table_index, def, new_def) {
+        if let Err(error) = stage_table_definition(storage, wal, txn, edit_target, def, new_def) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -65825,6 +65770,7 @@ fn alter_table_relation(
             txn,
             ReplicaIdentityAlter {
                 table_index,
+                edit_target,
                 definition: def,
                 target: *target,
             },
@@ -65839,7 +65785,7 @@ fn alter_table_relation(
             storage,
             wal,
             txn,
-            table_index,
+            edit_target,
             def,
             *parent,
             *inherit,
@@ -65961,7 +65907,7 @@ fn alter_table_relation(
         };
         let mut new_def = def;
         new_def.type_membership = membership;
-        if let Err(error) = stage_table_definition(storage, wal, txn, table_index, def, new_def) {
+        if let Err(error) = stage_table_definition(storage, wal, txn, edit_target, def, new_def) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -66341,12 +66287,7 @@ fn alter_table_relation(
             }
             seq_session.invalidate_cache(alteration.slot);
         }
-        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
-        {
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
-            storage.rollback_table_def(table_index, txn.txid);
+        if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &mapping, false) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -68120,15 +68061,9 @@ fn alter_table_relation(
         }
     }
 
-    if let Err(error) =
-        storage.write_table_def(table_index, txn.txid, new_def, &column_mapping, has_rewrite)
-    {
-        return sql_fail(error);
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
-        storage.rollback_table_def(table_index, txn.txid);
-        return sql_fail(error);
-    }
+    if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite) {
+            return sql_fail(error);
+        }
     let dropped_constraints = match arena.alloc_slice_with(txn.constraint_capacity(), |_| None) {
         Ok(constraints) => constraints,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -68335,7 +68270,7 @@ fn alter_table_relation(
                 {
                     continue;
                 }
-                let current = *storage.table_def(descendant, txn.txid);
+                let (dependent_target, current) = storage.select_table_definition(descendant, txn.txid);
                 let mut dependent = current;
                 let mut changed = match synchronize_inherited_constraint_changes(
                     &def,
@@ -68457,17 +68392,9 @@ fn alter_table_relation(
                         return sql_fail(error);
                     }
                 }
-                if let Err(error) =
-                    storage.write_table_def(descendant, txn.txid, dependent, &mapping, false)
-                {
-                    return sql_fail(error);
-                }
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::TableAltered(descendant as u32))
-                {
-                    storage.rollback_table_def(descendant, txn.txid);
-                    return sql_fail(error);
-                }
+                if let Err(error) = txn.write_table_definition(storage, dependent_target, dependent, &mapping, false) {
+            return sql_fail(error);
+        }
             }
         }
     }
@@ -68478,7 +68405,7 @@ fn alter_table_relation(
             {
                 continue;
             }
-            let current = *storage.table_def(dependent_table, txn.txid);
+            let (dependent_target, current) = storage.select_table_definition(dependent_table, txn.txid);
             let mut dependent = current;
             let mut changed = false;
             for foreign_key in &mut dependent.fkeys[..dependent.n_fkeys] {
@@ -68499,21 +68426,13 @@ fn alter_table_relation(
             {
                 *target = Some(current.columns()[column].name);
             }
-            if let Err(error) = storage.write_table_def(
-                dependent_table,
-                txn.txid,
+            if let Err(error) = txn.write_table_definition(storage, dependent_target,
                 dependent,
                 &identity_mapping,
                 false,
             ) {
-                return sql_fail(error);
-            }
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::TableAltered(dependent_table as u32))
-            {
-                storage.rollback_table_def(dependent_table, txn.txid);
-                return sql_fail(error);
-            }
+            return sql_fail(error);
+        }
         }
     }
     for i in 0..rewritten_rows {
@@ -68698,6 +68617,7 @@ fn validate_replica_identity_index(
 
 struct ReplicaIdentityAlter<'a> {
     table_index: usize,
+    edit_target: crate::storage::TableDefinitionTarget,
     definition: TableDef,
     target: crate::sql::ast::ReplicaIdentityTarget<'a>,
 }
@@ -68713,6 +68633,7 @@ fn alter_table_replica_identity(
 ) -> Outcome {
     let ReplicaIdentityAlter {
         table_index,
+        edit_target,
         definition,
         target,
     } = alteration;
@@ -68763,13 +68684,9 @@ fn alter_table_replica_identity(
             return sql_fail(error);
         }
     }
-    if let Err(error) = storage.write_table_def(table_index, txn.txid, next, &mapping, false) {
-        return sql_fail(error);
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
-        storage.rollback_table_def(table_index, txn.txid);
-        return sql_fail(error);
-    }
+    if let Err(error) = txn.write_table_definition(storage, edit_target, next, &mapping, false) {
+            return sql_fail(error);
+        }
     if emit_completion {
         responder.command_complete(tag)?;
     }

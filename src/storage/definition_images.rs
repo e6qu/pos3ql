@@ -17,6 +17,7 @@ struct Image {
     table: usize,
     transaction: u32,
     identity: TableIdentity,
+    target: super::TableDefinitionTarget,
     definition: TableDef,
 }
 
@@ -142,6 +143,25 @@ impl TableDefinitionImages {
         None
     }
 
+    pub(crate) fn definition_for_edit<'a>(
+        &'a self,
+        storage: &Storage,
+        table: usize,
+        transaction: u32,
+    ) -> Result<(super::TableDefinitionTarget, &'a TableDef), SqlError> {
+        let definition = self.definition(storage, table, transaction)?;
+        let mut slot = self.head.get();
+        while let Some(index) = slot {
+            // SAFETY: this owner's immutable chain remains occupied until Drop.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            if image.table == table && image.transaction == transaction {
+                return Ok((image.target, definition));
+            }
+            slot = image.next;
+        }
+        unreachable!("definition capture installs its source before returning")
+    }
+
     pub(crate) fn definition<'a>(
         &'a self,
         storage: &Storage,
@@ -202,6 +222,11 @@ impl TableDefinitionImages {
             core::ptr::addr_of_mut!((*target).table).write(table);
             core::ptr::addr_of_mut!((*target).transaction).write(transaction);
             core::ptr::addr_of_mut!((*target).identity).write(identity);
+            core::ptr::addr_of_mut!((*target).target).write(storage.table_definition_target(
+                table,
+                transaction,
+                &definition,
+            ));
             core::ptr::copy_nonoverlapping(
                 &*definition,
                 core::ptr::addr_of_mut!((*target).definition),
@@ -271,8 +296,13 @@ mod tests {
         pending.columns[0].name = crate::storage::SqlName::parse("pending_name").unwrap();
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(pending.columns[0].name);
-        storage
-            .write_table_def(table, 7, pending, &mapping, false)
+        let change = storage
+            .write_table_def(
+                storage.select_table_definition(table, 7).0,
+                pending,
+                &mapping,
+                false,
+            )
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let error = storage
@@ -301,7 +331,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            storage.rollback_table_def(table, 7);
+            storage.rollback_table_def(change);
             storage
                 .with_retained_table_definition(table, 7, |definition| {
                     assert_eq!(definition.columns()[0].name.as_str(), "original");

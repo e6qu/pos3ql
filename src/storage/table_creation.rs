@@ -167,9 +167,7 @@ pub(super) fn allocate(
                 position.created_at()
             }
         };
-        state.committed = def;
-        state.pending_has_rules_txid = None;
-        state.identity = table_definitions::TableIdentity {
+        state.install(def, table_definitions::TableIdentity {
             database: current_database(),
             ownership,
             created_at,
@@ -178,7 +176,7 @@ pub(super) fn allocate(
                 TableCreation::Committed => CatalogDdlState::Present,
                 TableCreation::Pending(txid) => CatalogDdlState::PendingCreate { txid },
             },
-        };
+        });
         drop(state);
         drop(source);
         table.mark_dirty();
@@ -203,9 +201,10 @@ pub(super) fn allocate(
         if let Err(error) = storage.refresh_enforcers_visible(slot, None) {
             storage.rollback_create_locked(slot);
             let mut state = table.definition.write();
-            state.committed = TableDef::empty();
-            state.identity.ownership = Ownership::BOOTSTRAP;
-            state.identity.created_at = 0;
+            let mut identity = state.identity;
+            identity.ownership = Ownership::BOOTSTRAP;
+            identity.created_at = 0;
+            state.install(TableDef::empty(), identity);
             return Err(error);
         }
         storage.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);

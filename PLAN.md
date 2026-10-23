@@ -47,7 +47,9 @@ table, routine, type, account and saved-query guarantees.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
-rollback and exhaustion release every owner within startup reservations.
+rollback and exhaustion release every owner within startup reservations. An
+installed table edit must own its exact rollback record before journal staging
+continues; a reused internal table number cannot identify that record.
 
 ### Run statements on startup-reserved CPU workers
 

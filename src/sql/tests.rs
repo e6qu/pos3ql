@@ -281,7 +281,25 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         editor.success(&mut engine,
             "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
         editor.success(&mut engine,
-            "CREATE SEQUENCE cascade_wait_calls; CREATE SEQUENCE cascade_restart_source; CREATE TABLE cascade_wait_audit(id serial, seen bigint, private_seen bigint, restarted_seen bigint); CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN CREATE SEQUENCE cascade_attempt_sequence START 17; ALTER SEQUENCE cascade_restart_source RESTART WITH 23; INSERT INTO cascade_wait_audit(seen, private_seen, restarted_seen) VALUES(nextval(''cascade_wait_calls''), nextval(''cascade_attempt_sequence''), nextval(''cascade_restart_source'')); RETURN; END'; CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait()", true);
+            r#"CREATE SEQUENCE cascade_wait_calls;
+            CREATE SEQUENCE cascade_restart_source;
+            CREATE SEQUENCE cascade_cached_source CACHE 10;
+            CREATE SEQUENCE cascade_prior_source START 51;
+            CREATE TABLE cascade_wait_audit(id serial, prior_seen bigint, seen bigint, private_seen bigint, restarted_seen bigint, cached_seen bigint);
+            CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS $hook$
+            DECLARE prior_value bigint;
+            BEGIN
+              PERFORM currval('cascade_prior_source');
+              prior_value := lastval();
+              PERFORM setval('cascade_cached_source', 100, true);
+              EXECUTE 'CREATE SEQUENCE cascade_attempt_sequence START 17';
+              EXECUTE 'ALTER SEQUENCE cascade_restart_source RESTART WITH 23';
+              INSERT INTO cascade_wait_audit(prior_seen, seen, private_seen, restarted_seen, cached_seen)
+                VALUES(prior_value, nextval('cascade_wait_calls'), nextval('cascade_attempt_sequence'), nextval('cascade_restart_source'), nextval('cascade_cached_source'));
+              RETURN;
+            END $hook$;
+            CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait();
+            SELECT nextval('cascade_prior_source')"#, true);
         assert_eq!(
             data_rows(&reader.success(&mut engine, "BEGIN; SELECT id FROM cascade_report", true)),
             ["1"]
@@ -337,6 +355,8 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         );
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT nextval('cascade_wait_calls')", true)), ["2"]);
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "SELECT nextval('cascade_cached_source')", true)), ["111"]);
         other.success(&mut engine, "CREATE SEQUENCE cascade_reused_slot", true);
         reader.success(&mut engine, "COMMIT", true);
         assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Ok(()));
@@ -351,9 +371,9 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
             "SELECT last_value FROM cascade_wait_calls", true)), ["2"],
             "resuming the same statement must not repeat its start trigger");
         assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT id, seen, private_seen, restarted_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source')", true)), ["1|1|17|23", "1", "18", "24"]);
+            "SELECT id, prior_seen, seen, private_seen, restarted_seen, cached_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source'); SELECT nextval('cascade_cached_source')", true)), ["1|51|1|17|23|101", "1", "18", "24", "112"]);
         assert_eq!(data_rows(&editor.success(&mut engine,
-            "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq')", true)), ["1|1"]);
+            "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq'); SELECT nextval('cascade_cached_source')", true)), ["1|1", "102"]);
         assert!(
             engine
                 .storage

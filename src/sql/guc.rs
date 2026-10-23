@@ -595,13 +595,12 @@ impl SeqSession {
         self.lastval.set(Some((slot, created_at)));
     }
 
-    /// Both forms discard cached values. Only is_called=true changes currval;
-    /// neither form selects a different lastval source.
+    /// Restore the logical result. Cache invalidation belongs to the physical
+    /// setval, so replay cannot discard values reserved later in the attempt.
     pub fn record_setval(&self, slot: usize, created_at: u64, value: i64, is_called: bool) {
         if is_called {
             self.currval_cell(slot).set((created_at, value));
         }
-        self.cache_cell(slot).set(SequenceCache::EMPTY);
     }
 
     /// This sequence's `currval` in this session, if `nextval`/`setval` has
@@ -618,6 +617,10 @@ impl SeqSession {
 
     pub(crate) fn last_sequence(&self) -> Option<(usize, u64)> {
         self.lastval.get()
+    }
+
+    pub(super) fn restore_last_sequence(&self, source: Option<(usize, u64)>) {
+        self.lastval.set(source);
     }
 
     pub fn discard(&self) {

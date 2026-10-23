@@ -660,6 +660,8 @@ returns `54000`, "volatile sequence replay exceeds statement memory", before
 making an unrecorded sequence change. Saved handles reject a reset or replacement
 arena, and a changed source or call order returns `40001`. A private sequence
 recreated by rollback must reproduce its saved result before execution continues.
+Retries preserve previously reserved sequence values and the connection's prior
+last-sequence source.
 `setval('orders_id_seq', 90, false)` makes the next generated ID 90 while leaving
 this connection's previous `currval` unchanged. `lastval` follows the last sequence
 used by `nextval`, checks access to that source and rejects a dropped or replaced

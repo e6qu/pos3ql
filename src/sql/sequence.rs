@@ -43,6 +43,7 @@ pub(super) struct StatementSequenceReplay {
     head: Option<ArenaHandle<SequenceEffect>>,
     tail: Option<ArenaHandle<SequenceEffect>>,
     next: Option<ArenaHandle<SequenceEffect>>,
+    initial_lastval: Option<(usize, u64)>,
 }
 
 impl StatementSequenceReplay {
@@ -50,6 +51,7 @@ impl StatementSequenceReplay {
         head: None,
         tail: None,
         next: None,
+        initial_lastval: None,
     };
 }
 
@@ -101,10 +103,15 @@ pub(super) fn enter_statement<'arena>(
             arena: PhantomData,
         };
     }
-    let mut replay = if resumed {
-        session.statement_replay.get()
+    let retained = session.statement_replay.get();
+    let mut replay = if resumed && retained.head.is_some() {
+        session.restore_last_sequence(retained.initial_lastval);
+        retained
     } else {
-        StatementSequenceReplay::EMPTY
+        StatementSequenceReplay {
+            initial_lastval: session.last_sequence(),
+            ..StatementSequenceReplay::EMPTY
+        }
     };
     replay.next = replay.head;
     session.statement_replay.set(replay);
@@ -367,39 +374,27 @@ pub(crate) fn next_cached(
     slot: usize,
     txid: u32,
 ) -> Result<i64, SqlError> {
-    let source = storage.sequence_replay_source(slot, txid);
+    let (source, sequence) = storage.select_sequence_for_replay(slot, txid)?;
     let value = statement_call(
         session,
         SequenceCall {
             operation: SequenceOperation::Next,
             source: Some(source),
         },
-        || next_cached_value(storage, session, slot, txid),
+        || {
+            if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
+                return Ok(value);
+            }
+            let (value, reserved, prelogged) =
+                storage.reserve_sequence_values(slot, txid, sequence.cache)?;
+            // Only reserving a new WAL range assigns a full transaction ID.
+            if prelogged {
+                storage.assign_transaction_identity(txid);
+            }
+            session.store_cache(slot, value, reserved, &sequence);
+            Ok(value)
+        },
     )?;
-    session.record_nextval(slot, source.created_at(), value);
-    Ok(value)
-}
-
-fn next_cached_value(
-    storage: &Storage,
-    session: &SeqSession,
-    slot: usize,
-    txid: u32,
-) -> Result<i64, SqlError> {
-    let sequence = storage.sequence_for(slot, txid);
-    if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
-        session.record_nextval(slot, sequence.created_at, value);
-        return Ok(value);
-    }
-    let (value, reserved, prelogged) =
-        storage.reserve_sequence_values(slot, txid, sequence.cache)?;
-    // PostgreSQL assigns a full XID only when nextval must emit a sequence WAL
-    // record. Values covered by the sequence's prelogged range do not assign
-    // one, even though the durable absolute position still advances here.
-    if prelogged {
-        storage.assign_transaction_identity(txid);
-    }
-    session.store_cache(slot, value, reserved, &sequence);
     session.record_nextval(slot, sequence.created_at, value);
     Ok(value)
 }
@@ -417,12 +412,12 @@ impl SequenceAccess for SeqEval<'_> {
     fn currval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
-        let seq = self.storage.sequence_for(slot, self.txid);
+        let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
         statement_call(
             self.session,
             SequenceCall {
                 operation: SequenceOperation::Current,
-                source: Some(self.storage.sequence_replay_source(slot, self.txid)),
+                source: Some(source),
             },
             || match self.session.currval(slot, seq.created_at) {
                 Some(v) => Ok(v),
@@ -443,8 +438,11 @@ impl SequenceAccess for SeqEval<'_> {
             )
         };
         let (slot, created_at) = self.session.last_sequence().ok_or_else(undefined)?;
-        let definition = self.storage.sequence_for(slot, self.txid);
-        if definition.created_at != created_at || !definition.visible_to(self.txid) {
+        let (source, definition) = self
+            .storage
+            .select_sequence_for_replay(slot, self.txid)
+            .map_err(|_| undefined())?;
+        if definition.created_at != created_at {
             return Err(undefined());
         }
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
@@ -452,7 +450,7 @@ impl SequenceAccess for SeqEval<'_> {
             self.session,
             SequenceCall {
                 operation: SequenceOperation::Last,
-                source: Some(self.storage.sequence_replay_source(slot, self.txid)),
+                source: Some(source),
             },
             || self.session.lastval().ok_or_else(undefined),
         )
@@ -461,7 +459,7 @@ impl SequenceAccess for SeqEval<'_> {
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
-        let seq = self.storage.sequence_for(slot, self.txid);
+        let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
         if self.dry {
             // Validate the range without moving the generator.
             self.storage.check_sequence_value(slot, self.txid, value)?;
@@ -471,13 +469,14 @@ impl SequenceAccess for SeqEval<'_> {
             self.session,
             SequenceCall {
                 operation: SequenceOperation::Set { value, is_called },
-                source: Some(self.storage.sequence_replay_source(slot, self.txid)),
+                source: Some(source),
             },
             || {
                 let result = self
                     .storage
                     .set_sequence_value(slot, self.txid, value, is_called)?;
                 self.storage.assign_transaction_identity(self.txid);
+                self.session.invalidate_cache(slot);
                 Ok(result)
             },
         )?;

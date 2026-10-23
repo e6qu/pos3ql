@@ -660,6 +660,11 @@ returns `54000`, "volatile sequence replay exceeds statement memory", before
 making an unrecorded sequence change. Saved handles reject a reset or replacement
 arena, and a changed source or call order returns `40001`. A private sequence
 recreated by rollback must reproduce its saved result before execution continues.
+`setval('orders_id_seq', 90, false)` makes the next generated ID 90 while leaving
+this connection's previous `currval` unchanged. `lastval` follows the last sequence
+used by `nextval`, checks access to that source and rejects a dropped or replaced
+source with `55000`. These rules follow
+[PostgreSQL's sequence functions](https://www.postgresql.org/docs/18/functions-sequence.html).
 The pg_typeof function is stable rather than immutable: an immutable cast of
 its result stays out of planning. A genuinely constant immutable cast can
 still raise a planning error even when WHERE FALSE removes all rows. These

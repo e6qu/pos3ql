@@ -50,6 +50,10 @@ jobs:
           python3 - <<'PYTHON'
           import os, pathlib, select, subprocess, time
           command = ["docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"], "psql", "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"]
+          sequence_fixture = pathlib.Path("tests/external/differential_exact/16_sequence_session_values.sql").read_text()
+          result = subprocess.run(command, input=sequence_fixture, text=True, capture_output=True, check=True, timeout=5)
+          assert result.stdout.splitlines() == ["40", "40", "90", "40|40", "90", "120", "120|120", "200", "200|120", "900", "900"], result.stdout
+          print("PostgreSQL setval modes and lastval source:", result.stdout.splitlines())
           fixture = pathlib.Path("tests/external/differential_exact/15_catalog_publication.sql").read_text()
           setup, marker, changes = fixture.partition("-- Changes while another connection retains unrelated work.")
           assert marker
@@ -155,4 +159,5 @@ jobs:
           configured_user_type_ statement_arena_scales_event_graphs_
           domains_enforce_and_report parallel_checkpoint_ constraint_validation_reuses_fixed_arena_
           sequence:: mem::arena::tests::arena_retained_handles
+          sequence_session_setval_modes_
           --test-threads=1

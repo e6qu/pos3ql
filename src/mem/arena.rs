@@ -26,11 +26,21 @@ pub struct Arena {
 static NEXT_RETENTION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn retention_identity() -> u64 {
-    NEXT_RETENTION_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
-            identity.checked_add(1)
-        })
-        .unwrap_or(0)
+    let mut identity = NEXT_RETENTION_IDENTITY.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = identity.checked_add(1) else {
+            return 0;
+        };
+        match NEXT_RETENTION_IDENTITY.compare_exchange_weak(
+            identity,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return identity,
+            Err(current) => identity = current,
+        }
+    }
 }
 
 /// A copied value in the persistent tail. Handles reject a reset, replacement
@@ -38,7 +48,9 @@ fn retention_identity() -> u64 {
 pub(crate) struct ArenaHandle<T> {
     identity: u64,
     offset: usize,
-    value: PhantomData<fn(T) -> T>,
+    // Keep T's thread-safety requirements and forbid shortening a stored
+    // reference's lifetime through one clone while retaining another clone.
+    value: PhantomData<(T, fn(T) -> T)>,
 }
 
 impl<T> Copy for ArenaHandle<T> {}

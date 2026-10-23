@@ -1,0 +1,15 @@
+CREATE SEQUENCE sequence_mode START 7;
+CREATE SEQUENCE sequence_other START 11;
+SELECT setval('sequence_mode', 40, false);
+SELECT nextval('sequence_mode');
+SELECT setval('sequence_mode', 90, false);
+SELECT currval('sequence_mode'), lastval();
+SELECT nextval('sequence_mode');
+SELECT setval('sequence_mode', 120, true);
+SELECT currval('sequence_mode'), lastval();
+SELECT setval('sequence_other', 200, true);
+SELECT currval('sequence_other'), lastval();
+DROP SEQUENCE sequence_mode;
+CREATE SEQUENCE sequence_mode START 900;
+SELECT nextval('sequence_mode');
+SELECT lastval();

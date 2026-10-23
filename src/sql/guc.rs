@@ -446,8 +446,9 @@ pub struct SeqSession {
     pub(super) statement_replay: Cell<super::sequence::StatementSequenceReplay>,
     /// Per-slot `(created_at, value)`; `created_at == 0` means undefined.
     currvals: [Cell<(u64, i64)>; INLINE_SEQUENCE_SLOTS],
-    /// `(defined, value)` for `lastval` — the last `nextval` of any sequence.
-    lastval: Cell<(bool, i64)>,
+    /// The last nextval source; setval can change its value without selecting
+    /// a different source, and slot reuse must invalidate it.
+    lastval: Cell<Option<(usize, u64)>>,
     caches: [Cell<SequenceCache>; INLINE_SEQUENCE_SLOTS],
     overflow_currvals: Option<FixedVec<Cell<(u64, i64)>>>,
     overflow_caches: Option<FixedVec<Cell<SequenceCache>>>,
@@ -493,7 +494,7 @@ impl SeqSession {
         SeqSession {
             statement_replay: Cell::new(super::sequence::StatementSequenceReplay::EMPTY),
             currvals: [const { Cell::new((0u64, 0i64)) }; INLINE_SEQUENCE_SLOTS],
-            lastval: Cell::new((false, 0)),
+            lastval: Cell::new(None),
             caches: [const { Cell::new(SequenceCache::EMPTY) }; INLINE_SEQUENCE_SLOTS],
             overflow_currvals: None,
             overflow_caches: None,
@@ -591,13 +592,15 @@ impl SeqSession {
     /// Records a `nextval`: defines both this sequence's `currval` and `lastval`.
     pub fn record_nextval(&self, slot: usize, created_at: u64, value: i64) {
         self.currval_cell(slot).set((created_at, value));
-        self.lastval.set((true, value));
+        self.lastval.set(Some((slot, created_at)));
     }
 
-    /// Records a `setval`: defines this sequence's `currval` only (PostgreSQL
-    /// does not let `setval` define `lastval`).
-    pub fn record_setval(&self, slot: usize, created_at: u64, value: i64) {
-        self.currval_cell(slot).set((created_at, value));
+    /// Both forms discard cached values. Only is_called=true changes currval;
+    /// neither form selects a different lastval source.
+    pub fn record_setval(&self, slot: usize, created_at: u64, value: i64, is_called: bool) {
+        if is_called {
+            self.currval_cell(slot).set((created_at, value));
+        }
         self.cache_cell(slot).set(SequenceCache::EMPTY);
     }
 
@@ -609,8 +612,12 @@ impl SeqSession {
     }
 
     pub fn lastval(&self) -> Option<i64> {
-        let (defined, value) = self.lastval.get();
-        defined.then_some(value)
+        let (slot, created_at) = self.lastval.get()?;
+        self.currval(slot, created_at)
+    }
+
+    pub(crate) fn last_sequence(&self) -> Option<(usize, u64)> {
+        self.lastval.get()
     }
 
     pub fn discard(&self) {
@@ -630,7 +637,7 @@ impl SeqSession {
                 cache.set(SequenceCache::EMPTY);
             }
         }
-        self.lastval.set((false, 0));
+        self.lastval.set(None);
     }
 }
 

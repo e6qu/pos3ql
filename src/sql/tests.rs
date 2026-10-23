@@ -8,6 +8,39 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
+    let mut config = test_config("sequence-session-values");
+    config.max_sequences = 2;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows = Vec::new();
+    for sql in include_str!("../../tests/external/differential_exact/16_sequence_session_values.sql").split(';').filter(|sql| !sql.trim().is_empty()) {
+        rows.extend(data_rows(&session.success(&mut engine, sql, true)));
+    }
+    assert_eq!(rows,
+        ["40", "40", "90", "40|40", "90", "120", "120|120", "200", "200|120", "900", "900"]);
+    let mut fresh = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    fresh.success(&mut engine, "SELECT setval('sequence_mode', 1000, false)", true);
+    for sql in ["SELECT currval('sequence_mode')", "SELECT lastval()"] {
+        assert_eq!(error_sqlstates(&fresh.execute(&mut engine, sql, true)), ["55000"]);
+    }
+    assert_eq!(data_rows(&fresh.success(&mut engine,
+        "SELECT setval('sequence_mode', 1100, true); SELECT currval('sequence_mode')", true)), ["1100", "1100"]);
+    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["55000"]);
+    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)), ["1101"]);
+    fresh.success(&mut engine, "CREATE ROLE sequence_observer; SET ROLE sequence_observer", true);
+    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["42501"]);
+    fresh.success(&mut engine,
+        "RESET ROLE; GRANT SELECT ON SEQUENCE sequence_mode TO sequence_observer; SET ROLE sequence_observer", true);
+    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT lastval()", true)), ["1101"]);
+    fresh.success(&mut engine, "RESET ROLE; DROP SEQUENCE sequence_mode", true);
+    fresh.success(&mut engine, "CREATE SEQUENCE sequence_mode START 9", true);
+    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["55000"]);
+    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)), ["9"]);
+}
+
+#[test]
 fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_recovery() {
     for (mode, suffix) in [
         (crate::config::TransactionMode::Mvcc, "mvcc"),

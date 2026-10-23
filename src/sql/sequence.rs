@@ -436,20 +436,25 @@ impl SequenceAccess for SeqEval<'_> {
     }
 
     fn lastval(&self) -> Result<i64, SqlError> {
+        let undefined = || {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "lastval is not yet defined in this session"
+            )
+        };
+        let (slot, created_at) = self.session.last_sequence().ok_or_else(undefined)?;
+        let definition = self.storage.sequence_for(slot, self.txid);
+        if definition.created_at != created_at || !definition.visible_to(self.txid) {
+            return Err(undefined());
+        }
+        self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
         statement_call(
             self.session,
             SequenceCall {
                 operation: SequenceOperation::Last,
-                source: None,
+                source: Some(self.storage.sequence_replay_source(slot, self.txid)),
             },
-            || {
-                self.session.lastval().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "lastval is not yet defined in this session"
-                    )
-                })
-            },
+            || self.session.lastval().ok_or_else(undefined),
         )
     }
 
@@ -476,7 +481,8 @@ impl SequenceAccess for SeqEval<'_> {
                 Ok(result)
             },
         )?;
-        self.session.record_setval(slot, seq.created_at, value);
+        self.session
+            .record_setval(slot, seq.created_at, value, is_called);
         Ok(result)
     }
 }

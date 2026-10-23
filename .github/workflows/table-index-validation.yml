@@ -88,6 +88,11 @@ jobs:
                       matched = re.search(r"ERROR:\s+([A-Z0-9]{5})", attempt.stderr)
                       observed[request] = matched.group(1) if matched else f"exit={attempt.returncode}:{attempt.stdout}:{attempt.stderr}"
                   print("PostgreSQL namespace reference:", label, observed, flush=True)
+                  expected = {
+                      "rename": {"rename_old": "42P07", "rename_new": "55P03", "create_old": "42P07", "create_new": "55P03"},
+                      "drop": {"rename_old": "42P07", "create_old": "42P07"},
+                  }
+                  assert observed == expected[label], (label, observed)
               finally:
                   if owner.poll() is None:
                       owner.communicate("ROLLBACK;\n", timeout=5)

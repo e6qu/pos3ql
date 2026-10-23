@@ -17,7 +17,7 @@ pub(crate) struct PendingIndexTable {
 }
 
 impl IndexDef {
-    fn pending_owner_other_than(&self, transaction: u32) -> Option<u32> {
+    pub(super) fn pending_owner_other_than(&self, transaction: u32) -> Option<u32> {
         self.ddl_state
             .pending_txid()
             .into_iter()
@@ -27,14 +27,14 @@ impl IndexDef {
             .find(|owner| *owner != transaction)
     }
 
-    pub(super) fn schema_for(self, transaction: u32) -> SqlName {
+    pub(super) fn schema_for(&self, transaction: u32) -> SqlName {
         self.pending_table
             .filter(|pending| pending.transaction == transaction)
             .map_or(self.schema, |pending| pending.schema)
     }
 
     pub(super) fn namespace_blocker(
-        self,
+        &self,
         schema: SqlName,
         name: SqlName,
         transaction: u32,
@@ -48,8 +48,9 @@ impl IndexDef {
             .or(self.pending_name.map(|pending| pending.txid))
             .or(self.ddl_state.pending_txid())?;
         (owner != transaction
-            && (self.ddl_state.committed_exists() && self.schema == schema && self.name == name
-                || self.schema_for(owner) == schema && self.name_for(owner) == name))
+            && self.visible_to(owner)
+            && self.schema_for(owner) == schema && self.name_for(owner) == name
+            && (!self.ddl_state.committed_exists() || self.schema != schema || self.name != name))
             .then_some(owner)
     }
 }
@@ -477,7 +478,12 @@ mod tests {
             );
             assert!(storage.pending_table_def(table).is_none());
             assert!(storage.index(slot).pending_table.is_none());
-            assert_eq!(storage.drop_index("binding_destination", "binding_index", 8).unwrap(), Some(occupied_slot));
+            assert_eq!(
+                storage
+                    .drop_index("binding_destination", "binding_index", 8)
+                    .unwrap(),
+                Some(occupied_slot)
+            );
             storage.commit_index_drop(occupied_slot);
             storage
                 .write_table_def(table, 7, moved, &mapping, false)
@@ -492,7 +498,13 @@ mod tests {
                     ..IndexMutableDefinition::DEFAULT
                 };
                 storage.alter_index_definition(slot, definition, 7).unwrap();
-                assert_eq!(storage.alter_index_definition(second_slot, definition, 7).unwrap_err().sqlstate, sqlstate::INVALID_OBJECT_DEFINITION);
+                assert_eq!(
+                    storage
+                        .alter_index_definition(second_slot, definition, 7)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INVALID_OBJECT_DEFINITION
+                );
             }
             storage.rollback_index_definition(slot, None);
             storage.rollback_index_create(second_slot);

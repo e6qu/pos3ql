@@ -651,7 +651,7 @@ impl DerefMut for CommittedDefinitionWrite<'_> {
 pub struct TableDefinitionRead<'a> {
     // Fields drop in order: release the slot before its table ownership.
     pending: Option<DefinitionSlotRead<'a>>,
-    state: RwLockReadGuard<'a, DefinitionState>,
+    pub(super) state: RwLockReadGuard<'a, DefinitionState>,
 }
 
 impl Deref for TableDefinitionRead<'_> {

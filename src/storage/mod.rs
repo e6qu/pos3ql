@@ -2603,6 +2603,7 @@ struct PendingVersionSlot {
 /// An append that rollback may remove only while it remains the row's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingWriteUndo {
+    source: row_publication::RowTableSource,
     identity: u64,
 }
 
@@ -32307,13 +32308,9 @@ impl Storage {
         rowid: u64,
         committed: VisibleRowHome,
         pending: &row_heap::HeapRowRead,
+        schema: &[ColType],
     ) -> Result<ColumnSet, SqlError> {
-        let columns = {
-            let definition = self.tables[table_index].definition();
-            definition.n_columns
-        };
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        self.tables[table_index].definition().schema(&mut schema);
+        let columns = schema.len();
         let mut pending_payloads = [&[][..]; MAX_COLUMNS];
         let mut pending_nulls = [false; MAX_COLUMNS];
         rowenc::encoded_columns(

@@ -17,22 +17,66 @@ struct PreparedPendingWrite {
     track_statistics: bool,
 }
 
-#[derive(Clone, Copy)]
-struct PreparedTableTarget {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RowTableSource {
+    origin: super::type_references::CatalogOrigin,
     table: usize,
     database: DatabaseOid,
     incarnation: u64,
 }
 
+impl RowTableSource {
+    fn capture(
+        storage: &Storage,
+        table: usize,
+        identity: table_definitions::TableIdentity,
+    ) -> Self {
+        Self {
+            origin: storage.catalog_sources.origin(),
+            table,
+            database: identity.database,
+            incarnation: identity.created_at,
+        }
+    }
+
+    fn matches(
+        self,
+        storage: &Storage,
+        table: usize,
+        identity: table_definitions::TableIdentity,
+    ) -> bool {
+        self.origin == storage.catalog_sources.origin()
+            && self.table == table
+            && self.database == identity.database
+            && self.incarnation == identity.created_at
+            && identity.existence != CatalogDdlState::Absent
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTableTarget {
+    source: RowTableSource,
+    committed_revision: TableDefinitionRevision,
+    pending_revision: u64,
+}
+
 impl PreparedTableTarget {
-    fn same_target(self, other: Self) -> Result<(), SqlError> {
-        if self.table != other.table
-            || self.database != other.database
-            || self.incarnation != other.incarnation
-        {
+    fn capture(
+        storage: &Storage,
+        table: usize,
+        txid: u32,
+        definition: &TableDefinitionRead<'_>,
+    ) -> Result<Self, SqlError> {
+        let identity = definition.identity();
+        if !identity.existence.visible_to(txid) {
             return Err(Self::retired_error());
         }
-        Ok(())
+        let (committed_revision, pending_revision) = definition.revisions();
+        Ok(Self {
+            source: RowTableSource::capture(storage, table, identity),
+            committed_revision,
+            pending_revision,
+        })
     }
 
     fn retired_error() -> SqlError {
@@ -42,30 +86,29 @@ impl PreparedTableTarget {
         )
     }
 
-    fn capture(
-        table: usize,
-        identity: table_definitions::TableIdentity,
-        txid: u32,
-    ) -> Result<Self, SqlError> {
-        let target = Self {
-            table,
-            database: identity.database,
-            incarnation: identity.created_at,
-        };
-        target.validate(identity, txid)?;
-        Ok(target)
-    }
-
     fn validate(
         &self,
-        identity: table_definitions::TableIdentity,
+        storage: &Storage,
+        definition: &table_definitions::DefinitionState,
         txid: u32,
     ) -> Result<(), SqlError> {
-        if identity.database != self.database
-            || identity.created_at != self.incarnation
-            || !identity.existence.visible_to(txid)
+        if !self
+            .source
+            .matches(storage, self.source.table, definition.identity)
+            || !definition.identity.existence.visible_to(txid)
         {
             return Err(Self::retired_error());
+        }
+        if self.committed_revision != definition.committed_revision
+            || self.pending_revision
+                != storage
+                    .pending_table_defs
+                    .selected_revision(definition, txid)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table definition changed while a row write was prepared"
+            ));
         }
         Ok(())
     }
@@ -152,29 +195,25 @@ impl Storage {
         mut image: Option<super::row_heap::HeapRowRead>,
         track_statistics: bool,
     ) -> Result<PendingWriteUndo, SqlError> {
-        let mut original_target: Option<PreparedTableTarget> = None;
+        let definition = self.table_def(table_index, txid);
+        let target = PreparedTableTarget::capture(self, table_index, txid, &definition)?;
+        drop(definition);
         loop {
-            if let Some(target) = original_target {
+            {
                 let definition = self.tables[table_index].definition.read();
-                target.validate(definition.identity, txid)?;
+                target.validate(self, &definition, txid)?;
             }
             if let Some(input) = &image {
                 image = Some(self.heap.retain_for_publication(input)?);
             }
-            let prepared = self.prepare_pending_write_image(
-                table_index,
+            let prepared = self.prepare_pending_write_image_for(
+                target,
                 rowid,
                 txid,
                 cid,
                 image.as_ref(),
                 track_statistics,
             )?;
-            let target = prepared.target;
-            if let Some(original) = original_target {
-                original.same_target(target)?;
-            } else {
-                original_target = Some(target);
-            }
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
                 PendingPublication::Retry => continue,
@@ -182,7 +221,7 @@ impl Storage {
                     // Wait outside the snapshot registry and retain the original
                     // request identity when byte preparation needs another turn.
                     let definition = self.tables[table_index].definition.read();
-                    target.validate(definition.identity, txid)?;
+                    target.validate(self, &definition, txid)?;
                 }
                 PendingPublication::Wait(owner, message) => {
                     return Err(self.pending_write_wait(txid, owner, message));
@@ -212,6 +251,7 @@ impl Storage {
         self.prepare_pending_write_image(table, rowid, txid, cid, image.as_ref(), track_statistics)
     }
 
+    #[cfg(test)]
     fn prepare_pending_write_image(
         &self,
         table: usize,
@@ -221,19 +261,38 @@ impl Storage {
         image: Option<&super::row_heap::HeapRowRead>,
         track_statistics: bool,
     ) -> Result<PreparedPendingWrite, SqlError> {
-        // Own input bytes across cold reads and movement. Publication rechecks
-        // placement under the same version ownership as relocation.
+        let definition = self.table_def(table, txid);
+        let target = PreparedTableTarget::capture(self, table, txid, &definition)?;
+        drop(definition);
+        self.prepare_pending_write_image_for(target, rowid, txid, cid, image, track_statistics)
+    }
+
+    fn prepare_pending_write_image_for(
+        &self,
+        target: PreparedTableTarget,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        image: Option<&super::row_heap::HeapRowRead>,
+        track_statistics: bool,
+    ) -> Result<PreparedPendingWrite, SqlError> {
+        let table = target.source.table;
+        // Copy the decoding schema under the same owner as its version. Cold
+        // reads and comparisons retain no live catalog or row-map owner.
         let loc = image.map(super::row_heap::HeapRowRead::location);
-        let target = {
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let columns = {
             let definition = self.table_def(table, txid);
+            target.validate(self, &definition.state, txid)?;
             if let Some(owner) = definition.locked_by_other(txid) {
+                drop(definition);
                 return Err(self.pending_write_wait(
                     txid,
                     owner,
                     "statement is waiting for a concurrent table definition change",
                 ));
             }
-            PreparedTableTarget::capture(table, definition.identity(), txid)?
+            definition.schema(&mut schema)
         };
         let resident = self.resident_row_state(table, rowid)?;
         if let Some(owner) = resident
@@ -286,7 +345,7 @@ impl Storage {
         );
         let changes_existence = committed.is_some() != image.is_some();
         let changed_columns = if track_statistics
-            && self.tables[table].pending_definition_transaction() != Some(txid)
+            && target.pending_revision == 0
             && committed.is_some()
             && let Some(input) = image
         {
@@ -303,9 +362,8 @@ impl Storage {
                     "committed update has no retained row source"
                 )
             })?;
-            self.pending_change_footprint(table, rowid, committed_image, input)?
+            self.pending_change_footprint(table, rowid, committed_image, input, &schema[..columns])?
         } else {
-            let columns = self.tables[table].definition().n_columns;
             ColumnSet::all(columns)
         };
         Ok(PreparedPendingWrite {
@@ -346,7 +404,7 @@ impl Storage {
             existed,
             track_statistics,
         } = prepared;
-        let table = target.table;
+        let table = target.source.table;
         let owners = super::row_ownership::acquire(|| {
             let snapshots =
                 super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?;
@@ -364,7 +422,7 @@ impl Storage {
         let Some((snapshots, definition, mut versions, mut rows)) = owners else {
             return Ok(PendingPublication::DefinitionBusy);
         };
-        target.validate(definition.identity, change.txid)?;
+        target.validate(self, &definition, change.txid)?;
         if let Some(owner) = definition
             .identity
             .existence
@@ -450,12 +508,16 @@ impl Storage {
                 self.max_row_versions_per_row
             ));
         }
-        let undo = push_pending_version(
+        let identity = push_pending_version(
             &mut versions.pending_row_versions,
             &mut state.pending,
             self.max_row_versions_per_row,
             change,
         )?;
+        let undo = PendingWriteUndo {
+            source: target.source,
+            identity,
+        };
         rows.insert(rowid, state)
             .expect("map capacity reserved under its owner");
         if track_statistics
@@ -470,12 +532,19 @@ impl Storage {
 
     /// Undo checks and removes one exact head under the same publication locks.
     pub fn restore_pending(&self, table: usize, rowid: u64, txid: u32, undo: PendingWriteUndo) {
-        let (mut versions, mut rows) = super::row_ownership::acquire(|| {
+        if undo.source.table != table || undo.source.origin != self.catalog_sources.origin() {
+            return;
+        }
+        let (definition, mut versions, mut rows) = super::row_ownership::acquire(|| {
             Ok((
+                self.tables[table].definition.try_read_for_batch()?,
                 self.row_versions.try_write_for_batch()?,
                 self.tables[table].rows.try_write_for_batch()?,
             ))
         });
+        if !undo.source.matches(self, table, definition.identity) {
+            return;
+        }
         Self::restore_pending_locked(&mut versions, &mut rows, rowid, txid, undo);
     }
 
@@ -528,6 +597,375 @@ mod tests {
 
     fn relocation_scratch() -> FixedVec<HeapRelocationEntry> {
         FixedVec::new(&mut Budget::new(4096), "publication relocation test", 16).unwrap()
+    }
+
+    fn rename_definition(
+        storage: &Storage,
+        table: usize,
+        txid: u32,
+        name: &str,
+    ) -> TableDefinitionChange {
+        let (target, mut definition) = storage.select_table_definition(table, txid);
+        definition.columns[0].name = SqlName::parse(name).unwrap();
+        let mut mapping = [None; MAX_COLUMNS];
+        for (column, mapped) in mapping.iter_mut().enumerate().take(definition.n_columns) {
+            *mapped = Some(definition.columns[column].name);
+        }
+        storage
+            .write_table_def(target, definition, &mapping, false)
+            .unwrap()
+    }
+
+    #[test]
+    fn row_definition_admission_rejects_committed_and_private_changes_before_mutation() {
+        for committed in [false, true] {
+            for tracked in [false, true] {
+                for deletion in [false, true] {
+                    let (mut storage, table) = fixture(&test_config());
+                    let input = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let prepared = storage
+                            .prepare_pending_write_image(
+                                table,
+                                1,
+                                7,
+                                1,
+                                (!deletion).then_some(&input),
+                                tracked,
+                            )
+                            .unwrap();
+                        let change = rename_definition(&storage, table, 7, "renamed");
+                        if committed {
+                            assert_eq!(storage.commit_table_def(change), Some(false));
+                        }
+                        let error = storage.publish_pending_write(prepared).err().unwrap();
+                        assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                        assert!(storage.tables[table].rows.is_empty());
+                        assert!(
+                            storage
+                                .cumulative_statistics()
+                                .relation_transactions
+                                .is_empty()
+                        );
+                        let versions = storage.row_versions.read();
+                        for slot in 0..versions.pending_row_versions.len() {
+                            assert!(!versions.pending_row_versions[slot].used);
+                        }
+                        drop(versions);
+                        if !committed {
+                            storage.rollback_table_def(change);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_definition_admission_retry_keeps_the_original_schema_after_relocation_and_wait() {
+        let (mut storage, table) = fixture(&test_config());
+        let input = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+        let mut scratch = relocation_scratch();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            let target = prepared.target;
+            let definition = storage.tables[table].definition.write();
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::DefinitionBusy
+            ));
+            drop(definition);
+            storage.compact_heap(&mut scratch).unwrap();
+            let change = rename_definition(&storage, table, 7, "after_wait");
+            let error = storage
+                .prepare_pending_write_image_for(target, 1, 7, 1, Some(&input), true)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.tables[table].rows.is_empty());
+            storage.rollback_table_def(change);
+            let prepared = storage
+                .prepare_pending_write_image_for(target, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::Retry
+            ));
+            let image = storage.heap.retain_for_publication(&input).unwrap();
+            let prepared = storage
+                .prepare_pending_write_image_for(target, 1, 7, 1, Some(&image), true)
+                .unwrap();
+            let PendingPublication::Written(undo) =
+                storage.publish_pending_write(prepared).unwrap()
+            else {
+                panic!("restoring the original definition permits its original request");
+            };
+            storage.restore_pending(table, 1, 7, undo);
+        });
+    }
+
+    #[test]
+    fn row_definition_admission_does_not_adopt_a_recreated_private_revision() {
+        let (storage, table) = fixture(&test_config());
+        let input = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = rename_definition(&storage, table, 7, "same_name");
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            storage.rollback_table_def(first);
+            let second = rename_definition(&storage, table, 7, "same_name");
+            assert_ne!(first.revision, second.revision);
+            assert_eq!(
+                storage
+                    .publish_pending_write(prepared)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert!(storage.tables[table].rows.is_empty());
+            storage.rollback_table_def(second);
+        });
+    }
+
+    #[test]
+    fn row_definition_admission_uses_private_column_count_and_allows_unrelated_edits() {
+        let (mut storage, table) = fixture(&test_config());
+        let other = storage
+            .create_table(make_def(
+                "other_definition",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (target, _) = storage.select_table_definition(table, 7);
+            let expanded = make_def(
+                "publication",
+                &[
+                    ("id", ColType::Int4, false),
+                    ("added", ColType::Int8, false),
+                ],
+            );
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(expanded.columns[0].name);
+            let change = storage
+                .write_table_def(target, expanded, &mapping, true)
+                .unwrap();
+            let input = storage
+                .heap
+                .append_row_image(&[Datum::Int4(1), Datum::Int8(9)])
+                .unwrap();
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            assert!(
+                prepared
+                    .change
+                    .changed_columns
+                    .intersects(ColumnSet::all(2))
+            );
+            assert_ne!(prepared.change.changed_columns, ColumnSet::all(1));
+            let other_change = rename_definition(&storage, other, 8, "unrelated");
+            let PendingPublication::Written(undo) =
+                storage.publish_pending_write(prepared).unwrap()
+            else {
+                panic!("unrelated definitions must not invalidate the selected table");
+            };
+            storage.rollback_table_def(other_change);
+            storage.rollback_table_def(change);
+            storage.restore_pending(table, 1, 7, undo);
+            assert!(storage.tables[table].rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn row_undo_source_rejects_foreign_storage_even_when_pending_counters_match() {
+        let (first, table) = fixture(&test_config());
+        let (second, other) = fixture(&test_config());
+        assert_eq!(table, other);
+        crate::mem::guard::forbid_alloc(|| {
+            let a = first.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+            let b = second.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+            let undo_a = first.write_pending_image(table, 1, 7, 1, Some(a)).unwrap();
+            let undo_b = second.write_pending_image(other, 1, 7, 1, Some(b)).unwrap();
+            assert_eq!(undo_a.identity, undo_b.identity);
+            second.restore_pending(other, 1, 7, undo_a);
+            first.restore_pending(table, 1, 7, undo_b);
+            assert_eq!(
+                first
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            assert_eq!(
+                second
+                    .resident_row_state(other, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            first.restore_pending(table, 1, 7, undo_a);
+            second.restore_pending(other, 1, 7, undo_b);
+            assert!(first.tables[table].rows.is_empty());
+            assert!(second.tables[other].rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn row_definition_admission_rejects_preparation_from_another_storage_owner() {
+        let (first, table) = fixture(&test_config());
+        let (second, other) = fixture(&test_config());
+        assert_eq!(table, other);
+        crate::mem::guard::forbid_alloc(|| {
+            let a = first.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+            let b = second.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+            let prepared = first
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&a), true)
+                .unwrap();
+            let undo = second.write_pending_image(other, 2, 8, 1, Some(b)).unwrap();
+            assert_eq!(
+                second
+                    .publish_pending_write(prepared)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert!(second.resident_row_state(other, 1).unwrap().is_none());
+            assert_eq!(
+                second
+                    .resident_row_state(other, 2)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            second.restore_pending(other, 2, 8, undo);
+        });
+    }
+
+    #[test]
+    fn row_undo_source_wait_releases_owners_and_preserves_unrelated_progress() {
+        let (mut storage, table) = fixture(&test_config());
+        let other = storage
+            .create_table(make_def("undo_progress", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let image = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+        let undo = storage
+            .write_pending_image(table, 1, 7, 1, Some(image))
+            .unwrap();
+        let held = storage.tables[table].definition.write();
+        let started = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        let progressed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.store(true, Ordering::Release);
+                crate::mem::guard::forbid_alloc(|| storage.restore_pending(table, 1, 7, undo));
+                finished.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let started_in_time = started.load(Ordering::Acquire);
+            let completed_before_release = finished.load(Ordering::Acquire);
+            scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let image = storage.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+                    let undo = storage
+                        .write_pending_image(other, 1, 8, 1, Some(image))
+                        .unwrap();
+                    storage.restore_pending(other, 1, 8, undo);
+                    assert!(storage.tables[other].rows.is_empty());
+                });
+                progressed.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !progressed.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let progress = progressed.load(Ordering::Acquire);
+            drop(held);
+            assert!(started_in_time);
+            assert!(
+                !completed_before_release,
+                "undo bypassed the original definition owner"
+            );
+            assert!(progress);
+        });
+        assert!(finished.load(Ordering::Acquire));
+        assert!(storage.tables[table].rows.is_empty());
+    }
+
+    #[test]
+    fn row_undo_source_survives_definition_changes_but_rejects_retirement_and_database_rebinding() {
+        let (mut storage, table) = fixture(&test_config());
+        crate::mem::guard::forbid_alloc(|| {
+            let image = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
+            let undo = storage
+                .write_pending_image(table, 1, 7, 1, Some(image))
+                .unwrap();
+            let change = rename_definition(&storage, table, 7, "new_shape");
+            storage.restore_pending(table, 1, 7, undo);
+            assert!(storage.tables[table].rows.is_empty());
+            storage.rollback_table_def(change);
+            let image = storage.heap.append_row_image(&[Datum::Int4(2)]).unwrap();
+            let undo = storage
+                .write_pending_image(table, 1, 7, 1, Some(image))
+                .unwrap();
+            {
+                let mut definition = storage.tables[table].definition.write();
+                definition.identity.database = DatabaseOid::TEMPLATE1;
+            }
+            storage.restore_pending(table, 1, 7, undo);
+            assert_eq!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            {
+                let mut definition = storage.tables[table].definition.write();
+                definition.identity.database = DatabaseOid::POSTGRES;
+            }
+            storage.restore_pending(table, 1, 7, undo);
+            assert!(storage.tables[table].rows.is_empty());
+            storage.commit_drop(table);
+            assert_eq!(
+                storage
+                    .create_table(make_def("replacement", &[("id", ColType::Int4, false)]))
+                    .unwrap(),
+                table
+            );
+            let image = storage.heap.append_row_image(&[Datum::Int4(3)]).unwrap();
+            let replacement = storage
+                .write_pending_image(table, 1, 7, 1, Some(image))
+                .unwrap();
+            storage.restore_pending(table, 1, 7, undo);
+            assert_eq!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            storage.restore_pending(table, 1, 7, replacement);
+        });
     }
 
     #[test]

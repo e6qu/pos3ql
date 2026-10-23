@@ -8,8 +8,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
-    PendingVersions, PendingWriteUndo, RowHome, RowLoc, committed_row_version_capacity,
-    pending_row_version_capacity,
+    PendingVersions, RowHome, RowLoc, committed_row_version_capacity, pending_row_version_capacity,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -189,7 +188,7 @@ pub(super) fn push_pending_version(
     versions: &mut PendingVersions,
     maximum: usize,
     change: PendingChange,
-) -> Result<PendingWriteUndo, SqlError> {
+) -> Result<u64, SqlError> {
     let identity = pool.next_identity.checked_add(1).ok_or_else(|| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -237,7 +236,7 @@ pub(super) fn push_pending_version(
     versions.tail = Some(slot);
     versions.len += 1;
     *next_identity = identity;
-    Ok(PendingWriteUndo { identity })
+    Ok(identity)
 }
 
 pub(super) fn pop_pending_version(

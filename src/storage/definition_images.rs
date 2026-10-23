@@ -112,6 +112,18 @@ impl TableDefinitionImages {
         }
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (super::TableDefinitionTarget, &TableDef)> {
+        let mut slot = self.head.get();
+        core::iter::from_fn(move || {
+            let index = slot?;
+            // SAFETY: the borrowed owner pins this immutable chain. A later
+            // capture prepends a head without changing existing images.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            slot = image.next;
+            Some((image.target, &image.definition))
+        })
+    }
+
     /// Read a captured image without reacquiring the live table identity.
     pub(crate) fn retained_definition(&self, table: usize, transaction: u32) -> Option<&TableDef> {
         let mut slot = self.head.get();

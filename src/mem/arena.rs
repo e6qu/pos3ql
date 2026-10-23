@@ -7,6 +7,8 @@
 
 use core::cell::Cell;
 use core::fmt;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
@@ -18,6 +20,46 @@ pub struct Arena {
     offset: Cell<usize>,
     tail_offset: Cell<usize>,
     high_water: Cell<usize>,
+    retention_identity: u64,
+}
+
+static NEXT_RETENTION_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn retention_identity() -> u64 {
+    let mut identity = NEXT_RETENTION_IDENTITY.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = identity.checked_add(1) else {
+            return 0;
+        };
+        match NEXT_RETENTION_IDENTITY.compare_exchange_weak(
+            identity,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return identity,
+            Err(current) => identity = current,
+        }
+    }
+}
+
+/// A copied value in the persistent tail. Handles reject a reset, replacement
+/// or different arena before accessing bytes; they do not retain references.
+pub(crate) struct ArenaHandle<T> {
+    identity: u64,
+    offset: usize,
+    // Keep T's thread-safety requirements and forbid shortening a stored
+    // reference's lifetime through one clone while retaining another clone.
+    value: PhantomData<T>,
+    invariant: PhantomData<fn(T) -> T>,
+}
+
+impl<T> Copy for ArenaHandle<T> {}
+
+impl<T> Clone for ArenaHandle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// An allocation frontier retained while short-lived work above it is
@@ -74,6 +116,7 @@ impl Arena {
             offset: Cell::new(0),
             tail_offset: Cell::new(capacity),
             high_water: Cell::new(0),
+            retention_identity: retention_identity(),
         })
     }
 
@@ -224,6 +267,44 @@ impl Arena {
     pub fn reset(&mut self) {
         self.offset.set(0);
         self.tail_offset.set(self.capacity);
+        self.retention_identity = retention_identity();
+    }
+
+    pub(crate) fn retain<T: Copy>(&self, value: T) -> Result<ArenaHandle<T>, ArenaFull> {
+        if self.retention_identity == 0 {
+            return Err(ArenaFull {
+                what: "arena retained identity space exhausted",
+                requested: 1,
+                remaining: 0,
+                capacity: 0,
+            });
+        }
+        let retained = self.alloc_persistent_slice_with(1, |_| value)?;
+        Ok(ArenaHandle {
+            identity: self.retention_identity,
+            offset: retained.as_ptr() as usize - self.base as usize,
+            value: PhantomData,
+            invariant: PhantomData,
+        })
+    }
+
+    pub(crate) fn retained<T: Copy>(&self, handle: ArenaHandle<T>) -> Option<T> {
+        if handle.identity != self.retention_identity {
+            return None;
+        }
+        // SAFETY: a matching non-reused identity proves retain initialized this
+        // typed slot in this arena's current tail. Only copies escape.
+        Some(unsafe { self.base.add(handle.offset).cast::<T>().read() })
+    }
+
+    pub(crate) fn replace_retained<T: Copy>(&self, handle: ArenaHandle<T>, value: T) -> bool {
+        if handle.identity != self.retention_identity {
+            return false;
+        }
+        // SAFETY: retain exposes only opaque handles, so this initialized slot
+        // cannot have outstanding references. Arena is not Sync.
+        unsafe { self.base.add(handle.offset).cast::<T>().write(value) };
+        true
     }
 
     /// Marks the current frontier for allocation-free per-row scratch reuse.
@@ -591,6 +672,30 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arena_retained_handles_survive_moves_and_rewinds_but_reject_reset_and_replacement() {
+        let mut budget = Budget::new(4096);
+        let original = Arena::new(&mut budget, "retained values", 2048).unwrap();
+        let other = Arena::new(&mut budget, "other retained values", 2048).unwrap();
+        let handle = original.retain(41u64).unwrap();
+        let mut moved = original;
+        crate::mem::guard::forbid_alloc(|| {
+            let mark = moved.mark();
+            moved.alloc_slice_with(32, |_| 0xa5u8).unwrap();
+            unsafe { moved.rewind_to(mark) };
+            assert_eq!(moved.retained(handle), Some(41));
+            assert!(moved.replace_retained(handle, 42));
+            assert_eq!(moved.retained(handle), Some(42));
+            assert_eq!(other.retained(handle), None);
+            assert!(!other.replace_retained(handle, 99));
+            moved.reset();
+            let replacement = moved.retain(100u64).unwrap();
+            assert_eq!(moved.retained(handle), None);
+            assert!(!moved.replace_retained(handle, 99));
+            assert_eq!(moved.retained(replacement), Some(100));
+        });
+    }
+
     struct Counted<'a>(&'a core::cell::Cell<usize>);
 
     impl Drop for Counted<'_> {

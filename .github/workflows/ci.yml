@@ -72,6 +72,8 @@ jobs:
             shared_heap_append
             owned_write_inputs_scoped_arena
             arena_owned_list_
+            arena_retained_handles_
+            sequence::tests::statement_replay_
             shared_heap_relocation_heap_
             row_lock_owners_heap_
             stable_row_slots_

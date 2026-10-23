@@ -12,9 +12,9 @@ and [storage format guide](docs/durable-format.md). Keep regression evidence in
 the implementing PR.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
-exact blocker. Publication, recovery, statement write selections, rewrite visibility, row and table versions, storage
-ownership, slot reuse,
-column bindings and capacity failures follow the same rule.
+exact blocker. Schema waits, type retirement, publication, recovery, retained row
+and table definitions, resumed command effects, storage ownership, slot reuse, column bindings and capacity
+failures follow the same rule.
 Remove repaired entries; preserve their evidence in the implementing
 change instead of keeping a resolved-work journal.
 

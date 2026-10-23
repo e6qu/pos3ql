@@ -19,6 +19,43 @@ pub(crate) struct TableDefinitionTarget {
 }
 
 impl TableDefinitionTarget {
+    fn matches_definition(
+        self,
+        storage: &Storage,
+        definition: &super::table_definitions::DefinitionState,
+    ) -> bool {
+        self.source.matches(
+            storage,
+            definition.identity.database,
+            definition.identity.created_at,
+            definition.identity.existence,
+        ) && definition.committed_revision == self.committed_revision
+            && storage
+                .pending_table_defs
+                .selected_revision(definition, self.transaction)
+                == self.pending_revision
+    }
+
+    pub(crate) fn validate(self, storage: &Storage) -> Result<(), SqlError> {
+        let table = storage.tables.get(self.table()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "selected table source is no longer present"
+            )
+        })?;
+        let definition = table.definition.read();
+        if self.matches_definition(storage, &definition)
+            && definition.identity.existence.visible_to(self.transaction)
+        {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table definition changed while acquiring its relation lock"
+            ))
+        }
+    }
+
     pub(crate) fn transaction(self) -> u32 {
         self.transaction
     }
@@ -67,17 +104,7 @@ pub(super) struct TableDefinitionEdit<'storage> {
 
 impl<'storage> TableDefinitionEdit<'storage> {
     fn matches_target(&self, target: TableDefinitionTarget) -> bool {
-        target.source.matches(
-            self.storage,
-            self.definition.identity.database,
-            self.definition.identity.created_at,
-            self.definition.identity.existence,
-        ) && self.definition.committed_revision == target.committed_revision
-            && self
-                .storage
-                .pending_table_defs
-                .selected_revision(&self.definition, target.transaction)
-                == target.pending_revision
+        target.matches_definition(self.storage, &self.definition)
     }
 
     fn after_wait(self, wait: super::row_ownership::LockWait<'storage>) -> Self {

@@ -8,6 +8,731 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
+    let mut config = test_config("sequence-session-values");
+    config.max_sequences = 2;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows = Vec::new();
+    for sql in
+        include_str!("../../tests/external/differential_exact/16_sequence_session_values.sql")
+            .split(';')
+            .filter(|sql| !sql.trim().is_empty())
+    {
+        rows.extend(data_rows(&session.success(&mut engine, sql, true)));
+    }
+    assert_eq!(
+        rows,
+        [
+            "40", "40", "90", "40|40", "90", "120", "120|120", "200", "200|120", "900", "900"
+        ]
+    );
+    let mut fresh = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    fresh.success(
+        &mut engine,
+        "SELECT setval('sequence_mode', 1000, false)",
+        true,
+    );
+    for sql in ["SELECT currval('sequence_mode')", "SELECT lastval()"] {
+        assert_eq!(
+            error_sqlstates(&fresh.execute(&mut engine, sql, true)),
+            ["55000"]
+        );
+    }
+    assert_eq!(
+        data_rows(&fresh.success(
+            &mut engine,
+            "SELECT setval('sequence_mode', 1100, true); SELECT currval('sequence_mode')",
+            true
+        )),
+        ["1100", "1100"]
+    );
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["55000"]
+    );
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)),
+        ["1101"]
+    );
+    fresh.success(
+        &mut engine,
+        "CREATE ROLE sequence_observer; SET ROLE sequence_observer",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["42501"]
+    );
+    fresh.success(&mut engine,
+        "RESET ROLE; GRANT SELECT ON SEQUENCE sequence_mode TO sequence_observer; SET ROLE sequence_observer", true);
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT lastval()", true)),
+        ["1101"]
+    );
+    fresh.success(&mut engine, "RESET ROLE; DROP SEQUENCE sequence_mode", true);
+    fresh.success(&mut engine, "CREATE SEQUENCE sequence_mode START 9", true);
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["55000"]
+    );
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)),
+        ["9"]
+    );
+}
+
+#[test]
+fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_recovery() {
+    for (mode, suffix) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc"),
+        (crate::config::TransactionMode::Locking, "locking"),
+    ] {
+        let name = format!("catalog-publication-unrelated-{suffix}");
+        let mut config = test_config(&name);
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut reader = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut copier = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut transition = copy_transition_scratch(&mut budget);
+        let arena = Arena::new(&mut budget, "unrelated catalog COPY", 1 << 18).unwrap();
+        let guc = GucState::new();
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "CREATE DOMAIN catalog_customer_id AS integer; CREATE DOMAIN catalog_unused_domain AS integer; CREATE TYPE catalog_pair AS (value integer); CREATE TYPE catalog_state AS ENUM ('ready'); CREATE TYPE catalog_unused_pair AS (value integer); CREATE SCHEMA catalog_empty; CREATE TABLE catalog_orders (id catalog_customer_id PRIMARY KEY); CREATE TABLE catalog_invoices (id integer); CREATE TABLE catalog_receipts (id integer); INSERT INTO catalog_orders VALUES (1); INSERT INTO catalog_invoices VALUES (22); INSERT INTO catalog_receipts VALUES (22)",
+        );
+        assert!(engine.checkpoint().unwrap());
+        let begin = match mode {
+            crate::config::TransactionMode::Mvcc => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            crate::config::TransactionMode::Locking => "BEGIN",
+        };
+        run_txn(&mut engine, &mut budget, &mut reader, begin);
+        assert_eq!(
+            data_rows(&run_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut reader,
+                "SELECT id FROM catalog_receipts"
+            )),
+            ["22"]
+        );
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut copier,
+            "BEGIN; COPY catalog_invoices FROM STDIN",
+        );
+        let setup = engine.take_pending_copy().expect("unrelated invoice COPY");
+        for (sql, tag) in [
+            (
+                "ALTER DOMAIN catalog_customer_id RENAME TO catalog_account_id",
+                "ALTER DOMAIN",
+            ),
+            (
+                "ALTER DOMAIN catalog_account_id SET DEFAULT 9",
+                "ALTER DOMAIN",
+            ),
+            (
+                "ALTER DOMAIN catalog_account_id ADD CONSTRAINT catalog_positive CHECK (VALUE > 0)",
+                "ALTER DOMAIN",
+            ),
+            (
+                "ALTER TYPE catalog_pair RENAME ATTRIBUTE value TO total",
+                "ALTER TYPE",
+            ),
+            (
+                "ALTER TYPE catalog_pair ADD ATTRIBUTE note text",
+                "ALTER TYPE",
+            ),
+            (
+                "ALTER TYPE catalog_state RENAME TO catalog_status",
+                "ALTER TYPE",
+            ),
+            ("DROP TYPE catalog_unused_pair", "DROP TYPE"),
+            ("DROP DOMAIN catalog_unused_domain", "DROP DOMAIN"),
+            ("DROP SCHEMA catalog_empty", "DROP SCHEMA"),
+        ] {
+            let response = run_txn_bytes(&mut engine, &mut budget, &mut writer, sql);
+            assert!(
+                error_sqlstates(&response).is_empty(),
+                "{sql}: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert!(
+                response
+                    .windows(tag.len())
+                    .any(|part| part == tag.as_bytes()),
+                "{sql} did not complete while unrelated sessions remained open: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert!(engine.fatal_commit_failure().is_none());
+        }
+        assert_eq!(
+            error_sqlstates(&run_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut writer,
+                "INSERT INTO catalog_orders VALUES (0)"
+            )),
+            ["23514"]
+        );
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut copier,
+            guc.seq_session(),
+            &arena,
+            b"23",
+            &mut transition,
+        )
+        .unwrap();
+        engine.copy_abort(&mut copier, &guc);
+        drop(setup);
+        run_txn(&mut engine, &mut budget, &mut copier, "ROLLBACK");
+        run_txn(&mut engine, &mut budget, &mut reader, "COMMIT");
+        drop(writer);
+        drop(reader);
+        drop(copier);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, 1 << 29);
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold,
+            "SELECT id FROM catalog_orders; SELECT id FROM catalog_invoices; SELECT 9::catalog_account_id; SELECT 'ready'::catalog_status; SELECT ROW(7, 'ok')::catalog_pair", false)),
+            ["1", "22", "9", "ready", "(7,ok)"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut cold,
+                "INSERT INTO catalog_orders VALUES (0)",
+                false
+            )),
+            ["23514"]
+        );
+    }
+}
+
+#[test]
+fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_writes() {
+    for (mode, suffix) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc"),
+        (crate::config::TransactionMode::Locking, "locking"),
+    ] {
+        let mut config = test_config(&format!("catalog-validation-locks-{suffix}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut editor =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(33);
+        editor.success(&mut engine,
+            "CREATE DOMAIN locked_domain AS integer; CREATE DOMAIN locked_child AS locked_domain; CREATE TABLE locked_domain_values (id locked_child); INSERT INTO locked_domain_values VALUES (20)", true);
+        assert_eq!(
+            data_rows(&reader.success(
+                &mut engine,
+                "BEGIN; SELECT id FROM locked_domain_values",
+                true
+            )),
+            ["20"]
+        );
+        let allowed = editor.execute(
+            &mut engine,
+            "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_positive CHECK (VALUE > 0)",
+            true,
+        );
+        assert!(error_sqlstates(&allowed).is_empty());
+        assert!(allowed.windows(12).any(|bytes| bytes == b"ALTER DOMAIN"));
+        reader.success(&mut engine, "COMMIT", true);
+        writer.success(
+            &mut engine,
+            "BEGIN; INSERT INTO locked_domain_values VALUES (2)",
+            true,
+        );
+        let sql = "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_large CHECK (VALUE > 10)";
+        let blocked = editor.execute(&mut engine, sql, true);
+        assert!(
+            blocked.is_empty(),
+            "a waiting domain edit must not emit a response"
+        );
+        assert!(editor.transaction.ddl().is_empty());
+        assert!(engine.fatal_commit_failure().is_none());
+        writer.success(&mut engine, "COMMIT", true);
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                sql,
+                0,
+                &editor.arena,
+                &mut editor.transaction,
+                &mut editor.pool,
+                &mut editor.cursors,
+                &mut editor.guc,
+                &mut Responder::new(&mut editor.send),
+                editor.connection_id,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert_eq!(error_sqlstates(editor.send.readable()), ["23514"]);
+        assert!(engine.fatal_commit_failure().is_none());
+        assert_eq!(data_rows(&editor.success(&mut engine,
+            "INSERT INTO locked_domain_values VALUES (3); SELECT id FROM locked_domain_values ORDER BY id", true)), ["2", "3", "20"]);
+        assert_eq!(
+            error_sqlstates(&editor.execute(
+                &mut engine,
+                "INSERT INTO locked_domain_values VALUES (0)",
+                true
+            )),
+            ["23514"]
+        );
+    }
+}
+
+#[test]
+fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
+    for (mode, suffix, extended) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc-simple", false),
+        (
+            crate::config::TransactionMode::Locking,
+            "locking-simple",
+            false,
+        ),
+        (crate::config::TransactionMode::Mvcc, "mvcc-extended", true),
+        (
+            crate::config::TransactionMode::Locking,
+            "locking-extended",
+            true,
+        ),
+    ] {
+        let mut config = test_config(&format!("catalog-cascade-locks-{suffix}"));
+        config.transaction_mode = mode;
+        config.max_sequences = 7;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut editor =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+        let mut other =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(33);
+        editor.success(&mut engine,
+            "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
+        editor.success(&mut engine,
+            r#"CREATE SEQUENCE cascade_disposable_source;
+            CREATE SEQUENCE cascade_wait_calls;
+            CREATE SEQUENCE cascade_restart_source;
+            CREATE SEQUENCE cascade_cached_source CACHE 10;
+            CREATE SEQUENCE cascade_prior_source START 51;
+            CREATE TABLE cascade_wait_audit(id serial, prior_seen bigint, seen bigint, private_seen bigint, restarted_seen bigint, cached_seen bigint);
+            CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS $hook$
+            DECLARE prior_value bigint;
+            BEGIN
+              PERFORM currval('cascade_prior_source');
+              prior_value := lastval();
+              PERFORM setval('cascade_cached_source', 100, true);
+              EXECUTE 'CREATE SEQUENCE cascade_attempt_sequence START 17';
+              EXECUTE 'ALTER SEQUENCE cascade_restart_source RESTART WITH 23';
+              INSERT INTO cascade_wait_audit(prior_seen, seen, private_seen, restarted_seen, cached_seen)
+                VALUES(prior_value, nextval('cascade_wait_calls'), nextval('cascade_attempt_sequence'), nextval('cascade_restart_source'), nextval('cascade_cached_source'));
+              RETURN;
+            END $hook$;
+            CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait();
+            SELECT nextval('cascade_prior_source')"#, true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, "BEGIN; SELECT id FROM cascade_report", true)),
+            ["1"]
+        );
+        let sql = "DROP SCHEMA cascade_orders CASCADE";
+        let execute = |engine: &mut Engine, session: &mut ConfiguredTransactionSession| {
+            if extended {
+                match engine
+                    .execute_extended(
+                        sql,
+                        &session.arena,
+                        NO_PARAMS,
+                        &[],
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut Responder::new(&mut session.send),
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+                {
+                    ExtendedExecutionStatus::Complete(true) => Ok(()),
+                    ExtendedExecutionStatus::Complete(false) => panic!(
+                        "extended schema drop failed: {}",
+                        String::from_utf8_lossy(session.send.readable())
+                    ),
+                    ExtendedExecutionStatus::Blocked { wait } => Err(wait),
+                }
+            } else {
+                match engine
+                    .execute_simple_from(
+                        sql,
+                        0,
+                        &session.arena,
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut Responder::new(&mut session.send),
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+                {
+                    ExecutionStatus::Complete => Ok(()),
+                    ExecutionStatus::Blocked {
+                        completed_statements: 0,
+                        wait,
+                        ..
+                    } => Err(wait),
+                    status => panic!("unexpected schema drop continuation: {status:?}"),
+                }
+            }
+        };
+        editor.send.clear();
+        editor.arena.reset();
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Err(StatementWait::Lock)
+        );
+        assert!(editor.send.readable().is_empty());
+        assert!(editor.transaction.ddl().is_empty());
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "SELECT last_value FROM cascade_wait_calls",
+                true
+            )),
+            ["1"]
+        );
+        assert!(
+            editor.transaction.touched().is_empty(),
+            "{suffix}: waiting attempt retained audit writes"
+        );
+        if mode == crate::config::TransactionMode::Mvcc {
+            let audit = other.success(&mut engine, "SELECT count(*) FROM cascade_wait_audit", true);
+            assert_eq!(
+                data_rows(&audit),
+                ["0"],
+                "{suffix}: {}",
+                String::from_utf8_lossy(&audit)
+            );
+        }
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Err(StatementWait::Lock)
+        );
+        assert!(editor.send.readable().is_empty());
+        assert!(
+            engine
+                .storage
+                .find_table("cascade_orders", "orders")
+                .is_some()
+        );
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "INSERT INTO cascade_other VALUES (7); SELECT id FROM cascade_other",
+                true
+            )),
+            ["7"]
+        );
+        assert_eq!(
+            data_rows(&other.success(&mut engine, "SELECT nextval('cascade_wait_calls')", true)),
+            ["2"]
+        );
+        assert_eq!(
+            data_rows(&other.success(&mut engine, "SELECT nextval('cascade_cached_source')", true)),
+            ["111"]
+        );
+        other.success(
+            &mut engine,
+            "CREATE SEQUENCE cascade_reused_slot; DROP SEQUENCE cascade_disposable_source",
+            true,
+        );
+        reader.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Ok(())
+        );
+        if extended {
+            crate::mem::guard::forbid_alloc(|| {
+                engine.commit_txn_with_triggers(
+                    &mut editor.transaction,
+                    &editor.guc,
+                    &editor.arena,
+                    &mut Responder::new(&mut editor.send),
+                )
+            })
+            .unwrap();
+        }
+        assert!(error_sqlstates(editor.send.readable()).is_empty());
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "SELECT last_value FROM cascade_wait_calls",
+                true
+            )),
+            ["2"],
+            "resuming the same statement must not repeat its start trigger"
+        );
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "SELECT id, prior_seen, seen, private_seen, restarted_seen, cached_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source'); SELECT nextval('cascade_cached_source'); SELECT nextval('cascade_reused_slot')", true)), ["1|51|1|17|23|101", "1", "18", "24", "112", "1"]);
+        assert_eq!(data_rows(&editor.success(&mut engine,
+            "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq'); SELECT nextval('cascade_cached_source')", true)), ["1|1", "102"]);
+        assert!(
+            engine
+                .storage
+                .find_table("cascade_orders", "orders")
+                .is_none()
+        );
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "INSERT INTO cascade_invoices VALUES (999); SELECT id FROM cascade_invoices ORDER BY id", true)), ["1", "999"]);
+        assert_eq!(
+            error_sqlstates(&other.execute(&mut engine, "SELECT * FROM cascade_report", true)),
+            ["42P01"]
+        );
+        assert!(engine.fatal_commit_failure().is_none());
+    }
+}
+
+#[test]
+fn catalog_publication_domain_validation_rejects_stored_container_dependencies() {
+    for setup in [
+        "CREATE TABLE nested_values (value validation_root[])",
+        "CREATE DOMAIN validation_child AS validation_root; CREATE TABLE nested_values (value validation_child[])",
+        "CREATE TYPE validation_pair AS (value validation_root); CREATE TABLE nested_values (value validation_pair)",
+        "CREATE TYPE validation_pair AS (value validation_root); CREATE TYPE validation_outer AS (value validation_pair[]); CREATE DOMAIN validation_holder AS validation_outer; CREATE TABLE nested_values (value validation_holder)",
+        "CREATE DOMAIN validation_vector AS validation_root[]; CREATE TABLE nested_values (value validation_vector)",
+        "CREATE TABLE nested_values (id integer, value validation_root[]) PARTITION BY RANGE (id)",
+        "CREATE MATERIALIZED VIEW nested_values AS SELECT ARRAY[1::validation_root] AS value",
+    ] {
+        let (mut engine, mut budget) = test_engine();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE DOMAIN validation_root AS integer",
+        );
+        assert!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty(),
+            "{setup}"
+        );
+        for sql in [
+            "ALTER DOMAIN validation_root ADD CONSTRAINT validation_positive CHECK (VALUE > 0)",
+            "ALTER DOMAIN validation_root SET NOT NULL",
+        ] {
+            assert_eq!(
+                error_sqlstates(&run_with(&mut engine, &mut budget, sql)),
+                ["0A000"],
+                "{setup}: {sql}"
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT 0::validation_root; SELECT NULL::validation_root"
+            )),
+            ["0", "NULL"]
+        );
+        assert!(engine.fatal_commit_failure().is_none());
+    }
+}
+
+#[test]
+fn catalog_publication_domain_validation_uses_complete_array_domain_values() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = "CREATE DOMAIN validation_element AS integer; CREATE DOMAIN validation_vector AS validation_element[]; CREATE TABLE validation_vectors (value validation_vector); INSERT INTO validation_vectors VALUES (ARRAY[1, 2]::validation_vector)";
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_vector ADD CONSTRAINT validation_length CHECK (cardinality(VALUE) = 2)")).is_empty());
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO validation_vectors VALUES (ARRAY[1]::validation_vector)"
+        )),
+        ["23514"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text FROM validation_vectors"
+        )),
+        ["{1,2}"]
+    );
+}
+
+#[test]
+fn catalog_publication_domain_validation_rechecks_valid_constraints_and_keeps_noops() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION validation_rule(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0'; CREATE DOMAIN validation_value AS integer CONSTRAINT validation_existing CHECK (validation_rule(VALUE)); CREATE TABLE validation_items (value validation_value); INSERT INTO validation_items VALUES (1); CREATE DOMAIN validation_required AS integer NOT NULL; CREATE TABLE validation_required_arrays (value validation_required[])",
+    );
+    assert!(error_sqlstates(&created).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_value VALIDATE CONSTRAINT validation_existing; ALTER DOMAIN validation_required SET NOT NULL")).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "CREATE OR REPLACE FUNCTION validation_rule(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 10'")).is_empty());
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER DOMAIN validation_value VALIDATE CONSTRAINT validation_existing"
+        )),
+        ["23514"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM validation_items"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
+fn catalog_publication_domain_validation_ignores_unstored_and_foreign_values() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = "CREATE DOMAIN validation_unstored AS integer; CREATE TYPE validation_unstored_pair AS (value validation_unstored); CREATE VIEW validation_unstored_view AS SELECT ARRAY[1::validation_unstored] AS value; CREATE FOREIGN DATA WRAPPER validation_wrapper; CREATE SERVER validation_server FOREIGN DATA WRAPPER validation_wrapper; CREATE FOREIGN TABLE validation_remote (value validation_unstored[]) SERVER validation_server";
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty());
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN validation_unstored ADD CONSTRAINT validation_unstored_positive CHECK (VALUE > 0); ALTER DOMAIN validation_unstored SET NOT NULL",
+    );
+    assert!(
+        error_sqlstates(&altered).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 0::validation_unstored"
+        )),
+        ["23514"]
+    );
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT NULL::validation_unstored"
+        )),
+        ["23502"]
+    );
+}
+
+#[test]
+fn catalog_publication_domain_graph_exhaustion_restores_the_prior_definition() {
+    let mut config = test_config("catalog-domain-graph-capacity");
+    config.max_domains = 512;
+    config.sql_arena_bytes = 16 << 10;
+    config.work_arena_bytes = 16 << 10;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::with_arena_bytes(
+        &config,
+        &mut budget,
+        config.sql_arena_bytes,
+    );
+    assert_eq!(session.arena.capacity(), 16 << 10);
+    let created = session.execute(&mut engine,
+        "CREATE DOMAIN capacity_domain AS integer; CREATE TABLE capacity_values (value capacity_domain)", true);
+    assert!(error_sqlstates(&created).is_empty());
+    assert!(created.windows(12).any(|part| part == b"CREATE TABLE"));
+    for slot in 1..config.max_domains {
+        let sql = format!("CREATE DOMAIN capacity_unused_{slot} AS integer");
+        let output = session.execute(&mut engine, &sql, true);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(engine.storage.domain_count(), config.max_domains);
+    let exhausted = session.execute(
+        &mut engine,
+        "ALTER DOMAIN capacity_domain ADD CONSTRAINT capacity_positive CHECK (VALUE > 0)",
+        true,
+    );
+    assert_eq!(error_sqlstates(&exhausted), ["54000"]);
+    assert!(
+        String::from_utf8_lossy(&exhausted)
+            .contains("domain dependency graph exceeds the statement arena")
+    );
+    let domain = engine
+        .storage
+        .domain_slot("public", "capacity_domain", 0)
+        .unwrap();
+    assert!(engine.storage.domain_for(domain, 0).checks().is_empty());
+    assert!(session.transaction.ddl().is_empty());
+    let resumed = session.execute(
+        &mut engine,
+        "ALTER DOMAIN capacity_domain SET DEFAULT 9",
+        true,
+    );
+    assert!(error_sqlstates(&resumed).is_empty());
+    assert!(resumed.windows(12).any(|part| part == b"ALTER DOMAIN"));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT 7", true)),
+        ["7"]
+    );
+    assert!(engine.fatal_commit_failure().is_none());
+}
+
+#[test]
+fn catalog_publication_request_fixtures_release_aborted_transaction_owners() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE abandoned_request (id integer)",
+    );
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; LOCK TABLE abandoned_request IN SHARE MODE; SELECT 1 / 0; ROLLBACK",
+    );
+    assert_eq!(error_sqlstates(&failed), ["22012"]);
+    assert!(!engine.storage.has_access_share_locks());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO abandoned_request VALUES (7); SELECT id FROM abandoned_request"
+        )),
+        ["7"]
+    );
+    assert!(engine.fatal_commit_failure().is_none());
+}
+
+#[test]
 fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_copy() {
     for checkpoint in [false, true] {
         let name = format!("statement-rewrite-readers-{checkpoint}");
@@ -14114,6 +14839,30 @@ fn test_data_directory_lives_until_the_last_engine_or_configuration_owner() {
     assert!(!path.exists(), "the final owner removes the test directory");
 }
 
+fn finish_test_request(
+    engine: &mut Engine,
+    transaction: &mut TxnState,
+    guc: &GucState,
+    status: ExecutionStatus,
+) {
+    assert_eq!(
+        status,
+        ExecutionStatus::Complete,
+        "a suspended fixture needs caller-owned transaction state"
+    );
+    assert!(
+        engine.pending_copy.is_none(),
+        "streamed COPY needs caller-owned transaction state"
+    );
+    if transaction.is_active() {
+        assert!(
+            transaction.staged_commit().is_none(),
+            "a durable commit needs caller-owned completion state"
+        );
+        crate::mem::guard::forbid_alloc(|| engine.rollback_txn(transaction, guc));
+    }
+}
+
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
     let mut guc = GucState::new();
     run_with_guc(engine, budget, sql_text, 32 << 20, &mut guc)
@@ -14134,7 +14883,7 @@ fn run_with_ddl_capacity(
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
-    engine
+    let status = engine
         .execute_simple(
             sql_text,
             &arena,
@@ -14146,6 +14895,7 @@ fn run_with_ddl_capacity(
             1,
         )
         .unwrap();
+    finish_test_request(engine, &mut txn, &guc, status);
     buffer.readable().to_vec()
 }
 
@@ -14254,7 +15004,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
     let mut cursors = test_cursors(&mut request_budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
-    crate::mem::guard::forbid_alloc(|| {
+    let status = crate::mem::guard::forbid_alloc(|| {
         engine.execute_simple(
             sql_text,
             &arena,
@@ -14267,6 +15017,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
         )
     })
     .unwrap();
+    finish_test_request(engine, &mut txn, &guc, status);
     buffer.readable().to_vec()
 }
 
@@ -15428,7 +16179,7 @@ fn run_with_guc(
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
     let mut responder = Responder::new(&mut buffer);
-    engine
+    let status = engine
         .execute_simple(
             sql_text,
             &arena,
@@ -15440,6 +16191,7 @@ fn run_with_guc(
             1,
         )
         .unwrap();
+    finish_test_request(engine, &mut txn, guc, status);
     buffer.readable().to_vec()
 }
 
@@ -52486,7 +53238,7 @@ fn domains_enforce_and_report() {
     let altered = run_with(
         &mut e,
         &mut b,
-        "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8)",
+        "ALTER DOMAIN smallpos ADD CHECK (VALUE < 8) NOT VALID",
     );
     assert!(
         String::from_utf8_lossy(&altered).contains("ALTER DOMAIN"),
@@ -52959,40 +53711,48 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
 
 #[test]
 fn composite_attribute_rename_rewrites_domain_chain_transactionally() {
-    let (mut engine, mut budget) = test_engine();
-    run_with(
+    let config = test_config("domain-chain-rename-rollback");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
         &mut engine,
-        &mut budget,
         "CREATE TYPE renamed_domain_point AS (x integer, y integer); \
          CREATE DOMAIN renamed_domain_root AS renamed_domain_point CHECK ((VALUE).x > 0); \
          CREATE DOMAIN renamed_domain_child AS renamed_domain_root CHECK ((VALUE).y < 10); \
          CREATE TABLE renamed_domain_values (value renamed_domain_child); \
          INSERT INTO renamed_domain_values VALUES (ROW(3,4)::renamed_domain_point)",
+        true,
     );
-
-    let failed = run_with(
+    let failed = session.execute(
         &mut engine,
-        &mut budget,
-        "BEGIN; \
-         ALTER TYPE renamed_domain_point RENAME ATTRIBUTE x TO east; \
-         INSERT INTO renamed_domain_values VALUES (ROW(1,14)::renamed_domain_point); \
-         ROLLBACK",
+        "BEGIN; ALTER TYPE renamed_domain_point RENAME ATTRIBUTE x TO east; \
+         INSERT INTO renamed_domain_values VALUES (ROW(1,14)::renamed_domain_point)",
+        true,
     );
-    assert!(String::from_utf8_lossy(&failed).contains("23514"));
+    assert_eq!(error_sqlstates(&failed), ["23514"]);
+    assert!(session.transaction.failed);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert!(!engine.storage.has_access_share_locks());
     assert_eq!(
-        data_rows(&run_with(
+        data_rows(&session.success(
             &mut engine,
-            &mut budget,
             "SELECT (value).x FROM renamed_domain_values",
+            true
         )),
         ["3"]
     );
-    let original_constraint = run_with(
+    let original_constraint = session.execute(
         &mut engine,
-        &mut budget,
         "INSERT INTO renamed_domain_values VALUES (ROW(-1,4)::renamed_domain_point)",
+        true,
     );
-    assert!(String::from_utf8_lossy(&original_constraint).contains("23514"));
+    assert_eq!(
+        error_sqlstates(&original_constraint),
+        ["23514"],
+        "{}",
+        String::from_utf8_lossy(&original_constraint)
+    );
 }
 
 #[test]
@@ -53053,7 +53813,7 @@ fn composite_attribute_rename_rewrites_nested_and_set_operation_views() {
 }
 
 #[test]
-fn alter_domain_revalidates_scalar_and_array_elements() {
+fn alter_domain_rejects_stored_domain_arrays_without_changing_rules() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
         &mut engine,
@@ -53078,22 +53838,14 @@ fn alter_domain_revalidates_scalar_and_array_elements() {
         &mut budget,
         "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).y > 0)",
     );
-    assert!(
-        !String::from_utf8_lossy(&tightened).contains("ERROR"),
-        "{}",
-        String::from_utf8_lossy(&tightened)
-    );
+    assert_eq!(error_sqlstates(&tightened), ["0A000"]);
 
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).x < 5)",
     );
-    assert!(
-        String::from_utf8_lossy(&rejected).contains("23514"),
-        "{}",
-        String::from_utf8_lossy(&rejected)
-    );
+    assert_eq!(error_sqlstates(&rejected), ["0A000"]);
     let post_rollback = run_with(
         &mut engine,
         &mut budget,
@@ -53285,12 +54037,12 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
              CREATE DOMAIN point_value AS domain_point CHECK ((VALUE).x > 0); \
+             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE DOMAIN point_child AS point_value CHECK ((VALUE).y < 20); \
              CREATE TYPE domain_point_wrapper AS (value point_child); \
              CREATE TABLE domain_point_values (value point_value, values point_value[], direct_values domain_point[], child point_child, child_values point_child[], wrapped domain_point_wrapper); \
              INSERT INTO domain_point_values VALUES \
                (ROW(6,7)::point_value, ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point], ROW(11,12)::point_child, ARRAY[ROW(13,14)::domain_point]::point_child[], ROW(ROW(15,16)::point_child)::domain_point_wrapper); \
-             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE TABLE array_subquery_values AS \
                SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
              ALTER TYPE domain_point ADD ATTRIBUTE z integer; \
@@ -53375,7 +54127,7 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         "ALTER DOMAIN point_value ADD CHECK ((VALUE).east < 7)",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("23514"),
+        String::from_utf8_lossy(&rejected).contains("0A000"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
@@ -91842,17 +92594,37 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
         assert!(!engine.checkpoint_beat().failed());
     }
     assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
-    let changed = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO requested_checkpoint VALUES(2); SELECT count(*) FROM requested_checkpoint",
-    );
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        "INSERT INTO requested_checkpoint VALUES(2); SELECT count(*) FROM requested_checkpoint";
+    let status = engine
+        .execute_simple(
+            sql,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked {
+            completed_statements: 2,
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
+    assert!(writer.transaction.staged_commit().is_some());
+    let changed = writer.send.readable();
     assert!(
-        error_sqlstates(&changed).is_empty(),
+        error_sqlstates(changed).is_empty(),
         "{}",
-        String::from_utf8_lossy(&changed)
+        String::from_utf8_lossy(changed)
     );
-    assert_eq!(data_rows(&changed), ["2"]);
+    assert_eq!(data_rows(changed), ["2"]);
     assert_eq!(
         engine
             .execute_checkpoint_statement(&mut later, &mut Responder::new(&mut send),)
@@ -91919,6 +92691,26 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             .count(),
         3
     );
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            2,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(writer.transaction.staged_commit().is_none());
+    assert!(!writer.transaction.is_active());
+    assert!(error_sqlstates(writer.send.readable()).is_empty());
+    assert_eq!(data_rows(writer.send.readable()), ["2"]);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut recovered_budget = test_engine_budget(&config, 1 << 29);
@@ -91993,14 +92785,30 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         .unwrap()
         .finish_maintenance(&engine.storage)
         .unwrap();
-    assert!(
-        error_sqlstates(&run_with(
-            &mut engine,
-            &mut budget,
-            "INSERT INTO failed_checkpoint VALUES(2)"
-        ))
-        .is_empty()
-    );
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = "INSERT INTO failed_checkpoint VALUES(2)";
+    let status = engine
+        .execute_simple(
+            sql,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked {
+            completed_statements: 1,
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
+    assert!(writer.transaction.staged_commit().is_some());
+    assert!(error_sqlstates(writer.send.readable()).is_empty());
     for txn in [&mut first, &mut second] {
         assert_eq!(
             engine
@@ -92085,6 +92893,25 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         "one cancelled request cannot discard another request's work"
     );
     assert_eq!(message_types(send.readable()), [b'C']);
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            1,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(writer.transaction.staged_commit().is_none());
+    assert!(!writer.transaction.is_active());
+    assert!(error_sqlstates(writer.send.readable()).is_empty());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

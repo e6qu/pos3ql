@@ -591,10 +591,35 @@ or changed while it was acquiring locks. Source installation and dependent
 updates share those locks; exhausted publication counters leave everything intact.
 Saved journal references retain their source lifetime even when a rename commits
 before an older dependent definition. Checkpoints preserve the same identities
-and resolve type definitions before their dependents. Some schema changes still
-wait for retained snapshots. Removing the remaining restrictions requires shared
-protection for engine-wide commits, type retirement and remaining table rewrites;
-SQL CPU workers remain planned work.
+and resolve type definitions before their dependents. Domain, type and schema
+changes wait on their affected objects rather than every retained snapshot.
+For example, importing invoices can continue while an unrelated customer domain
+is renamed. Schema cascades lock affected tables and views before changing them.
+Transaction-wide publication and SQL CPU workers remain [planned work](../PLAN.md).
+
+Adding or validating a domain rule takes PostgreSQL-compatible SHARE locks on
+tables whose values must be checked. Readers can continue; unfinished writers
+must finish first, and validation then selects current committed rows. Unchanged
+NOT NULL settings do not scan values. VALIDATE CONSTRAINT checks existing values
+again even when the rule was already marked valid.
+
+PostgreSQL rejects validation when a domain is stored inside arrays or composite
+values. For example, a column declared as `customer_id[]` makes immediately
+validating a new rule on `customer_id` fail with `0A000`; the old rules remain
+intact. `ADD CONSTRAINT ... NOT VALID` can install a rule for future values
+without scanning old ones. A domain
+whose value is an entire array validates that whole array. Unstored type
+definitions, views and foreign-table columns do not create local values to scan.
+The dependency walk uses the connection's SQL arena, reserved by `sql_arena_bytes`
+at startup, and returns `54000`, "domain dependency graph exceeds the statement
+arena", if that space fills. Temporary dependency links and the work queue are
+released before scanning rows. Table sources reuse the startup-reserved definition
+images; their pool reports `54000` if exhausted.
+If the spilled-row scan runs out of scratch space, its error reports the supplied
+arena's name and capacity; this can be the connection's SQL arena or a query
+workspace, so the scan does not prescribe a different reservation's setting.
+These rules follow
+[PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade
@@ -629,6 +654,22 @@ branch or WHERE condition does not advance it. Filtering a SELECT without FROM
 happens once before evaluating its outputs or expanding a set-returning function.
 Waiting for a nested function does not advance
 it again. SQL function result queries use the connection's sequence state.
+Commands that wait for a lock also retain their completed sequence calls. For
+example, if a schema-drop event trigger inserts an audit row with a serial ID,
+waiting for a report to finish does not consume another ID on each attempt.
+Calls to `nextval`, `currval`, `lastval` and `setval` retain their results in the
+existing statement arena; automatic serial values use the same path. Exhaustion
+returns `54000`, "volatile sequence replay exceeds statement memory", before
+making an unrecorded sequence change. Saved handles reject a reset or replacement
+arena, and a changed source or call order returns `40001`. A private sequence
+recreated by rollback must reproduce its saved result before execution continues.
+Retries preserve previously reserved sequence values and the connection's prior
+last-sequence source.
+`setval('orders_id_seq', 90, false)` makes the next generated ID 90 while leaving
+this connection's previous `currval` unchanged. `lastval` follows the last sequence
+used by `nextval`, checks access to that source and rejects a dropped or replaced
+source with `55000`. These rules follow
+[PostgreSQL's sequence functions](https://www.postgresql.org/docs/18/functions-sequence.html).
 The pg_typeof function is stable rather than immutable: an immutable cast of
 its result stays out of planning. A genuinely constant immutable cast can
 still raise a planning error even when WHERE FALSE removes all rows. These

@@ -1208,27 +1208,6 @@ pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u6
     }
 }
 
-fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
-    if matches!(
-        statement,
-        Stmt::AlterType {
-            action: ast::AlterTypeAction::AddValue { .. }
-                | ast::AlterTypeAction::RenameValue { .. },
-            ..
-        }
-    ) {
-        return false;
-    }
-    matches!(
-        statement,
-        Stmt::AlterDomain { .. }
-            | Stmt::DropDomain { .. }
-            | Stmt::AlterType { .. }
-            | Stmt::DropType { .. }
-            | Stmt::DropSchema { .. }
-    )
-}
-
 fn statement_tag(statement: &Stmt<'_>) -> &'static str {
     match statement {
         Stmt::Explain { statement, .. } => statement_tag(statement),
@@ -7729,6 +7708,7 @@ impl Engine {
     }
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
+        sequence::finish_statement(guc.seq_session());
         if txn.staged_commit().is_some() {
             crate::logging::error_args(
                 "rollback_after_commit_boundary",
@@ -10381,6 +10361,11 @@ impl Engine {
                 }
             }
             executed_any = true;
+            let sequence_scope = sequence::enter_statement(
+                arena,
+                guc.seq_session(),
+                txn.suspended_statement_context().is_some(),
+            );
             let output_mark = responder.buffer.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
@@ -10416,7 +10401,8 @@ impl Engine {
                         exec::TriggerQueueBoundary::Statement,
                     )
                 })
-                .and_then(|()| query::check_timeout());
+                .and_then(|()| query::check_timeout())
+                .and_then(|()| sequence_scope.finish(guc.seq_session()));
             if let Err(mut e) = outcome {
                 if self.fatal_commit_failure.is_some() {
                     responder.error(
@@ -10429,6 +10415,7 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.staged_commit().is_some() {
+                        sequence_scope.discard(guc.seq_session());
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
@@ -10436,6 +10423,14 @@ impl Engine {
                         });
                     }
                     if txn.owns_statement_mark(statement_mark) {
+                        if txn.suspended_statement_context().is_none() {
+                            txn.suspend_statement(
+                                None,
+                                datetime::statement_clock(),
+                                query::statement_deadline(),
+                                routine_transaction_context,
+                            );
+                        }
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
                         if !lock_timeout_expired {
@@ -10465,6 +10460,7 @@ impl Engine {
                 if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.storage.record_deadlock();
                 }
+                sequence_scope.discard(guc.seq_session());
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
                 } else if txn.is_explicit() {
@@ -10661,6 +10657,11 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         }
+        let sequence_scope = sequence::enter_statement(
+            arena,
+            guc.seq_session(),
+            txn.suspended_statement_context().is_some(),
+        );
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;
@@ -10704,7 +10705,8 @@ impl Engine {
                 exec::TriggerQueueBoundary::Statement,
             )
         })
-        .and_then(|()| query::check_timeout());
+        .and_then(|()| query::check_timeout())
+        .and_then(|()| sequence_scope.finish(guc.seq_session()));
         match outcome {
             Ok(()) => {
                 if txn.take_concurrent_partition_detach() {
@@ -10741,11 +10743,20 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.staged_commit().is_some() {
+                        sequence_scope.discard(guc.seq_session());
                         return Ok(ExtendedExecutionStatus::Blocked {
                             wait: crate::sql::StatementWait::ObjectIo,
                         });
                     }
                     if txn.owns_statement_mark(statement_mark) {
+                        if txn.suspended_statement_context().is_none() {
+                            txn.suspend_statement(
+                                None,
+                                datetime::statement_clock(),
+                                query::statement_deadline(),
+                                routine_transaction_context,
+                            );
+                        }
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
                         if !lock_timeout_expired {
@@ -10773,6 +10784,7 @@ impl Engine {
                 if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.storage.record_deadlock();
                 }
+                sequence_scope.discard(guc.seq_session());
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
                 } else if txn.is_explicit() {
@@ -14642,13 +14654,18 @@ impl Engine {
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let sequence_scope = sequence::enter_statement(
+            arena,
+            guc.seq_session(),
+            txn.suspended_statement_context().is_some(),
+        );
         let routine_transaction_context = txn
             .suspended_statement_context()
             .unwrap_or(routine_transaction_context);
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
-        let result = self.execute_stmt_with_workspace(
+        let mut result = self.execute_stmt_with_workspace(
             statement,
             arena,
             params,
@@ -14667,6 +14684,9 @@ impl Engine {
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
+            if txn.staged_commit().is_some() {
+                sequence_scope.discard(guc.seq_session());
+            }
             txn.suspend_statement(
                 None,
                 datetime::statement_clock(),
@@ -14675,6 +14695,13 @@ impl Engine {
             );
         } else {
             txn.release_suspended_statement();
+            if matches!(&result, Ok(Ok(()))) {
+                if let Err(error) = sequence_scope.finish(guc.seq_session()) {
+                    result = Ok(Err(error));
+                }
+            } else {
+                sequence_scope.discard(guc.seq_session());
+            }
         }
         result
     }
@@ -14761,17 +14788,6 @@ impl Engine {
                 sqlstate::READ_ONLY_SQL_TRANSACTION,
                 "cannot execute {} in a read-only transaction block",
                 statement_tag(statement)
-            )));
-        }
-        if statement_changes_schema(statement)
-            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
-        {
-            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
-                return Ok(Err(error));
-            }
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a schema lock"
             )));
         }
         let _snapshot_lease = match self.begin_command_snapshot(
@@ -15011,21 +15027,6 @@ impl Engine {
                 sqlstate::READ_ONLY_SQL_TRANSACTION,
                 "cannot execute {} in a read-only transaction",
                 statement_tag(statement)
-            )));
-        }
-        // Historical row images currently share the committed table
-        // definition. Prevent a concurrent definition rewrite from making an
-        // old row undecodable by joining the same wait graph as relation and
-        // row locks.
-        if statement_changes_schema(statement)
-            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
-        {
-            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
-                return Ok(Err(error));
-            }
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a schema lock"
             )));
         }
         // A data-modifying WITH statement lowers the command snapshot itself;

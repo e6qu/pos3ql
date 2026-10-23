@@ -9,12 +9,213 @@
 //!
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::{Arena, ArenaHandle, ArenaList};
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
 use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
 use core::cell::{Cell, RefCell};
+use core::marker::PhantomData;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SequenceOperation {
+    Next,
+    Current,
+    Last,
+    Set { value: i64, is_called: bool },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SequenceCall {
+    operation: SequenceOperation,
+    source: Option<crate::storage::SequenceReplaySource>,
+}
+
+#[derive(Clone, Copy)]
+struct SequenceEffect {
+    call: SequenceCall,
+    value: i64,
+    next: Option<ArenaHandle<SequenceEffect>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StatementSequenceReplay {
+    head: Option<ArenaHandle<SequenceEffect>>,
+    tail: Option<ArenaHandle<SequenceEffect>>,
+    next: Option<ArenaHandle<SequenceEffect>>,
+    initial_lastval: Option<(usize, u64)>,
+}
+
+impl StatementSequenceReplay {
+    pub(super) const EMPTY: Self = Self {
+        head: None,
+        tail: None,
+        next: None,
+        initial_lastval: None,
+    };
+}
+
+thread_local! {
+    static STATEMENT_ARENA: Cell<*const Arena> = const { Cell::new(core::ptr::null()) };
+}
+
+pub(super) struct StatementSequenceScope<'arena> {
+    previous: *const Arena,
+    arena: PhantomData<&'arena Arena>,
+}
+
+impl StatementSequenceScope<'_> {
+    pub(super) fn finish(&self, session: &SeqSession) -> Result<(), SqlError> {
+        if !self.previous.is_null() {
+            return Ok(());
+        }
+        let complete = session.statement_replay.get().next.is_none();
+        finish_statement(session);
+        if complete {
+            Ok(())
+        } else {
+            Err(replay_changed())
+        }
+    }
+
+    pub(super) fn discard(&self, session: &SeqSession) {
+        if self.previous.is_null() {
+            finish_statement(session);
+        }
+    }
+}
+
+impl Drop for StatementSequenceScope<'_> {
+    fn drop(&mut self) {
+        STATEMENT_ARENA.with(|active| active.set(self.previous));
+    }
+}
+
+pub(super) fn enter_statement<'arena>(
+    arena: &'arena Arena,
+    session: &SeqSession,
+    resumed: bool,
+) -> StatementSequenceScope<'arena> {
+    let previous = STATEMENT_ARENA.with(|active| active.get());
+    if !previous.is_null() {
+        return StatementSequenceScope {
+            previous,
+            arena: PhantomData,
+        };
+    }
+    let retained = session.statement_replay.get();
+    let mut replay = if resumed && retained.head.is_some() {
+        session.restore_last_sequence(retained.initial_lastval);
+        retained
+    } else {
+        StatementSequenceReplay {
+            initial_lastval: session.last_sequence(),
+            ..StatementSequenceReplay::EMPTY
+        }
+    };
+    replay.next = replay.head;
+    session.statement_replay.set(replay);
+    StatementSequenceScope {
+        previous: STATEMENT_ARENA.with(|active| active.replace(arena)),
+        arena: PhantomData,
+    }
+}
+
+pub(super) fn finish_statement(session: &SeqSession) {
+    session.statement_replay.set(StatementSequenceReplay::EMPTY);
+}
+
+fn replay_changed() -> SqlError {
+    sql_err!(
+        sqlstate::SERIALIZATION_FAILURE,
+        "sequence source or call order changed while resuming the statement"
+    )
+}
+
+fn statement_call(
+    session: &SeqSession,
+    call: SequenceCall,
+    action: impl FnOnce() -> Result<i64, SqlError>,
+) -> Result<i64, SqlError> {
+    STATEMENT_ARENA.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return action();
+        }
+        // SAFETY: the scope borrows this thread's arena until it restores the
+        // previous pointer. No reference escapes this synchronous invocation.
+        let arena = unsafe { &*pointer };
+        let mut replay = session.statement_replay.get();
+        if let Some(handle) = replay.next {
+            let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+            if effect.call != call {
+                let recreated = effect.call.operation == call.operation
+                    && call
+                        .source
+                        .zip(effect.call.source)
+                        .is_some_and(|(now, prior)| now.recreates(prior));
+                if !recreated {
+                    return Err(replay_changed());
+                }
+                // A CREATE or RESTART undone with the failed attempt needs its
+                // new private generator advanced; shared generators never do.
+                if action()? != effect.value {
+                    return Err(replay_changed());
+                }
+                assert!(arena.replace_retained(handle, SequenceEffect { call, ..effect }));
+            }
+            replay.next = effect.next;
+            session.statement_replay.set(replay);
+            return Ok(effect.value);
+        }
+        let prior_tail = replay
+            .tail
+            .map(|tail| {
+                arena
+                    .retained(tail)
+                    .map(|effect| (tail, effect))
+                    .ok_or_else(replay_changed)
+            })
+            .transpose()?;
+        // Reserve before advancing a sequence: exhaustion cannot lose an
+        // unrecorded nontransactional effect.
+        let handle = arena
+            .retain(SequenceEffect {
+                call,
+                value: 0,
+                next: None,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "volatile sequence replay exceeds statement memory"
+                )
+            })?;
+        let value = action()?;
+        assert!(arena.replace_retained(
+            handle,
+            SequenceEffect {
+                call,
+                value,
+                next: None
+            }
+        ));
+        if let Some((tail, effect)) = prior_tail {
+            assert!(arena.replace_retained(
+                tail,
+                SequenceEffect {
+                    next: Some(handle),
+                    ..effect
+                }
+            ));
+        } else {
+            replay.head = Some(handle);
+        }
+        replay.tail = Some(handle);
+        session.statement_replay.set(replay);
+        Ok(value)
+    })
+}
 
 /// Bounded effect log for an expression stream that may be physically retried
 /// while waiting for a mutable SQL routine. Sequence calls are replayed in
@@ -173,20 +374,27 @@ pub(crate) fn next_cached(
     slot: usize,
     txid: u32,
 ) -> Result<i64, SqlError> {
-    let sequence = storage.sequence_for(slot, txid);
-    if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
-        session.record_nextval(slot, sequence.created_at, value);
-        return Ok(value);
-    }
-    let (value, reserved, prelogged) =
-        storage.reserve_sequence_values(slot, txid, sequence.cache)?;
-    // PostgreSQL assigns a full XID only when nextval must emit a sequence WAL
-    // record. Values covered by the sequence's prelogged range do not assign
-    // one, even though the durable absolute position still advances here.
-    if prelogged {
-        storage.assign_transaction_identity(txid);
-    }
-    session.store_cache(slot, value, reserved, &sequence);
+    let (source, sequence) = storage.select_sequence_for_replay(slot, txid)?;
+    let value = statement_call(
+        session,
+        SequenceCall {
+            operation: SequenceOperation::Next,
+            source: Some(source),
+        },
+        || {
+            if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
+                return Ok(value);
+            }
+            let (value, reserved, prelogged) =
+                storage.reserve_sequence_values(slot, txid, sequence.cache)?;
+            // Only reserving a new WAL range assigns a full transaction ID.
+            if prelogged {
+                storage.assign_transaction_identity(txid);
+            }
+            session.store_cache(slot, value, reserved, &sequence);
+            Ok(value)
+        },
+    )?;
     session.record_nextval(slot, sequence.created_at, value);
     Ok(value)
 }
@@ -204,40 +412,76 @@ impl SequenceAccess for SeqEval<'_> {
     fn currval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
-        let seq = self.storage.sequence_for(slot, self.txid);
-        match self.session.currval(slot, seq.created_at) {
-            Some(v) => Ok(v),
-            None => Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "currval of sequence \"{}\" is not yet defined in this session",
-                seq.name.as_str()
-            )),
-        }
+        let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
+        statement_call(
+            self.session,
+            SequenceCall {
+                operation: SequenceOperation::Current,
+                source: Some(source),
+            },
+            || match self.session.currval(slot, seq.created_at) {
+                Some(v) => Ok(v),
+                None => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "currval of sequence \"{}\" is not yet defined in this session",
+                    seq.name.as_str()
+                )),
+            },
+        )
     }
 
     fn lastval(&self) -> Result<i64, SqlError> {
-        self.session.lastval().ok_or_else(|| {
+        let undefined = || {
             sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "lastval is not yet defined in this session"
             )
-        })
+        };
+        let (slot, created_at) = self.session.last_sequence().ok_or_else(undefined)?;
+        let (source, definition) = self
+            .storage
+            .select_sequence_for_replay(slot, self.txid)
+            .map_err(|_| undefined())?;
+        if definition.created_at != created_at {
+            return Err(undefined());
+        }
+        self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
+        statement_call(
+            self.session,
+            SequenceCall {
+                operation: SequenceOperation::Last,
+                source: Some(source),
+            },
+            || self.session.lastval().ok_or_else(undefined),
+        )
     }
 
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
-        let seq = self.storage.sequence_for(slot, self.txid);
+        let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
         if self.dry {
             // Validate the range without moving the generator.
             self.storage.check_sequence_value(slot, self.txid, value)?;
             return Ok(value);
         }
-        let result = self
-            .storage
-            .set_sequence_value(slot, self.txid, value, is_called)?;
-        self.storage.assign_transaction_identity(self.txid);
-        self.session.record_setval(slot, seq.created_at, value);
+        let result = statement_call(
+            self.session,
+            SequenceCall {
+                operation: SequenceOperation::Set { value, is_called },
+                source: Some(source),
+            },
+            || {
+                let result = self
+                    .storage
+                    .set_sequence_value(slot, self.txid, value, is_called)?;
+                self.storage.assign_transaction_identity(self.txid);
+                self.session.invalidate_cache(slot);
+                Ok(result)
+            },
+        )?;
+        self.session
+            .record_setval(slot, seq.created_at, value, is_called);
         Ok(result)
     }
 }
@@ -262,6 +506,119 @@ impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn statement_replay_preserves_calls_through_nested_scopes_and_front_rewinds() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "statement sequence effects", 1 << 16).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _statement = enter_statement(&arena, session, false);
+                let mark = arena.mark();
+                assert_eq!(
+                    statement_call(session, call, || {
+                        actions.set(actions.get() + 1);
+                        Ok(7)
+                    })
+                    .unwrap(),
+                    7
+                );
+                let _nested = enter_statement(&arena, session, false);
+                assert_eq!(
+                    statement_call(session, call, || {
+                        actions.set(actions.get() + 1);
+                        Ok(8)
+                    })
+                    .unwrap(),
+                    8
+                );
+                unsafe { arena.rewind_to(mark) };
+            }
+            for _ in 0..3 {
+                let _statement = enter_statement(&arena, session, true);
+                for expected in [7, 8] {
+                    assert_eq!(
+                        statement_call(session, call, || panic!(
+                            "a resumed call must not run again"
+                        ))
+                        .unwrap(),
+                        expected
+                    );
+                }
+            }
+            let statement = enter_statement(&arena, session, true);
+            assert_eq!(
+                statement_call(session, call, || panic!("replayed first call")).unwrap(),
+                7
+            );
+            assert_eq!(
+                statement.finish(session).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(actions.get(), 2);
+        });
+    }
+
+    #[test]
+    fn statement_replay_rejects_reset_and_changed_calls_and_reserves_before_effects() {
+        let mut budget = Budget::new(4096);
+        let mut arena = Arena::new(&mut budget, "bounded statement effects", 4096).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _statement = enter_statement(&arena, session, false);
+                loop {
+                    let before = actions.get();
+                    match statement_call(session, call, || {
+                        actions.set(before + 1);
+                        Ok(before)
+                    }) {
+                        Ok(value) => assert_eq!(value, before),
+                        Err(error) => {
+                            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                            assert_eq!(actions.get(), before);
+                            break;
+                        }
+                    }
+                }
+            }
+            {
+                let statement = enter_statement(&arena, session, true);
+                let changed = SequenceCall {
+                    operation: SequenceOperation::Set {
+                        value: 5,
+                        is_called: false,
+                    },
+                    source: None,
+                };
+                let error =
+                    statement_call(session, changed, || panic!("changed call must be rejected"))
+                        .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                // Keep the original records to also exercise a stale arena.
+                drop(statement);
+            }
+            arena.reset();
+            let statement = enter_statement(&arena, session, true);
+            let error = statement_call(session, call, || panic!("reset arena must be rejected"))
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            statement.discard(session);
+        });
+    }
 
     #[test]
     fn replay_state_scales_with_the_statement_arena_and_replays_exactly() {

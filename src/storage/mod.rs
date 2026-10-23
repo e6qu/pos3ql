@@ -42,6 +42,7 @@ pub(crate) use type_edits::{
     CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeCommitChange, TypeDdlDecision,
     TypeDdlUndo, TypeEditTarget,
 };
+mod domain_validation;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -10036,6 +10037,69 @@ impl SequenceValues {
 struct SequenceCatalog {
     definitions: FixedVec<SequenceDef>,
     values: FixedVec<SequenceValues>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SequenceReplaySource {
+    origin: type_references::CatalogOrigin,
+    slot: usize,
+    created_at: u64,
+    database: DatabaseOid,
+    schema: SqlName,
+    name: SqlName,
+    private_version: Option<u64>,
+}
+
+impl SequenceReplaySource {
+    pub(crate) fn recreates(self, previous: Self) -> bool {
+        self.private_version.is_some()
+            && previous.private_version.is_some()
+            && self.origin == previous.origin
+            && self.database == previous.database
+            && self.schema == previous.schema
+            && self.name == previous.name
+    }
+}
+
+impl Storage {
+    pub(crate) fn select_sequence_for_replay(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(SequenceReplaySource, SequenceDef), SqlError> {
+        let catalog = self.sequence_catalog();
+        let live = *catalog
+            .definitions
+            .get(slot)
+            .filter(|definition| {
+                definition.visible_to(transaction) && definition.database == current_database()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "sequence source no longer exists"
+                )
+            })?;
+        let selected = live.definition_for(transaction);
+        let private_version =
+            if live.ddl_state == (CatalogDdlState::PendingCreate { txid: transaction }) {
+                Some(live.created_at)
+            } else {
+                live.pending_definition
+                    .filter(|pending| pending.txid == transaction && pending.restarted)
+                    .map(|pending| pending.version)
+            };
+        let source = SequenceReplaySource {
+            origin: self.catalog_sources.origin(),
+            slot,
+            created_at: selected.created_at,
+            database: selected.database,
+            schema: selected.schema,
+            name: selected.name,
+            private_version,
+        };
+        Ok((source, selected))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30273,10 +30337,11 @@ impl Storage {
                 rowid: 0,
                 representation: SpilledRowRepresentation::Encoded(&[]),
             })
-            .map_err(|_| {
+            .map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "spilled scan batch exceeds the statement arena; raise work_arena_bytes"
+                    "spilled scan batch exceeds the statement arena: {}",
+                    error
                 )
             })?;
         let rows = &mut *rows;

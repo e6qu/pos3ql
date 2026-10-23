@@ -9,6 +9,115 @@ use super::ExecutionIdentity;
 use super::eval::{SqlError, sqlstate};
 use super::guc::{GucState, SeqSession};
 use super::txn::TxnState;
+use core::num::NonZeroU32;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PublicationPoint {
+    DefinitionsInstalled,
+    RowInstalled { table: usize, rowid: u64 },
+    DataInstalled,
+    Visible,
+    RollbackRestored,
+}
+
+#[cfg(test)]
+pub(super) type PublicationObserver =
+    fn(&super::Engine, PublicationPoint, u32) -> Result<(), SqlError>;
+
+#[derive(Clone, Copy)]
+pub(super) struct Publication {
+    coordinator: NonZeroU32,
+    prepared: Option<(NonZeroU32, bool)>,
+    pub lsn: u64,
+}
+
+impl Publication {
+    fn new(coordinator: u32, prepared: Option<(u32, bool)>, lsn: u64) -> Result<Self, SqlError> {
+        let invalid = || {
+            sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "durable publication has an invalid transaction owner"
+            )
+        };
+        let coordinator = NonZeroU32::new(coordinator).ok_or_else(invalid)?;
+        let prepared = prepared
+            .map(|(transaction, committed)| -> Result<_, SqlError> {
+                let transaction = NonZeroU32::new(transaction)
+                    .filter(|transaction| *transaction != coordinator)
+                    .ok_or_else(invalid)?;
+                Ok((transaction, committed))
+            })
+            .transpose()?;
+        Ok(Self {
+            coordinator,
+            prepared,
+            lsn,
+        })
+    }
+
+    fn owns(self, transaction: u32) -> bool {
+        self.coordinator.get() == transaction
+            || self
+                .prepared
+                .is_some_and(|(prepared, _)| prepared.get() == transaction)
+    }
+
+    pub fn transactions(self) -> impl Iterator<Item = (u32, bool)> {
+        core::iter::once((self.coordinator.get(), true)).chain(
+            self.prepared
+                .map(|(transaction, committed)| (transaction.get(), committed)),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PublicationState {
+    Idle,
+    Installing(Publication),
+    RecoveryRequired(Publication),
+}
+
+impl PublicationState {
+    pub fn begin(
+        &mut self,
+        coordinator: u32,
+        prepared: Option<(u32, bool)>,
+        lsn: u64,
+    ) -> Result<(), SqlError> {
+        if !matches!(self, Self::Idle) {
+            return Err(sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "durable publication requires recovery"
+            ));
+        }
+        *self = Self::Installing(Publication::new(coordinator, prepared, lsn)?);
+        Ok(())
+    }
+
+    pub fn owns(self, transaction: u32) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Installing(publication) | Self::RecoveryRequired(publication) => {
+                publication.owns(transaction)
+            }
+        }
+    }
+
+    pub fn complete(&mut self) -> Publication {
+        let Self::Installing(publication) = *self else {
+            panic!("only a fully installed publication can release its owners");
+        };
+        *self = Self::Idle;
+        publication
+    }
+
+    pub fn require_recovery(&mut self) {
+        if let Self::Installing(publication) = *self {
+            *self = Self::RecoveryRequired(publication);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket {

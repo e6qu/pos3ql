@@ -227,10 +227,13 @@ fn catalog_publication_domain_validation_ignores_unstored_and_foreign_values() {
 fn catalog_publication_domain_graph_exhaustion_restores_the_prior_definition() {
     let mut config = test_config("catalog-domain-graph-capacity");
     config.max_domains = 512;
+    config.sql_arena_bytes = 16 << 10;
     config.work_arena_bytes = 16 << 10;
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut session = ConfiguredTransactionSession::with_arena_bytes(
+        &config, &mut budget, config.sql_arena_bytes);
+    assert_eq!(session.arena.capacity(), 16 << 10);
     let created = session.execute(&mut engine,
         "CREATE DOMAIN capacity_domain AS integer; CREATE TABLE capacity_values (value capacity_domain)", true);
     assert!(error_sqlstates(&created).is_empty());

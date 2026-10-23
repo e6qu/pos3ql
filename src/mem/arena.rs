@@ -50,7 +50,8 @@ pub(crate) struct ArenaHandle<T> {
     offset: usize,
     // Keep T's thread-safety requirements and forbid shortening a stored
     // reference's lifetime through one clone while retaining another clone.
-    value: PhantomData<(T, fn(T) -> T)>,
+    value: PhantomData<T>,
+    invariant: PhantomData<fn(T) -> T>,
 }
 
 impl<T> Copy for ArenaHandle<T> {}
@@ -283,6 +284,7 @@ impl Arena {
             identity: self.retention_identity,
             offset: retained.as_ptr() as usize - self.base as usize,
             value: PhantomData,
+            invariant: PhantomData,
         })
     }
 

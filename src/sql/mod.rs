@@ -10413,6 +10413,7 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.staged_commit().is_some() {
+                        sequence_scope.discard(guc.seq_session());
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
@@ -10733,6 +10734,7 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.staged_commit().is_some() {
+                        sequence_scope.discard(guc.seq_session());
                         return Ok(ExtendedExecutionStatus::Blocked {
                             wait: crate::sql::StatementWait::ObjectIo,
                         });
@@ -14668,6 +14670,9 @@ impl Engine {
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
+            if txn.staged_commit().is_some() {
+                sequence_scope.discard(guc.seq_session());
+            }
             txn.suspend_statement(
                 None,
                 datetime::statement_clock(),

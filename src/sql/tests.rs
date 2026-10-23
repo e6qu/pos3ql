@@ -262,9 +262,11 @@ fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_wr
 
 #[test]
 fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
-    for (mode, suffix) in [
-        (crate::config::TransactionMode::Mvcc, "mvcc"),
-        (crate::config::TransactionMode::Locking, "locking"),
+    for (mode, suffix, extended) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc-simple", false),
+        (crate::config::TransactionMode::Locking, "locking-simple", false),
+        (crate::config::TransactionMode::Mvcc, "mvcc-extended", true),
+        (crate::config::TransactionMode::Locking, "locking-extended", true),
     ] {
         let mut config = test_config(&format!("catalog-cascade-locks-{suffix}"));
         config.transaction_mode = mode;
@@ -279,24 +281,45 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         editor.success(&mut engine,
             "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
         editor.success(&mut engine,
-            "CREATE SEQUENCE cascade_wait_calls; CREATE TABLE cascade_wait_audit(id serial, seen bigint); CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN INSERT INTO cascade_wait_audit(seen) VALUES(nextval(''cascade_wait_calls'')); RETURN; END'; CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait()", true);
+            "CREATE SEQUENCE cascade_wait_calls; CREATE SEQUENCE cascade_restart_source; CREATE TABLE cascade_wait_audit(id serial, seen bigint, private_seen bigint, restarted_seen bigint); CREATE FUNCTION count_cascade_wait() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN CREATE SEQUENCE cascade_attempt_sequence START 17; ALTER SEQUENCE cascade_restart_source RESTART WITH 23; INSERT INTO cascade_wait_audit(seen, private_seen, restarted_seen) VALUES(nextval(''cascade_wait_calls''), nextval(''cascade_attempt_sequence''), nextval(''cascade_restart_source'')); RETURN; END'; CREATE EVENT TRIGGER count_cascade_start ON ddl_command_start WHEN TAG IN ('DROP SCHEMA') EXECUTE FUNCTION count_cascade_wait()", true);
         assert_eq!(
             data_rows(&reader.success(&mut engine, "BEGIN; SELECT id FROM cascade_report", true)),
             ["1"]
         );
         let sql = "DROP SCHEMA cascade_orders CASCADE";
-        assert!(editor.execute(&mut engine, sql, true).is_empty());
+        let execute = |engine: &mut Engine, session: &mut ConfiguredTransactionSession| {
+            if extended {
+                match engine.execute_extended(
+                    sql, &session.arena, NO_PARAMS, &[], &mut session.transaction,
+                    &mut session.pool, &mut session.cursors, &mut session.guc,
+                    &mut Responder::new(&mut session.send), session.connection_id, false,
+                ).unwrap() {
+                    ExtendedExecutionStatus::Complete(true) => Ok(()),
+                    ExtendedExecutionStatus::Complete(false) => panic!("extended schema drop failed: {}", String::from_utf8_lossy(session.send.readable())),
+                    ExtendedExecutionStatus::Blocked { wait } => Err(wait),
+                }
+            } else {
+                match engine.execute_simple_from(
+                    sql, 0, &session.arena, &mut session.transaction, &mut session.pool,
+                    &mut session.cursors, &mut session.guc, &mut Responder::new(&mut session.send),
+                    session.connection_id, false,
+                ).unwrap() {
+                    ExecutionStatus::Complete => Ok(()),
+                    ExecutionStatus::Blocked { completed_statements: 0, wait, .. } => Err(wait),
+                    status => panic!("unexpected schema drop continuation: {status:?}"),
+                }
+            }
+        };
+        editor.send.clear();
+        editor.arena.reset();
+        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Err(StatementWait::Lock));
+        assert!(editor.send.readable().is_empty());
         assert!(editor.transaction.ddl().is_empty());
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT last_value FROM cascade_wait_calls", true)), ["1"]);
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT count(*) FROM cascade_wait_audit", true)), ["0"]);
-        let waiting = crate::mem::guard::forbid_alloc(|| engine.execute_simple_from(
-            sql, 0, &editor.arena, &mut editor.transaction, &mut editor.pool,
-            &mut editor.cursors, &mut editor.guc, &mut Responder::new(&mut editor.send),
-            editor.connection_id, false,
-        )).unwrap();
-        assert!(matches!(waiting, ExecutionStatus::Blocked { completed_statements: 0, wait: StatementWait::Lock, .. }));
+        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Err(StatementWait::Lock));
         assert!(editor.send.readable().is_empty());
         assert!(
             engine
@@ -314,29 +337,21 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         );
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT nextval('cascade_wait_calls')", true)), ["2"]);
+        other.success(&mut engine, "CREATE SEQUENCE cascade_reused_slot", true);
         reader.success(&mut engine, "COMMIT", true);
-        let status = crate::mem::guard::forbid_alloc(|| {
-            engine.execute_simple_from(
-                sql,
-                0,
-                &editor.arena,
-                &mut editor.transaction,
-                &mut editor.pool,
-                &mut editor.cursors,
-                &mut editor.guc,
+        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Ok(()));
+        if extended {
+            crate::mem::guard::forbid_alloc(|| engine.commit_txn_with_triggers(
+                &mut editor.transaction, &editor.guc, &editor.arena,
                 &mut Responder::new(&mut editor.send),
-                editor.connection_id,
-                false,
-            )
-        })
-        .unwrap();
-        assert_eq!(status, ExecutionStatus::Complete);
+            )).unwrap();
+        }
         assert!(error_sqlstates(editor.send.readable()).is_empty());
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT last_value FROM cascade_wait_calls", true)), ["2"],
             "resuming the same statement must not repeat its start trigger");
         assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT id, seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq", true)), ["1|1", "1"]);
+            "SELECT id, seen, private_seen, restarted_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source')", true)), ["1|1|17|23", "1", "18", "24"]);
         assert_eq!(data_rows(&editor.success(&mut engine,
             "SELECT currval('cascade_wait_calls'), currval('cascade_wait_audit_id_seq')", true)), ["1|1"]);
         assert!(

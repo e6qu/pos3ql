@@ -53356,17 +53356,22 @@ impl<'arena> ReplicationRow<'arena> {
         self.rowid
     }
 
-    fn selection(
+    pub(crate) fn definition(&self) -> &TableDef {
+        self.definitions.retained_definition(self.table_slot, self.transaction)
+            .expect("selected replication row retains its definition")
+    }
+
+    fn write_target(
         &self,
         storage: &Storage,
         table: usize,
         transaction: u32,
-    ) -> Result<(crate::storage::TableDefinitionTarget, &TableDef), SqlError> {
+    ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {
         if transaction != self.transaction {
             return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
                 "replication row selection belongs to another transaction"));
         }
-        self.definitions.selection(storage, table, self.transaction)
+        self.definitions.selection(storage, table, self.transaction).map(|(target, _)| target)
     }
 
     pub(crate) fn bytes(&self) -> &'arena [u8] {
@@ -53522,7 +53527,8 @@ fn apply_replication_delete_row(
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row_table = row.table_slot();
-    let (row_target, definition) = row.selection(storage, row_table, txn.txid)?;
+    let row_target = row.write_target(storage, row_table, txn.txid)?;
+    let definition = row.definition();
     storage.require_subscription_target(row_table, txn.txid)?;
     match storage.acquire_row_lock(
         row_table,
@@ -53648,8 +53654,11 @@ pub(crate) fn apply_replication_update(
     };
     let table_index = binding.table_slot();
     let row_table = row.table_slot();
-    let (logical_target, logical_definition) = row.selection(storage, table_index, txn.txid)?;
-    let (row_target, definition) = row.selection(storage, row_table, txn.txid)?;
+    let logical_target = row.write_target(storage, table_index, txn.txid)?;
+    let row_target = row.write_target(storage, row_table, txn.txid)?;
+    let logical_definition = row.definitions.retained_definition(table_index, row.transaction)
+        .expect("replication selection retains its logical definition");
+    let definition = row.definition();
     match storage.acquire_row_lock(
         row_table,
         row.rowid(),
@@ -71649,14 +71658,15 @@ mod tests {
                 arena.alloc_slice_copy(bytes).map(|bytes| &*bytes).map_err(|_| arena_full())
             }).unwrap();
             let row = ReplicationRow {table_slot: table, rowid: 1, selected, bytes, definitions, transaction: 7};
-            assert_eq!(row.selection(&storage, table, 8).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(row.write_target(&storage, table, 8).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert!(row.definitions.retained_definition(table, 8).is_none());
             let (_, mut changed) = storage.select_table_definition(table, 7);
             changed.columns[0].name = SqlName::parse("renamed").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(changed.columns[0].name);
             let change = storage.write_table_def(target, changed, &mapping, false).unwrap();
-            let (original, definition) = row.selection(&storage, table, 7).unwrap();
+            let original = row.write_target(&storage, table, 7).unwrap();
+            let definition = row.definition();
             assert_eq!(original.transaction(), 7);
             assert_eq!(definition.columns()[0].name.as_str(), "id");
             let image = storage.heap.append_row_image(&[Datum::Int4(8)]).unwrap();

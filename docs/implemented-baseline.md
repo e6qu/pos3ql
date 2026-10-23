@@ -612,8 +612,9 @@ whose value is an entire array validates that whole array. Unstored type
 definitions, views and foreign-table columns do not create local values to scan.
 The dependency walk uses the connection's SQL arena, reserved by `sql_arena_bytes`
 at startup, and returns `54000`, "domain dependency graph exceeds the statement
-arena", if that space fills. Retaining table sources
-can return `54000`, "domain validation table sources exceed the statement arena".
+arena", if that space fills. Temporary dependency links and the work queue are
+released before scanning rows. Table sources reuse the startup-reserved definition
+images; their pool reports `54000` if exhausted.
 These rules follow
 [PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).
 Type comments move within the same database. Composite type renames journal only the name

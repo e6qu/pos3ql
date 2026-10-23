@@ -42207,44 +42207,37 @@ fn validate_domain_rows(
             Some(storage.domain_validation_dependencies(target, txid, arena)?)
         }
     };
-    let table_count = storage.table_count();
-    let selected = arena.alloc_slice_with(table_count, |_| None).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "domain validation table sources exceed the statement arena"
-        )
-    })?;
     let definitions = storage.table_definition_images();
+    // Images prepend, so capture backwards to acquire locks in table order.
+    for table in (0..storage.table_count()).rev() {
+        if storage.table_slot_visible_to(table, txid)
+            && storage.foreign_table(table as u16, txid).is_none()
+        {
+            definitions.definition(storage, table, txid)?;
+        }
+    }
     // Lock every affected relation before selecting the latest committed rows.
     // Readers remain compatible; a pending writer must finish before validation.
-    for (table, selected) in selected.iter_mut().enumerate() {
-        if !storage.table_slot_visible_to(table, txid)
-            || storage.foreign_table(table as u16, txid).is_some()
-        {
-            continue;
-        }
-        let (source, definition) = definitions.selection(storage, table, txid)?;
+    for (source, definition) in definitions.iter() {
         let affected = match &dependencies {
             Some(dependencies) => dependencies.columns(storage, definition, txid)?,
             None => domain_rewrite_columns(storage, definition, target, txid)?,
         };
         if affected.iter().any(|column| *column) {
-            storage.lock_table(txid, table, crate::sql::ast::TableLockMode::Share, false)?;
+            storage.lock_table(txid, source.table(), crate::sql::ast::TableLockMode::Share, false)?;
             source.validate(storage)?;
-            *selected = Some(source);
         }
     }
     let read = storage.validation_read();
-    for (table_index, source) in selected.iter().copied().enumerate() {
-        let Some(source) = source else { continue };
-        source.validate(storage)?;
-        let def = definitions
-            .retained_definition(table_index, txid)
-            .expect("domain validation retains every selected table definition");
+    for (source, def) in definitions.iter() {
         let affected = match &dependencies {
             Some(dependencies) => dependencies.columns(storage, def, txid)?,
             None => domain_rewrite_columns(storage, def, target, txid)?,
         };
+        if !affected.iter().any(|column| *column) {
+            continue;
+        }
+        source.validate(storage)?;
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         def.schema(&mut schema);
         // SAFETY: validation consumes domain coercion results within the row;
@@ -42252,7 +42245,7 @@ fn validate_domain_rows(
         unsafe {
             constraints::for_each_validation_row(
                 storage,
-                table_index,
+                source.table(),
                 txid,
                 read,
                 &schema[..def.n_columns],

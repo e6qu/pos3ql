@@ -48,6 +48,8 @@ table, routine, type, account and saved-query guarantees.
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.
+Waiting and resuming a command must preserve its effects exactly once, including
+event triggers and sequence values.
 
 ### Run statements on startup-reserved CPU workers
 

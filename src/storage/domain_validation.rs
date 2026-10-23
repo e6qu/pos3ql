@@ -132,6 +132,7 @@ impl Storage {
         let sources = arena
             .alloc_slice_with(count, |_| None)
             .map_err(|_| full())?;
+        let scratch = arena.mark();
         let heads = arena
             .alloc_slice_with(count, |_| None)
             .map_err(|_| full())?;
@@ -251,6 +252,9 @@ impl Storage {
                 edge = dependency.next;
             }
         }
+        // SAFETY: only sources escapes; it precedes the mark. The adjacency
+        // lists and work queue are no longer read after classification.
+        unsafe { arena.rewind_to(scratch) };
         Ok(DomainValidationDependencies {
             origin: self.catalog_sources.origin(),
             database: super::current_database(),

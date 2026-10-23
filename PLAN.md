@@ -49,6 +49,7 @@ table, routine, type, account and saved-query guarantees.
 Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.
+Lost commit replies must resolve to all of the transaction's changes or none.
 Waiting and resuming a command must preserve its effects exactly once, including
 event triggers and sequence values.
 

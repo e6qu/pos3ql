@@ -8,6 +8,58 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn table_definition_undo_survives_savepoints_private_replacement_and_cold_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("table-definition-undo-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 64;
+            config.max_catalog_versions_per_object = 8;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    include_str!("../../tests/external/differential_exact/12_table_definition_undo.sql"),
+                    false,
+                )),
+                ["1|order|7", "11|original", "11|original", "1|ready|kept"]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, 1 << 29);
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    "SELECT id, description, amount FROM table_edit_orders ORDER BY id; \
+                     SELECT id, note FROM table_edit_selected ORDER BY id; \
+                     SELECT id, state, note FROM table_edit_typed ORDER BY id",
+                    false,
+                )),
+                ["1|order|7", "11|original", "1|ready|kept"]
+            );
+        }
+    }
+}
+
+#[test]
 fn private_index_schema_names_and_comments_survive_rollback_and_cold_recovery() {
     for checkpoint in [false, true] {
         for mode in [

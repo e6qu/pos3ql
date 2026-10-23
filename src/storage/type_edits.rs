@@ -19,6 +19,13 @@ pub(crate) struct TypeEditTarget {
 }
 
 impl TypeEditTarget {
+    pub(super) fn dependent_table_revision(self) -> super::TableDefinitionRevision {
+        super::TableDefinitionRevision::Type {
+            source: self.source,
+            version: self.version,
+        }
+    }
+
     pub(super) fn identity_move(
         self,
         catalog: &super::TypeCatalog,

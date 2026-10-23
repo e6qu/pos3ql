@@ -52,6 +52,7 @@ jobs:
           fixtures = {
               "10_private_index_bindings.sql": ["payload|7", "10|payload|7", "payload|7", "1"],
               "11_index_schema_names.sql": ["key comment", "key comment", "key comment", "key comment", "fresh", "key comment", "1"],
+              "12_table_definition_undo.sql": ["1|order|7", "11|original", "11|original", "1|ready|kept"],
           }
           for filename, expected in fixtures.items():
               sql = (pathlib.Path("tests/external/differential_exact") / filename).read_bytes()

@@ -35104,7 +35104,9 @@ impl Storage {
     pub(crate) fn reserve_table_definition_revision(
         &self,
     ) -> Result<TableDefinitionRevision, SqlError> {
-        self.catalog_sequence.next().map(TableDefinitionRevision::Catalog)
+        self.catalog_sequence
+            .next()
+            .map(TableDefinitionRevision::Catalog)
     }
 
     fn table_definition_target(

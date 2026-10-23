@@ -473,12 +473,7 @@ impl TypePublication {
                         })?;
                     }
                     let revision = match source {
-                        TypePublicationSource::Pending(target) => {
-                            super::TableDefinitionRevision::Type {
-                                source: target.source,
-                                version: target.version,
-                            }
-                        }
+                        TypePublicationSource::Pending(target) => target.dependent_table_revision(),
                         TypePublicationSource::Committed { .. } => {
                             storage.reserve_table_definition_revision()?
                         }

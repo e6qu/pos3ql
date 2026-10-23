@@ -208,6 +208,10 @@ fn transaction_publication_partial_failure_requires_recovery_without_undoing_dur
                 assert!(engine.transaction_publication.owns(transaction));
                 engine.publication_observer = None;
                 engine.rollback_txn(&mut writer.transaction, &writer.guc);
+                assert_eq!(engine.checkpoint().unwrap_err().sqlstate, "08007");
+                assert_eq!(engine.commit_wal().unwrap_err().sqlstate, "08007");
+                assert!(!engine.checkpoint_can_progress());
+                assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
                 assert_eq!(
                     engine.fatal_commit_failure().unwrap().message,
                     error.message
@@ -394,5 +398,113 @@ fn transaction_publication_rollback_restores_rows_and_definitions_before_unlocki
         observer.success(&mut engine,
             "LOCK TABLE publication_orders,publication_invoices IN ACCESS EXCLUSIVE MODE NOWAIT; COMMIT", true);
         assert_eq!(engine.storage.advisory_lock_view_count(), 0);
+    }
+}
+
+#[test]
+fn transaction_publication_queued_failure_preserves_later_durable_work_for_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let name = format!("publication-queued-fault-{mode:?}");
+        let mut config = test_config(&name);
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut later =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut observer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+        writer.success(&mut engine, SETUP, false);
+        writer.success(
+            &mut engine,
+            "CREATE TABLE publication_later(id integer)",
+            false,
+        );
+        writer.success(&mut engine, CHANGE, false);
+        let transaction = writer.transaction.txid;
+        later.success(
+            &mut engine,
+            "BEGIN; INSERT INTO publication_later VALUES(30)",
+            false,
+        );
+        observer.success(&mut engine, "BEGIN; SELECT 1", false);
+        engine.enable_async_durability();
+        engine.bind_query_connection(writer.connection_id);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(
+                || engine.commit_txn(&mut writer.transaction, &writer.guc)
+            )
+            .unwrap_err()
+            .sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
+        engine.bind_query_connection(later.connection_id);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(
+                || engine.commit_txn(&mut later.transaction, &later.guc)
+            )
+            .unwrap_err()
+            .sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
+        let frontier = engine.visible_lsn;
+        engine.publication_observer = Some((inject_row, observer.transaction.txid));
+        let mut failed = false;
+        for _ in 0..16 {
+            if let Err(error) = engine
+                .advance_wal_publication(std::time::Instant::now(), CommitProgressMode::Reactor)
+            {
+                assert_eq!(error.sqlstate, sqlstate::TRANSACTION_RESOLUTION_UNKNOWN);
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "injected publication failure was not reached");
+        assert_eq!(engine.visible_lsn, frontier);
+        assert!(engine.durable_lsn >= later.transaction.staged_commit().unwrap().lsn);
+        assert!(writer.transaction.staged_commit().is_some());
+        assert!(engine.transaction_publication.owns(transaction));
+        engine.publication_observer = None;
+        engine.rollback_txn(&mut writer.transaction, &writer.guc);
+        engine.rollback_txn(&mut later.transaction, &later.guc);
+        assert_eq!(
+            engine.fatal_commit_failure().unwrap().sqlstate,
+            sqlstate::INTERNAL_ERROR
+        );
+        assert_eq!(
+            engine
+                .finish_staged_transaction(&mut writer.transaction, &writer.guc)
+                .unwrap_err()
+                .sqlstate,
+            "08007"
+        );
+        assert_eq!(
+            engine
+                .finish_staged_transaction(&mut later.transaction, &later.guc)
+                .unwrap_err()
+                .sqlstate,
+            "08007"
+        );
+        assert_eq!(engine.checkpoint().unwrap_err().sqlstate, "08007");
+        drop(observer);
+        drop(later);
+        drop(writer);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, 1 << 29);
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold,
+            "SELECT amount FROM publication_orders; SELECT total FROM publication_invoices; SELECT id FROM publication_later", false)),
+            ["20", "20", "30"]);
     }
 }

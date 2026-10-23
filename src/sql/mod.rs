@@ -6628,22 +6628,25 @@ impl Engine {
                 }
             }
         };
+        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
+            self.visible_lsn = self.visible_lsn.max(staged.lsn);
+        }
+        #[cfg(test)]
         let result = result.and_then(|()| {
-            if staged.barrier == txn::CommitBarrier::Journal {
-                self.visible_lsn = self.visible_lsn.max(staged.lsn);
+            if matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+                Ok(())
+            } else {
+                self.observe_publication(commit::PublicationPoint::Visible)
             }
-            if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
-                #[cfg(test)]
-                self.observe_publication(commit::PublicationPoint::Visible)?;
-                let publication = self.transaction_publication.complete();
-                debug_assert_eq!(publication.lsn, staged.lsn);
-                for (transaction, committed) in publication.transactions() {
-                    self.storage.finish_transaction_identity(transaction, committed);
-                    release_transaction_locks(&self.storage, transaction);
-                }
-            }
-            Ok(())
         });
+        if result.is_ok() && !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+            let publication = self.transaction_publication.complete();
+            debug_assert_eq!(publication.lsn, staged.lsn);
+            for (transaction, committed) in publication.transactions() {
+                self.storage.finish_transaction_identity(transaction, committed);
+                release_transaction_locks(&self.storage, transaction);
+            }
+        }
         self.unpromoted_commits -= 1;
         if let Err(error) = &result {
             self.transaction_publication.require_recovery();
@@ -7916,6 +7919,7 @@ impl Engine {
     /// Publishes every committed journal record accumulated since the prior
     /// protocol flush.  This is the object-store acknowledgement barrier.
     pub fn commit_wal(&mut self) -> Result<(), SqlError> {
+        self.check_publication_health()?;
         // Manual completion explicitly retries now. Reactor turns preserve
         // their backoff deadline and never busy-wait on it.
         if let Some(pending) = &mut self.inflight_publication {
@@ -7962,14 +7966,9 @@ impl Engine {
         now: std::time::Instant,
         progress: CommitProgressMode,
     ) -> Result<bool, SqlError> {
+        self.check_publication_health()?;
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.advance_background_uploads(now);
-        }
-        if self.fatal_commit_failure.is_some() {
-            return Err(sql_err!(
-                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
-                "commit completion requires recovery"
-            ));
         }
         self.wal.commit();
         if !self.wal_upload {
@@ -9143,6 +9142,7 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
+        self.check_publication_health()?;
         if self.unpromoted_commits != 0 {
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
@@ -9858,6 +9858,9 @@ impl Engine {
     /// Heap and history cleanup use no object client. Publication and merge
     /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
+        if self.fatal_commit_failure.is_some() {
+            return false;
+        }
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.manifest_publication_pending()
         {
@@ -9923,6 +9926,9 @@ impl Engine {
     }
 
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
+        if self.fatal_commit_failure.is_some() {
+            return CheckpointBeat::LocalFailure;
+        }
         if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.manifest_publication_pending()
         {

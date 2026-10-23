@@ -63,7 +63,7 @@ impl Publication {
                 .is_some_and(|(prepared, _)| prepared.get() == transaction)
     }
 
-    pub fn transactions(self) -> impl Iterator<Item = (u32, bool)> {
+    pub(super) fn transactions(self) -> impl Iterator<Item = (u32, bool)> {
         core::iter::once((self.coordinator.get(), true)).chain(
             self.prepared
                 .map(|(transaction, committed)| (transaction.get(), committed)),
@@ -79,7 +79,7 @@ pub(super) enum PublicationState {
 }
 
 impl PublicationState {
-    pub fn begin(
+    pub(super) fn begin(
         &mut self,
         coordinator: u32,
         prepared: Option<(u32, bool)>,
@@ -95,7 +95,7 @@ impl PublicationState {
         Ok(())
     }
 
-    pub fn owns(self, transaction: u32) -> bool {
+    pub(super) fn owns(self, transaction: u32) -> bool {
         match self {
             Self::Idle => false,
             Self::Installing(publication) | Self::RecoveryRequired(publication) => {
@@ -104,7 +104,7 @@ impl PublicationState {
         }
     }
 
-    pub fn complete(&mut self) -> Publication {
+    pub(super) fn complete(&mut self) -> Publication {
         let Self::Installing(publication) = *self else {
             panic!("only a fully installed publication can release its owners");
         };
@@ -112,7 +112,7 @@ impl PublicationState {
         publication
     }
 
-    pub fn require_recovery(&mut self) {
+    pub(super) fn require_recovery(&mut self) {
         if let Self::Installing(publication) = *self {
             *self = Self::RecoveryRequired(publication);
         }

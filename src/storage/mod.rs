@@ -35106,7 +35106,7 @@ impl Storage {
     ) -> Result<TableDefinitionRevision, SqlError> {
         self.catalog_sequence
             .next()
-            .map(TableDefinitionRevision::Catalog)
+            .map(TableDefinitionRevision::catalog)
     }
 
     fn table_definition_target(
@@ -35233,7 +35233,7 @@ impl Storage {
             index,
             definition,
             &pending.column_mapping,
-            TableDefinitionRevision::Catalog(pending.revision),
+            TableDefinitionRevision::catalog(pending.revision),
         );
         self.commit_index_table_names(index, txid);
         self.clear_pending_table_defs(index);

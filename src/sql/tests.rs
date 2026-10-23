@@ -31,7 +31,9 @@ fn table_definition_undo_survives_savepoints_private_replacement_and_cold_recove
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
-                    include_str!("../../tests/external/differential_exact/12_table_definition_undo.sql"),
+                    include_str!(
+                        "../../tests/external/differential_exact/12_table_definition_undo.sql"
+                    ),
                     false,
                 )),
                 ["1|order|7", "11|original", "11|original", "1|ready|kept"]

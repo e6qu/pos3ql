@@ -34,9 +34,8 @@ not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
 Connect the remaining table edits, schema moves and rewrites to that publication
-boundary. Rollback must change only the table version originally selected,
-including after internal slot reuse. Preserve definitions selected before a
-wait and keep old row, index and backup data until their readers have finished.
+boundary. Preserve definitions selected before a wait and keep old row, index
+and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may
 retain exclusive startup access; ordinary publication must let unrelated
 operations progress under their own owners.
@@ -47,9 +46,7 @@ table, routine, type, account and saved-query guarantees.
 
 Done when failed publication leaves valid state, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
-rollback and exhaustion release every owner within startup reservations. An
-installed table edit must own its exact rollback record before journal staging
-continues; a reused internal table number cannot identify that record.
+rollback and exhaustion release every owner within startup reservations.
 
 ### Run statements on startup-reserved CPU workers
 

@@ -38,7 +38,7 @@ impl DefinitionState {
 
     pub(super) fn install(&mut self, definition: TableDef, identity: TableIdentity) {
         self.committed = definition;
-        self.committed_revision = TableDefinitionRevision::Initial;
+        self.committed_revision = TableDefinitionRevision::INITIAL;
         self.identity = identity;
         self.pending = None;
         self.pending_has_rules_txid = None;
@@ -103,7 +103,7 @@ impl TableDefinition {
         let state = DefinitionState {
             identity: TableIdentity::EMPTY,
             committed,
-            committed_revision: TableDefinitionRevision::Initial,
+            committed_revision: TableDefinitionRevision::INITIAL,
             pending: None,
             pending_has_rules_txid: None,
         };
@@ -598,13 +598,28 @@ impl Deref for DefinitionSlotRead<'_> {
 
 /// Table ownership prevents retirement until the selected slot is released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TableDefinitionRevision {
+pub(crate) struct TableDefinitionRevision(DefinitionRevisionSource);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefinitionRevisionSource {
     Initial,
     Catalog(u64),
     Type {
         source: super::type_references::TypeIdentity,
         version: u64,
     },
+}
+
+impl TableDefinitionRevision {
+    const INITIAL: Self = Self(DefinitionRevisionSource::Initial);
+
+    pub(super) fn catalog(version: u64) -> Self {
+        Self(DefinitionRevisionSource::Catalog(version))
+    }
+
+    pub(super) fn named_type(source: super::type_references::TypeIdentity, version: u64) -> Self {
+        Self(DefinitionRevisionSource::Type { source, version })
+    }
 }
 
 #[must_use]
@@ -1064,7 +1079,7 @@ mod tests {
                     let mut state = table.write();
                     versions.clear_locked(&mut state);
                     let stamp = epoch * 2 + 1;
-                    *state.edit_committed(TableDefinitionRevision::Catalog(stamp as u64)) =
+                    *state.edit_committed(TableDefinitionRevision::catalog(stamp as u64)) =
                         definition(stamp);
                     state.identity.created_at = stamp as u64;
                     state.identity.ownership.owner = (stamp % 4) as u16;

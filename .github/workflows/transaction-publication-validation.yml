@@ -79,6 +79,8 @@ jobs:
           shared_committed_publication commit_makes_writes_visible bounded_local_cleanup_
           ambiguous_commit configured_commit_chain_ one_protocol_flush_ cold_start_then_commit_
           login_event_triggers transaction_identities_
+          automatic_checkpoint_deletes_ published_checkpoint_maintenance_
+          named_backup_recovers_to_retained_lsn_and_timestamp_
           --test-threads=1
       - name: Retain build cache after a failed regression too
         if: always() && steps.cache.outputs.cache-hit != 'true'

@@ -52283,8 +52283,8 @@ pub fn copy_begin(
             "COPY FORCE_NULL cannot be used with COPY TO"
         ));
     }
-    let fmt = CopyFmt::resolve(&def, statement.table.name, &statement.options)?;
-    let filter = CopyFilter::resolve(statement, &def)?;
+    let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
+    let filter = CopyFilter::resolve(statement, def)?;
     if !statement.to {
         for &target in &targets[..n_targets] {
             if def.columns()[target].default.is_generated() {
@@ -53657,10 +53657,7 @@ pub(crate) fn apply_replication_update(
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply update waits for its row"),
     }
     storage.require_subscription_target(row_table, txn.txid)?;
-    let logical_definition = row
-        .definitions
-        .retained_definition(table_index, txn.txid)
-        .expect("replication selection retains its logical definition");
+    let (logical_target, logical_definition) = row.definitions.selection(storage, table_index, txn.txid)?;
     let (row_target, definition) = row.definitions.selection(storage, row_table, txn.txid)?;
     let mapping = crate::storage::RelationColumnMap::new(logical_definition, definition, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -53705,7 +53702,7 @@ pub(crate) fn apply_replication_update(
         return apply_replication_insert_values(
             storage,
             txn,
-            table_index,
+            logical_target,
             logical_definition,
             &mut logical_new,
             arena,
@@ -57104,8 +57101,8 @@ pub(crate) fn merge<'a>(
             let row_table = tables[j];
             let row_id = ids[j];
             let bytes = target_bytes[j];
-            let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
-                        Ok(selection) => selection,
+            let row_definition = match definitions.definition(storage, row_table, txn.txid) {
+                        Ok(definition) => definition,
                 Err(error) => return sql_fail(error),
             };
             let mut row_schema = [ColType::Bool; MAX_COLUMNS];

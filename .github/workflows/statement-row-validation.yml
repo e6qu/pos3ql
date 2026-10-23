@@ -57,6 +57,14 @@ jobs:
           expected = ["1|first|8", "2|second|5", "3|third|9", "1|first|8", "2|second|12", "4|fourth|14"]
           assert observed == expected, observed
           print("PostgreSQL reference:", observed)
+          sql = pathlib.Path("tests/external/differential_exact/14_statement_row_paths.sql").read_bytes()
+          observed = subprocess.check_output([
+              "docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"], "psql", "-U", "postgres",
+              "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-X", "-qAt"
+          ], input=sql).decode().splitlines()
+          expected = ["1|7|20|10", "2|7|12|6", "1|7|20|10", "2|7|12|6", "1|20|10", "2|12|8", "2"]
+          assert observed == expected, observed
+          print("PostgreSQL statement paths:", observed)
           PYTHON
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings

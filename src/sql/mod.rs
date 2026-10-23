@@ -23628,12 +23628,8 @@ fn validate_recovered_enabled_subscription(
 // Reserve the production engine separately from each fixture's session and SQL pools.
 #[cfg(test)]
 pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budget {
-    Budget::new(
-        config.memtable_bytes
-            + config.block_cache_bytes
-            + Engine::extra_budget_bytes(config)
-            + fixture_bytes,
-    )
+    let plan = config.memory_plan(0, Engine::extra_budget_bytes(config));
+    Budget::new(plan.memtable + plan.tables + plan.block_cache + fixture_bytes)
 }
 
 #[cfg(test)]

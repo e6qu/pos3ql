@@ -1798,7 +1798,12 @@ impl Config {
         MemoryPlan {
             memtable: self.memtable_bytes,
             tables: tables_bytes,
-            block_cache: self.block_cache_bytes,
+            block_cache: if self.object_store_on {
+                crate::store::StackPlan::resolve(self.block_cache_bytes, self.disk_cache_bytes)
+                    .ram_budget_bytes()
+            } else {
+                0
+            },
             connections: per_connection * self.max_connections as usize,
             server: server_bytes,
         }
@@ -2711,7 +2716,20 @@ sql_arena_bytes = 4096
             + transaction
             + sequence_session;
         assert_eq!(plan.connections, per_connection * 10);
-        assert_eq!(plan.total(), per_connection * 10 + 1000 + 2000 + 500 + 250);
+        assert_eq!(plan.block_cache, 0);
+        assert_eq!(plan.total(), per_connection * 10 + 1000 + 500 + 250);
+        c.object_store_on = true;
+        c.block_cache_bytes = 2 * crate::store::MAX_PAYLOAD;
+        c.disk_cache_bytes = 3 * crate::store::BLOCK_SIZE;
+        let cache_bytes = crate::store::StackPlan::resolve(c.block_cache_bytes, c.disk_cache_bytes)
+            .ram_budget_bytes();
+        assert!(cache_bytes > c.block_cache_bytes);
+        let plan = c.memory_plan(500, 250);
+        assert_eq!(plan.block_cache, cache_bytes);
+        assert_eq!(
+            plan.total(),
+            per_connection * 10 + 1000 + cache_bytes + 500 + 250
+        );
     }
 
     #[test]

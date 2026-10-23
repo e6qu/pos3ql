@@ -60,6 +60,11 @@ pub(crate) struct BlockCache<S: BlockStore> {
 }
 
 impl<S: BlockStore> BlockCache<S> {
+    pub(crate) fn budget_bytes(frame_count: usize) -> usize {
+        frame_count * (MAX_PAYLOAD + size_of::<Frame>())
+            + FixedMap::<BlockId, usize>::budget_bytes(frame_count)
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut S {
         &mut self.inner
     }

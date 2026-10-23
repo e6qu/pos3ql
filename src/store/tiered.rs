@@ -56,6 +56,20 @@ pub(crate) struct StackPlan {
 }
 
 impl StackPlan {
+    pub(crate) fn ram_budget_bytes(&self) -> usize {
+        let ram = if self.ram.units == 0 {
+            0
+        } else {
+            BlockCache::<super::object::OwnedObjectStore>::budget_bytes(self.ram.units)
+        };
+        let disk = if self.disk.units == 0 {
+            0
+        } else {
+            DiskCache::<super::object::OwnedObjectStore>::budget_bytes(self.disk.units)
+        };
+        ram + disk
+    }
+
     pub(crate) fn resolve(block_cache_bytes: usize, disk_cache_bytes: usize) -> Self {
         StackPlan {
             ram: TierSizing::ram(block_cache_bytes),
@@ -522,6 +536,22 @@ mod tests {
         let (n, _) = s.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
+    }
+
+    #[test]
+    fn startup_budget_covers_cache_payloads_metadata_and_disk_scratch() {
+        for ram in [0, FRAME, 3 * FRAME + 17] {
+            for disk in [0, SLOT, 3 * SLOT + 19] {
+                let (_, store) = base();
+                let path = dir();
+                let plan = StackPlan::resolve(ram, disk);
+                let mut budget = Budget::new(plan.ram_budget_bytes());
+                let stack = build(&mut budget, store, plan, &path).unwrap();
+                assert_eq!(budget.remaining(), 0);
+                drop(stack);
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
         ports:
-          - 5432/tcp
+          - 15432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
@@ -84,8 +84,10 @@ jobs:
         run: |
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -c 'ALTER SYSTEM SET max_prepared_transactions = 1'
           docker restart "$POSTGRES_CONTAINER"
+          bound_port=$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$POSTGRES_CONTAINER")
+          test "$bound_port" = "$PGPORT"
           for attempt in $(seq 1 10); do
-            if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres; then break; fi
+            if docker exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -U postgres; then break; fi
             sleep 1
           done
           "${{ runner.temp }}/pos3ql-python/bin/python" - <<'PYTHON'
@@ -101,6 +103,7 @@ jobs:
           print("PostgreSQL 18 concurrent rewrite publication:", observed)
           PYTHON
       - name: Row layouts, retained readers, maintenance and transaction recovery
+        if: ${{ !cancelled() }}
         run: >-
           cargo test --release --lib --locked --
           row_layout:: row_scans:: row_walks:: row_images:: row_reads::

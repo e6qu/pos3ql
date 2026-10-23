@@ -71,5 +71,5 @@ jobs:
       - name: Statement write and recovery regressions
         run: >-
           cargo test --release --lib --locked -- statement_row_ row_definition_ row_undo_source_ row_publication:: row_ownership::
-          table_definition_ pending_table_definition type_edits:: query_definition_ copy_ replication_ partition_ foreign_key_ large_object_ prepared_ heap_relocation::
+          table_definition_ pending_table_definition type_edits:: query_definition_ copy_ replication_ pgoutput_ partition foreign_key large_object prepared_ heap_relocation::
           --test-threads=1

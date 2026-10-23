@@ -270,7 +270,7 @@ Comment text publication preserves name changes owned by another transaction.
 and recreate that table with different rows. Rolling back to the saved position
 restores the original table and rows. Earlier column changes and a type rename
 also survive commit and recovery with an empty local data directory. The
-[shared PostgreSQL comparison](../tests/external/differential_exact/12_table_definition_undo.sql)
+[shared PostgreSQL comparison](https://github.com/e6qu/pos3ql/blob/458738f54100c19ff0ed2ac9c7ad92ac57829df7/tests/external/differential_exact/12_table_definition_undo.sql)
 exercises these cases; storage tests also force internal table-number reuse.
 
 Table reads and scalar function contracts capture the complete type chain before

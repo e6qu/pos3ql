@@ -610,8 +610,9 @@ intact. `ADD CONSTRAINT ... NOT VALID` can install a rule for future values
 without scanning old ones. A domain
 whose value is an entire array validates that whole array. Unstored type
 definitions, views and foreign-table columns do not create local values to scan.
-The dependency walk uses statement memory and returns `54000`, "domain dependency
-graph exceeds the statement arena", if that space fills. Retaining table sources
+The dependency walk uses the connection's SQL arena, reserved by `sql_arena_bytes`
+at startup, and returns `54000`, "domain dependency graph exceeds the statement
+arena", if that space fills. Retaining table sources
 can return `54000`, "domain validation table sources exceed the statement arena".
 These rules follow
 [PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).

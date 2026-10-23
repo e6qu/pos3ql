@@ -30,13 +30,18 @@ impl TableDefinitionTarget {
             definition.identity.created_at,
             definition.identity.existence,
         ) && definition.committed_revision == self.committed_revision
-            && storage.pending_table_defs.selected_revision(definition, self.transaction)
+            && storage
+                .pending_table_defs
+                .selected_revision(definition, self.transaction)
                 == self.pending_revision
     }
 
     pub(crate) fn validate(self, storage: &Storage) -> Result<(), SqlError> {
         let table = storage.tables.get(self.table()).ok_or_else(|| {
-            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected table source is no longer present")
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "selected table source is no longer present"
+            )
         })?;
         let definition = table.definition.read();
         if self.matches_definition(storage, &definition)

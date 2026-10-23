@@ -13099,19 +13099,22 @@ pub(crate) fn drop_schema(
             Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
-        if let Err(error) = storage.lock_table(txn.txid, table, mode, false)
+        if let Err(error) = storage
+            .lock_table(txn.txid, table, mode, false)
             .and_then(|()| source.validate(storage))
         {
             return sql_fail(error);
         }
     }
     for (view, selected) in view_locks.iter().copied().enumerate() {
-        if selected && let Err(error) = storage.lock_object(
-            txn.txid,
-            crate::storage::ObjectLockTarget::View(view),
-            crate::sql::ast::TableLockMode::AccessExclusive,
-            false,
-        ) {
+        if selected
+            && let Err(error) = storage.lock_object(
+                txn.txid,
+                crate::storage::ObjectLockTarget::View(view),
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            )
+        {
             return sql_fail(error);
         }
     }
@@ -41920,7 +41923,10 @@ pub fn alter_domain(
         checks: current.checks,
         n_checks: current.n_checks,
     };
-    if matches!((action, spec.not_null), (A::SetNotNull, true) | (A::DropNotNull, false)) {
+    if matches!(
+        (action, spec.not_null),
+        (A::SetNotNull, true) | (A::DropNotNull, false)
+    ) {
         responder.command_complete("ALTER DOMAIN")?;
         return sql_ok();
     }
@@ -42176,8 +42182,12 @@ fn domain_rewrite_columns(
 ) -> Result<[bool; MAX_COLUMNS], SqlError> {
     let mut affected = [false; MAX_COLUMNS];
     for (column, definition) in definition.columns().iter().enumerate() {
-        let Some(identity) = definition.user_type else { continue };
-        let Some(domain) = storage.domain_reference_slot(identity, transaction)? else { continue };
+        let Some(identity) = definition.user_type else {
+            continue;
+        };
+        let Some(domain) = storage.domain_reference_slot(identity, transaction)? else {
+            continue;
+        };
         affected[column] = storage.domain_depends_on(domain, target, transaction)?;
     }
     Ok(affected)
@@ -42193,8 +42203,9 @@ fn validate_domain_rows(
 ) -> Result<(), SqlError> {
     let dependencies = match validation {
         DomainValidation::All => None,
-        DomainValidation::NotNull { .. } | DomainValidation::Check { .. } =>
-            Some(storage.domain_validation_dependencies(target, txid, arena)?),
+        DomainValidation::NotNull { .. } | DomainValidation::Check { .. } => {
+            Some(storage.domain_validation_dependencies(target, txid, arena)?)
+        }
     };
     let table_count = storage.table_count();
     let selected = arena.alloc_slice_with(table_count, |_| None).map_err(|_| {
@@ -42227,7 +42238,8 @@ fn validate_domain_rows(
     for (table_index, source) in selected.iter().copied().enumerate() {
         let Some(source) = source else { continue };
         source.validate(storage)?;
-        let def = definitions.retained_definition(table_index, txid)
+        let def = definitions
+            .retained_definition(table_index, txid)
             .expect("domain validation retains every selected table definition");
         let affected = match &dependencies {
             Some(dependencies) => dependencies.columns(storage, def, txid)?,

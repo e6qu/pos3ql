@@ -32510,12 +32510,6 @@ impl Storage {
                     table.rows.try_write_for_batch()?,
                 ))
             });
-        if rewritten && snapshots.retains_for(txid) {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "table rewrite publication conflicts with an active snapshot"
-            ));
-        }
         let n_enforcers = publication.n_enforcers;
         let generation = publication.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
@@ -32543,7 +32537,10 @@ impl Storage {
         // Publish the location protected by the write transition, not its old copy.
         let pending = pending_last(&versions.pending_row_versions, state.pending)
             .expect("validated pending head");
-        if snapshots.retains_for(txid) && state.has_committed_version() {
+        // A rewrite installs a new physical layout. An older snapshot first
+        // opening this table must not decode its prior rows with the new shape.
+        // Already selected byte sources retain their original images.
+        if !rewritten && snapshots.retains_for(txid) && state.has_committed_version() {
             let old = CommittedVersion {
                 home: state.committed,
                 lsn: state.committed_lsn,
@@ -35260,6 +35257,20 @@ impl Storage {
 
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
         if rewrote_rows {
+            // Deleted rows may still have history in the previous layout.
+            // Clear every stable slot, releasing shared owners between rows.
+            let end = self.tables[index].rows.read().scan_end();
+            for slot in 0..end {
+                let (mut versions, mut rows) = row_ownership::acquire(|| {
+                    Ok((
+                        self.row_versions.try_write_for_batch()?,
+                        self.tables[index].rows.try_write_for_batch()?,
+                    ))
+                });
+                if let Some((_, state)) = rows.entry_at_slot_mut(slot) {
+                    prune_committed_history(&mut versions.committed_row_versions, &mut state.history, None);
+                }
+            }
             self.set_spill_list(index, &[]);
             let mut publication = self.tables[index].publication();
             publication.generation = publication

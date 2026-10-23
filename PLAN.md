@@ -33,8 +33,8 @@ transaction boundary before several CPU workers run statements. A query must
 not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
-Connect the remaining table edits, schema moves and rewrites to that publication
-boundary. Keep a statement's retained definitions and rows consistent with the same
+Connect table edits, schema moves and rewrite finalization to that transaction
+publication boundary. Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
 preparation. Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may

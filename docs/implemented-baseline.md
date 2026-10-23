@@ -276,6 +276,13 @@ change keeps that value after recovery with an empty local directory. Storage
 regressions separately force a definition change between row preparation and
 installation; they check that it fails before rows or write counts change.
 
+An invoice import can remain open while an order column is physically rewritten.
+The rewrite discards the earlier layout from new row lookups; an older repeatable-read
+transaction that first opens that table after commit sees it as empty, as described
+in [PostgreSQL 18's rewrite caveat](https://www.postgresql.org/docs/18/mvcc-caveats.html).
+A byte source selected before replacement still reads its original heap or saved
+file. Existing table locks protect SQL reports already reading the affected table.
+
 Rollback records identify the table's lifetime and the installed definition.
 An old record cannot undo a newer edit or change a replacement table. SQL
 installs the edit and records its undo in one transaction operation, before
@@ -1037,8 +1044,8 @@ they cannot install into a replacement table. Their controls and reader mappings
 are included in startup memory reservations. Durable file bytes are unchanged.
 
 Paced merges keep the historical baseline, and byte scans skip versions newer than
-the selected snapshot. Complete rewrites with historical object versions remain
-explicitly guarded until a complete historical source exists. Merge scratch
+the selected snapshot. Maintenance that replaces a complete saved history remains
+guarded until that operation retains a complete historical source. Merge scratch
 exhaustion returns `54000`.
 
 A startup-sized registry protects durable and temporary object graphs used by

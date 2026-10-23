@@ -615,6 +615,9 @@ at startup, and returns `54000`, "domain dependency graph exceeds the statement
 arena", if that space fills. Temporary dependency links and the work queue are
 released before scanning rows. Table sources reuse the startup-reserved definition
 images; their pool reports `54000` if exhausted.
+If the spilled-row scan runs out of scratch space, its error reports the supplied
+arena's name and capacity; this can be the connection's SQL arena or a query
+workspace, so the scan does not prescribe a different reservation's setting.
 These rules follow
 [PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).
 Type comments move within the same database. Composite type renames journal only the name

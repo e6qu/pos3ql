@@ -30337,10 +30337,11 @@ impl Storage {
                 rowid: 0,
                 representation: SpilledRowRepresentation::Encoded(&[]),
             })
-            .map_err(|_| {
+            .map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "spilled scan batch exceeds the statement arena; raise work_arena_bytes"
+                    "spilled scan batch exceeds the statement arena: {}",
+                    error
                 )
             })?;
         let rows = &mut *rows;

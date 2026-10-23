@@ -153,8 +153,12 @@ impl Storage {
                 if Self::redundant_spilled_row_state(&state) {
                     continue;
                 }
-                let selected =
-                    RowRead::borrowed(state, &versions).visible_version_at(txid, command, commit);
+                let selected = RowRead::borrowed(
+                    publication.row_layout.visible_state(state),
+                    &versions,
+                    publication.generation,
+                )
+                .visible_version_at(txid, command, commit);
                 records[at] = source.capture_selection(rowid, selected)?;
                 at += 1;
             }
@@ -330,7 +334,7 @@ mod tests {
             let pending_version = {
                 let versions = storage.row_versions.read();
                 let state = storage.tables[table].rows.get(&2).unwrap();
-                RowRead::borrowed(state, &versions)
+                RowRead::borrowed(state, &versions, storage.table(table).generation())
                     .visible_version_at(11, 2, 7)
                     .unwrap()
                     .0

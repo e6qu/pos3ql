@@ -167,9 +167,12 @@ impl Storage {
                 .then(|| try_mutex(&self.snapshots, "snapshot state lock poisoned"))
                 .transpose()?;
             let definition = table.definition.try_read_for_batch()?;
-            let publication = matches!(task, RowCleanupTask::SavedMarkers { .. })
-                .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
-                .transpose()?;
+            let publication = matches!(
+                task,
+                RowCleanupTask::SavedMarkers { .. } | RowCleanupTask::SnapshotHistory
+            )
+            .then(|| try_mutex(&table.publication, "table publication lock poisoned"))
+            .transpose()?;
             let generations = table.spill_generations.try_read_for_batch()?;
             let versions = matches!(
                 task,
@@ -267,10 +270,15 @@ impl Storage {
                     );
                 }
                 RowCleanupTask::SnapshotHistory => {
+                    let oldest = if publication.as_ref().unwrap().row_layout.obsolete(state) {
+                        None
+                    } else {
+                        snapshots.as_ref().unwrap().oldest()
+                    };
                     changed |= prune_committed_history(
                         &mut versions.as_mut().unwrap().committed_row_versions,
                         &mut state.history,
-                        snapshots.as_ref().unwrap().oldest(),
+                        oldest,
                     );
                 }
                 RowCleanupTask::HeapRows(_) => {

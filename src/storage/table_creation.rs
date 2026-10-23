@@ -180,6 +180,7 @@ pub(super) fn allocate(
                 },
             },
         );
+        table.publication().row_layout = super::row_layout::RowLayout::initial();
         drop(state);
         drop(source);
         table.mark_dirty();

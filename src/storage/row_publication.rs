@@ -402,11 +402,15 @@ impl Storage {
                     panic!("table definition lock poisoned")
                 }
             };
+            let publication = super::row_ownership::try_mutex(
+                &self.tables[table].publication,
+                "table publication lock poisoned",
+            )?;
             let versions = self.row_versions.try_write_for_batch()?;
             let rows = self.tables[table].rows.try_write_for_batch()?;
-            Ok(Some((snapshots, definition, versions, rows)))
+            Ok(Some((snapshots, definition, publication, versions, rows)))
         });
-        let Some((snapshots, definition, mut versions, mut rows)) = owners else {
+        let Some((snapshots, definition, publication, mut versions, mut rows)) = owners else {
             return Ok(PendingPublication::DefinitionBusy);
         };
         target.validate_row_write(self, &definition)?;
@@ -449,7 +453,9 @@ impl Storage {
         let current_identity = current
             .and_then(|state| state.pending.tail)
             .map(|slot| versions.pending_row_versions[slot].identity);
-        if current != expected || current_identity != pending_identity {
+        if current.map(|state| publication.row_layout.visible_state(state)) != expected
+            || current_identity != pending_identity
+        {
             return Ok(PendingPublication::Retry);
         }
         if current.is_none() && rows.len() == rows.capacity() {
@@ -470,6 +476,14 @@ impl Storage {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         });
+        if publication.row_layout.obsolete(&state) {
+            prune_committed_history(
+                &mut versions.committed_row_versions,
+                &mut state.history,
+                None,
+            );
+            state.committed = None;
+        }
         // Readers at or after the current image need no earlier boundary.
         let retained = oldest
             .filter(|snapshot| !state.has_committed_version() || *snapshot < state.committed_lsn);
@@ -821,7 +835,7 @@ mod tests {
                             .unwrap();
                         let change = rename_definition(&storage, table, 7, "renamed");
                         if committed {
-                            assert_eq!(storage.commit_table_def(change), Some(false));
+                            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
                         }
                         let error = storage.publish_pending_write(prepared).err().unwrap();
                         assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);

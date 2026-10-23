@@ -6786,7 +6786,7 @@ impl Engine {
             {
                 continue;
             }
-            let Some(rewrote_rows) = self.storage.commit_table_def(change) else {
+            let Some(rewrote_rows) = self.storage.commit_table_def(change)? else {
                 continue;
             };
             self.commit_altered_tables
@@ -21681,10 +21681,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
+            let generation = storage.table(index).generation();
             storage
                 .table_mut(index)
                 .rows
-                .insert(rowid, crate::storage::RowState::committed_only_at(loc, lsn))
+                .insert(rowid, crate::storage::RowState::committed_in_generation(loc, lsn, generation))
                 .map_err(|e| SqlError {
                     sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
                     message: stack_format!(192, "journal replay overflows {}", e.what),

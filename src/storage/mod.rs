@@ -79,6 +79,7 @@ pub(crate) use row_cleanup::{
 mod row_cleanup;
 mod row_identities;
 mod row_images;
+mod row_layout;
 mod row_map;
 mod row_ownership;
 mod row_publication;
@@ -2478,8 +2479,8 @@ pub struct RowState {
     /// Commit LSN of the current image or deletion shadowing an older SST row.
     /// Temporary changes may share zero; their committed revision records presence.
     pub committed_lsn: u64,
-    /// None means no committed image. Saved/replayed images use Some(0);
-    /// new publications use the table's next revision for temporary spill coverage.
+    /// None means no committed image. Saved and replayed images carry their
+    /// selecting publication; writes use the next revision, including temporary data.
     pub(crate) committed_generation: Option<u64>,
     /// Latest committed row change not yet captured by a published row SST.
     /// Keeping this identity in the bounded overlay lets delta checkpoints
@@ -2618,15 +2619,16 @@ impl RowState {
         self.committed_generation.is_some()
     }
 
-    pub fn committed_only(loc: RowLoc) -> Self {
-        Self::committed_only_at(loc, 0)
+    #[cfg(test)]
+    pub(crate) fn committed_only_at(loc: RowLoc, commit_lsn: u64) -> Self {
+        Self::committed_in_generation(loc, commit_lsn, 0)
     }
 
-    pub fn committed_only_at(loc: RowLoc, commit_lsn: u64) -> Self {
+    pub(crate) fn committed_in_generation(loc: RowLoc, commit_lsn: u64, generation: u64) -> Self {
         Self {
             committed: Some(RowHome::Heap(loc)),
             committed_lsn: commit_lsn,
-            committed_generation: Some(0),
+            committed_generation: Some(generation),
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
@@ -2666,6 +2668,7 @@ struct TablePublication {
     generation: u64,
     /// Last committed replacement of row encodings, independent of row updates.
     rewrite_generation: u64,
+    row_layout: row_layout::RowLayout,
     /// A complete candidate list and its count publish together.
     enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     n_enforcers: usize,
@@ -18392,6 +18395,7 @@ impl Storage {
                         dirty: false,
                         generation: 1,
                         rewrite_generation: 0,
+                        row_layout: row_layout::RowLayout::initial(),
                         enforcers: [const { None }; MAX_VALUE_ENFORCERS],
                         n_enforcers: 0,
                     }),
@@ -30786,7 +30790,7 @@ impl Storage {
     }
 
     pub(crate) fn resident_rows(&self, table_slot: usize) -> RowReadView<'_> {
-        RowReadView::new(&self.row_versions, &self.tables[table_slot].rows)
+        RowReadView::for_table(self, table_slot)
     }
 
     pub(crate) fn for_each_resident_row_state(
@@ -30811,9 +30815,11 @@ impl Storage {
     ) -> Result<(row_walks::RowMetadataTarget, row_walks::RetainedRowIds), SqlError> {
         let table = &self.tables[table_slot];
         let definition = table.definition.read();
+        let publication = table.publication();
         let target = row_walks::RowMetadataTarget::Captured {
             table: table_slot,
             created_at: definition.identity.created_at,
+            generation: publication.generation,
         };
         Ok((target, self.row_walks.retain(&table.rows)?))
     }
@@ -31125,16 +31131,16 @@ impl Storage {
                 table.rows.try_read_for_batch()?,
             ))
         });
-        target.validate(definition.identity.created_at)?;
+        target.validate(definition.identity.created_at, publication.row_layout)?;
         let image = spill_generations::SpillGenerationImage::capture(
             &definition,
             publication.generation,
             table_slot,
             u64::MAX,
         );
-        let state = rows.get(&rowid).copied();
+        let state = rows.get(&rowid).copied().map(|state| publication.row_layout.visible_state(state));
         drop(rows);
-        RowReadView::capture_with(&self.row_versions, &versions, state, |state, captured| {
+        RowReadView::capture_with(&self.row_versions, &versions, state, publication.generation, |state, captured| {
             let heap = captured
                 .has_heap(state)
                 .then(|| self.heap.retain_read_view());
@@ -31150,6 +31156,7 @@ impl Storage {
                 table: table_slot,
                 rowid,
                 created_at: image.created_at,
+                generation: image.data_generation,
                 heap,
                 objects,
             }))
@@ -31231,8 +31238,7 @@ impl Storage {
             ))
         });
         rows.get(&rowid).is_some_and(|&state| {
-            RowRead::borrowed(state, &versions)
-                .pending_last()
+            pending_last(&versions.pending_row_versions, state.pending)
                 .is_some_and(|pending| pending.txid == txid)
         })
     }
@@ -31293,6 +31299,7 @@ impl Storage {
             let snapshot = RowSnapshot {
                 created_at: self.tables[table_slot].created_at(),
                 version,
+                generation: state.generation,
             };
             if let RowHome::Spilled {
                 len, commit_lsn, ..
@@ -31396,6 +31403,7 @@ impl Storage {
         let target = row_walks::RowMetadataTarget::Captured {
             table: table_slot,
             created_at: snapshot.created_at,
+            generation: snapshot.generation,
         };
         let state = match self.capture_resident_row_metadata(target, rowid)? {
             Some(state) => state,
@@ -31419,6 +31427,13 @@ impl Storage {
         snapshot: RowSnapshot,
         state: RowRead<'_>,
     ) -> Result<VisibleRowHome, SqlError> {
+        if let RowVersionIdentity::Committed(lsn) = snapshot.version
+            && self.tables[table_slot].definition().persistence == RelationPersistence::Temporary
+            && state.committed_lsn == lsn
+            && state.committed_generation.is_some_and(|generation| generation > snapshot.generation) {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
+                "retained temporary row version is no longer available"));
+        }
         let image = match snapshot.version {
             RowVersionIdentity::Pending(identity) => {
                 let home = state
@@ -35256,16 +35271,17 @@ impl Storage {
 
     /// Promotes the latest pending definition after its WAL batch is durable.
     /// Row images are promoted separately by the transaction coordinator.
-    pub(crate) fn commit_table_def(&mut self, change: TableDefinitionChange) -> Option<bool> {
+    pub(crate) fn commit_table_def(&mut self, change: TableDefinitionChange) -> Result<Option<bool>, SqlError> {
         let index = change.table();
-        let identity = self.tables.get(index)?.identity();
+        let Some(table) = self.tables.get(index) else { return Ok(None) };
+        let identity = table.identity();
         if !change.source.matches(
             self,
             identity.database,
             identity.created_at,
             identity.existence,
         ) {
-            return None;
+            return Ok(None);
         }
         {
             let definition = self.tables[index].definition.read();
@@ -35274,10 +35290,10 @@ impl Storage {
                 change.transaction,
                 change.revision,
             ) {
-                return None;
+                return Ok(None);
             }
         }
-        let pending = self.pending_table_def(index).map(|pending| *pending)?;
+        let Some(pending) = self.pending_table_def(index).map(|pending| *pending) else { return Ok(None) };
         let txid = change.transaction;
         let mut definition = pending.def;
         definition.has_toast |= {
@@ -35294,11 +35310,12 @@ impl Storage {
             definition,
             &pending.column_mapping,
             TableDefinitionRevision::catalog(pending.revision),
-        );
+            pending.rewrites_rows,
+        )?;
         self.commit_index_table_names(index, txid);
         self.clear_pending_table_defs(index);
         self.commit_constraint_comment_identities(index, txid);
-        Some(pending.rewrites_rows)
+        Ok(Some(pending.rewrites_rows))
     }
 
     fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
@@ -35322,32 +35339,12 @@ impl Storage {
 
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
         if rewrote_rows {
-            // Deleted rows may still have history in the previous layout.
-            // Clear every stable slot, releasing shared owners between rows.
-            let end = self.tables[index].rows.read().scan_end();
-            for slot in 0..end {
-                let (mut versions, mut rows) = row_ownership::acquire(|| {
-                    Ok((
-                        self.row_versions.try_write_for_batch()?,
-                        self.tables[index].rows.try_write_for_batch()?,
-                    ))
-                });
-                if let Some((_, state)) = rows.entry_at_slot_mut(slot) {
-                    prune_committed_history(
-                        &mut versions.committed_row_versions,
-                        &mut state.history,
-                        None,
-                    );
-                }
-            }
             self.set_spill_list(index, &[]);
             let mut publication = self.tables[index].publication();
-            publication.generation = publication
-                .generation
-                .checked_add(1)
-                .expect("table publication generation exhausted");
             publication.rewrite_generation = publication.generation;
             publication.dirty = true;
+            drop(publication);
+            self.snapshot_state().statement_reclamation_pending = true;
         }
     }
 
@@ -35460,7 +35457,7 @@ impl Storage {
             definition.has_rules
         };
         let revision = self.reserve_table_definition_revision()?;
-        self.set_table_def(index, def, &column_mapping, revision);
+        self.set_table_def(index, def, &column_mapping, revision, false)?;
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
             self.tables[index]
@@ -46102,10 +46099,27 @@ impl Storage {
         def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         revision: TableDefinitionRevision,
-    ) {
+        rewrites_rows: bool,
+    ) -> Result<(), SqlError> {
         let old = *self.tables[index].definition();
         let database_oid = self.tables[index].database();
         let database = Some(database_oid);
+        // Schema moves and inbound foreign-key rebinding also publish definitions.
+        // Check every affected counter before changing any catalog entry.
+        for (slot, table) in self.tables.iter().enumerate() {
+            if table.database() != database_oid { continue; }
+            let definition = table.definition();
+            let schema_change = old.schema != def.schema;
+            let follows_schema = schema_change && table.live() && definition.fkeys().iter().any(|key| key.parent_schema == old.schema && key.parent == old.name);
+            let follows_name = old.name != def.name && definition.fkeys().iter().any(|key| {
+                let schema = if follows_schema && key.parent_schema == old.schema && key.parent == old.name { def.schema } else { key.parent_schema };
+                schema == def.schema && key.parent == old.name
+            });
+            let publications = u64::from(slot == index) + u64::from(schema_change && slot == index) + u64::from(follows_schema) + u64::from(follows_name);
+            table.publication().generation.checked_add(publications).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "table publication generation exhausted")
+            })?;
+        }
         if old.schema != def.schema {
             self.move_table_schema(index, def.schema, revision);
         }
@@ -46207,8 +46221,17 @@ impl Storage {
             index_def.schema = def.schema;
             index_def.table = def.name;
         }
-        *self.tables[index].definition_mut(revision) = def;
-        self.tables[index].mark_dirty();
+        {
+            let table = &mut self.tables[index];
+            let mut publication = table.publication.lock().expect("table publication lock poisoned");
+            let next = publication.generation.checked_add(1).expect("definition publication was preflighted");
+            *table.definition.committed_mut(revision) = def;
+            publication.generation = next;
+            if rewrites_rows {
+                publication.row_layout = row_layout::RowLayout::installed_at(next);
+            }
+            publication.dirty = true;
+        }
         self.rename_stored_query_dependency(
             DependencyClass::Table,
             index,
@@ -46216,6 +46239,7 @@ impl Storage {
             def.schema,
             def.name,
         );
+        Ok(())
     }
 
     pub fn next_rowid(&self) -> Result<u64, SqlError> {
@@ -55015,7 +55039,7 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            assert_eq!(storage.commit_table_def(second_change), Some(false));
+            assert_eq!(storage.commit_table_def(second_change).unwrap(), Some(false));
             assert_eq!(original.name.as_str(), "original");
             let published = storage.table_definition_images();
             assert_eq!(

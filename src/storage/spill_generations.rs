@@ -1658,6 +1658,11 @@ impl SpilledRowState {
     }
 
     pub(super) fn state(&self) -> super::RowState {
+        let generation = self.roots.pool.slots[self.roots.slot]
+            .snapshot
+            .read()
+            .expect("query SST roots poisoned")
+            .data_generation;
         super::RowState {
             committed: self.version.len.map(|len| super::RowHome::Spilled {
                 len,
@@ -1665,7 +1670,7 @@ impl SpilledRowState {
                 commit_lsn: self.version.commit_lsn,
             }),
             committed_lsn: self.version.commit_lsn,
-            committed_generation: Some(0),
+            committed_generation: Some(generation),
             checkpoint_change_lsn: 0,
             history: super::CommittedHistory::empty(),
             pending: super::PendingVersions::empty(),
@@ -1751,6 +1756,7 @@ pub(super) struct SpilledRowRead {
     roots: QueryRootLease,
     pub(super) table_slot: usize,
     pub(super) created_at: u64,
+    generation: u64,
     pub(super) rowid: u64,
     pub(super) len: u32,
     pub(super) member: SpillGenerationId,
@@ -1765,14 +1771,15 @@ impl SpilledRowRead {
         member: SpillGenerationId,
         commit_lsn: u64,
     ) -> Result<Self, SqlError> {
-        let (table_slot, created_at) = roots.with_snapshot(|source| {
+        let (table_slot, created_at, generation) = roots.with_snapshot(|source| {
             source.handle_for_generation(member)?;
-            Ok((source.table_slot, source.created_at))
+            Ok((source.table_slot, source.created_at, source.data_generation))
         })?;
         Ok(Self {
             roots,
             table_slot,
             created_at,
+            generation,
             rowid,
             len,
             member,
@@ -1784,6 +1791,7 @@ impl SpilledRowRead {
         super::RowSnapshot {
             created_at: self.created_at,
             version: super::row_images::RowVersionIdentity::Committed(self.commit_lsn),
+            generation: self.generation,
         }
     }
 
@@ -1851,7 +1859,7 @@ pub(super) struct SpillGenerationImage {
     n_columns: usize,
     table_slot: usize,
     pub(super) created_at: u64,
-    data_generation: u64,
+    pub(super) data_generation: u64,
     pub(super) commit_lsn: u64,
 }
 
@@ -5262,6 +5270,7 @@ mod tests {
                     super::super::RowSnapshot {
                         created_at: storage.table(table).created_at(),
                         version: super::super::row_images::RowVersionIdentity::Committed(7),
+                        generation: storage.table(table).generation(),
                     },
                 )
                 .unwrap();

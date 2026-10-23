@@ -64,7 +64,7 @@ impl super::Storage {
         let Some(&state) = rows.get(&rowid) else {
             return Ok(RowSelfChange::Original);
         };
-        let state = RowRead::borrowed(state, &versions);
+        let state = RowRead::borrowed(state, &versions, original.generation);
         let Some(pending) = state.pending_last().filter(|pending| pending.txid == txid) else {
             return Ok(RowSelfChange::Original);
         };
@@ -95,6 +95,7 @@ pub(super) struct CapturedRowSources {
     pub(super) table: usize,
     pub(super) rowid: u64,
     pub(super) created_at: u64,
+    pub(super) generation: u64,
     pub(super) heap: Option<HeapReadView>,
     pub(super) objects: Option<QueryRootLease>,
 }
@@ -268,6 +269,7 @@ impl CapturedRowMetadata {
 /// borrow their owner. Only these owning views can issue resident reads.
 pub(crate) struct RowRead<'a> {
     state: RowState,
+    pub(super) generation: u64,
     versions: VersionOwner<'a>,
     captured_roots: Option<&'a CapturedSpillRoots<'a>>,
 }
@@ -293,9 +295,14 @@ impl Deref for RowRead<'_> {
 }
 
 impl<'owner> RowRead<'owner> {
-    pub(super) fn borrowed(state: RowState, versions: &'owner RowVersionState) -> Self {
+    pub(super) fn borrowed(
+        state: RowState,
+        versions: &'owner RowVersionState,
+        generation: u64,
+    ) -> Self {
         Self {
             state,
+            generation,
             versions: VersionOwner::Borrowed(versions),
             captured_roots: None,
         }
@@ -410,6 +417,7 @@ impl<'owner> RowRead<'owner> {
         let snapshot = super::RowSnapshot {
             created_at: source.created_at,
             version,
+            generation: source.generation,
         };
         match home {
             RowHome::Heap(location) => {
@@ -463,6 +471,9 @@ impl<'owner> RowRead<'owner> {
         let state = source.state();
         Self {
             state,
+            generation: state
+                .committed_generation
+                .expect("saved row has a publication"),
             versions: VersionOwner::Immutable(source),
             captured_roots: None,
         }
@@ -477,6 +488,7 @@ impl<'owner> RowRead<'owner> {
     {
         RowRead {
             state: self.state,
+            generation: self.generation,
             versions: self.versions,
             captured_roots: Some(roots),
         }
@@ -641,14 +653,42 @@ impl<'owner> RowRead<'owner> {
 pub(crate) struct RowReadView<'a> {
     rows: RwLockReadGuard<'a, RowEntries>,
     versions: RwLockReadGuard<'a, RowVersionState>,
+    layout: super::row_layout::RowLayout,
+    generation: u64,
 }
 
 impl<'a> RowReadView<'a> {
+    pub(super) fn for_table(storage: &'a super::Storage, table: usize) -> Self {
+        let table = &storage.tables[table];
+        let (publication, versions, rows) = super::row_ownership::acquire(|| {
+            Ok((
+                super::row_ownership::try_mutex(
+                    &table.publication,
+                    "table publication lock poisoned",
+                )?,
+                storage.row_versions.try_read_for_batch()?,
+                table.rows.try_read_for_batch()?,
+            ))
+        });
+        Self {
+            rows,
+            versions,
+            layout: publication.row_layout,
+            generation: publication.generation,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn new(versions: &'a RowVersionPools, rows: &'a RowMap) -> Self {
         let (versions, rows) = super::row_ownership::acquire(|| {
             Ok((versions.try_read_for_batch()?, rows.try_read_for_batch()?))
         });
-        Self { rows, versions }
+        Self {
+            rows,
+            versions,
+            layout: super::row_layout::RowLayout::initial(),
+            generation: 0,
+        }
     }
 
     #[cfg(test)]
@@ -662,13 +702,14 @@ impl<'a> RowReadView<'a> {
         });
         let state = rows.get(&rowid).copied();
         drop(rows);
-        Self::capture_with(versions, &owner, state, |_, _| Ok(None))
+        Self::capture_with(versions, &owner, state, 0, |_, _| Ok(None))
     }
 
     pub(super) fn capture_with(
         versions: &RowVersionPools,
         owner: &RowVersionState,
         state: Option<RowState>,
+        generation: u64,
         sources: impl FnOnce(
             RowState,
             &CapturedRowMetadata,
@@ -682,15 +723,23 @@ impl<'a> RowReadView<'a> {
             .capture(owner, state, |image| sources(state, image))?;
         Ok(Some(RowRead {
             state,
+            generation,
             versions: VersionOwner::Retained(image),
             captured_roots: None,
         }))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, RowRead<'_>)> {
-        self.rows
-            .iter()
-            .map(|(&rowid, &state)| (rowid, RowRead::borrowed(state, &self.versions)))
+        self.rows.iter().map(|(&rowid, &state)| {
+            (
+                rowid,
+                RowRead::borrowed(
+                    self.layout.visible_state(state),
+                    &self.versions,
+                    self.generation,
+                ),
+            )
+        })
     }
 }
 

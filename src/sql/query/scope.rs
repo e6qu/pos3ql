@@ -1875,7 +1875,10 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            assert_eq!(storage.commit_table_def(published_change), Some(false));
+            assert_eq!(
+                storage.commit_table_def(published_change).unwrap(),
+                Some(false)
+            );
             storage.commit_drop(table);
             assert_eq!(
                 storage.create_table(definition("replacement", 1)).unwrap(),

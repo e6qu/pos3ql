@@ -28,7 +28,7 @@ fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_re
         let arena = Arena::new(&mut budget, "unrelated catalog COPY", 1 << 18).unwrap();
         let guc = GucState::new();
         run_txn(&mut engine, &mut budget, &mut writer,
-            "CREATE DOMAIN catalog_customer_id AS integer; CREATE DOMAIN catalog_unused_domain AS integer; CREATE TYPE catalog_pair AS (value integer); CREATE TYPE catalog_state AS ENUM ('ready'); CREATE TYPE catalog_unused_pair AS (value integer); CREATE SCHEMA catalog_empty; CREATE TABLE catalog_orders (id catalog_customer_id PRIMARY KEY); CREATE TABLE catalog_invoices (id integer); INSERT INTO catalog_orders VALUES (1); INSERT INTO catalog_invoices VALUES (22)");
+            "CREATE DOMAIN catalog_customer_id AS integer; CREATE DOMAIN catalog_unused_domain AS integer; CREATE TYPE catalog_pair AS (value integer); CREATE TYPE catalog_state AS ENUM ('ready'); CREATE TYPE catalog_unused_pair AS (value integer); CREATE SCHEMA catalog_empty; CREATE TABLE catalog_orders (id catalog_customer_id PRIMARY KEY); CREATE TABLE catalog_invoices (id integer); CREATE TABLE catalog_receipts (id integer); INSERT INTO catalog_orders VALUES (1); INSERT INTO catalog_invoices VALUES (22); INSERT INTO catalog_receipts VALUES (22)");
         assert!(engine.checkpoint().unwrap());
         let begin = match mode {
             crate::config::TransactionMode::Mvcc => "BEGIN ISOLATION LEVEL REPEATABLE READ",
@@ -36,7 +36,7 @@ fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_re
         };
         run_txn(&mut engine, &mut budget, &mut reader, begin);
         assert_eq!(data_rows(&run_txn_bytes(&mut engine, &mut budget, &mut reader,
-            "SELECT id FROM catalog_invoices")), ["22"]);
+            "SELECT id FROM catalog_receipts")), ["22"]);
         run_txn(&mut engine, &mut budget, &mut copier, "BEGIN; COPY catalog_invoices FROM STDIN");
         let setup = engine.take_pending_copy().expect("unrelated invoice COPY");
         for (sql, tag) in [
@@ -221,6 +221,45 @@ fn catalog_publication_domain_validation_ignores_unstored_and_foreign_values() {
         "SELECT 0::validation_unstored")), ["23514"]);
     assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget,
         "SELECT NULL::validation_unstored")), ["23502"]);
+}
+
+#[test]
+fn catalog_publication_domain_graph_exhaustion_restores_the_prior_definition() {
+    let mut config = test_config("catalog-domain-graph-capacity");
+    config.max_domains = 512;
+    config.work_arena_bytes = 16 << 10;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let created = session.execute(&mut engine,
+        "CREATE DOMAIN capacity_domain AS integer; CREATE TABLE capacity_values (value capacity_domain)", true);
+    assert!(error_sqlstates(&created).is_empty());
+    assert!(created.windows(12).any(|part| part == b"CREATE TABLE"));
+    let exhausted = session.execute(&mut engine,
+        "ALTER DOMAIN capacity_domain ADD CONSTRAINT capacity_positive CHECK (VALUE > 0)", true);
+    assert_eq!(error_sqlstates(&exhausted), ["54000"]);
+    assert!(String::from_utf8_lossy(&exhausted).contains("domain dependency graph exceeds the statement arena"));
+    let domain = engine.storage.domain_slot("public", "capacity_domain", 0).unwrap();
+    assert!(engine.storage.domain_for(domain, 0).checks().is_empty());
+    assert!(session.transaction.ddl().is_empty());
+    let resumed = session.execute(&mut engine, "ALTER DOMAIN capacity_domain SET DEFAULT 9", true);
+    assert!(error_sqlstates(&resumed).is_empty());
+    assert!(resumed.windows(12).any(|part| part == b"ALTER DOMAIN"));
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT 7", true)), ["7"]);
+    assert!(engine.fatal_commit_failure().is_none());
+}
+
+#[test]
+fn catalog_publication_request_fixtures_release_aborted_transaction_owners() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE abandoned_request (id integer)");
+    let failed = run_with(&mut engine, &mut budget,
+        "BEGIN; LOCK TABLE abandoned_request IN SHARE MODE; SELECT 1 / 0; ROLLBACK");
+    assert_eq!(error_sqlstates(&failed), ["22012"]);
+    assert!(!engine.storage.has_access_share_locks());
+    assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
+        "INSERT INTO abandoned_request VALUES (7); SELECT id FROM abandoned_request")), ["7"]);
+    assert!(engine.fatal_commit_failure().is_none());
 }
 
 #[test]
@@ -14330,6 +14369,23 @@ fn test_data_directory_lives_until_the_last_engine_or_configuration_owner() {
     assert!(!path.exists(), "the final owner removes the test directory");
 }
 
+fn finish_test_request(
+    engine: &mut Engine,
+    transaction: &mut TxnState,
+    guc: &GucState,
+    status: ExecutionStatus,
+) {
+    assert_eq!(status, ExecutionStatus::Complete,
+        "a suspended fixture needs caller-owned transaction state");
+    assert!(engine.pending_copy.is_none(),
+        "streamed COPY needs caller-owned transaction state");
+    if transaction.is_active() {
+        assert!(transaction.staged_commit().is_none(),
+            "a durable commit needs caller-owned completion state");
+        crate::mem::guard::forbid_alloc(|| engine.rollback_txn(transaction, guc));
+    }
+}
+
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
     let mut guc = GucState::new();
     run_with_guc(engine, budget, sql_text, 32 << 20, &mut guc)
@@ -14350,7 +14406,7 @@ fn run_with_ddl_capacity(
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
-    engine
+    let status = engine
         .execute_simple(
             sql_text,
             &arena,
@@ -14362,6 +14418,7 @@ fn run_with_ddl_capacity(
             1,
         )
         .unwrap();
+    finish_test_request(engine, &mut txn, &guc, status);
     buffer.readable().to_vec()
 }
 
@@ -14470,7 +14527,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
     let mut cursors = test_cursors(&mut request_budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
-    crate::mem::guard::forbid_alloc(|| {
+    let status = crate::mem::guard::forbid_alloc(|| {
         engine.execute_simple(
             sql_text,
             &arena,
@@ -14483,6 +14540,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
         )
     })
     .unwrap();
+    finish_test_request(engine, &mut txn, &guc, status);
     buffer.readable().to_vec()
 }
 
@@ -15644,7 +15702,7 @@ fn run_with_guc(
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
     let mut responder = Responder::new(&mut buffer);
-    engine
+    let status = engine
         .execute_simple(
             sql_text,
             &arena,
@@ -15656,6 +15714,7 @@ fn run_with_guc(
             1,
         )
         .unwrap();
+    finish_test_request(engine, &mut txn, guc, status);
     buffer.readable().to_vec()
 }
 
@@ -53175,41 +53234,31 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
 
 #[test]
 fn composite_attribute_rename_rewrites_domain_chain_transactionally() {
-    let (mut engine, mut budget) = test_engine();
-    run_with(
-        &mut engine,
-        &mut budget,
+    let config = test_config("domain-chain-rename-rollback");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
         "CREATE TYPE renamed_domain_point AS (x integer, y integer); \
          CREATE DOMAIN renamed_domain_root AS renamed_domain_point CHECK ((VALUE).x > 0); \
          CREATE DOMAIN renamed_domain_child AS renamed_domain_root CHECK ((VALUE).y < 10); \
          CREATE TABLE renamed_domain_values (value renamed_domain_child); \
-         INSERT INTO renamed_domain_values VALUES (ROW(3,4)::renamed_domain_point)",
-    );
-
-    let failed = run_with(
-        &mut engine,
-        &mut budget,
-        "BEGIN; \
-         ALTER TYPE renamed_domain_point RENAME ATTRIBUTE x TO east; \
-         INSERT INTO renamed_domain_values VALUES (ROW(1,14)::renamed_domain_point); \
-         ROLLBACK",
-    );
-    assert!(String::from_utf8_lossy(&failed).contains("23514"));
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT (value).x FROM renamed_domain_values",
-        )),
-        ["3"]
-    );
-    let original_constraint = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO renamed_domain_values VALUES (ROW(-1,4)::renamed_domain_point)",
-    );
-    assert!(String::from_utf8_lossy(&original_constraint).contains("23514"));
+         INSERT INTO renamed_domain_values VALUES (ROW(3,4)::renamed_domain_point)", true);
+    let failed = session.execute(&mut engine,
+        "BEGIN; ALTER TYPE renamed_domain_point RENAME ATTRIBUTE x TO east; \
+         INSERT INTO renamed_domain_values VALUES (ROW(1,14)::renamed_domain_point)", true);
+    assert_eq!(error_sqlstates(&failed), ["23514"]);
+    assert!(session.transaction.failed);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert!(!engine.storage.has_access_share_locks());
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT (value).x FROM renamed_domain_values", true)), ["3"]);
+    let original_constraint = session.execute(&mut engine,
+        "INSERT INTO renamed_domain_values VALUES (ROW(-1,4)::renamed_domain_point)", true);
+    assert_eq!(error_sqlstates(&original_constraint), ["23514"],
+        "{}", String::from_utf8_lossy(&original_constraint));
 }
+
 
 #[test]
 fn composite_attribute_rename_rewrites_nested_and_set_operation_views() {
@@ -53493,12 +53542,12 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
             "CREATE SCHEMA durable_domain; \
              CREATE TYPE domain_point AS (x integer, y integer); \
              CREATE DOMAIN point_value AS domain_point CHECK ((VALUE).x > 0); \
+             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE DOMAIN point_child AS point_value CHECK ((VALUE).y < 20); \
              CREATE TYPE domain_point_wrapper AS (value point_child); \
              CREATE TABLE domain_point_values (value point_value, values point_value[], direct_values domain_point[], child point_child, child_values point_child[], wrapped domain_point_wrapper); \
              INSERT INTO domain_point_values VALUES \
                (ROW(6,7)::point_value, ARRAY[ROW(7,8)::domain_point]::point_value[], ARRAY[ROW(9,10)::domain_point], ROW(11,12)::point_child, ARRAY[ROW(13,14)::domain_point]::point_child[], ROW(ROW(15,16)::point_child)::domain_point_wrapper); \
-             ALTER DOMAIN point_value ADD CHECK ((VALUE).y > 0); \
              CREATE TABLE array_subquery_values AS \
                SELECT ARRAY(SELECT direct_values[1] FROM domain_point_values) AS values; \
              ALTER TYPE domain_point ADD ATTRIBUTE z integer; \
@@ -53583,7 +53632,7 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         "ALTER DOMAIN point_value ADD CHECK ((VALUE).east < 7)",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("23514"),
+        String::from_utf8_lossy(&rejected).contains("0A000"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );

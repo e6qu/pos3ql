@@ -56,7 +56,7 @@ jobs:
           subprocess.run(command, input=setup, text=True, check=True)
           reader = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
           try:
-              reader.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 'ready' FROM catalog_invoices; SELECT 'orders' FROM catalog_orders;\n")
+              reader.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 'ready' FROM catalog_receipts; SELECT 'orders' FROM catalog_orders;\n")
               reader.stdin.flush()
               assert select.select([reader.stdout], [], [], 5)[0], "reference reader did not start"
               assert reader.stdout.readline().strip() == "ready"
@@ -118,6 +118,6 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Catalog publication and recovery regressions
         run: >-
-          cargo test --release --lib --locked -- catalog_publication_ alter_domain_ domain_ composite_ type_definition_ type_edits::
+          cargo test --release --lib --locked -- catalog_publication_ alter_domain_ domain_ composite_ type_definitions:: type_edits::
           named_type_ shared_type_ table_definition_ schema_ copy_ concurrent_partition_detach
           --test-threads=1

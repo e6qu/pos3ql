@@ -6,8 +6,10 @@ CREATE TYPE catalog_unused_pair AS (value integer);
 CREATE SCHEMA catalog_empty;
 CREATE TABLE catalog_orders (id catalog_customer_id PRIMARY KEY);
 CREATE TABLE catalog_invoices (id integer);
+CREATE TABLE catalog_receipts (id integer);
 INSERT INTO catalog_orders VALUES (1);
 INSERT INTO catalog_invoices VALUES (22);
+INSERT INTO catalog_receipts VALUES (22);
 
 -- Changes while another connection retains unrelated work.
 ALTER DOMAIN catalog_customer_id RENAME TO catalog_account_id;

@@ -604,8 +604,10 @@ NOT NULL settings do not scan values. VALIDATE CONSTRAINT checks existing values
 again even when the rule was already marked valid.
 
 PostgreSQL rejects validation when a domain is stored inside arrays or composite
-values. For example, a column declared as `customer_id[]` makes adding a checked
-rule to `customer_id` fail with `0A000`; the old rules remain intact. A domain
+values. For example, a column declared as `customer_id[]` makes immediately
+validating a new rule on `customer_id` fail with `0A000`; the old rules remain
+intact. `ADD CONSTRAINT ... NOT VALID` can install a rule for future values
+without scanning old ones. A domain
 whose value is an entire array validates that whole array. Unstored type
 definitions, views and foreign-table columns do not create local values to scan.
 The dependency walk uses statement memory and returns `54000`, "domain dependency

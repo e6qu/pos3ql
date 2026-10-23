@@ -7251,11 +7251,8 @@ impl Engine {
         for slot in 0..self.storage.extended_statistics_count() {
             self.storage.commit_extended_statistics_data(slot, txn.txid);
         }
-        // Past the durability point, so these fire iff the transaction really
-        // committed: apply its LISTEN/UNLISTEN to the shared registry and move
-        // its notifications into the delivery outbox. A pool-exhaustion here is
-        // a loud error reported to the client — like a post-commit upload
-        // failure, the data is committed regardless — never a silent drop.
+        // Delivery state installs after durability, under the same owners as
+        // rows and definitions. Failure requires recovery, never row rollback.
         let notify_result = self.flush_committed_notifications(txn);
         let temporary_result = self.storage.apply_temporary_on_commit();
         if let Some(guc) = guc {

@@ -1208,27 +1208,6 @@ pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u6
     }
 }
 
-fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
-    if matches!(
-        statement,
-        Stmt::AlterType {
-            action: ast::AlterTypeAction::AddValue { .. }
-                | ast::AlterTypeAction::RenameValue { .. },
-            ..
-        }
-    ) {
-        return false;
-    }
-    matches!(
-        statement,
-        Stmt::AlterDomain { .. }
-            | Stmt::DropDomain { .. }
-            | Stmt::AlterType { .. }
-            | Stmt::DropType { .. }
-            | Stmt::DropSchema { .. }
-    )
-}
-
 fn statement_tag(statement: &Stmt<'_>) -> &'static str {
     match statement {
         Stmt::Explain { statement, .. } => statement_tag(statement),
@@ -14763,17 +14742,6 @@ impl Engine {
                 statement_tag(statement)
             )));
         }
-        if statement_changes_schema(statement)
-            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
-        {
-            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
-                return Ok(Err(error));
-            }
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a schema lock"
-            )));
-        }
         let _snapshot_lease = match self.begin_command_snapshot(
             txn,
             true,
@@ -15011,21 +14979,6 @@ impl Engine {
                 sqlstate::READ_ONLY_SQL_TRANSACTION,
                 "cannot execute {} in a read-only transaction",
                 statement_tag(statement)
-            )));
-        }
-        // Historical row images currently share the committed table
-        // definition. Prevent a concurrent definition rewrite from making an
-        // old row undecodable by joining the same wait graph as relation and
-        // row locks.
-        if statement_changes_schema(statement)
-            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
-        {
-            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
-                return Ok(Err(error));
-            }
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a schema lock"
             )));
         }
         // A data-modifying WITH statement lowers the command snapshot itself;

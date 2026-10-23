@@ -77,6 +77,153 @@ fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_re
 }
 
 #[test]
+fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_writes() {
+    for (mode, suffix) in [(crate::config::TransactionMode::Mvcc, "mvcc"), (crate::config::TransactionMode::Locking, "locking")] {
+        let mut config = test_config(&format!("catalog-validation-locks-{suffix}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut editor = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(33);
+        editor.success(&mut engine,
+            "CREATE DOMAIN locked_domain AS integer; CREATE DOMAIN locked_child AS locked_domain; CREATE TABLE locked_domain_values (id locked_child); INSERT INTO locked_domain_values VALUES (20)", true);
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "BEGIN; SELECT id FROM locked_domain_values", true)), ["20"]);
+        let allowed = editor.execute(&mut engine,
+            "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_positive CHECK (VALUE > 0)", true);
+        assert!(error_sqlstates(&allowed).is_empty());
+        assert!(allowed.windows(12).any(|bytes| bytes == b"ALTER DOMAIN"));
+        reader.success(&mut engine, "COMMIT", true);
+        writer.success(&mut engine, "BEGIN; INSERT INTO locked_domain_values VALUES (2)", true);
+        let sql = "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_large CHECK (VALUE > 10)";
+        let blocked = editor.execute(&mut engine, sql, true);
+        assert!(blocked.is_empty(), "a waiting domain edit must not emit a response");
+        assert!(editor.transaction.ddl().is_empty());
+        assert!(engine.fatal_commit_failure().is_none());
+        writer.success(&mut engine, "COMMIT", true);
+        let status = crate::mem::guard::forbid_alloc(|| engine.execute_simple_from(
+            sql, 0, &editor.arena, &mut editor.transaction, &mut editor.pool,
+            &mut editor.cursors, &mut editor.guc, &mut Responder::new(&mut editor.send),
+            editor.connection_id, false,
+        )).unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert_eq!(error_sqlstates(editor.send.readable()), ["23514"]);
+        assert!(engine.fatal_commit_failure().is_none());
+        assert_eq!(data_rows(&editor.success(&mut engine,
+            "INSERT INTO locked_domain_values VALUES (3); SELECT id FROM locked_domain_values ORDER BY id", true)), ["2", "3", "20"]);
+        assert_eq!(error_sqlstates(&editor.execute(&mut engine,
+            "INSERT INTO locked_domain_values VALUES (0)", true)), ["23514"]);
+    }
+}
+
+#[test]
+fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
+    for (mode, suffix) in [(crate::config::TransactionMode::Mvcc, "mvcc"), (crate::config::TransactionMode::Locking, "locking")] {
+        let mut config = test_config(&format!("catalog-cascade-locks-{suffix}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut editor = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+        let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(33);
+        editor.success(&mut engine,
+            "CREATE SCHEMA cascade_orders; CREATE TABLE cascade_orders.orders (id integer PRIMARY KEY); CREATE TABLE cascade_invoices (id integer REFERENCES cascade_orders.orders); CREATE TABLE cascade_other (id integer); INSERT INTO cascade_orders.orders VALUES (1); INSERT INTO cascade_invoices VALUES (1); CREATE VIEW cascade_report AS SELECT id FROM cascade_orders.orders", true);
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "BEGIN; SELECT id FROM cascade_report", true)), ["1"]);
+        let sql = "DROP SCHEMA cascade_orders CASCADE";
+        assert!(editor.execute(&mut engine, sql, true).is_empty());
+        assert!(editor.transaction.ddl().is_empty());
+        assert!(engine.storage.find_table("cascade_orders", "orders").is_some());
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "INSERT INTO cascade_other VALUES (7); SELECT id FROM cascade_other", true)), ["7"]);
+        reader.success(&mut engine, "COMMIT", true);
+        let status = crate::mem::guard::forbid_alloc(|| engine.execute_simple_from(
+            sql, 0, &editor.arena, &mut editor.transaction, &mut editor.pool,
+            &mut editor.cursors, &mut editor.guc, &mut Responder::new(&mut editor.send),
+            editor.connection_id, false,
+        )).unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(error_sqlstates(editor.send.readable()).is_empty());
+        assert!(engine.storage.find_table("cascade_orders", "orders").is_none());
+        assert_eq!(data_rows(&other.success(&mut engine,
+            "INSERT INTO cascade_invoices VALUES (999); SELECT id FROM cascade_invoices ORDER BY id", true)), ["1", "999"]);
+        assert_eq!(error_sqlstates(&other.execute(&mut engine,
+            "SELECT * FROM cascade_report", true)), ["42P01"]);
+        assert!(engine.fatal_commit_failure().is_none());
+    }
+}
+
+#[test]
+fn catalog_publication_domain_validation_rejects_stored_container_dependencies() {
+    for setup in [
+        "CREATE TABLE nested_values (value validation_root[])",
+        "CREATE DOMAIN validation_child AS validation_root; CREATE TABLE nested_values (value validation_child[])",
+        "CREATE TYPE validation_pair AS (value validation_root); CREATE TABLE nested_values (value validation_pair)",
+        "CREATE TYPE validation_pair AS (value validation_root); CREATE TYPE validation_outer AS (value validation_pair[]); CREATE DOMAIN validation_holder AS validation_outer; CREATE TABLE nested_values (value validation_holder)",
+        "CREATE DOMAIN validation_vector AS validation_root[]; CREATE TABLE nested_values (value validation_vector)",
+        "CREATE TABLE nested_values (id integer, value validation_root[]) PARTITION BY RANGE (id)",
+        "CREATE MATERIALIZED VIEW nested_values AS SELECT ARRAY[1::validation_root] AS value",
+    ] {
+        let (mut engine, mut budget) = test_engine();
+        run_with(&mut engine, &mut budget, "CREATE DOMAIN validation_root AS integer");
+        assert!(error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty(), "{setup}");
+        for sql in [
+            "ALTER DOMAIN validation_root ADD CONSTRAINT validation_positive CHECK (VALUE > 0)",
+            "ALTER DOMAIN validation_root SET NOT NULL",
+        ] {
+            assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget, sql)), ["0A000"], "{setup}: {sql}");
+        }
+        assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
+            "SELECT 0::validation_root; SELECT NULL::validation_root")), ["0", "NULL"]);
+        assert!(engine.fatal_commit_failure().is_none());
+    }
+}
+
+#[test]
+fn catalog_publication_domain_validation_uses_complete_array_domain_values() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = "CREATE DOMAIN validation_element AS integer; CREATE DOMAIN validation_vector AS validation_element[]; CREATE TABLE validation_vectors (value validation_vector); INSERT INTO validation_vectors VALUES (ARRAY[1, 2]::validation_vector)";
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_vector ADD CONSTRAINT validation_length CHECK (cardinality(VALUE) = 2)")).is_empty());
+    assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "INSERT INTO validation_vectors VALUES (ARRAY[1]::validation_vector)")), ["23514"]);
+    assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
+        "SELECT value::text FROM validation_vectors")), ["{1,2}"]);
+}
+
+#[test]
+fn catalog_publication_domain_validation_rechecks_valid_constraints_and_keeps_noops() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(&mut engine, &mut budget,
+        "CREATE FUNCTION validation_rule(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0'; CREATE DOMAIN validation_value AS integer CONSTRAINT validation_existing CHECK (validation_rule(VALUE)); CREATE TABLE validation_items (value validation_value); INSERT INTO validation_items VALUES (1); CREATE DOMAIN validation_required AS integer NOT NULL; CREATE TABLE validation_required_arrays (value validation_required[])");
+    assert!(error_sqlstates(&created).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_value VALIDATE CONSTRAINT validation_existing; ALTER DOMAIN validation_required SET NOT NULL")).is_empty());
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "CREATE OR REPLACE FUNCTION validation_rule(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 10'")).is_empty());
+    assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_value VALIDATE CONSTRAINT validation_existing")), ["23514"]);
+    assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
+        "SELECT value FROM validation_items")), ["1"]);
+}
+
+#[test]
+fn catalog_publication_domain_validation_ignores_unstored_and_foreign_values() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = "CREATE DOMAIN validation_unstored AS integer; CREATE TYPE validation_unstored_pair AS (value validation_unstored); CREATE VIEW validation_unstored_view AS SELECT ARRAY[1::validation_unstored] AS value; CREATE FOREIGN DATA WRAPPER validation_wrapper; CREATE SERVER validation_server FOREIGN DATA WRAPPER validation_wrapper; CREATE FOREIGN TABLE validation_remote (value validation_unstored[]) SERVER validation_server";
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, setup)).is_empty());
+    let altered = run_with(&mut engine, &mut budget,
+        "ALTER DOMAIN validation_unstored ADD CONSTRAINT validation_unstored_positive CHECK (VALUE > 0); ALTER DOMAIN validation_unstored SET NOT NULL");
+    assert!(error_sqlstates(&altered).is_empty(), "{}", String::from_utf8_lossy(&altered));
+    assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "SELECT 0::validation_unstored")), ["23514"]);
+    assert_eq!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "SELECT NULL::validation_unstored")), ["23502"]);
+}
+
+#[test]
 fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_copy() {
     for checkpoint in [false, true] {
         let name = format!("statement-rewrite-readers-{checkpoint}");
@@ -53122,7 +53269,7 @@ fn composite_attribute_rename_rewrites_nested_and_set_operation_views() {
 }
 
 #[test]
-fn alter_domain_revalidates_scalar_and_array_elements() {
+fn alter_domain_rejects_stored_domain_arrays_without_changing_rules() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
         &mut engine,
@@ -53147,22 +53294,14 @@ fn alter_domain_revalidates_scalar_and_array_elements() {
         &mut budget,
         "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).y > 0)",
     );
-    assert!(
-        !String::from_utf8_lossy(&tightened).contains("ERROR"),
-        "{}",
-        String::from_utf8_lossy(&tightened)
-    );
+    assert_eq!(error_sqlstates(&tightened), ["0A000"]);
 
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "ALTER DOMAIN checked_point_value ADD CHECK ((VALUE).x < 5)",
     );
-    assert!(
-        String::from_utf8_lossy(&rejected).contains("23514"),
-        "{}",
-        String::from_utf8_lossy(&rejected)
-    );
+    assert_eq!(error_sqlstates(&rejected), ["0A000"]);
     let post_rollback = run_with(
         &mut engine,
         &mut budget,

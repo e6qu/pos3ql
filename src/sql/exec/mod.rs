@@ -12080,9 +12080,16 @@ pub(crate) fn drop_schema(
         *n_objects += 1;
         Ok(())
     };
+    let definitions = storage.table_definition_images();
     for t in 0..storage.table_count() {
-        let def = storage.table_def(t, txn.txid);
-        if !storage.table_slot_visible_to(t, txn.txid) || !in_listed(storage, def.schema.as_str()) {
+        if !storage.table_slot_visible_to(t, txn.txid) {
+            continue;
+        }
+        let def = match definitions.definition(storage, t, txn.txid) {
+            Ok(definition) => definition,
+            Err(error) => return sql_fail(error),
+        };
+        if !in_listed(storage, def.schema.as_str()) {
             continue;
         }
         let def = *def;
@@ -13060,6 +13067,54 @@ pub(crate) fn drop_schema(
             storage.schema_def(first).name.as_str()
         ));
     }
+    let table_locks = match arena.alloc_slice_with(storage.table_count(), |_| None) {
+        Ok(locks) => locks,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    let view_locks = match arena.alloc_slice_with(storage.view_count(), |_| false) {
+        Ok(locks) => locks,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    for object in objects[..n_objects].iter().flatten() {
+        match object {
+            SchemaObject::Table(table)
+            | SchemaObject::Matview { table, .. }
+            | SchemaObject::InboundFk { table, .. } => {
+                table_locks[*table] = Some(crate::sql::ast::TableLockMode::AccessExclusive);
+            }
+            SchemaObject::View(view) => view_locks[*view] = true,
+            SchemaObject::Policy { slot, .. } => {
+                let table = usize::from(storage.policy(*slot).table);
+                if table_locks[table].is_none() {
+                    table_locks[table] = Some(crate::sql::ast::TableLockMode::ShareRowExclusive);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Resolve all waits before cascade notices, journal writes or catalog edits.
+    for (table, mode) in table_locks.iter().copied().enumerate() {
+        let Some(mode) = mode else { continue };
+        let (source, _) = match definitions.selection(storage, table, txn.txid) {
+            Ok(selection) => selection,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = storage.lock_table(txn.txid, table, mode, false)
+            .and_then(|()| source.validate(storage))
+        {
+            return sql_fail(error);
+        }
+    }
+    for (view, selected) in view_locks.iter().copied().enumerate() {
+        if selected && let Err(error) = storage.lock_object(
+            txn.txid,
+            crate::storage::ObjectLockTarget::View(view),
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
+        }
+    }
     if reported_object_count == 1 {
         let mut line = crate::util::StackStr::<192>::new();
         let object = objects[..n_objects]
@@ -13234,14 +13289,6 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
-                if let Err(error) = storage.lock_object(
-                    txn.txid,
-                    crate::storage::ObjectLockTarget::View(*v),
-                    crate::sql::ast::TableLockMode::AccessExclusive,
-                    false,
-                ) {
-                    return sql_fail(error);
-                }
                 let (schema, vname, temporary) = {
                     let view = storage.view(*v);
                     (
@@ -28333,15 +28380,16 @@ fn drop_policy_slot(
     slot: usize,
 ) -> Result<(), SqlError> {
     let policy = storage.policy(slot);
-    let (table_schema, table_name) = {
-        let table_definition = storage.table_def(usize::from(policy.table), txn.txid);
-        (table_definition.schema, table_definition.name)
-    };
-    if storage
-        .table_def(usize::from(policy.table), txn.txid)
-        .persistence
-        != crate::storage::RelationPersistence::Temporary
-    {
+    let (source, definition) = storage.select_table_definition(usize::from(policy.table), txn.txid);
+    storage.lock_table(
+        txn.txid,
+        source.table(),
+        crate::sql::ast::TableLockMode::ShareRowExclusive,
+        false,
+    )?;
+    source.validate(storage)?;
+    let (table_schema, table_name) = (definition.schema, definition.name);
+    if definition.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -41872,6 +41920,10 @@ pub fn alter_domain(
         checks: current.checks,
         n_checks: current.n_checks,
     };
+    if matches!((action, spec.not_null), (A::SetNotNull, true) | (A::DropNotNull, false)) {
+        responder.command_complete("ALTER DOMAIN")?;
+        return sql_ok();
+    }
     let revalidation;
     match action {
         A::SetNotNull => {
@@ -42064,14 +42116,6 @@ pub fn alter_domain(
                     name.name
                 ));
             };
-            if spec.checks[index].validation.validated() {
-                return sql_fail(sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "constraint \"{}\" of domain \"{}\" is already validated",
-                    cname,
-                    name.name
-                ));
-            }
             if let Err(error) = validate_domain_rows(
                 storage,
                 slot,
@@ -42124,8 +42168,22 @@ enum DomainValidation {
     Check { target: usize, index: usize },
 }
 
-/// Validates the selected domain property for every stored value declared as
-/// `target` or a descendant. Array domains validate elements, not containers.
+fn domain_rewrite_columns(
+    storage: &Storage,
+    definition: &TableDef,
+    target: usize,
+    transaction: u32,
+) -> Result<[bool; MAX_COLUMNS], SqlError> {
+    let mut affected = [false; MAX_COLUMNS];
+    for (column, definition) in definition.columns().iter().enumerate() {
+        let Some(identity) = definition.user_type else { continue };
+        let Some(domain) = storage.domain_reference_slot(identity, transaction)? else { continue };
+        affected[column] = storage.domain_depends_on(domain, target, transaction)?;
+    }
+    Ok(affected)
+}
+
+/// Validate domain rules on current rows after excluding concurrent writers.
 fn validate_domain_rows(
     storage: &Storage,
     target: usize,
@@ -42133,29 +42191,48 @@ fn validate_domain_rows(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let dependencies = match validation {
+        DomainValidation::All => None,
+        DomainValidation::NotNull { .. } | DomainValidation::Check { .. } =>
+            Some(storage.domain_validation_dependencies(target, txid, arena)?),
+    };
+    let table_count = storage.table_count();
+    let selected = arena.alloc_slice_with(table_count, |_| None).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "domain validation table sources exceed the statement arena"
+        )
+    })?;
+    let definitions = storage.table_definition_images();
+    // Lock every affected relation before selecting the latest committed rows.
+    // Readers remain compatible; a pending writer must finish before validation.
+    for (table, selected) in selected.iter_mut().enumerate() {
+        if !storage.table_slot_visible_to(table, txid)
+            || storage.foreign_table(table as u16, txid).is_some()
+        {
+            continue;
+        }
+        let (source, definition) = definitions.selection(storage, table, txid)?;
+        let affected = match &dependencies {
+            Some(dependencies) => dependencies.columns(storage, definition, txid)?,
+            None => domain_rewrite_columns(storage, definition, target, txid)?,
+        };
+        if affected.iter().any(|column| *column) {
+            storage.lock_table(txid, table, crate::sql::ast::TableLockMode::Share, false)?;
+            source.validate(storage)?;
+            *selected = Some(source);
+        }
+    }
     let read = storage.validation_read();
-    for table_index in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(table_index, txid) {
-            continue;
-        }
-        let def = *storage.table_def(table_index, txid);
-        let mut affected = [false; MAX_COLUMNS];
-        let mut any = false;
-        for (column_index, column) in def.columns().iter().enumerate() {
-            let Some(identity) = column.user_type else {
-                continue;
-            };
-            let Some(domain_slot) = storage.domain_reference_slot(identity, txid)? else {
-                continue;
-            };
-            if storage.domain_depends_on(domain_slot, target, txid)? {
-                affected[column_index] = true;
-                any = true;
-            }
-        }
-        if !any {
-            continue;
-        }
+    for (table_index, source) in selected.iter().copied().enumerate() {
+        let Some(source) = source else { continue };
+        source.validate(storage)?;
+        let def = definitions.retained_definition(table_index, txid)
+            .expect("domain validation retains every selected table definition");
+        let affected = match &dependencies {
+            Some(dependencies) => dependencies.columns(storage, def, txid)?,
+            None => domain_rewrite_columns(storage, def, target, txid)?,
+        };
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         def.schema(&mut schema);
         // SAFETY: validation consumes domain coercion results within the row;
@@ -42248,8 +42325,14 @@ fn validate_stored_domain_value(
             )
         }
     };
-    let ColType::Array(element @ crate::sql::types::ArrElem::Domain { .. }) = ctype else {
+    if ctype == storage.domain_for(leaf, txid).base {
         return validate(value);
+    }
+    let ColType::Array(element @ crate::sql::types::ArrElem::Domain { .. }) = ctype else {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "stored domain value does not match its selected representation"
+        ));
     };
     let Datum::Array { raw, .. } = value else {
         return matches!(value, Datum::Null).then_some(()).ok_or_else(|| {

@@ -48,6 +48,7 @@ mod table_edits;
 mod table_names;
 mod type_contracts;
 mod type_creation;
+mod domain_validation;
 mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
 mod type_names;

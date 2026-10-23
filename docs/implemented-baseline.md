@@ -591,10 +591,26 @@ or changed while it was acquiring locks. Source installation and dependent
 updates share those locks; exhausted publication counters leave everything intact.
 Saved journal references retain their source lifetime even when a rename commits
 before an older dependent definition. Checkpoints preserve the same identities
-and resolve type definitions before their dependents. Some schema changes still
-wait for retained snapshots. Removing the remaining restrictions requires shared
-protection for engine-wide commits, type retirement and remaining table rewrites;
-SQL CPU workers remain planned work.
+and resolve type definitions before their dependents. Domain, type and schema
+changes wait on their affected objects rather than every retained snapshot.
+For example, importing invoices can continue while an unrelated customer domain
+is renamed. Schema cascades lock affected tables and views before changing them.
+Transaction-wide publication and SQL CPU workers remain [planned work](../PLAN.md).
+
+Adding or validating a domain rule takes PostgreSQL-compatible SHARE locks on
+tables whose values must be checked. Readers can continue; unfinished writers
+must finish first, and validation then selects current committed rows. Unchanged
+NOT NULL settings do not scan values. VALIDATE CONSTRAINT checks existing values
+again even when the rule was already marked valid.
+
+PostgreSQL rejects validation when a domain is stored inside arrays or composite
+values. For example, a column declared as `customer_id[]` makes adding a checked
+rule to `customer_id` fail with `0A000`; the old rules remain intact. A domain
+whose value is an entire array validates that whole array. Unstored type
+definitions, views and foreign-table columns do not create local values to scan.
+The dependency walk uses statement memory and returns `54000`, "domain dependency
+graph exceeds the statement arena", if that space fills. These rules follow
+[PostgreSQL 18's domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c#L2870).
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade

@@ -844,6 +844,47 @@ def alter_rewrite_source_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE alter_source_diff")
 
 
+def row_layout_publication_transcript(reader, writer) -> list[str]:
+    results = []
+    for prepared_commit in (False, True):
+        writer.execute("CREATE TABLE layout_publication_orders(id integer PRIMARY KEY)")
+        writer.execute("CREATE TABLE layout_publication_invoices(id integer)")
+        writer.execute("INSERT INTO layout_publication_orders VALUES (1), (2), (3), (4)")
+        writer.execute("INSERT INTO layout_publication_invoices VALUES (22)")
+        prepared = False
+        try:
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            assert reader.execute("SELECT id FROM layout_publication_invoices").fetchall() == [(22,)]
+            writer.execute("DELETE FROM layout_publication_orders WHERE id > 1")
+            writer.execute("BEGIN")
+            writer.execute("ALTER TABLE layout_publication_orders ALTER COLUMN id TYPE bigint")
+            batch = "not_applicable"
+            if prepared_commit:
+                writer.execute("PREPARE TRANSACTION 'layout-publication-diff'")
+                prepared = True
+                batch = sqlstate(writer, "SELECT 1; COMMIT PREPARED 'layout-publication-diff'")
+                assert batch == "25001", batch
+                writer.execute("COMMIT PREPARED 'layout-publication-diff'")
+                prepared = False
+            else:
+                writer.execute("COMMIT")
+            older = reader.execute("SELECT count(*) FROM layout_publication_orders").fetchone()[0]
+            invoices = reader.execute("SELECT id FROM layout_publication_invoices").fetchall()
+            current = writer.execute("SELECT id, pg_typeof(id)::text FROM layout_publication_orders").fetchall()
+            reader.execute("ROLLBACK")
+            writer.execute("UPDATE layout_publication_orders SET id = 2")
+            updated = writer.execute("SELECT id FROM layout_publication_orders").fetchall()
+            results.append(f"row_layout_prepared={prepared_commit},older:{older},invoices:{invoices},current:{current},updated:{updated},batch:{batch}")
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            if prepared:
+                writer.execute("ROLLBACK PREPARED 'layout-publication-diff'")
+            writer.execute("DROP TABLE layout_publication_orders")
+            writer.execute("DROP TABLE layout_publication_invoices")
+    return results
+
+
 def copy_transition_value_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE copy_value_diff(id integer, label text, chars integer GENERATED ALWAYS AS (length(label)) STORED)")
     writer.execute("CREATE TABLE copy_value_audit_diff(labels text, total bigint)")
@@ -1141,6 +1182,7 @@ def exercise(port: int) -> list[str]:
                 constraint_partition_transcript(reader, writer),
                 constraint_rewrite_transcript(reader, writer),
                 alter_rewrite_source_transcript(reader, writer),
+                row_layout_publication_transcript(reader, writer),
                 copy_transition_value_transcript(reader, writer),
                 analyze_snapshot_transcript(reader, writer),
                 rule_publication_transcript(reader, writer),

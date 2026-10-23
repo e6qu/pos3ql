@@ -5282,16 +5282,9 @@ mod tests {
             let old = state.visible_at(7).unwrap().unwrap();
             let deleted_old = deleted.visible_at(7).unwrap().unwrap();
             assert!(deleted.visible_at(u64::MAX).unwrap().is_none());
-            let snapshot = {
-                let publication = storage.table(table).publication();
-                super::super::RowSnapshot {
-                    created_at: storage.table(table).created_at(),
-                    version: super::super::row_images::RowVersionIdentity::Committed(7),
-                    generation: publication.generation,
-                    row_layout: publication.row_layout,
-                }
-            };
-            let deferred = storage.read_row_snapshot(table, 2, snapshot).unwrap();
+            let deferred = storage
+                .read_row_snapshot(table, 2, deleted_old.snapshot())
+                .unwrap();
             assert_eq!(
                 deferred.snapshot().version,
                 super::super::row_images::RowVersionIdentity::Committed(7)

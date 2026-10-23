@@ -17,6 +17,8 @@ jobs:
         image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
@@ -59,6 +61,9 @@ jobs:
             ${{ runner.temp }}/validation-fixture-tree
       - name: All-target compilation and lint
         run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: ${{ runner.temp }}/pos3ql-python
       - name: PostgreSQL rewrite reference
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
@@ -72,6 +77,32 @@ jobs:
           expected = ["130|8515|integer", "11|order|bigint", "8|bigint", "replacement"]
           assert result.stdout.splitlines() == expected, (result.stdout, result.stderr)
           print("PostgreSQL 18 rewrite, rollback and temporary reuse:", expected)
+          PYTHON
+      - name: PostgreSQL concurrent and prepared rewrite reference
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -c 'ALTER SYSTEM SET max_prepared_transactions = 1'
+          docker restart "$POSTGRES_CONTAINER"
+          for attempt in $(seq 1 10); do
+            if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres; then break; fi
+            sleep 1
+          done
+          "${{ runner.temp }}/pos3ql-python/bin/python" - <<'PYTHON'
+          import os, sys
+          sys.path.insert(0, "tests/external")
+          from mvcc_diff import connect, row_layout_publication_transcript
+          with connect(int(os.environ["PGPORT"])) as reader, connect(int(os.environ["PGPORT"])) as writer:
+              reader.execute("SET statement_timeout = '5s'")
+              writer.execute("SET statement_timeout = '5s'")
+              observed = row_layout_publication_transcript(reader, writer)
+          expected = [f"row_layout_prepared={prepared},older:0,invoices:[(22,)],current:[(1, 'bigint')],updated:[(2,)],batch:{batch}" for prepared, batch in ((False, "not_applicable"), (True, "25001"))]
+          assert observed == expected, observed
+          print("PostgreSQL 18 concurrent rewrite publication:", observed)
           PYTHON
       - name: Row layouts, retained readers, maintenance and transaction recovery
         run: >-

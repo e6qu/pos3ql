@@ -90,7 +90,17 @@ fn row_layout_retained_history_survives_saved_publication_and_prepared_rewrite()
             "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM layout_invoices",
             false,
         );
-        writer.success(&mut engine, "DELETE FROM layout_orders WHERE id > 1; BEGIN; ALTER TABLE layout_orders ALTER COLUMN id TYPE bigint; PREPARE TRANSACTION 'layout_rewrite'; COMMIT PREPARED 'layout_rewrite'", false);
+        writer.success(&mut engine, "DELETE FROM layout_orders WHERE id > 1", false);
+        writer.success(&mut engine, "BEGIN; ALTER TABLE layout_orders ALTER COLUMN id TYPE bigint; PREPARE TRANSACTION 'layout_rewrite'", false);
+        assert_eq!(
+            error_sqlstates(&writer.execute(
+                &mut engine,
+                "SELECT 1; COMMIT PREPARED 'layout_rewrite'",
+                false
+            )),
+            ["25001"]
+        );
+        writer.success(&mut engine, "COMMIT PREPARED 'layout_rewrite'", false);
         assert_eq!(
             data_rows(&reader.success(
                 &mut engine,

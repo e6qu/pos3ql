@@ -27,55 +27,132 @@ fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_cop
         let mut transition = copy_transition_scratch(&mut budget);
         let arena = Arena::new(&mut budget, "unrelated COPY rewrite", 1 << 18).unwrap();
         let guc = GucState::new();
-        run_txn(&mut engine, &mut budget, &mut writer,
-            "CREATE TABLE rewrite_reader_orders (id integer PRIMARY KEY); CREATE TABLE rewrite_reader_invoices (id integer); INSERT INTO rewrite_reader_orders VALUES (11), (12); INSERT INTO rewrite_reader_invoices VALUES (22)");
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
-        let table = engine.storage.find_table("public", "rewrite_reader_orders").unwrap();
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "CREATE TABLE rewrite_reader_orders (id integer PRIMARY KEY); CREATE TABLE rewrite_reader_invoices (id integer); INSERT INTO rewrite_reader_orders VALUES (11), (12); INSERT INTO rewrite_reader_invoices VALUES (22)",
+        );
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        let table = engine
+            .storage
+            .find_table("public", "rewrite_reader_orders")
+            .unwrap();
         let snapshot = engine.storage.lsn();
         let mut original = None;
-        engine.storage.for_each_row_state(table, &mut |rowid, state| {
-            if let Some(home) = engine.storage.visible_row_home_at(table, rowid, state, 0, crate::storage::SNAPSHOT_ALL, snapshot)? {
-                original = Some((rowid, home));
-                return Ok(core::ops::ControlFlow::Break(()));
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
-        }).unwrap();
+        engine
+            .storage
+            .for_each_row_state(table, &mut |rowid, state| {
+                if let Some(home) = engine.storage.visible_row_home_at(
+                    table,
+                    rowid,
+                    state,
+                    0,
+                    crate::storage::SNAPSHOT_ALL,
+                    snapshot,
+                )? {
+                    original = Some((rowid, home));
+                    return Ok(core::ops::ControlFlow::Break(()));
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
         let (original_rowid, original) = original.expect("selected original order source");
-        run_txn(&mut engine, &mut budget, &mut reader,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM rewrite_reader_invoices");
-        run_txn(&mut engine, &mut budget, &mut copier,
-            "BEGIN; COPY rewrite_reader_invoices FROM STDIN");
-        let setup = engine.take_pending_copy().expect("unrelated COPY keeps its snapshot");
-        run_txn(&mut engine, &mut budget, &mut writer,
-            "DELETE FROM rewrite_reader_orders WHERE id = 12");
-        let response = run_txn_bytes(&mut engine, &mut budget, &mut writer,
-            "ALTER TABLE rewrite_reader_orders ALTER COLUMN id TYPE bigint");
-        assert!(error_sqlstates(&response).is_empty(), "{}", String::from_utf8_lossy(&response));
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM rewrite_reader_invoices",
+        );
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut copier,
+            "BEGIN; COPY rewrite_reader_invoices FROM STDIN",
+        );
+        let setup = engine
+            .take_pending_copy()
+            .expect("unrelated COPY keeps its snapshot");
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "DELETE FROM rewrite_reader_orders WHERE id = 12",
+        );
+        let response = run_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "ALTER TABLE rewrite_reader_orders ALTER COLUMN id TYPE bigint",
+        );
+        assert!(
+            error_sqlstates(&response).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
         assert!(engine.fatal_commit_failure().is_none());
-        engine.storage.with_row_bytes(table, original_rowid, original, |bytes| {
-            let mut values = [Datum::Null; 1];
-            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-            assert_eq!(values[0], Datum::Int4(11));
-            Ok(())
-        }).unwrap();
-        assert_eq!(data_rows(&run_txn_bytes(&mut engine, &mut budget, &mut reader,
-            "SELECT count(*) FROM rewrite_reader_orders; SELECT id FROM rewrite_reader_orders WHERE id = 11; SELECT id FROM rewrite_reader_invoices")), ["0", "22"]);
-        assert_eq!(data_rows(&run_txn_bytes(&mut engine, &mut budget, &mut writer,
-            "SELECT id FROM rewrite_reader_orders WHERE id = 11")), ["11"]);
-        copy_line(&mut engine, &mut budget, &setup, &mut copier, guc.seq_session(), &arena, b"23", &mut transition).unwrap();
+        engine
+            .storage
+            .with_row_bytes(table, original_rowid, original, |bytes| {
+                let mut values = [Datum::Null; 1];
+                crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                assert_eq!(values[0], Datum::Int4(11));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            data_rows(&run_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut reader,
+                "SELECT count(*) FROM rewrite_reader_orders; SELECT id FROM rewrite_reader_orders WHERE id = 11; SELECT id FROM rewrite_reader_invoices"
+            )),
+            ["0", "22"]
+        );
+        assert_eq!(
+            data_rows(&run_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut writer,
+                "SELECT id FROM rewrite_reader_orders WHERE id = 11"
+            )),
+            ["11"]
+        );
+        copy_line(
+            &mut engine,
+            &mut budget,
+            &setup,
+            &mut copier,
+            guc.seq_session(),
+            &arena,
+            b"23",
+            &mut transition,
+        )
+        .unwrap();
         engine.copy_abort(&mut copier, &guc);
         drop(setup);
         run_txn(&mut engine, &mut budget, &mut copier, "ROLLBACK");
         run_txn(&mut engine, &mut budget, &mut reader, "COMMIT");
-        drop(writer); drop(reader); drop(copier); drop(engine);
+        drop(writer);
+        drop(reader);
+        drop(copier);
+        drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut cold_budget = test_engine_budget(&config, 1 << 29);
         let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
         assert_eq!(data_rows(&session.success(&mut cold,
             "SELECT id FROM rewrite_reader_orders WHERE id = 11; SELECT id FROM rewrite_reader_invoices", false)), ["11", "22"]);
-        assert_eq!(error_sqlstates(&session.execute(&mut cold,
-            "INSERT INTO rewrite_reader_orders VALUES (11)", false)), ["23505"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut cold,
+                "INSERT INTO rewrite_reader_orders VALUES (11)",
+                false
+            )),
+            ["23505"]
+        );
     }
 }
 

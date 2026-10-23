@@ -35268,7 +35268,11 @@ impl Storage {
                     ))
                 });
                 if let Some((_, state)) = rows.entry_at_slot_mut(slot) {
-                    prune_committed_history(&mut versions.committed_row_versions, &mut state.history, None);
+                    prune_committed_history(
+                        &mut versions.committed_row_versions,
+                        &mut state.history,
+                        None,
+                    );
                 }
             }
             self.set_spill_list(index, &[]);

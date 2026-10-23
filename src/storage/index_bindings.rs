@@ -477,10 +477,25 @@ mod tests {
             );
             assert!(storage.pending_table_def(table).is_none());
             assert!(storage.index(slot).pending_table.is_none());
+            assert_eq!(storage.drop_index("binding_destination", "binding_index", 8).unwrap(), Some(occupied_slot));
             storage.commit_index_drop(occupied_slot);
             storage
                 .write_table_def(table, 7, moved, &mapping, false)
                 .unwrap();
+            let mut second = index("second_binding_index", "binding_source", 0, 1);
+            second.schema = target_schema;
+            let second_slot = storage.create_index(second, 7).unwrap();
+            for (clustered, replica_identity) in [(true, false), (false, true)] {
+                let definition = IndexMutableDefinition {
+                    clustered,
+                    replica_identity,
+                    ..IndexMutableDefinition::DEFAULT
+                };
+                storage.alter_index_definition(slot, definition, 7).unwrap();
+                assert_eq!(storage.alter_index_definition(second_slot, definition, 7).unwrap_err().sqlstate, sqlstate::INVALID_OBJECT_DEFINITION);
+            }
+            storage.rollback_index_definition(slot, None);
+            storage.rollback_index_create(second_slot);
             assert!(
                 storage
                     .comment_text(

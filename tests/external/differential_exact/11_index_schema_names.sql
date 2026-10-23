@@ -8,7 +8,7 @@ CREATE INDEX private_schema_key ON private_index_destination.competitor(key);
 DO $body$
 BEGIN
   BEGIN
-    ALTER TABLE private_schema_source SET SCHEMA private_index_destination;
+    EXECUTE 'ALTER TABLE private_schema_source SET SCHEMA private_index_destination';
     RAISE EXCEPTION 'schema move accepted an occupied index name';
   EXCEPTION WHEN SQLSTATE '42P07' THEN
     NULL;
@@ -31,7 +31,7 @@ SELECT COALESCE(obj_description('public.private_schema_key'::regclass), 'fresh')
 DO $body$
 BEGIN
   BEGIN
-    CREATE INDEX private_schema_key ON private_index_destination.competitor(key);
+    EXECUTE 'CREATE INDEX private_schema_key ON private_index_destination.competitor(key)';
     RAISE EXCEPTION 'index creation accepted a pending schema move name';
   EXCEPTION WHEN SQLSTATE '42P07' THEN
     NULL;

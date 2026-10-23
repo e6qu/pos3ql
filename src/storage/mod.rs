@@ -44609,8 +44609,7 @@ impl Storage {
             && catalog.iter().any(|index| {
                 index.database == current_database()
                     && index.visible_to(txid)
-                    && index.schema == def.schema
-                    && index.table == def.table
+                    && index.table_binding.is_some_and(|binding| Some(binding.source) == def.table_binding.map(|selected| selected.source))
                     && index.mutable_for(txid).clustered
             })
         {
@@ -44623,8 +44622,7 @@ impl Storage {
             && catalog.iter().any(|index| {
                 index.database == current_database()
                     && index.visible_to(txid)
-                    && index.schema == def.schema
-                    && index.table == def.table
+                    && index.table_binding.is_some_and(|binding| Some(binding.source) == def.table_binding.map(|selected| selected.source))
                     && index.mutable_for(txid).replica_identity
             })
         {
@@ -44804,8 +44802,7 @@ impl Storage {
                 other_slot != slot
                     && other.database == current_database()
                     && other.visible_to(txid)
-                    && other.schema == index.schema
-                    && other.table == index.table
+                    && other.table_binding.is_some_and(|binding| Some(binding.source) == index.table_binding.map(|selected| selected.source))
                     && other.mutable_for(txid).clustered
             }) {
                 return Err(sql_err!(
@@ -44820,8 +44817,7 @@ impl Storage {
                 other_slot != slot
                     && other.database == current_database()
                     && other.visible_to(txid)
-                    && other.schema == index.schema
-                    && other.table == index.table
+                    && other.table_binding.is_some_and(|binding| Some(binding.source) == index.table_binding.map(|selected| selected.source))
                     && other.mutable_for(txid).replica_identity
             }) {
                 return Err(sql_err!(
@@ -44867,7 +44863,7 @@ impl Storage {
             identity.created_at,
         );
         for index in self.index_catalog().iter_mut() {
-            if index.visible_to(txid)
+            if index.database == current_database() && index.visible_to(txid)
                 && index
                     .table_binding
                     .is_some_and(|binding| binding.source == source)
@@ -44888,7 +44884,7 @@ impl Storage {
         );
         for slot in 0..self.index_count() {
             let index = self.index(slot);
-            if index
+            if index.database == current_database() && index
                 .table_binding
                 .is_some_and(|binding| binding.source == source)
                 && index.ddl_state.pending_drop_txid() == Some(txid)
@@ -44908,7 +44904,7 @@ impl Storage {
             identity.created_at,
         );
         for x in self.index_catalog().iter_mut() {
-            if x.table_binding
+            if x.database == current_database() && x.table_binding
                 .is_some_and(|binding| binding.source == source)
                 && x.ddl_state.pending_drop_txid() == Some(txid)
             {

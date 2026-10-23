@@ -1036,6 +1036,51 @@ def rule_publication_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE rule_publication_other_diff")
 
 
+def index_namespace_transcript(reader, writer) -> list[str]:
+    results = []
+    writer.execute("CREATE SCHEMA index_namespace_destination_diff")
+    writer.execute("CREATE TABLE index_namespace_source_diff(id integer)")
+    writer.execute("CREATE TABLE index_namespace_other_diff(id integer)")
+    writer.execute("CREATE TABLE index_namespace_destination_diff.other_table(id integer)")
+    writer.execute("CREATE INDEX index_namespace_old_diff ON index_namespace_source_diff(id)")
+    writer.execute("CREATE INDEX index_namespace_competitor_diff ON index_namespace_other_diff(id)")
+    writer.execute("CREATE INDEX index_namespace_competitor_diff ON index_namespace_destination_diff.other_table(id)")
+    reader.execute("SET lock_timeout = '50ms'")
+    try:
+        for operation, statement, requests in [
+            ("rename", "ALTER INDEX index_namespace_old_diff RENAME TO index_namespace_new_diff", [
+                ("rename_old", "ALTER INDEX public.index_namespace_competitor_diff RENAME TO index_namespace_old_diff"),
+                ("rename_new", "ALTER INDEX public.index_namespace_competitor_diff RENAME TO index_namespace_new_diff"),
+                ("create_old", "CREATE INDEX index_namespace_old_diff ON index_namespace_other_diff(id)"),
+                ("create_new", "CREATE INDEX index_namespace_new_diff ON index_namespace_other_diff(id)"),
+            ]),
+            ("drop", "DROP INDEX index_namespace_old_diff", [
+                ("rename_old", "ALTER INDEX public.index_namespace_competitor_diff RENAME TO index_namespace_old_diff"),
+                ("create_old", "CREATE INDEX index_namespace_old_diff ON index_namespace_other_diff(id)"),
+            ]),
+            ("schema", "ALTER TABLE index_namespace_source_diff SET SCHEMA index_namespace_destination_diff", [
+                ("rename_old", "ALTER INDEX public.index_namespace_competitor_diff RENAME TO index_namespace_old_diff"),
+                ("rename_new", "ALTER INDEX index_namespace_destination_diff.index_namespace_competitor_diff RENAME TO index_namespace_old_diff"),
+                ("create_old", "CREATE INDEX index_namespace_old_diff ON index_namespace_other_diff(id)"),
+                ("create_new", "CREATE INDEX index_namespace_old_diff ON index_namespace_destination_diff.other_table(id)"),
+            ]),
+        ]:
+            writer.execute("BEGIN")
+            writer.execute(statement)
+            try:
+                for label, query in requests:
+                    results.append(f"index_namespace_{operation}_{label}=" + sqlstate(reader, query))
+            finally:
+                writer.execute("ROLLBACK")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE index_namespace_source_diff CASCADE")
+        writer.execute("DROP TABLE index_namespace_other_diff CASCADE")
+        writer.execute("DROP SCHEMA index_namespace_destination_diff CASCADE")
+
+
 def exercise(port: int) -> list[str]:
     reader = connect(port)
     writer = connect(port)
@@ -1090,6 +1135,7 @@ def exercise(port: int) -> list[str]:
                 partition_attachment_transcript(reader, writer),
                 wide_partition_transcript(reader, writer),
                 index_validation_transcript(reader, writer),
+                index_namespace_transcript(reader, writer),
                 partition_index_validation_transcript(reader, writer),
                 constraint_validation_transcript(reader, writer),
                 constraint_partition_transcript(reader, writer),

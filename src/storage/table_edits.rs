@@ -14,7 +14,7 @@ use crate::sql_err;
 pub(crate) struct TableDefinitionTarget {
     pub(super) source: super::catalog_sources::CatalogObjectIdentity,
     pub(super) transaction: u32,
-    pub(super) committed_revision: u64,
+    pub(super) committed_revision: super::TableDefinitionRevision,
     pub(super) pending_revision: u64,
 }
 

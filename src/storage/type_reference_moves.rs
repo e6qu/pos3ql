@@ -472,7 +472,17 @@ impl TypePublication {
                             )
                         })?;
                     }
-                    let revision = storage.reserve_table_definition_revision()?;
+                    let revision = match source {
+                        TypePublicationSource::Pending(target) => {
+                            super::TableDefinitionRevision::Type {
+                                source: target.source,
+                                version: target.version,
+                            }
+                        }
+                        TypePublicationSource::Committed { .. } => {
+                            storage.reserve_table_definition_revision()?
+                        }
+                    };
                     install_source(&mut types, &mut members);
                     for owner in owners.slots.iter_mut().flatten() {
                         assert!(storage.pending_table_defs.move_type_references_locked(
@@ -1209,6 +1219,12 @@ mod tests {
                 assert!(storage.type_catalog.try_lock().is_ok());
                 assert!(storage.tables[related].publication.try_lock().is_ok());
                 storage.tables[related].publication().generation = 0;
+                let (selected_table, selected_definition) =
+                    storage.select_table_definition(related, 7);
+                storage
+                    .catalog_sequence
+                    .0
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                 match kind {
                     TypeReferenceKind::Domain => storage.commit_domain_alter(target),
                     TypeReferenceKind::Enum => storage.commit_enum_alter(target),
@@ -1219,6 +1235,14 @@ mod tests {
                     source_identity(&storage.type_catalog.lock().unwrap(), movement),
                     movement.current
                 );
+                let error = storage
+                    .write_table_def(selected_table, selected_definition, &mapping("id"), false)
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlstate,
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE
+                );
+                assert!(storage.pending_table_def(related).is_none());
             });
         }
     }

@@ -20,7 +20,7 @@ use crate::sql_err;
 pub(super) struct DefinitionState {
     pub(super) identity: TableIdentity,
     committed: TableDef,
-    pub(super) committed_revision: u64,
+    pub(super) committed_revision: TableDefinitionRevision,
     pub(super) pending: Option<PendingDefinitionHead>,
     /// A CREATE RULE changes the visible history only for its transaction.
     pub(super) pending_has_rules_txid: Option<u32>,
@@ -32,13 +32,13 @@ impl DefinitionState {
     }
 
     pub(super) fn edit_committed(&mut self, revision: TableDefinitionRevision) -> &mut TableDef {
-        self.committed_revision = revision.0;
+        self.committed_revision = revision;
         &mut self.committed
     }
 
     pub(super) fn install(&mut self, definition: TableDef, identity: TableIdentity) {
         self.committed = definition;
-        self.committed_revision = 0;
+        self.committed_revision = TableDefinitionRevision::Initial;
         self.identity = identity;
         self.pending = None;
         self.pending_has_rules_txid = None;
@@ -103,7 +103,7 @@ impl TableDefinition {
         let state = DefinitionState {
             identity: TableIdentity::EMPTY,
             committed,
-            committed_revision: 0,
+            committed_revision: TableDefinitionRevision::Initial,
             pending: None,
             pending_has_rules_txid: None,
         };
@@ -597,21 +597,25 @@ impl Deref for DefinitionSlotRead<'_> {
 }
 
 /// Table ownership prevents retirement until the selected slot is released.
-#[derive(Clone, Copy)]
-pub(crate) struct TableDefinitionRevision(pub(super) u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableDefinitionRevision {
+    Initial,
+    Catalog(u64),
+    Type {
+        source: super::type_references::TypeIdentity,
+        version: u64,
+    },
+}
 
 #[must_use]
 pub(crate) struct CommittedDefinitionWrite<'a> {
     state: DefinitionWrite<'a>,
-    revision: u64,
+    revision: TableDefinitionRevision,
 }
 
 impl<'a> CommittedDefinitionWrite<'a> {
     pub(super) fn new(state: DefinitionWrite<'a>, revision: TableDefinitionRevision) -> Self {
-        Self {
-            state,
-            revision: revision.0,
-        }
+        Self { state, revision }
     }
 }
 
@@ -650,7 +654,7 @@ impl<'a> TableDefinitionRead<'a> {
         self.state.identity
     }
 
-    pub(super) fn revisions(&self) -> (u64, u64) {
+    pub(super) fn revisions(&self) -> (TableDefinitionRevision, u64) {
         (
             self.state.committed_revision,
             self.pending
@@ -1060,7 +1064,7 @@ mod tests {
                     let mut state = table.write();
                     versions.clear_locked(&mut state);
                     let stamp = epoch * 2 + 1;
-                    *state.edit_committed(TableDefinitionRevision(stamp as u64)) =
+                    *state.edit_committed(TableDefinitionRevision::Catalog(stamp as u64)) =
                         definition(stamp);
                     state.identity.created_at = stamp as u64;
                     state.identity.ownership.owner = (stamp % 4) as u16;

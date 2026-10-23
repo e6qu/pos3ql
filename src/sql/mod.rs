@@ -6661,7 +6661,8 @@ impl Engine {
         });
         if result.is_ok() {
             if let txn::CommitTarget::CommitPrepared { slot, .. }
-                | txn::CommitTarget::RollbackPrepared { slot, .. } = staged.target {
+            | txn::CommitTarget::RollbackPrepared { slot, .. } = staged.target
+            {
                 self.prepared_transactions.release(slot);
             }
             let publication = self.transaction_publication.complete();

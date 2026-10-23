@@ -1657,7 +1657,7 @@ impl SpilledRowState {
         }
     }
 
-    pub(super) fn state(&self) -> (super::RowState, super::row_layout::RowLayout) {
+    pub(super) fn metadata(&self) -> (super::RowState, super::row_layout::RowLayout) {
         let snapshot = self.roots.pool.slots[self.roots.slot]
             .snapshot
             .read()

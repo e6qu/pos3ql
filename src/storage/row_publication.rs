@@ -304,26 +304,16 @@ impl Storage {
         } else {
             None
         };
-        let committed = expected.map_or_else(
-            || spilled.as_ref().and_then(|source| source.state().committed),
-            |state| state.committed,
-        );
-        let committed_lsn = expected.map_or_else(
-            || {
-                spilled
-                    .as_ref()
-                    .map_or(0, |source| source.state().committed_lsn)
-            },
-            |state| state.committed_lsn,
-        );
-        let committed_generation = expected.map_or_else(
-            || {
-                spilled
-                    .as_ref()
-                    .and_then(|source| source.state().committed_generation)
-            },
-            |state| state.committed_generation,
-        );
+        let committed_state =
+            expected.or_else(|| spilled.as_ref().map(|source| source.metadata().0));
+        let (committed, committed_lsn, committed_generation) = match committed_state {
+            Some(state) => (
+                state.committed,
+                state.committed_lsn,
+                state.committed_generation,
+            ),
+            None => (None, 0, None),
+        };
         let changes_existence = committed.is_some() != image.is_some();
         let changed_columns = if track_statistics
             && target.pending_revision == 0

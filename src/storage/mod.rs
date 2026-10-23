@@ -31139,30 +31139,40 @@ impl Storage {
             table_slot,
             u64::MAX,
         );
-        let state = rows.get(&rowid).copied().map(|state| publication.row_layout.visible_state(state));
+        let state = rows
+            .get(&rowid)
+            .copied()
+            .map(|state| publication.row_layout.visible_state(state));
         drop(rows);
-        RowReadView::capture_with(&self.row_versions, &versions, state, publication.generation, publication.row_layout, |state, captured| {
-            let heap = captured
-                .has_heap(state)
-                .then(|| self.heap.retain_read_view());
-            let objects = if generations.is_empty() {
-                None
-            } else {
-                Some(
-                    self.query_roots
-                        .retain_point_image(self, image, &generations)?,
-                )
-            };
-            Ok(Some(row_reads::CapturedRowSources {
-                table: table_slot,
-                rowid,
-                created_at: image.created_at,
-                generation: image.data_generation,
-                row_layout: image.row_layout,
-                heap,
-                objects,
-            }))
-        })
+        RowReadView::capture_with(
+            &self.row_versions,
+            &versions,
+            state,
+            publication.generation,
+            publication.row_layout,
+            |state, captured| {
+                let heap = captured
+                    .has_heap(state)
+                    .then(|| self.heap.retain_read_view());
+                let objects = if generations.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.query_roots
+                            .retain_point_image(self, image, &generations)?,
+                    )
+                };
+                Ok(Some(row_reads::CapturedRowSources {
+                    table: table_slot,
+                    rowid,
+                    created_at: image.created_at,
+                    generation: image.data_generation,
+                    row_layout: image.row_layout,
+                    heap,
+                    objects,
+                }))
+            },
+        )
     }
 
     pub(crate) fn table_row_snapshot<'arena>(
@@ -31433,9 +31443,14 @@ impl Storage {
         if let RowVersionIdentity::Committed(lsn) = snapshot.version
             && self.tables[table_slot].definition().persistence == RelationPersistence::Temporary
             && state.committed_lsn == lsn
-            && state.committed_generation.is_some_and(|generation| generation > snapshot.generation) {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
-                "retained temporary row version is no longer available"));
+            && state
+                .committed_generation
+                .is_some_and(|generation| generation > snapshot.generation)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained temporary row version is no longer available"
+            ));
         }
         let image = match snapshot.version {
             RowVersionIdentity::Pending(identity) => {
@@ -35274,9 +35289,14 @@ impl Storage {
 
     /// Promotes the latest pending definition after its WAL batch is durable.
     /// Row images are promoted separately by the transaction coordinator.
-    pub(crate) fn commit_table_def(&mut self, change: TableDefinitionChange) -> Result<Option<bool>, SqlError> {
+    pub(crate) fn commit_table_def(
+        &mut self,
+        change: TableDefinitionChange,
+    ) -> Result<Option<bool>, SqlError> {
         let index = change.table();
-        let Some(table) = self.tables.get(index) else { return Ok(None) };
+        let Some(table) = self.tables.get(index) else {
+            return Ok(None);
+        };
         let identity = table.identity();
         if !change.source.matches(
             self,
@@ -35296,7 +35316,9 @@ impl Storage {
                 return Ok(None);
             }
         }
-        let Some(pending) = self.pending_table_def(index).map(|pending| *pending) else { return Ok(None) };
+        let Some(pending) = self.pending_table_def(index).map(|pending| *pending) else {
+            return Ok(None);
+        };
         let txid = change.transaction;
         let mut definition = pending.def;
         definition.has_toast |= {
@@ -46110,18 +46132,43 @@ impl Storage {
         // Schema moves and inbound foreign-key rebinding also publish definitions.
         // Check every affected counter before changing any catalog entry.
         for (slot, table) in self.tables.iter().enumerate() {
-            if table.database() != database_oid { continue; }
+            if table.database() != database_oid {
+                continue;
+            }
             let definition = table.definition();
             let schema_change = old.schema != def.schema;
-            let follows_schema = schema_change && definition.identity.live() && definition.fkeys().iter().any(|key| key.parent_schema == old.schema && key.parent == old.name);
-            let follows_name = old.name != def.name && definition.fkeys().iter().any(|key| {
-                let schema = if follows_schema && key.parent_schema == old.schema && key.parent == old.name { def.schema } else { key.parent_schema };
-                schema == def.schema && key.parent == old.name
-            });
-            let publications = u64::from(slot == index) + u64::from(schema_change && slot == index) + u64::from(follows_schema) + u64::from(follows_name);
-            table.publication().generation.checked_add(publications).ok_or_else(|| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "table publication generation exhausted")
-            })?;
+            let follows_schema = schema_change
+                && definition.identity().live()
+                && definition
+                    .fkeys()
+                    .iter()
+                    .any(|key| key.parent_schema == old.schema && key.parent == old.name);
+            let follows_name = old.name != def.name
+                && definition.fkeys().iter().any(|key| {
+                    let schema = if follows_schema
+                        && key.parent_schema == old.schema
+                        && key.parent == old.name
+                    {
+                        def.schema
+                    } else {
+                        key.parent_schema
+                    };
+                    schema == def.schema && key.parent == old.name
+                });
+            let publications = u64::from(slot == index)
+                + u64::from(schema_change && slot == index)
+                + u64::from(follows_schema)
+                + u64::from(follows_name);
+            table
+                .publication()
+                .generation
+                .checked_add(publications)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table publication generation exhausted"
+                    )
+                })?;
         }
         if old.schema != def.schema {
             self.move_table_schema(index, def.schema, revision);
@@ -46226,8 +46273,14 @@ impl Storage {
         }
         {
             let table = &mut self.tables[index];
-            let mut publication = table.publication.lock().expect("table publication lock poisoned");
-            let next = publication.generation.checked_add(1).expect("definition publication was preflighted");
+            let mut publication = table
+                .publication
+                .lock()
+                .expect("table publication lock poisoned");
+            let next = publication
+                .generation
+                .checked_add(1)
+                .expect("definition publication was preflighted");
             *table.definition.committed_mut(revision) = def;
             publication.generation = next;
             if rewrites_rows {
@@ -55042,7 +55095,10 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            assert_eq!(storage.commit_table_def(second_change).unwrap(), Some(false));
+            assert_eq!(
+                storage.commit_table_def(second_change).unwrap(),
+                Some(false)
+            );
             assert_eq!(original.name.as_str(), "original");
             let published = storage.table_definition_images();
             assert_eq!(

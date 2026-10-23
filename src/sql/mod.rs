@@ -21685,7 +21685,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage
                 .table_mut(index)
                 .rows
-                .insert(rowid, crate::storage::RowState::committed_in_generation(loc, lsn, generation))
+                .insert(
+                    rowid,
+                    crate::storage::RowState::committed_in_generation(loc, lsn, generation),
+                )
                 .map_err(|e| SqlError {
                     sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
                     message: stack_format!(192, "journal replay overflows {}", e.what),

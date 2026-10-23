@@ -7,8 +7,8 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
-mod transaction_publication;
 mod row_layout;
+mod transaction_publication;
 
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {

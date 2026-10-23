@@ -474,7 +474,7 @@ impl<'owner> RowRead<'owner> {
 
     /// Immutable SST metadata has no resident chain handles or lock owner.
     pub(super) fn immutable(source: SpilledRowState) -> Self {
-        let (state, row_layout) = source.state();
+        let (state, row_layout) = source.metadata();
         Self {
             state,
             generation: state

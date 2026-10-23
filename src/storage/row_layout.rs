@@ -7,6 +7,38 @@ pub(super) struct RowLayout {
     first_generation: u64,
 }
 
+impl RowLayout {
+    pub(super) const fn initial() -> Self {
+        Self {
+            first_generation: 0,
+        }
+    }
+
+    pub(super) fn installed_at(generation: u64) -> Self {
+        Self {
+            first_generation: generation,
+        }
+    }
+
+    pub(super) fn accepts(self, generation: u64) -> bool {
+        generation >= self.first_generation
+    }
+
+    pub(super) fn obsolete(self, state: &RowState) -> bool {
+        state
+            .committed_generation
+            .is_some_and(|generation| !self.accepts(generation))
+    }
+
+    pub(super) fn visible_state(self, mut state: RowState) -> RowState {
+        if self.obsolete(&state) {
+            state.committed = None;
+            state.history = CommittedHistory::empty();
+        }
+        state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,16 +61,13 @@ mod tests {
             .create_table(make_def("layout_invoices", &[("id", ColType::Int4, false)]))
             .unwrap();
         let location = storage.heap.append_row(&[Datum::Int4(11)]).unwrap();
+        let generation = storage.table(table).generation();
         for rowid in 1..=count as u64 {
             storage.tables[table]
                 .rows
                 .insert(
                     rowid,
-                    RowState::committed_in_generation(
-                        location,
-                        7,
-                        storage.table(table).generation(),
-                    ),
+                    RowState::committed_in_generation(location, 7, generation),
                 )
                 .unwrap();
         }
@@ -432,37 +461,5 @@ mod tests {
                 storage.rollback_table_def(change);
             });
         }
-    }
-}
-
-impl RowLayout {
-    pub(super) const fn initial() -> Self {
-        Self {
-            first_generation: 0,
-        }
-    }
-
-    pub(super) fn installed_at(generation: u64) -> Self {
-        Self {
-            first_generation: generation,
-        }
-    }
-
-    pub(super) fn accepts(self, generation: u64) -> bool {
-        generation >= self.first_generation
-    }
-
-    pub(super) fn obsolete(self, state: &RowState) -> bool {
-        state
-            .committed_generation
-            .is_some_and(|generation| !self.accepts(generation))
-    }
-
-    pub(super) fn visible_state(self, mut state: RowState) -> RowState {
-        if self.obsolete(&state) {
-            state.committed = None;
-            state.history = CommittedHistory::empty();
-        }
-        state
     }
 }

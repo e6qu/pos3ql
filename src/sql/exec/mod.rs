@@ -71643,7 +71643,7 @@ mod tests {
             let image = storage.heap.append_row_image(&[Datum::Int4(7)]).unwrap();
             let undo = storage.write_pending_image(target, 1, 2, Some(image), crate::storage::RowWriteStatistics::Tracked).unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-            let home = storage.visible_row_home(table, 1, state, 7).unwrap().unwrap();
+            let home = storage.visible_row_home_at(table, 1, state, 7, crate::storage::SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
             let selected = PhysicalRow::local(table, 1, home.snapshot());
             let bytes = storage.with_row_bytes(table, 1, home, |bytes| {
                 arena.alloc_slice_copy(bytes).map(|bytes| &*bytes).map_err(|_| arena_full())

@@ -1949,8 +1949,7 @@ mod tests {
         let table = storage.create_table(definition("source", 1)).unwrap();
         storage
             .write_table_def(
-                table,
-                7,
+                storage.select_table_definition(table, 7).0,
                 definition("source", 2),
                 &[None; MAX_COLUMNS],
                 false,

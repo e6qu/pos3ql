@@ -56,9 +56,9 @@ mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
+pub(crate) use table_definitions::TableDefinitionRevision;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) use table_edits::{TableDefinitionChange, TableDefinitionTarget};
-pub(crate) use table_definitions::TableDefinitionRevision;
 pub(crate) use type_names::{NamedTypeKind, NamedTypeSlot};
 pub(crate) use type_references::StorageSetupError;
 pub(crate) use type_references::TypeReference;
@@ -35101,7 +35101,9 @@ impl Storage {
         )
     }
 
-    pub(crate) fn reserve_table_definition_revision(&self) -> Result<TableDefinitionRevision, SqlError> {
+    pub(crate) fn reserve_table_definition_revision(
+        &self,
+    ) -> Result<TableDefinitionRevision, SqlError> {
         self.catalog_sequence.next().map(TableDefinitionRevision)
     }
 
@@ -45953,9 +45955,12 @@ impl Storage {
             if t.database() != database_oid || !t.live() {
                 continue;
             }
-            if !t.definition().fkeys().iter().any(|key| {
-                key.parent_schema == old_schema && key.parent == name
-            }) {
+            if !t
+                .definition()
+                .fkeys()
+                .iter()
+                .any(|key| key.parent_schema == old_schema && key.parent == name)
+            {
                 continue;
             }
             let mut changed = false;
@@ -46030,9 +46035,12 @@ impl Storage {
                 if table.database() != database_oid {
                     continue;
                 }
-                if !table.definition().fkeys().iter().any(|key| {
-                    key.parent_schema == current.schema && key.parent == current.name
-                }) {
+                if !table
+                    .definition()
+                    .fkeys()
+                    .iter()
+                    .any(|key| key.parent_schema == current.schema && key.parent == current.name)
+                {
                     continue;
                 }
                 let mut changed = false;
@@ -49639,7 +49647,9 @@ impl Storage {
         };
         drop(owners);
         if let RuleTarget::Table(table) = definition.target {
-            self.tables[usize::from(table)].definition.mark_rules_present();
+            self.tables[usize::from(table)]
+                .definition
+                .mark_rules_present();
         }
         self.catalog_sequence.observe(created_at);
         Ok(())
@@ -52961,7 +52971,12 @@ mod tests {
             let mut renamed = *storage.tables[foreign].definition();
             renamed.name = SqlName::parse("pending_name").unwrap();
             let _change = storage
-                .write_table_def(storage.select_table_definition(foreign, 7).0, renamed, &[None; MAX_COLUMNS], false)
+                .write_table_def(
+                    storage.select_table_definition(foreign, 7).0,
+                    renamed,
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
                 .unwrap();
             assert_eq!(
                 storage.ddl_name_locked_by_other("public", "pending_name", 9),
@@ -60203,7 +60218,12 @@ mod tests {
         let mut updated = *storage.table_def(first, 7);
         updated.name = SqlName::parse("held_pending_cleanup").unwrap();
         let _change = storage
-            .write_table_def(storage.select_table_definition(first, 7).0, updated, &[None; MAX_COLUMNS], false)
+            .write_table_def(
+                storage.select_table_definition(first, 7).0,
+                updated,
+                &[None; MAX_COLUMNS],
+                false,
+            )
             .unwrap();
         let target = RuleTarget::Table(second as u16);
         let publication_rule = storage

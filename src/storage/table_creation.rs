@@ -167,16 +167,19 @@ pub(super) fn allocate(
                 position.created_at()
             }
         };
-        state.install(def, table_definitions::TableIdentity {
-            database: current_database(),
-            ownership,
-            created_at,
-            ddl_version: created_at,
-            existence: match creation {
-                TableCreation::Committed => CatalogDdlState::Present,
-                TableCreation::Pending(txid) => CatalogDdlState::PendingCreate { txid },
+        state.install(
+            def,
+            table_definitions::TableIdentity {
+                database: current_database(),
+                ownership,
+                created_at,
+                ddl_version: created_at,
+                existence: match creation {
+                    TableCreation::Committed => CatalogDdlState::Present,
+                    TableCreation::Pending(txid) => CatalogDdlState::PendingCreate { txid },
+                },
             },
-        });
+        );
         drop(state);
         drop(source);
         table.mark_dirty();

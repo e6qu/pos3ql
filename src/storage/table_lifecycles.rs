@@ -88,9 +88,10 @@ impl Storage {
             let (schema, name) = state
                 .pending
                 .filter(|pending| pending.transaction == transaction)
-                .map_or((state.committed().schema, state.committed().name), |pending| {
-                    (pending.schema, pending.name)
-                });
+                .map_or(
+                    (state.committed().schema, state.committed().name),
+                    |pending| (pending.schema, pending.name),
+                );
             let version = self.catalog_sequence.next()?;
             self.stage_catalog_comment_drop(&mut comments, source, transaction, |comment| {
                 if comment.class == CommentClass::Constraint {

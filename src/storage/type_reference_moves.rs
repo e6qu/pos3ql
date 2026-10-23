@@ -475,11 +475,11 @@ impl TypePublication {
                     let revision = storage.reserve_table_definition_revision()?;
                     install_source(&mut types, &mut members);
                     for owner in owners.slots.iter_mut().flatten() {
-                        assert!(
-                            storage
-                                .pending_table_defs
-                                .move_type_references_locked(&mut owner.definition, movement, revision)
-                        );
+                        assert!(storage.pending_table_defs.move_type_references_locked(
+                            &mut owner.definition,
+                            movement,
+                            revision
+                        ));
                         owner.publication.generation += 1;
                         owner.publication.dirty = true;
                     }
@@ -1940,7 +1940,12 @@ mod tests {
                                 storage.create_table_in(definition, 7)
                             } else {
                                 storage
-                                    .write_table_def(storage.select_table_definition(related, 7).0, definition, &mapping("id"), false)
+                                    .write_table_def(
+                                        storage.select_table_definition(related, 7).0,
+                                        definition,
+                                        &mapping("id"),
+                                        false,
+                                    )
                                     .map(|_change| related)
                             }
                         })
@@ -1996,14 +2001,24 @@ mod tests {
                 }
                 assert_eq!(
                     storage
-                        .write_table_def(storage.select_table_definition(table, 9).0, captured, &mapping("id"), false)
+                        .write_table_def(
+                            storage.select_table_definition(table, 9).0,
+                            captured,
+                            &mapping("id"),
+                            false
+                        )
                         .unwrap_err()
                         .sqlstate,
                     crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT
                 );
                 captured.name = SqlName::parse("late_edit").unwrap();
                 let change = storage
-                    .write_table_def(storage.select_table_definition(table, 9).0, captured, &mapping("id"), false)
+                    .write_table_def(
+                        storage.select_table_definition(table, 9).0,
+                        captured,
+                        &mapping("id"),
+                        false,
+                    )
                     .unwrap();
                 assert_identity(&storage, table, 9, movement.current);
                 storage.rollback_table_def(change);
@@ -2201,7 +2216,12 @@ mod tests {
                     );
                     assert_eq!(
                         storage
-                            .write_table_def(storage.select_table_definition(table, 7).0, submitted, &mapping("id"), false)
+                            .write_table_def(
+                                storage.select_table_definition(table, 7).0,
+                                submitted,
+                                &mapping("id"),
+                                false
+                            )
                             .unwrap_err()
                             .sqlstate,
                         crate::sql::eval::sqlstate::UNDEFINED_OBJECT
@@ -2539,7 +2559,12 @@ mod tests {
                     && storage.comments.try_lock().is_ok();
                 let staged = if waiting && available {
                     Some(crate::mem::guard::forbid_alloc(|| {
-                        storage.write_table_def(storage.select_table_definition(unrelated, 7).0, pending, &mapping("id"), false)
+                        storage.write_table_def(
+                            storage.select_table_definition(unrelated, 7).0,
+                            pending,
+                            &mapping("id"),
+                            false,
+                        )
                     }))
                 } else {
                     None
@@ -2548,7 +2573,9 @@ mod tests {
                 writer.join().unwrap();
                 assert!(waiting);
                 assert!(available);
-                staged.expect("publication released unrelated owners").expect("stage unrelated definition")
+                staged
+                    .expect("publication released unrelated owners")
+                    .expect("stage unrelated definition")
             });
             crate::mem::guard::forbid_alloc(|| {
                 assert_identity(&storage, unrelated, 7, movement.current);
@@ -2675,7 +2702,12 @@ mod tests {
                     let mut definition = *storage.table_def(related, 7);
                     definition.columns[0].name = SqlName::parse(name).unwrap();
                     storage
-                        .write_table_def(storage.select_table_definition(related, 7).0, definition, &mapping(name), false)
+                        .write_table_def(
+                            storage.select_table_definition(related, 7).0,
+                            definition,
+                            &mapping(name),
+                            false,
+                        )
                         .unwrap()
                 });
                 let held = storage.table_def(related, if pending_reader { 7 } else { 0 });
@@ -2808,7 +2840,12 @@ mod tests {
                 }
             }
             let change = storage
-                .write_table_def(storage.select_table_definition(related, 7).0, pending, &mapping("id"), false)
+                .write_table_def(
+                    storage.select_table_definition(related, 7).0,
+                    pending,
+                    &mapping("id"),
+                    false,
+                )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 publish_move(&storage, movement, source);

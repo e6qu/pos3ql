@@ -472,7 +472,12 @@ mod tests {
             mapping[1] = Some(SqlName::parse("payload").unwrap());
             assert_eq!(
                 storage
-                    .write_table_def(storage.select_table_definition(table, 7).0, moved, &mapping, false)
+                    .write_table_def(
+                        storage.select_table_definition(table, 7).0,
+                        moved,
+                        &mapping,
+                        false
+                    )
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::DUPLICATE_TABLE
@@ -487,7 +492,12 @@ mod tests {
             );
             storage.commit_index_drop(occupied_slot);
             let change = storage
-                .write_table_def(storage.select_table_definition(table, 7).0, moved, &mapping, false)
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    moved,
+                    &mapping,
+                    false,
+                )
                 .unwrap();
             let mut second = index("second_binding_index", "binding_source", 0, 1);
             second.schema = target_schema;
@@ -741,7 +751,12 @@ mod tests {
             first_mapping[1] = Some(SqlName::parse("key").unwrap());
             first_mapping[2] = Some(SqlName::parse("payload").unwrap());
             let _first_change = storage
-                .write_table_def(storage.select_table_definition(table, 7).0, first, &first_mapping, false)
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    first,
+                    &first_mapping,
+                    false,
+                )
                 .unwrap();
             let during = storage
                 .create_index(index("during_shape", "binding_source", 2, 1), 7)
@@ -760,7 +775,12 @@ mod tests {
             second_mapping[2] = Some(SqlName::parse("added_renamed").unwrap());
             for commit in [false, true] {
                 let second_change = storage
-                    .write_table_def(storage.select_table_definition(table, 7).0, second, &second_mapping, false)
+                    .write_table_def(
+                        storage.select_table_definition(table, 7).0,
+                        second,
+                        &second_mapping,
+                        false,
+                    )
                     .unwrap();
                 for (slot, expected) in [(before, (1, 0)), (during, (2, 0))] {
                     let projected = storage.index_visible_to(slot, 7).unwrap();

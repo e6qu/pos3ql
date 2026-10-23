@@ -5923,7 +5923,8 @@ fn drop_table_kind(
                     let Some((child, foreign_key)) = inbound else {
                         break;
                     };
-                    let (child_target, child_definition) = storage.select_table_definition(child, txn.txid);
+                    let (child_target, child_definition) =
+                        storage.select_table_definition(child, txn.txid);
                     let constraint = child_definition.fkeys()[foreign_key].name;
                     if !statement.cascade {
                         return sql_fail(sql_err!(
@@ -5959,9 +5960,15 @@ fn drop_table_kind(
                     {
                         *target = Some(child_definition.columns()[column].name);
                     }
-                    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &identity_mapping, false) {
-            return sql_fail(error);
-        }
+                    if let Err(error) = txn.write_table_definition(
+                        storage,
+                        child_target,
+                        updated,
+                        &identity_mapping,
+                        false,
+                    ) {
+                        return sql_fail(error);
+                    }
                 }
                 // Owned serial/identity sequences are internal dependencies:
                 // dropping their table drops them in the same transaction.
@@ -13217,9 +13224,15 @@ pub(crate) fn drop_schema(
                 {
                     *target = Some(def.columns()[column].name);
                 }
-                if let Err(error) = txn.write_table_definition(storage, edit_target, updated, &identity_mapping, false) {
-            return sql_fail(error);
-        }
+                if let Err(error) = txn.write_table_definition(
+                    storage,
+                    edit_target,
+                    updated,
+                    &identity_mapping,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
             }
             SchemaObject::View(v) => {
                 if let Err(error) = storage.lock_object(
@@ -13371,7 +13384,7 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::Matview { table, catalog } => {
-                let (edit_target, def) = storage.select_table_definition(*table, txn.txid);
+                let def = *storage.table_def(*table, txn.txid);
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage_reserved(
                     txn.txid,
@@ -49927,7 +49940,8 @@ pub fn alter_tables_tablespace(
         }
         let mut next = definition;
         next.tablespace = target;
-        if let Err(error) = stage_table_definition(storage, wal, txn, edit_target, definition, next) {
+        if let Err(error) = stage_table_definition(storage, wal, txn, edit_target, definition, next)
+        {
             return sql_fail(error);
         }
     }
@@ -64652,9 +64666,10 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &mapping, false) {
-            return sql_fail(error);
-        }
+    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &mapping, false)
+    {
+        return sql_fail(error);
+    }
     if emit_completion {
         responder.command_complete(tag)?;
     }
@@ -65080,9 +65095,10 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = txn.write_table_definition(storage, child_target, new_def, &mapping, false) {
-            return sql_fail(error);
-        }
+    if let Err(error) = txn.write_table_definition(storage, child_target, new_def, &mapping, false)
+    {
+        return sql_fail(error);
+    }
     if attaching && child_def.partition.is_partitioned() {
         for depth in 1..=storage.table_count() {
             for descendant in 0..storage.table_count() {
@@ -65091,7 +65107,8 @@ fn alter_partition_attachment(
                 {
                     continue;
                 }
-                let (dependent_target, current) = storage.select_table_definition(descendant, txn.txid);
+                let (dependent_target, current) =
+                    storage.select_table_definition(descendant, txn.txid);
                 let attachment = current
                     .partition
                     .attachment
@@ -65135,9 +65152,15 @@ fn alter_partition_attachment(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = txn.write_table_definition(storage, dependent_target, dependent, &mapping, false) {
-            return sql_fail(error);
-        }
+                if let Err(error) = txn.write_table_definition(
+                    storage,
+                    dependent_target,
+                    dependent,
+                    &mapping,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
             }
         }
     }
@@ -65697,7 +65720,9 @@ fn alter_table_relation(
         for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
             *target = Some(def.columns()[column].name);
         }
-        if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &mapping, false) {
+        if let Err(error) =
+            txn.write_table_definition(storage, edit_target, new_def, &mapping, false)
+        {
             return sql_fail(error);
         }
         if emit_completion {
@@ -66287,7 +66312,9 @@ fn alter_table_relation(
             }
             seq_session.invalidate_cache(alteration.slot);
         }
-        if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &mapping, false) {
+        if let Err(error) =
+            txn.write_table_definition(storage, edit_target, new_def, &mapping, false)
+        {
             return sql_fail(error);
         }
         if emit_completion {
@@ -68061,9 +68088,11 @@ fn alter_table_relation(
         }
     }
 
-    if let Err(error) = txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite) {
-            return sql_fail(error);
-        }
+    if let Err(error) =
+        txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite)
+    {
+        return sql_fail(error);
+    }
     let dropped_constraints = match arena.alloc_slice_with(txn.constraint_capacity(), |_| None) {
         Ok(constraints) => constraints,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -68270,7 +68299,8 @@ fn alter_table_relation(
                 {
                     continue;
                 }
-                let (dependent_target, current) = storage.select_table_definition(descendant, txn.txid);
+                let (dependent_target, current) =
+                    storage.select_table_definition(descendant, txn.txid);
                 let mut dependent = current;
                 let mut changed = match synchronize_inherited_constraint_changes(
                     &def,
@@ -68392,9 +68422,15 @@ fn alter_table_relation(
                         return sql_fail(error);
                     }
                 }
-                if let Err(error) = txn.write_table_definition(storage, dependent_target, dependent, &mapping, false) {
-            return sql_fail(error);
-        }
+                if let Err(error) = txn.write_table_definition(
+                    storage,
+                    dependent_target,
+                    dependent,
+                    &mapping,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
             }
         }
     }
@@ -68405,7 +68441,8 @@ fn alter_table_relation(
             {
                 continue;
             }
-            let (dependent_target, current) = storage.select_table_definition(dependent_table, txn.txid);
+            let (dependent_target, current) =
+                storage.select_table_definition(dependent_table, txn.txid);
             let mut dependent = current;
             let mut changed = false;
             for foreign_key in &mut dependent.fkeys[..dependent.n_fkeys] {
@@ -68426,13 +68463,15 @@ fn alter_table_relation(
             {
                 *target = Some(current.columns()[column].name);
             }
-            if let Err(error) = txn.write_table_definition(storage, dependent_target,
+            if let Err(error) = txn.write_table_definition(
+                storage,
+                dependent_target,
                 dependent,
                 &identity_mapping,
                 false,
             ) {
-            return sql_fail(error);
-        }
+                return sql_fail(error);
+            }
         }
     }
     for i in 0..rewritten_rows {
@@ -68685,8 +68724,8 @@ fn alter_table_replica_identity(
         }
     }
     if let Err(error) = txn.write_table_definition(storage, edit_target, next, &mapping, false) {
-            return sql_fail(error);
-        }
+        return sql_fail(error);
+    }
     if emit_completion {
         responder.command_complete(tag)?;
     }

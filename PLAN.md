@@ -34,7 +34,7 @@ not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
 Connect table edits, schema moves and rewrite finalization to that transaction
-publication boundary. Keep a statement's retained definitions and rows consistent with the same
+publication boundary. Replace remaining database-wide schema waits with locks on affected objects and retained type and table definitions. Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
 preparation. Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may

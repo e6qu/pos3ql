@@ -1,0 +1,79 @@
+name: Catalog publication validation
+
+on:
+  push:
+    branches: [scope-catalog-publication]
+
+concurrency:
+  group: catalog-publication-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format and record the tested source
+        run: |
+          cargo fmt
+          git diff --binary -- src > "$RUNNER_TEMP/format.patch"
+          git add src
+          git rev-parse HEAD > "$RUNNER_TEMP/validation-head"
+          validation_tree=$(git write-tree)
+          printf '%s\n' "$validation_tree" > "$RUNNER_TEMP/validation-tree"
+          git rev-parse "${validation_tree}:src" > "$RUNNER_TEMP/validation-source-tree"
+      - name: Retain tested source provenance and formatting corrections
+        uses: actions/upload-artifact@v6
+        with:
+          name: catalog-publication-format
+          path: |
+            ${{ runner.temp }}/format.patch
+            ${{ runner.temp }}/validation-head
+            ${{ runner.temp }}/validation-tree
+            ${{ runner.temp }}/validation-source-tree
+      - name: PostgreSQL catalog publication reference
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, select, subprocess
+          command = ["docker", "exec", "-i", os.environ["POSTGRES_CONTAINER"], "psql", "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"]
+          fixture = pathlib.Path("tests/external/differential_exact/15_catalog_publication.sql").read_text()
+          setup, marker, changes = fixture.partition("-- Changes while another connection retains unrelated work.")
+          assert marker
+          subprocess.run(command, input=setup, text=True, check=True)
+          reader = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+          try:
+              reader.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 'ready' FROM catalog_invoices; SELECT 'orders' FROM catalog_orders;\n")
+              reader.stdin.flush()
+              assert select.select([reader.stdout], [], [], 5)[0], "reference reader did not start"
+              assert reader.stdout.readline().strip() == "ready"
+              assert reader.stdout.readline().strip() == "orders"
+              result = subprocess.run(command, input="SET lock_timeout = '1s'; SET statement_timeout = '4s'; " + changes, text=True, capture_output=True, check=True, timeout=5)
+              assert result.stdout.splitlines() == ["1", "22", "9", "ready", "(7,ok)"], result.stdout
+              output, errors = reader.communicate("SELECT id FROM catalog_invoices; SELECT id FROM catalog_orders; COMMIT;\n", timeout=5)
+              assert reader.returncode == 0, errors
+              assert output.splitlines() == ["22", "1"], output
+              print("PostgreSQL catalog changes with unrelated and related readers:", result.stdout.splitlines())
+          finally:
+              if reader.poll() is None:
+                  reader.communicate("ROLLBACK;\n", timeout=5)
+          PYTHON
+      - name: All-target compilation and lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Catalog publication and recovery regressions
+        run: >-
+          cargo test --release --lib --locked -- catalog_publication_
+          --test-threads=1

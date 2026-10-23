@@ -8,6 +8,75 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 #[test]
+fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_recovery() {
+    for (mode, suffix) in [(crate::config::TransactionMode::Mvcc, "mvcc"), (crate::config::TransactionMode::Locking, "locking")] {
+        let name = format!("catalog-publication-unrelated-{suffix}");
+        let mut config = test_config(&name);
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut reader = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut copier = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let mut transition = copy_transition_scratch(&mut budget);
+        let arena = Arena::new(&mut budget, "unrelated catalog COPY", 1 << 18).unwrap();
+        let guc = GucState::new();
+        run_txn(&mut engine, &mut budget, &mut writer,
+            "CREATE DOMAIN catalog_customer_id AS integer; CREATE DOMAIN catalog_unused_domain AS integer; CREATE TYPE catalog_pair AS (value integer); CREATE TYPE catalog_state AS ENUM ('ready'); CREATE TYPE catalog_unused_pair AS (value integer); CREATE SCHEMA catalog_empty; CREATE TABLE catalog_orders (id catalog_customer_id PRIMARY KEY); CREATE TABLE catalog_invoices (id integer); INSERT INTO catalog_orders VALUES (1); INSERT INTO catalog_invoices VALUES (22)");
+        assert!(engine.checkpoint().unwrap());
+        let begin = match mode {
+            crate::config::TransactionMode::Mvcc => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            crate::config::TransactionMode::Locking => "BEGIN",
+        };
+        run_txn(&mut engine, &mut budget, &mut reader, begin);
+        assert_eq!(data_rows(&run_txn_bytes(&mut engine, &mut budget, &mut reader,
+            "SELECT id FROM catalog_invoices")), ["22"]);
+        run_txn(&mut engine, &mut budget, &mut copier, "BEGIN; COPY catalog_invoices FROM STDIN");
+        let setup = engine.take_pending_copy().expect("unrelated invoice COPY");
+        for (sql, tag) in [
+            ("ALTER DOMAIN catalog_customer_id RENAME TO catalog_account_id", "ALTER DOMAIN"),
+            ("ALTER DOMAIN catalog_account_id SET DEFAULT 9", "ALTER DOMAIN"),
+            ("ALTER DOMAIN catalog_account_id ADD CONSTRAINT catalog_positive CHECK (VALUE > 0)", "ALTER DOMAIN"),
+            ("ALTER TYPE catalog_pair RENAME ATTRIBUTE value TO total", "ALTER TYPE"),
+            ("ALTER TYPE catalog_pair ADD ATTRIBUTE note text", "ALTER TYPE"),
+            ("ALTER TYPE catalog_state RENAME TO catalog_status", "ALTER TYPE"),
+            ("DROP TYPE catalog_unused_pair", "DROP TYPE"),
+            ("DROP DOMAIN catalog_unused_domain", "DROP DOMAIN"),
+            ("DROP SCHEMA catalog_empty", "DROP SCHEMA"),
+        ] {
+            let response = run_txn_bytes(&mut engine, &mut budget, &mut writer, sql);
+            assert!(error_sqlstates(&response).is_empty(), "{sql}: {}", String::from_utf8_lossy(&response));
+            assert!(response.windows(tag.len()).any(|part| part == tag.as_bytes()),
+                "{sql} did not complete while unrelated sessions remained open: {}", String::from_utf8_lossy(&response));
+            assert!(engine.fatal_commit_failure().is_none());
+        }
+        assert_eq!(error_sqlstates(&run_txn_bytes(&mut engine, &mut budget, &mut writer,
+            "INSERT INTO catalog_orders VALUES (0)")), ["23514"]);
+        copy_line(&mut engine, &mut budget, &setup, &mut copier, guc.seq_session(), &arena,
+            b"23", &mut transition).unwrap();
+        engine.copy_abort(&mut copier, &guc);
+        drop(setup);
+        run_txn(&mut engine, &mut budget, &mut copier, "ROLLBACK");
+        run_txn(&mut engine, &mut budget, &mut reader, "COMMIT");
+        drop(writer); drop(reader); drop(copier); drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, 1 << 29);
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold,
+            "SELECT id FROM catalog_orders; SELECT id FROM catalog_invoices; SELECT 9::catalog_account_id; SELECT 'ready'::catalog_status; SELECT ROW(7, 'ok')::catalog_pair", false)),
+            ["1", "22", "9", "ready", "(7,ok)"]);
+        assert_eq!(error_sqlstates(&session.execute(&mut cold, "INSERT INTO catalog_orders VALUES (0)", false)), ["23514"]);
+    }
+}
+
+#[test]
 fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_copy() {
     for checkpoint in [false, true] {
         let name = format!("statement-rewrite-readers-{checkpoint}");

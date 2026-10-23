@@ -462,4 +462,86 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn row_layout_byte_sources_accept_compatible_updates_and_reject_rewrite_images() {
+        let (mut storage, table, _) = fixture(RelationPersistence::Permanent, 2);
+        crate::mem::guard::forbid_alloc(|| {
+            let source = storage.table_row_snapshot(table, None).unwrap();
+            let original = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    7,
+                )
+                .unwrap()
+                .unwrap();
+            let selected = source.retain(1, &original).unwrap();
+            let location = storage.heap.append_row(&[Datum::Int4(12)]).unwrap();
+            storage
+                .write_pending(table, 1, 8, 1, Some(location))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            let compatible = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    9,
+                )
+                .unwrap()
+                .unwrap();
+            let updated = source.retain(1, &compatible).unwrap();
+            let metadata = change(&storage, table, ColType::Int4, false);
+            assert_eq!(storage.commit_table_def(metadata).unwrap(), Some(false));
+            assert!(source.retain(1, &compatible).is_ok());
+            let rewrite = change(&storage, table, ColType::Int8, true);
+            let location = storage.heap.append_row(&[Datum::Int8(13)]).unwrap();
+            storage
+                .write_pending(table, 1, 8, 1, Some(location))
+                .unwrap();
+            assert_eq!(storage.commit_table_def(rewrite).unwrap(), Some(true));
+            storage.commit_rewritten_row(table, 1, 8, 11).unwrap();
+            storage.finish_table_def_commit(table, true);
+            let replacement = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    11,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                source.retain(1, &replacement).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let current = storage.table_row_snapshot(table, None).unwrap();
+            assert_eq!(
+                current.retain(1, &original).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert!(current.retain(1, &replacement).is_ok());
+            for (image, expected) in [
+                (selected.read().unwrap(), 11),
+                (updated.read().unwrap(), 12),
+            ] {
+                storage
+                    .with_row_bytes(table, 1, image, |bytes| {
+                        let mut values = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(expected));
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+    }
 }

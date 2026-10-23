@@ -126,6 +126,7 @@ impl Storage {
             let image = SpillGenerationImage::capture(
                 &definition,
                 publication.generation,
+                publication.row_layout,
                 table_slot,
                 commit,
             );
@@ -157,6 +158,7 @@ impl Storage {
                     publication.row_layout.visible_state(state),
                     &versions,
                     publication.generation,
+                    publication.row_layout,
                 )
                 .visible_version_at(txid, command, commit);
                 records[at] = source.capture_selection(rowid, selected)?;
@@ -334,10 +336,15 @@ mod tests {
             let pending_version = {
                 let versions = storage.row_versions.read();
                 let state = storage.tables[table].rows.get(&2).unwrap();
-                RowRead::borrowed(state, &versions, storage.table(table).generation())
-                    .visible_version_at(11, 2, 7)
-                    .unwrap()
-                    .0
+                RowRead::borrowed(
+                    state,
+                    &versions,
+                    storage.table(table).generation(),
+                    storage.table(table).publication().row_layout,
+                )
+                .visible_version_at(11, 2, 7)
+                .unwrap()
+                .0
             };
             let later = storage.captured_row_scan_in(table, 11, &arena).unwrap();
             let index = storage.index_validation_scan_in(table, 11, &arena).unwrap();

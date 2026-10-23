@@ -18,6 +18,7 @@ pub(crate) struct RowSnapshot {
     pub(super) created_at: u64,
     pub(super) version: RowVersionIdentity,
     pub(super) generation: u64,
+    pub(super) row_layout: super::row_layout::RowLayout,
 }
 
 impl RowSnapshot {
@@ -40,6 +41,7 @@ pub(super) enum RowVersionIdentity {
 pub(crate) struct TableRowSnapshot<'arena> {
     pub(super) created_at: u64,
     generation: u64,
+    row_layout: super::row_layout::RowLayout,
     table_slot: usize,
     heap: Option<HeapReadView>,
     roots: CapturedSpillRoots<'arena>,
@@ -182,6 +184,7 @@ impl<'arena> TableRowSnapshot<'arena> {
         Ok(Self {
             created_at: image.created_at,
             generation: image.data_generation,
+            row_layout: image.row_layout,
             table_slot: image.table_slot(),
             heap: retain_heap.then(|| storage.heap.retain_read_view()),
             roots: CapturedSpillRoots::capture(storage, image, generations, arena)?,
@@ -232,6 +235,12 @@ impl<'arena> TableRowSnapshot<'arena> {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "scan row belongs to a different table incarnation"
+            ));
+        }
+        if self.row_layout != image.snapshot.row_layout {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "scan row belongs to a different row layout"
             ));
         }
         image.validate_request(self.table_slot, rowid)?;
@@ -306,6 +315,7 @@ impl<'arena> TableRowSnapshot<'arena> {
                     created_at: self.created_at,
                     version,
                     generation: self.generation,
+                    row_layout: self.row_layout,
                 },
                 self.heap
                     .as_ref()
@@ -550,6 +560,7 @@ impl OrderedRowSnapshot<'_, '_> {
                         created_at: source.created_at,
                         version,
                         generation: source.generation,
+                        row_layout: source.row_layout,
                     },
                     heap.read_location(location)?,
                     source.table_slot,
@@ -710,6 +721,7 @@ mod tests {
         let source = TableRowSnapshot {
             created_at: u64::MAX,
             generation: 0,
+            row_layout: super::super::row_layout::RowLayout::initial(),
             table_slot: 17,
             heap: None,
             roots: CapturedSpillRoots::Empty,
@@ -776,6 +788,7 @@ mod tests {
                         created_at: source.created_at,
                         version: versions[index],
                         generation: source.generation,
+                        row_layout: source.row_layout,
                     },
                     storage.heap.get(locations[index]).unwrap(),
                     table,
@@ -845,6 +858,7 @@ mod tests {
                     created_at: source.created_at,
                     version: RowVersionIdentity::Committed(7),
                     generation: source.generation,
+                    row_layout: source.row_layout,
                 },
                 storage.heap.get(location).unwrap(),
                 table,
@@ -862,6 +876,7 @@ mod tests {
                     created_at: source.created_at,
                     version: RowVersionIdentity::Committed(7),
                     generation: source.generation,
+                    row_layout: source.row_layout,
                 },
                 storage.heap.get(location).unwrap(),
                 table,
@@ -876,6 +891,7 @@ mod tests {
                         created_at: source.created_at,
                         version,
                         generation: source.generation,
+                        row_layout: source.row_layout,
                     },
                     storage.heap.get(location).unwrap(),
                     table,
@@ -953,6 +969,7 @@ mod tests {
                 created_at,
                 version: RowVersionIdentity::Pending(1),
                 generation: table.generation,
+                row_layout: table.row_layout,
             },
             storage.heap.get(location).unwrap(),
             slot,

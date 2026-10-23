@@ -229,6 +229,7 @@ impl Storage {
         let image = super::spill_generations::SpillGenerationImage::capture(
             &definition,
             publication.generation,
+            publication.row_layout,
             table_slot,
             commit_lsn,
         );
@@ -1922,6 +1923,7 @@ mod tests {
                 let snapshot = super::super::RowSnapshot {
                     created_at: storage.tables[table].created_at(),
                     generation: state.generation,
+                    row_layout: state.row_layout,
                     version: if pending {
                         super::super::RowVersionIdentity::Pending(
                             state.pending_head_identity().unwrap(),

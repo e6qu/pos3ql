@@ -289,7 +289,8 @@ cleanup turn visits at most 64 row slots and releases its owners between turns.
 Already selected row bytes remain readable after cleanup. A metadata lookup saved
 before the physical layout changed returns `40001` rather than decoding replacement
 bytes using the old column types. Renames and unrelated row changes do not invalidate
-that lookup. These checks use table publication generations, so temporary changes
+that lookup. Retained scans also reject newly supplied row images from another
+physical layout, even when their bytes share a heap allocation. These checks use table publication generations, so temporary changes
 sharing a journal position cannot redirect an old selection to new bytes.
 
 **User example:** deleting most orders and then changing their ID from `integer`

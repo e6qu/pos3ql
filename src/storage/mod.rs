@@ -31135,12 +31135,13 @@ impl Storage {
         let image = spill_generations::SpillGenerationImage::capture(
             &definition,
             publication.generation,
+            publication.row_layout,
             table_slot,
             u64::MAX,
         );
         let state = rows.get(&rowid).copied().map(|state| publication.row_layout.visible_state(state));
         drop(rows);
-        RowReadView::capture_with(&self.row_versions, &versions, state, publication.generation, |state, captured| {
+        RowReadView::capture_with(&self.row_versions, &versions, state, publication.generation, publication.row_layout, |state, captured| {
             let heap = captured
                 .has_heap(state)
                 .then(|| self.heap.retain_read_view());
@@ -31157,6 +31158,7 @@ impl Storage {
                 rowid,
                 created_at: image.created_at,
                 generation: image.data_generation,
+                row_layout: image.row_layout,
                 heap,
                 objects,
             }))
@@ -31300,6 +31302,7 @@ impl Storage {
                 created_at: self.tables[table_slot].created_at(),
                 version,
                 generation: state.generation,
+                row_layout: state.row_layout,
             };
             if let RowHome::Spilled {
                 len, commit_lsn, ..

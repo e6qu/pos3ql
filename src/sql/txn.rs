@@ -2393,7 +2393,7 @@ impl TxnState {
         definition: crate::storage::TableDef,
         column_mapping: &[Option<crate::storage::SqlName>; crate::storage::MAX_COLUMNS],
         rewrites_rows: bool,
-    ) -> Result<(), SqlError> {
+    ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {
         if target.transaction() != self.txid {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
@@ -2405,7 +2405,30 @@ impl TxnState {
             storage.rollback_table_def(change);
             return Err(error);
         }
-        Ok(())
+        Ok(change.row_target())
+    }
+
+    pub(crate) fn write_row(
+        &mut self,
+        storage: &crate::storage::Storage,
+        target: crate::storage::TableDefinitionTarget,
+        rowid: u64,
+        command: u32,
+        image: Option<crate::storage::HeapRowRead>,
+        statistics: crate::storage::RowWriteStatistics,
+    ) -> Result<crate::storage::PendingWriteUndo, SqlError> {
+        if target.transaction() != self.txid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "row definition selection belongs to another transaction"
+            ));
+        }
+        let undo = storage.write_pending_image(target, rowid, command, image, statistics)?;
+        if let Err(error) = self.touch(target.table() as u32, rowid, undo) {
+            storage.restore_pending(target.table(), rowid, self.txid, undo);
+            return Err(error);
+        }
+        Ok(undo)
     }
 
     pub(crate) fn record_table_drop(

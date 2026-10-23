@@ -5105,7 +5105,7 @@ enum ConflictOutcome<'a> {
 fn handle_conflict<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    table_index: usize,
+    row_target: crate::storage::TableDefinitionTarget,
     logical_table_index: usize,
     def: &TableDef,
     logical_definition: &TableDef,
@@ -5129,6 +5129,7 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
 where
     'snapshot: 'a,
 {
+    let table_index = row_target.table();
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
@@ -5473,17 +5474,8 @@ where
     })?;
     rowenc::encode(&new_values[..def.n_columns], new_bytes);
     let new_image = storage.heap.append_image(new_bytes)?;
-    let prior = storage.write_pending_image(
-        table_index,
-        rowid,
-        txn.txid,
-        txn.command_id(),
-        Some(new_image),
-    )?;
-    if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-        storage.restore_pending(table_index, rowid, txn.txid, prior);
-        return Err(e);
-    }
+    txn.write_row(storage, row_target, rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked)?;
+
     if referenced_key_changed(
         storage,
         def.schema.as_str(),
@@ -39269,6 +39261,7 @@ pub fn create_table_as(
     // Populate, unless WITH NO DATA. Two passes: materialize the query's rows
     // into the arena (reading storage immutably), then store them (mutably) —
     // the source could reference another table, so the phases must not overlap.
+    let write_target = storage.select_table_definition(table_index, txn.txid).0;
     let mut count = 0u64;
     if with_data {
         let sel = match crate::sql::parser::parse_query(sql, arena) {
@@ -39345,7 +39338,7 @@ pub fn create_table_as(
                     Err(e) => return sql_fail(e),
                 }
             }
-            if let Err(e) = store_row(storage, txn, table_index, None, &values[..n_cols]) {
+            if let Err(e) = store_row(storage, txn, write_target, None, &values[..n_cols]) {
                 return sql_fail(e);
             }
             count += 1;
@@ -39463,7 +39456,7 @@ pub fn refresh_materialized_view(
         Some(crate::storage::ResolvedRelation::Table(idx)) => idx,
         _ => return sql_fail(undefined_kind("relation", name.name)),
     };
-    let def = *storage.table_def(table_index, txn.txid);
+    let (write_target, def) = storage.select_table_definition(table_index, txn.txid);
     let Some(slot) = storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -39609,14 +39602,9 @@ pub fn refresh_materialized_view(
             break;
         }
         for &rowid in &rowids[..count] {
-            match storage.write_pending_image(table_index, rowid, txn.txid, txn.command_id(), None)
+            match txn.write_row(storage, write_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked)
             {
-                Ok(prior) => {
-                    if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-                        storage.restore_pending(table_index, rowid, txn.txid, prior);
-                        return sql_fail(e);
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => return sql_fail(e),
             }
         }
@@ -39631,7 +39619,7 @@ pub fn refresh_materialized_view(
                 Err(e) => return sql_fail(e),
             }
         }
-        if let Err(e) = store_row(storage, txn, table_index, None, &values[..n_cols]) {
+        if let Err(e) = store_row(storage, txn, write_target, None, &values[..n_cols]) {
             return sql_fail(e);
         }
     }
@@ -52186,7 +52174,8 @@ pub fn copy_begin(
     } else {
         resolve_dml_table(storage, &statement.table, txid)?
     };
-    let def = storage.table_def(table_index, txid);
+    let definitions = storage.table_definition_images();
+    let def = definitions.definition(storage, table_index, txid)?;
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
@@ -52307,8 +52296,6 @@ pub fn copy_begin(
             }
         }
     }
-    let definitions = storage.table_definition_images();
-    definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
         snapshot_lease: Mutex::new(None),
         definitions,
@@ -52419,7 +52406,8 @@ pub(crate) fn subscription_copy_setup(
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
     let table_index = storage.resolve_subscription_target(schema.as_str(), table.as_str(), txid)?;
-    let definition = storage.table_def(table_index, txid);
+    let definitions = storage.table_definition_images();
+    let definition = definitions.definition(storage, table_index, txid)?;
     let mut targets = [0usize; MAX_COLUMNS];
     if columns.is_empty() || columns.len() > definition.n_columns {
         return Err(sql_err!(
@@ -52457,8 +52445,6 @@ pub(crate) fn subscription_copy_setup(
         }
         targets[index] = local;
     }
-    let definitions = storage.table_definition_images();
-    definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
         snapshot_lease: Mutex::new(None),
         definitions,
@@ -52678,9 +52664,9 @@ pub(crate) fn copy_row(
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     let _files = setup.restore_snapshot(storage)?;
-    let def = setup
+    let (write_target, def) = setup
         .definitions
-        .definition(storage, setup.table_index, txn.txid)?;
+        .selection(storage, setup.table_index, txn.txid)?;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let fmt = &setup.fmt;
     let n_fields = if fmt.csv {
@@ -52779,7 +52765,7 @@ pub(crate) fn copy_row(
         responder,
         scratch,
         inserted,
-        setup.table_index,
+        write_target,
         setup.security_role,
         def,
         &checks,
@@ -52809,9 +52795,9 @@ pub(crate) fn copy_row_binary(
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     let _files = setup.restore_snapshot(storage)?;
-    let def = setup
+    let (write_target, def) = setup
         .definitions
-        .definition(storage, setup.table_index, txn.txid)?;
+        .selection(storage, setup.table_index, txn.txid)?;
     let malformed = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid COPY binary row");
     let mut reader = crate::pg::wire::MsgIn::new(row);
     let count = reader.i16().map_err(|_| malformed())?;
@@ -52884,7 +52870,7 @@ pub(crate) fn copy_row_binary(
         responder,
         scratch,
         inserted,
-        setup.table_index,
+        write_target,
         setup.security_role,
         def,
         &checks,
@@ -52905,7 +52891,7 @@ fn finish_copy_row<'a>(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
-    logical_table: usize,
+    logical_target: crate::storage::TableDefinitionTarget,
     security_role: Option<u16>,
     definition: &TableDef,
     checks: &ParsedChecks<'a>,
@@ -52913,14 +52899,15 @@ fn finish_copy_row<'a>(
     values: &mut [Datum<'a>; MAX_COLUMNS],
     arena: &'a Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
+    let logical_table = logical_target.table();
     partition_insert::with_partition_insert_row(
         storage,
-        logical_table,
+        logical_target,
         definition,
         values,
-        txn.txid,
         arena,
-        |storage, target, physical, values, mapping| {
+        |storage, row_target, physical, values, mapping| {
+            let target = row_target.table();
             if txn.replication_apply {
                 storage.require_subscription_target(target, txn.txid)?;
             }
@@ -53049,7 +53036,7 @@ fn finish_copy_row<'a>(
                 store_row(
                     storage,
                     txn,
-                    target,
+                    row_target,
                     row.stored(),
                     &values[..physical.n_columns],
                 )?;
@@ -53116,8 +53103,8 @@ pub(crate) fn apply_replication_insert(
         crate::sql::ast::TableLockMode::RowExclusive,
         false,
     )?;
-    let definition = *storage.table_def(table_index, txn.txid);
-    let mut values = decode_replication_tuple(storage, txn, binding, tuple, arena, false)?;
+    let (write_target, definition) = storage.select_table_definition(table_index, txn.txid);
+    let mut values = decode_replication_tuple(storage, txn, &definition, binding.remote_to_local(), tuple, arena, false)?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
         explicit[local] = true;
@@ -53136,7 +53123,7 @@ pub(crate) fn apply_replication_insert(
     apply_replication_insert_values(
         storage,
         txn,
-        table_index,
+        write_target,
         &definition,
         &mut values,
         arena,
@@ -53148,22 +53135,23 @@ pub(crate) fn apply_replication_insert(
 fn apply_replication_insert_values<'arena>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    table_index: usize,
+    logical_target: crate::storage::TableDefinitionTarget,
     definition: &TableDef,
     values: &mut [Datum<'arena>; MAX_COLUMNS],
     arena: &'arena Arena,
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
+    let table_index = logical_target.table();
     let checks = parse_checks(definition, arena)?;
     let generated = parse_generated(definition, arena)?;
     partition_insert::with_partition_insert_row(
         storage,
-        table_index,
+        logical_target,
         definition,
         values,
-        txn.txid,
         arena,
-        |storage, target_table, definition, values, _mapping| {
+        |storage, row_target, definition, values, _mapping| {
+            let target_table = row_target.table();
             storage.require_subscription_target(target_table, txn.txid)?;
             let leaf_checks;
             let checks = if target_table == table_index {
@@ -53224,7 +53212,7 @@ fn apply_replication_insert_values<'arena>(
             store_row(
                 storage,
                 txn,
-                target_table,
+                row_target,
                 Some(rowid),
                 &values[..definition.n_columns],
             )?;
@@ -53254,26 +53242,7 @@ fn apply_replication_insert_values<'arena>(
 fn decode_replication_tuple<'a>(
     storage: &Storage,
     txn: &TxnState,
-    binding: RelationBinding,
-    tuple: Tuple<'a>,
-    arena: &'a Arena,
-    allow_unchanged_toast: bool,
-) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
-    decode_replication_tuple_for_columns(
-        storage,
-        txn,
-        binding.table_slot(),
-        binding.remote_to_local(),
-        tuple,
-        arena,
-        allow_unchanged_toast,
-    )
-}
-
-fn decode_replication_tuple_for_columns<'a>(
-    storage: &Storage,
-    txn: &TxnState,
-    table_slot: usize,
+    definition: &TableDef,
     remote_to_local: &[usize],
     tuple: Tuple<'a>,
     arena: &'a Arena,
@@ -53287,7 +53256,6 @@ fn decode_replication_tuple_for_columns<'a>(
             remote_to_local.len()
         ));
     }
-    let definition = storage.table_def(table_slot, txn.txid);
     let mut values = [Datum::Null; MAX_COLUMNS];
     for (remote, field) in tuple.columns().enumerate() {
         let local = remote_to_local[remote];
@@ -53329,6 +53297,7 @@ fn decode_replication_old_tuple<'a>(
     storage: &Storage,
     txn: &TxnState,
     binding: RelationBinding,
+    definition: &TableDef,
     old: OldTuple<'a>,
     arena: &'a Arena,
 ) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
@@ -53350,10 +53319,10 @@ fn decode_replication_old_tuple<'a>(
             ));
         }
     }
-    decode_replication_tuple_for_columns(
+    decode_replication_tuple(
         storage,
         txn,
-        binding.table_slot(),
+        definition,
         binding.remote_to_local(),
         old.tuple,
         arena,
@@ -53418,7 +53387,9 @@ pub fn locate_replication_row<'arena>(
     old: OldTuple<'_>,
     arena: &'arena Arena,
 ) -> Result<ReplicationRow<'arena>, SqlError> {
-    let expected = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    let definitions = storage.table_definition_images();
+    let definition = definitions.definition(storage, binding.table_slot(), txn.txid)?;
+    let expected = decode_replication_old_tuple(storage, txn, binding, definition, old, arena)?;
     locate_replication_row_by_values(
         storage,
         txn,
@@ -53426,6 +53397,7 @@ pub fn locate_replication_row<'arena>(
         &expected,
         binding.identity_local_columns(old.identity),
         arena,
+        definitions,
     )
 }
 
@@ -53436,6 +53408,7 @@ fn locate_replication_row_by_values<'arena>(
     expected: &[Datum<'_>; MAX_COLUMNS],
     identity_columns: &[usize],
     arena: &'arena Arena,
+    definitions: crate::storage::TableDefinitionImages,
 ) -> Result<ReplicationRow<'arena>, SqlError> {
     if identity_columns.is_empty() {
         return Err(sql_err!(
@@ -53445,7 +53418,6 @@ fn locate_replication_row_by_values<'arena>(
     }
     let table_index = binding.table_slot();
     storage.require_subscription_target(table_index, txn.txid)?;
-    let definitions = storage.table_definition_images();
     let definition = definitions.definition(storage, table_index, txn.txid)?;
     let mut found = None;
     let leaves = arena
@@ -53560,7 +53532,7 @@ fn apply_replication_delete_row(
         }
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
     }
-    let definition = row.definition();
+    let (row_target, definition) = row.definitions.selection(storage, row_table, txn.txid)?;
     let bytes = row.bytes();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -53604,12 +53576,8 @@ fn apply_replication_delete_row(
             MAX_FK_CASCADE_DEPTH,
         )?;
     }
-    let prior =
-        storage.write_pending_image(row_table, row.rowid(), txn.txid, txn.command_id(), None)?;
-    if let Err(error) = txn.touch(row_table as u32, row.rowid(), prior) {
-        storage.restore_pending(row_table, row.rowid(), txn.txid, prior);
-        return Err(error);
-    }
+    txn.write_row(storage, row_target, row.rowid(), txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked)?;
+
     fire_partition_row_triggers(
         storage,
         txn,
@@ -53645,7 +53613,9 @@ pub(crate) fn apply_replication_update(
     let row = match identity {
         UpdateIdentity::Old(old) => locate_replication_row(storage, txn, binding, old, arena)?,
         UpdateIdentity::NewTupleKey => {
-            let expected = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+            let definitions = storage.table_definition_images();
+            let definition = definitions.definition(storage, binding.table_slot(), txn.txid)?;
+            let expected = decode_replication_tuple(storage, txn, definition, binding.remote_to_local(), new, arena, true)?;
             for (remote, field) in new.columns().enumerate() {
                 let local = binding.remote_to_local()[remote];
                 if binding.key_local_columns().contains(&local)
@@ -53664,6 +53634,7 @@ pub(crate) fn apply_replication_update(
                 &expected,
                 binding.key_local_columns(),
                 arena,
+                definitions,
             )?
         }
     };
@@ -53690,7 +53661,7 @@ pub(crate) fn apply_replication_update(
         .definitions
         .retained_definition(table_index, txn.txid)
         .expect("replication selection retains its logical definition");
-    let definition = row.definition();
+    let (row_target, definition) = row.definitions.selection(storage, row_table, txn.txid)?;
     let mapping = crate::storage::RelationColumnMap::new(logical_definition, definition, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
@@ -53702,7 +53673,7 @@ pub(crate) fn apply_replication_update(
     )?;
     let mut logical_old = [Datum::Null; MAX_COLUMNS];
     mapping.project(&old_values, &mut logical_old);
-    let mut logical_new = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+    let mut logical_new = decode_replication_tuple(storage, txn, logical_definition, binding.remote_to_local(), new, arena, true)?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
         explicit[local] = true;
@@ -53795,7 +53766,7 @@ pub(crate) fn apply_replication_update(
     store_row(
         storage,
         txn,
-        row_table,
+        row_target,
         Some(row.rowid()),
         &new_values[..definition.n_columns],
     )?;
@@ -53867,6 +53838,7 @@ pub fn apply_replication_truncate(
             "subscription TRUNCATE repeats a local table"
         ));
     }
+    let definitions = storage.table_definition_images();
     for &table in tables {
         storage.lock_table(
             txn.txid,
@@ -53874,6 +53846,7 @@ pub fn apply_replication_truncate(
             crate::sql::ast::TableLockMode::AccessExclusive,
             false,
         )?;
+        definitions.definition(storage, table, txn.txid)?;
     }
     for other in 0..storage.table_count() {
         if !storage.table(other).visible_to(txn.txid) || tables.contains(&other) {
@@ -53894,6 +53867,7 @@ pub fn apply_replication_truncate(
         }
     }
     for &table in tables {
+        let (row_target, _) = definitions.selection(storage, table, txn.txid)?;
         let mut rowids = [0_u64; 4096];
         loop {
             let mut count = 0;
@@ -53916,17 +53890,8 @@ pub fn apply_replication_truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                let prior = storage.write_pending_image_untracked(
-                    table,
-                    rowid,
-                    txn.txid,
-                    txn.command_id(),
-                    None,
-                )?;
-                if let Err(error) = txn.touch(table as u32, rowid, prior) {
-                    storage.restore_pending(table, rowid, txn.txid, prior);
-                    return Err(error);
-                }
+                txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Untracked)?;
+
             }
         }
         if restart_identity {
@@ -56434,8 +56399,8 @@ pub(crate) fn merge<'a>(
         }
     }
     let definitions = storage.table_definition_images();
-    let def = match definitions.definition(storage, table_index, txn.txid) {
-        Ok(definition) => definition,
+    let (table_target, def) = match definitions.selection(storage, table_index, txn.txid) {
+        Ok(selection) => selection,
         Err(error) => return sql_fail(error),
     };
     let foreign_target = def.kind == crate::storage::TableKind::Foreign;
@@ -57139,8 +57104,8 @@ pub(crate) fn merge<'a>(
             let row_table = tables[j];
             let row_id = ids[j];
             let bytes = target_bytes[j];
-            let row_definition = match definitions.definition(storage, row_table, txn.txid) {
-                Ok(definition) => definition,
+            let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
+                        Ok(selection) => selection,
                 Err(error) => return sql_fail(error),
             };
             let mut row_schema = [ColType::Bool; MAX_COLUMNS];
@@ -57358,9 +57323,8 @@ pub(crate) fn merge<'a>(
                         Err(e) => return sql_fail(e),
                     }
                 }
-                let row_definition =
-                    match definitions.definition(storage, target_tables[j], txn.txid) {
-                        Ok(definition) => definition,
+                let (row_target, row_definition) = match definitions.selection(storage, target_tables[j], txn.txid) {
+                        Ok(selection) => selection,
                         Err(error) => return sql_fail(error),
                     };
                 let row_layout = match retained_rows.layout(target_tables[j]) {
@@ -57463,26 +57427,8 @@ pub(crate) fn merge<'a>(
                             ) {
                                 return sql_fail(error);
                             }
-                            match storage.write_pending_image(
-                                target_tables[j],
-                                target_ids[j],
-                                txn.txid,
-                                txn.command_id(),
-                                None,
-                            ) {
-                                Ok(prior) => {
-                                    if let Err(e) =
-                                        txn.touch(target_tables[j] as u32, target_ids[j], prior)
-                                    {
-                                        storage.restore_pending(
-                                            target_tables[j],
-                                            target_ids[j],
-                                            txn.txid,
-                                            prior,
-                                        );
-                                        return sql_fail(e);
-                                    }
-                                }
+                            match txn.write_row(storage, row_target, target_ids[j], txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked) {
+                                Ok(_) => {}
                                 Err(e) => return sql_fail(e),
                             }
                         }
@@ -57702,9 +57648,8 @@ pub(crate) fn merge<'a>(
                             // child-only fields.
                             target_tables[j]
                         };
-                        let new_definition =
-                            match definitions.definition(storage, updated_table, txn.txid) {
-                                Ok(definition) => definition,
+                        let (new_target, new_definition) = match definitions.selection(storage, updated_table, txn.txid) {
+                                Ok(selection) => selection,
                                 Err(error) => return sql_fail(error),
                             };
                         let new_layout = match retained_rows.layout(updated_table) {
@@ -57722,7 +57667,8 @@ pub(crate) fn merge<'a>(
                                 storage,
                                 txn,
                                 selected_rows[j].expect("local MERGE retains selected row"),
-                                row_definition,
+                                row_target,
+                    row_definition,
                                 target_physical[j],
                                 updated_table,
                                 new_definition,
@@ -57865,51 +57811,17 @@ pub(crate) fn merge<'a>(
                                 Err(e) => return sql_fail(e),
                             };
                             if updated_table == target_tables[j] {
-                                match storage.write_pending_image(
-                                    updated_table,
-                                    target_ids[j],
-                                    txn.txid,
-                                    txn.command_id(),
-                                    Some(image),
-                                ) {
-                                    Ok(prior) => {
-                                        if let Err(e) =
-                                            txn.touch(updated_table as u32, target_ids[j], prior)
-                                        {
-                                            storage.restore_pending(
-                                                updated_table,
-                                                target_ids[j],
-                                                txn.txid,
-                                                prior,
-                                            );
-                                            return sql_fail(e);
-                                        }
-                                    }
+                                match txn.write_row(storage, new_target, target_ids[j], txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked) {
+                                    Ok(_) => {}
                                     Err(e) => return sql_fail(e),
                                 }
                             } else {
                                 let inserted_rowid = stored_rowid;
-                                let prior = match storage.write_pending_image(
-                                    updated_table,
-                                    inserted_rowid,
-                                    txn.txid,
-                                    txn.command_id(),
-                                    Some(image),
-                                ) {
-                                    Ok(prior) => prior,
+                                match txn.write_row(storage, new_target, inserted_rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked) {
+                                    Ok(_) => {},
                                     Err(error) => return sql_fail(error),
                                 };
-                                if let Err(error) =
-                                    txn.touch(updated_table as u32, inserted_rowid, prior)
-                                {
-                                    storage.restore_pending(
-                                        updated_table,
-                                        inserted_rowid,
-                                        txn.txid,
-                                        prior,
-                                    );
-                                    return sql_fail(error);
-                                }
+
                             }
                         }
                         if !foreign_target {
@@ -58069,7 +57981,7 @@ pub(crate) fn merge<'a>(
                         match merge_insert(
                             storage,
                             txn,
-                            table_index,
+                            table_target,
                             def,
                             columns,
                             values,
@@ -58226,7 +58138,7 @@ fn merge_cardinality() -> SqlError {
 fn merge_insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    table_index: usize,
+    logical_target: crate::storage::TableDefinitionTarget,
     def: &'a TableDef,
     columns: &[&str],
     values: &[&'a Expr<'a>],
@@ -58244,6 +58156,7 @@ fn merge_insert<'a>(
     scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let table_index = logical_target.table();
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if columns.is_empty() {
@@ -58332,12 +58245,12 @@ fn merge_insert<'a>(
     let mut row_arr = row;
     partition_insert::with_partition_insert_row(
         storage,
-        table_index,
+        logical_target,
         def,
         &mut row_arr,
-        txn.txid,
         arena,
-        |storage, target_table, physical_definition, row_arr, mapping| {
+        |storage, row_target, physical_definition, row_arr, mapping| {
+            let target_table = row_target.table();
             let logical_definition = def;
             let def = physical_definition;
             let leaf_checks;
@@ -58456,7 +58369,7 @@ fn merge_insert<'a>(
                 store_row(
                     storage,
                     txn,
-                    target_table,
+                    row_target,
                     row.stored(),
                     &row_arr[..def.n_columns],
                 )?;
@@ -58498,7 +58411,7 @@ fn merge_insert<'a>(
 fn finish_insert_row<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    logical_table_index: usize,
+    logical_target: crate::storage::TableDefinitionTarget,
     definition: &TableDef,
     values: &mut [Datum<'a>; MAX_COLUMNS],
     generated: &constraints::ParsedDefaults<'a>,
@@ -58522,14 +58435,15 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
 where
     'snapshot: 'a,
 {
+    let logical_table_index = logical_target.table();
     match partition_insert::with_partition_insert_row(
         storage,
-        logical_table_index,
+        logical_target,
         definition,
         values,
-        txn.txid,
         arena,
-        |storage, table_index, physical_definition, values, mapping| {
+        |storage, row_target, physical_definition, values, mapping| {
+            let table_index = row_target.table();
             let logical_definition = definition;
             let definition = physical_definition;
             let leaf_checks;
@@ -58668,7 +58582,7 @@ where
                 match handle_conflict(
                     storage,
                     txn,
-                    table_index,
+                    row_target,
                     logical_table_index,
                     definition,
                     logical_definition,
@@ -58772,7 +58686,7 @@ where
             } else if let Err(error) = store_row(
                 storage,
                 txn,
-                table_index,
+                row_target,
                 row.stored(),
                 &values[..definition.n_columns],
             ) {
@@ -59680,8 +59594,8 @@ where
         Err(e) => return sql_fail(e),
     };
     let definitions = storage.table_definition_images();
-    let def = match definitions.definition(storage, table_index, txn.txid) {
-        Ok(definition) => definition,
+    let (table_target, def) = match definitions.selection(storage, table_index, txn.txid) {
+        Ok(selection) => selection,
         Err(error) => return sql_fail(error),
     };
     if def.kind == crate::storage::TableKind::Foreign
@@ -60113,7 +60027,7 @@ where
             match finish_insert_row(
                 storage,
                 txn,
-                table_index,
+                table_target,
                 def,
                 &mut values,
                 &generated_exprs,
@@ -60348,7 +60262,7 @@ where
         match finish_insert_row(
             storage,
             txn,
-            table_index,
+            table_target,
             def,
             &mut values,
             &generated_exprs,
@@ -61307,8 +61221,8 @@ pub(crate) fn update<'a>(
             Ok(b) => b,
             Err(error) => return sql_fail(error),
         };
-        let row_definition = match definitions.definition(storage, row_table, txn.txid) {
-            Ok(definition) => definition,
+        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
+                        Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
         let row_layout = match retained_rows.layout(row_table) {
@@ -61318,6 +61232,7 @@ pub(crate) fn update<'a>(
         let row_schema = row_layout.schema;
         let new_layout;
         let new_definition;
+        let new_target;
         let mut physical_old = [Datum::Null; MAX_COLUMNS];
         if let Err(error) = rowenc::decode(row_bytes, row_schema, &mut physical_old) {
             return sql_fail(error);
@@ -61599,8 +61514,8 @@ pub(crate) fn update<'a>(
                     };
                 }
             }
-            new_definition = match definitions.definition(storage, target_table, txn.txid) {
-                Ok(definition) => definition,
+            (new_target, new_definition) = match definitions.selection(storage, target_table, txn.txid) {
+                Ok(selection) => selection,
                 Err(error) => return sql_fail(error),
             };
             new_layout = match retained_rows.layout(target_table) {
@@ -61617,6 +61532,7 @@ pub(crate) fn update<'a>(
                     storage,
                     txn,
                     scratch[i],
+                    row_target,
                     row_definition,
                     &physical_old[..row_definition.n_columns],
                     target_table,
@@ -61822,37 +61738,17 @@ pub(crate) fn update<'a>(
             Err(e) => return sql_fail(e),
         };
         if target_table == row_table {
-            match storage.write_pending_image(
-                row_table,
-                rowid,
-                txn.txid,
-                txn.command_id(),
-                Some(new_image),
-            ) {
-                Ok(prior) => {
-                    if let Err(e) = txn.touch(row_table as u32, rowid, prior) {
-                        storage.restore_pending(row_table, rowid, txn.txid, prior);
-                        return sql_fail(e);
-                    }
-                }
+            match txn.write_row(storage, row_target, rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked) {
+                Ok(_) => {}
                 Err(e) => return sql_fail(e),
             }
         } else {
             let inserted_rowid = stored_rowid;
-            let insert_prior = match storage.write_pending_image(
-                target_table,
-                inserted_rowid,
-                txn.txid,
-                txn.command_id(),
-                Some(new_image),
-            ) {
-                Ok(prior) => prior,
+            match txn.write_row(storage, new_target, inserted_rowid, txn.command_id(), Some(new_image), crate::storage::RowWriteStatistics::Tracked) {
+                Ok(_) => {},
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.touch(target_table as u32, inserted_rowid, insert_prior) {
-                storage.restore_pending(target_table, inserted_rowid, txn.txid, insert_prior);
-                return sql_fail(error);
-            }
+
         }
         // With the new parent row in place, apply each referencing key's
         // ON UPDATE action when a referenced column changed (NO ACTION /
@@ -62420,8 +62316,8 @@ pub(crate) fn delete<'a>(
             continue;
         }
         let (row_table, rowid, _) = scratch[i].local_parts();
-        let row_definition = match definitions.definition(storage, row_table, txn.txid) {
-            Ok(definition) => definition,
+        let (row_target, row_definition) = match definitions.selection(storage, row_table, txn.txid) {
+                        Ok(selection) => selection,
             Err(error) => return sql_fail(error),
         };
         let layout = match retained_rows.layout(row_table) {
@@ -62491,13 +62387,8 @@ pub(crate) fn delete<'a>(
             Ok(false) => continue,
             Err(error) => return sql_fail(error),
         }
-        match storage.write_pending_image(row_table, rowid, txn.txid, txn.command_id(), None) {
-            Ok(prior) => {
-                if let Err(error) = txn.touch(row_table as u32, rowid, prior) {
-                    storage.restore_pending(row_table, rowid, txn.txid, prior);
-                    return sql_fail(error);
-                }
-            }
+        match txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Tracked) {
+            Ok(_) => {}
             Err(error) => return sql_fail(error),
         }
         if row_has_triggers
@@ -62717,8 +62608,17 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
+    let definitions = storage.table_definition_images();
     for &table_index in &list[..n] {
-        let definition = *storage.table_def(table_index, txn.txid);
+        if let Err(error) = definitions.definition(storage, table_index, txn.txid) {
+            return sql_fail(error);
+        }
+    }
+    for &table_index in &list[..n] {
+        let definition = match definitions.definition(storage, table_index, txn.txid) {
+            Ok(definition) => *definition,
+            Err(error) => return sql_fail(error),
+        };
         if let Err(error) = fire_statement_triggers(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
@@ -62790,6 +62690,10 @@ pub(crate) fn truncate(
     }
     // Remove every visible row, transactionally.
     for &table_index in &list[..n] {
+        let (row_target, _) = match definitions.selection(storage, table_index, txn.txid) {
+            Ok(selection) => selection,
+            Err(error) => return sql_fail(error),
+        };
         let mut rowids: [u64; 4096] = [0; 4096];
         loop {
             let mut count = 0usize;
@@ -62814,19 +62718,8 @@ pub(crate) fn truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                match storage.write_pending_image_untracked(
-                    table_index,
-                    rowid,
-                    txn.txid,
-                    txn.command_id(),
-                    None,
-                ) {
-                    Ok(prior) => {
-                        if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-                            storage.restore_pending(table_index, rowid, txn.txid, prior);
-                            return sql_fail(e);
-                        }
-                    }
+                match txn.write_row(storage, row_target, rowid, txn.command_id(), None, crate::storage::RowWriteStatistics::Untracked) {
+                    Ok(_) => {}
                     Err(e) => return sql_fail(e),
                 }
             }
@@ -65552,7 +65445,7 @@ fn alter_table_relation(
         return sql_fail(error);
     }
     let definitions = storage.table_definition_images();
-    let (edit_target, def) = match definitions.definition_for_edit(storage, table_index, txn.txid) {
+    let (edit_target, def) = match definitions.selection(storage, table_index, txn.txid) {
         Ok((target, definition)) => (target, *definition),
         Err(error) => return sql_fail(error),
     };
@@ -68088,11 +67981,10 @@ fn alter_table_relation(
         }
     }
 
-    if let Err(error) =
-        txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite)
-    {
-        return sql_fail(error);
-    }
+    let row_write_target = match txn.write_table_definition(storage, edit_target, new_def, &column_mapping, has_rewrite) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
     let dropped_constraints = match arena.alloc_slice_with(txn.constraint_capacity(), |_| None) {
         Ok(constraints) => constraints,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -68479,19 +68371,8 @@ fn alter_table_relation(
         let image = rewritten_images[i]
             .take()
             .expect("rewritten input retained");
-        match storage.write_pending_image_untracked(
-            table_index,
-            rowid,
-            txn.txid,
-            txn.command_id(),
-            Some(image),
-        ) {
-            Ok(prior) => {
-                if let Err(error) = txn.touch(table_index as u32, rowid, prior) {
-                    storage.restore_pending(table_index, rowid, txn.txid, prior);
-                    return sql_fail(error);
-                }
-            }
+        match txn.write_row(storage, row_write_target, rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Untracked) {
+            Ok(_) => {}
             Err(error) => return sql_fail(error),
         }
     }
@@ -69590,7 +69471,7 @@ fn collect_join_matches_with_transition<'a>(
 fn store_row(
     storage: &mut Storage,
     txn: &mut TxnState,
-    table_index: usize,
+    target: crate::storage::TableDefinitionTarget,
     rowid: Option<u64>,
     values: &[Datum],
 ) -> Result<(), SqlError> {
@@ -69599,12 +69480,7 @@ fn store_row(
         None => storage.next_rowid()?,
     };
     let image = storage.heap.append_row_image(values)?;
-    let prior =
-        storage.write_pending_image(table_index, rowid, txn.txid, txn.command_id(), Some(image))?;
-    if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
-        storage.restore_pending(table_index, rowid, txn.txid, prior);
-        return Err(e);
-    }
+    txn.write_row(storage, target, rowid, txn.command_id(), Some(image), crate::storage::RowWriteStatistics::Tracked)?;
     Ok(())
 }
 

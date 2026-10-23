@@ -58,6 +58,7 @@ use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 pub(crate) use table_definitions::TableDefinitionRevision;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
+pub(crate) use row_publication::RowWriteStatistics;
 pub(crate) use table_edits::{TableDefinitionChange, TableDefinitionTarget};
 pub(crate) use type_names::{NamedTypeKind, NamedTypeSlot};
 pub(crate) use type_references::StorageSetupError;
@@ -105,7 +106,7 @@ pub(crate) use spill_generations::{
 pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 
 pub(crate) use definition_images::TableDefinitionImages;
-pub(crate) use row_heap::RowHeap;
+pub(crate) use row_heap::{HeapRowRead, RowHeap};
 pub(crate) use row_images::{
     OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
 };

@@ -20615,17 +20615,9 @@ fn replay_transaction_batches(
                             };
                             let image = storage.heap.append_image(row)?;
                             storage.observe_rowid(rowid);
-                            let prior = storage.write_pending_image_untracked(
-                                table_slot,
-                                rowid,
-                                transaction_id,
-                                command_id,
-                                Some(image),
-                            )?;
-                            prepared.slot_mut(slot).transaction.touch(
-                                table_slot as u32,
-                                rowid,
-                                prior,
+                            let row_target = storage.select_table_definition(table_slot, transaction_id).0;
+                            prepared.slot_mut(slot).transaction.write_row(
+                                storage, row_target, rowid, command_id, Some(image), crate::storage::RowWriteStatistics::Untracked
                             )?;
                         }
                         WalOp::Delete {
@@ -20640,17 +20632,9 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let prior = storage.write_pending_image_untracked(
-                                table_slot,
-                                rowid,
-                                transaction_id,
-                                command_id,
-                                None,
-                            )?;
-                            prepared.slot_mut(slot).transaction.touch(
-                                table_slot as u32,
-                                rowid,
-                                prior,
+                            let row_target = storage.select_table_definition(table_slot, transaction_id).0;
+                            prepared.slot_mut(slot).transaction.write_row(
+                                storage, row_target, rowid, command_id, None, crate::storage::RowWriteStatistics::Untracked
                             )?;
                         }
                         WalOp::SequenceSet {

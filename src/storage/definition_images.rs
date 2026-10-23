@@ -143,7 +143,7 @@ impl TableDefinitionImages {
         None
     }
 
-    pub(crate) fn definition_for_edit<'a>(
+    pub(crate) fn selection<'a>(
         &'a self,
         storage: &Storage,
         table: usize,

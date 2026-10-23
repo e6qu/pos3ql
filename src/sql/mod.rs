@@ -10362,7 +10362,9 @@ impl Engine {
             }
             executed_any = true;
             let sequence_scope = sequence::enter_statement(
-                arena, guc.seq_session(), txn.suspended_statement_context().is_some(),
+                arena,
+                guc.seq_session(),
+                txn.suspended_statement_context().is_some(),
             );
             let output_mark = responder.buffer.mark();
             let statement_mark =
@@ -10422,7 +10424,12 @@ impl Engine {
                     }
                     if txn.owns_statement_mark(statement_mark) {
                         if txn.suspended_statement_context().is_none() {
-                            txn.suspend_statement(None, datetime::statement_clock(), query::statement_deadline(), routine_transaction_context);
+                            txn.suspend_statement(
+                                None,
+                                datetime::statement_clock(),
+                                query::statement_deadline(),
+                                routine_transaction_context,
+                            );
                         }
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
@@ -10651,7 +10658,9 @@ impl Engine {
             }
         }
         let sequence_scope = sequence::enter_statement(
-            arena, guc.seq_session(), txn.suspended_statement_context().is_some(),
+            arena,
+            guc.seq_session(),
+            txn.suspended_statement_context().is_some(),
         );
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
@@ -10741,7 +10750,12 @@ impl Engine {
                     }
                     if txn.owns_statement_mark(statement_mark) {
                         if txn.suspended_statement_context().is_none() {
-                            txn.suspend_statement(None, datetime::statement_clock(), query::statement_deadline(), routine_transaction_context);
+                            txn.suspend_statement(
+                                None,
+                                datetime::statement_clock(),
+                                query::statement_deadline(),
+                                routine_transaction_context,
+                            );
                         }
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);

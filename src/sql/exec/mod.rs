@@ -42224,7 +42224,12 @@ fn validate_domain_rows(
             None => domain_rewrite_columns(storage, definition, target, txid)?,
         };
         if affected.iter().any(|column| *column) {
-            storage.lock_table(txid, source.table(), crate::sql::ast::TableLockMode::Share, false)?;
+            storage.lock_table(
+                txid,
+                source.table(),
+                crate::sql::ast::TableLockMode::Share,
+                false,
+            )?;
             source.validate(storage)?;
         }
     }

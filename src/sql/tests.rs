@@ -15,29 +15,72 @@ fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresq
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut rows = Vec::new();
-    for sql in include_str!("../../tests/external/differential_exact/16_sequence_session_values.sql").split(';').filter(|sql| !sql.trim().is_empty()) {
+    for sql in
+        include_str!("../../tests/external/differential_exact/16_sequence_session_values.sql")
+            .split(';')
+            .filter(|sql| !sql.trim().is_empty())
+    {
         rows.extend(data_rows(&session.success(&mut engine, sql, true)));
     }
-    assert_eq!(rows,
-        ["40", "40", "90", "40|40", "90", "120", "120|120", "200", "200|120", "900", "900"]);
+    assert_eq!(
+        rows,
+        [
+            "40", "40", "90", "40|40", "90", "120", "120|120", "200", "200|120", "900", "900"
+        ]
+    );
     let mut fresh = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    fresh.success(&mut engine, "SELECT setval('sequence_mode', 1000, false)", true);
+    fresh.success(
+        &mut engine,
+        "SELECT setval('sequence_mode', 1000, false)",
+        true,
+    );
     for sql in ["SELECT currval('sequence_mode')", "SELECT lastval()"] {
-        assert_eq!(error_sqlstates(&fresh.execute(&mut engine, sql, true)), ["55000"]);
+        assert_eq!(
+            error_sqlstates(&fresh.execute(&mut engine, sql, true)),
+            ["55000"]
+        );
     }
-    assert_eq!(data_rows(&fresh.success(&mut engine,
-        "SELECT setval('sequence_mode', 1100, true); SELECT currval('sequence_mode')", true)), ["1100", "1100"]);
-    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["55000"]);
-    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)), ["1101"]);
-    fresh.success(&mut engine, "CREATE ROLE sequence_observer; SET ROLE sequence_observer", true);
-    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["42501"]);
+    assert_eq!(
+        data_rows(&fresh.success(
+            &mut engine,
+            "SELECT setval('sequence_mode', 1100, true); SELECT currval('sequence_mode')",
+            true
+        )),
+        ["1100", "1100"]
+    );
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["55000"]
+    );
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)),
+        ["1101"]
+    );
+    fresh.success(
+        &mut engine,
+        "CREATE ROLE sequence_observer; SET ROLE sequence_observer",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["42501"]
+    );
     fresh.success(&mut engine,
         "RESET ROLE; GRANT SELECT ON SEQUENCE sequence_mode TO sequence_observer; SET ROLE sequence_observer", true);
-    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT lastval()", true)), ["1101"]);
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT lastval()", true)),
+        ["1101"]
+    );
     fresh.success(&mut engine, "RESET ROLE; DROP SEQUENCE sequence_mode", true);
     fresh.success(&mut engine, "CREATE SEQUENCE sequence_mode START 9", true);
-    assert_eq!(error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)), ["55000"]);
-    assert_eq!(data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)), ["9"]);
+    assert_eq!(
+        error_sqlstates(&fresh.execute(&mut engine, "SELECT lastval()", true)),
+        ["55000"]
+    );
+    assert_eq!(
+        data_rows(&fresh.success(&mut engine, "SELECT nextval('sequence_mode')", true)),
+        ["9"]
+    );
 }
 
 #[test]
@@ -264,9 +307,17 @@ fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_wr
 fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
     for (mode, suffix, extended) in [
         (crate::config::TransactionMode::Mvcc, "mvcc-simple", false),
-        (crate::config::TransactionMode::Locking, "locking-simple", false),
+        (
+            crate::config::TransactionMode::Locking,
+            "locking-simple",
+            false,
+        ),
         (crate::config::TransactionMode::Mvcc, "mvcc-extended", true),
-        (crate::config::TransactionMode::Locking, "locking-extended", true),
+        (
+            crate::config::TransactionMode::Locking,
+            "locking-extended",
+            true,
+        ),
     ] {
         let mut config = test_config(&format!("catalog-cascade-locks-{suffix}"));
         config.transaction_mode = mode;
@@ -309,40 +360,88 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
         let sql = "DROP SCHEMA cascade_orders CASCADE";
         let execute = |engine: &mut Engine, session: &mut ConfiguredTransactionSession| {
             if extended {
-                match engine.execute_extended(
-                    sql, &session.arena, NO_PARAMS, &[], &mut session.transaction,
-                    &mut session.pool, &mut session.cursors, &mut session.guc,
-                    &mut Responder::new(&mut session.send), session.connection_id, false,
-                ).unwrap() {
+                match engine
+                    .execute_extended(
+                        sql,
+                        &session.arena,
+                        NO_PARAMS,
+                        &[],
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut Responder::new(&mut session.send),
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+                {
                     ExtendedExecutionStatus::Complete(true) => Ok(()),
-                    ExtendedExecutionStatus::Complete(false) => panic!("extended schema drop failed: {}", String::from_utf8_lossy(session.send.readable())),
+                    ExtendedExecutionStatus::Complete(false) => panic!(
+                        "extended schema drop failed: {}",
+                        String::from_utf8_lossy(session.send.readable())
+                    ),
                     ExtendedExecutionStatus::Blocked { wait } => Err(wait),
                 }
             } else {
-                match engine.execute_simple_from(
-                    sql, 0, &session.arena, &mut session.transaction, &mut session.pool,
-                    &mut session.cursors, &mut session.guc, &mut Responder::new(&mut session.send),
-                    session.connection_id, false,
-                ).unwrap() {
+                match engine
+                    .execute_simple_from(
+                        sql,
+                        0,
+                        &session.arena,
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut Responder::new(&mut session.send),
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+                {
                     ExecutionStatus::Complete => Ok(()),
-                    ExecutionStatus::Blocked { completed_statements: 0, wait, .. } => Err(wait),
+                    ExecutionStatus::Blocked {
+                        completed_statements: 0,
+                        wait,
+                        ..
+                    } => Err(wait),
                     status => panic!("unexpected schema drop continuation: {status:?}"),
                 }
             }
         };
         editor.send.clear();
         editor.arena.reset();
-        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Err(StatementWait::Lock));
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Err(StatementWait::Lock)
+        );
         assert!(editor.send.readable().is_empty());
         assert!(editor.transaction.ddl().is_empty());
-        assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT last_value FROM cascade_wait_calls", true)), ["1"]);
-        assert!(editor.transaction.touched().is_empty(), "{suffix}: waiting attempt retained audit writes");
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "SELECT last_value FROM cascade_wait_calls",
+                true
+            )),
+            ["1"]
+        );
+        assert!(
+            editor.transaction.touched().is_empty(),
+            "{suffix}: waiting attempt retained audit writes"
+        );
         if mode == crate::config::TransactionMode::Mvcc {
             let audit = other.success(&mut engine, "SELECT count(*) FROM cascade_wait_audit", true);
-            assert_eq!(data_rows(&audit), ["0"], "{suffix}: {}", String::from_utf8_lossy(&audit));
+            assert_eq!(
+                data_rows(&audit),
+                ["0"],
+                "{suffix}: {}",
+                String::from_utf8_lossy(&audit)
+            );
         }
-        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Err(StatementWait::Lock));
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Err(StatementWait::Lock)
+        );
         assert!(editor.send.readable().is_empty());
         assert!(
             engine
@@ -358,23 +457,45 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
             )),
             ["7"]
         );
-        assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT nextval('cascade_wait_calls')", true)), ["2"]);
-        assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT nextval('cascade_cached_source')", true)), ["111"]);
-        other.success(&mut engine, "CREATE SEQUENCE cascade_reused_slot; DROP SEQUENCE cascade_disposable_source", true);
+        assert_eq!(
+            data_rows(&other.success(&mut engine, "SELECT nextval('cascade_wait_calls')", true)),
+            ["2"]
+        );
+        assert_eq!(
+            data_rows(&other.success(&mut engine, "SELECT nextval('cascade_cached_source')", true)),
+            ["111"]
+        );
+        other.success(
+            &mut engine,
+            "CREATE SEQUENCE cascade_reused_slot; DROP SEQUENCE cascade_disposable_source",
+            true,
+        );
         reader.success(&mut engine, "COMMIT", true);
-        assert_eq!(crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)), Ok(()));
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| execute(&mut engine, &mut editor)),
+            Ok(())
+        );
         if extended {
-            crate::mem::guard::forbid_alloc(|| engine.commit_txn_with_triggers(
-                &mut editor.transaction, &editor.guc, &editor.arena,
-                &mut Responder::new(&mut editor.send),
-            )).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                engine.commit_txn_with_triggers(
+                    &mut editor.transaction,
+                    &editor.guc,
+                    &editor.arena,
+                    &mut Responder::new(&mut editor.send),
+                )
+            })
+            .unwrap();
         }
         assert!(error_sqlstates(editor.send.readable()).is_empty());
-        assert_eq!(data_rows(&other.success(&mut engine,
-            "SELECT last_value FROM cascade_wait_calls", true)), ["2"],
-            "resuming the same statement must not repeat its start trigger");
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "SELECT last_value FROM cascade_wait_calls",
+                true
+            )),
+            ["2"],
+            "resuming the same statement must not repeat its start trigger"
+        );
         assert_eq!(data_rows(&other.success(&mut engine,
             "SELECT id, prior_seen, seen, private_seen, restarted_seen, cached_seen FROM cascade_wait_audit; SELECT last_value FROM cascade_wait_audit_id_seq; SELECT nextval('cascade_attempt_sequence'); SELECT nextval('cascade_restart_source'); SELECT nextval('cascade_cached_source'); SELECT nextval('cascade_reused_slot')", true)), ["1|51|1|17|23|101", "1", "18", "24", "112", "1"]);
         assert_eq!(data_rows(&editor.success(&mut engine,
@@ -92474,18 +92595,28 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     }
     assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-    let sql = "INSERT INTO requested_checkpoint VALUES(2); SELECT count(*) FROM requested_checkpoint";
-    let status = engine.execute_simple(
-        sql,
-        &writer.arena,
-        &mut writer.transaction,
-        &mut writer.pool,
-        &mut writer.cursors,
-        &mut writer.guc,
-        &mut Responder::new(&mut writer.send),
-        writer.connection_id,
-    ).unwrap();
-    assert!(matches!(status, ExecutionStatus::Blocked { completed_statements: 2, wait: StatementWait::ObjectIo, .. }));
+    let sql =
+        "INSERT INTO requested_checkpoint VALUES(2); SELECT count(*) FROM requested_checkpoint";
+    let status = engine
+        .execute_simple(
+            sql,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked {
+            completed_statements: 2,
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
     assert!(writer.transaction.staged_commit().is_some());
     let changed = writer.send.readable();
     assert!(
@@ -92573,7 +92704,8 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             writer.connection_id,
             false,
         )
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(status, ExecutionStatus::Complete);
     assert!(writer.transaction.staged_commit().is_none());
     assert!(!writer.transaction.is_active());
@@ -92655,17 +92787,26 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
         .unwrap();
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
     let sql = "INSERT INTO failed_checkpoint VALUES(2)";
-    let status = engine.execute_simple(
-        sql,
-        &writer.arena,
-        &mut writer.transaction,
-        &mut writer.pool,
-        &mut writer.cursors,
-        &mut writer.guc,
-        &mut Responder::new(&mut writer.send),
-        writer.connection_id,
-    ).unwrap();
-    assert!(matches!(status, ExecutionStatus::Blocked { completed_statements: 1, wait: StatementWait::ObjectIo, .. }));
+    let status = engine
+        .execute_simple(
+            sql,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked {
+            completed_statements: 1,
+            wait: StatementWait::ObjectIo,
+            ..
+        }
+    ));
     assert!(writer.transaction.staged_commit().is_some());
     assert!(error_sqlstates(writer.send.readable()).is_empty());
     for txn in [&mut first, &mut second] {
@@ -92754,11 +92895,19 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     assert_eq!(message_types(send.readable()), [b'C']);
     let status = crate::mem::guard::forbid_alloc(|| {
         engine.execute_simple_from(
-            sql, 1, &writer.arena, &mut writer.transaction, &mut writer.pool,
-            &mut writer.cursors, &mut writer.guc, &mut Responder::new(&mut writer.send),
-            writer.connection_id, false,
+            sql,
+            1,
+            &writer.arena,
+            &mut writer.transaction,
+            &mut writer.pool,
+            &mut writer.cursors,
+            &mut writer.guc,
+            &mut Responder::new(&mut writer.send),
+            writer.connection_id,
+            false,
         )
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(status, ExecutionStatus::Complete);
     assert!(writer.transaction.staged_commit().is_none());
     assert!(!writer.transaction.is_active());

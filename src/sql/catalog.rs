@@ -8915,7 +8915,14 @@ pub(crate) fn object_acl_by_address<'a>(
         | "pg_statistic_ext" | "pg_user_mapping" => return Ok(None),
         _ => return Err(unknown_class()),
     };
-    let table = synthesize_current(storage, Some("pg_catalog"), catalog, txid, arena)?;
+    let table = synthesize_current(
+        storage,
+        Some("pg_catalog"),
+        catalog,
+        txid,
+        Materialization::Query,
+        arena,
+    )?;
     let column = |name: &str| {
         table.def.columns()[..table.def.n_columns]
             .iter()
@@ -9014,7 +9021,14 @@ pub(crate) fn synthesize<'a>(
         }
     }
     select_catalog_rows(storage, qualifier, name, txid, scan, arena, |transaction| {
-        synthesize_current(storage, qualifier, name, transaction, arena)
+        synthesize_current(
+            storage,
+            qualifier,
+            name,
+            transaction,
+            Materialization::Query,
+            arena,
+        )
     })
 }
 
@@ -9061,17 +9075,25 @@ fn select_catalog_rows<'a>(
     build(txid)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Materialization {
+    Query,
+    /// Immutable generated rows cannot change and need no before-image.
+    History,
+}
+
 pub(crate) fn synthesize_current<'a>(
     storage: &Storage,
     qualifier: Option<&str>,
     name: &'a str,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
     let table = match (info, name) {
         (false, "pg_class") => pg_class(storage, txid, arena),
-        (false, "pg_attribute") => pg_attribute(storage, txid, arena),
+        (false, "pg_attribute") => pg_attribute(storage, txid, purpose, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
         (false, "pg_collation") => pg_collation(storage, txid, arena),
         (false, "pg_conversion") => pg_conversion(storage, txid, arena),
@@ -9326,7 +9348,12 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_group") => pg_group(storage, txid, arena),
         (false, "pg_shadow") => pg_shadow(storage, txid, arena, false),
         (false, "pg_user") => pg_shadow(storage, txid, arena, true),
-        (false, "pg_authid") => pg_authid(storage, txid, arena, true),
+        (false, "pg_authid") => pg_authid(
+            storage,
+            txid,
+            arena,
+            matches!(purpose, Materialization::Query),
+        ),
         (false, "pg_seclabel") => empty_monitoring_view("pg_seclabel", arena),
         (false, "pg_shdepend") => pg_shdepend(storage, txid, arena),
         (false, "pg_description") => pg_description(storage, txid, arena),
@@ -16974,10 +17001,14 @@ fn pg_statistic_ext_data<'a>(
                 if n_expressions == 0 {
                     Datum::Null
                 } else {
-                    Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&expressions[..n_expressions], arena)?,
-                    }
+                    super::eval::cast_to(
+                        Datum::Array {
+                            element: super::types::ArrElem::Text,
+                            raw: super::array::build(&expressions[..n_expressions], arena)?,
+                        },
+                        ColType::Text,
+                        arena,
+                    )?
                 },
             ],
             arena,
@@ -21902,6 +21933,7 @@ fn index_attribute_options<'a>(
 fn pg_attribute<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_attribute", false);
@@ -21929,7 +21961,11 @@ fn pg_attribute<'a>(
         .map(|(_, view)| view.columns_for(txid).len())
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
-    let builtin_attributes = crate::sql::catalog_metadata::ATTRIBUTE_ROWS
+    let builtin_rows: &[_] = match purpose {
+        Materialization::Query => crate::sql::catalog_metadata::ATTRIBUTE_ROWS,
+        Materialization::History => &[],
+    };
+    let builtin_attributes = builtin_rows
         .iter()
         .filter(|attributes| {
             matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
@@ -21946,7 +21982,7 @@ fn pg_attribute<'a>(
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
-    for attributes in crate::sql::catalog_metadata::ATTRIBUTE_ROWS.iter().filter(|attributes| {
+    for attributes in builtin_rows.iter().filter(|attributes| {
         matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
     }) {
         out[n] = attributes;

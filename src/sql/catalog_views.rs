@@ -55,9 +55,14 @@ impl Read {
                 crate::sql::catalog_snapshot::CatalogScan::Sequential,
                 arena,
             ),
-            Self::Current => {
-                super::synthesize_current(storage, Some("pg_catalog"), name, transaction, arena)
-            }
+            Self::Current => super::synthesize_current(
+                storage,
+                Some("pg_catalog"),
+                name,
+                transaction,
+                super::Materialization::Query,
+                arena,
+            ),
         }
     }
 

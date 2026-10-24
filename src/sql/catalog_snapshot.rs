@@ -122,6 +122,20 @@ pub(crate) fn canonical_acl_values<'a>(
         .alloc_slice_with(table.rows.len(), |_| &[] as &[Datum<'a>])
         .map_err(|_| arena_full())?;
     for (output, source) in rows.iter_mut().zip(table.rows) {
+        if !source
+            .iter()
+            .zip(table.def.columns())
+            .any(|(value, column)| {
+                !value.is_null()
+                    && matches!(
+                        column.ctype,
+                        ColType::AclItem | ColType::Array(ArrElem::AclItem)
+                    )
+            })
+        {
+            *output = source;
+            continue;
+        }
         let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
         for (value, column) in values.iter_mut().zip(table.def.columns()) {
             match (column.ctype, *value) {
@@ -467,6 +481,7 @@ pub(crate) fn capture_transaction(
                 Some("pg_catalog"),
                 relation.name,
                 0,
+                super::catalog::Materialization::History,
                 arena,
             )?;
             let private = super::catalog::synthesize_current(
@@ -474,6 +489,7 @@ pub(crate) fn capture_transaction(
                 Some("pg_catalog"),
                 relation.name,
                 transaction.txid,
+                super::catalog::Materialization::History,
                 arena,
             )?;
             capture_rows(
@@ -498,7 +514,15 @@ pub(crate) fn capture_transaction(
         })();
         // record copies keys and row images into the startup-sized history owner.
         unsafe { arena.rewind_to(mark) };
-        result?;
+        result.map_err(|error: SqlError| SqlError {
+            sqlstate: error.sqlstate,
+            message: crate::stack_format!(
+                192,
+                "catalog history {}: {}",
+                relation.name,
+                error.message
+            ),
+        })?;
     }
     Ok(batch.has_rows().then_some(batch))
 }

@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn int2vector_casts_to_an_ordinary_smallint_array() {
+    fn int2vector_array_cast_preserves_its_zero_lower_bound() {
         let mut budget = crate::mem::Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "int2vector cast", 1 << 12).unwrap();
         let Datum::Array { element, raw } = cast_to(
@@ -1460,7 +1460,7 @@ mod tests {
         };
         assert_eq!(element, ArrElem::Int2);
         let shape = crate::sql::array::shape(raw).unwrap();
-        assert_eq!(shape.lower_bound(0), Some(1));
+        assert_eq!(shape.lower_bound(0), Some(0));
         assert_eq!(
             crate::sql::array::get(raw, element, 0),
             Some(Datum::Int2(1))

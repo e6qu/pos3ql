@@ -4870,6 +4870,9 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
     if a == b {
         return Some(a);
     }
+    if matches!((a, b), (Name, Text) | (Text, Name)) {
+        return Some(Text);
+    }
     if let (ColType::Composite(slot), ColType::Record)
     | (ColType::Record, ColType::Composite(slot)) = (a, b)
     {

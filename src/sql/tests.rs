@@ -21274,6 +21274,43 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn catalog_snapshot_small_work_arena_keeps_view_bindings_during_rename() {
+    let mut config = test_config("catalog-small-work-arena");
+    config.work_arena_bytes = 2 << 20;
+    config.sql_arena_bytes = 4 << 20;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "CREATE ROLE catalog_small_creator CREATEROLE",
+        "GRANT catalog_small_creator TO postgres",
+        "SET ROLE catalog_small_creator",
+        "CREATE ROLE catalog_small_child",
+        "ALTER ROLE catalog_small_child LOGIN",
+        "RESET ROLE",
+        "CREATE TABLE catalog_small_orders(id bigint PRIMARY KEY, tenant text, payload text)",
+        "CREATE VIEW catalog_small_report AS SELECT id, tenant, payload FROM catalog_small_orders",
+        "ALTER TABLE catalog_small_orders ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY catalog_small_policy ON catalog_small_orders USING (tenant = current_user)",
+        "ALTER TABLE catalog_small_orders RENAME tenant TO account_name",
+        "ALTER TABLE catalog_small_orders RENAME TO catalog_small_sales",
+    ] {
+        session.success(&mut engine, sql, true);
+    }
+    assert_eq!(
+        data_rows(&session.success(&mut engine,
+            "SELECT pg_typeof(nspname)::text,nspname FROM pg_namespace JOIN (SELECT 'public'::text AS nspname) names USING(nspname)", true)),
+        ["text|public"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine,
+            "SELECT attname FROM pg_attribute WHERE attrelid='catalog_small_report'::regclass AND attnum>0 ORDER BY attnum", true)),
+        ["id", "tenant", "payload"]
+    );
+}
+
+#[test]
 fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objects() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -63167,7 +63204,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
         ),
         (
             "CREATE INDEX bad_gin_class ON search_rows USING gin (tags jsonb_ops)",
-            "does not accept data type array",
+            "does not accept data type integer[]",
         ),
         (
             "CREATE UNIQUE INDEX bad_spgist_unique ON search_rows USING spgist (network)",

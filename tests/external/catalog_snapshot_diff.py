@@ -542,6 +542,8 @@ def transcript(reader, writer):
             record(writer, f"{prefix}.metadata.builtin_type_io", "SELECT typname,typinput::text,typinput::oid,typoutput::text,typoutput::oid FROM pg_type WHERE typnamespace='pg_catalog'::regnamespace AND typname IN ('int4','text','varchar','numeric','_int4') ORDER BY typname")
             record(writer, f"{prefix}.metadata.user_type_io", "SELECT typname,typinput::text,typinput::oid,typoutput::text,typoutput::oid FROM pg_type WHERE typnamespace='public'::regnamespace AND typname IN ('catalog_metadata_domain_diff','catalog_metadata_enum_diff','_catalog_metadata_domain_diff','_catalog_metadata_enum_diff','catalog_metadata_columns_diff') ORDER BY typname")
             record(writer, f"{prefix}.metadata.full_table", "SELECT * FROM information_schema.tables WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff'")
+            record(writer, f"{prefix}.metadata.name_text_join", "SELECT pg_typeof(nspname)::text,nspname FROM pg_namespace JOIN (SELECT 'public'::text AS nspname) names USING(nspname)")
+            record(writer, f"{prefix}.metadata.text_name_join", "SELECT pg_typeof(nspname)::text,nspname FROM (SELECT 'public'::text AS nspname) names JOIN pg_namespace USING(nspname)")
             record(writer, f"{prefix}.metadata.hidden_catalog_columns", "SELECT attname FROM pg_attribute WHERE attrelid='pg_namespace'::regclass AND attnum>0 ORDER BY attnum")
             record(writer, f"{prefix}.metadata.catalog_tableoids", "SELECT tableoid='pg_namespace'::regclass FROM pg_namespace WHERE nspname='public'")
         finally:

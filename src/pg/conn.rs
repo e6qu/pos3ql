@@ -6995,8 +6995,11 @@ mod tests {
                 Step::Continue
             ));
             let installing = engine
-                .storage
-                .begin_transaction_installation(writer.txn.txid, engine.storage.visible_lsn())
+                .publication_storage_for_tests()
+                .begin_transaction_installation(
+                    writer.txn.txid,
+                    engine.publication_storage_for_tests().visible_lsn(),
+                )
                 .unwrap();
             let requested = 4242u32.to_be_bytes();
             let frame = function_call(715, &[&requested], true);
@@ -7040,7 +7043,10 @@ mod tests {
                 );
             }
             assert_eq!(
-                engine.storage.large_objects_visible_to(0).count(),
+                engine
+                    .publication_storage_for_tests()
+                    .large_objects_visible_to(0)
+                    .count(),
                 usize::from(!expired)
             );
             reader.send.clear();
@@ -7059,7 +7065,10 @@ mod tests {
                 wire::MSG_ERROR_RESPONSE
             ));
             assert_eq!(
-                engine.storage.large_objects_visible_to(0).count(),
+                engine
+                    .publication_storage_for_tests()
+                    .large_objects_visible_to(0)
+                    .count(),
                 1 + usize::from(!expired)
             );
             drop(reader);

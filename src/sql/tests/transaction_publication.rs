@@ -1,6 +1,12 @@
 use super::*;
 use crate::sql::commit::{PublicationPoint, PublicationState};
 
+impl Engine {
+    pub(crate) fn publication_storage_for_tests(&self) -> &Storage {
+        &self.storage
+    }
+}
+
 const SETUP: &str = "CREATE TABLE publication_orders(id integer PRIMARY KEY, total integer); \
     CREATE TABLE publication_invoices(id integer PRIMARY KEY, total integer); \
     INSERT INTO publication_orders VALUES(1,10); INSERT INTO publication_invoices VALUES(1,10)";

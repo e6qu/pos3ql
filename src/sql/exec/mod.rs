@@ -54764,7 +54764,7 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
     }
     Ok(Datum::Int2Vector {
         lower_bound: 0,
-        raw: raw,
+        raw,
     })
 }
 
@@ -54822,7 +54822,7 @@ fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datu
     }
     Ok(Datum::OidVector {
         lower_bound: 0,
-        raw: raw,
+        raw,
     })
 }
 

@@ -15001,9 +15001,10 @@ fn run_with_fixed_memory_and_ddl_capacity(
     arena_bytes: usize,
     ddl_capacity: usize,
 ) -> Vec<u8> {
-    // Simulated object-store uploads allocate; drain startup recovery before
-    // checking the request itself for post-startup heap allocation.
-    engine.commit_wal().unwrap();
+    // Requests and resumed commits stay guarded; the simulated remote store
+    // allocates its fixtures only while publication advances between turns.
+    let commit_progress = engine.commit_progress;
+    engine.enable_async_durability();
     let mut request_budget = Budget::new(budget.remaining());
     let mut buffer = crate::mem::FixedBuf::new(&mut request_budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(&mut request_budget, "sql", arena_bytes).unwrap();
@@ -15011,21 +15012,44 @@ fn run_with_fixed_memory_and_ddl_capacity(
     let mut pool = test_pool(&mut request_budget);
     let mut cursors = test_cursors(&mut request_budget);
     let mut guc = GucState::new();
-    let mut responder = Responder::new(&mut buffer);
-    let status = crate::mem::guard::forbid_alloc(|| {
-        engine.execute_simple(
-            sql_text,
-            &arena,
-            &mut txn,
-            &mut pool,
-            &mut cursors,
-            &mut guc,
-            &mut responder,
-            1,
-        )
-    })
-    .unwrap();
-    finish_test_request(engine, &mut txn, &guc, status);
+    let mut resume_statement = 0;
+    let mut completed = false;
+    for _ in 0..64 {
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                sql_text,
+                resume_statement,
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut Responder::new(&mut buffer),
+                1,
+                false,
+            )
+        })
+        .unwrap();
+        match status {
+            ExecutionStatus::Complete => {
+                finish_test_request(engine, &mut txn, &guc, status);
+                completed = true;
+                break;
+            }
+            ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } => {
+                assert_eq!(wait, StatementWait::ObjectIo);
+                buffer.truncate_to(output_mark);
+                resume_statement = completed_statements;
+                engine.commit_wal().unwrap();
+            }
+        }
+    }
+    assert!(completed, "fixed-memory request did not finish publication");
+    engine.commit_progress = commit_progress;
     buffer.readable().to_vec()
 }
 

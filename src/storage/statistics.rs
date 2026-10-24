@@ -555,14 +555,17 @@ impl Storage {
     /// Estimates consult metadata and resident counts without object I/O.
     pub(crate) fn planning_row_estimate(&self, table_slot: usize) -> u64 {
         let table = &self.tables[table_slot];
+        // Maintenance counts describe an earlier scan. When the complete row
+        // map is resident, later inserts must not leave planning at zero rows.
+        if table.spill_generations().is_empty() {
+            return table.rows.len() as u64;
+        }
         let estimate = {
             let state = table.statistics.read();
             state.committed.valid.then_some(state.committed.rows)
         };
         if let Some(rows) = estimate {
             rows
-        } else if table.spill_generations().is_empty() {
-            table.rows.len() as u64
         } else {
             (table.rows.len() as u64).max(1_000)
         }

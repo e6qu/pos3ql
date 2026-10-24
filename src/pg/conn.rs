@@ -5795,15 +5795,29 @@ mod tests {
                 std::fs::remove_dir_all(&directory).unwrap();
                 let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
-                // Drain recovery uploads before the guarded client command;
-                // the simulated remote store allocates its fixture objects.
-                engine.commit_wal().unwrap();
+                engine.enable_async_durability();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
                 conn.phase = Phase::Ready;
                 assert!(matches!(
                     message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
                     Step::Continue
                 ));
+                for _ in 0..64 {
+                    if !conn.parked {
+                        break;
+                    }
+                    assert_eq!(conn.parked_wait, crate::sql::StatementWait::ObjectIo);
+                    // The simulated remote store allocates its fixture objects.
+                    engine.commit_wal().unwrap();
+                    let step = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
+                    });
+                    assert_eq!(step.after, After::Continue);
+                }
+                assert!(
+                    !conn.parked,
+                    "recovered COPY query did not finish publication"
+                );
                 assert_rows(conn.send.readable());
                 drop(conn);
                 drop(engine);

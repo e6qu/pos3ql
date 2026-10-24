@@ -511,7 +511,7 @@ fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum
     }
     Ok(Datum::Int2Vector {
         lower_bound: 0,
-        raw: raw,
+        raw,
     })
 }
 

@@ -70,6 +70,8 @@ The current PR's full CI gates remain the completion boundary. Its repairs
 preserve catalog-vector subscripts through casts and recovery, size wide routine
 metadata from the actual result width, and exclude the shared internal page
 table from database cloning. Further failures must be fixed before merging.
+Planning also uses the resident row population when a complete row map is
+available; a count recorded before later inserts must not suppress index probes.
 
 Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

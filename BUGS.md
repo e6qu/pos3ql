@@ -4,6 +4,8 @@ No defects currently meet the reporting boundary below.
 
 PR #705 keeps the catalog, cloning, vector recovery, and allocation-check
 regressions in its implementation and test evidence until its full gates pass.
+Guarded recovery tests retain both the original request and resumed commit
+checks while simulated remote publication advances between request turns.
 
 Fix reproducible defects in the PR that finds them, including incidental
 failures, timeouts, rollback and recovery errors. Record a defect here only

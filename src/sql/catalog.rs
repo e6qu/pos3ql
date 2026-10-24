@@ -21864,7 +21864,7 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
     }
     Ok(Datum::Int2Vector {
         lower_bound: 0,
-        raw: raw,
+        raw,
     })
 }
 
@@ -21877,7 +21877,7 @@ fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> 
     }
     Ok(Datum::OidVector {
         lower_bound: 0,
-        raw: raw,
+        raw,
     })
 }
 

@@ -79,6 +79,30 @@ def transcript(reader, writer):
             writer.execute("DROP TABLE IF EXISTS catalog_old_diff")
             writer.execute("DROP TABLE IF EXISTS catalog_renamed_diff")
 
+        writer.execute("CREATE TABLE catalog_comment_private_diff(id integer)")
+        writer.execute("COMMENT ON TABLE catalog_comment_private_diff IS 'old comment'")
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        try:
+            oid = reader.execute("SELECT oid FROM pg_class WHERE relname='catalog_comment_private_diff'").fetchone()[0]
+            query = "SELECT obj_description(%s::oid, 'pg_class'), (SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0)"
+            record(reader, f"{prefix}.comment_private.before", query, (oid, oid))
+            writer.execute("COMMENT ON TABLE catalog_comment_private_diff IS 'new comment'")
+            record(reader, f"{prefix}.comment_private.concurrent", query, (oid, oid))
+            reader.execute("SAVEPOINT before_private_comment")
+            reader.execute("COMMENT ON TABLE catalog_comment_private_diff IS 'new comment'")
+            record(reader, f"{prefix}.comment_private.equal_write", query, (oid, oid))
+            reader.execute("ROLLBACK TO before_private_comment")
+            record(reader, f"{prefix}.comment_private.rolled_back", query, (oid, oid))
+            writer.execute("COMMENT ON TABLE catalog_comment_private_diff IS NULL")
+            reader.execute("COMMENT ON TABLE catalog_comment_private_diff IS NULL")
+            record(reader, f"{prefix}.comment_private.absent_removal", query, (oid, oid))
+            reader.execute("COMMIT")
+            record(reader, f"{prefix}.comment_private.fresh", query, (oid, oid))
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            writer.execute("DROP TABLE IF EXISTS catalog_comment_private_diff")
+
         writer.execute("CREATE TABLE catalog_replace_diff(old_column integer)")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:

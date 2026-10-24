@@ -9409,6 +9409,17 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+        if self
+            .storage
+            .cast_for_oids(source_oid, target.oid(), self.txid)
+            .is_none()
+        {
+            super::eval::validate_catalog_reference_cast(source_oid, target)?;
+        }
+        Ok(())
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         match self.scope.find_column(qualifier, name) {
             Ok(entry) => Ok(self.scope.output_type(entry)),

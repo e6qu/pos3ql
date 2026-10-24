@@ -1383,8 +1383,8 @@ pub trait ColTypeResolver {
         self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
     }
 
-    fn validate_explicit_cast(&self, _source_oid: i32, _target: ColType) -> Result<(), SqlError> {
-        Ok(())
+    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+        super::super::eval::validate_catalog_reference_cast(source_oid, target)
     }
 
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
@@ -3677,9 +3677,11 @@ pub fn infer_type_res(
         Expr::Cast {
             operand, type_name, ..
         } => {
-            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+            if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
+                ColType::from_sql_name(type_name)
+            {
                 let source_oid = infer_routine_argument_oid(operand, columns)?;
-                columns.validate_explicit_cast(source_oid, ColType::Int2)?;
+                columns.validate_explicit_cast(source_oid, target)?;
             }
             if let Some(type_oid) = columns.named_type_oid(type_name) {
                 return Ok((

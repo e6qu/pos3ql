@@ -2502,10 +2502,12 @@ fn eval_full_inner<'a>(
                     return Ok(value);
                 }
             }
-            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+            if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
+                ColType::from_sql_name(type_name)
+            {
                 let source_oid =
                     expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
-                validate_catalog_reference_cast(source_oid, ColType::Int2)?;
+                validate_catalog_reference_cast(source_oid, target)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
                 || matches!(

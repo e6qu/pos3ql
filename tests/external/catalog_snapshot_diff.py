@@ -119,10 +119,12 @@ def transcript(reader, writer):
         writer.execute("BEGIN")
         try:
             for source, target in (("smallint", "int2vector"), ("oid", "oidvector")):
-                record_outcome(
-                    writer, f"{prefix}.rejected_array_to_{target}",
-                    f"SELECT '[8:9]={{9,10}}'::{source}[]::{target}", (),
-                )
+                for label, value in (("null", "NULL"), ("empty", "'{}'"),
+                                     ("bounded", "'[8:9]={9,10}'")):
+                    record_outcome(
+                        writer, f"{prefix}.rejected_array_to_{target}.{label}",
+                        f"SELECT {value}::{source}[]::{target}", (),
+                    )
         finally:
             writer.execute("ROLLBACK")
 

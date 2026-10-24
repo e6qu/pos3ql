@@ -7487,88 +7487,21 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             last_space = false;
         }
     }
-    let canonical = match collapsed.as_str() {
-        // These spell types the engine models; render via the one name table.
-        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
-            return Err(unknown());
-        }
-        "timestamp without time zone" | "timestamp" => "timestamp without time zone",
-        "timestamp with time zone" | "timestamptz" => "timestamp with time zone",
-        "time without time zone" | "time" => "time without time zone",
-        "time with time zone" | "timetz" => "time with time zone",
-        // Identifier/object types render as themselves.
-        "oid" => "oid",
-        s @ ("regtype"
-        | "regclass"
-        | "regproc"
-        | "regprocedure"
-        | "regrole"
-        | "regnamespace"
-        | "regoper"
-        | "regoperator"
-        | "regconfig"
-        | "regdictionary"
-        | "regcollation"
-        | "anyelement"
-        | "anyarray"
-        | "anynonarray"
-        | "anyenum"
-        | "anyrange"
-        | "anymultirange"
-        | "anycompatible"
-        | "anycompatiblearray"
-        | "anycompatiblenonarray"
-        | "anycompatiblerange"
-        | "anycompatiblemultirange"
-        | "fdw_handler") => match s {
-            "regtype" => "regtype",
-            "regclass" => "regclass",
-            "regproc" => "regproc",
-            "regprocedure" => "regprocedure",
-            "regrole" => "regrole",
-            "regnamespace" => "regnamespace",
-            "regoper" => "regoper",
-            "regoperator" => "regoperator",
-            "regconfig" => "regconfig",
-            "regdictionary" => "regdictionary",
-            "regcollation" => "regcollation",
-            "fdw_handler" => "fdw_handler",
-            "anyelement" => "anyelement",
-            "anyarray" => "anyarray",
-            "anynonarray" => "anynonarray",
-            "anyenum" => "anyenum",
-            "anyrange" => "anyrange",
-            "anymultirange" => "anymultirange",
-            "anycompatible" => "anycompatible",
-            "anycompatiblearray" => "anycompatiblearray",
-            "anycompatiblenonarray" => "anycompatiblenonarray",
-            "anycompatiblerange" => "anycompatiblerange",
-            "anycompatiblemultirange" => "anycompatiblemultirange",
-            _ => unreachable!(),
-        },
-        other => match ColType::from_sql_name(other) {
-            Some(ct) => ct.name(),
-            None => return Err(unknown()),
-        },
-    };
-    let referenced_oid = match canonical {
-        "timestamp without time zone" => crate::sql::types::oid::TIMESTAMP,
-        "timestamp with time zone" => crate::sql::types::oid::TIMESTAMPTZ,
-        "time without time zone" => crate::sql::types::oid::TIME,
-        "time with time zone" => crate::sql::types::oid::TIMETZ,
-        "regtype" => crate::sql::types::oid::REGTYPE,
-        "regclass" => crate::sql::types::oid::REGCLASS,
-        "regproc" => crate::sql::types::oid::REGPROC,
-        "regprocedure" => crate::sql::types::oid::REGPROCEDURE,
-        "regrole" => crate::sql::types::oid::REGROLE,
-        "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
-        "regoper" => crate::sql::types::oid::REGOPER,
-        "regoperator" => crate::sql::types::oid::REGOPERATOR,
-        "regconfig" => crate::sql::types::oid::REGCONFIG,
-        "regdictionary" => crate::sql::types::oid::REGDICTIONARY,
-        "regcollation" => crate::sql::types::oid::REGCOLLATION,
+    let name = collapsed.as_str();
+    if matches!(
+        name,
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+    ) {
+        return Err(unknown());
+    }
+    if let Some(ctype) = ColType::from_sql_name(name) {
+        return Ok(Datum::Regtype {
+            referenced_oid: ctype.oid(),
+            name: ctype.name(),
+        });
+    }
+    let referenced_oid = match name {
         "anyelement" => crate::sql::types::oid::ANYELEMENT,
-        "anyarray" => crate::sql::types::oid::ANYARRAY,
         "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
         "anyenum" => crate::sql::types::oid::ANYENUM,
         "anyrange" => crate::sql::types::oid::ANYRANGE,
@@ -7578,13 +7511,12 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "anycompatiblenonarray" => crate::sql::types::oid::ANYCOMPATIBLENONARRAY,
         "anycompatiblerange" => crate::sql::types::oid::ANYCOMPATIBLERANGE,
         "anycompatiblemultirange" => crate::sql::types::oid::ANYCOMPATIBLEMULTIRANGE,
-        _ => ColType::from_sql_name(canonical)
-            .expect("canonical type")
-            .oid(),
+        "fdw_handler" => crate::sql::types::oid::FDW_HANDLER,
+        _ => return Err(unknown()),
     };
     Ok(Datum::Regtype {
         referenced_oid,
-        name: canonical,
+        name: regtype_builtin_name(referenced_oid).expect("matched intrinsic type has a name"),
     })
 }
 

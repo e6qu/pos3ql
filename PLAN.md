@@ -42,10 +42,11 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Build system and information-schema views from the selected base rows,
-  with PostgreSQL's column shapes, joins and current permission checks. For
-  example, `pg_tables` and `information_schema.tables` must agree about the
-  table names an older report selected.
+- Finish connecting derived system and information-schema views to selected
+  base rows, beyond the views covered in the behavior guide. Preserve
+  PostgreSQL's column shapes, joins and current permission checks. For example,
+  `pg_views` and `information_schema.views` must keep the view names an older
+  report selected.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

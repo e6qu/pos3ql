@@ -1133,6 +1133,33 @@ that stale publication to fail with `40001`; it cannot insert an old binding's
 hash into a new cache. These checks do not yet provide the roadmap's
 whole-statement catalog capture or SQL execution on several CPU workers.
 
+### Reading database descriptions while they change
+
+With `transaction_mode = mvcc`, catalog listings retain the rows selected by
+their statement or transaction. A read-committed statement can select newer
+rows; a repeatable-read transaction keeps its earlier listing. `pg_tables`,
+`pg_roles`, `information_schema.tables` and `information_schema.columns` build
+their results from those selected base rows. Remaining derived views are
+tracked in [PLAN.md](../PLAN.md).
+
+**User example:** start a repeatable-read report listing `orders`. Another
+connection renames it to `sales` and commits. The report can still list
+`orders`, while `to_regclass('sales')` resolves the current name. An owner's
+displayed account name can also change after that account is renamed. Listing
+an old definition and resolving an object for use are different operations.
+
+Set `catalog_history_bytes` explicitly before startup; `16MiB` is one example
+for MVCC mode. It reserves space for earlier catalog rows. A full reservation
+returns `54000` before making the change durable. Rollback and savepoints release
+unfinished reservations; old readers retain the committed rows they need.
+Locking mode requires `catalog_history_bytes = 0` and waits for conflicting
+operations instead of retaining these earlier catalog rows.
+
+Catalog object identifiers have type `oid`, and `tableoid` is a hidden system
+column: name it explicitly rather than expecting it in `SELECT *`. Index
+vectors such as `pg_index.indoption` start at zero. For example,
+`indoption[0]` describes the first key; included columns have no option entry.
+
 ### What permission lookups see
 
 Catalog permission rows retain role identifiers. Renaming a role changes the

@@ -21440,18 +21440,28 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         &mut restarted,
         &mut restarted_budget,
         "SELECT count(*) FROM pg_parameter_acl WHERE parname IN ('application_name', 'datestyle');
-         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';
-         COMMIT PREPARED 'parameter-commit';
-         ROLLBACK PREPARED 'parameter-rollback';
-         SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
-         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'datestyle';",
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';",
     );
     assert!(
         !String::from_utf8_lossy(&resolved).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&resolved)
     );
-    assert_eq!(data_rows(&resolved), ["0", "{}", "t", "0"]);
+    assert_eq!(data_rows(&resolved), ["0", "{}"]);
+    for decision in [
+        "COMMIT PREPARED 'parameter-commit'",
+        "ROLLBACK PREPARED 'parameter-rollback'",
+    ] {
+        let output = run_with(&mut restarted, &mut restarted_budget, decision);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(data_rows(&run_with(&mut restarted, &mut restarted_budget,
+        "SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'datestyle';")), ["t", "0"]);
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,

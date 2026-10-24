@@ -21430,12 +21430,13 @@ fn catalog_snapshot_acl_addresses_match_postgresql_object_classes() {
                 pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 1),
                 pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 65536) IS NULL;
          SELECT pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 7) = pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 0);
+         SELECT pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 0)::text LIKE '{=X/postgres,postgres=X/postgres,%}';
          SELECT pg_get_acl('pg_largeobject'::regclass, 50001, -7) = pg_get_acl('pg_largeobject_metadata'::regclass, 50001, 0), pg_get_acl('pg_largeobject'::regclass, 50001, -7) IS NOT NULL;
          SELECT pg_get_acl('pg_authid'::regclass, 10, 3) IS NULL;
          SELECT pg_get_acl(0, 0, 99) IS NULL;");
     assert_eq!(
         data_rows(&output),
-        ["t|t|t", "t", "t|t", "t", "t"],
+        ["t|t|t", "t", "t", "t|t", "t", "t"],
         "{}",
         String::from_utf8_lossy(&output)
     );

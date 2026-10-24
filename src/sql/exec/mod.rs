@@ -10917,9 +10917,10 @@ fn materialize_public_acl_default(
     } else {
         crate::storage::default_public_object_privileges(object.class)
     };
+    // PostgreSQL's initial ACL places PUBLIC before the owner when present.
     for (grantee, privileges) in [
-        (owner, owner_privileges),
         (crate::storage::PUBLIC_ROLE, public_privileges),
+        (owner, owner_privileges),
     ] {
         if privileges.0 == 0 {
             continue;

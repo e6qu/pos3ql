@@ -781,12 +781,12 @@ mod tests {
         let table = relation(DatabaseOid::POSTGRES, 2608);
         forbid_alloc(|| {
             let mut first = history.reserve().unwrap();
-            let duplicates = Some(CatalogRowImage {
+            let duplicates = CatalogRowImage {
                 bytes: b"dependency",
                 count: NonZeroU32::new(3).unwrap(),
                 root: None,
-            });
-            let mut invalid = duplicates.unwrap();
+            };
+            let mut invalid = duplicates;
             invalid.root = NonZeroU64::new(17);
             assert_eq!(
                 first
@@ -796,7 +796,7 @@ mod tests {
                 sqlstate::INTERNAL_ERROR
             );
             assert!(!first.has_rows());
-            first.record(table, &[0], duplicates).unwrap();
+            first.record(table, &[0], Some(duplicates)).unwrap();
             let rooted = Some(CatalogRowImage {
                 bytes: b"unique",
                 count: NonZeroU32::new(1).unwrap(),
@@ -809,7 +809,7 @@ mod tests {
             assert_eq!(rows.len(), 3);
             assert_eq!(
                 rows.iter().find(|row| row.key == [0]).unwrap().before,
-                duplicates
+                Some(duplicates)
             );
             assert_eq!(
                 rows.iter().find(|row| row.key == [16]).unwrap().before,

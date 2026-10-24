@@ -403,6 +403,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(first, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let selected = storage.resident_row_state(first, 1).unwrap().unwrap();
             let retained = storage
                 .visible_row_home_at(first, 1, selected, 99, SNAPSHOT_ALL, 7)
@@ -762,6 +763,7 @@ mod tests {
                     .unwrap();
                 storage.commit_row(table, 1, txid, lsn).unwrap();
                 storage.observe_lsn(lsn);
+                storage.advance_visible_lsn(lsn).unwrap();
             }
             drop(old_reader);
         });
@@ -860,6 +862,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             drop(reader);
         });
         let versions = storage.row_versions.test_write().unwrap();
@@ -1008,6 +1011,7 @@ mod tests {
                     .unwrap();
                 storage.commit_row(table, 1, 8, lsn).unwrap();
                 storage.observe_lsn(lsn);
+                storage.advance_visible_lsn(lsn).unwrap();
             });
             let start = std::sync::Barrier::new(2);
             std::thread::scope(|scope| {
@@ -1125,6 +1129,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             drop(released);
             let one = NonZeroUsize::new(1).unwrap();
@@ -1208,6 +1213,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             drop(released);
             assert_eq!(
@@ -1294,6 +1300,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             assert!(storage.history_pressure());
             finish_history_work(&storage);
             assert!(
@@ -1348,6 +1355,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             drop(old);
             let current = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
@@ -1363,6 +1371,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 10, 11).unwrap();
             storage.observe_lsn(11);
+            storage.advance_visible_lsn(11).unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             let selected = storage
                 .visible_row_home_at(table, 1, state, 100, SNAPSHOT_ALL, current.snapshot())

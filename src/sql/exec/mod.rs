@@ -49215,12 +49215,16 @@ fn finish_index_creation(
     let index = storage
         .index_visible_to(slot, txn.txid)
         .expect("new index is visible to its creator");
-    if let Err(error) = validate_index_rows(storage, table, txn.txid, index.unique, arena) {
-        storage.rollback_index_create(slot);
-        return Err(error);
-    }
+    let statistics = match validate_index_rows(storage, table, txn.txid, index.unique, arena) {
+        Ok(statistics) => statistics,
+        Err(error) => {
+            storage.rollback_index_create(slot);
+            return Err(error);
+        }
+    };
     let result = (|| {
         storage.prepare_index_enforcers(table, txn.txid)?;
+        storage.write_relation_counts(table, statistics, true)?;
         if storage.table_def(table, txn.txid).persistence
             != crate::storage::RelationPersistence::Temporary
         {
@@ -49283,7 +49287,7 @@ fn validate_index_rows(
     txid: u32,
     unique: bool,
     arena: &Arena,
-) -> Result<(), SqlError> {
+) -> Result<crate::storage::TableStatistics, SqlError> {
     let mark = arena.mark();
     let result = (|| {
         let definition = *storage.table_def(table_index, txid);
@@ -49313,11 +49317,16 @@ fn validate_index_rows(
             result
         };
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+        let mut rows = 0u64;
+        let mut row_bytes = 0u64;
         let overlay = scan.for_each_overlay(&mut |rowid, home| {
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                validate_values(rowid, &values[..definition.n_columns])
+                validate_values(rowid, &values[..definition.n_columns])?;
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
@@ -49327,8 +49336,8 @@ fn validate_index_rows(
                 "index validation stopped before completing the scan"
             ));
         }
-        scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
-            for spilled in rows {
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for spilled in batch {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
@@ -49338,9 +49347,25 @@ fn validate_index_rows(
                     crate::storage::SpilledRowRepresentation::Values(values) => values,
                 };
                 validate_values(spilled.rowid, values)?;
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => bytes.len() as u64,
+                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                        rowenc::encoded_len(values) as u64
+                    }
+                });
             }
             Ok(core::ops::ControlFlow::Continue(()))
-        })
+        })?;
+        let mut statistics = storage.table_statistics(table_index, 0);
+        statistics.valid = true;
+        statistics.rows = rows;
+        statistics.average_row_width = row_bytes
+            .checked_div(rows)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        statistics.analyzed_generation = scan.publication_generation(storage, table_index)?;
+        Ok(statistics)
     })();
     // SAFETY: the retained scan and callbacks have ended. Validation publishes
     // no references; the caller's SQL and catalog state precede the mark.

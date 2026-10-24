@@ -1142,6 +1142,19 @@ copy the image visible to their transaction under short guards. The private
 version pool, rollback, commit, replay, and table reuse use the same ownership
 order. Readers retain their copied values without holding these guards.
 
+Creating an index also refreshes the table's row estimate using the validation
+scan. `VACUUM` counts resident and saved rows in batches and preserves column
+estimates unless `ANALYZE` was requested. A table's `relhasindex` flag can remain
+true after an index is dropped or its creation is rolled back. `pg_index` lists
+the actual visible indexes; `VACUUM` clears the flag when none remain. The flag
+belongs to the table's lifetime and cannot leak to a replacement table.
+
+**User example:** after `DROP INDEX orders_lookup`, a catalog query can still
+show `relhasindex = true` for `orders`. Running `VACUUM orders` clears it when
+the table has no remaining indexes, and refreshes its row estimate. Restarting
+with empty caches preserves the saved flag and estimate. An unresolved prepared
+`ANALYZE` restores its relation counts while its column estimates remain private.
+
 Journal capture copies the visible estimates and records the exact relation-count
 revision from the same cell. Acknowledgement clears that captured revision's
 pending marker; a newer revision remains pending. Reused table slots preserve

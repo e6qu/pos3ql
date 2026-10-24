@@ -18946,7 +18946,10 @@ fn pg_class<'a>(
             return Err(catalog_capacity_exceeded("pg_class"));
         }
         let toid = table_oid(storage, slot);
-        let has_index = indexes.iter().any(|i| i.table_oid == toid);
+        let has_index = storage.relation_has_index(crate::storage::CatalogPosition::new(
+            slot,
+            table_def.identity().created_at,
+        )?) || indexes.iter().any(|i| i.table_oid == toid);
         let has_triggers = storage.triggers_for_table(slot, txid).next().is_some()
             || !table_def.fkeys().is_empty()
             || foreign_keys

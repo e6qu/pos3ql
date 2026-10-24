@@ -21622,6 +21622,163 @@ fn parameter_acls_are_typed_enforced_and_visible() {
 }
 
 #[test]
+fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery() {
+    let mut config = test_config("catalog-relation-metadata-cold");
+    config.max_prepared_transactions = 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("catalog-relation-metadata-cold-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE relation_estimates(id integer, note text);
+         INSERT INTO relation_estimates SELECT generate_series(1,8), 'old';
+         ANALYZE relation_estimates;
+         COMMENT ON TABLE relation_estimates IS 'discarded comment';
+         COMMENT ON TABLE relation_estimates IS NULL;
+         COMMENT ON TABLE relation_estimates IS 'old comment';
+         CREATE TABLE retained_index_hint(id integer);
+         CREATE INDEX initial_hint_index ON retained_index_hint(id);
+         DROP INDEX initial_hint_index;
+         CREATE TABLE unknown_estimate(id integer);",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let table = engine
+        .storage
+        .find_table("public", "relation_estimates")
+        .unwrap();
+    let before_columns = engine.storage.table_statistics(table, 0).columns;
+    assert!(engine.checkpoint().unwrap());
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE journal_index_hint(id integer);
+         CREATE INDEX journal_hint_index ON journal_index_hint(id);
+         DROP INDEX journal_hint_index;
+         BEGIN;
+         INSERT INTO relation_estimates SELECT generate_series(9,16), NULL;
+         ANALYZE relation_estimates;
+         COMMENT ON TABLE relation_estimates IS 'prepared comment';
+         PREPARE TRANSACTION 'relation-counts-commit';
+         BEGIN;
+         CREATE INDEX rollback_hint_index ON retained_index_hint(id);
+         PREPARE TRANSACTION 'relation-hint-rollback';",
+    );
+    assert!(
+        !message_types(&prepared).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let table = engine
+        .storage
+        .find_table("public", "relation_estimates")
+        .unwrap();
+    assert_eq!(
+        engine.storage.table_statistics(table, 0).columns,
+        before_columns
+    );
+    let restored = run_with(&mut engine, &mut budget,
+        "SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';
+         SELECT count(*) FROM relation_estimates;
+         SELECT relhasindex FROM pg_class WHERE relname IN ('retained_index_hint', 'journal_index_hint') ORDER BY relname;
+         SELECT reltuples::bigint FROM pg_class WHERE relname='unknown_estimate';");
+    assert_eq!(
+        data_rows(&restored),
+        ["16", "8", "t", "t", "-1"],
+        "{}",
+        String::from_utf8_lossy(&restored)
+    );
+    let mut reader = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let selected = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');",
+    );
+    assert_eq!(data_rows(&selected), ["old comment"]);
+    for decision in [
+        "COMMIT PREPARED 'relation-counts-commit'",
+        "ROLLBACK PREPARED 'relation-hint-rollback'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, decision);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        engine.storage.table_statistics(table, 0).columns[1].null_fraction_ppm,
+        500_000
+    );
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "COMMENT ON TABLE relation_estimates IS 'own comment';
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');
+         SELECT description FROM pg_description WHERE objoid='relation_estimates'::regclass AND classoid='pg_class'::regclass AND objsubid=0;
+         SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid='relation_estimates'::regclass AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description;
+         ROLLBACK;");
+    assert_eq!(
+        data_rows(&retained),
+        ["old comment", "old comment", "old comment", "own comment"],
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    let vacuumed = run_with(
+        &mut engine,
+        &mut budget,
+        "VACUUM retained_index_hint;
+         VACUUM relation_estimates;
+         SELECT relhasindex FROM pg_class WHERE relname='retained_index_hint';
+         SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';",
+    );
+    assert_eq!(
+        data_rows(&vacuumed),
+        ["f", "16"],
+        "{}",
+        String::from_utf8_lossy(&vacuumed)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let final_rows = run_with(&mut engine, &mut budget,
+        "SELECT relhasindex FROM pg_class WHERE relname IN ('retained_index_hint', 'journal_index_hint') ORDER BY relname;
+         SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';
+         SELECT reltuples::bigint FROM pg_class WHERE relname='unknown_estimate';
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');");
+    assert_eq!(
+        data_rows(&final_rows),
+        ["t", "f", "16", "-1", "prepared comment"],
+        "{}",
+        String::from_utf8_lossy(&final_rows)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn parameter_acls_survive_cold_object_store_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -80033,7 +80190,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v22\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v23\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -80223,7 +80380,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v22\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v23\n"))
     );
     drop(recovered);
 

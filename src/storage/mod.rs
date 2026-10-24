@@ -2798,7 +2798,7 @@ struct PendingTableStatisticsSlot {
     used: bool,
     previous: Option<usize>,
     depth: u32,
-    statistics: TableStatistics,
+    columns: [ColumnStatistics; MAX_COLUMNS],
 }
 
 impl TableStatistics {
@@ -3970,10 +3970,6 @@ impl Table {
         self.lifecycle
             .lock()
             .expect("table lifecycle lock poisoned")
-    }
-
-    pub(crate) fn committed_statistics(&self) -> TableStatistics {
-        self.statistics.committed()
     }
 
     pub(crate) fn identity(&self) -> table_definitions::TableIdentity {
@@ -31512,6 +31508,50 @@ impl Storage {
         Ok(count)
     }
 
+    pub(crate) fn refresh_relation_counts(
+        &self,
+        table_slot: usize,
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        let _snapshot = self.analyze_snapshot();
+        let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
+        let mut rows = 0u64;
+        let mut row_bytes = 0u64;
+        let _ = scan.for_each_overlay(&mut |rowid, home| {
+            crate::sql::query::check_timeout()?;
+            self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for row in batch {
+                crate::sql::query::check_timeout()?;
+                let length = match row.representation {
+                    SpilledRowRepresentation::Encoded(bytes) => bytes.len(),
+                    SpilledRowRepresentation::Values(values) => rowenc::encoded_len(values),
+                };
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(length as u64);
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let generation = scan.publication_generation(self, table_slot)?;
+        drop(scan);
+        let mut statistics = self.table_statistics(table_slot, 0);
+        statistics.valid = true;
+        statistics.rows = rows;
+        statistics.average_row_width = row_bytes
+            .checked_div(rows)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        statistics.analyzed_generation = generation;
+        self.write_relation_counts(table_slot, statistics, true)
+    }
+
     /// Rebuilds statistics from current committed data and all own changes.
     /// An empty `selected_columns` means every column; otherwise
     /// only the named column statistics are replaced while table cardinality
@@ -35029,6 +35069,11 @@ impl Storage {
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
+                self.tables[table_index].statistics.set_index_hint(
+                    definition.identity.created_at,
+                    true,
+                    true,
+                )?;
                 publication.enforcers = candidate;
                 publication.n_enforcers = n_want;
                 return Ok(());
@@ -35098,6 +35143,11 @@ impl Storage {
                 "table changed while its value caches were being built"
             ));
         }
+        self.tables[table_index].statistics.set_index_hint(
+            definition.identity.created_at,
+            true,
+            true,
+        )?;
         publication.enforcers = candidate;
         publication.n_enforcers = n_want;
         Ok(())

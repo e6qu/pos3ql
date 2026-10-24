@@ -393,10 +393,14 @@ impl CatalogHistoryBatch {
         key: &[u8],
         before: Option<CatalogRowImage<'_>>,
     ) -> Result<(), SqlError> {
-        if key.is_empty() || before.is_some_and(|row| row.bytes.is_empty()) {
+        if key.is_empty()
+            || before.is_some_and(|row| {
+                row.bytes.is_empty() || (row.root.is_some() && row.count.get() != 1)
+            })
+        {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
-                "catalog history requires an encoded row key and nonempty row images"
+                "catalog history requires an encoded key, nonempty images and unique tuple roots"
             ));
         }
         let mut state = self
@@ -782,17 +786,37 @@ mod tests {
                 count: NonZeroU32::new(3).unwrap(),
                 root: None,
             });
+            let mut invalid = duplicates.unwrap();
+            invalid.root = NonZeroU64::new(17);
+            assert_eq!(
+                first
+                    .record(table, &[0], Some(invalid))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            assert!(!first.has_rows());
             first.record(table, &[0], duplicates).unwrap();
-            first.record(table, &[16], None).unwrap();
+            let rooted = Some(CatalogRowImage {
+                bytes: b"unique",
+                count: NonZeroU32::new(1).unwrap(),
+                root: NonZeroU64::new(17),
+            });
+            first.record(table, &[16], rooted).unwrap();
+            first.record(table, &[32], None).unwrap();
             first.publish(NonZeroU64::new(7).unwrap());
             let rows = history.rows_at(table, 6, &arena).unwrap();
-            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.len(), 3);
             assert_eq!(
                 rows.iter().find(|row| row.key == [0]).unwrap().before,
                 duplicates
             );
             assert_eq!(
                 rows.iter().find(|row| row.key == [16]).unwrap().before,
+                rooted
+            );
+            assert_eq!(
+                rows.iter().find(|row| row.key == [32]).unwrap().before,
                 None
             );
         });

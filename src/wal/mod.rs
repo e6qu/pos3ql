@@ -152,6 +152,7 @@ wal_record_kinds! {
     KIND_UPSERT_V2 = 153;
     KIND_CREATE_TYPED = 154;
     KIND_PREPARED_CATALOG_ROW = 155;
+    KIND_SET_RELATION_INDEX_HINT = 156;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -1792,6 +1793,10 @@ pub(crate) enum WalOp<'a> {
         relation: crate::storage::CatalogRelationIdentity,
         row: crate::storage::HistoricalCatalogRow<'a>,
     },
+    SetRelationIndexHint {
+        position: crate::storage::CatalogPosition,
+        has_index: bool,
+    },
 }
 
 // Wide durable images belong to borrowed staging or isolated replay frames,
@@ -2806,6 +2811,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
+        WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
 }
 
@@ -4026,6 +4032,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::PreparedCatalogRow { row, .. } => 28usize
             .saturating_add(row.key.len())
             .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
+        WalOp::SetRelationIndexHint { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1,
     }
 }
 
@@ -6340,6 +6347,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::SetRelationIndexHint {
+            position,
+            has_index,
+        } => buffer.append(&position.encode()) && buffer.append(&[u8::from(*has_index)]),
         WalOp::PreparedCatalogRow { relation, row } => {
             let Ok(key_length) = u32::try_from(row.key.len()) else {
                 return false;
@@ -11504,6 +11515,21 @@ fn decode_op_inner<'a>(
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }),
+        KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
+            let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;
+            if payload.len() != 11 {
+                return None;
+            }
+            let has_index = match payload[10] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            Some(WalOp::SetRelationIndexHint {
+                position,
+                has_index,
+            })
+        }),
         KIND_PREPARED_CATALOG_ROW => decode_large_op(|| {
             use core::num::{NonZeroU32, NonZeroUsize};
             let database = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
@@ -11531,11 +11557,13 @@ fn decode_op_inner<'a>(
             let key = payload.get(28..key_end)?;
             let before = match (NonZeroU32::new(count), row_length) {
                 (None, 0) if root.is_none() => None,
-                (Some(count), length) if length > 0 => Some(crate::storage::CatalogRowImage {
-                    bytes: payload.get(key_end..row_end)?,
-                    count,
-                    root,
-                }),
+                (Some(count), length) if length > 0 && (root.is_none() || count.get() == 1) => {
+                    Some(crate::storage::CatalogRowImage {
+                        bytes: payload.get(key_end..row_end)?,
+                        count,
+                        root,
+                    })
+                }
                 _ => return None,
             };
             Some(WalOp::PreparedCatalogRow {
@@ -13721,12 +13749,41 @@ mod tests {
             CatalogRelationIdentity, CatalogRowImage, DatabaseOid, HistoricalCatalogRow,
         };
         use core::num::NonZeroU32;
+        for has_index in [false, true] {
+            let position = crate::storage::CatalogPosition::new(7, 17).unwrap();
+            let mut bytes = [0; 32];
+            let encoded = encode_catalog_operation(
+                &WalOp::SetRelationIndexHint {
+                    position,
+                    has_index,
+                },
+                &mut bytes,
+            );
+            assert!(
+                matches!(decode_op(KIND_SET_RELATION_INDEX_HINT, encoded), Some(WalOp::SetRelationIndexHint { position: actual, has_index: flag }) if actual == position && flag == has_index)
+            );
+            for end in 0..encoded.len() {
+                assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &encoded[..end]).is_none());
+            }
+            let mut invalid = [0; 11];
+            invalid.copy_from_slice(encoded);
+            invalid[10] = 2;
+            assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &invalid).is_none());
+            invalid.copy_from_slice(encoded);
+            invalid[2..10].fill(0);
+            assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &invalid).is_none());
+        }
         for database in [None, Some(DatabaseOid::POSTGRES)] {
             for before in [
                 None,
                 Some(CatalogRowImage {
                     bytes: b"old catalog row",
                     count: NonZeroU32::new(3).unwrap(),
+                    root: None,
+                }),
+                Some(CatalogRowImage {
+                    bytes: b"old catalog row",
+                    count: NonZeroU32::new(1).unwrap(),
                     root: core::num::NonZeroU64::new(19),
                 }),
             ] {

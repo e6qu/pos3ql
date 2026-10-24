@@ -5756,6 +5756,20 @@ impl Engine {
             if image.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
+            if let Err(error) = self.wal.stage_reserved(
+                txn.txid,
+                self.storage.bump_lsn(),
+                &WalOp::SetRelationIndexHint {
+                    position: image.position,
+                    has_index: image.has_index,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            if !image.statistics.valid {
+                continue;
+            }
             let lsn = self.storage.bump_lsn();
             if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
@@ -8485,7 +8499,7 @@ impl Engine {
     }
 
     fn record_vacuum_targets(
-        &self,
+        &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
         elapsed_micros: u64,
@@ -8495,6 +8509,10 @@ impl Engine {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
                 {
+                    self.work.reset();
+                    self.storage
+                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
             }
@@ -8509,6 +8527,10 @@ impl Engine {
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
                 {
+                    self.work.reset();
+                    self.storage
+                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
             }
@@ -20459,7 +20481,7 @@ fn replay_transaction_batches(
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
                     prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
                 }
-                for (_, raw) in &batch[..batch.len() - 1] {
+                for (record_lsn, raw) in &batch[..batch.len() - 1] {
                     match crate::wal::decode_record(raw).ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
@@ -20820,6 +20842,39 @@ fn replay_transaction_batches(
                                     crate::storage::CatalogDdlDecision::Rollback,
                                 );
                                 return Err(error);
+                            }
+                        }
+                        WalOp::SetRelationIndexHint {
+                            position,
+                            has_index,
+                        } => {
+                            if *record_lsn > apply_floor {
+                                storage.replay_relation_index_hint(
+                                    position,
+                                    has_index,
+                                    transaction_id,
+                                )?;
+                            }
+                        }
+                        WalOp::Analyze {
+                            schema,
+                            table,
+                            statistics,
+                        } => {
+                            if *record_lsn > apply_floor {
+                                let table_slot = storage
+                                    .find_visible(schema, table, transaction_id)
+                                    .ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_TABLE,
+                                            "prepared ANALYZE references an unknown table"
+                                        )
+                                    })?;
+                                storage.write_relation_counts(
+                                    table_slot,
+                                    statistics.materialize()?,
+                                    false,
+                                )?;
                             }
                         }
                         WalOp::PreparedCatalogRow { relation, row } => {
@@ -21752,6 +21807,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 });
             };
             storage.replay_table_serial_value(index, column as usize, last, 0)?;
+        }
+        WalOp::SetRelationIndexHint {
+            position,
+            has_index,
+        } => {
+            storage.replay_relation_index_hint(position, has_index, 0)?;
         }
         WalOp::Analyze {
             schema,

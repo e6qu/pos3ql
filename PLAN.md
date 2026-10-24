@@ -58,6 +58,9 @@ rows when that transaction is finally committed. Keep current role-name renderin
 Statistics estimates and lazy index flags belong to a particular catalog row
 version: an old reader can see an index flag change, then retain that version's
 estimates after another connection renames the table and analyzes its new version.
+Check index-build estimates, sticky index flags after rollback or removal, and
+VACUUM's count refresh against PostgreSQL. Cover checkpoint, journal-only recovery,
+unresolved prepared changes, stale acknowledgements and replacement tables.
 Keep rewrite history cleanup paced during concurrent publication.
 Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may

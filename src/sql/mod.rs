@@ -6159,6 +6159,10 @@ impl Engine {
                     grantor: grantor_name.as_str(),
                     privileges,
                     grant_options,
+                    order: self
+                        .storage
+                        .object_acl_order(slot as usize, txn.txid)
+                        .expect("staged object ACL has a grant order"),
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -20223,7 +20227,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.restore_object_owner(object, prior);
         }
         DdlUndo::ObjectAclChanged { slot, prior } => {
-            storage.restore_acl_pending(slot as usize, prior);
+            storage
+                .restore_acl_pending(slot as usize, prior)
+                .expect("transaction owns its object ACL undo");
         }
         DdlUndo::ColumnAclChanged { slot, prior } => {
             storage.restore_column_acl_pending(slot as usize, prior);
@@ -23763,6 +23769,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             grantor,
             privileges,
             grant_options,
+            order,
         } => {
             let class = crate::storage::AccessClass::from_u8(class).ok_or_else(|| {
                 sql_err!(
@@ -23817,7 +23824,17 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             };
             let grantor = grantor_slot as u16;
-            storage.change_acl(object, grantee, grantor, privileges, grant_options, 0)?;
+            storage.change_acl(
+                object,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+                crate::storage::ObjectAclWrite::Exact {
+                    transaction: 0,
+                    order,
+                },
+            )?;
         }
         WalOp::SetColumnAcl {
             class,

@@ -12072,6 +12072,38 @@ pub(crate) struct PendingAcl {
     pub grant_options: PrivilegeSet,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectAclWrite {
+    Change {
+        transaction: u32,
+    },
+    Exact {
+        transaction: u32,
+        order: core::num::NonZeroU64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingObjectAcl {
+    pub txid: u32,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub order: core::num::NonZeroU64,
+    change: core::num::NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObjectAclUndo {
+    origin: type_references::CatalogOrigin,
+    slot: usize,
+    object: AccessObject,
+    transaction: u32,
+    change: core::num::NonZeroU64,
+    prior: Option<PendingObjectAcl>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AclEntry {
     pub object: AccessObject,
@@ -12080,7 +12112,8 @@ pub(crate) struct AclEntry {
     pub privileges: PrivilegeSet,
     pub grant_options: PrivilegeSet,
     pub live: bool,
-    pub pending: Option<PendingAcl>,
+    pub pending: Option<PendingObjectAcl>,
+    pub order: Option<core::num::NonZeroU64>,
 }
 
 /// A non-default `pg_parameter_acl` row.  Parameters have no owner or
@@ -12201,6 +12234,8 @@ pub(crate) struct DefaultAclEntry {
 /// privilege images, while every fixed vector retains its startup capacity.
 struct AclCatalog {
     objects: FixedVec<AclEntry>,
+    next_object_order: u64,
+    next_object_change: u64,
     columns: FixedVec<ColumnAclEntry>,
     defaults: FixedVec<DefaultAclEntry>,
     parameters: FixedVec<ParameterAclEntry>,
@@ -12234,18 +12269,11 @@ impl Iterator for ObjectAclIter<'_> {
             let include = if self.checkpoint {
                 entry.object.slot != u16::MAX
                     && !self.storage.access_object_is_temporary(entry.object, 0)
+                    && entry.order.is_some()
                     && (entry.live
-                        || (entry.object.class == AccessClass::Schema
-                            && entry.grantee == PUBLIC_ROLE
-                            && entry.grantor == 0)
-                        || (matches!(
-                            entry.object.class,
-                            AccessClass::Domain
-                                | AccessClass::Enum
-                                | AccessClass::Composite
-                                | AccessClass::Routine
-                                | AccessClass::Language
-                        ) && entry.grantee == PUBLIC_ROLE))
+                        || (entry.grantee == entry.grantor
+                            && usize::from(entry.grantee)
+                                == self.storage.object_owner(entry.object, 0)))
             } else {
                 entry.object.slot != u16::MAX
                     && self.storage.access_object_in_current_database(entry.object)
@@ -18314,6 +18342,7 @@ impl Storage {
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
+            + 2 * size_of::<u64>()
             + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
             + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
             + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
@@ -18386,6 +18415,10 @@ impl Storage {
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
+        budget.draw(
+            2 * size_of::<u64>(),
+            "object ACL grant order and undo counters",
+        )?;
         budget.draw(
             size_of::<core::num::NonZeroU64>(),
             "comment tuple identity counter",
@@ -18978,6 +19011,7 @@ impl Storage {
                     grant_options: PrivilegeSet::NONE,
                     live: true,
                     pending: None,
+                    order: core::num::NonZeroU64::new(u64::from(slot) + 1),
                 })
                 .expect("ACL pool has room for public schema defaults");
         }
@@ -19300,6 +19334,8 @@ impl Storage {
             }),
             acl_catalog: Mutex::new(AclCatalog {
                 objects: acl_entries,
+                next_object_order: 3,
+                next_object_change: 0,
                 columns: column_acl_entries,
                 defaults: default_acl_entries,
                 parameters: parameter_acl_entries,
@@ -21747,7 +21783,7 @@ impl Storage {
 
             for source_slot in 0..self.acl_entry_count() {
                 let entry = self.acl_entry(source_slot);
-                if !entry.live
+                if entry.order.is_none()
                     || self.access_object_database(entry.object) != Some(source)
                     || self.access_object_is_temporary(entry.object, 0)
                 {
@@ -21762,7 +21798,10 @@ impl Storage {
                     entry.grantor,
                     entry.privileges,
                     entry.grant_options,
-                    0,
+                    ObjectAclWrite::Exact {
+                        transaction: 0,
+                        order: entry.order.expect("cloned ACL is defined"),
+                    },
                 )?;
             }
             for source_slot in 0..self.column_acl_entry_count() {
@@ -24121,6 +24160,7 @@ impl Storage {
                 entry.privileges = PrivilegeSet::NONE;
                 entry.grant_options = PrivilegeSet::NONE;
                 entry.pending = None;
+                entry.order = None;
                 entry.object.slot = u16::MAX;
             }
         }
@@ -24805,13 +24845,27 @@ impl Storage {
         grantor: u16,
         privileges: PrivilegeSet,
         grant_options: PrivilegeSet,
-        txid: u32,
-    ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        write: ObjectAclWrite,
+    ) -> Result<(usize, ObjectAclUndo), SqlError> {
+        let txid = match write {
+            ObjectAclWrite::Change { transaction } => transaction,
+            ObjectAclWrite::Exact { transaction, .. } => transaction,
+        };
         if grantee != PUBLIC_ROLE {
             self.role_reference_ready(usize::from(grantee), txid)?;
         }
         self.role_reference_ready(usize::from(grantor), txid)?;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if let Some(blocker) = catalog.objects.iter().find_map(|entry| {
+            (entry.object == object)
+                .then_some(entry.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "object privileges"));
+        }
         let slot = catalog
             .objects
             .iter()
@@ -24820,7 +24874,7 @@ impl Storage {
                 entry.object == object
                     && visible_grantee == grantee
                     && visible_grantor == grantor
-                    && (entry.live || entry.pending.is_some())
+                    && (entry.order.is_some() || entry.pending.is_some())
             })
             .or_else(|| {
                 catalog.objects.iter().position(|entry| {
@@ -24828,6 +24882,52 @@ impl Storage {
                 })
             })
             .unwrap_or(catalog.objects.len());
+        let old_order = catalog.objects.get(slot).and_then(|entry| {
+            if entry.object == object && Self::acl_visible(entry, txid).0 {
+                match entry.pending {
+                    Some(pending) if pending.txid == txid => Some(pending.order),
+                    _ => entry.order,
+                }
+            } else {
+                None
+            }
+        });
+        let order = match write {
+            ObjectAclWrite::Exact { order, .. } => {
+                if catalog.objects.iter().enumerate().any(|(other, entry)| {
+                    other != slot && entry.object == object && entry.order == Some(order)
+                }) {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "duplicate object ACL grant order"
+                    ));
+                }
+                order
+            }
+            ObjectAclWrite::Change { .. } => match old_order {
+                Some(order) => order,
+                None => catalog
+                    .next_object_order
+                    .checked_add(1)
+                    .and_then(core::num::NonZeroU64::new)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "object ACL grant order space exhausted"
+                        )
+                    })?,
+            },
+        };
+        let change = catalog
+            .next_object_change
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "object ACL undo identity space exhausted"
+                )
+            })?;
         if slot == catalog.objects.len() {
             catalog
                 .objects
@@ -24839,6 +24939,7 @@ impl Storage {
                     grant_options: PrivilegeSet::NONE,
                     live: false,
                     pending: None,
+                    order: None,
                 })
                 .map_err(|_| {
                     sql_err!(
@@ -24851,9 +24952,19 @@ impl Storage {
             catalog.objects[slot].object = object;
             catalog.objects[slot].grantee = grantee;
             catalog.objects[slot].grantor = grantor;
+            catalog.objects[slot].order = None;
         }
+        catalog.next_object_order = catalog.next_object_order.max(order.get());
+        catalog.next_object_change = change.get();
         let entry = &mut catalog.objects[slot];
-        let prior = entry.pending;
+        let prior = ObjectAclUndo {
+            origin: self.catalog_sources.origin(),
+            slot,
+            object,
+            transaction: txid,
+            change,
+            prior: entry.pending,
+        };
         if txid == 0 {
             entry.grantee = grantee;
             entry.grantor = grantor;
@@ -24861,13 +24972,16 @@ impl Storage {
             entry.grant_options = grant_options;
             entry.live = privileges.0 != 0;
             entry.pending = None;
+            entry.order = Some(order);
         } else {
-            entry.pending = Some(PendingAcl {
+            entry.pending = Some(PendingObjectAcl {
                 txid,
                 grantee,
                 grantor,
                 privileges,
                 grant_options,
+                order,
+                change,
             });
         }
         Ok((slot, prior))
@@ -24969,8 +25083,11 @@ impl Storage {
             entry.grant_options = pending.grant_options;
             entry.live = pending.privileges.0 != 0;
             entry.pending = None;
+            entry.order = Some(pending.order);
         }
         Self::deduplicate_acl(&mut catalog.objects, slot);
+        drop(catalog);
+        self.wake_transaction_waiters(txid);
     }
 
     fn deduplicate_acl(entries: &mut FixedVec<AclEntry>, slot: usize) {
@@ -24993,18 +25110,62 @@ impl Storage {
         entries[canonical].privileges = entries[canonical].privileges.union(privileges);
         entries[canonical].grant_options = entries[canonical].grant_options.union(grant_options);
         entries[canonical].live = entries[canonical].privileges.0 != 0;
+        entries[canonical].order = entries[canonical].order.min(entries[slot].order);
         entries[slot].object.slot = u16::MAX;
         entries[slot].privileges = PrivilegeSet::NONE;
         entries[slot].grant_options = PrivilegeSet::NONE;
         entries[slot].live = false;
+        entries[slot].order = None;
     }
 
-    pub(crate) fn restore_acl_pending(&self, slot: usize, prior: Option<PendingAcl>) {
+    pub(crate) fn restore_acl_pending(
+        &self,
+        slot: usize,
+        undo: ObjectAclUndo,
+    ) -> Result<(), SqlError> {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if undo.origin != self.catalog_sources.origin()
+            || undo.slot != slot
+            || catalog.objects.get(slot).is_none_or(|entry| {
+                entry.object != undo.object
+                    || !entry.pending.is_some_and(|pending| {
+                        pending.txid == undo.transaction && pending.change == undo.change
+                    })
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stale or foreign object ACL undo"
+            ));
+        }
+        catalog.objects[slot].pending = undo.prior;
+        if undo.prior.is_none() && catalog.objects[slot].order.is_none() {
+            catalog.objects[slot].object.slot = u16::MAX;
+        }
+        drop(catalog);
+        self.wake_transaction_waiters(undo.transaction);
+        Ok(())
+    }
+
+    pub(crate) fn object_acl_defined(&self, object: AccessObject, txid: u32) -> bool {
         self.acl_catalog
             .lock()
             .expect("ACL catalog lock poisoned")
-            .objects[slot]
-            .pending = prior;
+            .objects
+            .iter()
+            .any(|entry| {
+                entry.object == object
+                    && (entry.order.is_some()
+                        || entry.pending.is_some_and(|pending| pending.txid == txid))
+            })
+    }
+
+    pub(crate) fn object_acl_order(&self, slot: usize, txid: u32) -> Option<core::num::NonZeroU64> {
+        let entry = self.acl_entry(slot);
+        match entry.pending {
+            Some(pending) if pending.txid == txid => Some(pending.order),
+            _ => entry.order,
+        }
     }
 
     fn parameter_acl_visible(
@@ -25247,28 +25408,70 @@ impl Storage {
         grantee: u16,
         grantor: u16,
         txid: u32,
-    ) -> Option<PendingAcl> {
+    ) -> Result<ObjectAclUndo, SqlError> {
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let object = catalog.objects[slot].object;
+        if let Some(blocker) = catalog.objects.iter().find_map(|entry| {
+            (entry.object == object)
+                .then_some(entry.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "object privileges"));
+        }
+        let change = catalog
+            .next_object_change
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "object ACL undo identity space exhausted"
+                )
+            })?;
         let entry = &mut catalog.objects[slot];
-        let prior = entry.pending;
+        let prior = ObjectAclUndo {
+            origin: self.catalog_sources.origin(),
+            slot,
+            object,
+            transaction: txid,
+            change,
+            prior: entry.pending,
+        };
+        let order = prior
+            .prior
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.order)
+            .or(entry.order)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "object ACL identity has no grant order"
+                )
+            })?;
         let (_, _, _, privileges, grant_options) = Self::acl_visible(entry, txid);
         if txid == 0 {
             entry.grantee = grantee;
             entry.grantor = grantor;
             entry.pending = None;
         } else {
-            entry.pending = Some(PendingAcl {
+            entry.pending = Some(PendingObjectAcl {
                 txid,
                 grantee,
                 grantor,
                 privileges,
                 grant_options,
+                order,
+                change,
             });
         }
         if txid == 0 {
             Self::deduplicate_acl(&mut catalog.objects, slot);
         }
-        prior
+        catalog.next_object_change = change.get();
+        Ok(prior)
     }
 
     fn default_acl_visible(
@@ -25984,17 +26187,26 @@ impl Storage {
         privilege: PrivilegeSet,
         txid: u32,
     ) -> bool {
-        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
-        {
+        if self.role(role).attributes_to(txid).superuser {
             return true;
         }
+        let owner = self.object_owner(object, txid) as u16;
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let acl_defined = catalog.objects.iter().any(|entry| {
             entry.object == object
                 && entry.object.slot != u16::MAX
-                && (entry.live || entry.pending.is_some())
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
+        });
+        let owner_defined = catalog.objects.iter().any(|entry| {
+            let (_, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+            entry.object == object
+                && grantee == owner
+                && grantor == owner
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
         });
         let mut effective = if !acl_defined {
             default_public_object_privileges(object.class)
@@ -26005,6 +26217,9 @@ impl Storage {
             if inherited {
                 effective = effective
                     .union(Self::acl_to_entries(&catalog.objects, object, slot as u16, txid).0);
+                if slot == usize::from(owner) && !owner_defined {
+                    effective = effective.union(all_object_privileges(object.class));
+                }
             }
         }
         effective.contains(privilege)
@@ -57921,9 +58136,9 @@ mod tests {
                             object,
                             grantee,
                             BOOTSTRAP_ROLE,
-                            PrivilegeSet::USAGE,
+                            PrivilegeSet::CONNECT,
                             PrivilegeSet::NONE,
-                            txid,
+                            ObjectAclWrite::Change { transaction: 0 },
                         )
                         .unwrap();
                     storage.commit_acl(object_slot, txid);
@@ -58025,6 +58240,164 @@ mod tests {
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
+    }
+
+    #[test]
+    fn object_acl_ownership_order_and_undo_are_bounded() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut other_budget = test_budget(&config);
+        let other = Storage::new(&config, &mut other_budget, 0).unwrap();
+        let object = AccessObject {
+            class: AccessClass::Database,
+            slot: 0,
+        };
+        let unrelated = AccessObject {
+            class: AccessClass::Database,
+            slot: 1,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, undo) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 7 },
+                )
+                .unwrap();
+            let order = storage.object_acl_order(slot, 7).unwrap();
+            assert!(storage.object_acl_defined(object, 7));
+            assert!(!storage.object_acl_defined(object, 8));
+            assert_eq!(
+                storage
+                    .change_acl(
+                        object,
+                        BOOTSTRAP_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction: 8 }
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            let (other_slot, other_undo) = other
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 7 },
+                )
+                .unwrap();
+            assert_eq!(other_slot, slot);
+            assert!(other.restore_acl_pending(other_slot, undo).is_err());
+            other.restore_acl_pending(other_slot, other_undo).unwrap();
+            let (independent, independent_undo) = storage
+                .change_acl(
+                    unrelated,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 8 },
+                )
+                .unwrap();
+            storage
+                .restore_acl_pending(independent, independent_undo)
+                .unwrap();
+            storage.restore_acl_pending(slot, undo).unwrap();
+            assert!(!storage.object_acl_defined(object, 0));
+            let (reused, replacement) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 8 },
+                )
+                .unwrap();
+            assert_eq!(reused, slot);
+            assert!(storage.restore_acl_pending(slot, undo).is_err());
+            let new_order = storage.object_acl_order(slot, 8).unwrap();
+            assert!(new_order > order);
+            storage.commit_acl(slot, 8);
+            assert!(storage.restore_acl_pending(slot, replacement).is_err());
+            let (_, update) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT.union(PrivilegeSet::TEMPORARY),
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            assert_eq!(storage.object_acl_order(slot, 9), Some(new_order));
+            let (_, revoke) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::NONE,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            assert!(storage.restore_acl_pending(slot, update).is_err());
+            storage.restore_acl_pending(slot, revoke).unwrap();
+            storage.restore_acl_pending(slot, update).unwrap();
+            assert_eq!(storage.acl_state(slot, 0).0, PrivilegeSet::CONNECT);
+            storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::NONE,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            storage.commit_acl(slot, 9);
+            assert!(storage.object_acl_defined(object, 0));
+            assert!(!storage.acl_entry_visible(slot, 0));
+            storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 10 },
+                )
+                .unwrap();
+            assert!(storage.object_acl_order(slot, 10).unwrap() > new_order);
+            storage.commit_acl(slot, 10);
+            let before = storage.acl_entry_count();
+            storage.acl_catalog.lock().unwrap().next_object_order = u64::MAX;
+            assert_eq!(
+                storage
+                    .change_acl(
+                        unrelated,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction: 11 }
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.acl_entry_count(), before);
+            assert!(!storage.object_acl_defined(unrelated, 0));
+        });
     }
 
     #[test]
@@ -58964,7 +59337,7 @@ mod tests {
                 BOOTSTRAP_ROLE,
                 PrivilegeSet::USAGE,
                 PrivilegeSet::NONE,
-                0,
+                crate::storage::ObjectAclWrite::Change { transaction: 0 },
             )
             .unwrap();
         assert_eq!(

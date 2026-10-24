@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 9;
+pub(crate) const RECORD_VERSION: u8 = 10;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1763,6 +1763,7 @@ pub(crate) enum WalOp<'a> {
         grantor: &'a str,
         privileges: crate::storage::PrivilegeSet,
         grant_options: crate::storage::PrivilegeSet,
+        order: core::num::NonZeroU64,
     },
     SetColumnAcl {
         class: u8,
@@ -4009,7 +4010,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + grantee.len()
                 + 1
                 + grantor.len()
-                + 4
+                + 12
         }
         WalOp::SetColumnAcl {
             schema,
@@ -6281,6 +6282,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             grantor,
             privileges,
             grant_options,
+            order,
         } => {
             buffer.append(&[*class])
                 && (!access_class_has_oid(*class) || buffer.append(&object_oid.to_le_bytes()))
@@ -6290,6 +6292,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, grantor)
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
+                && buffer.append(&order.get().to_le_bytes())
         }
         WalOp::SetColumnAcl {
             class,
@@ -11428,6 +11431,10 @@ fn decode_op_inner<'a>(
             at += 2;
             let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let order = core::num::NonZeroU64::new(u64::from_le_bytes(
+                payload.get(at..at + 8)?.try_into().ok()?,
+            ))?;
+            at += 8;
             if privileges & !crate::storage::all_object_privileges(class).0 != 0
                 || grant_options & !privileges != 0
             {
@@ -11442,6 +11449,7 @@ fn decode_op_inner<'a>(
                 grantor,
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
+                order,
             })
         }),
         KIND_SET_COLUMN_ACL => decode_large_op(|| {
@@ -13411,6 +13419,7 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::EXECUTE,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             },
         )
         .unwrap();
@@ -13435,6 +13444,7 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::EXECUTE,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             }
         ));
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
@@ -13905,6 +13915,7 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::SELECT,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             },
         )
         .unwrap();

@@ -61,6 +61,9 @@ an unresolved prepared transaction must still preserve a reader's older catalog
 rows when that transaction is finally committed. Keep current role-name rendering.
 Compare permission listings with `pg_get_acl` and privilege checks: a listing
 can retain an older grant while the functions inspect current permissions.
+Preserve grant order after slot reuse and revocation. An explicitly empty
+permission list must remain empty after restart; concurrent editors of one
+object's list must wait, while other objects remain available.
 Statistics estimates and lazy index flags belong to a particular catalog row
 version: an old reader can see an index flag change, then retain that version's
 estimates after another connection renames the table and analyzes its new version.

@@ -366,6 +366,8 @@ def transcript(reader, writer):
         try:
             writer.execute("CREATE TABLE catalog_acl_released_diff(id integer)")
             writer.execute("CREATE TABLE catalog_acl_order_diff(id integer)")
+            writer.execute("REVOKE SELECT ON catalog_acl_order_diff FROM catalog_order_c_diff")
+            record(writer, f"{prefix}.permission_order.ungranted_revoke", "SELECT relacl::text FROM pg_class WHERE oid='catalog_acl_order_diff'::regclass")
             writer.execute("GRANT SELECT ON catalog_acl_released_diff TO catalog_order_a_diff")
             writer.execute("GRANT SELECT ON catalog_acl_order_diff TO catalog_order_a_diff")
             writer.execute("DROP TABLE catalog_acl_released_diff")
@@ -391,6 +393,8 @@ def transcript(reader, writer):
             record_outcome(reader, f"{prefix}.permission_order.after_owner_release", "GRANT DELETE ON catalog_acl_order_diff TO catalog_order_b_diff", ())
             reader.execute("COMMIT")
             record(writer, f"{prefix}.permission_order.committed_after_wait", query)
+            writer.execute("ALTER TABLE catalog_acl_order_diff OWNER TO catalog_order_c_diff")
+            record(writer, f"{prefix}.permission_order.revoked_owner_privilege", "SELECT has_table_privilege('catalog_order_c_diff','catalog_acl_order_diff','SELECT'), has_table_privilege('catalog_order_c_diff','catalog_acl_order_diff','SELECT WITH GRANT OPTION')")
         finally:
             reader.execute("ROLLBACK")
             writer.execute("ROLLBACK")

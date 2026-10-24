@@ -6358,12 +6358,14 @@ fn rewrite_object_acl_owner(
                 grantor
             },
             txn.txid,
-        );
+        )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -6422,13 +6424,25 @@ fn preserve_object_acl(
             grantor,
             privileges,
             grant_options,
-            txn.txid,
+            crate::storage::ObjectAclWrite::Exact {
+                transaction: txn.txid,
+                order: storage
+                    .object_acl_order(acl_slot, txn.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "copied object ACL has no grant order"
+                        )
+                    })?,
+            },
         )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: changed as u32,
             prior,
         }) {
-            storage.restore_acl_pending(changed, prior);
+            storage
+                .restore_acl_pending(changed, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -8975,13 +8989,23 @@ fn apply_default_privileges_to_new_object(
         {
             continue;
         }
-        let (slot, prior) =
-            storage.change_acl(object, grantee, owner, privileges, grant_options, txn.txid)?;
+        let (slot, prior) = storage.change_acl(
+            object,
+            grantee,
+            owner,
+            privileges,
+            grant_options,
+            crate::storage::ObjectAclWrite::Change {
+                transaction: txn.txid,
+            },
+        )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -9354,13 +9378,17 @@ fn record_acl_removal(
         grantor,
         crate::storage::PrivilegeSet::NONE,
         crate::storage::PrivilegeSet::NONE,
-        txn.txid,
+        crate::storage::ObjectAclWrite::Change {
+            transaction: txn.txid,
+        },
     )?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
         slot: changed as u32,
         prior,
     }) {
-        storage.restore_acl_pending(changed, prior);
+        storage
+            .restore_acl_pending(changed, prior)
+            .expect("transaction owns its object ACL undo");
         return Err(error);
     }
     Ok(grant_options)
@@ -10899,7 +10927,7 @@ fn materialize_public_acl_default(
     for (slot, entry) in storage.acl_entries() {
         if entry.object != object
             || entry.object.slot == u16::MAX
-            || (!entry.live && entry.pending.is_none())
+            || storage.object_acl_order(slot, txn.txid).is_none()
         {
             continue;
         }
@@ -10931,13 +10959,17 @@ fn materialize_public_acl_default(
             owner,
             privileges,
             crate::storage::PrivilegeSet::NONE,
-            txn.txid,
+            crate::storage::ObjectAclWrite::Change {
+                transaction: txn.txid,
+            },
         )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -11129,7 +11161,9 @@ pub fn grant_privileges(
                     acl_grantor as u16,
                     old_privileges.union(requested),
                     new_options,
-                    txn.txid,
+                    crate::storage::ObjectAclWrite::Change {
+                        transaction: txn.txid,
+                    },
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
@@ -11138,7 +11172,9 @@ pub fn grant_privileges(
                     slot: slot as u32,
                     prior,
                 }) {
-                    storage.restore_acl_pending(slot, prior);
+                    storage
+                        .restore_acl_pending(slot, prior)
+                        .expect("transaction owns its object ACL undo");
                     return sql_fail(error);
                 }
             }
@@ -11296,15 +11332,8 @@ pub fn revoke_privileges(
             ));
         }
     }
-    let revokes_public = grantees
-        .iter()
-        .any(|grantee| grantee.eq_ignore_ascii_case("public"));
     for object in &objects[..object_count] {
-        // Only a PUBLIC revocation changes PostgreSQL's implicit default ACL.
-        // Materializing it for another grantee consumes a durable ACL entry and
-        // transaction undo record for an otherwise untouched object.
-        if revokes_public && let Err(error) = materialize_public_acl_default(storage, txn, *object)
-        {
+        if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
         let requested = match privilege_mask(privileges, object.class, false) {
@@ -11415,7 +11444,9 @@ pub fn revoke_privileges(
                                 dependent_grantor,
                                 dependent_privileges.without(lost_options),
                                 dependent_options.without(lost_options),
-                                txn.txid,
+                                crate::storage::ObjectAclWrite::Change {
+                                    transaction: txn.txid,
+                                },
                             ) {
                                 Ok(change) => change,
                                 Err(error) => return sql_fail(error),
@@ -11426,7 +11457,9 @@ pub fn revoke_privileges(
                                     prior,
                                 })
                             {
-                                storage.restore_acl_pending(slot, prior);
+                                storage
+                                    .restore_acl_pending(slot, prior)
+                                    .expect("transaction owns its object ACL undo");
                                 return sql_fail(error);
                             }
                             if dependent_grantee != PUBLIC_ROLE && recursively_lost.0 != 0 {
@@ -11459,7 +11492,9 @@ pub fn revoke_privileges(
                     acl_grantor as u16,
                     new_privileges,
                     new_options,
-                    txn.txid,
+                    crate::storage::ObjectAclWrite::Change {
+                        transaction: txn.txid,
+                    },
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
@@ -11468,7 +11503,9 @@ pub fn revoke_privileges(
                     slot: slot as u32,
                     prior,
                 }) {
-                    storage.restore_acl_pending(slot, prior);
+                    storage
+                        .restore_acl_pending(slot, prior)
+                        .expect("transaction owns its object ACL undo");
                     return sql_fail(error);
                 }
             }

@@ -628,7 +628,7 @@ pub(crate) enum DdlUndo {
     },
     ObjectAclChanged {
         slot: u32,
-        prior: Option<crate::storage::PendingAcl>,
+        prior: crate::storage::ObjectAclUndo,
     },
     ColumnAclChanged {
         slot: u32,

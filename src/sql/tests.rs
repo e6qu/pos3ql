@@ -22164,6 +22164,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("role-acl-cold-{sequence}"));
+    config.max_prepared_transactions = 1;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-role-acl-{}-{sequence}", std::process::id());
@@ -22204,7 +22205,15 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
          RESET ROLE;
          REVOKE USAGE ON TYPE durable_state FROM PUBLIC;
          GRANT SELECT ON durable_exposed TO durable_reader;
-         GRANT USAGE ON SEQUENCE durable_sequence TO durable_reader;",
+         GRANT USAGE ON SEQUENCE durable_sequence TO durable_reader;
+         CREATE TABLE durable_acl_released(id integer);
+         CREATE TABLE durable_acl_ordered(id integer);
+         GRANT SELECT ON durable_acl_released TO durable_reader;
+         GRANT SELECT ON durable_acl_ordered TO durable_reader;
+         DROP TABLE durable_acl_released;
+         GRANT UPDATE ON durable_acl_ordered TO unprivileged;
+         CREATE TABLE durable_acl_empty(id integer);
+         REVOKE ALL PRIVILEGES ON durable_acl_empty FROM postgres;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -22212,6 +22221,20 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&output)
     );
     assert!(engine.checkpoint().unwrap());
+    let journal = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_acl_journal_empty(id integer);
+         REVOKE ALL PRIVILEGES ON durable_acl_journal_empty FROM postgres;
+         BEGIN;
+         GRANT SELECT ON durable_acl_empty TO unprivileged;
+         PREPARE TRANSACTION 'durable-acl-grants';",
+    );
+    assert!(
+        !message_types(&journal).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&journal)
+    );
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -22222,6 +22245,35 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         ),
     );
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let permissions = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT relname, relacl::text FROM pg_class
+          WHERE relname IN ('durable_acl_empty','durable_acl_journal_empty','durable_acl_ordered')
+          ORDER BY relname;",
+    );
+    assert_eq!(
+        data_rows(&permissions),
+        [
+            "durable_acl_empty|{}",
+            "durable_acl_journal_empty|{}",
+            "durable_acl_ordered|{postgres=arwdDxtm/postgres,durable_reader=r/postgres,unprivileged=w/postgres}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&permissions)
+    );
+    let committed = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "COMMIT PREPARED 'durable-acl-grants';
+         SELECT relacl::text FROM pg_class WHERE relname='durable_acl_empty';",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["{unprivileged=r/postgres}"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
@@ -22257,7 +22309,29 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    assert!(restarted.checkpoint().unwrap());
     drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut final_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    let final_permissions = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "SELECT relname, relacl::text FROM pg_class
+          WHERE relname IN ('durable_acl_empty','durable_acl_journal_empty','durable_acl_ordered')
+          ORDER BY relname;",
+    );
+    assert_eq!(
+        data_rows(&final_permissions),
+        [
+            "durable_acl_empty|{unprivileged=r/postgres}",
+            "durable_acl_journal_empty|{}",
+            "durable_acl_ordered|{postgres=arwdDxtm/postgres,durable_reader=r/postgres,unprivileged=w/postgres}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&final_permissions)
+    );
+    drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -80357,7 +80431,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v23\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v24\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -80570,7 +80644,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v23\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v24\n"))
     );
     drop(recovered);
 

@@ -10,6 +10,8 @@ publication, cancellation and recovery failures in the change that finds them.
 Catalog visibility repairs must preserve both explicit catalog-query snapshots
 and current object resolution; neither boundary is a reason to defer the other.
 Permission row identity, rollback and durable replay are part of that repair.
+That includes ordered and explicitly empty permission lists and conflicting
+writers, rather than treating each grant as an independent catalog row.
 Comment row identity, lookup versus listing behavior, and rejection of malformed
 stored keys belong to the same boundary.
 Index hints and relation counts must survive recovery without turning private

@@ -9808,26 +9808,12 @@ fn acl<'a>(
     let explicit_owner_acl = storage.acl_entries().any(|(slot, entry)| {
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         entry.object == object
-            && storage.acl_entry_visible(slot, txid)
+            && storage.object_acl_order(slot, txid).is_some()
             && grantee == owner as u16
             && grantor == owner as u16
             && entry.object.slot != u16::MAX
     });
-    let has_entries = storage.acl_entries().any(|(slot, entry)| {
-        let (grantee, _) = storage.acl_identity(slot, txid);
-        entry.object == object
-            && storage.acl_entry_visible(slot, txid)
-            && (storage.acl_state(slot, txid).0.0 != 0
-                || (explicit_owner_acl && grantee == owner as u16)
-                || (matches!(
-                    object.class,
-                    crate::storage::AccessClass::Domain
-                        | crate::storage::AccessClass::Enum
-                        | crate::storage::AccessClass::Routine
-                        | crate::storage::AccessClass::Language
-                ) && grantee == crate::storage::PUBLIC_ROLE))
-    });
-    if !has_entries {
+    if !storage.object_acl_defined(object, txid) {
         return Ok(Datum::Null);
     }
     let values = arena
@@ -9911,7 +9897,25 @@ fn acl<'a>(
         );
         count += 1;
     }
+    let ordered = arena
+        .alloc_slice_with(storage.acl_entry_count(), |_| (0u64, 0usize))
+        .map_err(|_| arena_full())?;
+    let mut ordered_count = 0;
     for (slot, entry) in storage.acl_entries() {
+        if entry.object == object && storage.acl_entry_visible(slot, txid) {
+            let order = storage.object_acl_order(slot, txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible object ACL has no grant order"
+                )
+            })?;
+            ordered[ordered_count] = (order.get(), slot);
+            ordered_count += 1;
+        }
+    }
+    ordered[..ordered_count].sort_unstable_by_key(|(order, _)| *order);
+    for (_, slot) in ordered[..ordered_count].iter().copied() {
+        let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         if entry.object != object || !storage.acl_entry_visible(slot, txid) {
             continue;

@@ -26,8 +26,10 @@ SELECT obj_description('publication_target_sql.publication_owned_sql'::regclass)
 SELECT nextval('publication_target_sql.publication_owned_sql');
 BEGIN;
 ALTER TABLE publication_target_sql.publication_renamed_sql RENAME TO publication_rolled_back_sql;
+ALTER TABLE publication_target_sql.publication_rolled_back_sql RENAME TO publication_rolled_back_twice_sql;
 SELECT nextval('publication_target_sql.publication_owned_sql');
 ROLLBACK;
+SELECT nextval('publication_target_sql.publication_owned_sql');
 INSERT INTO publication_target_sql.publication_renamed_sql VALUES (2, 20);
 INSERT INTO publication_child_sql VALUES (2);
 SELECT count(*), sum(amount) FROM publication_target_sql.publication_renamed_sql;

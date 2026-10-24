@@ -36,6 +36,7 @@ fn table_publication_sql_renames_indexes_comments_sequences_and_cold_recovery() 
                     "published sequence",
                     "3",
                     "5",
+                    "7",
                     "2|30",
                     "2"
                 ]
@@ -54,7 +55,7 @@ fn table_publication_sql_renames_indexes_comments_sequences_and_cold_recovery() 
                  SELECT count(*) FROM publication_child_sql; \
                  SELECT obj_description('publication_target_sql.publication_key_sql'::regclass); \
                  SELECT nextval('publication_target_sql.publication_owned_sql')", false)),
-                ["2|30", "2", "published index", "7"]);
+                ["2|30", "2", "published index", "9"]);
             assert_eq!(
                 error_sqlstates(&session.execute(
                     &mut cold,

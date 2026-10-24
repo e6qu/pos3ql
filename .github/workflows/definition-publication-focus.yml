@@ -61,7 +61,7 @@ jobs:
           assert 180000 <= int(version.stdout.strip()) < 190000, version.stdout
           cases = [
               ("19_key_preparation.sql", ["1", "1|11", "3|20|23", "2|5|42"]),
-              ("20_table_publication.sql", ["1", "1|10", "1", "3", "published table", "published index", "published sequence", "3", "5", "2|30", "2"]),
+              ("20_table_publication.sql", ["1", "1|10", "1", "3", "published table", "published index", "published sequence", "3", "5", "7", "2|30", "2"]),
           ]
           for name, expected in cases:
               fixture = pathlib.Path("tests/external/differential_exact", name).read_text()

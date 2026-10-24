@@ -5,7 +5,8 @@ belong here. Fix every other defect, including CI regressions, in the PR that
 finds it. Keep repaired defects and their evidence in the implementing PR.
 Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
-No defects currently meet this blocked-only boundary.
+No defects currently meet this boundary. Repair reproducible admission,
+publication, cancellation and recovery failures in the change that finds them.
 
 Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
 and [storage format guide](docs/durable-format.md). Keep regression evidence in

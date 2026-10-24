@@ -104,7 +104,7 @@ next statement.
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
-| Read positions | Statement and transaction retention; replication export validity and import protection share one guard, with separate fixed capacities | Integrate every remaining table lifecycle path and engine publication |
+| Read positions | Statement admission and the last fully installed commit share an owner; existing statement and transaction snapshots retain history. Replication export validity and import protection share that guard, with separate fixed capacities | Extend admission to coherent later catalog lookups and every table lifecycle path |
 | Deferred reads | Scans and rewrites keep their original byte sources; UPDATE, DELETE, and MERGE copy selected values into fixed statement memory | Finish coherent table lifecycle changes |
 
 ### How long reads keep data alive
@@ -116,6 +116,24 @@ the same synchronization as row publication, so it cannot miss an intervening
 commit. Nested statements do not replace a transaction's snapshot. Completion,
 errors, and transaction end release retention, wake schema waiters, and
 schedule pruning.
+
+**User example:** a transaction updates an order and its invoice from 10 to 20.
+A report already reading the old versions can finish while the commit installs
+both changes. A new report reaching this installation step yields through the
+existing lock-wait mechanism and resumes after both values are installed. It
+cannot select the position of an unfinished commit. Choosing that position and
+retaining its history happen under the same owner, so cleanup cannot slip
+between them. Journal position reservations do not advance the visible position.
+
+Installation starts after the object-store durability wait and ends after the
+ordinary or prepared transaction's changes and outcome are installed. It does
+not wait for existing reports to finish. An abandoned partial installation wakes
+waiting connections but rejects new admission with `08007` until recovery;
+it does not expose the partial result. Lock-only mode uses the same admission
+boundary without reserving row-history slots. These controls are charged at
+startup, with no new pool or configuration limit. SQL still uses one CPU worker;
+consistent later metadata capture and remaining synchronous storage reads are
+separate [remaining work](../PLAN.md).
 
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
 or abort and restores the captured read position for each chunk. When statement

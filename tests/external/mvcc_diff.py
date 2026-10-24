@@ -28,6 +28,40 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def transaction_admission_transcript(reader, writer) -> list[str]:
+    results = []
+    writer.execute("CREATE TABLE admission_order_diff(id integer PRIMARY KEY, total integer)")
+    writer.execute("CREATE TABLE admission_invoice_diff(id integer PRIMARY KEY, total integer)")
+    query = "SELECT o.total,i.total FROM admission_order_diff o JOIN admission_invoice_diff i ON o.id=i.id"
+    try:
+        for isolation in ["READ COMMITTED", "REPEATABLE READ"]:
+            writer.execute("TRUNCATE admission_order_diff,admission_invoice_diff")
+            writer.execute("INSERT INTO admission_order_diff VALUES(1,10)")
+            writer.execute("INSERT INTO admission_invoice_diff VALUES(1,10)")
+            reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            before = reader.execute(query).fetchall()
+            writer.execute("BEGIN")
+            writer.execute("UPDATE admission_order_diff SET total=20")
+            partial = reader.execute(query).fetchall()
+            writer.execute("UPDATE admission_invoice_diff SET total=20")
+            writer.execute("COMMIT")
+            committed = reader.execute(query).fetchall()
+            reader.execute("COMMIT")
+            fresh = reader.execute(query).fetchall()
+            writer.execute("BEGIN")
+            writer.execute("UPDATE admission_order_diff SET total=30")
+            writer.execute("UPDATE admission_invoice_diff SET total=30")
+            writer.execute("ROLLBACK")
+            rolled_back = reader.execute(query).fetchall()
+            results.append(f"transaction_admission_{isolation}=before:{before},partial:{partial},committed:{committed},fresh:{fresh},rollback:{rolled_back}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE admission_invoice_diff")
+        writer.execute("DROP TABLE admission_order_diff")
+
+
 def generated_write_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE generated_write_diff(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED)")
     writer.execute("CREATE FUNCTION generated_write_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.seed := 2; RETURN NEW; END$$")
@@ -1163,6 +1197,7 @@ def exercise(port: int) -> list[str]:
         ] + [
             line
             for transcript in [
+                transaction_admission_transcript(reader, writer),
                 dml_target_transcript(reader, writer),
                 dml_description_transcript(reader, writer),
                 prepared_statement_cleanup_transcript(reader),

@@ -34,12 +34,13 @@ boundary before several CPU workers run statements. A query must
 not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
-Connect reader admission and the guarded table/type publication and retirement
-paths to that transaction boundary. Keep rewrite history cleanup paced during concurrent publication.
+Extend the statement admission boundary to complete metadata capture, connecting
+the guarded table/type publication and retirement paths to retained catalog
+versions. Keep rewrite history cleanup paced during concurrent publication.
 Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
 preparation across all catalog consumers. Extend the selected table-shape
-checks used by index keys to the whole statement's reader admission.
+checks used by index keys to every later catalog lookup in a statement.
 Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may
 retain exclusive startup access; ordinary publication must let unrelated

@@ -40,6 +40,27 @@ fn transaction_publication_rows_definitions_indexes_and_comments_match_postgresq
 }
 
 fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Result<(), SqlError> {
+    match engine.transaction_publication {
+        PublicationState::Installing(_) => assert_eq!(
+            engine
+                .storage
+                .statement_snapshot_lsn(observer)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT,
+            "new reader entered unfinished publication at {point:?}"
+        ),
+        PublicationState::RecoveryRequired(_) => assert_eq!(
+            engine
+                .storage
+                .statement_snapshot_lsn(observer)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+            "new reader entered failed publication at {point:?}"
+        ),
+        PublicationState::Idle => {}
+    }
     if let PublicationState::Installing(publication) = engine.transaction_publication {
         if publication.transactions().count() == 2 {
             assert_eq!(
@@ -58,7 +79,7 @@ fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Re
         }
         if point != PublicationPoint::Visible {
             assert!(
-                engine.visible_lsn < publication.lsn,
+                engine.storage.visible_lsn() < publication.lsn,
                 "visible journal position crossed unfinished installation at {point:?}"
             );
         }
@@ -105,6 +126,97 @@ fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Re
         "transaction advisory lock released at {point:?}"
     );
     Ok(())
+}
+
+#[test]
+fn transaction_admission_sql_preserves_complete_transactions_across_isolation_levels() {
+    for isolation in ["READ COMMITTED", "REPEATABLE READ"] {
+        let config = test_config(&format!("admission-isolation-{isolation}"));
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, SETUP, true);
+        reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL {isolation}"),
+            true,
+        );
+        let query = "SELECT o.total,i.total FROM publication_orders o JOIN publication_invoices i ON o.id=i.id";
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["10|10"]
+        );
+        writer.success(
+            &mut engine,
+            "BEGIN; UPDATE publication_orders SET total=20",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["10|10"]
+        );
+        writer.success(
+            &mut engine,
+            "UPDATE publication_invoices SET total=20; COMMIT",
+            true,
+        );
+        let expected = if isolation == "REPEATABLE READ" {
+            "10|10"
+        } else {
+            "20|20"
+        };
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            [expected]
+        );
+        reader.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["20|20"]
+        );
+        writer.success(&mut engine, "BEGIN; UPDATE publication_orders SET total=30; UPDATE publication_invoices SET total=30; ROLLBACK", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["20|20"]
+        );
+    }
+}
+
+#[test]
+fn transaction_admission_sql_wait_does_not_advance_command_or_take_a_snapshot() {
+    let config = test_config("admission-wait-before-command");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, SETUP, true);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    let command = reader.transaction.command_id();
+    let installation = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let error = engine
+            .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
+            .err()
+            .unwrap();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+        assert_eq!(reader.transaction.command_id(), command);
+        assert!(!reader.transaction.snapshot_taken());
+        assert_eq!(reader.transaction.snapshot_lsn(), None);
+    });
+    installation.complete();
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT total FROM publication_orders", true)),
+        ["10"]
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    reader.success(&mut engine, "ROLLBACK", true);
+    writer.success(&mut engine, "ROLLBACK", true);
 }
 
 fn inject_definitions(
@@ -523,7 +635,7 @@ fn transaction_publication_queued_failure_preserves_later_durable_work_for_recov
             .sqlstate,
             sqlstate::INTERNAL_IO_WAIT
         );
-        let frontier = engine.visible_lsn;
+        let frontier = engine.storage.visible_lsn();
         engine.publication_observer = Some((inject_row, observer.transaction.txid));
         let mut failed = false;
         for _ in 0..16 {
@@ -536,7 +648,7 @@ fn transaction_publication_queued_failure_preserves_later_durable_work_for_recov
             }
         }
         assert!(failed, "injected publication failure was not reached");
-        assert_eq!(engine.visible_lsn, frontier);
+        assert_eq!(engine.storage.visible_lsn(), frontier);
         assert!(engine.durable_lsn >= later.transaction.staged_commit().unwrap().lsn);
         assert!(writer.transaction.staged_commit().is_some());
         assert!(engine.transaction_publication.owns(transaction));

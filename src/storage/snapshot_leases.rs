@@ -262,6 +262,7 @@ impl Storage {
     ) -> Result<StatementSnapshotLease, SqlError> {
         let owner = self.transaction_wait_owner(transaction);
         let mut snapshots = self.snapshot_state();
+        let visible = snapshots.admission.select(owner, &self.locks)?;
         let next = snapshots
             .next_statement
             .checked_add(1)
@@ -280,7 +281,7 @@ impl Storage {
             ));
         }
         let files = self.spill_roots.retain_statement()?;
-        let lsn = select(self.lsn());
+        let lsn = select(visible);
         snapshots
             .statements
             .push(StatementSnapshot {

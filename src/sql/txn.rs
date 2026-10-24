@@ -1294,7 +1294,7 @@ impl TxnState {
             ));
         }
         let command = self.next_command_identity()?;
-        let snapshot = self.statement_snapshot(storage.lsn());
+        let snapshot = self.statement_snapshot(storage.statement_snapshot_lsn(self.txid)?);
         if matches!(
             self.isolation,
             TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable

@@ -536,7 +536,6 @@ pub struct Engine {
     publication_observer: Option<(commit::PublicationObserver, u32)>,
     commit_queue: Option<commit::Queue>,
     read_owner: Option<crate::store::ReadOwner>,
-    visible_lsn: u64,
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
@@ -3878,6 +3877,7 @@ impl Engine {
             size_of::<commit::PublicationState>(),
             "transaction publication owner",
         )?;
+        storage.restore_visible_lsn(recovered_durable_lsn);
         Ok(Self {
             storage,
             wal,
@@ -3904,7 +3904,6 @@ impl Engine {
                 None
             },
             read_owner: None,
-            visible_lsn: recovered_durable_lsn,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: DmlWorkspaces::new(config, budget)?,
@@ -3976,7 +3975,7 @@ impl Engine {
 
     pub(crate) fn replication_identity(&self) -> (u64, u64) {
         let lsn = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn.min(self.durable_lsn)
+            self.storage.visible_lsn().min(self.durable_lsn)
         } else {
             self.wal.last_lsn()
         };
@@ -4536,7 +4535,7 @@ impl Engine {
         } = emission;
         self.validate_replication_publications(publication_names)?;
         let ceiling = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn.min(self.durable_lsn)
+            self.storage.visible_lsn().min(self.durable_lsn)
         } else {
             u64::MAX
         };
@@ -5324,11 +5323,6 @@ impl Engine {
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        let visible = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn
-        } else {
-            self.storage.lsn()
-        };
         let resumed = if resume_statement {
             txn.resume_statement()
         } else {
@@ -5337,24 +5331,24 @@ impl Engine {
         if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
         }
-        if advance_command && resumed.is_none() {
-            txn.begin_command()?;
-        }
+        let begin_command = advance_command && resumed.is_none();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let retained_lease = resumed.and_then(|state| state.lease);
         let lease = if retained_lease.is_some() {
             retained_lease
         } else if takes_snapshot && retain_snapshot {
             Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| {
-                txn.statement_snapshot(lsn.min(visible))
+                txn.statement_snapshot(lsn)
             })?)
         } else {
             None
         };
         let snapshot = if takes_snapshot {
-            let snapshot = lease
-                .as_ref()
-                .map_or_else(|| txn.statement_snapshot(visible), |lease| lease.snapshot());
+            let snapshot = if let Some(lease) = &lease {
+                lease.snapshot()
+            } else {
+                txn.statement_snapshot(self.storage.statement_snapshot_lsn(txn.txid)?)
+            };
             if matches!(
                 txn.isolation,
                 TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -5366,8 +5360,11 @@ impl Engine {
             }
             snapshot
         } else {
-            self.storage.lsn()
+            self.storage.statement_snapshot_lsn(txn.txid)?
         };
+        if begin_command {
+            txn.begin_command()?;
+        }
         self.storage.set_commit_snapshot(snapshot);
         let files = lease
             .as_ref()
@@ -6478,11 +6475,13 @@ impl Engine {
             if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
                 // Position zero denotes an absent deletion marker. Temporary data
                 // needs a real position even before the first durable transaction.
-                if self.visible_lsn == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
+                let visible = self.storage.visible_lsn();
+                if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
                     self.storage.observe_lsn(1);
-                    self.visible_lsn = 1;
+                    1
+                } else {
+                    visible
                 }
-                self.visible_lsn
             } else {
                 commit_lsn
             };
@@ -6597,6 +6596,7 @@ impl Engine {
             });
             return Err(error);
         }
+        let mut installation = None;
         let result = (|| {
             if self.wal_upload
                 && self.commit_progress == CommitProgressMode::Inline
@@ -6605,6 +6605,10 @@ impl Engine {
             {
                 self.commit_wal()?;
             }
+            installation = Some(
+                self.storage
+                    .begin_transaction_installation(txn.txid, staged.lsn)?,
+            );
             match staged.target {
                 txn::CommitTarget::Prepare { slot, .. } => {
                     txn.take_staged_commit();
@@ -6648,9 +6652,6 @@ impl Engine {
                 }
             }
         })();
-        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
-            self.visible_lsn = self.visible_lsn.max(staged.lsn);
-        }
         #[cfg(test)]
         let result = result.and_then(|()| {
             if matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
@@ -6674,6 +6675,10 @@ impl Engine {
                     release_transaction_locks(&self.storage, transaction);
                 }
             }
+            installation
+                .take()
+                .expect("successful publication owns reader admission")
+                .complete();
         }
         self.unpromoted_commits -= 1;
         if let Err(error) = &result {
@@ -6729,7 +6734,7 @@ impl Engine {
             .transaction_publication
             .pending_lsn()
             .map_or(frontier, |lsn| frontier.min(lsn.saturating_sub(1)));
-        self.visible_lsn = self.visible_lsn.max(frontier);
+        self.storage.advance_visible_lsn(frontier)?;
         Ok(())
     }
 
@@ -10948,6 +10953,11 @@ impl Engine {
         }
         let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
             Ok(lease) => lease,
+            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                return Ok(ExtendedExecutionStatus::Blocked {
+                    wait: StatementWait::Lock,
+                });
+            }
             Err(error) => {
                 if txn.is_explicit() {
                     txn.failed = true;

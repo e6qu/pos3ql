@@ -1,0 +1,86 @@
+name: Transaction admission focus
+
+on:
+  push:
+    branches: [shared-transaction-admission]
+  workflow_dispatch:
+
+concurrency:
+  group: transaction-admission-focus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: key-preparation-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            coherent-readers-${{ runner.os }}-
+            ${{ runner.os }}-cargo-
+      - name: Format and retain exact patch
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/format.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: transaction-admission-format
+          path: ${{ runner.temp }}/format.patch
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: ./.github/actions/python-test-environment
+        if: ${{ !cancelled() }}
+        with:
+          venv: ${{ runner.temp }}/reference-venv
+      - name: PostgreSQL 18 two-connection reference
+        if: ${{ !cancelled() }}
+        env:
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+        run: |
+          "$RUNNER_TEMP/reference-venv/bin/python" - <<'PY'
+          import sys
+          sys.path.insert(0, "tests/external")
+          from mvcc_diff import connect, transaction_admission_transcript
+          reader, writer = connect(5432), connect(5432)
+          try:
+              version = int(reader.execute("SHOW server_version_num").fetchone()[0])
+              assert 180000 <= version < 190000, version
+              observed = transaction_admission_transcript(reader, writer)
+              expected = [
+                  "transaction_admission_READ COMMITTED=before:[(10, 10)],partial:[(10, 10)],committed:[(20, 20)],fresh:[(20, 20)],rollback:[(20, 20)]",
+                  "transaction_admission_REPEATABLE READ=before:[(10, 10)],partial:[(10, 10)],committed:[(10, 10)],fresh:[(20, 20)],rollback:[(20, 20)]",
+              ]
+              assert observed == expected, observed
+              print(f"PostgreSQL {version}: {observed}")
+          finally:
+              reader.close()
+              writer.close()
+          PY
+      - name: Admission, transaction, row and snapshot regressions
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo test --release --lib --locked --
+          transaction_admission_ transaction_publication_ statement_snapshot_
+          statement_replay_ snapshot_reclamation_ shared_row_publication_
+          row_layout_ key_preparation_ trigger_sql_ analyze_ prepared_
+          --test-threads=1 --color=never --format=pretty

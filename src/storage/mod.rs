@@ -92,6 +92,7 @@ mod row_walks;
 pub(crate) mod rowenc;
 mod snapshot_leases;
 mod snapshot_reclamation;
+mod transaction_admission;
 use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 mod statistics;
@@ -13504,6 +13505,7 @@ pub(crate) enum SchemaLockBlocker {
 
 struct SnapshotState {
     transaction_mode: crate::config::TransactionMode,
+    admission: transaction_admission::TransactionAdmission,
     exported: FixedVec<ExportedSnapshot>,
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
@@ -19274,6 +19276,7 @@ impl Storage {
             transaction_mode: config.transaction_mode,
             snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
+                admission: transaction_admission::TransactionAdmission::new(0),
                 exported: exported_snapshots,
                 active: active_snapshots,
                 serializable: serializable_snapshots,
@@ -51574,6 +51577,7 @@ impl Storage {
     /// Recovery: pins the LSN to a replayed record's.
     pub fn set_lsn(&mut self, lsn: u64) {
         self.lsn.restore(lsn);
+        self.restore_visible_lsn(lsn);
     }
 
     /// Recovery: ensures freshly assigned rowids stay above replayed ones.

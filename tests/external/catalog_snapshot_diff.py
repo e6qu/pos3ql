@@ -30,6 +30,18 @@ def transcript(reader, writer):
         rows = connection.execute(sql, parameters).fetchall()
         observed.append({"step": label, "rows": rows})
 
+    def record_outcome(connection, label, sql, parameters):
+        connection.execute("SAVEPOINT catalog_statement_outcome")
+        try:
+            cursor = connection.execute(sql, parameters)
+            rows = cursor.fetchall() if cursor.description is not None else []
+            observed.append({"step": label, "rows": rows})
+        except psycopg.Error as error:
+            observed.append({"step": label, "sqlstate": error.sqlstate})
+            connection.execute("ROLLBACK TO catalog_statement_outcome")
+        finally:
+            connection.execute("RELEASE catalog_statement_outcome")
+
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
@@ -91,6 +103,13 @@ def transcript(reader, writer):
             reader.execute("SAVEPOINT before_private_comment")
             reader.execute("COMMENT ON TABLE catalog_comment_private_diff IS 'new comment'")
             record(reader, f"{prefix}.comment_private.equal_write", query, (oid, oid))
+            record(reader, f"{prefix}.comment_private.equal_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.different_write", "COMMENT ON TABLE catalog_comment_private_diff IS 'own comment'", ())
+            record(reader, f"{prefix}.comment_private.different_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.different_function", "SELECT obj_description(%s::oid, 'pg_class')", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.remove_existing", "COMMENT ON TABLE catalog_comment_private_diff IS NULL", ())
+            record(reader, f"{prefix}.comment_private.removed_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.removed_function", "SELECT obj_description(%s::oid, 'pg_class')", (oid,))
             reader.execute("ROLLBACK TO before_private_comment")
             record(reader, f"{prefix}.comment_private.rolled_back", query, (oid, oid))
             writer.execute("COMMENT ON TABLE catalog_comment_private_diff IS NULL")

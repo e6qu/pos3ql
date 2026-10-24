@@ -351,6 +351,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         (storage, first, second)
     }
 
@@ -494,6 +495,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(first, 1, 8, 9).unwrap();
             storage.set_lsn(9);
+            storage.restore_visible_lsn(9);
             assert!(
                 !storage.tables[first]
                     .rows
@@ -1056,6 +1058,7 @@ mod tests {
             .create_table(make_def("bounded_deleted", &[("id", ColType::Int4, true)]))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         crate::mem::guard::forbid_alloc(|| {
             let mut deleted = RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
             deleted.committed = None;
@@ -1269,6 +1272,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
@@ -1329,6 +1333,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         let old = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();

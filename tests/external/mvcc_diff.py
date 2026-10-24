@@ -30,6 +30,7 @@ def sqlstate(connection, statement: str) -> str:
 
 def transaction_admission_transcript(reader, writer) -> list[str]:
     results = []
+    large_object_created = False
     writer.execute("CREATE TABLE admission_order_diff(id integer PRIMARY KEY, total integer)")
     writer.execute("CREATE TABLE admission_invoice_diff(id integer PRIMARY KEY, total integer)")
     query = "SELECT o.total,i.total FROM admission_order_diff o JOIN admission_invoice_diff i ON o.id=i.id"
@@ -54,10 +55,22 @@ def transaction_admission_transcript(reader, writer) -> list[str]:
             writer.execute("ROLLBACK")
             rolled_back = reader.execute(query).fetchall()
             results.append(f"transaction_admission_{isolation}=before:{before},partial:{partial},committed:{committed},fresh:{fresh},rollback:{rolled_back}")
+        writer.execute("BEGIN")
+        writer.execute("SELECT lo_create(4242)")
+        reader.execute("SET lock_timeout = '50ms'")
+        waited = sqlstate(reader, "SELECT lo_create(4242)")
+        writer.execute("ROLLBACK")
+        created = reader.execute("SELECT lo_create(4242)").fetchone()[0]
+        large_object_created = True
+        duplicate = sqlstate(reader, "SELECT lo_create(4242)")
+        results.append(f"transaction_admission_large_object=wait:{waited},retry:{created},duplicate:{duplicate}")
         return results
     finally:
         reader.execute("ROLLBACK")
         writer.execute("ROLLBACK")
+        reader.execute("RESET lock_timeout")
+        if large_object_created:
+            writer.execute("SELECT lo_unlink(4242)")
         writer.execute("DROP TABLE admission_invoice_diff")
         writer.execute("DROP TABLE admission_order_diff")
 

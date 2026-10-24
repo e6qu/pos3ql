@@ -23026,9 +23026,8 @@ impl Storage {
                         object.database == database && object.oid == oid && object.visible_to(txid)
                     }) {
                         return Err(sql_err!(
-                            sqlstate::DUPLICATE_OBJECT,
-                            "large object {} already exists",
-                            oid.get()
+                            sqlstate::UNIQUE_VIOLATION,
+                            "duplicate key value violates unique constraint \"pg_largeobject_metadata_oid_index\""
                         ));
                     }
                     (oid, false)
@@ -47381,6 +47380,12 @@ impl Storage {
         self.lock_state().row.generation()
     }
 
+    pub(crate) fn lock_wait_generation(&self, connection: i32) -> u64 {
+        self.lock_state()
+            .row
+            .wait_generation(crate::sql::lock::connection_wait_owner(connection))
+    }
+
     pub(crate) fn begin_serializable(&self, txid: u32) -> Result<(), SqlError> {
         let mut snapshots = self.snapshot_state();
         if snapshots.serializable.iter().any(|entry| entry.0 == txid) {
@@ -51574,10 +51579,10 @@ impl Storage {
             .swap(value, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Recovery: pins the LSN to a replayed record's.
+    /// Replay restores a record position; reader visibility changes only after
+    /// its complete transaction has been installed.
     pub fn set_lsn(&mut self, lsn: u64) {
         self.lsn.restore(lsn);
-        self.restore_visible_lsn(lsn);
     }
 
     /// Recovery: ensures freshly assigned rowids stay above replayed ones.

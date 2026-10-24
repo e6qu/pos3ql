@@ -5331,7 +5331,9 @@ impl Engine {
         if let Some(lease) = resumed.as_ref().and_then(|state| state.lease.as_ref()) {
             lease.validate_storage(&self.storage)?;
         }
-        let begin_command = advance_command && resumed.is_none();
+        if advance_command && resumed.is_none() {
+            txn.begin_command()?;
+        }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let retained_lease = resumed.and_then(|state| state.lease);
         let lease = if retained_lease.is_some() {
@@ -5363,9 +5365,6 @@ impl Engine {
         } else {
             self.storage.statement_snapshot_lsn(txn.txid)?
         };
-        if begin_command {
-            txn.begin_command()?;
-        }
         self.storage.set_commit_snapshot(snapshot);
         let files = lease
             .as_ref()
@@ -9442,9 +9441,10 @@ impl Engine {
         self.cache_capacity_generation
     }
 
-    pub(crate) fn statement_wait_generation(&self, wait: StatementWait) -> u64 {
+    pub(crate) fn statement_wait_generation(&self, wait: StatementWait, connection: i32) -> u64 {
         match wait {
-            StatementWait::Lock | StatementWait::ObjectIo => self.lock_generation(),
+            StatementWait::Lock => self.storage.lock_wait_generation(connection),
+            StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
         }
     }
@@ -10960,8 +10960,8 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
         }
-        let _snapshot_lease = match query::check_timeout()
-            .and_then(|()| self.begin_command_snapshot(txn, true, true, true, false))
+        let mut snapshot = match query::check_timeout()
+            .and_then(|()| self.begin_command_snapshot(txn, true, true, true, true))
         {
             Ok(lease) => lease,
             Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
@@ -11003,6 +11003,18 @@ impl Engine {
         });
         let value = match result {
             Ok(value) => value,
+            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT || error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                self.rollback_waiting_statement(txn, mark);
+                txn.suspend_statement(
+                    snapshot.lease.take(),
+                    datetime::statement_clock(),
+                    query::statement_deadline(),
+                    exec::PlpgsqlTransactionContext::Atomic,
+                );
+                return Ok(ExtendedExecutionStatus::Blocked {
+                    wait: if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT { StatementWait::Lock } else { StatementWait::ObjectIo },
+                });
+            }
             Err(error) => {
                 if txn.owns_statement_mark(mark) {
                     self.rollback_waiting_statement(txn, mark);

@@ -1923,6 +1923,13 @@ impl Conn {
                 }
             }
         }
+        if self.lock_timeout_expired() {
+            return self.function_call_error(
+                engine,
+                sqlstate::LOCK_NOT_AVAILABLE,
+                "canceling statement due to lock timeout",
+            );
+        }
         const MAX_FAST_PATH_ARGUMENTS: usize = 3;
         self.arena.reset();
         let payload = &self.recv.readable()[5..total];
@@ -2042,9 +2049,12 @@ impl Conn {
             )
         };
         match result {
-            Ok(crate::sql::ExtendedExecutionStatus::Complete(_)) => Step::Continue,
+            Ok(crate::sql::ExtendedExecutionStatus::Complete(_)) => {
+                self.finish_lock_wait();
+                Step::Continue
+            }
             Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
-                self.park(wait, engine.statement_wait_generation(wait));
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, wait);
                 Step::Parked
             }
@@ -2058,6 +2068,7 @@ impl Conn {
         state: impl AsRef<str>,
         message: &str,
     ) -> Step {
+        self.finish_lock_wait();
         if self.txn.is_explicit() {
             self.txn.failed = true;
         } else {
@@ -3482,7 +3493,7 @@ impl Conn {
                     } else {
                         self.send.truncate_to(send_mark);
                     }
-                    self.park(wait, engine.statement_wait_generation(wait));
+                    self.park(wait, engine.statement_wait_generation(wait, self.id));
                     engine.park_backend_statement(self.id, wait);
                     return Step::Parked;
                 }
@@ -3731,7 +3742,7 @@ impl Conn {
             }) => {
                 self.send.truncate_to(output_mark);
                 self.resume_statement = completed_statements;
-                self.park(wait, engine.statement_wait_generation(wait));
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, wait);
                 self.arena.reset();
                 return Step::Parked;

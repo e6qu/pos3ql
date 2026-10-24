@@ -364,6 +364,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         (storage, table)
     }
 

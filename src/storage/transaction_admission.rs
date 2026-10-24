@@ -173,6 +173,9 @@ mod tests {
     fn fixture(mode: TransactionMode) -> (Storage, [usize; 2]) {
         let mut config = test_config();
         config.transaction_mode = mode;
+        config.max_tables = 2;
+        config.table_rows = 2;
+        config.txn_rows = 2;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let tables = ["admission_orders", "admission_invoices"].map(|name| {
@@ -187,6 +190,7 @@ mod tests {
             table
         });
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         (storage, tables)
     }
 
@@ -343,6 +347,26 @@ mod tests {
             storage.advance_visible_lsn(9).unwrap();
             storage.advance_visible_lsn(8).unwrap();
             assert_eq!(storage.statement_snapshot_lsn(100).unwrap(), 9);
+        });
+    }
+
+    #[test]
+    fn transaction_admission_replay_positions_do_not_publish_an_unfinished_transaction() {
+        let (mut storage, tables) = fixture(TransactionMode::Mvcc);
+        crate::mem::guard::forbid_alloc(|| {
+            let installing = storage.begin_transaction_installation(8, 9).unwrap();
+            install_row(&storage, tables[0]);
+            storage.set_lsn(500);
+            assert_eq!(storage.visible_lsn(), 7);
+            assert_eq!(
+                storage.statement_snapshot_lsn(99).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            install_row(&storage, tables[1]);
+            installing.complete();
+            let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            assert_eq!(reader.snapshot(), 9);
+            assert_eq!(total(&storage, tables, reader.snapshot()), [20, 20]);
         });
     }
 

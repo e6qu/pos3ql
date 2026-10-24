@@ -61,7 +61,7 @@ jobs:
           "$RUNNER_TEMP/reference-venv/bin/python" - <<'PY'
           import sys
           sys.path.insert(0, "tests/external")
-          from mvcc_diff import connect, transaction_admission_transcript
+          from mvcc_diff import connect, sqlstate, transaction_admission_transcript
           reader, writer = connect(5432), connect(5432)
           try:
               version = int(reader.execute("SHOW server_version_num").fetchone()[0])
@@ -70,9 +70,15 @@ jobs:
               expected = [
                   "transaction_admission_READ COMMITTED=before:[(10, 10)],partial:[(10, 10)],committed:[(20, 20)],fresh:[(20, 20)],rollback:[(20, 20)]",
                   "transaction_admission_REPEATABLE READ=before:[(10, 10)],partial:[(10, 10)],committed:[(10, 10)],fresh:[(20, 20)],rollback:[(20, 20)]",
+                  "transaction_admission_large_object=wait:55P03,retry:4242,duplicate:23505",
               ]
               assert observed == expected, observed
               print(f"PostgreSQL {version}: {observed}")
+              reader.execute("SELECT lo_create(4242)")
+              duplicate = sqlstate(reader, "SELECT lo_create(4242)")
+              print(f"PostgreSQL {version} duplicate large-object SQLSTATE: {duplicate}")
+              assert duplicate == "23505", duplicate
+              reader.execute("SELECT lo_unlink(4242)")
           finally:
               reader.close()
               writer.close()
@@ -83,5 +89,5 @@ jobs:
           cargo test --release --lib --locked --
           transaction_admission_ transaction_publication_ statement_snapshot_
           statement_replay_ snapshot_reclamation_ shared_row_publication_
-          row_layout_ key_preparation_ trigger_sql_ analyze_ prepared_
+          row_layout_ key_preparation_ trigger_sql_ analyze_ prepared_ lock_wait_handoff_
           --test-threads=1 --color=never --format=pretty

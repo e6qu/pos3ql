@@ -12,15 +12,9 @@ and [storage format guide](docs/durable-format.md). Keep regression evidence in
 the implementing PR.
 
 Each entry must include a reproducer, affected boundary, observed behavior and
-exact blocker. Schema waits, type retirement, publication, recovery, retained row
-and table definitions, resumed command effects, storage ownership, slot reuse, column bindings and capacity
-failures follow the same rule, including stale row layouts, temporary changes
-sharing a journal position, failed index-cache replacement, cross-database recovery, prepared keys
-whose binding changed, irreversible commit failures and
-checkpointing after partial installation. This includes private foreign-key and
-owned-sequence references that could restore old names after publication waits.
-Fault tests must restart a terminally
-failed instance before checking recovery; they must reject partial transactions.
+exact blocker. Publication, rollback and recovery defects follow the same rule.
+Fault tests must restart a terminally failed instance before checking recovery;
+they must reject partial transactions.
 Remove repaired entries; preserve their evidence in the implementing
 change instead of keeping a resolved-work journal.
 

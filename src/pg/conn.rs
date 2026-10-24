@@ -6958,6 +6958,118 @@ mod tests {
     }
 
     #[test]
+    fn transaction_admission_function_call_frame_resumes_and_clears_lock_timeout() {
+        for expired in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "pos3ql-function-admission-{}-{expired}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.object_store_on = false;
+            config.wal_upload = false;
+            config.max_connections = 2;
+            config.max_tables = 2;
+            config.table_rows = 16;
+            config.txn_rows = 16;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut reader = Conn::new(&config, &mut budget).unwrap();
+            let mut writer = Conn::new(&config, &mut budget).unwrap();
+            reader.phase = Phase::Ready;
+            reader.id = 1;
+            writer.phase = Phase::Ready;
+            writer.id = 2;
+            reader
+                .recv
+                .append(&frontend(wire::FMSG_QUERY, b"SET lock_timeout = '1s'\0"));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| reader.process_message(&mut engine)),
+                Step::Continue
+            ));
+            reader.send.clear();
+            writer.recv.append(&frontend(wire::FMSG_QUERY, b"BEGIN\0"));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                Step::Continue
+            ));
+            let installing = engine
+                .storage
+                .begin_transaction_installation(writer.txn.txid, engine.storage.visible_lsn())
+                .unwrap();
+            let requested = 4242u32.to_be_bytes();
+            let frame = function_call(715, &[&requested], true);
+            reader.recv.append(&frame);
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| reader.process_message(&mut engine)),
+                Step::Parked
+            ));
+            assert!(reader.send.readable().is_empty());
+            assert_eq!(reader.recv.readable(), frame);
+            assert!(reader.parked);
+            assert!(reader.parked_deadline.is_some());
+            if expired {
+                reader.parked_deadline = Some(Instant::now());
+            }
+            installing.complete();
+            let generation = engine.lock_generation();
+            let response = crate::mem::guard::forbid_alloc(|| {
+                reader.retry_parked(&mut engine, &[0; 16], generation, false)
+            })
+            .unwrap();
+            assert!(matches!(response.after, After::Continue));
+            assert!(reader.recv.readable().is_empty());
+            assert!(!reader.parked);
+            assert!(reader.parked_deadline.is_none());
+            assert_eq!(
+                has_backend_message(reader.send.readable(), wire::MSG_ERROR_RESPONSE),
+                expired
+            );
+            assert_eq!(
+                has_backend_message(reader.send.readable(), wire::MSG_FUNCTION_CALL_RESPONSE),
+                !expired
+            );
+            if expired {
+                assert!(
+                    reader
+                        .send
+                        .readable()
+                        .windows(5)
+                        .any(|bytes| bytes == b"55P03")
+                );
+            }
+            assert_eq!(
+                engine.storage.large_objects_visible_to(0).count(),
+                usize::from(!expired)
+            );
+            reader.send.clear();
+            let next = 4243u32.to_be_bytes();
+            reader.recv.append(&function_call(715, &[&next], true));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| reader.process_message(&mut engine)),
+                Step::Continue
+            ));
+            assert!(has_backend_message(
+                reader.send.readable(),
+                wire::MSG_FUNCTION_CALL_RESPONSE
+            ));
+            assert!(!has_backend_message(
+                reader.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            assert_eq!(
+                engine.storage.large_objects_visible_to(0).count(),
+                1 + usize::from(!expired)
+            );
+            drop(reader);
+            drop(writer);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn extended_binary_char_bind_and_result_preserve_the_raw_byte() {
         use core::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);

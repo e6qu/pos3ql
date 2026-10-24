@@ -4,12 +4,21 @@ on:
   push:
     branches: [catalog-statement-visibility]
     paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
       - tests/external/catalog_snapshot_diff.py
+      - tests/external/differential-capacities.conf
       - .github/workflows/catalog-reference.yml
 
 permissions:
   contents: read
   actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   reference:
@@ -47,4 +56,72 @@ jobs:
         with:
           name: catalog-reference-${{ github.sha }}
           path: ${{ runner.temp }}/catalog-reference/
+          if-no-files-found: error
+
+  comparison:
+    needs: reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-catalog-comparison-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-differential-build-
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - uses: actions/download-artifact@v8
+        with:
+          name: catalog-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/catalog-comparison
+      - name: Rebuild the checked-out server
+        run: |
+          cargo clean -p pos3ql
+          cargo build --release --locked
+          git rev-parse HEAD > "$RUNNER_TEMP/catalog-comparison/candidate-revision"
+          sha256sum target/release/pos3ql > "$RUNNER_TEMP/catalog-comparison/candidate-SHA256SUMS"
+      - name: Compare live catalog behavior with actual PostgreSQL
+        shell: bash
+        run: |
+          work="$RUNNER_TEMP/catalog-comparison"
+          test "$(cat "$work/revision")" = "$GITHUB_SHA"
+          cat > "$work/pos3ql.conf" <<EOF
+          listen_addr = 127.0.0.1:15599
+          data_dir = $work/data
+          object_store = off
+          log_format = text
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          max_prepared_transactions = 8
+          memtable_bytes = 256MiB
+          EOF
+          cat tests/external/differential-capacities.conf >> "$work/pos3ql.conf"
+          target/release/pos3ql --config "$work/pos3ql.conf" > "$work/server.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in {1..100}; do
+            kill -0 "$server"
+            if grep -q '^startup complete:.*accepting connections$' "$work/server.log"; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          test "$ready" = 1
+          target/external-venv/bin/python tests/external/catalog_snapshot_diff.py \
+            --host 127.0.0.1 --port 15599 --user postgres --database postgres \
+            --reference "$work/postgresql.json" --output "$work/pos3ql.json" \
+            2>&1 | tee "$work/comparison.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: catalog-comparison-${{ github.sha }}
+          path: ${{ runner.temp }}/catalog-comparison/
           if-no-files-found: error

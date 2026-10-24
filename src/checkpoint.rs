@@ -16740,7 +16740,7 @@ fn decode_manifest_hex_bytes(hex: &str) -> Result<Vec<u8>, CheckpointSetupError>
         return Err(CheckpointSetupError::Corrupt("odd-length hex bytes"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let digit = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),

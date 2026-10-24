@@ -7,9 +7,7 @@ pub mod ast;
 mod brin_catalog;
 pub mod catalog;
 mod catalog_metadata;
-#[cfg(test)]
 mod catalog_snapshot;
-#[cfg(test)]
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
 pub mod copy;
@@ -5484,6 +5482,26 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        let catalog_publication = if self.commit_progress == CommitProgressMode::Reactor
+            || self.commit_queue.is_some()
+            || matches!(target, txn::CommitTarget::Prepare { .. })
+        {
+            crate::storage::CatalogPublication::MayYield
+        } else {
+            crate::storage::CatalogPublication::Uninterrupted
+        };
+        match catalog_snapshot::capture_transaction(
+            &self.storage,
+            txn,
+            catalog_publication,
+            &self.work,
+        ) {
+            Ok(history) => txn.catalog_history = history,
+            Err(error) => {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
             let transaction_id = txn.txid;
@@ -6593,6 +6611,23 @@ impl Engine {
                 self.storage
                     .begin_transaction_installation(txn.txid, staged.lsn)?,
             );
+            if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+                let committed_at = core::num::NonZeroU64::new(staged.lsn)
+                    .expect("a staged transaction has a journal commit identity");
+                if let Some(history) = txn.catalog_history.take() {
+                    history.publish(committed_at);
+                }
+                if let txn::CommitTarget::CommitPrepared { slot, .. } = staged.target
+                    && let Some(history) = self
+                        .prepared_transactions
+                        .slot_mut(slot)
+                        .transaction
+                        .catalog_history
+                        .take()
+                {
+                    history.publish(committed_at);
+                }
+            }
             match staged.target {
                 txn::CommitTarget::Prepare { slot, .. } => {
                     txn.take_staged_commit();

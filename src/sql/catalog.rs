@@ -8967,6 +8967,45 @@ pub fn synthesize<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    if qualifier != Some("information_schema")
+        && storage.commit_snapshot() != crate::storage::SNAPSHOT_ALL
+        && let Some(relation) = super::catalog_snapshot_keys::RELATIONS
+            .iter()
+            .find(|relation| relation.name == name)
+    {
+        let history = storage.catalog_rows_at(
+            relation.identity(storage.current_database_oid()),
+            storage.commit_snapshot(),
+            arena,
+        )?;
+        if !history.is_empty() {
+            let committed = synthesize_current(storage, qualifier, name, 0, arena)?;
+            let private;
+            let selected = if txid == 0 {
+                &committed
+            } else {
+                private = synthesize_current(storage, qualifier, name, txid, arena)?;
+                &private
+            };
+            return super::catalog_snapshot::restore_rows(
+                relation.key,
+                &committed,
+                selected,
+                history,
+                arena,
+            );
+        }
+    }
+    synthesize_current(storage, qualifier, name, txid, arena)
+}
+
+pub(crate) fn synthesize_current<'a>(
+    storage: &Storage,
+    qualifier: Option<&str>,
+    name: &'a str,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
     match (info, name) {
         (false, "pg_class") => pg_class(storage, txid, arena),

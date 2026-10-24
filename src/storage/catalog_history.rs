@@ -5,7 +5,7 @@ use core::mem::size_of;
 use core::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
-use super::DatabaseOid;
+use super::{DatabaseOid, Storage};
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
@@ -16,6 +16,13 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 const HEADER_BYTES: usize = 40;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogPublication {
+    /// The exclusive SQL worker admits no new statement before installation.
+    Uninterrupted,
+    MayYield,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogRelationIdentity {
@@ -288,6 +295,38 @@ impl CatalogHistory {
             frame.committed_at != 0
                 && oldest_snapshot.is_none_or(|oldest| frame.committed_at <= oldest)
         });
+    }
+}
+
+impl Storage {
+    pub(crate) fn reserve_catalog_history(
+        &self,
+        transaction: u32,
+        publication: CatalogPublication,
+    ) -> Result<Option<CatalogHistoryBatch>, SqlError> {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return Ok(None);
+        }
+        let snapshots = self.snapshot_state();
+        let required =
+            publication == CatalogPublication::MayYield || snapshots.retains_for(transaction);
+        let oldest = snapshots.oldest();
+        drop(snapshots);
+        self.catalog_history.reclaim(oldest);
+        if required {
+            self.catalog_history.reserve().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn catalog_rows_at<'a>(
+        &self,
+        relation: CatalogRelationIdentity,
+        snapshot: u64,
+        arena: &'a Arena,
+    ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
+        self.catalog_history.rows_at(relation, snapshot, arena)
     }
 }
 

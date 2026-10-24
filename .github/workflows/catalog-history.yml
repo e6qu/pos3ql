@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: |
           cargo clean -p pos3ql
-          cargo test --lib --release --locked -- storage::catalog_history::tests sql::catalog_snapshot:: config::tests:: parameter_acl acl_catalog_is_synchronized manifest_hex_decode --nocapture --test-threads=1 \
+          cargo test --lib --release --locked -- storage::catalog_history::tests sql::catalog_snapshot:: config::tests:: catalog_snapshot_ parameter_acl acl_catalog_is_synchronized manifest_hex_decode --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/catalog-history.log"
       - name: Check formatting and all-target lint
         run: |

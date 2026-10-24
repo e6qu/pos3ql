@@ -262,6 +262,7 @@ pub(super) struct CacheCapacityWait {
 
 pub struct TxnState {
     staged_commit: Option<StagedCommit>,
+    pub(super) catalog_history: Option<crate::storage::CatalogHistoryBatch>,
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
@@ -909,6 +910,7 @@ impl TxnState {
         }
         Ok(Self {
             staged_commit: None,
+            catalog_history: None,
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
@@ -2528,6 +2530,7 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.staged_commit = None;
+        self.catalog_history = None;
         self.mode = TxnMode::Idle;
         self.command_id = 0;
         self.command_counter = 0;

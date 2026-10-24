@@ -2006,10 +2006,12 @@ mod tests {
             assert_eq!(budget.used(), 0);
         }
         assert!(
-            crate::config::Config::parse("transaction_mode = mvcc\nmemtable_bytes = 4GiB")
-                .unwrap_err()
-                .message
-                .contains("row-location")
+            crate::config::Config::parse(
+                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nmemtable_bytes = 4GiB"
+            )
+            .unwrap_err()
+            .message
+            .contains("row-location")
         );
     }
 }

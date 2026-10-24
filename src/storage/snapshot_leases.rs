@@ -64,6 +64,14 @@ pub(super) fn snapshot_owner_bytes() -> usize {
 }
 
 impl SnapshotState {
+    pub(super) fn retains_for(&self, transaction: u32) -> bool {
+        !self.exported.is_empty()
+            || self.active.iter().any(|(owner, _)| *owner != transaction)
+            || self
+                .statements
+                .iter()
+                .any(|statement| statement.lsn.is_some() && statement.transaction != transaction)
+    }
     pub(super) fn oldest(&self) -> Option<u64> {
         if self.transaction_mode == crate::config::TransactionMode::Locking {
             return None;
@@ -74,18 +82,6 @@ impl SnapshotState {
             .chain(self.exported.iter().map(|snapshot| snapshot.lsn))
             .chain(self.statements.iter().filter_map(|statement| statement.lsn))
             .min()
-    }
-
-    pub(super) fn retains_for(&self, transaction: u32) -> bool {
-        if self.transaction_mode == crate::config::TransactionMode::Locking {
-            return false;
-        }
-        !self.active.is_empty()
-            || !self.exported.is_empty()
-            || self
-                .statements
-                .iter()
-                .any(|statement| statement.lsn.is_some() && statement.transaction != transaction)
     }
 }
 

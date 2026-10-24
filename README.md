@@ -70,6 +70,9 @@ recovery and later reads. [Object storage](docs/object-storage.md) and
 
 Every configuration must select `transaction_mode = mvcc` or
 `transaction_mode = locking`; the server requires `--config`.
+Also set `catalog_history_bytes` explicitly: for example, `16MiB` in `mvcc`
+mode, or `0` in `locking` mode. This reserves space for older catalog rows such
+as table names and column definitions while transactions still need them.
 
 - `mvcc` retains older row values while readers need them. For example, a
   repeatable-read report can keep seeing an order's earlier status while

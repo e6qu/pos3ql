@@ -5,12 +5,10 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
-#[cfg(test)]
 mod catalog_history;
-#[cfg(test)]
 pub(crate) use catalog_history::{
-    CatalogHistory, CatalogHistoryBatch, CatalogRelationIdentity, CatalogRowImage,
-    HistoricalCatalogRow,
+    CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
+    CatalogRowImage, HistoricalCatalogRow,
 };
 mod catalog_sources;
 mod parameter_acls;
@@ -12331,40 +12329,6 @@ impl Iterator for DefaultAclIter<'_> {
     }
 }
 
-enum ParameterAclIterMode {
-    Visible(u32),
-    Checkpoint,
-}
-
-struct ParameterAclIter<'a> {
-    catalog: &'a Mutex<AclCatalog>,
-    next_slot: usize,
-    mode: ParameterAclIterMode,
-}
-
-impl Iterator for ParameterAclIter<'_> {
-    type Item = (usize, ParameterAclEntry);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let catalog = self.catalog.lock().expect("ACL catalog lock poisoned");
-        while self.next_slot < catalog.parameters.len() {
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            let entry = catalog.parameters[slot];
-            let include = match self.mode {
-                ParameterAclIterMode::Visible(txid) => {
-                    Storage::parameter_acl_visible(&entry, txid).0
-                }
-                ParameterAclIterMode::Checkpoint => entry.live,
-            };
-            if include {
-                return Some((slot, entry));
-            }
-        }
-        None
-    }
-}
-
 /// Startup-bounded PostgreSQL role catalog. Role metadata is catalog state and
 /// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
 /// it never lives in a process-global authentication side table.
@@ -14071,6 +14035,7 @@ impl Iterator for MatviewIter<'_> {
 
 pub struct Storage {
     transaction_mode: crate::config::TransactionMode,
+    catalog_history: std::sync::Arc<CatalogHistory>,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     /// Serializes table-name checks and empty-slot initialization, never row I/O.
@@ -18221,6 +18186,10 @@ impl Storage {
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + CatalogHistory::budget_bytes(
+                config.catalog_history_bytes,
+                catalog_transaction_capacity(config),
+            )
             + log_positions::LogPositions::budget_bytes()
             + size_of::<CatalogSequence>()
             + size_of::<usize>()
@@ -19297,6 +19266,12 @@ impl Storage {
             catalog_sequence: CatalogSequence::new(0),
             catalog_sources,
             transaction_mode: config.transaction_mode,
+            catalog_history: CatalogHistory::new(
+                budget,
+                config.catalog_history_bytes,
+                catalog_transaction_capacity(config),
+                config.max_catalog_versions_per_object,
+            )?,
             snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
                 admission: transaction_admission::TransactionAdmission::new(0),
@@ -25201,33 +25176,12 @@ impl Storage {
         (privileges, grant_options)
     }
 
-    pub(crate) fn parameter_acl_entries_visible(
-        &self,
-        txid: u32,
-    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
-        ParameterAclIter {
-            catalog: &self.acl_catalog,
-            next_slot: 0,
-            mode: ParameterAclIterMode::Visible(txid),
-        }
-    }
-
     pub(crate) fn parameter_acl_entry_count(&self) -> usize {
         self.acl_catalog
             .lock()
             .expect("ACL catalog lock poisoned")
             .parameters
             .len()
-    }
-
-    pub(crate) fn checkpoint_parameter_acls(
-        &self,
-    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
-        ParameterAclIter {
-            catalog: &self.acl_catalog,
-            next_slot: 0,
-            mode: ParameterAclIterMode::Checkpoint,
-        }
     }
 
     pub(crate) fn acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
@@ -57756,7 +57710,7 @@ mod tests {
         assert_send_sync::<ObjectAclIter<'_>>();
         assert_send_sync::<ColumnAclIter<'_>>();
         assert_send_sync::<DefaultAclIter<'_>>();
-        assert_send_sync::<ParameterAclIter<'_>>();
+        assert_send_sync::<parameter_acls::ParameterAclRowIter<'_>>();
 
         const WORKERS: usize = 4;
         let parameters = ["acl.a", "acl.b", "acl.c", "acl.d"];
@@ -57869,7 +57823,17 @@ mod tests {
         assert_eq!(seen, WORKERS);
         assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
-        assert_eq!(storage.checkpoint_parameter_acls().count(), 2 * WORKERS);
+        assert_eq!(
+            storage
+                .acl_catalog
+                .lock()
+                .unwrap()
+                .parameters
+                .iter()
+                .filter(|entry| entry.live)
+                .count(),
+            2 * WORKERS
+        );
         assert_eq!(storage.parameter_acl_rows_visible(0).count(), WORKERS);
         assert_eq!(
             storage

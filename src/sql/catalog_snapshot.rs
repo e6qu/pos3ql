@@ -40,6 +40,313 @@ impl CatalogSnapshotRelation {
     }
 }
 
+fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
+    use super::txn::DdlUndo::*;
+    match change {
+        Created(_)
+        | Dropped(_)
+        | TableAltered(_)
+        | IndexCreated(_)
+        | IndexDropped(_)
+        | IndexRenamed { .. }
+        | IndexAltered { .. }
+        | MatviewChanged(_)
+        | MatviewPopulationChanged(_) => &[
+            "pg_class",
+            "pg_attribute",
+            "pg_attrdef",
+            "pg_constraint",
+            "pg_index",
+            "pg_inherits",
+            "pg_partitioned_table",
+            "pg_sequence",
+            "pg_type",
+            "pg_statistic_ext",
+            "pg_statistic_ext_data",
+            "pg_trigger",
+            "pg_rewrite",
+            "pg_publication_rel",
+            "pg_foreign_table",
+            "pg_policy",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        ViewChanged(_) | ViewDropped(_) | RuleChanged { .. } | RuleAltered(_) | RuleDropped(_) => {
+            &[
+                "pg_class",
+                "pg_attribute",
+                "pg_type",
+                "pg_rewrite",
+                "pg_depend",
+                "pg_shdepend",
+                "pg_description",
+            ]
+        }
+        RoutineChanged(_) => &[
+            "pg_proc",
+            "pg_aggregate",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        DomainCreated(_) | DomainDropped(_) | DomainAltered(_) | EnumCreated(_)
+        | EnumDropped(_) | EnumAltered(_) | CompositeCreated(_) | CompositeDropped(_)
+        | CompositeAltered(_) => &[
+            "pg_type",
+            "pg_enum",
+            "pg_range",
+            "pg_attribute",
+            "pg_class",
+            "pg_constraint",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        CastCreated(_) | CastDropped(_) => &["pg_cast", "pg_depend", "pg_description"],
+        OperatorCreated(_) | OperatorAltered { .. } | OperatorDropped(_) => {
+            &["pg_operator", "pg_depend", "pg_shdepend", "pg_description"]
+        }
+        OperatorFamilyCreated(_)
+        | OperatorFamilyAltered { .. }
+        | OperatorFamilyDropped(_)
+        | OperatorClassCreated(_)
+        | OperatorClassAltered { .. }
+        | OperatorClassDropped(_) => &[
+            "pg_opfamily",
+            "pg_opclass",
+            "pg_amop",
+            "pg_amproc",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        CollationCreated(_) | CollationAltered { .. } | CollationDropped(_) => {
+            &["pg_collation", "pg_depend", "pg_shdepend", "pg_description"]
+        }
+        ConversionCreated(_) | ConversionAltered { .. } | ConversionDropped(_) => &[
+            "pg_conversion",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        TextSearchCreated(_) | TextSearchAltered { .. } | TextSearchDropped(_) => &[
+            "pg_ts_config",
+            "pg_ts_config_map",
+            "pg_ts_dict",
+            "pg_ts_parser",
+            "pg_ts_template",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        EventTriggerCreated(_) | EventTriggerAltered { .. } | EventTriggerDropped(_) => &[
+            "pg_event_trigger",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        TriggerCreated(_)
+        | TriggerDropped(_)
+        | TriggerAltered { .. }
+        | PartitionTriggerAltered { .. } => &[
+            "pg_trigger",
+            "pg_class",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        PolicyCreated(_) | PolicyDropped(_) | PolicyAltered { .. } => &[
+            "pg_policy",
+            "pg_class",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        StatisticsCreated(_)
+        | StatisticsDropped(_)
+        | StatisticsAltered { .. }
+        | StatisticsKeysAltered { .. } => &[
+            "pg_statistic_ext",
+            "pg_statistic_ext_data",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        PublicationCreated(_)
+        | PublicationDropped(_)
+        | PublicationAltered { .. }
+        | PublicationOwnerChanged { .. }
+        | PublicationRenamed { .. } => &[
+            "pg_publication",
+            "pg_publication_namespace",
+            "pg_publication_rel",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        ForeignDataWrapperCreated(_)
+        | ForeignDataWrapperAltered { .. }
+        | ForeignDataWrapperDropped(_)
+        | ForeignServerCreated(_)
+        | ForeignServerAltered { .. }
+        | ForeignServerDropped(_)
+        | UserMappingCreated(_)
+        | UserMappingAltered { .. }
+        | UserMappingDropped(_)
+        | ForeignTableCreated(_)
+        | ForeignTableAltered { .. }
+        | ForeignTableDropped(_)
+        | ForeignOwnerChanged { .. } => &[
+            "pg_foreign_data_wrapper",
+            "pg_foreign_server",
+            "pg_user_mapping",
+            "pg_foreign_table",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        SubscriptionCreated(_)
+        | SubscriptionDropped(_)
+        | SubscriptionEnabled { .. }
+        | SubscriptionBootstrapChanged { .. }
+        | SubscriptionRelationsChanged { .. }
+        | SubscriptionDefinitionChanged { .. }
+        | SubscriptionOwnerChanged { .. }
+        | SubscriptionRenamed { .. } => &[
+            "pg_subscription",
+            "pg_subscription_rel",
+            "pg_shdepend",
+            "pg_shdescription",
+        ],
+        SequenceChanged(_) => &[
+            "pg_sequence",
+            "pg_class",
+            "pg_attribute",
+            "pg_type",
+            "pg_depend",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        LargeObjectCreated(_) | LargeObjectDropped(_) => &[
+            "pg_largeobject",
+            "pg_largeobject_metadata",
+            "pg_shdepend",
+            "pg_description",
+        ],
+        TablespaceCreated(_) | TablespaceAltered { .. } | TablespaceDropped(_) => {
+            &["pg_tablespace", "pg_shdepend", "pg_shdescription"]
+        }
+        AccessMethodCreated(_) | AccessMethodDropped(_) => {
+            &["pg_am", "pg_depend", "pg_description"]
+        }
+        DatabaseCreated(_) | DatabaseAltered { .. } | DatabaseDropped(_) => &[
+            "pg_database",
+            "pg_db_role_setting",
+            "pg_shdepend",
+            "pg_shdescription",
+        ],
+        SchemaCreated(_) | SchemaDropped(_) | SchemaRenamed { .. } => {
+            &["pg_namespace", "pg_depend", "pg_shdepend", "pg_description"]
+        }
+        ExtensionCreated(_)
+        | ExtensionDropped(_)
+        | ExtensionAltered { .. }
+        | ExtensionDependencyChanged { .. }
+        | ExtensionConfigChanged { .. } => {
+            &["pg_extension", "pg_depend", "pg_shdepend", "pg_description"]
+        }
+        RoleChanged { .. } | RoleMembershipChanged { .. } => &[
+            "pg_authid",
+            "pg_auth_members",
+            "pg_shdepend",
+            "pg_shdescription",
+        ],
+        RoleSettingChanged { .. } => &["pg_db_role_setting"],
+        ObjectOwnerChanged { .. } | ObjectAclChanged { .. } => &[
+            "pg_class",
+            "pg_type",
+            "pg_proc",
+            "pg_namespace",
+            "pg_database",
+            "pg_tablespace",
+            "pg_language",
+            "pg_largeobject_metadata",
+            "pg_foreign_data_wrapper",
+            "pg_foreign_server",
+            "pg_operator",
+            "pg_opclass",
+            "pg_opfamily",
+            "pg_collation",
+            "pg_conversion",
+            "pg_ts_config",
+            "pg_ts_dict",
+            "pg_publication",
+            "pg_subscription",
+            "pg_shdepend",
+        ],
+        ColumnAclChanged { .. } => &["pg_attribute", "pg_shdepend"],
+        DefaultAclChanged { .. } => &["pg_default_acl", "pg_shdepend"],
+        ParameterAclChanged { .. } => &["pg_parameter_acl", "pg_shdepend"],
+        CommentSet { .. } | ConstraintCommentRenamed { .. } => {
+            &["pg_description", "pg_shdescription"]
+        }
+        SequenceReset { .. } | SystemSettingChanged { .. } => &[],
+    }
+}
+
+pub(crate) fn capture_transaction(
+    storage: &crate::storage::Storage,
+    transaction: &super::txn::TxnState,
+    publication: crate::storage::CatalogPublication,
+    arena: &Arena,
+) -> Result<Option<CatalogHistoryBatch>, SqlError> {
+    if transaction.ddl().is_empty() {
+        return Ok(None);
+    }
+    let Some(mut batch) = storage.reserve_catalog_history(transaction.txid, publication)? else {
+        return Ok(None);
+    };
+    for relation in super::catalog_snapshot_keys::RELATIONS {
+        if !transaction
+            .ddl()
+            .iter()
+            .any(|change| affected_catalogs(change).contains(&relation.name))
+        {
+            continue;
+        }
+        let mark = arena.mark();
+        let result = (|| {
+            let committed = super::catalog::synthesize_current(
+                storage,
+                Some("pg_catalog"),
+                relation.name,
+                0,
+                arena,
+            )?;
+            let private = super::catalog::synthesize_current(
+                storage,
+                Some("pg_catalog"),
+                relation.name,
+                transaction.txid,
+                arena,
+            )?;
+            capture_rows(
+                relation.identity(storage.current_database_oid()),
+                relation.key,
+                &committed,
+                &private,
+                &mut batch,
+                arena,
+            )
+        })();
+        // record copies keys and row images into the startup-sized history owner.
+        unsafe { arena.rewind_to(mark) };
+        result?;
+    }
+    Ok(Some(batch))
+}
+
 #[cfg(test)]
 mod key_definitions {
     use super::*;

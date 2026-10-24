@@ -398,7 +398,17 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(storage.parameter_acl_rows_visible(0).count(), 0);
-            assert_eq!(storage.parameter_acl_entries_visible(2).count(), 0);
+            assert_eq!(
+                storage
+                    .acl_catalog
+                    .lock()
+                    .unwrap()
+                    .parameters
+                    .iter()
+                    .filter(|entry| Storage::parameter_acl_visible(entry, 2).0)
+                    .count(),
+                0
+            );
             storage.acl_catalog.lock().unwrap().parameter_rows.next_oid = u32::MAX as u64;
             let error = storage
                 .change_parameter_acl(
@@ -411,7 +421,17 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.parameter_acl_entries_visible(2).count(), 0);
+            assert_eq!(
+                storage
+                    .acl_catalog
+                    .lock()
+                    .unwrap()
+                    .parameters
+                    .iter()
+                    .filter(|entry| Storage::parameter_acl_visible(entry, 2).0)
+                    .count(),
+                0
+            );
         });
     }
 }
@@ -524,7 +544,9 @@ impl<'a> ParameterAclGrants<'a> {
     pub(crate) fn parse(bytes: &'a [u8]) -> Option<Self> {
         if !bytes.len().is_multiple_of(ParameterAclGrant::BYTES)
             || bytes
-                .chunks_exact(ParameterAclGrant::BYTES)
+                .as_chunks::<{ ParameterAclGrant::BYTES }>()
+                .0
+                .iter()
                 .any(|grant| ParameterAclGrant::decode(grant).is_none())
         {
             return None;

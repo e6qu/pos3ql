@@ -21263,6 +21263,118 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
+    for (isolation, expected) in [
+        ("REPEATABLE READ", "orders|id"),
+        ("READ COMMITTED", "sales|newid"),
+    ] {
+        let (mut engine, mut budget) = test_engine();
+        let setup = run_with(&mut engine, &mut budget, "CREATE TABLE orders(id integer)");
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+        let mut guc = GucState::new();
+        let rows = "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname IN ('orders', 'sales') AND a.attnum > 0 ORDER BY a.attnum";
+        let started = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            &format!("BEGIN ISOLATION LEVEL {isolation}; {rows}"),
+        );
+        assert_eq!(data_rows(&started), ["orders|id"]);
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE orders RENAME TO sales; ALTER TABLE sales RENAME COLUMN id TO newid",
+        );
+        assert!(
+            !String::from_utf8_lossy(&changed).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let selected =
+            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, rows);
+        assert_eq!(
+            data_rows(&selected),
+            [expected],
+            "{isolation}: {}",
+            String::from_utf8_lossy(&selected)
+        );
+        let names = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "SELECT to_regclass('orders') IS NULL, to_regclass('sales')::text; CREATE TABLE private_orders(id integer); SELECT relname FROM pg_class WHERE relname = 'private_orders'; ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&names),
+            ["t|sales", "private_orders"],
+            "{}",
+            String::from_utf8_lossy(&names)
+        );
+        let fresh = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname FROM pg_class WHERE relname IN ('orders', 'sales', 'private_orders') ORDER BY relname",
+        );
+        assert_eq!(data_rows(&fresh), ["sales"]);
+    }
+}
+
+#[test]
+fn catalog_snapshot_exhaustion_rolls_back_before_durability_and_releases_owners() {
+    let mut config = test_config("catalog-history-exhaustion");
+    config.catalog_history_bytes = 64;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let started = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class",
+    );
+    assert!(!String::from_utf8_lossy(&started).contains("ERROR"));
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_catalog_rows(id integer)",
+    );
+    let failed = String::from_utf8_lossy(&failed);
+    assert!(
+        failed.contains("54000") && failed.contains("catalog_history_bytes"),
+        "{failed}"
+    );
+    assert!(
+        engine
+            .storage
+            .find_visible("public", "bounded_catalog_rows", 0)
+            .is_none()
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+    let retried = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_catalog_rows(id integer); SELECT count(*) FROM bounded_catalog_rows",
+    );
+    assert!(
+        !String::from_utf8_lossy(&retried).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&retried)
+    );
+    assert_eq!(data_rows(&retried), ["0"]);
+}
+
+#[test]
 fn parameter_acl_row_identity_default_removal_and_empty_lists_match_postgresql() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(&mut engine, &mut budget,

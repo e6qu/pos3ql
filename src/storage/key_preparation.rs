@@ -70,23 +70,11 @@ impl ValueKeyPreparation {
     }
 
     pub(super) fn validate_row(&self, home: &RowByteRead) -> Result<(), SqlError> {
-        let snapshot = match &home.0 {
-            RowByteSource::Visible(image) => image.snapshot(),
-            RowByteSource::Snapshot(snapshot) => *snapshot,
-            // Physical metadata is supplied by exclusive replay or maintenance.
-            RowByteSource::Physical(_) => return Ok(()),
-        };
         let identity = self
             .definitions
             .retained_identity(self.target.table(), 0)
             .expect("key preparation retains its table lifetime");
-        if snapshot.created_at != identity.created_at || snapshot.row_layout != self.layout {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "retained row layout does not match the selected index definition"
-            ));
-        }
-        Ok(())
+        validate_row_layout(home, identity.created_at, self.layout)
     }
 
     pub(super) fn index(&self, storage: &Storage, created_at: u64) -> Result<IndexDef, SqlError> {
@@ -114,28 +102,117 @@ impl ValueKeyPreparation {
                 )
             })
     }
+}
 
-    pub(super) fn binding(&self, storage: &Storage, binding: usize) -> Result<Enforcer, SqlError> {
-        let table = &storage.tables[self.target.table()];
-        let (definition, publication) = row_ownership::acquire(|| {
-            Ok((
-                table.definition.try_read_for_batch()?,
-                row_ownership::try_mutex(&table.publication, "table publication lock poisoned")?,
-            ))
-        });
-        self.validate_definition(storage, &definition)?;
-        publication
-            .enforcers
-            .get(binding)
-            .and_then(Option::as_ref)
-            .cloned()
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "selected index binding no longer exists"
-                )
-            })
+pub(super) struct ValueBindingRead {
+    enforcer: Enforcer,
+    schema: [ColType; MAX_COLUMNS],
+    n_columns: usize,
+    created_at: u64,
+    layout: row_layout::RowLayout,
+    definition: Option<ValueKeyPreparation>,
+}
+
+impl ValueBindingRead {
+    pub(super) fn capture(
+        storage: &Storage,
+        table: usize,
+        binding: usize,
+    ) -> Result<Self, SqlError> {
+        let definition = storage.table_def(table, 0);
+        let target = storage.table_definition_target(table, 0, &definition);
+        let (enforcer, layout) = {
+            let publication = storage.tables[table].publication();
+            let enforcer = publication
+                .enforcers
+                .get(binding)
+                .and_then(Option::as_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected index binding no longer exists"
+                    )
+                })?;
+            (enforcer, publication.row_layout)
+        };
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = definition.schema(&mut schema);
+        let created_at = definition.identity().created_at;
+        drop(definition);
+        let definition = if enforcer.index_created_at.is_some() {
+            let selection = ValueKeyPreparation::capture(storage, table)?;
+            let definition = storage.tables[table].definition.read();
+            if !target.matches_definition(storage, &definition) {
+                return Err(ValueKeyPreparation::changed());
+            }
+            selection.validate_definition(storage, &definition)?;
+            Some(selection)
+        } else {
+            None
+        };
+        Ok(Self {
+            enforcer,
+            schema,
+            n_columns,
+            created_at,
+            layout,
+            definition,
+        })
     }
+
+    pub(super) fn schema(&self) -> &[ColType] {
+        &self.schema[..self.n_columns]
+    }
+
+    pub(super) fn validate_row(&self, home: &RowByteRead) -> Result<(), SqlError> {
+        validate_row_layout(home, self.created_at, self.layout)
+    }
+
+    pub(super) fn with_values<R>(
+        &self,
+        storage: &Storage,
+        arena: &Arena,
+        values: &[Datum],
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        if values.len() != self.n_columns {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "row values do not match the selected index definition"
+            ));
+        }
+        match &self.definition {
+            Some(selection) => storage.with_value_binding_values_for(
+                arena,
+                selection,
+                &self.enforcer,
+                values,
+                visit,
+            ),
+            None => Storage::with_plain_value_binding_values(&self.enforcer, values, visit),
+        }
+    }
+}
+
+fn validate_row_layout(
+    home: &RowByteRead,
+    created_at: u64,
+    layout: row_layout::RowLayout,
+) -> Result<(), SqlError> {
+    let snapshot = match &home.0 {
+        RowByteSource::Visible(image) => image.snapshot(),
+        RowByteSource::Snapshot(snapshot) => *snapshot,
+        // Exclusive replay and maintenance supply physical metadata explicitly.
+        RowByteSource::Physical(_) => return Ok(()),
+    };
+    if snapshot.created_at != created_at || snapshot.row_layout != layout {
+        return Err(sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "retained row layout does not match the selected index definition"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) struct PreparedRowKeys {
@@ -192,13 +269,8 @@ impl PreparedRowKeys {
             .count();
         if let Some(home) = home.filter(|_| count != 0) {
             if plain {
-                let snapshot = home.snapshot();
-                if snapshot.created_at != created_at || snapshot.row_layout != layout {
-                    return Err(sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "retained row layout does not match the selected index definition"
-                    ));
-                }
+                let home = RowByteRead::from(home);
+                validate_row_layout(&home, created_at, layout)?;
                 storage.with_row_bytes(table, rowid, home, |bytes| {
                     let mut values = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
@@ -533,6 +605,19 @@ mod tests {
                 storage.commit_row(table, 1, 8, 7).unwrap();
                 if indexed {
                     assert_eq!(key_rows(&storage, table, 2), 1);
+                    let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+                    let home = storage
+                        .visible_row_home_at(table, 1, state, 0, SNAPSHOT_ALL, 7)
+                        .unwrap()
+                        .unwrap();
+                    let mut output = [0; 128];
+                    let (key_len, _, _) = storage
+                        .encode_value_binding_entry(table, 0, 1, home, &mut output)
+                        .unwrap()
+                        .unwrap();
+                    let mut key = [Datum::Null];
+                    rowenc::decode(&output[..key_len], &[ColType::Int4], &mut key).unwrap();
+                    assert!(matches!(key[0], Datum::Int4(2)));
                 } else {
                     let row = storage.resident_row_state(table, 1).unwrap().unwrap();
                     assert_eq!(row.committed_lsn, 7);

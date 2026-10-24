@@ -32872,10 +32872,8 @@ impl Storage {
         home: impl Into<RowByteRead>,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
-        let enforcer = selection.binding(self, binding)?;
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = selection.definition().schema(&mut schema);
+        let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
+        let schema = selection.schema();
         let home = home.into();
         selection.validate_row(&home)?;
         let arena = self
@@ -32885,14 +32883,8 @@ impl Storage {
         let mark = arena.mark();
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.with_value_binding_values_for(
-                &arena,
-                &selection,
-                &enforcer,
-                &values[..n_columns],
-                visit,
-            )
+            rowenc::decode(bytes, schema, &mut values)?;
+            selection.with_values(self, &arena, &values[..schema.len()], visit)
         });
         // SAFETY: `visit` cannot return a borrowed key, and all expression
         // values have been encoded or hashed before this row-local rewind.
@@ -32908,9 +32900,8 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
-        let enforcer = selection.binding(self, binding)?;
-        self.with_value_binding_values_for(arena, &selection, &enforcer, values, visit)
+        let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
+        selection.with_values(self, arena, values, visit)
     }
 
     fn with_value_binding_values_for<R>(
@@ -32921,9 +32912,8 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
-        if let Some(created_at) = enforcer.index_created_at {
+        let key = if let Some(created_at) = enforcer.index_created_at {
             index = selection.index(self, created_at)?;
             if let Some(source) = index.predicate {
                 let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
@@ -32945,7 +32935,7 @@ impl Storage {
                         Some(crate::sql::parser::parse_expr(source.as_str(), arena)?);
                 }
             }
-            key = crate::sql::exec::constraints::index_key_values(
+            crate::sql::exec::constraints::index_key_values(
                 self,
                 enforcer.evaluation_txid,
                 selection.definition(),
@@ -32953,11 +32943,21 @@ impl Storage {
                 &index.columns[..index.n_cols],
                 &expressions[..index.n_cols],
                 arena,
-            )?;
+            )?
         } else {
-            for (position, column) in enforcer.columns().iter().enumerate() {
-                key[position] = values[*column as usize];
-            }
+            return Self::with_plain_value_binding_values(enforcer, values, visit);
+        };
+        visit(Some(&key[..enforcer.n_cols]), values, enforcer)
+    }
+
+    fn with_plain_value_binding_values<R>(
+        enforcer: &Enforcer,
+        values: &[Datum],
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let mut key = [Datum::Null; MAX_INDEX_COLS];
+        for (position, column) in enforcer.columns().iter().enumerate() {
+            key[position] = values[usize::from(*column)];
         }
         visit(Some(&key[..enforcer.n_cols]), values, enforcer)
     }

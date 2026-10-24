@@ -71,6 +71,7 @@ jobs:
           cargo test --release --lib --locked --
           key_preparation_ row_layout_ shared_row_publication_ private_index_bindings_
           row_walk_ value_index_ expression_index partial_index
+          index_ columnar_
           index_creation_cache_failure_ failed_index_cache_reservation_
           configured_transaction_capacity_covers_truncate_fanout_
           configured_transaction_ddl_capacity_drives_commit_and_index_scratch

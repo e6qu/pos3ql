@@ -185,11 +185,7 @@ mod tests {
         let mut budget = super::super::tests::test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let role = reader(&storage);
-        let role_oid = storage
-            .role_reference_ready(usize::from(role), 0)
-            .unwrap()
-            .oid()
-            .get() as u32;
+        let role_oid = storage.role_oid(usize::from(role)) as u32;
         let arena = Arena::new(&mut budget, "ACL images", 8192).unwrap();
         let oid = ParameterAclOid::parse(18000).unwrap();
         let empty = ParameterAclImage::new(oid, ParameterAclGrants::from_slice(&[])).unwrap();
@@ -1030,16 +1026,13 @@ impl Storage {
         let grantee_identity = if grantee == super::PUBLIC_ROLE {
             Grantee::Public
         } else {
-            Grantee::Role(
-                self.role_reference_ready(usize::from(grantee), transaction)?
-                    .oid(),
-            )
+            self.role_reference_ready(usize::from(grantee), transaction)?;
+            Grantee::Role(self.role(usize::from(grantee)).oid())
         };
+        self.role_reference_ready(usize::from(grantor), transaction)?;
         let identity = ParameterAclGrantIdentity {
             grantee: grantee_identity,
-            grantor: self
-                .role_reference_ready(usize::from(grantor), transaction)?
-                .oid(),
+            grantor: self.role(usize::from(grantor)).oid(),
         };
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         if let Some(blocker) = catalog.parameter_rows.headers.iter().find_map(|header| {

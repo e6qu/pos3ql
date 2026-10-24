@@ -20812,7 +20812,9 @@ impl Storage {
                 self.rebind_template_table_types(&mut definition, source, target, txid)?;
                 let created_at = self.tables[source_slot].created_at();
                 let ownership = self.tables[source_slot].ownership().committed();
-                let statistics = self.tables[source_slot].statistics.committed();
+                let statistics = self.table_statistics(source_slot, 0);
+                let has_index =
+                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?);
                 let serial_values = self.table_serial_values(source_slot);
                 let target_slot = table_creation::allocate(
                     self,
@@ -20825,6 +20827,9 @@ impl Storage {
                     target_table.identity_mut().created_at = created_at;
                     target_table.identity_mut().ownership = ownership;
                     target_table.statistics.set_image(statistics, None, false);
+                    target_table
+                        .statistics
+                        .set_index_hint(created_at, has_index, true)?;
                     *target_table
                         .serial
                         .get_mut()

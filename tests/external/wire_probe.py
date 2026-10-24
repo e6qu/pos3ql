@@ -3855,8 +3855,8 @@ def test_catalog_aware_binary_bind_parameters():
          binary_array_shaped(21, [0], [0], [])),
         ("empty oidvector", "SELECT ''::oidvector", 30,
          binary_array_shaped(26, [0], [0], [])),
-        ("oidvector inherited bounds", "SELECT '[8:9]={9,10}'::oid[]::oidvector", 30,
-         binary_array_shaped(26, [2], [8], [struct.pack("!I", 9), struct.pack("!I", 10)])),
+        ("oidvector zero-based values", "SELECT '9 10'::oidvector", 30,
+         binary_array_shaped(26, [2], [0], [struct.pack("!I", 9), struct.pack("!I", 10)])),
         (
             "enum array shape",
             "SELECT '[0:1][5:6]={{ready,blocked},{blocked,ready}}'::wire_binary_state[]",

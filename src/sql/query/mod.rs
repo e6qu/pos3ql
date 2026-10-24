@@ -9662,6 +9662,14 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         ))
     }
 
+    fn composite_slot_field(
+        &self,
+        slot: u16,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        super::exec::catalog_composite_slot_field(self.storage, self.txid, slot, index)
+    }
+
     fn named_composite_field(
         &self,
         type_name: &str,

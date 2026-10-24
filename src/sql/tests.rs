@@ -1473,6 +1473,67 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
 }
 
 #[test]
+fn catalog_database_recreation_retires_schema_permission_entries() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("database-retired-schema-acls-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for generation in 0..3 {
+            let name = format!("retired_acl_{generation}");
+            let created = run_with_fixed_memory(
+                &mut engine,
+                &mut budget,
+                &format!("CREATE DATABASE {name} TEMPLATE template0"),
+            );
+            assert!(
+                error_sqlstates(&created).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&created)
+            );
+            let database = engine
+                .storage
+                .database_slot(&name, 0)
+                .map(|slot| engine.storage.database(slot).oid)
+                .unwrap();
+            engine.select_database(database).unwrap();
+            let schema = run_with_fixed_memory(
+                &mut engine,
+                &mut budget,
+                "CREATE SCHEMA protected_schema; REVOKE ALL ON SCHEMA protected_schema FROM PUBLIC; SELECT has_schema_privilege('protected_schema','USAGE')",
+            );
+            assert!(
+                error_sqlstates(&schema).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&schema)
+            );
+            assert_eq!(data_rows(&schema), ["t"]);
+            engine
+                .select_database(crate::storage::DatabaseOid::POSTGRES)
+                .unwrap();
+            let dropped =
+                run_with_fixed_memory(&mut engine, &mut budget, &format!("DROP DATABASE {name}"));
+            assert!(
+                error_sqlstates(&dropped).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&dropped)
+            );
+            for slot in 0..engine.storage.acl_entry_count() {
+                let entry = engine.storage.acl_entry(slot);
+                if entry.object.slot == u16::MAX {
+                    assert!(!entry.live);
+                    assert!(entry.pending.is_none());
+                    assert!(entry.order.is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn metadata_materialized_template_keeps_its_copied_backing_table() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -54984,6 +55045,80 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
 }
 
 #[test]
+fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recovery() {
+    let mut config = test_config("catalog-composite-rename-history");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-composite-rename-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    {
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with_fixed_memory(
+            &mut engine,
+            &mut budget,
+            "
+            CREATE TYPE history_point AS (x integer, y integer);
+            CREATE DOMAIN history_point_value AS history_point CHECK ((VALUE).x > 0);
+            CREATE DOMAIN history_point_child AS history_point_value CHECK ((VALUE).y < 10);
+            CREATE TABLE history_points (value history_point_child);
+            INSERT INTO history_points VALUES (ROW(3,4)::history_point);
+            CREATE INDEX history_point_index ON history_points (((value).x));
+            CREATE VIEW history_point_view AS SELECT (value).x AS observed FROM history_points;
+            CREATE TABLE history_point_rules (value history_point,
+                observed integer GENERATED ALWAYS AS ((value).x) STORED, CHECK ((value).x > 0));
+            INSERT INTO history_point_rules(value) VALUES (ROW(6,7)::history_point);
+            ALTER TYPE history_point ADD ATTRIBUTE z integer;
+            BEGIN;
+            SAVEPOINT original_field;
+            ALTER TYPE history_point RENAME ATTRIBUTE x TO temporary_field;
+            SELECT observed FROM history_point_view;
+            ROLLBACK TO original_field;
+            SELECT (value).x FROM history_points;
+            COMMIT;
+            ALTER TYPE history_point RENAME ATTRIBUTE x TO east;
+            SELECT (value).east FROM history_points;
+            SELECT observed FROM history_point_view;
+            SELECT observed FROM history_point_rules;
+        ",
+        );
+        assert!(
+            error_sqlstates(&setup).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        assert_eq!(data_rows(&setup), ["3", "3", "3", "3", "6"]);
+        let retired = run_with_fixed_memory(
+            &mut engine,
+            &mut budget,
+            "SELECT (value).x FROM history_points",
+        );
+        assert_eq!(error_sqlstates(&retired), ["42703"]);
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with_fixed_memory(
+        &mut engine,
+        &mut budget,
+        "SELECT (value).east FROM history_points; SELECT observed FROM history_point_view; SELECT observed FROM history_point_rules",
+    );
+    assert!(
+        error_sqlstates(&recovered).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    assert_eq!(data_rows(&recovered), ["3", "3", "6"]);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn composite_attribute_rename_rewrites_domain_chain_transactionally() {
     let config = test_config("domain-chain-rename-rollback");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -75487,6 +75622,31 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
 }
 
 #[test]
+fn catalog_vectors_reject_array_casts_including_null_and_empty_inputs() {
+    let (mut engine, mut budget) = test_engine();
+    for target in ["int2vector", "oidvector"] {
+        let source = if target == "int2vector" {
+            "smallint"
+        } else {
+            "oid"
+        };
+        for input in ["NULL", "'{}'", "'[8:9]={9,10}'"] {
+            let result = run_with_fixed_memory(
+                &mut engine,
+                &mut budget,
+                &format!("SELECT {input}::{source}[]::{target}"),
+            );
+            assert_eq!(
+                error_sqlstates(&result),
+                ["42846"],
+                "{}",
+                String::from_utf8_lossy(&result)
+            );
+        }
+    }
+}
+
+#[test]
 fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
     let mut config = test_config("catalog-vectors-cold-recovery");
     config.object_store_on = true;
@@ -75504,10 +75664,10 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
             &mut budget,
             "CREATE TABLE durable_catalog_vectors (\
                  id integer PRIMARY KEY,\
-                 attributes int2vector DEFAULT ('[-3:-2]={3,-4}'::int2[]::int2vector),\
-                 identifiers oidvector DEFAULT ('[8:9]={7,8}'::oid[]::oidvector)); \
+                 attributes int2vector DEFAULT '3 -4',\
+                 identifiers oidvector DEFAULT '7 8'); \
              INSERT INTO durable_catalog_vectors VALUES \
-                 (1, ARRAY[1::int2, 2::int2]::int2vector, '9 10'::oidvector), \
+                 (1, '1 2'::int2vector, '9 10'::oidvector), \
                  (2, DEFAULT, DEFAULT)",
         );
         assert!(
@@ -75530,7 +75690,7 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
     );
     assert_eq!(
         data_rows(&rows),
-        ["{1,2}|[0:1]={9,10}", "[-3:-2]={3,-4}|[8:9]={7,8}"]
+        ["[0:1]={1,2}|[0:1]={9,10}", "[0:1]={3,-4}|[0:1]={7,8}"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -75611,15 +75771,18 @@ fn pg_dump_bootstrap_surface() {
     let catalog_vector_casts = run_with(
         &mut engine,
         &mut budget,
-        "SELECT ARRAY[1::int2, 2::int2]::int2vector::int2[]::text, \
-                    ARRAY[1::oid, 2::oid]::oidvector::oid[]::text",
+        "SELECT '1 2'::int2vector::int2[]::text, \
+                    '1 2'::oidvector::oid[]::text",
     );
     assert!(
         !String::from_utf8_lossy(&catalog_vector_casts).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&catalog_vector_casts)
     );
-    assert_eq!(data_rows(&catalog_vector_casts), ["{1,2}|{1,2}"]);
+    assert_eq!(
+        data_rows(&catalog_vector_casts),
+        ["[0:1]={1,2}|[0:1]={1,2}"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

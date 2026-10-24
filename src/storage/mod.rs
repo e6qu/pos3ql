@@ -12149,6 +12149,19 @@ pub(crate) struct AclEntry {
     pub order: Option<core::num::NonZeroU64>,
 }
 
+impl AclEntry {
+    fn retire(&mut self) {
+        self.object.slot = u16::MAX;
+        self.grantee = u16::MAX;
+        self.grantor = u16::MAX;
+        self.privileges = PrivilegeSet::NONE;
+        self.grant_options = PrivilegeSet::NONE;
+        self.live = false;
+        self.pending = None;
+        self.order = None;
+    }
+}
+
 /// A non-default `pg_parameter_acl` row.  Parameters have no owner or
 /// database scope, so their ACL identity is intentionally separate from an
 /// [`AccessObject`].
@@ -22046,9 +22059,7 @@ impl Storage {
                 if entry.object != prior.object {
                     continue;
                 }
-                entry.object.slot = u16::MAX;
-                entry.live = false;
-                entry.pending = None;
+                entry.retire();
             }
         }
         for slot in 0..self.column_acl_entry_count() {
@@ -24222,12 +24233,7 @@ impl Storage {
     fn clear_object_acl_entries_locked(catalog: &mut AclCatalog, object: AccessObject) {
         for entry in catalog.objects.iter_mut() {
             if entry.object == object {
-                entry.live = false;
-                entry.privileges = PrivilegeSet::NONE;
-                entry.grant_options = PrivilegeSet::NONE;
-                entry.pending = None;
-                entry.order = None;
-                entry.object.slot = u16::MAX;
+                entry.retire();
             }
         }
         for entry in catalog.columns.iter_mut() {
@@ -25197,8 +25203,7 @@ impl Storage {
                 && entry.pending.is_none()
                 && (entry.grantee != owner || entry.grantor != owner)
             {
-                entry.object.slot = u16::MAX;
-                entry.order = None;
+                entry.retire();
             }
         }
     }
@@ -25229,11 +25234,7 @@ impl Storage {
         entries[canonical].grant_options = entries[canonical].grant_options.union(grant_options);
         entries[canonical].live = entries[canonical].privileges.0 != 0;
         entries[canonical].order = order;
-        entries[slot].object.slot = u16::MAX;
-        entries[slot].privileges = PrivilegeSet::NONE;
-        entries[slot].grant_options = PrivilegeSet::NONE;
-        entries[slot].live = false;
-        entries[slot].order = None;
+        entries[slot].retire();
     }
 
     pub(crate) fn restore_acl_pending(
@@ -25258,7 +25259,7 @@ impl Storage {
         }
         catalog.objects[slot].pending = undo.prior;
         if undo.prior.is_none() && catalog.objects[slot].order.is_none() {
-            catalog.objects[slot].object.slot = u16::MAX;
+            catalog.objects[slot].retire();
         }
         drop(catalog);
         self.wake_transaction_waiters(undo.transaction);
@@ -26995,11 +26996,7 @@ impl Storage {
             let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
             for entry in catalog.objects.iter_mut() {
                 if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
-                    entry.object.slot = u16::MAX;
-                    entry.live = false;
-                    entry.privileges = PrivilegeSet::NONE;
-                    entry.grant_options = PrivilegeSet::NONE;
-                    entry.pending = None;
+                    entry.retire();
                 }
             }
             for entry in catalog.columns.iter_mut() {

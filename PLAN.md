@@ -30,7 +30,8 @@ its rows or definitions. Cleanup should let ordinary queries run between turns.
 
 Connect retained catalog rows to every later lookup of table and type
 definitions, columns, index bindings and comments. The [behavior guide](docs/implemented-baseline.md)
-owns the implemented admission, permission, comment and statistics guarantees;
+owns the implemented admission, permission, comment, statistics and bound-view
+rename guarantees;
 their regressions remain in the implementing change.
 
 Preserve PostgreSQL's distinction between listing rows and looking up an object

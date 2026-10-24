@@ -104,18 +104,27 @@ def transcript(reader, writer):
                 f"SELECT {','.join(fields)} FROM pg_catalog.{relation} LIMIT 0",
             )
 
-        record(writer, f"{prefix}.vector_bound_round_trip", """
-            SELECT ('[8:9]={9,10}'::oid[]::oidvector)::oid[]::text,
-                   ('[-3:-2]={1,-2}'::smallint[]::int2vector)::smallint[]::text,
-                   array_dims('[8:9]={9,10}'::oid[]::oidvector),
-                   array_lower('[-3:-2]={1,-2}'::smallint[]::int2vector,1),
-                   array_upper('[-3:-2]={1,-2}'::smallint[]::int2vector,1),
-                   ('[-3:-2]={1,-2}'::smallint[]::int2vector)[-2],
-                   ('[8:9]={9,10}'::oid[]::oidvector)[8],
+        record(writer, f"{prefix}.vector_array_cast", """
+            SELECT ('9 10'::oidvector)::oid[]::text,
+                   ('1 -2'::int2vector)::smallint[]::text,
+                   array_dims('9 10'::oidvector),
+                   array_lower('1 -2'::int2vector,1),
+                   array_upper('1 -2'::int2vector,1),
+                   ('1 -2'::int2vector)[1],
+                   ('9 10'::oidvector)[0],
                    '1 2'::int2vector < '1 10'::int2vector,
-                   '9 10'::oidvector <> '[8:9]={9,10}'::oid[]::oidvector,
+                   '9 10'::oidvector = '9 10'::oidvector,
                    '9'::oidvector < '1 2'::oidvector
         """)
+        writer.execute("BEGIN")
+        try:
+            for source, target in (("smallint", "int2vector"), ("oid", "oidvector")):
+                record_outcome(
+                    writer, f"{prefix}.rejected_array_to_{target}",
+                    f"SELECT '[8:9]={{9,10}}'::{source}[]::{target}", (),
+                )
+        finally:
+            writer.execute("ROLLBACK")
 
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
         try:

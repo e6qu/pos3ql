@@ -738,25 +738,12 @@ impl ColTypeResolver for CatalogCols<'_> {
         .record_column_handle(qualifier, name)
     }
 
-    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
-        if !self
-            .storage
-            .composite_slot_visible_to(usize::from(slot), self.txid)
-        {
-            return None;
-        }
-        let definition = self.storage.composite_for(usize::from(slot), self.txid);
-        let field = definition
-            .active_fields()
-            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
-        Some(StaticTypeMeta {
-            ctype: field.ctype,
-            type_oid: self
-                .storage
-                .routine_type_oid(field.ctype, field.user_type, self.txid)?,
-            type_mod: field.type_mod,
-            collation: field.collation,
-        })
+    fn composite_slot_field(
+        &self,
+        slot: u16,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        catalog_composite_slot_field(self.storage, self.txid, slot, index)
     }
 
     fn named_composite_field(
@@ -1497,7 +1484,22 @@ pub trait ColTypeResolver {
     /// One field of a named composite already resolved to its catalog slot.
     /// Catalog-free resolvers may still use the statement-scoped shape copy.
     fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
-        composite_slot_field_metadata(slot, field)
+        let mut index = 0;
+        while let Some((name, metadata)) = self.composite_slot_field(slot, index) {
+            if name.as_str().eq_ignore_ascii_case(field) {
+                return Some(metadata);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn composite_slot_field(
+        &self,
+        slot: u16,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        registered_composite_slot_field(slot, index)
     }
 
     /// One durable named-composite field, copied out of the bounded catalog.
@@ -1776,35 +1778,56 @@ pub fn register_named_composite_shape(
     })
 }
 
-fn visit_composite_slot_shape_metadata(
+pub(crate) fn catalog_composite_slot_field(
+    storage: &crate::storage::Storage,
+    txid: u32,
     slot: u16,
-    mut visit: impl FnMut(&str, StaticTypeMeta),
-) -> Option<usize> {
-    RECORD_SHAPES.with(|p| {
-        let p = p.borrow();
-        let pool = p.as_ref()?;
-        let at = pool.named[..pool.named_n]
-            .iter()
-            .position(|candidate| candidate.slot == slot)?;
-        let len = pool.named[at].len as usize;
-        for field in &pool.named[at].fields[..len] {
-            visit(field.name.as_str(), field.metadata());
-        }
-        Some(len)
-    })
+    index: usize,
+) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
+        return None;
+    }
+    let definition = storage.composite_for(usize::from(slot), txid);
+    let field = definition.active_field(index)?;
+    Some((
+        crate::util::StackStr::from_str(field.name.as_str()),
+        StaticTypeMeta {
+            ctype: field.ctype,
+            type_oid: storage.routine_type_oid(field.ctype, field.user_type, txid)?,
+            type_mod: field.type_mod,
+            collation: field.collation,
+        },
+    ))
 }
 
-fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMeta> {
+fn visit_composite_slot_shape_metadata(
+    slot: u16,
+    columns: &dyn ColTypeResolver,
+    mut visit: impl FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
+    let mut count = 0;
+    while let Some((name, meta)) = columns.composite_slot_field(slot, count) {
+        visit(name.as_str(), meta);
+        count += 1;
+    }
+    (count != 0).then_some(count)
+}
+
+fn registered_composite_slot_field(
+    slot: u16,
+    index: usize,
+) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
-        let at = pool.named[..pool.named_n]
+        let shape = pool.named[..pool.named_n]
             .iter()
-            .position(|candidate| candidate.slot == slot)?;
-        pool.named[at].fields[..pool.named[at].len as usize]
-            .iter()
-            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
-            .map(|candidate| candidate.metadata())
+            .find(|candidate| candidate.slot == slot)?;
+        let field = shape.fields[..usize::from(shape.len)].get(index)?;
+        Some((
+            crate::util::StackStr::from_str(field.name.as_str()),
+            field.metadata(),
+        ))
     })
 }
 
@@ -2354,7 +2377,7 @@ fn record_shape_metadata_dyn(
             let ColType::Composite(slot) = columns.resolve(*qualifier, name).ok()? else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            visit_composite_slot_shape_metadata(slot, columns, visit)
         }
         Expr::Field { base, field }
             if matches!(
@@ -2365,7 +2388,7 @@ fn record_shape_metadata_dyn(
             let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            visit_composite_slot_shape_metadata(slot, columns, visit)
         }
         Expr::Subscript { base: array, .. } => {
             let element = match &**array {
@@ -2397,7 +2420,7 @@ fn record_shape_metadata_dyn(
             let Some(ColType::Composite(slot)) = element else {
                 return None;
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            visit_composite_slot_shape_metadata(slot, columns, visit)
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
@@ -2560,24 +2583,30 @@ pub fn record_field_metadata(
             qualifier: None,
             name,
         } if columns.is_whole_row(name) => columns.column_meta(Some(name), field),
-        Expr::Column { qualifier, name } => columns
-            .record_column_handle(*qualifier, name)
-            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
-            .or_else(|| match columns.resolve(*qualifier, name).ok()? {
-                ColType::Composite(slot) => columns.composite_field(slot, field),
-                _ => None,
-            }),
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name).ok() {
+            Some(ColType::Composite(slot)) => {
+                // A named type uses the selected catalog definition, including
+                // edits made after statement-local anonymous shapes were built.
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => columns
+                .record_column_handle(*qualifier, name)
+                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+        },
         Expr::Field {
             base: inner,
             field: inner_field,
-        } => expr_record_handle(base, columns)
-            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
-            .or_else(
-                || match record_field_type(inner, inner_field, columns).ok()? {
-                    ColType::Composite(slot) => columns.composite_field(slot, field),
-                    _ => None,
-                },
-            ),
+        } => match record_field_type(inner, inner_field, columns).ok() {
+            Some(ColType::Composite(slot)) => {
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => expr_record_handle(base, columns)
+                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+        },
         Expr::Cast { type_name, .. } => {
             let mut index = 0usize;
             let mut found = None;

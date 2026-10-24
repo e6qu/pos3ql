@@ -84,8 +84,9 @@ filters and exact result checks can need more data.
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
 and readers use manifest v25, journal v12, and table-definition payload v8.
-For example, an array starting at subscript -3 retains that subscript after a
-cast to `oidvector`, checkpoint, and recovery with empty local caches.
+The codec retains these bounds independently of SQL input conversion; SQL
+array-to-vector casts are rejected. Recovery tests cover text-created vectors,
+checkpointing, and recovery with empty local caches.
 Existing startup buffers remain fixed; exhaustion fails explicitly.
 
 ## Format details for implementers

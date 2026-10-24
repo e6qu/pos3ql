@@ -3,7 +3,8 @@
 No known defects are blocked by an external dependency or an intractable problem.
 
 Fix reproducible defects in the PR that finds them, including incidental
-failures, timeouts, rollback and recovery errors. Record a defect here only
+failures, invalid catalog identities, timeouts, rollback and recovery errors.
+Record a defect here only
 when an external blocker or genuine intractability prevents its repair.
 Each entry needs a reproducer, affected behavior, observed result and exact
 blocker. Remove repaired entries and retain their evidence in the fixing PR.

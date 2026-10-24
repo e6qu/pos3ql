@@ -63,6 +63,16 @@ pub(crate) fn validate_catalog_reference_cast(
     source_oid: i32,
     target: ColType,
 ) -> Result<(), SqlError> {
+    if matches!(target, ColType::Int2Vector | ColType::OidVector)
+        && let Some(source @ ColType::Array(_)) = ColType::from_oid(source_oid)
+    {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            source.name(),
+            target.name()
+        ));
+    }
     if target == ColType::Int2
         && let Some(source) = ColType::from_oid(source_oid)
         && (source == ColType::Oid || source == ColType::Regtype || source.is_reg_object())
@@ -141,10 +151,13 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 lower_bound: 0,
                 raw: parse_int2vector_text(text, arena)?,
             },
-            Datum::Array {
-                element: ArrElem::Int2,
-                raw,
-            } => int2vector_from_array(raw, arena)?,
+            Datum::Array { element, .. } => {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type {} to int2vector",
+                    ColType::Array(element).name()
+                ));
+            }
             _ => return Err(cast_unsupported(&v, "int2vector")),
         },
         ColType::OidVector => match v {
@@ -153,10 +166,13 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 lower_bound: 0,
                 raw: parse_oidvector_text(text, arena)?,
             },
-            Datum::Array {
-                element: ArrElem::Oid,
-                raw,
-            } => oidvector_from_array(raw, arena)?,
+            Datum::Array { element, .. } => {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type {} to oidvector",
+                    ColType::Array(element).name()
+                ));
+            }
             _ => return Err(cast_unsupported(&v, "oidvector")),
         },
         ColType::PgNodeTree
@@ -764,22 +780,6 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
     Ok(out)
 }
 
-fn invalid_vector(name: &'static str) -> SqlError {
-    sql_err!(sqlstate::DATATYPE_MISMATCH, "array is not a valid {name}")
-}
-
-fn vector_array_shape(
-    raw: &[u8],
-    name: &'static str,
-) -> Result<crate::sql::array::Shape, SqlError> {
-    let shape = crate::sql::array::shape(raw)
-        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid array datum"))?;
-    if shape.dimension_count() != 1 {
-        return Err(invalid_vector(name));
-    }
-    Ok(shape)
-}
-
 fn parse_int2vector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
     let count = text.split_ascii_whitespace().count();
     let out = arena
@@ -812,52 +812,6 @@ fn parse_oidvector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], Sq
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     Ok(out)
-}
-
-fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let shape = vector_array_shape(raw, "int2vector")?;
-    let count = shape.element_count();
-    let out = arena
-        .alloc_slice_with(count * 2, |_| 0u8)
-        .map_err(|_| arena_full())?;
-    for (chunk, item) in out
-        .as_chunks_mut::<2>()
-        .0
-        .iter_mut()
-        .zip(crate::sql::array::elements(raw, ArrElem::Int2))
-    {
-        let Datum::Int2(value) = item else {
-            return Err(invalid_vector("int2vector"));
-        };
-        chunk.copy_from_slice(&value.to_le_bytes());
-    }
-    Ok(Datum::Int2Vector {
-        raw: out,
-        lower_bound: shape.lower_bound(0).expect("validated vector dimension"),
-    })
-}
-
-fn oidvector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let shape = vector_array_shape(raw, "oidvector")?;
-    let count = shape.element_count();
-    let out = arena
-        .alloc_slice_with(count * 4, |_| 0u8)
-        .map_err(|_| arena_full())?;
-    for (chunk, item) in out
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(crate::sql::array::elements(raw, ArrElem::Oid))
-    {
-        let Datum::Oid(value) = item else {
-            return Err(invalid_vector("oidvector"));
-        };
-        chunk.copy_from_slice(&value.to_le_bytes());
-    }
-    Ok(Datum::OidVector {
-        raw: out,
-        lower_bound: shape.lower_bound(0).expect("validated vector dimension"),
-    })
 }
 
 fn int2vector_as_array<'a>(
@@ -1502,16 +1456,15 @@ mod tests {
             Some(Datum::Int2(2))
         );
         assert_eq!(
-            cast_to(Datum::Array { element, raw }, ColType::Int2Vector, &arena,).unwrap(),
-            Datum::Int2Vector {
-                lower_bound: 0,
-                raw: &[1, 0, 2, 0]
-            }
+            cast_to(Datum::Array { element, raw }, ColType::Int2Vector, &arena)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::CANNOT_COERCE
         );
     }
 
     #[test]
-    fn oidvector_casts_round_trip_through_oid_array() {
+    fn oidvector_casts_to_oid_array_and_rejects_reverse_cast() {
         let mut budget = crate::mem::Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "oidvector cast", 1 << 12).unwrap();
         let Datum::Array { element, raw } = cast_to(
@@ -1528,11 +1481,10 @@ mod tests {
         assert_eq!(element, ArrElem::Oid);
         assert_eq!(crate::sql::array::get(raw, element, 0), Some(Datum::Oid(1)));
         assert_eq!(
-            cast_to(Datum::Array { element, raw }, ColType::OidVector, &arena).unwrap(),
-            Datum::OidVector {
-                lower_bound: 0,
-                raw: &[1, 0, 0, 0, 2, 0, 0, 0]
-            }
+            cast_to(Datum::Array { element, raw }, ColType::OidVector, &arena)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::CANNOT_COERCE
         );
     }
 

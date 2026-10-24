@@ -694,7 +694,7 @@ mod partition_update;
 pub(crate) use copy_transition::CopyTransitionRows;
 
 mod describe;
-pub(crate) use describe::CatalogCols;
+pub(crate) use describe::{CatalogCols, catalog_composite_slot_field};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,

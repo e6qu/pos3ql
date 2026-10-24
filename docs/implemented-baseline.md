@@ -1167,15 +1167,14 @@ after `CREATE VIEW order_report AS SELECT customer_id FROM orders` and
 same source column. Rollback restores its earlier definition, and recovery
 retains the committed binding.
 
-Casting an ordinary array to a vector preserves that array's subscripts. For
-example, `('[8:9]={9,10}'::oid[]::oidvector)[8]` returns `9`, including after
-recovery. PostgreSQL's `oidvector` equality compares its values and ignores
-these bounds; its ordering compares length before values. The array casts and
-the [PostgreSQL 18.6 comparison implementation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/nbtree/nbtcompare.c)
-are checked separately from text rendering and storage recovery.
-Binary input follows PostgreSQL's narrower receive rules: a vector must be
-nonempty, start at zero, and contain no NULL elements. SQL array casts can retain
-other bounds. Empty vectors still have PostgreSQL's one-dimensional binary
+Catalog vectors cast to ordinary arrays while keeping zero-based subscripts.
+For example, `('9 10'::oidvector)::oid[]::text` returns `[0:1]={9,10}`.
+The reverse SQL cast, `oid[]::oidvector` (or `smallint[]::int2vector`), fails
+with `42846`, matching PostgreSQL. `oidvector` equality compares its values;
+its ordering compares length before values. See the
+[PostgreSQL 18.6 comparison implementation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/nbtree/nbtcompare.c).
+Binary input must be nonempty, start at zero, and contain no NULL elements.
+Empty vectors still have PostgreSQL's one-dimensional binary
 result header; sending that result back as binary input is rejected by
 [PostgreSQL's receiver](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/oid.c).
 

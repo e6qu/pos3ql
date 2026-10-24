@@ -24851,6 +24851,7 @@ impl Storage {
             ObjectAclWrite::Change { transaction } => transaction,
             ObjectAclWrite::Exact { transaction, .. } => transaction,
         };
+        let committed_owner = (txid == 0).then(|| self.object_owner(object, txid) as u16);
         if grantee != PUBLIC_ROLE {
             self.role_reference_ready(usize::from(grantee), txid)?;
         }
@@ -24895,7 +24896,12 @@ impl Storage {
         let order = match write {
             ObjectAclWrite::Exact { order, .. } => {
                 if catalog.objects.iter().enumerate().any(|(other, entry)| {
-                    other != slot && entry.object == object && entry.order == Some(order)
+                    let current = entry
+                        .pending
+                        .filter(|pending| pending.txid == txid)
+                        .map(|pending| pending.order)
+                        .or(entry.order);
+                    other != slot && entry.object == object && current == Some(order)
                 }) {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -24984,6 +24990,9 @@ impl Storage {
                 change,
             });
         }
+        if let Some(owner) = committed_owner {
+            Self::reclaim_revoked_acls(&mut catalog, object, owner, txid);
+        }
         Ok((slot, prior))
     }
 
@@ -25068,10 +25077,19 @@ impl Storage {
     }
 
     pub(crate) fn commit_acl(&self, slot: usize, txid: u32) {
+        let selected = {
+            let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+            let entry = &catalog.objects[slot];
+            let Some(pending) = entry.pending.filter(|pending| pending.txid == txid) else {
+                return;
+            };
+            (entry.object, pending.change)
+        };
+        let owner = self.object_owner(selected.0, txid) as u16;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let Some(pending) = catalog.objects[slot]
             .pending
-            .filter(|pending| pending.txid == txid)
+            .filter(|pending| pending.txid == txid && pending.change == selected.1)
         else {
             return;
         };
@@ -25086,8 +25104,37 @@ impl Storage {
             entry.order = Some(pending.order);
         }
         Self::deduplicate_acl(&mut catalog.objects, slot);
+        Self::reclaim_revoked_acls(&mut catalog, selected.0, owner, txid);
         drop(catalog);
         self.wake_transaction_waiters(txid);
+    }
+
+    fn reclaim_revoked_acls(catalog: &mut AclCatalog, object: AccessObject, owner: u16, txid: u32) {
+        // The owner's entry records an explicit list even after its last grant
+        // is revoked. Other removed grants need no retained slot or role reference.
+        if !catalog.objects.iter().any(|entry| {
+            let (_, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+            entry.object == object
+                && grantee == owner
+                && grantor == owner
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
+        }) {
+            return;
+        }
+        for entry in catalog
+            .objects
+            .iter_mut()
+            .filter(|entry| entry.object == object)
+        {
+            if !entry.live
+                && entry.pending.is_none()
+                && (entry.grantee != owner || entry.grantor != owner)
+            {
+                entry.object.slot = u16::MAX;
+                entry.order = None;
+            }
+        }
     }
 
     fn deduplicate_acl(entries: &mut FixedVec<AclEntry>, slot: usize) {
@@ -25107,10 +25154,15 @@ impl Storage {
         };
         let privileges = entries[slot].privileges;
         let grant_options = entries[slot].grant_options;
+        let order = match (entries[canonical].live, entries[slot].live) {
+            (true, false) => entries[canonical].order,
+            (false, true) => entries[slot].order,
+            _ => entries[canonical].order.min(entries[slot].order),
+        };
         entries[canonical].privileges = entries[canonical].privileges.union(privileges);
         entries[canonical].grant_options = entries[canonical].grant_options.union(grant_options);
         entries[canonical].live = entries[canonical].privileges.0 != 0;
-        entries[canonical].order = entries[canonical].order.min(entries[slot].order);
+        entries[canonical].order = order;
         entries[slot].object.slot = u16::MAX;
         entries[slot].privileges = PrivilegeSet::NONE;
         entries[slot].grant_options = PrivilegeSet::NONE;
@@ -25166,6 +25218,42 @@ impl Storage {
             Some(pending) if pending.txid == txid => Some(pending.order),
             _ => entry.order,
         }
+    }
+
+    pub(crate) fn object_acl_grant_order(
+        &self,
+        object: AccessObject,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> Option<core::num::NonZeroU64> {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut defined = None;
+        let mut visible = None;
+        for entry in catalog
+            .objects
+            .iter()
+            .filter(|entry| entry.object == object)
+        {
+            let (live, to, from, _, _) = Self::acl_visible(entry, txid);
+            if to != grantee || from != grantor {
+                continue;
+            }
+            let order = match entry.pending {
+                Some(pending) if pending.txid == txid => Some(pending.order),
+                _ => entry.order,
+            };
+            if let Some(order) = order {
+                defined =
+                    Some(defined.map_or(order, |before: core::num::NonZeroU64| before.min(order)));
+                if live {
+                    visible = Some(
+                        visible.map_or(order, |before: core::num::NonZeroU64| before.min(order)),
+                    );
+                }
+            }
+        }
+        visible.or(defined)
     }
 
     fn parameter_acl_visible(
@@ -58244,7 +58332,8 @@ mod tests {
 
     #[test]
     fn object_acl_ownership_order_and_undo_are_bounded() {
-        let config = test_config();
+        let mut config = test_config();
+        config.max_acl_entries = 5;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut other_budget = test_budget(&config);
@@ -58357,6 +58446,16 @@ mod tests {
             storage
                 .change_acl(
                     object,
+                    BOOTSTRAP_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::DATABASE_ALL,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 0 },
+                )
+                .unwrap();
+            storage
+                .change_acl(
+                    object,
                     PUBLIC_ROLE,
                     BOOTSTRAP_ROLE,
                     PrivilegeSet::NONE,
@@ -58379,6 +58478,31 @@ mod tests {
                 .unwrap();
             assert!(storage.object_acl_order(slot, 10).unwrap() > new_order);
             storage.commit_acl(slot, 10);
+            for transaction in 11..43 {
+                let (removed, _) = storage
+                    .change_acl(
+                        object,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::NONE,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction },
+                    )
+                    .unwrap();
+                storage.commit_acl(removed, transaction);
+                let (added, _) = storage
+                    .change_acl(
+                        object,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction },
+                    )
+                    .unwrap();
+                storage.commit_acl(added, transaction);
+                assert_eq!(added, slot);
+            }
             let before = storage.acl_entry_count();
             storage.acl_catalog.lock().unwrap().next_object_order = u64::MAX;
             assert_eq!(

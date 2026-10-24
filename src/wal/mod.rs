@@ -13423,12 +13423,14 @@ mod tests {
             },
         )
         .unwrap();
-        let WalOp::SetObjectAcl { object_oid, .. } =
-            decode_record(&buffer.readable()[16..]).unwrap()
+        let WalOp::SetObjectAcl {
+            object_oid, order, ..
+        } = decode_record(&buffer.readable()[16..]).unwrap()
         else {
             panic!("expected object ACL WAL operation");
         };
         assert_eq!(object_oid, 16_401);
+        assert_eq!(order.get(), 7);
 
         let mut invalid_budget = Budget::new(1024);
         let mut invalid =
@@ -13447,6 +13449,17 @@ mod tests {
                 order: core::num::NonZeroU64::new(7).unwrap(),
             }
         ));
+        assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+        invalid.clear();
+        assert!(invalid.append(&buffer.readable()[HEADER_LEN..]));
+        assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_some());
+        let length = invalid.len();
+        for removed in 1..=8 {
+            assert!(
+                decode_op(KIND_SET_OBJECT_ACL, &invalid.readable()[..length - removed]).is_none()
+            );
+        }
+        invalid.filled_mut()[length - 8..].fill(0);
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
     }
 

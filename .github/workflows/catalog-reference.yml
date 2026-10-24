@@ -80,9 +80,24 @@ jobs:
           name: catalog-reference-${{ github.sha }}
           path: ${{ runner.temp }}/catalog-comparison
       - name: Rebuild the checked-out server
+        shell: bash
         run: |
           cargo clean -p pos3ql
-          cargo build --release --locked
+          work="$RUNNER_TEMP/catalog-comparison"
+          (
+            while true; do
+              date -u
+              ps -C cargo,rustc,cc,ld,clang,lld -o pid,ppid,pcpu,rss,stat,etime,comm || true
+              free -m
+              if test -r /sys/fs/cgroup/memory.events; then
+                cat /sys/fs/cgroup/memory.events
+              fi
+              sleep 10
+            done
+          ) > "$work/build-resources.log" &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true' EXIT
+          /usr/bin/time -v cargo build --release --locked 2>&1 | tee "$work/build.log"
           git rev-parse HEAD > "$RUNNER_TEMP/catalog-comparison/candidate-revision"
           sha256sum target/release/pos3ql > "$RUNNER_TEMP/catalog-comparison/candidate-SHA256SUMS"
       - name: Compare live catalog behavior with actual PostgreSQL

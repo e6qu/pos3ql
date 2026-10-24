@@ -10855,6 +10855,34 @@ fn resolve_privilege_objects(
             }
         }
     }
+    for object in &objects[..count] {
+        let table = match object.class {
+            AccessClass::Table => Some(usize::from(object.slot)),
+            AccessClass::MaterializedView => Some(usize::from(
+                storage.matview(usize::from(object.slot)).backing_table,
+            )),
+            AccessClass::View => {
+                storage.lock_object(
+                    txid,
+                    crate::storage::ObjectLockTarget::View(usize::from(object.slot)),
+                    crate::sql::ast::TableLockMode::AccessShare,
+                    false,
+                )?;
+                None
+            }
+            _ => None,
+        };
+        if let Some(table) = table {
+            let (source, _) = storage.select_table_definition(table, txid);
+            storage.lock_table(
+                txid,
+                table,
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )?;
+            source.validate(storage)?;
+        }
+    }
     Ok(count)
 }
 

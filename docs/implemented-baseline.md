@@ -1146,6 +1146,13 @@ Its accepted object classes, large-object alias and sub-object numbers follow
 For example, a class without an ACL returns NULL, while an unrecognized class
 raises `XX000`; these cases are distinct.
 
+Permission lists keep grant order when storage slots are reused. Removing a
+grant and adding it again puts it at the end. Removing the last grant leaves
+an explicit empty list (`{}`), which survives restart; a later SELECT grant
+adds only that grant. An owner can revoke its own SELECT permission while
+retaining the right to grant SELECT. Concurrent changes to one object's list
+wait for its transaction, while changes to other objects can proceed.
+
 ### How statistics reads and journal batches stay consistent
 
 `ANALYZE` collects estimates used to choose query plans. Relation counts and

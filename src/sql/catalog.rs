@@ -9914,7 +9914,7 @@ fn acl<'a>(
         }
     }
     ordered[..ordered_count].sort_unstable_by_key(|(order, _)| *order);
-    for (_, slot) in ordered[..ordered_count].iter().copied() {
+    for (position, (_, slot)) in ordered[..ordered_count].iter().copied().enumerate() {
         let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         if entry.object != object || !storage.acl_entry_visible(slot, txid) {
@@ -9924,14 +9924,9 @@ fn acl<'a>(
         if owner_entry && !explicit_owner_acl {
             continue;
         }
-        if storage
-            .acl_entries()
-            .filter(|(earlier_slot, _)| *earlier_slot < slot)
-            .any(|(earlier_slot, earlier)| {
-                earlier.object == object
-                    && storage.acl_entry_visible(earlier_slot, txid)
-                    && storage.acl_identity(earlier_slot, txid) == (grantee, grantor)
-            })
+        if ordered[..position]
+            .iter()
+            .any(|(_, earlier)| storage.acl_identity(*earlier, txid) == (grantee, grantor))
         {
             continue;
         }

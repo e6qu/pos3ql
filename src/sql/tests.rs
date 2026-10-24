@@ -22265,8 +22265,17 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     let committed = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "COMMIT PREPARED 'durable-acl-grants';
-         SELECT relacl::text FROM pg_class WHERE relname='durable_acl_empty';",
+        "COMMIT PREPARED 'durable-acl-grants'",
+    );
+    assert!(
+        !message_types(&committed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    let committed = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT relacl::text FROM pg_class WHERE relname='durable_acl_empty'",
     );
     assert_eq!(
         data_rows(&committed),
@@ -70777,7 +70786,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
          COMMENT ON TABLE template_app.items IS 'copied template table';
          GRANT USAGE ON SCHEMA template_app TO template_reader;
-         GRANT SELECT ON template_app.items TO template_reader;",
+         GRANT SELECT ON template_app.items TO template_reader;
+         CREATE TABLE template_app.empty_permissions(id integer);
+         REVOKE ALL PRIVILEGES ON template_app.empty_permissions FROM postgres;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -70827,10 +70838,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.empty_permissions'::regclass;
+         SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),
-        ["t", "11|ready"]
+        ["{}", "t", "11|ready"]
     );
     let output = run_with(
         &mut engine,
@@ -71044,10 +71056,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.empty_permissions'::regclass;
+         SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),
-        ["t", "11|ready"]
+        ["{}", "t", "11|ready"]
     );
     let reloaded_session = GucState::new();
     restarted.apply_system_settings(&reloaded_session).unwrap();
@@ -71114,6 +71127,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

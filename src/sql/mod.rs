@@ -6161,7 +6161,7 @@ impl Engine {
                     grant_options,
                     order: self
                         .storage
-                        .object_acl_order(slot as usize, txn.txid)
+                        .object_acl_grant_order(object, grantee, grantor, txn.txid)
                         .expect("staged object ACL has a grant order"),
                 },
             ) {

@@ -36,7 +36,7 @@ jobs:
         shell: bash
         run: |
           cargo clean -p pos3ql
-          RUST_BACKTRACE=1 cargo test --lib --release --locked -- storage::catalog_history::tests sql::catalog_snapshot:: config::tests:: catalog_snapshot_ parameter_acl prepared_catalog_row object_acl_ role_ownership_and_acl_survive acl_catalog_is_synchronized comment_catalog_ pending_table_definition_comment_ownership manifest_hex_decode current_manifest_metadata_rejects_missing_duplicate_and_old_fields manifest_catalog_duplicates_reject_before_replacement manifest_round_trip_preserves_reference_names current_manifest_cold_recovery_rejects_invalid_roots_without_publication promotion_ statistics_ownership --nocapture --test-threads=1 \
+          RUST_BACKTRACE=1 cargo test --lib --release --locked -- storage::catalog_history::tests sql::catalog_snapshot:: config::tests:: catalog_snapshot_ parameter_acl prepared_catalog_row object_acl_ object_ownership_and_acl role_ownership_and_acl_survive database_template_catalogs metadata_database_copy metadata_materialized_template acl_catalog_is_synchronized comment_catalog_ pending_table_definition_comment_ownership manifest_hex_decode current_manifest_metadata_rejects_missing_duplicate_and_old_fields manifest_catalog_duplicates_reject_before_replacement manifest_round_trip_preserves_reference_names current_manifest_cold_recovery_rejects_invalid_roots_without_publication promotion_ statistics_ownership --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/catalog-history.log"
       - name: Check formatting and all-target lint
         run: |

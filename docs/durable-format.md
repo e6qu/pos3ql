@@ -31,7 +31,7 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v24` | yes | yes | Retains explicit per-table index-presence hints and catalog identities, including parameter permission rows with empty grant lists, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Checkpoint manifest | `pos3ql-manifest-v24` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
 | Journal record | Version `10` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog records retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |

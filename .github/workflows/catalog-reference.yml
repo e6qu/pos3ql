@@ -35,6 +35,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/catalog-reference"
           target/external-venv/bin/python tests/external/catalog_snapshot_diff.py \
             --host 127.0.0.1 --port 5432 --user postgres --database postgres \
+            --metadata-output "$RUNNER_TEMP/catalog-reference/metadata.json" \
             --output "$RUNNER_TEMP/catalog-reference/postgresql.json"
           git rev-parse HEAD > "$RUNNER_TEMP/catalog-reference/revision"
           docker inspect '${{ job.services.postgres.id }}' --format '{{.Image}}' > "$RUNNER_TEMP/catalog-reference/postgresql-image"
@@ -62,7 +63,7 @@ jobs:
         shell: bash
         run: |
           cargo clean -p pos3ql
-          cargo test --lib --release --locked storage::catalog_history::tests -- --nocapture --test-threads=1 \
+          cargo test --lib --release --locked -- storage::catalog_history::tests config::tests:: --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/catalog-history.log"
       - name: Check formatting and all-target lint
         run: |
@@ -73,4 +74,28 @@ jobs:
         with:
           name: catalog-history-${{ github.sha }}
           path: ${{ runner.temp }}/catalog-history.log
+          if-no-files-found: error
+
+  history-ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MIRIFLAGS: -Zmiri-preemption-rate=1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Interpret catalog history lifetimes and concurrent publication
+        shell: bash
+        run: |
+          cargo miri test --lib --locked storage::catalog_history::tests -- --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/catalog-history-miri.log"
+          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/catalog-history-miri.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: catalog-history-miri-${{ github.sha }}
+          path: ${{ runner.temp }}/catalog-history-miri.log
           if-no-files-found: error

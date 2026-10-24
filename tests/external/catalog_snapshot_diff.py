@@ -148,8 +148,35 @@ def main():
     parser.add_argument("--database", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument("--metadata-output", type=Path)
     arguments = parser.parse_args()
     with connect(arguments.host, arguments.port, arguments.user, arguments.database) as reader, connect(arguments.host, arguments.port, arguments.user, arguments.database) as writer:
+        if arguments.metadata_output is not None:
+            metadata = {
+                "version": reader.execute("SELECT version()").fetchone()[0],
+                "catalog_keys": reader.execute("""
+                    SELECT c.relname, idx.relname,
+                           array_agg(a.attname ORDER BY k.ordinality)
+                      FROM pg_class c
+                      JOIN pg_index i ON i.indrelid = c.oid
+                      JOIN pg_class idx ON idx.oid = i.indexrelid
+                      CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ordinality)
+                      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+                     WHERE c.relnamespace = 'pg_catalog'::regnamespace
+                       AND c.relkind = 'r' AND i.indisunique
+                       AND k.ordinality <= i.indnkeyatts
+                     GROUP BY c.relname, idx.relname, i.indisprimary, idx.oid
+                     ORDER BY c.relname, i.indisprimary DESC, idx.oid
+                """).fetchall(),
+                "catalog_views": reader.execute("""
+                    SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, false)
+                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname IN ('pg_catalog', 'information_schema')
+                       AND c.relkind = 'v'
+                     ORDER BY n.nspname, c.relname
+                """).fetchall(),
+            }
+            arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")
         observed = transcript(reader, writer)
     # JSON normalizes driver tuples before comparing two independent servers.
     serialized = json.dumps(observed, indent=2) + "\n"

@@ -40,6 +40,7 @@ struct HistoryState {
     bytes: FixedBuf,
     reservations: FixedVec<NonZeroU64>,
     next_reservation: u64,
+    max_versions_per_key: usize,
 }
 
 pub(super) struct CatalogHistory {
@@ -157,6 +158,7 @@ impl CatalogHistory {
         budget: &mut Budget,
         bytes: usize,
         transactions: usize,
+        max_versions_per_key: usize,
     ) -> Result<Arc<Self>, BudgetError> {
         budget.draw(Self::budget_bytes(0, 0), "catalog history owner")?;
         let bytes = FixedBuf::new(budget, "catalog history bytes", bytes)?;
@@ -170,6 +172,7 @@ impl CatalogHistory {
                 bytes,
                 reservations,
                 next_reservation: 0,
+                max_versions_per_key,
             }),
         }))
     }
@@ -299,12 +302,24 @@ impl CatalogHistoryBatch {
             .state
             .lock()
             .expect("catalog history lock poisoned");
-        if frames(state.bytes.readable()).any(|frame| {
-            frame.batch == self.identity && frame.relation == relation && frame.row.key == key
-        }) {
+        let mut versions = 0;
+        for frame in frames(state.bytes.readable()) {
+            if frame.relation != relation || frame.row.key != key {
+                continue;
+            }
+            if frame.batch == self.identity {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog history batch contains a duplicate row key"
+                ));
+            }
+            versions += 1;
+        }
+        if versions >= state.max_versions_per_key {
             return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "catalog history batch contains a duplicate row key"
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "catalog row exceeds max_catalog_versions_per_object ({})",
+                state.max_versions_per_key
             ));
         }
         let row = before.map_or(&[][..], |row| row.bytes);
@@ -393,7 +408,7 @@ mod tests {
     #[test]
     fn catalog_history_preserves_oldest_future_row_and_creation_absence() {
         let mut budget = Budget::new(32 * 1024);
-        let history = CatalogHistory::new(&mut budget, 4096, 2).unwrap();
+        let history = CatalogHistory::new(&mut budget, 4096, 2, 8).unwrap();
         let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
         let table = relation(DatabaseOid::POSTGRES, 1259);
         forbid_alloc(|| {
@@ -437,7 +452,7 @@ mod tests {
     #[test]
     fn catalog_history_scopes_rows_by_database_and_relation() {
         let mut budget = Budget::new(32 * 1024);
-        let history = CatalogHistory::new(&mut budget, 4096, 1).unwrap();
+        let history = CatalogHistory::new(&mut budget, 4096, 1, 8).unwrap();
         let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
         forbid_alloc(|| {
             let mut batch = history.reserve().unwrap();
@@ -475,7 +490,7 @@ mod tests {
     fn catalog_history_rollback_and_reclamation_preserve_copied_rows() {
         let bytes = HEADER_BYTES + b"key".len() + b"old".len();
         let mut budget = Budget::new(8192);
-        let history = CatalogHistory::new(&mut budget, bytes * 2, 2).unwrap();
+        let history = CatalogHistory::new(&mut budget, bytes * 2, 2, 8).unwrap();
         let arena = Arena::new(&mut budget, "catalog history test", 4096).unwrap();
         let table = relation(DatabaseOid::POSTGRES, 1259);
         forbid_alloc(|| {
@@ -509,7 +524,7 @@ mod tests {
         let bytes = HEADER_BYTES + b"key".len() + b"old".len();
         let mut budget = Budget::new(8192);
         let before = budget.remaining();
-        let history = CatalogHistory::new(&mut budget, bytes, 1).unwrap();
+        let history = CatalogHistory::new(&mut budget, bytes, 1, 8).unwrap();
         assert_eq!(
             before - budget.remaining(),
             CatalogHistory::budget_bytes(bytes, 1)
@@ -543,6 +558,185 @@ mod tests {
             assert!(empty.record(table, &[], None).is_err());
             assert!(empty.record(table, b"key", image(&[])).is_err());
             empty.publish(NonZeroU64::new(9).unwrap());
+        });
+    }
+
+    #[test]
+    fn catalog_history_version_limit_releases_only_after_the_retention_floor() {
+        let mut budget = Budget::new(16 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 2, 1).unwrap();
+        let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            let mut first = history.reserve().unwrap();
+            first.record(table, b"key", image(b"old")).unwrap();
+            first.publish(NonZeroU64::new(7).unwrap());
+            let mut second = history.reserve().unwrap();
+            for floor in [None, Some(6)] {
+                if floor.is_some() {
+                    history.reclaim(floor);
+                }
+                let error = second.record(table, b"key", image(b"new")).unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert!(
+                    error
+                        .message
+                        .as_str()
+                        .contains("max_catalog_versions_per_object")
+                );
+                assert_eq!(
+                    history.rows_at(table, 6, &arena).unwrap()[0].before,
+                    image(b"old")
+                );
+            }
+            history.reclaim(Some(7));
+            second.record(table, b"key", image(b"new")).unwrap();
+            second.publish(NonZeroU64::new(9).unwrap());
+            assert_eq!(
+                history.rows_at(table, 7, &arena).unwrap()[0].before,
+                image(b"new")
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_history_binary_key_collisions_and_duplicate_row_counts_are_exact() {
+        let mut budget = Budget::new(16 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 2, 8).unwrap();
+        let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 2608);
+        forbid_alloc(|| {
+            let mut first = history.reserve().unwrap();
+            let duplicates = Some(CatalogRowImage {
+                bytes: b"dependency",
+                count: NonZeroU32::new(3).unwrap(),
+            });
+            first.record(table, &[0], duplicates).unwrap();
+            first.record(table, &[16], None).unwrap();
+            first.publish(NonZeroU64::new(7).unwrap());
+            let rows = history.rows_at(table, 6, &arena).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows.iter().find(|row| row.key == [0]).unwrap().before,
+                duplicates
+            );
+            assert_eq!(
+                rows.iter().find(|row| row.key == [16]).unwrap().before,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_history_exhausted_identity_and_statement_arena_are_named_errors() {
+        let mut budget = Budget::new(8192);
+        let history = CatalogHistory::new(&mut budget, 4096, 1, 8).unwrap();
+        let arena = Arena::new(&mut budget, "small catalog history test", 1).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            batch.record(table, b"key", image(b"old")).unwrap();
+            batch.publish(NonZeroU64::new(7).unwrap());
+            let error = history.rows_at(table, 6, &arena).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("SQL arena"));
+            history.state.lock().unwrap().next_reservation = u64::MAX;
+            let error = match history.reserve() {
+                Ok(_) => panic!("catalog history reservation identity wrapped"),
+                Err(error) => error,
+            };
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("identity space exhausted"));
+        });
+    }
+
+    #[test]
+    fn catalog_history_four_readers_see_atomic_publication_and_own_copied_rows() {
+        let mut budget = Budget::new(256 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 1, 8).unwrap();
+        let arenas: [Arena; 4] = core::array::from_fn(|_| {
+            Arena::new(&mut budget, "concurrent catalog history test", 32 * 1024).unwrap()
+        });
+        let rendezvous = Arc::new(std::sync::Barrier::new(5));
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        let batch = forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            batch.record(table, b"orders", image(b"10")).unwrap();
+            batch.record(table, b"invoices", image(b"10")).unwrap();
+            batch
+        });
+        std::thread::scope(|scope| {
+            for arena in arenas {
+                let history = Arc::clone(&history);
+                let rendezvous = Arc::clone(&rendezvous);
+                scope.spawn(move || {
+                    rendezvous.wait();
+                    forbid_alloc(|| {
+                        for _ in 0..32 {
+                            let rows = history.rows_at(table, 6, &arena).unwrap();
+                            assert!(rows.is_empty() || rows.len() == 2);
+                            assert!(rows.iter().all(|row| row.before == image(b"10")));
+                            std::thread::yield_now();
+                        }
+                    });
+                    rendezvous.wait();
+                    let copied = forbid_alloc(|| history.rows_at(table, 6, &arena).unwrap());
+                    assert_eq!(copied.len(), 2);
+                    rendezvous.wait();
+                    rendezvous.wait();
+                    forbid_alloc(|| {
+                        assert!(copied.iter().all(|row| row.before == image(b"10")));
+                        assert!(history.rows_at(table, 6, &arena).unwrap().is_empty());
+                    });
+                });
+            }
+            rendezvous.wait();
+            forbid_alloc(|| batch.publish(NonZeroU64::new(7).unwrap()));
+            rendezvous.wait();
+            rendezvous.wait();
+            forbid_alloc(|| history.reclaim(None));
+            rendezvous.wait();
+        });
+    }
+
+    #[test]
+    fn catalog_history_unwinding_releases_reservations_and_unpublished_bytes() {
+        let mut budget = Budget::new(8192);
+        let history = CatalogHistory::new(&mut budget, HEADER_BYTES + 6, 1, 1).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        let batch = forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            batch.record(table, b"key", image(b"old")).unwrap();
+            batch
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _batch = batch;
+            panic!("catalog preparation interrupted");
+        }));
+        assert!(result.is_err());
+        forbid_alloc(|| {
+            let mut replacement = history.reserve().unwrap();
+            replacement.record(table, b"key", image(b"new")).unwrap();
+            replacement.publish(NonZeroU64::new(7).unwrap());
+        });
+    }
+
+    #[test]
+    fn catalog_history_disabled_byte_pool_never_accepts_a_row() {
+        let mut budget = Budget::new(8192);
+        let history = CatalogHistory::new(&mut budget, 0, 1, 8).unwrap();
+        let arena = Arena::new(&mut budget, "disabled catalog history test", 1).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            assert!(history.rows_at(table, 0, &arena).unwrap().is_empty());
+            let mut batch = history.reserve().unwrap();
+            let error = batch.record(table, b"key", None).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("catalog_history_bytes"));
+            drop(batch);
+            let empty = history.reserve().unwrap();
+            empty.publish(NonZeroU64::new(7).unwrap());
+            history.reclaim(None);
         });
     }
 }

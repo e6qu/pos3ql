@@ -144,7 +144,7 @@ pub(super) fn allocate(
                 drop(names);
                 #[cfg(test)]
                 storage
-                    .type_publication
+                    .definition_publication
                     .waits
                     .fetch_add(1, core::sync::atomic::Ordering::Release);
                 wait.wait();

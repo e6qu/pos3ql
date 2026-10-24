@@ -446,7 +446,7 @@ mod tests {
                     .write_table_def(target, definition, &mapping, true)
                     .unwrap();
                 let exhausted = if dependent_exhausted { other } else { table };
-                storage.tables[exhausted].publication().generation = u64::MAX - 1;
+                storage.tables[exhausted].publication().generation = u64::MAX;
                 let error = storage.commit_table_def(change).err().unwrap();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 let committed = storage.table_def(table, 0);

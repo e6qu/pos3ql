@@ -240,24 +240,24 @@ impl TypeReferenceMove {
     }
 }
 
-/// Only type-identity publication uses this startup workspace. Ordinary reads
-/// and writes do not acquire its mutex.
-pub(super) struct TypePublication {
-    scratch: Mutex<Arena>,
+/// Table and type definition publication share this startup workspace.
+/// Ordinary reads and row writes do not acquire its mutex.
+pub(super) struct DefinitionPublication {
+    pub(super) scratch: Mutex<Arena>,
     #[cfg(test)]
     pub(super) waits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     scan_pause: std::sync::atomic::AtomicU8,
 }
 
-struct TableOwner<'storage> {
-    definition: DefinitionWrite<'storage>,
-    publication: MutexGuard<'storage, TablePublication>,
-    _lifecycle: MutexGuard<'storage, ()>,
+pub(super) struct TableOwner<'storage> {
+    pub(super) definition: DefinitionWrite<'storage>,
+    pub(super) publication: MutexGuard<'storage, TablePublication>,
+    pub(super) _lifecycle: MutexGuard<'storage, ()>,
 }
 
-struct TableAttempt<'slots, 'storage> {
-    slots: &'slots mut [Option<TableOwner<'storage>>],
+pub(super) struct TableAttempt<'slots, 'storage> {
+    pub(super) slots: &'slots mut [Option<TableOwner<'storage>>],
 }
 
 impl Drop for TableAttempt<'_, '_> {
@@ -268,7 +268,7 @@ impl Drop for TableAttempt<'_, '_> {
     }
 }
 
-impl TypePublication {
+impl DefinitionPublication {
     pub(super) fn validate_generations(
         storage: &Storage,
         changes: impl Iterator<Item = super::TypeCommitChange> + Clone,
@@ -323,11 +323,11 @@ impl TypePublication {
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
-        budget.draw(size_of::<Self>(), "type publication controls")?;
+        budget.draw(size_of::<Self>(), "definition publication controls")?;
         Ok(Self {
             scratch: Mutex::new(Arena::new(
                 budget,
-                "type publication",
+                "definition publication",
                 Self::scratch_bytes(config),
             )?),
             #[cfg(test)]
@@ -524,7 +524,7 @@ impl Storage {
         source: TypePublicationSource,
         install_source: impl FnOnce(&mut TypeCatalog, &mut EnumMemberImages),
     ) -> Result<(), crate::sql::eval::SqlError> {
-        self.type_publication
+        self.definition_publication
             .publish(self, movement, source, install_source)
     }
 }
@@ -747,7 +747,7 @@ mod tests {
                 })
                 .unwrap();
                 storage
-                    .type_publication
+                    .definition_publication
                     .scan_pause
                     .store(1, Ordering::Release);
                 std::thread::scope(|scope| {
@@ -755,9 +755,9 @@ mod tests {
                         crate::sql::set_execution_database_oid(database);
                         crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target))
                     });
-                    let resume = ResumeScan(&storage.type_publication.scan_pause);
+                    let resume = ResumeScan(&storage.definition_publication.scan_pause);
                     let deadline = Instant::now() + Duration::from_secs(5);
-                    while storage.type_publication.scan_pause.load(Ordering::Acquire) != 2 {
+                    while storage.definition_publication.scan_pause.load(Ordering::Acquire) != 2 {
                         assert!(
                             Instant::now() < deadline,
                             "type publication did not reach its scan boundary"
@@ -821,7 +821,7 @@ mod tests {
                     assert_identity(&storage, related, 0, movement.current);
                     assert_identity(&storage, dependent, 11, movement.current);
                     assert!(storage.type_catalog.try_lock().is_ok());
-                    assert!(storage.type_publication.scratch.try_lock().is_ok());
+                    assert!(storage.definition_publication.scratch.try_lock().is_ok());
                 });
             }
         }
@@ -907,7 +907,7 @@ mod tests {
                         assert_identity(&storage, related, 0, next_name);
                     }
                     assert!(storage.type_catalog.try_lock().is_ok());
-                    assert!(storage.type_publication.scratch.try_lock().is_ok());
+                    assert!(storage.definition_publication.scratch.try_lock().is_ok());
                 });
             }
         }
@@ -1263,7 +1263,7 @@ mod tests {
     fn wait_until_contended(storage: &Storage) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while storage
-            .type_publication
+            .definition_publication
             .waits
             .load(std::sync::atomic::Ordering::Acquire)
             == 0
@@ -2406,14 +2406,14 @@ mod tests {
         for max_tables in [1, 3, 128] {
             let mut config = test_config();
             config.max_tables = max_tables;
-            let bytes = TypePublication::budget_bytes(&config);
+            let bytes = DefinitionPublication::budget_bytes(&config);
             let mut insufficient = Budget::new(bytes - 1);
-            let error = TypePublication::new(&config, &mut insufficient)
+            let error = DefinitionPublication::new(&config, &mut insufficient)
                 .err()
                 .unwrap();
-            assert_eq!(error.what, "type publication");
+            assert_eq!(error.what, "definition publication");
             let mut exact = Budget::new(bytes);
-            let publication = TypePublication::new(&config, &mut exact).unwrap();
+            let publication = DefinitionPublication::new(&config, &mut exact).unwrap();
             assert_eq!(exact.remaining(), 0);
             crate::mem::guard::forbid_alloc(|| {
                 for _ in 0..3 {
@@ -2616,7 +2616,7 @@ mod tests {
 
     fn publish_move(storage: &Storage, movement: TypeReferenceMove, source: TypePublicationSource) {
         storage
-            .type_publication
+            .definition_publication
             .publish(
                 storage,
                 movement,
@@ -2743,7 +2743,7 @@ mod tests {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     let waiting = loop {
                         if storage
-                            .type_publication
+                            .definition_publication
                             .waits
                             .load(std::sync::atomic::Ordering::Acquire)
                             > 0

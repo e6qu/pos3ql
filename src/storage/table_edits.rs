@@ -113,7 +113,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
         drop(self);
         #[cfg(test)]
         storage
-            .type_publication
+            .definition_publication
             .waits
             .fetch_add(1, core::sync::atomic::Ordering::Release);
         wait.wait();
@@ -945,7 +945,7 @@ mod tests {
             assert!(storage.pending_table_def(table).is_none());
             let (committed_target, committed) = storage.select_table_definition(table, 7);
             let revision = storage.reserve_table_definition_revision().unwrap();
-            storage.move_table_schema(table, SqlName::parse("moved").unwrap(), revision);
+            storage.move_table_schema(table, SqlName::parse("moved").unwrap(), revision).unwrap();
             let error = storage
                 .write_table_def(committed_target, committed, &mapping("id"), false)
                 .unwrap_err();
@@ -1025,7 +1025,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             let waiting = loop {
                 if storage
-                    .type_publication
+                    .definition_publication
                     .waits
                     .load(core::sync::atomic::Ordering::Acquire)
                     != 0

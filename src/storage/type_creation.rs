@@ -18,7 +18,7 @@ impl Storage {
                 Ok(owners) => return owners,
                 Err(wait) => {
                     #[cfg(test)]
-                    self.type_publication
+                    self.definition_publication
                         .waits
                         .fetch_add(1, core::sync::atomic::Ordering::Release);
                     wait.wait();
@@ -173,7 +173,7 @@ mod tests {
                 )
                 .unwrap();
             let comments = storage.comments.lock().unwrap();
-            let before = storage.type_publication.waits.load(Ordering::Acquire);
+            let before = storage.definition_publication.waits.load(Ordering::Acquire);
             let (finished, received) = std::sync::mpsc::sync_channel(1);
             std::thread::scope(|scope| {
                 let dropper =
@@ -292,7 +292,7 @@ mod tests {
 
     fn saw_wait(storage: &Storage, before: usize) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while storage.type_publication.waits.load(Ordering::Acquire) == before {
+        while storage.definition_publication.waits.load(Ordering::Acquire) == before {
             if Instant::now() >= deadline {
                 return false;
             }
@@ -340,7 +340,7 @@ mod tests {
                 let storage = fixture(TransactionMode::Mvcc);
                 let permissions = (blocked == 0).then(|| storage.acl_catalog.lock().unwrap());
                 let types = (blocked == 1).then(|| storage.type_catalog.lock().unwrap());
-                let before = storage.type_publication.waits.load(Ordering::Acquire);
+                let before = storage.definition_publication.waits.load(Ordering::Acquire);
                 std::thread::scope(|scope| {
                     let writer = scope.spawn(|| {
                         crate::mem::guard::forbid_alloc(|| {
@@ -370,7 +370,7 @@ mod tests {
             let owner = role(&storage, "waiting_owner");
             let actor = SessionIdentity::bound(storage.capture_role_slot(owner, 0).unwrap());
             let types = storage.type_catalog.lock().unwrap();
-            let before = storage.type_publication.waits.load(Ordering::Acquire);
+            let before = storage.definition_publication.waits.load(Ordering::Acquire);
             std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
                     let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);

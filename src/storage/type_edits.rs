@@ -615,7 +615,7 @@ impl super::Storage {
         }
         drop(catalog);
         if has_identity_moves {
-            super::type_reference_moves::TypePublication::validate_generations(self, changes)?;
+            super::type_reference_moves::DefinitionPublication::validate_generations(self, changes)?;
         }
         Ok(())
     }

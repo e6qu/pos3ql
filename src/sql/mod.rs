@@ -23173,7 +23173,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 });
             };
             let revision = storage.reserve_table_definition_revision()?;
-            storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?, revision);
+            storage.move_table_schema(index, crate::storage::SqlName::parse(new_schema)?, revision)?;
         }
         WalOp::SetSequenceSchema {
             identity,

@@ -6352,6 +6352,18 @@ impl Engine {
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
         let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        let memory_catalog_lsn =
+            if prepared_slot.is_none() && staged_bytes == 0 && txn.catalog_history.is_some() {
+                match self.storage.bump_lsn().resolve() {
+                    Ok(position) => Some(position),
+                    Err(error) => {
+                        self.rollback_txn(txn, guc);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
         // ROLLBACK leaves an empty protocol transaction. Only a durable
         // change needs writer ownership at this final commit boundary.
         if (staged_bytes != 0 || target != txn::CommitTarget::Ordinary)
@@ -6486,8 +6498,8 @@ impl Engine {
             self.prepared_transactions.claim_resolution(slot, txn.txid);
         }
         let journal = prepared_slot.is_some() || staged_bytes != 0;
-        let publication_lsn = if !journal && txn.catalog_history.is_some() {
-            self.storage.bump_lsn()
+        let publication_lsn = if let Some(position) = memory_catalog_lsn {
+            commit_lsn.max(position)
         } else if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor
         {
             // Position zero denotes an absent deletion marker. Temporary data

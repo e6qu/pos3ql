@@ -32637,7 +32637,10 @@ impl Storage {
             keys: prepared_keys,
         } = prepared;
         if origin != self.catalog_sources.origin() {
-            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "prepared row publication belongs to another storage instance"));
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "prepared row publication belongs to another storage instance"
+            ));
         }
         let table = &self.tables[table_index];
         let rewritten = prepared_keys.is_none();
@@ -32833,7 +32836,9 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let mut n_out = 0;
         for (binding, selected) in bindings.iter().enumerate() {
-            let Some(selected) = selected.as_ref() else { continue };
+            let Some(selected) = selected.as_ref() else {
+                continue;
+            };
             self.with_value_binding_values_for(
                 arena,
                 selection,
@@ -34610,7 +34615,11 @@ impl Storage {
     pub fn rebuild_recovered_enforcers(&mut self) -> Result<(), SqlError> {
         for i in 0..self.tables.len() {
             if self.tables[i].live() {
-                self.build_enforcers_visible(i, None, key_preparation::EnforcerRows::RebuildRecovered)?;
+                self.build_enforcers_visible(
+                    i,
+                    None,
+                    key_preparation::EnforcerRows::RebuildRecovered,
+                )?;
             }
         }
         Ok(())
@@ -34633,7 +34642,11 @@ impl Storage {
         table_index: usize,
         txid: u32,
     ) -> Result<(), SqlError> {
-        self.build_enforcers_visible(table_index, Some(txid), key_preparation::EnforcerRows::ReusePrepared)
+        self.build_enforcers_visible(
+            table_index,
+            Some(txid),
+            key_preparation::EnforcerRows::ReusePrepared,
+        )
     }
 
     fn refresh_enforcers_visible(
@@ -34647,7 +34660,11 @@ impl Storage {
     /// Row publication already updated prepared index caches. Finalize their
     /// catalog owner without rescanning rows when the complete shape matches.
     pub(crate) fn finish_index_enforcers(&self, table_index: usize) -> Result<(), SqlError> {
-        self.build_enforcers_visible(table_index, None, key_preparation::EnforcerRows::ReusePrepared)
+        self.build_enforcers_visible(
+            table_index,
+            None,
+            key_preparation::EnforcerRows::ReusePrepared,
+        )
     }
 
     pub(crate) fn finish_table_enforcers(
@@ -34659,7 +34676,10 @@ impl Storage {
             && self.tables[table_index].spill_generations().is_empty();
         let empty_caches = if empty {
             let bindings = self.tables[table_index].publication().enforcers.clone();
-            bindings.iter().flatten().all(|enforcer| enforcer.cache.read().is_empty())
+            bindings
+                .iter()
+                .flatten()
+                .all(|enforcer| enforcer.cache.read().is_empty())
         } else {
             false
         };
@@ -34682,18 +34702,31 @@ impl Storage {
             let (definition, mut publication, indexes) = row_ownership::acquire(|| {
                 Ok((
                     table.definition.try_read_for_batch()?,
-                    row_ownership::try_mutex(&table.publication, "table publication lock poisoned")?,
+                    row_ownership::try_mutex(
+                        &table.publication,
+                        "table publication lock poisoned",
+                    )?,
                     row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
                 ))
             });
-            let has_constraints = definition.committed().columns().iter().any(|column| column.unique)
+            let has_constraints = definition
+                .committed()
+                .columns()
+                .iter()
+                .any(|column| column.unique)
                 || definition.committed().n_uniques != 0;
             let has_indexes = indexes.iter().any(|index| {
-                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| index.visible_to(owner))
-                    && index.table_binding.is_some_and(|binding| {
-                        binding.source.slot() == catalog_sources::CatalogObjectSlot::Table(table_index)
-                            && binding.source.matches_lifetime(self, definition.identity.database, definition.identity.created_at, definition.identity.existence)
-                    })
+                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                    index.visible_to(owner)
+                }) && index.table_binding.is_some_and(|binding| {
+                    binding.source.slot() == catalog_sources::CatalogObjectSlot::Table(table_index)
+                        && binding.source.matches_lifetime(
+                            self,
+                            definition.identity.database,
+                            definition.identity.created_at,
+                            definition.identity.existence,
+                        )
+                })
             });
             if !has_constraints && !has_indexes {
                 publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
@@ -34717,7 +34750,12 @@ impl Storage {
             });
             selection.validate_definition(self, &definition)?;
             let count = publication.n_enforcers;
-            let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] = core::array::from_fn(|index| publication.enforcers[index].as_ref().map(|enforcer| enforcer.metadata));
+            let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] =
+                core::array::from_fn(|index| {
+                    publication.enforcers[index]
+                        .as_ref()
+                        .map(|enforcer| enforcer.metadata)
+                });
             let published = if matches!(rows, key_preparation::EnforcerRows::RebuildRecovered) {
                 // Recovery has exclusive access before serving clients. Keep
                 // durable identities while recycling its unexposed buffers.
@@ -34933,15 +34971,26 @@ impl Storage {
             want[n_want].include_mask = include_mask;
             n_want += 1;
         }
-        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = [const { None }; MAX_VALUE_ENFORCERS];
+        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] =
+            [const { None }; MAX_VALUE_ENFORCERS];
         let mut populate = [true; MAX_VALUE_ENFORCERS];
         if matches!(rows, key_preparation::EnforcerRows::ReusePrepared) {
             let mut used = [false; MAX_VALUE_ENFORCERS];
             let mut count = 0;
             for (position, wanted) in want[..n_want].iter().enumerate() {
-                let Some((slot, enforcer)) = published[..n_published].iter().enumerate().find_map(|(slot, enforcer)| {
-                    enforcer.as_ref().filter(|enforcer| !used[slot] && wanted.matches(&enforcer.metadata)).map(|enforcer| (slot, enforcer))
-                }) else {
+                let Some((slot, enforcer)) =
+                    published[..n_published]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, enforcer)| {
+                            enforcer
+                                .as_ref()
+                                .filter(|enforcer| {
+                                    !used[slot] && wanted.matches(&enforcer.metadata)
+                                })
+                                .map(|enforcer| (slot, enforcer))
+                        })
+                else {
                     continue;
                 };
                 used[slot] = true;
@@ -34952,21 +35001,27 @@ impl Storage {
                 count += 1;
             }
             if count == n_want {
-            let (definition, mut publication) = row_ownership::acquire(|| {
-                Ok((
-                    self.tables[table_index].definition.try_read_for_batch()?,
-                    row_ownership::try_mutex(&self.tables[table_index].publication, "table publication lock poisoned")?,
-                ))
-            });
-            selection.validate_definition(self, &definition)?;
-            if publication.generation != expected_generation
-                || !key_preparation::same_bindings(&published, &publication.enforcers, true)
-            {
-                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "table changed while its prepared index caches were being finalized"));
-            }
-            publication.enforcers = candidate;
-            publication.n_enforcers = n_want;
-            return Ok(());
+                let (definition, mut publication) = row_ownership::acquire(|| {
+                    Ok((
+                        self.tables[table_index].definition.try_read_for_batch()?,
+                        row_ownership::try_mutex(
+                            &self.tables[table_index].publication,
+                            "table publication lock poisoned",
+                        )?,
+                    ))
+                });
+                selection.validate_definition(self, &definition)?;
+                if publication.generation != expected_generation
+                    || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "table changed while its prepared index caches were being finalized"
+                    ));
+                }
+                publication.enforcers = candidate;
+                publication.n_enforcers = n_want;
+                return Ok(());
             }
         }
         for (w, wanted) in want.iter().take(n_want).enumerate() {
@@ -35008,7 +35063,11 @@ impl Storage {
             });
         }
         let fresh: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = core::array::from_fn(|index| {
-            if populate[index] { candidate[index].clone() } else { None }
+            if populate[index] {
+                candidate[index].clone()
+            } else {
+                None
+            }
         });
         self.populate_enforcers(table_index, &selection, &fresh[..n_want])?;
         let (definition, mut publication) = row_ownership::acquire(|| {

@@ -945,7 +945,9 @@ mod tests {
             assert!(storage.pending_table_def(table).is_none());
             let (committed_target, committed) = storage.select_table_definition(table, 7);
             let revision = storage.reserve_table_definition_revision().unwrap();
-            storage.move_table_schema(table, SqlName::parse("moved").unwrap(), revision).unwrap();
+            storage
+                .move_table_schema(table, SqlName::parse("moved").unwrap(), revision)
+                .unwrap();
             let error = storage
                 .write_table_def(committed_target, committed, &mapping("id"), false)
                 .unwrap_err();

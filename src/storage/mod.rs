@@ -47,8 +47,8 @@ mod domain_validation;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
-mod table_publication;
 mod table_names;
+mod table_publication;
 mod type_contracts;
 mod type_creation;
 mod type_definitions;
@@ -18362,7 +18362,8 @@ impl Storage {
         let row_walks = RowWalkPool::new(config, budget)?;
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
-        let definition_publication = type_reference_moves::DefinitionPublication::new(config, budget)?;
+        let definition_publication =
+            type_reference_moves::DefinitionPublication::new(config, budget)?;
         let type_definition_versions = type_edits::TypeRevisions::new(config, budget)?;
         let type_definition_images =
             type_definitions::TypeDefinitionImagePools::new(config, budget)?;
@@ -35510,10 +35511,8 @@ impl Storage {
         &self,
         change: TableDefinitionChange,
     ) -> Result<Option<bool>, SqlError> {
-        self.definition_publication.publish_table(
-            self,
-            table_publication::DefinitionSource::Pending(change),
-        )
+        self.definition_publication
+            .publish_table(self, table_publication::DefinitionSource::Pending(change))
     }
 
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
@@ -39940,19 +39939,11 @@ impl Storage {
         pending.previous
     }
 
-    fn clear_pending_enum_member_chain(
-        &self,
-        catalog: &mut TypeCatalog,
-        mut tail: Option<u32>,
-        keep: Option<u32>,
-    ) {
-        while let Some(slot) = tail {
-            tail = self.release_pending_enum_members(catalog, slot, keep);
-        }
-    }
-
     fn release_enum_definition_images(&self, catalog: &mut TypeCatalog, slot: usize) {
-        let mut images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+        let mut images = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned");
         Self::release_enum_definition_images_locked(catalog, &mut images, slot);
     }
 
@@ -39961,7 +39952,9 @@ impl Storage {
         images: &mut EnumMemberImages,
         slot: usize,
     ) {
-        let mut pending = catalog.enums[slot].pending_definition.take()
+        let mut pending = catalog.enums[slot]
+            .pending_definition
+            .take()
             .map(|pending| pending.member_slot);
         while let Some(slot) = pending {
             pending = Self::release_pending_enum_members_locked(catalog, images, slot, None);
@@ -46164,18 +46157,24 @@ impl Storage {
             *target = Some(definition.columns[column].name);
         }
         definition.schema = new_schema;
-        self.definition_publication.publish_table(
-            self,
-            table_publication::DefinitionSource::Committed {
-                source,
-                committed_revision,
-                definition: &definition,
-                column_mapping: &mapping,
-                revision,
-                rewrites_rows: false,
-            },
-        )?.ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE,
-            "table definition source changed before schema publication"))?;
+        self.definition_publication
+            .publish_table(
+                self,
+                table_publication::DefinitionSource::Committed {
+                    source,
+                    committed_revision,
+                    definition: &definition,
+                    column_mapping: &mapping,
+                    revision,
+                    rewrites_rows: false,
+                },
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition source changed before schema publication"
+                )
+            })?;
         Ok(())
     }
 
@@ -46218,18 +46217,24 @@ impl Storage {
         );
         let committed_revision = state.committed_revision;
         drop(state);
-        self.definition_publication.publish_table(
-            self,
-            table_publication::DefinitionSource::Committed {
-                source,
-                committed_revision,
-                definition: &definition,
-                column_mapping,
-                revision,
-                rewrites_rows,
-            },
-        )?.ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE,
-            "table definition source changed before replay publication"))?;
+        self.definition_publication
+            .publish_table(
+                self,
+                table_publication::DefinitionSource::Committed {
+                    source,
+                    committed_revision,
+                    definition: &definition,
+                    column_mapping,
+                    revision,
+                    rewrites_rows,
+                },
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition source changed before replay publication"
+                )
+            })?;
         Ok(())
     }
 

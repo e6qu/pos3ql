@@ -272,7 +272,11 @@ impl DefinitionPublication {
     #[cfg(test)]
     pub(super) fn pause_after_scan(&self) {
         use std::sync::atomic::Ordering;
-        if self.scan_pause.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if self
+            .scan_pause
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             while self.scan_pause.load(Ordering::Acquire) == 2 {
                 std::thread::yield_now();
             }
@@ -394,32 +398,19 @@ impl DefinitionPublication {
         let mut scratch = self
             .scratch
             .lock()
-            .expect("type publication scratch poisoned");
+            .expect("definition publication scratch poisoned");
         scratch.reset();
         // Startup reserves one slot per physical table, including the internal
         // relation. This is the only allocation from the reset workspace.
         let mut slots = scratch
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
-            .expect("startup type publication reservation covers every table");
+            .expect("startup definition publication reservation covers every table");
         loop {
             let mut owners = TableAttempt { slots: &mut slots };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_tables(storage, movement, &mut owners)?;
                 #[cfg(test)]
-                if self
-                    .scan_pause
-                    .compare_exchange(
-                        1,
-                        2,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    while self.scan_pause.load(std::sync::atomic::Ordering::Acquire) == 2 {
-                        std::thread::yield_now();
-                    }
-                }
+                self.pause_after_scan();
                 try_mutex(&storage.type_catalog, "type catalog lock poisoned")
             })();
             let mut types = match attempt {
@@ -767,7 +758,12 @@ mod tests {
                     });
                     let resume = ResumeScan(&storage.definition_publication.scan_pause);
                     let deadline = Instant::now() + Duration::from_secs(5);
-                    while storage.definition_publication.scan_pause.load(Ordering::Acquire) != 2 {
+                    while storage
+                        .definition_publication
+                        .scan_pause
+                        .load(Ordering::Acquire)
+                        != 2
+                    {
                         assert!(
                             Instant::now() < deadline,
                             "type publication did not reach its scan boundary"

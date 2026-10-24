@@ -615,7 +615,9 @@ impl super::Storage {
         }
         drop(catalog);
         if has_identity_moves {
-            super::type_reference_moves::DefinitionPublication::validate_generations(self, changes)?;
+            super::type_reference_moves::DefinitionPublication::validate_generations(
+                self, changes,
+            )?;
         }
         Ok(())
     }
@@ -676,14 +678,20 @@ impl super::Storage {
                     && next == State::Absent
                 {
                     Some(super::row_ownership::try_mutex(
-                        &self.enum_member_images, "enum member-image lock poisoned",
+                        &self.enum_member_images,
+                        "enum member-image lock poisoned",
                     )?)
-                } else { None };
+                } else {
+                    None
+                };
                 let comments = if undo.operation == Drop && decision == Commit {
                     Some(super::row_ownership::try_mutex(
-                        &self.comments, "comment catalog lock poisoned",
+                        &self.comments,
+                        "comment catalog lock poisoned",
                     )?)
-                } else { None };
+                } else {
+                    None
+                };
                 Ok((comments, images))
             })();
             match attempt {
@@ -691,9 +699,9 @@ impl super::Storage {
                 Err(wait) => {
                     drop(catalog);
                     #[cfg(test)]
-                    self.definition_publication.waits.fetch_add(
-                        1, core::sync::atomic::Ordering::Release,
-                    );
+                    self.definition_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
                     wait.wait();
                 }
             }
@@ -708,9 +716,12 @@ impl super::Storage {
         if let Some(comments) = &mut comments {
             for slot in 0..comments.entries.len() {
                 let comment = &comments.entries[slot];
-                if comment.used && comment.database == Some(undo.source.database())
-                    && comment.class == super::CommentClass::Type && comment.pending.is_none()
-                    && comment.schema == schema && comment.name == name
+                if comment.used
+                    && comment.database == Some(undo.source.database())
+                    && comment.class == super::CommentClass::Type
+                    && comment.pending.is_none()
+                    && comment.schema == schema
+                    && comment.name == name
                 {
                     comments.entries[slot].live = None;
                     comments.reap(slot);
@@ -954,41 +965,68 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         for (kind, block_images) in [
-            (NamedTypeKind::Domain, false), (NamedTypeKind::Enum, false),
-            (NamedTypeKind::Composite, false), (NamedTypeKind::Enum, true),
+            (NamedTypeKind::Domain, false),
+            (NamedTypeKind::Enum, false),
+            (NamedTypeKind::Composite, false),
+            (NamedTypeKind::Enum, true),
         ] {
             for rollback in [false, true] {
                 let mut storage = fixture();
                 let created = create(&mut storage, kind);
                 storage.finish_type_ddl(created, TypeDdlDecision::Commit);
-                let retained = (kind == NamedTypeKind::Enum).then(|| storage.enum_for(created.slot(), 0));
-                storage.apply_comment(crate::storage::CommentClass::Type,
-                    SqlName::parse("public").unwrap(), SqlName::parse("owned_type").unwrap(), 0,
-                    Some(crate::storage::comment_stackstr("retained type comment").unwrap())).unwrap();
-                let dropped = storage.stage_type_drop(kind, "public", "owned_type", 7).unwrap().unwrap();
+                let retained =
+                    (kind == NamedTypeKind::Enum).then(|| storage.enum_for(created.slot(), 0));
+                storage
+                    .apply_comment(
+                        crate::storage::CommentClass::Type,
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("owned_type").unwrap(),
+                        0,
+                        Some(crate::storage::comment_stackstr("retained type comment").unwrap()),
+                    )
+                    .unwrap();
+                let dropped = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
                 let before = storage.definition_publication.waits.load(Ordering::Acquire);
                 let comments = (!block_images).then(|| storage.comments.lock().unwrap());
                 let images = block_images.then(|| storage.enum_member_images.lock().unwrap());
                 std::thread::scope(|scope| {
-                    let writer = scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.finish_type_ddl(dropped, TypeDdlDecision::Commit)));
+                    let writer = scope.spawn(|| {
+                        crate::mem::guard::forbid_alloc(|| {
+                            storage.finish_type_ddl(dropped, TypeDdlDecision::Commit)
+                        })
+                    });
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while storage.definition_publication.waits.load(Ordering::Acquire) == before
-                        && Instant::now() < deadline {
+                        && Instant::now() < deadline
+                    {
                         std::thread::yield_now();
                     }
-                    let waiting = storage.definition_publication.waits.load(Ordering::Acquire) != before;
-                    let released = waiting && storage.type_catalog.try_lock().is_ok()
+                    let waiting =
+                        storage.definition_publication.waits.load(Ordering::Acquire) != before;
+                    let released = waiting
+                        && storage.type_catalog.try_lock().is_ok()
                         && (block_images || storage.enum_member_images.try_lock().is_ok());
                     if released {
                         crate::mem::guard::forbid_alloc(|| {
-                            let other = storage.create_composite(SqlName::parse("public").unwrap(),
-                                SqlName::parse("unrelated_retirement_type").unwrap(),
-                                crate::storage::CompositeSpec {
-                                    fields: [crate::storage::CompositeFieldDef::EMPTY; crate::storage::MAX_COMPOSITE_FIELDS],
-                                    n_fields: 0,
-                                }, 9).unwrap();
+                            let other = storage
+                                .create_composite(
+                                    SqlName::parse("public").unwrap(),
+                                    SqlName::parse("unrelated_retirement_type").unwrap(),
+                                    crate::storage::CompositeSpec {
+                                        fields: [crate::storage::CompositeFieldDef::EMPTY;
+                                            crate::storage::MAX_COMPOSITE_FIELDS],
+                                        n_fields: 0,
+                                    },
+                                    9,
+                                )
+                                .unwrap();
                             storage.finish_type_ddl(other, TypeDdlDecision::Commit);
-                            if rollback { storage.finish_type_ddl(dropped, TypeDdlDecision::Rollback); }
+                            if rollback {
+                                storage.finish_type_ddl(dropped, TypeDdlDecision::Rollback);
+                            }
                         });
                     }
                     drop((comments, images));
@@ -996,9 +1034,26 @@ mod tests {
                     assert!(waiting && released);
                 });
                 crate::mem::guard::forbid_alloc(|| {
-                    assert_eq!(state(&storage, dropped), if rollback { CatalogDdlState::Present } else { CatalogDdlState::Absent });
-                    assert_eq!(storage.comment_text(crate::storage::CommentClass::Type,
-                        "public", "owned_type", 0, 0).is_some(), rollback);
+                    assert_eq!(
+                        state(&storage, dropped),
+                        if rollback {
+                            CatalogDdlState::Present
+                        } else {
+                            CatalogDdlState::Absent
+                        }
+                    );
+                    assert_eq!(
+                        storage
+                            .comment_text(
+                                crate::storage::CommentClass::Type,
+                                "public",
+                                "owned_type",
+                                0,
+                                0
+                            )
+                            .is_some(),
+                        rollback
+                    );
                     if let Some(retained) = &retained {
                         assert_eq!(retained.members().next().unwrap().label.as_str(), "ready");
                     }

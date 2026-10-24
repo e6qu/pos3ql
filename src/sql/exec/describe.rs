@@ -1828,7 +1828,7 @@ pub(crate) fn visit_catalog_composite_fields(
         );
         count += 1;
     }
-    (count != 0).then_some(count)
+    Some(count)
 }
 
 fn visit_registered_composite_fields(

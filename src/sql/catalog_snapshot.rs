@@ -337,6 +337,15 @@ pub(crate) fn capture_transaction(
                 &committed,
                 &private,
                 &mut batch,
+                |key| {
+                    super::catalog::private_catalog_row(
+                        storage,
+                        transaction.txid,
+                        relation.name,
+                        key,
+                        arena,
+                    )
+                },
                 arena,
             )
         })();
@@ -643,14 +652,16 @@ pub(crate) fn capture_rows(
     committed: &SynthTable<'_>,
     private: &SynthTable<'_>,
     batch: &mut CatalogHistoryBatch,
+    private_change: impl Fn(&[u8]) -> Result<bool, SqlError>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let committed = KeyedRows::from_catalog(committed, key, arena)?;
     let private = KeyedRows::from_catalog(private, key, arena)?;
     for row in committed.iter() {
-        if private
-            .get(row.key)
-            .is_none_or(|after| after.image != row.image)
+        if private_change(row.key)?
+            || private
+                .get(row.key)
+                .is_none_or(|after| after.image != row.image)
         {
             batch.record(relation, row.key, row.image)?;
         }
@@ -669,15 +680,25 @@ fn selected_image<'a>(
     current: Option<CatalogRowImage<'a>>,
     private: Option<CatalogRowImage<'a>>,
     historical: Option<KeyedRow<'a>>,
+    private_change: bool,
 ) -> Result<Option<CatalogRowImage<'a>>, SqlError> {
     let snapshot = historical.map_or(current, |row| row.image);
     match key {
-        CatalogRowKey::Columns(_) => Ok(if current != private {
-            private
-        } else {
-            snapshot
+        CatalogRowKey::Columns(_) => Ok(match historical {
+            Some(KeyedRow {
+                image: Some(before),
+                ..
+            }) => Some(before),
+            _ if private_change || current != private => private,
+            _ => snapshot,
         }),
         CatalogRowKey::Tuple => {
+            if private_change {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "multiset catalog rows require counted private changes"
+                ));
+            }
             let count = i64::from(snapshot.map_or(0, |row| row.count.get()))
                 + i64::from(private.map_or(0, |row| row.count.get()))
                 - i64::from(current.map_or(0, |row| row.count.get()));
@@ -701,13 +722,14 @@ fn selected_image<'a>(
     }
 }
 
-/// Own pending changes override the older committed snapshot. Otherwise the
-/// earliest before-image after that snapshot replaces the current catalog row.
+/// A private write to a newer committed tuple does not replace the older
+/// catalog tuple selected by the statement. Own creations remain visible.
 pub(crate) fn restore_rows<'a>(
     key: CatalogRowKey<'_>,
     committed: &SynthTable<'a>,
     private: &SynthTable<'a>,
     history: &[HistoricalCatalogRow<'a>],
+    private_change: impl Fn(&[u8]) -> Result<bool, SqlError>,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let committed_rows = KeyedRows::from_catalog(committed, key, arena)?;
@@ -728,6 +750,7 @@ pub(crate) fn restore_rows<'a>(
             committed_rows.get(row.key).and_then(|row| row.image),
             row.image,
             historical_rows.get(row.key),
+            private_change(row.key)?,
         )?;
         count += 1;
     }
@@ -739,6 +762,7 @@ pub(crate) fn restore_rows<'a>(
                 committed_rows.get(row.key).and_then(|row| row.image),
                 None,
                 Some(row),
+                private_change(row.key)?,
             )?;
             count += 1;
         }
@@ -858,18 +882,29 @@ mod tests {
                 ],
             );
             let mut batch = history.reserve().unwrap();
-            capture_rows(relation(), KEY, &before, &current, &mut batch, &arena).unwrap();
+            capture_rows(
+                relation(),
+                KEY,
+                &before,
+                &current,
+                &mut batch,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             batch.publish(NonZeroU64::new(7).unwrap());
             let changes = history.rows_at(relation(), 6, &arena).unwrap();
             assert_eq!(changes.len(), 3);
-            let restored = restore_rows(KEY, &current, &current, changes, &arena).unwrap();
+            let restored =
+                restore_rows(KEY, &current, &current, changes, |_| Ok(false), &arena).unwrap();
             assert_eq!(restored.rows.len(), 3);
             assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), Some("same"));
             assert_eq!(comment(&restored, 3), None);
             assert_eq!(comment(&restored, 4), Some("deleted"));
             let fresh = history.rows_at(relation(), 7, &arena).unwrap();
-            let restored = restore_rows(KEY, &current, &current, fresh, &arena).unwrap();
+            let restored =
+                restore_rows(KEY, &current, &current, fresh, |_| Ok(false), &arena).unwrap();
             assert_eq!(comment(&restored, 1), Some("new"));
             assert_eq!(comment(&restored, 3), Some("created"));
             assert_eq!(comment(&restored, 4), None);
@@ -877,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_snapshot_private_updates_creation_deletion_and_rollback_override_history() {
+    fn catalog_snapshot_private_changes_preserve_the_selected_committed_tuple() {
         let mut budget = Budget::new(32 * 1024 * 1024);
         let history = CatalogHistory::new(&mut budget, 4096, 1, 8).unwrap();
         let arena = Arena::new(&mut budget, "catalog snapshot test", 16 * 1024 * 1024).unwrap();
@@ -891,29 +926,65 @@ mod tests {
                 &[description(1, "new"), description(2, "new other object")],
             );
             let mut batch = history.reserve().unwrap();
-            capture_rows(relation(), KEY, &before, &current, &mut batch, &arena).unwrap();
+            capture_rows(
+                relation(),
+                KEY,
+                &before,
+                &current,
+                &mut batch,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             batch.publish(NonZeroU64::new(7).unwrap());
             let changes = history.rows_at(relation(), 6, &arena).unwrap();
             let private = table(
                 &arena,
                 &[description(1, "my change"), description(4, "my new object")],
             );
-            let restored = restore_rows(KEY, &current, &private, changes, &arena).unwrap();
+            let restored =
+                restore_rows(KEY, &current, &private, changes, |_| Ok(false), &arena).unwrap();
             assert_eq!(restored.rows.len(), 3);
-            assert_eq!(comment(&restored, 1), Some("my change"));
+            assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), None);
             assert_eq!(comment(&restored, 3), Some("old deleted object"));
             assert_eq!(comment(&restored, 4), Some("my new object"));
             let deleted = table(&arena, &[description(2, "new other object")]);
-            let restored = restore_rows(KEY, &current, &deleted, changes, &arena).unwrap();
-            assert_eq!(restored.rows.len(), 1);
-            assert_eq!(comment(&restored, 1), None);
+            let restored =
+                restore_rows(KEY, &current, &deleted, changes, |_| Ok(false), &arena).unwrap();
+            assert_eq!(restored.rows.len(), 2);
+            assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), None);
             assert_eq!(comment(&restored, 3), Some("old deleted object"));
-            let rolled_back = restore_rows(KEY, &current, &current, changes, &arena).unwrap();
+            let rolled_back =
+                restore_rows(KEY, &current, &current, changes, |_| Ok(false), &arena).unwrap();
             assert_eq!(rolled_back.rows.len(), 2);
             assert_eq!(comment(&rolled_back, 1), Some("old"));
             assert_eq!(comment(&rolled_back, 3), Some("old deleted object"));
+            let overwritten =
+                encode_projected_pub(&[Datum::Oid(1), Datum::Oid(1259), Datum::Int4(0)], &arena)
+                    .unwrap();
+            let removed =
+                encode_projected_pub(&[Datum::Oid(3), Datum::Oid(1259), Datum::Int4(0)], &arena)
+                    .unwrap();
+            let own_equal_values = restore_rows(
+                KEY,
+                &current,
+                &current,
+                changes,
+                |key| Ok(key == overwritten || key == removed),
+                &arena,
+            )
+            .unwrap();
+            assert_eq!(own_equal_values.rows.len(), 2);
+            assert_eq!(comment(&own_equal_values, 1), Some("old"));
+            assert_eq!(comment(&own_equal_values, 3), Some("old deleted object"));
+            let selected_tuple =
+                restore_rows(KEY, &before, &private, &[], |_| Ok(false), &arena).unwrap();
+            assert_eq!(selected_tuple.rows.len(), 2);
+            assert_eq!(comment(&selected_tuple, 1), Some("my change"));
+            assert_eq!(comment(&selected_tuple, 3), None);
+            assert_eq!(comment(&selected_tuple, 4), Some("my new object"));
         });
     }
 
@@ -934,7 +1005,16 @@ mod tests {
             );
             let current = table(&arena, &[description(1, "same")]);
             let mut batch = history.reserve().unwrap();
-            capture_rows(relation(), KEY, &before, &current, &mut batch, &arena).unwrap();
+            capture_rows(
+                relation(),
+                KEY,
+                &before,
+                &current,
+                &mut batch,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             batch.publish(NonZeroU64::new(7).unwrap());
             assert!(history.rows_at(relation(), 6, &arena).unwrap().is_empty());
             let duplicate = table(&arena, &[description(1, "same"), description(1, "same")]);
@@ -944,6 +1024,21 @@ mod tests {
             };
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert!(error.message.as_str().contains("duplicate unique row keys"));
+            let mut batch = history.reserve().unwrap();
+            capture_rows(
+                relation(),
+                KEY,
+                &current,
+                &current,
+                &mut batch,
+                |_| Ok(true),
+                &arena,
+            )
+            .unwrap();
+            assert!(batch.has_rows());
+            batch.publish(NonZeroU64::new(8).unwrap());
+            let physical_update = history.rows_at(relation(), 7, &arena).unwrap();
+            assert_eq!(physical_update.len(), 1);
         });
     }
 
@@ -969,6 +1064,7 @@ mod tests {
                 &before,
                 &current,
                 &mut batch,
+                |_| Ok(false),
                 &arena,
             )
             .unwrap();
@@ -976,8 +1072,15 @@ mod tests {
             let changes = history.rows_at(relation(), 6, &arena).unwrap();
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].before.unwrap().count.get(), 3);
-            let restored =
-                restore_rows(CatalogRowKey::Tuple, &current, &current, changes, &arena).unwrap();
+            let restored = restore_rows(
+                CatalogRowKey::Tuple,
+                &current,
+                &current,
+                changes,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 3);
             assert!(
                 restored
@@ -986,12 +1089,26 @@ mod tests {
                     .all(|row| row[3] == Datum::Text("same"))
             );
             let added = table(&arena, &[description(1, "same"), description(1, "same")]);
-            let restored =
-                restore_rows(CatalogRowKey::Tuple, &current, &added, changes, &arena).unwrap();
+            let restored = restore_rows(
+                CatalogRowKey::Tuple,
+                &current,
+                &added,
+                changes,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 4);
             let removed = table(&arena, &[]);
-            let restored =
-                restore_rows(CatalogRowKey::Tuple, &current, &removed, changes, &arena).unwrap();
+            let restored = restore_rows(
+                CatalogRowKey::Tuple,
+                &current,
+                &removed,
+                changes,
+                |_| Ok(false),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 2);
         });
     }

@@ -21310,17 +21310,39 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         &mut transaction,
         &mut guc,
         &format!(
-            "SAVEPOINT before_comment; COMMENT ON TABLE described_orders IS 'own table'; {query}; ROLLBACK TO before_comment; {query}"
+            "SAVEPOINT before_comment;
+             COMMENT ON TABLE described_orders IS 'new table'; {query};
+             SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0;
+             ROLLBACK TO before_comment;
+             COMMENT ON TABLE described_orders IS 'own table'; {query}; ROLLBACK TO before_comment; {query}"
         ),
     );
     assert_eq!(
         data_rows(&private),
         [
-            "own table|own table|old column",
+            "old table|old table|old column",
+            "old table",
+            "old table|old table|old column",
             "old table|old table|old column"
         ],
         "{}",
         String::from_utf8_lossy(&private)
+    );
+    let removed = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON COLUMN described_orders.id IS NULL",
+    );
+    assert!(!String::from_utf8_lossy(&removed).contains("ERROR"));
+    let absent_removal = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+        &format!("SAVEPOINT before_absent_removal; COMMENT ON COLUMN described_orders.id IS NULL; {query};
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 1;
+            ROLLBACK TO before_absent_removal"));
+    assert_eq!(
+        data_rows(&absent_removal),
+        ["old table|old table|old column", "old column"],
+        "{}",
+        String::from_utf8_lossy(&absent_removal)
     );
     let dropped = run_with(
         &mut engine,

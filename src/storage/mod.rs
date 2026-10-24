@@ -12947,48 +12947,73 @@ impl Iterator for LiveCommentIter<'_> {
     }
 }
 
-struct VisibleCommentIter<'a> {
+pub(crate) struct CatalogComment {
+    pub(crate) class: CommentClass,
+    pub(crate) schema: SqlName,
+    pub(crate) name: SqlName,
+    pub(crate) subid: u32,
+    pub(crate) text: Option<StackStr<COMMENT_MAX>>,
+    pub(crate) private: bool,
+    pub(crate) lookup_transaction: u32,
+}
+
+struct CatalogCommentIter<'a> {
     catalog: &'a Mutex<CommentCatalog>,
     database: DatabaseOid,
     txid: u32,
     next_slot: usize,
 }
 
-impl Iterator for VisibleCommentIter<'_> {
-    type Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>);
+impl Iterator for CatalogCommentIter<'_> {
+    type Item = CatalogComment;
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("comment catalog lock poisoned");
-        while self.next_slot < catalog.entries.len() {
-            let slot = self.next_slot;
+        while let Some(comment) = catalog.entries.get(self.next_slot).copied() {
             self.next_slot += 1;
-            let comment = catalog.entries[slot];
             if !comment.used
-                || comment
-                    .pending_drop
-                    .is_some_and(|pending| pending.txid == self.txid)
                 || comment
                     .database
                     .is_some_and(|database| database != self.database)
             {
                 continue;
             }
+            let removed = self.txid != 0
+                && comment
+                    .pending_drop
+                    .is_some_and(|pending| pending.txid == self.txid);
+            let pending = comment
+                .pending
+                .filter(|pending| self.txid != 0 && pending.txid == self.txid);
             let identity = comment
                 .pending_identity
-                .filter(|identity| identity.txid == self.txid);
-            let Some(text) = (match comment.pending {
-                Some(pending) if pending.txid == self.txid => pending.text,
-                _ => comment.live,
-            }) else {
-                continue;
+                .filter(|identity| self.txid != 0 && identity.txid == self.txid);
+            let private = removed || pending.is_some();
+            let text = if removed {
+                None
+            } else {
+                pending.map_or(comment.live, |pending| pending.text)
             };
-            return Some((
-                comment.class,
-                identity.map_or(comment.schema, |identity| identity.schema),
-                identity.map_or(comment.name, |identity| identity.name),
-                comment.subid,
+            if text.is_none() && !private {
+                continue;
+            }
+            return Some(CatalogComment {
+                class: comment.class,
+                schema: if removed {
+                    comment.schema
+                } else {
+                    identity.map_or(comment.schema, |identity| identity.schema)
+                },
+                name: if removed {
+                    comment.name
+                } else {
+                    identity.map_or(comment.name, |identity| identity.name)
+                },
+                subid: comment.subid,
                 text,
-            ));
+                private,
+                lookup_transaction: if removed { 0 } else { self.txid },
+            });
         }
         None
     }
@@ -27376,7 +27401,21 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>)> + '_
     {
-        VisibleCommentIter {
+        self.catalog_comments(txid).filter_map(|comment| {
+            comment.text.map(|text| {
+                (
+                    comment.class,
+                    comment.schema,
+                    comment.name,
+                    comment.subid,
+                    text,
+                )
+            })
+        })
+    }
+
+    pub(crate) fn catalog_comments(&self, txid: u32) -> impl Iterator<Item = CatalogComment> + '_ {
+        CatalogCommentIter {
             catalog: &self.comments,
             database: current_database(),
             txid,
@@ -27602,7 +27641,7 @@ impl Storage {
     /// Sets (or, with `text == None`, removes) a comment as `txid`'s
     /// uncommitted overlay. Returns the slot and the prior overlay, for the
     /// transaction's undo log. A fresh key claims a free slot; exhausting the
-    /// slab is a loud error.
+    /// slab is a loud error. Removing an absent comment returns no change.
     pub fn set_comment(
         &self,
         class: CommentClass,
@@ -27611,7 +27650,7 @@ impl Storage {
         subid: u32,
         text: Option<StackStr<COMMENT_MAX>>,
         txid: u32,
-    ) -> Result<(usize, Option<PendingComment>), SqlError> {
+    ) -> Result<Option<(usize, Option<PendingComment>)>, SqlError> {
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
@@ -27623,9 +27662,23 @@ impl Storage {
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid))
         }) {
+            if let Some(pending) = comments.entries[slot].pending
+                && pending.txid != txid
+            {
+                return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
+            }
+            let visible = comments.entries[slot]
+                .pending
+                .map_or(comments.entries[slot].live, |pending| pending.text);
+            if text.is_none() && visible.is_none() {
+                return Ok(None);
+            }
             let prior = comments.entries[slot].pending.take();
             comments.entries[slot].pending = Some(PendingComment { txid, text });
-            return Ok((slot, prior));
+            return Ok(Some((slot, prior)));
+        }
+        if text.is_none() {
+            return Ok(None);
         }
         let Some(slot) = comments.entries.iter().position(|c| !c.used) else {
             return Err(sql_err!(
@@ -27646,15 +27699,23 @@ impl Storage {
             pending_identity: None,
             pending_drop: None,
         };
-        Ok((slot, None))
+        Ok(Some((slot, None)))
     }
 
     /// Rollback: restores the comment slot's prior uncommitted overlay,
     /// freeing the slot if it now holds nothing.
     pub fn restore_comment_pending(&self, slot: usize, prior: Option<PendingComment>) {
         let mut comments = self.comment_catalog();
+        let released = comments.entries[slot]
+            .pending
+            .filter(|pending| prior.is_none_or(|prior| prior.txid != pending.txid))
+            .map(|pending| pending.txid);
         comments.entries[slot].pending = prior;
         comments.reap(slot);
+        drop(comments);
+        if let Some(transaction) = released {
+            self.wake_transaction_waiters(transaction);
+        }
     }
 
     /// Commit: promotes `txid`'s overlay to the committed value and returns the
@@ -27672,7 +27733,7 @@ impl Storage {
     )> {
         let mut comments = self.comment_catalog();
         let entry = &mut comments.entries[slot];
-        match entry.pending {
+        let committed = match entry.pending {
             Some(p) if p.txid == txid => {
                 if entry
                     .pending_identity
@@ -27698,7 +27759,12 @@ impl Storage {
                 Some(out)
             }
             _ => None,
+        };
+        drop(comments);
+        if committed.is_some() {
+            self.wake_transaction_waiters(txid);
         }
+        committed
     }
 
     /// Committed apply (journal replay and checkpoint load): sets the committed
@@ -56416,6 +56482,7 @@ mod tests {
                 Some(StackStr::from_str("comment")),
                 10,
             )
+            .unwrap()
             .unwrap();
         storage.commit_comment(comment, 10);
         assert!(
@@ -57852,12 +57919,62 @@ mod tests {
     }
 
     #[test]
+    fn comment_catalog_private_writes_wait_and_absent_removals_use_no_capacity() {
+        let mut config = test_config();
+        config.max_comments = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("commented").unwrap();
+        let absent = SqlName::parse("absent").unwrap();
+        let text = Some(comment_stackstr("same text").unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, _) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 7)
+                .unwrap()
+                .unwrap();
+            let error = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert!(
+                storage
+                    .set_comment(CommentClass::Relation, schema, absent, 0, None, 8)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(storage.commit_comment(slot, 7).is_some());
+            let (same_slot, prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(same_slot, slot);
+            assert!(storage.catalog_comments(8).next().unwrap().private);
+            storage.restore_comment_pending(same_slot, prior);
+            assert!(!storage.catalog_comments(8).next().unwrap().private);
+            let (slot, _) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, None, 9)
+                .unwrap()
+                .unwrap();
+            assert!(storage.catalog_comments(9).next().unwrap().private);
+            storage.commit_comment(slot, 9).unwrap();
+            assert!(
+                storage
+                    .set_comment(CommentClass::Relation, schema, name, 0, None, 10)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(storage.catalog_comments(10).count(), 0);
+        });
+    }
+
+    #[test]
     fn comment_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Mutex<CommentCatalog>>();
         assert_send_sync::<LiveCommentIter<'_>>();
         assert_send_sync::<CheckpointCommentIter<'_>>();
-        assert_send_sync::<VisibleCommentIter<'_>>();
+        assert_send_sync::<CatalogCommentIter<'_>>();
 
         const WORKERS: usize = 4;
         let names = ["comment_a", "comment_b", "comment_c", "comment_d"];
@@ -57881,6 +57998,7 @@ mod tests {
                             Some(comment_stackstr(texts[worker]).unwrap()),
                             txid,
                         )
+                        .unwrap()
                         .unwrap();
                     assert!(prior.is_none());
                     assert!(storage.commit_comment(slot, txid).is_some());

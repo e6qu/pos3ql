@@ -38930,14 +38930,17 @@ fn stage_comment(
         Some("") | None => None,
         Some(text) => Some(crate::storage::comment_stackstr(text)?),
     };
-    let (slot, prior) = storage.set_comment(
+    let Some((slot, prior)) = storage.set_comment(
         identity.class,
         identity.schema,
         identity.name,
         identity.subid,
         stored_text,
         txn.txid,
-    )?;
+    )?
+    else {
+        return Ok(());
+    };
     let temporary = match identity.class {
         crate::storage::CommentClass::Relation => [
             crate::storage::AccessClass::Table,
@@ -50811,27 +50814,18 @@ pub fn drop_access_method(
                 Err(error) => return Err(error),
             }
         }
-        if storage
-            .comment_text(
-                crate::storage::CommentClass::AccessMethod,
-                "",
-                method.definition.name.as_str(),
-                method.oid().get() as u32,
-                txn.txid,
-            )
-            .is_some()
-        {
-            let (comment_slot, prior) = match storage.set_comment(
-                crate::storage::CommentClass::AccessMethod,
-                SqlName::EMPTY,
-                method.definition.name,
-                method.oid().get() as u32,
-                None,
-                txn.txid,
-            ) {
-                Ok(comment) => comment,
-                Err(error) => return sql_fail(error),
-            };
+        let comment = match storage.set_comment(
+            crate::storage::CommentClass::AccessMethod,
+            SqlName::EMPTY,
+            method.definition.name,
+            method.oid().get() as u32,
+            None,
+            txn.txid,
+        ) {
+            Ok(comment) => comment,
+            Err(error) => return sql_fail(error),
+        };
+        if let Some((comment_slot, prior)) = comment {
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
@@ -68153,7 +68147,8 @@ fn alter_table_relation(
             None,
             txn.txid,
         ) {
-            Ok(comment) => comment,
+            Ok(Some(comment)) => comment,
+            Ok(None) => continue,
             Err(error) => return sql_fail(error),
         };
         if storage.table_def(dropped_table, txn.txid).persistence

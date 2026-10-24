@@ -41,6 +41,10 @@ object for use. For example, after another connection renames `orders` to
 and sequence counters keep advancing. Do not freeze every metadata lookup at
 the row snapshot. Compare both paths with PostgreSQL 18, including replacement
 objects, comments, enum labels, private changes and rollback.
+Own creations must be visible. If another connection already replaced a comment,
+editing its newer version can leave an older transaction's comment lookup
+returning the old text until commit. Check this separately from ordinary private
+edits and savepoint rollback against PostgreSQL.
 Parameter permission rows must preserve their identity through edits and restart,
 and receive a new identity after their removal. Check empty permission lists
 separately from restored default permissions, which remove the catalog row.

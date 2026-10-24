@@ -8992,6 +8992,7 @@ pub fn synthesize<'a>(
                 &committed,
                 selected,
                 history,
+                |key| private_catalog_row(storage, txid, relation.name, key, arena),
                 arena,
             );
         }
@@ -14485,30 +14486,42 @@ pub fn comment_text_for<'a>(
     };
     let collect = |transaction| {
         let mut rows = [None; super::catalog_snapshot_keys::RELATIONS.len()];
-        visit_comments_for_object(storage, transaction, target, oid, |catalog, text| {
-            let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "comment refers to an unknown catalog"
-                )
-            })? as u32;
-            let row = &mut rows[ordinal(classoid)?];
-            if row.is_some() {
-                return Err(sql_err!(
-                    sqlstate::CARDINALITY_VIOLATION,
-                    "more than one row returned by a subquery used as an expression"
-                ));
-            }
-            *row = Some(arena.alloc_str(text).map_err(|_| arena_full())?);
-            Ok(())
-        })?;
-        Ok::<_, SqlError>(rows)
+        let mut owned = [false; super::catalog_snapshot_keys::RELATIONS.len()];
+        let mut seen = [false; super::catalog_snapshot_keys::RELATIONS.len()];
+        visit_comments_for_object(
+            storage,
+            transaction,
+            target,
+            oid,
+            |catalog, text, private| {
+                let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "comment refers to an unknown catalog"
+                    )
+                })? as u32;
+                let index = ordinal(classoid)?;
+                let row = &mut rows[index];
+                owned[index] |= private;
+                if core::mem::replace(&mut seen[index], true) {
+                    return Err(sql_err!(
+                        sqlstate::CARDINALITY_VIOLATION,
+                        "more than one row returned by a subquery used as an expression"
+                    ));
+                }
+                *row = text
+                    .map(|text| arena.alloc_str(text).map_err(|_| arena_full()))
+                    .transpose()?;
+                Ok(())
+            },
+        )?;
+        Ok::<_, SqlError>((rows, owned))
     };
-    let private = collect(txid)?;
+    let (private, owned) = collect(txid)?;
     let committed = if history.is_empty() {
         private
     } else {
-        collect(0)?
+        collect(0)?.0
     };
     let mut older = [None; super::catalog_snapshot_keys::RELATIONS.len()];
     for row in history {
@@ -14540,10 +14553,11 @@ pub fn comment_text_for<'a>(
     }
     let mut found = None;
     for index in 0..private.len() {
-        let selected = if private[index] != committed[index] {
-            private[index]
-        } else {
-            older[index].unwrap_or(committed[index])
+        let selected = match older[index] {
+            Some(Some(before)) => Some(before),
+            _ if owned[index] || private[index] != committed[index] => private[index],
+            Some(None) => None,
+            None => committed[index],
         };
         if let Some(text) = selected
             && found.replace(text).is_some()
@@ -14557,19 +14571,77 @@ pub fn comment_text_for<'a>(
     Ok(found)
 }
 
+pub(crate) fn private_catalog_row(
+    storage: &Storage,
+    txid: u32,
+    relation: &str,
+    key: &[u8],
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    if txid == 0 || !matches!(relation, "pg_description" | "pg_shdescription") {
+        return Ok(false);
+    }
+    let oid_at = |index| match super::exec::decode_projected_col_record(key, index, arena)? {
+        Datum::Oid(oid) => Ok(oid),
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid private description key"
+        )),
+    };
+    let oid = oid_at(0)?;
+    let classoid = oid_at(1)?;
+    let catalog = i32::try_from(classoid)
+        .ok()
+        .and_then(catalog_relation_name)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "private description refers to an unknown catalog"
+            )
+        })?;
+    let target = if relation == "pg_shdescription" {
+        super::eval::DescriptionTarget::Shared { catalog }
+    } else {
+        let column = match super::exec::decode_projected_col_record(key, 2, arena)? {
+            Datum::Int4(column) => column,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid private description column key"
+                ));
+            }
+        };
+        super::eval::DescriptionTarget::Local {
+            catalog: Some(catalog),
+            column,
+        }
+    };
+    let mut owned = false;
+    visit_comments_for_object(storage, txid, target, oid, |_, _, private| {
+        owned |= private;
+        Ok(())
+    })?;
+    Ok(owned)
+}
+
 fn visit_comments_for_object(
     storage: &Storage,
     txid: u32,
     target: super::eval::DescriptionTarget<'_>,
     oid: u32,
-    mut visit: impl FnMut(&str, &str) -> Result<(), SqlError>,
+    mut visit: impl FnMut(&str, Option<&str>, bool) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let (catalog_name, subid, shared) = match target {
         super::eval::DescriptionTarget::Local { catalog, column } => (catalog, column, false),
         super::eval::DescriptionTarget::Shared { catalog } => (Some(catalog), 0, true),
     };
     let signed_oid = i32::try_from(oid).ok();
-    for (class, schema, name, csub, text) in storage.comments_visible(txid) {
+    for comment in storage.catalog_comments(txid) {
+        let class = comment.class;
+        let schema = comment.schema;
+        let name = comment.name;
+        let csub = comment.subid;
+        let txid = comment.lookup_transaction;
         let is_shared = matches!(
             class,
             crate::storage::CommentClass::Role
@@ -14581,7 +14653,6 @@ fn visit_comments_for_object(
         }
         let schema = schema.as_str();
         let name = name.as_str();
-        let text = text.as_str();
         let selected_catalog = match catalog_name {
             Some(name) => name,
             None => match class {
@@ -14904,7 +14975,11 @@ fn visit_comments_for_object(
             _ => false,
         };
         if hit {
-            visit(selected_catalog, text)?;
+            visit(
+                selected_catalog,
+                comment.text.as_ref().map(|text| text.as_str()),
+                comment.private,
+            )?;
         }
     }
     Ok(())

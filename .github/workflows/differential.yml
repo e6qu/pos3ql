@@ -499,6 +499,25 @@ jobs:
           done
           exit 1
 
+      - name: Verify generated PostgreSQL type routine metadata
+        if: matrix.run_core == '1'
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          generated="$RUNNER_TEMP/catalog_metadata.rs"
+          tools/generate-pg18-catalog-metadata.sh "$POSTGRES_CONTAINER" "$generated"
+          python3 - "$generated" <<'PY'
+          from pathlib import Path
+          import sys
+
+          declaration = 'pub(crate) const TYPE_IO: &[TypeIo] = &['
+          expected = Path('src/sql/catalog_metadata.rs').read_text().split(declaration, 1)[1]
+          actual = Path(sys.argv[1]).read_text().split(declaration, 1)[1]
+          if actual != expected:
+              raise SystemExit('generated type routine metadata differs from PostgreSQL')
+          print('PostgreSQL type input/output identifiers and names match generated metadata')
+          PY
+
       - name: Install SQL extension oracle fixtures
         if: matrix.run_fast == '1'
         run: |
@@ -577,4 +596,13 @@ jobs:
           FUZZ_BUDGET: "0"
           POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
-        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh "$RUNNER_TEMP/differential-release/pos3ql"
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh "$RUNNER_TEMP/differential-release/pos3ql" "$RUNNER_TEMP/differential-evidence"
+
+      - name: Retain catalog comparison evidence
+        if: always() && matrix.auxiliary_phase == 'types'
+        uses: actions/upload-artifact@v6
+        with:
+          name: catalog-comparison-${{ github.sha }}
+          path: ${{ runner.temp }}/differential-evidence/
+          if-no-files-found: error
+          retention-days: 7

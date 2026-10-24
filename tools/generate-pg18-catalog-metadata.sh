@@ -99,8 +99,8 @@ source_image=$(docker inspect "$container" --format '{{.Image}}')
     docker exec "$container" psql -U postgres -Atc "
         SELECT format(
             '    TypeIo { oid: %s, input: TypeIoRoutine { oid: %s, name: %s }, output: TypeIoRoutine { oid: %s, name: %s } },',
-            t.oid, t.typinput, chr(34) || i.proname || chr(34),
-            t.typoutput, chr(34) || o.proname || chr(34))
+            t.oid, t.typinput::oid, chr(34) || i.proname || chr(34),
+            t.typoutput::oid, chr(34) || o.proname || chr(34))
         FROM pg_catalog.pg_type AS t
         JOIN pg_catalog.pg_proc AS i ON i.oid = t.typinput
         JOIN pg_catalog.pg_proc AS o ON o.oid = t.typoutput

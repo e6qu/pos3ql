@@ -100,6 +100,14 @@ implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values.
+Synchronize concurrent catalog changes before comparing current permission
+lookups. For example, after another connection grants access to `orders`,
+`LOCK TABLE orders IN ACCESS SHARE MODE` acquires a new relation lock and makes
+PostgreSQL process pending cache changes. A constant-only `pg_get_acl` query can
+otherwise reuse cached information in repeatable read. Keep checking ordinary
+catalog listings against the older transaction snapshot. See PostgreSQL 18.6's
+[relation lock refresh](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/storage/lmgr/lmgr.c#L110-L130)
+and [catalog snapshot invalidation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/cache/inval.c#L768-L789).
 Use the same relation kind on both sides when checking accepted commands. For
 example, a PostgreSQL plain table cannot establish whether a command is accepted
 on a foreign table; use a PostgreSQL foreign table for that boundary.

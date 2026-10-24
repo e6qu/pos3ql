@@ -21263,6 +21263,43 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn parameter_acl_row_identity_default_removal_and_empty_lists_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget,
+        "CREATE ROLE parameter_reader;
+         CREATE ROLE parameter_writer;
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         CREATE TABLE saved_parameter_oid AS SELECT oid FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT ALTER SYSTEM ON PARAMETER event_triggers TO parameter_writer;
+         SELECT oid = (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         REVOKE ALTER SYSTEM ON PARAMETER event_triggers FROM parameter_writer;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         SELECT oid <> (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         UPDATE saved_parameter_oid SET oid = (SELECT oid FROM pg_parameter_acl WHERE parname = 'event_triggers');
+         BEGIN;
+         SAVEPOINT before_parameter_recreation;
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         SELECT oid <> (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         ROLLBACK TO before_parameter_recreation;
+         SELECT oid = (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         COMMIT;
+         REVOKE ALL ON PARAMETER event_triggers FROM postgres;
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT ALL ON PARAMETER event_triggers TO postgres;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'event_triggers';");
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["t", "0", "t", "t", "t", "{}", "0"]);
+}
+
+#[test]
 fn parameter_acls_are_typed_enforced_and_visible() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -21335,6 +21372,7 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("parameter-acl-cold-{sequence}"));
+    config.max_prepared_transactions = 2;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-parameter-acl-{}-{sequence}", std::process::id());
@@ -21352,23 +21390,72 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         &mut engine,
         &mut budget,
         "CREATE ROLE durable_parameter_operator;
-         GRANT SET ON PARAMETER event_triggers TO durable_parameter_operator;",
+         GRANT SET ON PARAMETER event_triggers, track_functions TO durable_parameter_operator;
+         REVOKE ALL ON PARAMETER track_functions FROM postgres;
+         REVOKE SET ON PARAMETER track_functions FROM durable_parameter_operator;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&output)
     );
+    let original_ids = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT parname, oid FROM pg_parameter_acl ORDER BY parname",
+    ));
+    assert_eq!(original_ids.len(), 2);
     assert!(engine.checkpoint().unwrap());
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT ALTER SYSTEM ON PARAMETER event_triggers TO durable_parameter_operator;
+         BEGIN;
+         CREATE ROLE prepared_parameter_operator;
+         GRANT SET ON PARAMETER application_name TO prepared_parameter_operator;
+         PREPARE TRANSACTION 'parameter-commit';
+         BEGIN;
+         GRANT SET ON PARAMETER datestyle TO durable_parameter_operator;
+         PREPARE TRANSACTION 'parameter-rollback';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT parname, oid FROM pg_parameter_acl ORDER BY parname"
+        )),
+        original_ids
+    );
+    let resolved = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT count(*) FROM pg_parameter_acl WHERE parname IN ('application_name', 'datestyle');
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';
+         COMMIT PREPARED 'parameter-commit';
+         ROLLBACK PREPARED 'parameter-rollback';
+         SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'datestyle';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&resolved).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&resolved)
+    );
+    assert_eq!(data_rows(&resolved), ["0", "{}", "t", "0"]);
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT parname, paracl::text FROM pg_parameter_acl;
+        "SELECT parname, paracl::text FROM pg_parameter_acl WHERE parname = 'event_triggers';
          SELECT has_parameter_privilege('durable_parameter_operator', 'event_triggers', 'SET');
          SET ROLE durable_parameter_operator;
          SET event_triggers = off;",
@@ -21376,13 +21463,31 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     assert_eq!(
         data_rows(&output),
         [
-            "event_triggers|{postgres=sA/postgres,durable_parameter_operator=s/postgres}",
+            "event_triggers|{postgres=sA/postgres,durable_parameter_operator=sA/postgres}",
             "t"
         ],
         "{}",
         String::from_utf8_lossy(&output)
     );
+    assert!(restarted.checkpoint().unwrap());
     drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut final_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    let final_rows = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';
+         SELECT count(*) FROM pg_prepared_xacts;",
+    );
+    assert_eq!(
+        data_rows(&final_rows),
+        ["t", "{}", "0"],
+        "{}",
+        String::from_utf8_lossy(&final_rows)
+    );
+    drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

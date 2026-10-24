@@ -172,34 +172,34 @@ def transcript(reader, writer):
         writer.execute("CREATE ROLE catalog_parameter_writer_diff")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:
-            count_query = "SELECT count(*) FROM pg_parameter_acl WHERE parname='log_min_messages'"
-            acl_query = "SELECT paracl::text FROM pg_parameter_acl WHERE parname='log_min_messages'"
+            count_query = "SELECT count(*) FROM pg_parameter_acl WHERE parname='track_functions'"
+            acl_query = "SELECT paracl::text FROM pg_parameter_acl WHERE parname='track_functions'"
             record(reader, f"{prefix}.parameter_acl.before", count_query)
-            writer.execute("GRANT SET ON PARAMETER log_min_messages TO catalog_parameter_reader_diff")
-            first_oid = writer.execute("SELECT oid FROM pg_parameter_acl WHERE parname='log_min_messages'").fetchone()[0]
+            writer.execute("GRANT SET ON PARAMETER track_functions TO catalog_parameter_reader_diff")
+            first_oid = writer.execute("SELECT oid FROM pg_parameter_acl WHERE parname='track_functions'").fetchone()[0]
             record(reader, f"{prefix}.parameter_acl.catalog", count_query)
-            record(reader, f"{prefix}.parameter_acl.current_privilege", "SELECT has_parameter_privilege('catalog_parameter_reader_diff', 'log_min_messages', 'SET')")
-            writer.execute("GRANT ALTER SYSTEM ON PARAMETER log_min_messages TO catalog_parameter_writer_diff")
-            record(writer, f"{prefix}.parameter_acl.stable_oid", "SELECT oid=%s::oid FROM pg_parameter_acl WHERE parname='log_min_messages'", (first_oid,))
+            record(reader, f"{prefix}.parameter_acl.current_privilege", "SELECT has_parameter_privilege('catalog_parameter_reader_diff', 'track_functions', 'SET')")
+            writer.execute("GRANT ALTER SYSTEM ON PARAMETER track_functions TO catalog_parameter_writer_diff")
+            record(writer, f"{prefix}.parameter_acl.stable_oid", "SELECT oid=%s::oid FROM pg_parameter_acl WHERE parname='track_functions'", (first_oid,))
             record(writer, f"{prefix}.parameter_acl.complete_acl", acl_query)
             reader.execute("COMMIT")
             record(reader, f"{prefix}.parameter_acl.fresh", acl_query)
-            writer.execute("REVOKE SET ON PARAMETER log_min_messages FROM catalog_parameter_reader_diff")
-            writer.execute("REVOKE ALTER SYSTEM ON PARAMETER log_min_messages FROM catalog_parameter_writer_diff")
+            writer.execute("REVOKE SET ON PARAMETER track_functions FROM catalog_parameter_reader_diff")
+            writer.execute("REVOKE ALTER SYSTEM ON PARAMETER track_functions FROM catalog_parameter_writer_diff")
             record(reader, f"{prefix}.parameter_acl.default_removed", count_query)
-            writer.execute("GRANT SET ON PARAMETER log_min_messages TO catalog_parameter_reader_diff")
-            replacement_oid = writer.execute("SELECT oid FROM pg_parameter_acl WHERE parname='log_min_messages'").fetchone()[0]
-            record(reader, f"{prefix}.parameter_acl.recreated_oid", "SELECT oid<>%s::oid FROM pg_parameter_acl WHERE parname='log_min_messages'", (first_oid,))
+            writer.execute("GRANT SET ON PARAMETER track_functions TO catalog_parameter_reader_diff")
+            replacement_oid = writer.execute("SELECT oid FROM pg_parameter_acl WHERE parname='track_functions'").fetchone()[0]
+            record(reader, f"{prefix}.parameter_acl.recreated_oid", "SELECT oid<>%s::oid FROM pg_parameter_acl WHERE parname='track_functions'", (first_oid,))
             writer.execute("BEGIN")
-            writer.execute("REVOKE SET ON PARAMETER log_min_messages FROM catalog_parameter_reader_diff")
-            writer.execute("GRANT SET ON PARAMETER log_min_messages TO catalog_parameter_reader_diff")
-            record(writer, f"{prefix}.parameter_acl.private_recreated_oid", "SELECT oid<>%s::oid FROM pg_parameter_acl WHERE parname='log_min_messages'", (replacement_oid,))
+            writer.execute("REVOKE SET ON PARAMETER track_functions FROM catalog_parameter_reader_diff")
+            writer.execute("GRANT SET ON PARAMETER track_functions TO catalog_parameter_reader_diff")
+            record(writer, f"{prefix}.parameter_acl.private_recreated_oid", "SELECT oid<>%s::oid FROM pg_parameter_acl WHERE parname='track_functions'", (replacement_oid,))
             writer.execute("ROLLBACK")
-            record(reader, f"{prefix}.parameter_acl.rollback_oid", "SELECT oid=%s::oid FROM pg_parameter_acl WHERE parname='log_min_messages'", (replacement_oid,))
-            writer.execute("REVOKE ALL PRIVILEGES ON PARAMETER log_min_messages FROM postgres")
-            writer.execute("REVOKE SET ON PARAMETER log_min_messages FROM catalog_parameter_reader_diff")
+            record(reader, f"{prefix}.parameter_acl.rollback_oid", "SELECT oid=%s::oid FROM pg_parameter_acl WHERE parname='track_functions'", (replacement_oid,))
+            writer.execute("REVOKE ALL PRIVILEGES ON PARAMETER track_functions FROM postgres")
+            writer.execute("REVOKE SET ON PARAMETER track_functions FROM catalog_parameter_reader_diff")
             record(reader, f"{prefix}.parameter_acl.empty_acl", acl_query)
-            writer.execute("GRANT ALL PRIVILEGES ON PARAMETER log_min_messages TO postgres")
+            writer.execute("GRANT ALL PRIVILEGES ON PARAMETER track_functions TO postgres")
             record(reader, f"{prefix}.parameter_acl.restored_default", count_query)
         finally:
             reader.execute("ROLLBACK")

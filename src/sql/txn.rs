@@ -638,7 +638,6 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingDefaultAcl>,
     },
     ParameterAclChanged {
-        slot: u32,
         prior: crate::storage::ParameterAclUndo,
     },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring

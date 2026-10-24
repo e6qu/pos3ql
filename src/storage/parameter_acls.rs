@@ -98,7 +98,7 @@ mod tests {
             );
             let first_oid = first.oid();
             storage.commit_parameter_acls(2);
-            let (slot, undo) = storage
+            let undo = storage
                 .change_parameter_acl(
                     parameter(),
                     role,
@@ -114,7 +114,7 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            let (regrant_slot, regrant_undo) = storage
+            let regrant_undo = storage
                 .change_parameter_acl(
                     parameter(),
                     role,
@@ -132,10 +132,8 @@ mod tests {
                     .oid(),
                 first_oid
             );
-            storage
-                .restore_parameter_acl_pending(regrant_slot, regrant_undo)
-                .unwrap();
-            storage.restore_parameter_acl_pending(slot, undo).unwrap();
+            storage.restore_parameter_acl_pending(regrant_undo).unwrap();
+            storage.restore_parameter_acl_pending(undo).unwrap();
             assert_eq!(
                 storage
                     .snapshot_parameter_acl_row(parameter(), 0, &arena)
@@ -264,7 +262,7 @@ mod tests {
         let role_a = reader(&first);
         let role_b = reader(&second);
         crate::mem::guard::forbid_alloc(|| {
-            let (slot, undo) = first
+            let undo = first
                 .change_parameter_acl(
                     parameter(),
                     role_a,
@@ -274,7 +272,7 @@ mod tests {
                     2,
                 )
                 .unwrap();
-            let (other_slot, other_undo) = second
+            let other_undo = second
                 .change_parameter_acl(
                     parameter(),
                     role_b,
@@ -284,12 +282,8 @@ mod tests {
                     2,
                 )
                 .unwrap();
-            assert!(
-                second
-                    .restore_parameter_acl_pending(other_slot, undo)
-                    .is_err()
-            );
-            let (later_slot, later) = first
+            assert!(second.restore_parameter_acl_pending(undo).is_err());
+            let later = first
                 .change_parameter_acl(
                     parameter(),
                     role_a,
@@ -299,15 +293,88 @@ mod tests {
                     2,
                 )
                 .unwrap();
-            assert!(first.restore_parameter_acl_pending(slot, undo).is_err());
-            first
-                .restore_parameter_acl_pending(later_slot, later)
+            assert!(first.restore_parameter_acl_pending(undo).is_err());
+            first.restore_parameter_acl_pending(later).unwrap();
+            first.restore_parameter_acl_pending(undo).unwrap();
+            assert!(first.restore_parameter_acl_pending(undo).is_err());
+            second.restore_parameter_acl_pending(other_undo).unwrap();
+        });
+    }
+
+    #[test]
+    fn parameter_acl_prepared_owner_reserves_capacity_and_releases_it_on_resolution() {
+        let mut config = config();
+        config.max_parameter_acl_entries = 4;
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let role = reader(&storage);
+        let grants = [
+            ParameterAclGrant::INITIAL,
+            ParameterAclGrant::parse(storage.role_oid(usize::from(role)) as u32, 10, 1, 0).unwrap(),
+        ];
+        let image = ParameterAclImage::new(
+            ParameterAclOid::parse(19000).unwrap(),
+            ParameterAclGrants::from_slice(&grants),
+        )
+        .unwrap();
+        let arena = Arena::new(&mut budget, "prepared ACL images", 8192).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let reserved = storage
+                .reserve_prepared_parameter_acl(parameter(), None, Some(image), 10)
                 .unwrap();
-            first.restore_parameter_acl_pending(slot, undo).unwrap();
-            assert!(first.restore_parameter_acl_pending(slot, undo).is_err());
-            second
-                .restore_parameter_acl_pending(other_slot, other_undo)
+            assert!(
+                storage
+                    .snapshot_parameter_acl_row(parameter(), 10, &arena)
+                    .unwrap()
+                    .is_none()
+            );
+            let error = storage
+                .change_parameter_acl(
+                    parameter(),
+                    role,
+                    BOOTSTRAP_ROLE,
+                    ParameterPrivileges::SET,
+                    ParameterPrivileges::NONE,
+                    11,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            let other = ParameterName::parse("other.parameter").unwrap();
+            storage
+                .change_parameter_acl(
+                    other,
+                    role,
+                    BOOTSTRAP_ROLE,
+                    ParameterPrivileges::SET,
+                    ParameterPrivileges::NONE,
+                    12,
+                )
                 .unwrap();
+            storage.commit_parameter_acls(12);
+            let error = storage
+                .change_parameter_acl(
+                    ParameterName::parse("third.parameter").unwrap(),
+                    role,
+                    BOOTSTRAP_ROLE,
+                    ParameterPrivileges::SET,
+                    ParameterPrivileges::NONE,
+                    13,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            storage.restore_parameter_acl_pending(reserved).unwrap();
+            storage
+                .restore_parameter_acl_row(parameter(), None, Some(image))
+                .unwrap();
+            assert_eq!(
+                storage
+                    .snapshot_parameter_acl_row(parameter(), 0, &arena)
+                    .unwrap()
+                    .unwrap()
+                    .oid(),
+                image.oid()
+            );
+            assert_eq!(storage.parameter_acl_rows_visible(0).count(), 2);
         });
     }
 
@@ -514,10 +581,17 @@ impl<'a> ParameterAclImage<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum PendingContents {
+    Grants,
+    Prepared { additional_grants: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PendingHeader {
     transaction: u32,
     change: u64,
     oid: Option<ParameterAclOid>,
+    contents: PendingContents,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -536,7 +610,12 @@ impl Header {
 
     fn oid_to(self, transaction: u32) -> Option<ParameterAclOid> {
         match self.pending {
-            Some(pending) if pending.transaction == transaction => pending.oid,
+            Some(pending)
+                if pending.transaction == transaction
+                    && matches!(pending.contents, PendingContents::Grants) =>
+            {
+                pending.oid
+            }
             _ => self.committed,
         }
     }
@@ -571,6 +650,16 @@ pub(crate) struct ParameterAclUndo {
 }
 
 impl ParameterAclRows {
+    fn reserved_grants(&self) -> usize {
+        self.headers
+            .iter()
+            .filter_map(|header| header.pending)
+            .map(|pending| match pending.contents {
+                PendingContents::Grants => 0,
+                PendingContents::Prepared { additional_grants } => additional_grants,
+            })
+            .sum()
+    }
     pub(super) fn oid_to(
         &self,
         parameter: ParameterName,
@@ -721,6 +810,152 @@ fn entry_slot(
 }
 
 impl Storage {
+    /// Startup cannot publish a prepared image, but must retain its ownership
+    /// and capacity until its saved decision is resolved.
+    pub(crate) fn reserve_prepared_parameter_acl(
+        &self,
+        parameter: ParameterName,
+        expected: Option<ParameterAclOid>,
+        image: Option<ParameterAclImage<'_>>,
+        transaction: u32,
+    ) -> Result<ParameterAclUndo, SqlError> {
+        let corrupt = || {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid prepared parameter ACL row"
+            )
+        };
+        if transaction == 0 || parameter.is_empty() {
+            return Err(corrupt());
+        }
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if catalog.parameter_rows.oid_to(parameter, 0) != expected
+            || catalog.parameter_rows.headers.iter().any(|header| {
+                (header.parameter == parameter && header.pending.is_some())
+                    || image.is_some_and(|image| {
+                        header.parameter != parameter
+                            && (header.committed == Some(image.oid())
+                                || header
+                                    .pending
+                                    .is_some_and(|pending| pending.oid == Some(image.oid())))
+                    })
+            })
+        {
+            return Err(corrupt());
+        }
+        let header_slot = catalog
+            .parameter_rows
+            .headers
+            .iter()
+            .position(|header| header.parameter == parameter)
+            .or_else(|| {
+                catalog
+                    .parameter_rows
+                    .headers
+                    .iter()
+                    .position(|header| header.committed.is_none() && header.pending.is_none())
+            })
+            .unwrap_or(catalog.parameter_rows.headers.len());
+        if header_slot == catalog.parameter_rows.headers.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "parameter ACL row capacity exhausted"
+            ));
+        }
+        catalog.parameter_rows.grant_keys.clear();
+        if let Some(image) = image {
+            for grant in image.grants().iter() {
+                if catalog
+                    .parameter_rows
+                    .grant_keys
+                    .insert((grant.grantee(), grant.grantor()), ())
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "parameter ACL grant capacity exhausted"
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Err(corrupt());
+                }
+            }
+        }
+        let current_count = catalog
+            .parameters
+            .iter()
+            .filter(|entry| entry.parameter == parameter && entry.live)
+            .count();
+        let additional_grants = image
+            .map_or(0, |image| image.grants().len())
+            .saturating_sub(current_count);
+        let occupied = catalog
+            .parameters
+            .iter()
+            .filter(|entry| !entry.parameter.is_empty())
+            .count();
+        if occupied
+            .saturating_add(catalog.parameter_rows.reserved_grants())
+            .saturating_add(additional_grants)
+            > catalog.parameters.capacity()
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "parameter ACL prepared grant capacity exhausted"
+            ));
+        }
+        let change = catalog
+            .parameter_rows
+            .next_change
+            .checked_add(1)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "parameter ACL change identity space exhausted"
+                )
+            })?;
+        let before = catalog
+            .parameter_rows
+            .headers
+            .get(header_slot)
+            .copied()
+            .unwrap_or(Header::EMPTY);
+        let undo = ParameterAclUndo {
+            origin: catalog.parameter_rows.origin,
+            header_slot,
+            header: before,
+            entries: [None, None],
+            transaction,
+            change,
+        };
+        if header_slot == catalog.parameter_rows.headers.len() {
+            catalog
+                .parameter_rows
+                .headers
+                .push(Header::EMPTY)
+                .expect("parameter row capacity was checked");
+        }
+        catalog.parameter_rows.headers[header_slot] = Header {
+            parameter,
+            committed: before.committed,
+            pending: Some(PendingHeader {
+                transaction,
+                change,
+                oid: image.map(|image| image.oid()),
+                contents: PendingContents::Prepared { additional_grants },
+            }),
+        };
+        catalog.parameter_rows.next_change = change;
+        if let Some(image) = image {
+            catalog.parameter_rows.next_oid = catalog
+                .parameter_rows
+                .next_oid
+                .max(u64::from(image.oid().get()));
+        }
+        catalog.parameter_rows.grant_keys.clear();
+        Ok(undo)
+    }
+
     pub(crate) fn parameter_acl_image_budget_bytes(config: &Config) -> usize {
         config
             .max_parameter_acl_entries
@@ -806,10 +1041,10 @@ impl Storage {
             let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
             while let Some(header) = catalog.parameter_rows.headers.get(next).copied() {
                 next += 1;
-                if header
-                    .pending
-                    .is_some_and(|pending| pending.transaction == transaction)
-                {
+                if header.pending.is_some_and(|pending| {
+                    pending.transaction == transaction
+                        && matches!(pending.contents, PendingContents::Grants)
+                }) {
                     return Some((header.parameter, header.committed));
                 }
             }
@@ -923,7 +1158,7 @@ impl Storage {
             + catalog.parameters.capacity()
             - catalog.parameters.len();
         let count = catalog.parameter_rows.replay.len();
-        if count > replaceable {
+        if count.saturating_add(catalog.parameter_rows.reserved_grants()) > replaceable {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "parameter ACL grant capacity exhausted"
@@ -1010,7 +1245,7 @@ impl Storage {
         privileges: ParameterPrivileges,
         grant_options: ParameterPrivileges,
         transaction: u32,
-    ) -> Result<(usize, ParameterAclUndo), SqlError> {
+    ) -> Result<ParameterAclUndo, SqlError> {
         if transaction == 0 || parameter.is_empty() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -1104,6 +1339,28 @@ impl Storage {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many parameter privilege entries (limit {})",
                 catalog.parameters.capacity()
+            ));
+        }
+        let occupied = catalog
+            .parameters
+            .iter()
+            .filter(|entry| !entry.parameter.is_empty())
+            .count();
+        let vacant = |slot: usize| {
+            catalog
+                .parameters
+                .get(slot)
+                .is_none_or(|entry| entry.parameter.is_empty())
+        };
+        let additional = usize::from(vacant(primary)) + usize::from(default.is_some_and(vacant));
+        if occupied
+            .saturating_add(additional)
+            .saturating_add(catalog.parameter_rows.reserved_grants())
+            > catalog.parameters.capacity()
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "parameter ACL grant capacity reserved by prepared transactions"
             ));
         }
         let proposed = |slot: usize, entry: ParameterAclEntry| {
@@ -1270,16 +1527,16 @@ impl Storage {
                 transaction,
                 change,
                 oid,
+                contents: PendingContents::Grants,
             }),
         };
         catalog.parameter_rows.next_change = change;
         catalog.parameter_rows.next_order = next_order;
-        Ok((primary, undo))
+        Ok(undo)
     }
 
     pub(crate) fn restore_parameter_acl_pending(
         &self,
-        primary: usize,
         undo: ParameterAclUndo,
     ) -> Result<(), SqlError> {
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
@@ -1295,7 +1552,6 @@ impl Storage {
                 )
             })?;
         if undo.origin != catalog.parameter_rows.origin
-            || undo.entries[0].map(|(slot, _)| slot) != Some(primary)
             || !current.pending.is_some_and(|pending| {
                 pending.transaction == undo.transaction && pending.change == undo.change
             })
@@ -1343,6 +1599,10 @@ impl Storage {
             else {
                 continue;
             };
+            assert!(
+                matches!(pending.contents, PendingContents::Grants),
+                "prepared parameter ACL reservations must be resolved from their saved row images"
+            );
             if pending.oid.is_none() {
                 for entry in catalog
                     .parameters

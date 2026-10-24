@@ -68,7 +68,7 @@ mod key_definitions {
                 .find(|definition| definition.name == relation.name)
                 .unwrap();
             assert_eq!(baseline.oid as u32, identity.relation.get());
-            if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+            if !super::super::catalog::is_catalog_relation(None, relation.name) {
                 continue;
             }
             arena.reset();
@@ -124,7 +124,7 @@ mod key_definitions {
         let mut matched = 0;
         let mut errors = Vec::new();
         for relation in super::super::catalog_snapshot_keys::RELATIONS {
-            if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+            if !super::super::catalog::is_catalog_relation(None, relation.name) {
                 continue;
             }
             arena.reset();

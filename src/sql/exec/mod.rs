@@ -11661,7 +11661,7 @@ pub fn grant_parameter_privileges(
             };
             let (old_privileges, old_options) =
                 storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
-            let (slot, prior) = match storage.change_parameter_acl(
+            let prior = match storage.change_parameter_acl(
                 *parameter,
                 grantee,
                 grantor as u16,
@@ -11676,12 +11676,9 @@ pub fn grant_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
                 storage
-                    .restore_parameter_acl_pending(slot, prior)
+                    .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
@@ -11735,7 +11732,7 @@ fn cascade_parameter_acl_grants(
                 old_privileges.bits() & lost.bits(),
             )
             .expect("intersection of parameter privilege bits is valid");
-            let (changed, prior) = storage.change_parameter_acl(
+            let prior = storage.change_parameter_acl(
                 entry.parameter,
                 grantee,
                 grantor,
@@ -11743,12 +11740,9 @@ fn cascade_parameter_acl_grants(
                 old_options.without(removed),
                 txn.txid,
             )?;
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: changed as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
                 storage
-                    .restore_parameter_acl_pending(changed, prior)
+                    .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
                 return Err(error);
             }
@@ -11849,7 +11843,7 @@ pub fn revoke_parameter_privileges(
                     old_options.without(command.target.privileges),
                 )
             };
-            let (slot, prior) = match storage.change_parameter_acl(
+            let prior = match storage.change_parameter_acl(
                 *parameter,
                 grantee,
                 grantor as u16,
@@ -11860,12 +11854,9 @@ pub fn revoke_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
                 storage
-                    .restore_parameter_acl_pending(slot, prior)
+                    .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
@@ -11891,9 +11882,6 @@ pub fn revoke_parameter_privileges(
                     &mut scratch,
                 )
             {
-                storage
-                    .restore_parameter_acl_pending(slot, prior)
-                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
         }

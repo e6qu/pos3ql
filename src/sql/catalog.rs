@@ -3299,7 +3299,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(6225, "multirange_agg_transfn", 2281, "2281 4537", 2, "i"),
     intrinsic!(6226, "multirange_agg_finalfn", 4537, "2281 4537", 2, "i"),
-    intrinsic!(6391, "range_sortsupport", 2278, "2281", 1, "i"),
     intrinsic!(4301, "range_agg", 4537, "3831", 1, "i"),
     intrinsic!(4389, "range_intersect_agg", 4537, "4537", 1, "i"),
     intrinsic!(4450, "range_intersect_agg", 3831, "3831", 1, "i"),

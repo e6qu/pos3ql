@@ -18877,6 +18877,17 @@ fn parse_partition_bound_manifest(
 
 #[cfg(test)]
 mod stored_dependency_tests {
+    #[test]
+    fn manifest_hex_decode_rejects_non_ascii_without_panicking() {
+        for invalid in ["é", "🦀", "0é0", "0g", "abc"] {
+            assert!(super::decode_manifest_hex_bytes(invalid).is_err());
+        }
+        assert_eq!(super::decode_manifest_hex_bytes("fe00").unwrap(), [254, 0]);
+        assert!(super::decode_hex_name("ff").is_err());
+        assert_eq!(super::decode_hex_name("c3a9").unwrap(), "é");
+        assert_eq!(super::decode_manifest_hex_bytes("-").unwrap(), []);
+    }
+
     use super::*;
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;

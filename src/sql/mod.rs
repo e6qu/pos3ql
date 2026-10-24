@@ -20145,9 +20145,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::DefaultAclChanged { slot, prior } => {
             storage.restore_default_acl_pending(slot as usize, prior);
         }
-        DdlUndo::ParameterAclChanged { slot, prior } => {
+        DdlUndo::ParameterAclChanged { prior } => {
             storage
-                .restore_parameter_acl_pending(slot as usize, prior)
+                .restore_parameter_acl_pending(prior)
                 .expect("transaction owns its parameter ACL undo");
         }
         DdlUndo::CommentSet { slot, prior } => {
@@ -20755,6 +20755,33 @@ fn replay_transaction_batches(
                                     undo,
                                     crate::storage::CatalogDdlDecision::Rollback,
                                 );
+                                return Err(error);
+                            }
+                        }
+                        WalOp::SetParameterAcl {
+                            parameter,
+                            expected,
+                            image,
+                        } => {
+                            let parameter =
+                                ast::ParameterName::parse(parameter).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "invalid prepared parameter ACL name"
+                                    )
+                                })?;
+                            let prior = storage.reserve_prepared_parameter_acl(
+                                parameter,
+                                expected,
+                                image,
+                                transaction_id,
+                            )?;
+                            if let Err(error) = prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_ddl(DdlUndo::ParameterAclChanged { prior })
+                            {
+                                storage.restore_parameter_acl_pending(prior)?;
                                 return Err(error);
                             }
                         }

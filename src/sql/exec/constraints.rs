@@ -2057,6 +2057,8 @@ fn check_fk_child_one_at(
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
     else {
+        #[cfg(test)]
+        eprintln!("foreign-key parent is missing: {fk:?}, transaction {txid}");
         return Err(sql_err!(
             sqlstate::FOREIGN_KEY_VIOLATION,
             "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
@@ -2079,6 +2081,11 @@ fn check_fk_child_one_at(
     )? {
         Ok(())
     } else {
+        #[cfg(test)]
+        eprintln!(
+            "foreign-key parent key is missing: {fk:?}, transaction {txid}, snapshot {}",
+            storage.commit_snapshot()
+        );
         Err(sql_err!(
             sqlstate::FOREIGN_KEY_VIOLATION,
             "insert or update on table \"{}\" violates foreign key constraint \"{}\"",

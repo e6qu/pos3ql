@@ -8554,6 +8554,14 @@ impl RoutineArgumentDef {
     };
 }
 
+/// Name and identifier probes must not copy reserved bodies or result arrays.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoutineIdentity {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub oid: i32,
+}
+
 /// A durable SQL-language routine. Arguments and result contracts are stored
 /// as parsed types, so catalog rendering and execution cannot disagree.
 #[derive(Debug, Clone, Copy)]
@@ -8660,6 +8668,13 @@ impl RoutineDef {
 
     pub(crate) fn arguments(&self) -> &[RoutineArgumentDef] {
         &self.arguments[..self.argument_count]
+    }
+
+    fn arguments_for(&self, txid: u32) -> &[RoutineArgumentDef] {
+        match self.pending_definition_for(txid) {
+            Some(pending) => &pending.definition.arguments[..pending.definition.argument_count],
+            None => self.arguments(),
+        }
     }
 
     pub(crate) fn parameters(&self) -> &[RoutineParameterDef] {
@@ -41211,9 +41226,40 @@ impl Storage {
         }
     }
 
+    pub(crate) fn routine_identity_for(&self, slot: usize, txid: u32) -> Option<RoutineIdentity> {
+        let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+        let routine = catalog.get(slot)?;
+        (routine.database == current_database() && routine.visible_to(txid)).then(|| {
+            RoutineIdentity {
+                schema: routine.schema_for(txid),
+                name: routine.name_for(txid),
+                oid: routine_oid(routine),
+            }
+        })
+    }
+
+    pub(crate) fn routine_signature_matches(
+        &self,
+        slot: usize,
+        txid: u32,
+        arguments: &[RoutineArgumentDef],
+    ) -> bool {
+        let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+        let Some(routine) = catalog.get(slot) else {
+            return false;
+        };
+        if routine.database != current_database() || !routine.visible_to(txid) {
+            return false;
+        }
+        let defined = routine.arguments_for(txid);
+        defined.len() == arguments.len()
+            && defined.iter().zip(arguments).all(|(defined, argument)| {
+                defined.ctype == argument.ctype && defined.user_type == argument.user_type
+            })
+    }
+
     pub(crate) fn routine_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        let routine = self.routine(slot);
-        routine.database == current_database() && routine.visible_to(txid)
+        self.routine_identity_for(slot, txid).is_some()
     }
 
     pub(crate) fn routine(&self, slot: usize) -> RoutineDef {
@@ -41236,12 +41282,17 @@ impl Storage {
     }
 
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.routine_entries().find_map(|(slot, routine)| {
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && routine_oid(&routine) == oid)
-                .then_some(slot)
-        })
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .iter()
+            .enumerate()
+            .find_map(|(slot, routine)| {
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && routine_oid(routine) == oid)
+                    .then_some(slot)
+            })
     }
 
     /// Resolves a scalar call from its evaluated values and their SQL type
@@ -57119,6 +57170,21 @@ mod tests {
                 assert!(candidates.next().is_none());
                 candidate
             };
+            assert_eq!(
+                storage.routine_identity_for(1, 0).unwrap().name.as_str(),
+                "probe"
+            );
+            let private = storage.routine_identity_for(1, 7).unwrap();
+            assert_eq!(private.name.as_str(), "renamed");
+            assert_eq!(storage.routine_slot_by_oid(private.oid, 7), Some(1));
+            assert!(storage.routine_signature_matches(1, 7, &[]));
+            assert!(!storage.routine_signature_matches(1, 7, &[RoutineArgumentDef::EMPTY]));
+            assert!(!storage.routine_signature_matches(2, 7, &[]));
+            assert!(storage.routines.try_lock().is_ok());
+            assert!(storage.routine_identity_for(0, 7).is_none());
+            assert!(storage.routine_identity_for(2, 7).is_none());
+            assert!(storage.routine_identity_for(3, 0).is_none());
+            assert!(storage.routine_identity_for(3, 7).is_some());
             assert_eq!(slots("probe", 0, RoutineCallKind::Scalar), Some(1));
             assert_eq!(slots("probe", 7, RoutineCallKind::Scalar), Some(3));
             assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), Some(1));

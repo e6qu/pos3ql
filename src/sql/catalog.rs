@@ -12591,27 +12591,17 @@ pub(crate) fn routine_oid_by_name(
         consider(routine.oid)?;
     }
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
-        if !storage.routine_slot_visible_to(slot, txid)
-            || !routine_name_matches(
-                name,
-                routine.schema_for(txid).as_str(),
-                routine.name_for(txid).as_str(),
-            )
-            || (signature
-                && (routine.argument_count != argument_count
-                    || !routine
-                        .arguments()
-                        .iter()
-                        .zip(&arguments[..argument_count])
-                        .all(|(defined, argument)| {
-                            defined.ctype == argument.ctype
-                                && defined.user_type == argument.user_type
-                        })))
+        let Some(identity) = storage.routine_identity_for(slot, txid) else {
+            continue;
+        };
+        if !routine_name_matches(name, identity.schema.as_str(), identity.name.as_str()) {
+            continue;
+        }
+        if signature && !storage.routine_signature_matches(slot, txid, &arguments[..argument_count])
         {
             continue;
         }
-        consider(crate::storage::routine_oid(&routine))?;
+        consider(identity.oid)?;
     }
     Ok(found)
 }
@@ -26196,10 +26186,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     }
     let mut count = INTRINSIC_ROUTINES.len();
     for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {
             continue;
         }
+        let routine = storage.routine_for(slot, txid);
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_proc"));
         }

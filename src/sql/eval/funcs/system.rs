@@ -1646,17 +1646,11 @@ pub(crate) fn dispatch<'a>(
                 };
                 let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
                     Some(oid) => oid.0,
-                    None => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "pg_get_userbyid() requires an oid"
-                        ));
-                    }
+                    None => return Ok(Datum::Null),
                 };
-                Ok(cat
-                    .role_name(oid, arena)?
-                    .map(Datum::Text)
-                    .unwrap_or(Datum::Null))
+                Ok(Datum::Text(crate::sql::catalog::user_name_by_oid(
+                    cat, oid, arena,
+                )?))
             }
             // A non-partitioned table is its own only ancestor/root; we have no
             // partitioning, so these return the argument unchanged.

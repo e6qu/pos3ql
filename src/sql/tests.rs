@@ -21548,6 +21548,7 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
                 SELECT pg_get_acl('pg_class'::regclass, 'permission_orders'::regclass, 0)::text LIKE '%visibility_acl_renamed=rw/%';
                 SELECT has_table_privilege('visibility_acl_renamed', 'permission_orders', 'UPDATE');
                 SELECT rolname FROM pg_authid WHERE oid={role_oid}::oid;
+                SELECT rolname FROM pg_roles WHERE oid={role_oid}::oid;
                 ROLLBACK;"));
         assert_eq!(
             data_rows(&observed),
@@ -21559,12 +21560,111 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
                     "visibility_acl_role"
                 } else {
                     "visibility_acl_renamed"
+                },
+                if historical {
+                    "visibility_acl_role"
+                } else {
+                    "visibility_acl_renamed"
                 }
             ],
             "{}",
             String::from_utf8_lossy(&observed)
         );
     }
+}
+
+#[test]
+fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_view_reader;
+         ALTER ROLE catalog_view_reader SET application_name='catalog-old';
+         CREATE TABLE catalog_view_orders(id integer);
+         CREATE INDEX catalog_view_index ON catalog_view_orders(id);
+         ALTER TABLE catalog_view_orders OWNER TO catalog_view_reader;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut reader = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let selected = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename='catalog_view_orders';
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname='catalog_view_reader';");
+    assert_eq!(
+        data_rows(&selected),
+        [
+            "catalog_view_orders|catalog_view_reader|t",
+            "catalog_view_reader|{application_name=catalog-old}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE catalog_view_orders RENAME TO catalog_view_sales;
+         ALTER ROLE catalog_view_reader RENAME TO catalog_view_renamed;
+         ALTER ROLE catalog_view_renamed SET application_name='catalog-new';
+         DROP INDEX catalog_view_index;",
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let vacuum = run_with(&mut engine, &mut budget, "VACUUM catalog_view_sales");
+    assert!(
+        !message_types(&vacuum).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&vacuum)
+    );
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename IN ('catalog_view_orders','catalog_view_sales');
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname IN ('catalog_view_reader','catalog_view_renamed');
+         ROLLBACK;");
+    assert_eq!(
+        data_rows(&retained),
+        [
+            "catalog_view_orders|catalog_view_renamed|t",
+            "catalog_view_reader|{application_name=catalog-old}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    let fresh = run_with(&mut engine, &mut budget,
+        "SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename IN ('catalog_view_orders','catalog_view_sales');
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname IN ('catalog_view_reader','catalog_view_renamed');
+         SELECT pg_get_userbyid(0),pg_get_userbyid(4294967295::oid),pg_get_userbyid(NULL::oid),pg_typeof(pg_get_userbyid(0))::text;
+         SET ROLE catalog_view_renamed;
+         SELECT rolpassword FROM pg_roles WHERE rolname='catalog_view_renamed';
+         RESET ROLE;");
+    assert_eq!(
+        data_rows(&fresh),
+        [
+            "catalog_view_sales|catalog_view_renamed|f",
+            "catalog_view_renamed|{application_name=catalog-new}",
+            "unknown (OID=0)|unknown (OID=4294967295)|NULL|name",
+            "********"
+        ],
+        "{}",
+        String::from_utf8_lossy(&fresh)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE catalog_view_renamed; SELECT rolpassword FROM pg_authid",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
 }
 
 #[test]

@@ -23723,7 +23723,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                             grantor
                         },
                         0,
-                    );
+                    )?;
                 }
             }
             let column_acl_count = storage.column_acl_entry_count();

@@ -25,6 +25,9 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_views.rs"]
+mod views;
+
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
@@ -8989,6 +8992,27 @@ pub(crate) fn synthesize<'a>(
     scan: super::catalog_snapshot::CatalogScan,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    if qualifier != Some("information_schema") {
+        match name {
+            "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
+            "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
+            _ => {}
+        }
+    }
+    select_catalog_rows(storage, qualifier, name, txid, scan, arena, |transaction| {
+        synthesize_current(storage, qualifier, name, transaction, arena)
+    })
+}
+
+fn select_catalog_rows<'a>(
+    storage: &Storage,
+    qualifier: Option<&str>,
+    name: &str,
+    txid: u32,
+    scan: super::catalog_snapshot::CatalogScan,
+    arena: &'a Arena,
+    build: impl Fn(u32) -> Result<SynthTable<'a>, SqlError>,
+) -> Result<SynthTable<'a>, SqlError> {
     if qualifier != Some("information_schema")
         && storage.commit_snapshot() != u64::MAX
         && let Some(relation) = super::catalog_snapshot_keys::RELATIONS
@@ -9001,12 +9025,12 @@ pub(crate) fn synthesize<'a>(
             arena,
         )?;
         if !history.is_empty() {
-            let committed = synthesize_current(storage, qualifier, name, 0, arena)?;
+            let committed = build(0)?;
             let private;
             let selected = if txid == 0 {
                 &committed
             } else {
-                private = synthesize_current(storage, qualifier, name, txid, arena)?;
+                private = build(txid)?;
                 &private
             };
             return super::catalog_snapshot::restore_rows(
@@ -9020,7 +9044,7 @@ pub(crate) fn synthesize<'a>(
             );
         }
     }
-    synthesize_current(storage, qualifier, name, txid, arena)
+    build(txid)
 }
 
 pub(crate) fn synthesize_current<'a>(
@@ -9218,7 +9242,7 @@ pub(crate) fn synthesize_current<'a>(
         }
         (false, "pg_stat_progress_copy") => empty_monitoring_view("pg_stat_progress_copy", arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
-        (false, "pg_tables") => pg_tables(storage, txid, arena),
+        (false, "pg_tables") => views::tables(storage, txid, views::Read::Current, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
         (false, "pg_am") => pg_am(storage, txid, arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
@@ -9284,7 +9308,7 @@ pub(crate) fn synthesize_current<'a>(
         }
         (false, "pg_depend") => pg_depend(storage, txid, arena),
         (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
-        (false, "pg_roles") => pg_roles(storage, txid, arena),
+        (false, "pg_roles") => views::roles(storage, txid, views::Read::Current, arena),
         (false, "pg_group") => pg_group(storage, txid, arena),
         (false, "pg_shadow") => pg_shadow(storage, txid, arena, false),
         (false, "pg_user") => pg_shadow(storage, txid, arena, true),
@@ -9720,6 +9744,18 @@ pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
     PREDEFINED_ROLES
         .iter()
         .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
+}
+
+pub(crate) fn user_name_by_oid<'a>(
+    catalog: &dyn super::eval::CatalogAccess,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    if let Some(name) = catalog.role_name(oid, arena)? {
+        return Ok(name);
+    }
+    let name = stack_format!(64, "unknown (OID={})", oid as u32);
+    arena.alloc_str(name.as_str()).map_err(|_| arena_full())
 }
 
 #[derive(Clone, Copy)]
@@ -29795,78 +29831,6 @@ fn pg_indexes<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_tables<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_tables", false);
-    let indexes = collect_indexes(storage, txid, arena)?;
-    let row_capacity = (0..storage.table_count())
-        .filter(|slot| {
-            if !storage.table_slot_visible_to(*slot, txid) {
-                return false;
-            }
-            let table = storage.table_def(*slot, txid);
-            table.kind != crate::storage::TableKind::Foreign
-                && storage.matview_slot_for_table(*slot, txid).is_none()
-        })
-        .count();
-    let out = catalog_rows(arena, row_capacity)?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        if table.kind == crate::storage::TableKind::Foreign
-            || storage.matview_slot_for_table(slot, txid).is_some()
-        {
-            continue;
-        }
-        if n == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "information_schema.tables exceeds static capacity"
-            ));
-        }
-        out[n] = row(
-            &[
-                text(
-                    arena
-                        .alloc_str(table.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(table.name.as_str(), arena)?,
-                owner_name(
-                    storage,
-                    crate::storage::AccessClass::Table,
-                    slot,
-                    txid,
-                    arena,
-                )?,
-                match table.tablespace {
-                    0 => Datum::Null,
-                    tablespace => storage
-                        .tablespace_name(tablespace, txid)
-                        .map_or(Ok(Datum::Null), |name| text(name.as_str(), arena))?,
-                },
-                Datum::Bool(indexes.iter().any(|index| index.table_slot == slot)),
-                Datum::Bool(storage.table_has_rules(slot, txid)),
-                Datum::Bool(
-                    storage.triggers_for_table(slot, txid).next().is_some()
-                        || !table.fkeys().is_empty(),
-                ),
-                Datum::Bool(table.row_level_security.enabled),
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn pg_group<'a>(
     storage: &Storage,
     txid: u32,
@@ -30018,77 +29982,6 @@ fn pg_shadow<'a>(
         count += 1;
     }
     finish(definition, &rows[..count], arena)
-}
-
-fn pg_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_roles", false);
-    let output = arena
-        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
-            &[] as &[Datum]
-        })
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    for &(oid, name) in PREDEFINED_ROLES {
-        output[count] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Int4(-1),
-                text("********", arena)?,
-                Datum::Null,
-                Datum::Bool(false),
-                Datum::Bool(false),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for slot in 0..storage.role_count() {
-        let role = storage.role(slot);
-        if !role.visible_to(txid) {
-            continue;
-        }
-        let attributes = role.attributes_to(txid);
-        let valid_until = match attributes.valid_until.as_ref() {
-            None => Datum::Null,
-            Some(value) => {
-                Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
-            }
-        };
-        output[count] = row(
-            &[
-                Datum::Int4(storage.role_oid(slot)),
-                text(
-                    arena
-                        .alloc_str(role.name_to(txid).as_str())
-                        .map_err(|_| arena_full())?,
-                    arena,
-                )?,
-                Datum::Bool(attributes.superuser),
-                Datum::Bool(attributes.inherit),
-                Datum::Bool(attributes.create_role),
-                Datum::Bool(attributes.create_database),
-                Datum::Bool(attributes.can_login),
-                Datum::Int4(attributes.connection_limit),
-                text("********", arena)?,
-                valid_until,
-                Datum::Bool(attributes.replication),
-                Datum::Bool(attributes.bypass_row_level_security),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(def, &output[..count], arena)
 }
 
 fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {

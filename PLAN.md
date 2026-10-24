@@ -28,57 +28,42 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Extend statement admission to consistent table/type definitions, rows, index
-bindings and comments, including lookups after a query has begun. A report must
-not combine its selected order rows with a replacement table's columns or
-later comments. Connect the guarded table/type publication and retirement paths
-to retained catalog versions before several CPU workers run statements.
-Extend the table-shape checks used by index keys to every later catalog lookup.
-Preserve PostgreSQL's distinction between listing catalog rows and resolving an
-object for use. For example, after another connection renames `orders` to
-`sales`, a repeatable-read query of `pg_class` still lists `orders`, while
-`to_regclass('sales')` resolves the current name. Functions use current definitions
-and sequence counters keep advancing. Do not freeze every metadata lookup at
-the row snapshot. Compare both paths with PostgreSQL 18, including replacement
-objects, comments, enum labels, private changes and rollback.
-Own creations must be visible. If another connection already replaced a comment,
-editing its newer version can leave an older transaction's comment lookup
-returning the old text until commit. Check this separately from ordinary private
-edits and savepoint rollback against PostgreSQL.
-Check direct lookups separately from row listings: a listing can contain both
-the selected older comment and an own edit. Deleting and inserting the comment
-again can expose both rows even to a direct lookup. Preserve that distinction
-through savepoints and prepared-transaction recovery, within startup memory.
-Parameter permission rows must preserve their identity through edits and restart,
-and receive a new identity after their removal. Check empty permission lists
-separately from restored default permissions, which remove the catalog row.
-Check readers admitted while a commit waits for object storage.
-Validate saved catalogs before writer promotion and pin the root versions used
-for restoration. A changed root must require a fresh startup, and rejected
-catalog records must leave durable roots unchanged.
-After a restart,
-an unresolved prepared transaction must still preserve a reader's older catalog
-rows when that transaction is finally committed. Keep current role-name rendering.
-Compare permission listings with `pg_get_acl` and privilege checks: a listing
-can retain an older grant while the functions inspect current permissions.
-Preserve grant order after slot reuse and revocation. An explicitly empty
-permission list must remain empty after restart; concurrent editors of one
-object's list must wait, while other objects remain available.
-Statistics estimates and lazy index flags belong to a particular catalog row
-version: an old reader can see an index flag change, then retain that version's
-estimates after another connection renames the table and analyzes its new version.
-Check index-build estimates, sticky index flags after rollback or removal, and
-VACUUM's count refresh against PostgreSQL. Cover checkpoint, journal-only recovery,
-unresolved prepared changes, stale acknowledgements and replacement tables.
-Keep rewrite history cleanup paced during concurrent publication.
-Keep old row, index and backup data until their readers have finished.
-Check reader and backup retention while old files are replaced. Recovery may
-retain exclusive startup access; ordinary publication must let unrelated
-operations progress under their own owners.
-Some metadata capture and maintenance reads still block the worker. Raising
-memory limits is not a completion criterion. The
-[current behavior guide](docs/implemented-baseline.md) owns the implemented
-table, routine, type, account and saved-query guarantees.
+Connect retained catalog rows to every later lookup of table and type
+definitions, columns, index bindings and comments. The [behavior guide](docs/implemented-baseline.md)
+owns the implemented admission, permission, comment and statistics guarantees;
+their regressions remain in the implementing change.
+
+Preserve PostgreSQL's distinction between listing rows and looking up an object
+for use. After another connection renames `orders` to `sales`, an older
+repeatable-read listing can still show `orders`, while `to_regclass('sales')`
+resolves the current name. Permission functions and displayed account names
+also follow their current lookup rules. Freezing every lookup at the report's
+read position would produce the wrong result.
+
+Complete these remaining cases:
+
+- Build system and information-schema views from the selected base rows,
+  with PostgreSQL's column shapes, joins and current permission checks. For
+  example, `pg_tables` and `information_schema.tables` must agree about the
+  table names an older report selected.
+- Keep a schema rename private until commit, including names used by its own
+  transaction, rollback, dependent definitions and prepared recovery.
+- Cover private edits after another connection replaced a catalog tuple across
+  all catalog families. Listings and direct lookups can expose different rows;
+  dependency rows also need exact duplicate counts.
+- Give replacement objects fresh SQL object identifiers, independently of reused
+  storage slots. A cached identifier for a dropped table must not name its
+  replacement. Check shared catalogs across databases as well.
+- Keep old row, index and backup data until their readers finish. Pace history
+  pruning, file replacement and deletion without holding unrelated owners.
+- Replace remaining synchronous metadata and maintenance reads with bounded
+  work that yields while waiting for storage. Recovery may retain exclusive
+  startup access; ordinary publication must let unrelated operations progress.
+
+Raising memory limits is not a completion criterion. Preserve rollback,
+savepoints, prepared transactions, exhaustion cleanup and cold recovery as each
+case is connected. Validate restored catalogs and their captured root versions
+before writer promotion; rejected or stale restoration must change no roots.
 
 Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

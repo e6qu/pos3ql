@@ -151,6 +151,7 @@ wal_record_kinds! {
     KIND_CREATE_VIEW_BOUND = 152;
     KIND_UPSERT_V2 = 153;
     KIND_CREATE_TYPED = 154;
+    KIND_PREPARED_CATALOG_ROW = 155;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -1787,6 +1788,10 @@ pub(crate) enum WalOp<'a> {
         expected: Option<crate::storage::ParameterAclOid>,
         image: Option<crate::storage::ParameterAclImage<'a>>,
     },
+    PreparedCatalogRow {
+        relation: crate::storage::CatalogRelationIdentity,
+        row: crate::storage::HistoricalCatalogRow<'a>,
+    },
 }
 
 // Wide durable images belong to borrowed staging or isolated replay frames,
@@ -2800,6 +2805,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
+        WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
     }
 }
 
@@ -4017,6 +4023,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             1 + parameter.len() + 4 + 1 + image.map_or(0, |image| 8 + image.grants().encoded_len())
         }
+        WalOp::PreparedCatalogRow { row, .. } => 20usize
+            .saturating_add(row.key.len())
+            .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
     }
 }
 
@@ -6330,6 +6339,30 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
             }
             ok
+        }
+        WalOp::PreparedCatalogRow { relation, row } => {
+            let Ok(key_length) = u32::try_from(row.key.len()) else {
+                return false;
+            };
+            let Ok(row_length) = u32::try_from(row.before.map_or(0, |image| image.bytes.len()))
+            else {
+                return false;
+            };
+            buffer.append(
+                &relation
+                    .database
+                    .map_or(0, |database| database.get())
+                    .to_le_bytes(),
+            ) && buffer.append(&relation.relation.get().to_le_bytes())
+                && buffer.append(&key_length.to_le_bytes())
+                && buffer.append(
+                    &row.before
+                        .map_or(0, |image| image.count.get())
+                        .to_le_bytes(),
+                )
+                && buffer.append(&row_length.to_le_bytes())
+                && buffer.append(row.key)
+                && buffer.append(row.before.map_or(&[], |image| image.bytes))
         }
         WalOp::Analyze {
             schema,
@@ -11465,6 +11498,41 @@ fn decode_op_inner<'a>(
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }),
+        KIND_PREPARED_CATALOG_ROW => decode_large_op(|| {
+            use core::num::{NonZeroU32, NonZeroUsize};
+            let database = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            let database = if database == 0 {
+                None
+            } else {
+                Some(crate::storage::DatabaseOid::parse(database as i32)?)
+            };
+            let relation =
+                NonZeroU32::new(u32::from_le_bytes(payload.get(4..8)?.try_into().ok()?))?;
+            let key_length = NonZeroUsize::new(u32::from_le_bytes(
+                payload.get(8..12)?.try_into().ok()?,
+            ) as usize)?
+            .get();
+            let count = u32::from_le_bytes(payload.get(12..16)?.try_into().ok()?);
+            let row_length = u32::from_le_bytes(payload.get(16..20)?.try_into().ok()?) as usize;
+            let key_end = 20usize.checked_add(key_length)?;
+            let row_end = key_end.checked_add(row_length)?;
+            if row_end != payload.len() {
+                return None;
+            }
+            let key = payload.get(20..key_end)?;
+            let before = match (NonZeroU32::new(count), row_length) {
+                (None, 0) => None,
+                (Some(count), length) if length > 0 => Some(crate::storage::CatalogRowImage {
+                    bytes: payload.get(key_end..row_end)?,
+                    count,
+                }),
+                _ => return None,
+            };
+            Some(WalOp::PreparedCatalogRow {
+                relation: crate::storage::CatalogRelationIdentity { database, relation },
+                row: crate::storage::HistoricalCatalogRow { key, before },
+            })
+        }),
         KIND_SET_PARAMETER_ACL => decode_large_op(|| {
             let parameter = take_name(&mut at)?;
             crate::sql::ast::ParameterName::parse(parameter)?;
@@ -13635,6 +13703,56 @@ mod tests {
             );
             assert_eq!(at, payload.len());
         });
+    }
+
+    #[test]
+    fn prepared_catalog_row_codec_preserves_scope_absence_and_multiplicity() {
+        use crate::storage::{
+            CatalogRelationIdentity, CatalogRowImage, DatabaseOid, HistoricalCatalogRow,
+        };
+        use core::num::NonZeroU32;
+        for database in [None, Some(DatabaseOid::POSTGRES)] {
+            for before in [
+                None,
+                Some(CatalogRowImage {
+                    bytes: b"old catalog row",
+                    count: NonZeroU32::new(3).unwrap(),
+                }),
+            ] {
+                let relation = CatalogRelationIdentity {
+                    database,
+                    relation: NonZeroU32::new(1234).unwrap(),
+                };
+                let row = HistoricalCatalogRow {
+                    key: b"row key",
+                    before,
+                };
+                let mut bytes = [0; 256];
+                let payload = encode_catalog_operation(
+                    &WalOp::PreparedCatalogRow { relation, row },
+                    &mut bytes,
+                );
+                let Some(WalOp::PreparedCatalogRow {
+                    relation: decoded_relation,
+                    row: decoded_row,
+                }) = decode_op(KIND_PREPARED_CATALOG_ROW, payload)
+                else {
+                    panic!("prepared catalog row did not round trip");
+                };
+                assert_eq!(decoded_relation, relation);
+                assert_eq!(decoded_row, row);
+                for end in 0..payload.len() {
+                    assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &payload[..end]).is_none());
+                }
+                let mut invalid = [0; 256];
+                invalid[..payload.len()].copy_from_slice(payload);
+                invalid[8..12].fill(0);
+                assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none());
+                invalid[..payload.len()].copy_from_slice(payload);
+                invalid[12..16].copy_from_slice(&u32::from(before.is_none()).to_le_bytes());
+                assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none());
+            }
+        }
     }
 
     #[test]

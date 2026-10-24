@@ -21560,6 +21560,18 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&resolved)
     );
     assert_eq!(data_rows(&resolved), ["0", "{}"]);
+    let mut old_catalog = TxnState::new(&mut restarted_budget, 64).unwrap();
+    let mut old_catalog_guc = GucState::new();
+    let selected = run_session_transaction(
+        &mut restarted,
+        &mut restarted_budget,
+        &mut old_catalog,
+        &mut old_catalog_guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
+         SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';",
+    );
+    assert_eq!(data_rows(&selected), ["0", "0"]);
     for decision in [
         "COMMIT PREPARED 'parameter-commit'",
         "ROLLBACK PREPARED 'parameter-rollback'",
@@ -21571,6 +21583,22 @@ fn parameter_acls_survive_cold_object_store_recovery() {
             String::from_utf8_lossy(&output)
         );
     }
+    let selected = run_session_transaction(
+        &mut restarted,
+        &mut restarted_budget,
+        &mut old_catalog,
+        &mut old_catalog_guc,
+        "SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
+         SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';
+         SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&selected),
+        ["0", "0", "t"],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
     assert_eq!(data_rows(&run_with(&mut restarted, &mut restarted_budget,
         "SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
          SELECT count(*) FROM pg_parameter_acl WHERE parname = 'datestyle';")), ["t", "0"]);

@@ -163,6 +163,21 @@ v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
 The current manifest text represents sparse column sets and streams wide
 composite fields into the configured manifest buffer.
 
+Parameter permission records (kind 123) save the parameter name, expected old
+row identifier, and either removal or a complete replacement row. Each grant
+stores two 32-bit role identifiers and one byte each for privileges and grant
+options. An existing row with no grants differs from removal, which restores
+default permissions. Checkpoint `pacl` records retain that same distinction.
+
+Prepared catalog row records (kind 155) retain the changed row keys and their
+values before the prepared transaction. They use 32-bit database, relation,
+key-length, multiplicity and row-length fields, followed by key and row bytes.
+A zero database identifies a shared catalog; zero multiplicity and row length
+identify a row that did not yet exist. Recovery reserves these images until
+the prepared transaction commits or rolls back. They protect readers that
+start after a restart but before a prepared commit. Completed transactions do
+not need their old client snapshots restored.
+
 Table constraints are fixed at 64 entries per modeled kind and
 domain checks at 64 entries. Their journal counts are unsigned bytes, while
 their positions use a 64-entry stride in synthesized `pg_constraint` and

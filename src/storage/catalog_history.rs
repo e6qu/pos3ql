@@ -331,6 +331,23 @@ impl Storage {
 }
 
 impl CatalogHistoryBatch {
+    /// Visitors may copy into reserved RAM buffers; they must not perform I/O
+    /// or call another history operation while the row owner is held.
+    pub(crate) fn visit_rows(
+        &self,
+        mut visit: impl FnMut(CatalogRelationIdentity, HistoricalCatalogRow<'_>) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        let state = self
+            .history
+            .state
+            .lock()
+            .expect("catalog history lock poisoned");
+        for frame in frames(state.bytes.readable()).filter(|frame| frame.batch == self.identity) {
+            visit(frame.relation, frame.row)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn record(
         &mut self,
         relation: CatalogRelationIdentity,

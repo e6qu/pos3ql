@@ -8968,7 +8968,7 @@ pub fn synthesize<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     if qualifier != Some("information_schema")
-        && storage.commit_snapshot() != crate::storage::SNAPSHOT_ALL
+        && storage.commit_snapshot() != u64::MAX
         && let Some(relation) = super::catalog_snapshot_keys::RELATIONS
             .iter()
             .find(|relation| relation.name == name)

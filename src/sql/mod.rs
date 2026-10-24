@@ -6335,6 +6335,19 @@ impl Engine {
                 }
             }
         }
+        if prepared_slot.is_some()
+            && let Some(history) = txn.catalog_history.as_ref()
+        {
+            let staged = history.visit_rows(|relation, row| {
+                let lsn = self.storage.bump_lsn();
+                self.wal
+                    .stage_reserved(txn.txid, lsn, &WalOp::PreparedCatalogRow { relation, row })
+            });
+            if let Err(error) = staged {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
         // Keep the publication object inside its startup-reserved buffer.
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
@@ -20793,6 +20806,37 @@ fn replay_transaction_batches(
                                 return Err(error);
                             }
                         }
+                        WalOp::PreparedCatalogRow { relation, row } => {
+                            let definition = catalog_snapshot_keys::RELATIONS
+                                .iter()
+                                .find(|definition| definition.oid == relation.relation)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "unknown prepared catalog relation"
+                                    )
+                                })?;
+                            if relation.database.is_none() != definition.shared
+                                || relation
+                                    .database
+                                    .is_some_and(|database| database != metadata.database)
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "invalid prepared catalog database scope"
+                                ));
+                            }
+                            let transaction = &mut prepared.slot_mut(slot).transaction;
+                            if transaction.catalog_history.is_none() {
+                                transaction.catalog_history = storage.reserve_catalog_history(
+                                    transaction_id,
+                                    crate::storage::CatalogPublication::MayYield,
+                                )?;
+                            }
+                            if let Some(history) = transaction.catalog_history.as_mut() {
+                                history.record(relation, row.key, row.before)?;
+                            }
+                        }
                         WalOp::SetParameterAcl {
                             parameter,
                             expected,
@@ -21186,6 +21230,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::Commit { .. }
         | WalOp::PrepareTransaction { .. }
         | WalOp::PreparedLocks { .. }
+        | WalOp::PreparedCatalogRow { .. }
         | WalOp::CommitPrepared { .. }
         | WalOp::RollbackPrepared { .. } => {}
         WalOp::Truncate { .. } | WalOp::LogicalMessage { .. } => {}

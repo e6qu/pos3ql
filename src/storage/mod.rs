@@ -46261,7 +46261,7 @@ impl Storage {
         self.lsn.current()
     }
 
-    /// Observe a completed publication without moving a newer position backward.
+    /// Observe a journal position without moving a newer reservation backward.
     pub(crate) fn observe_lsn(&self, lsn: u64) {
         self.lsn.observe(lsn);
     }

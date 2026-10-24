@@ -46,6 +46,7 @@ jobs:
           name: transaction-admission-format
           path: ${{ runner.temp }}/format.patch
       - name: Compile and lint all targets
+        id: lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - uses: ./.github/actions/python-test-environment
         if: ${{ !cancelled() }}
@@ -77,7 +78,7 @@ jobs:
               writer.close()
           PY
       - name: Admission, transaction, row and snapshot regressions
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.lint.outcome == 'success' }}
         run: >-
           cargo test --release --lib --locked --
           transaction_admission_ transaction_publication_ statement_snapshot_

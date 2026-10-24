@@ -135,6 +135,10 @@ startup, with no new pool or configuration limit. SQL still uses one CPU worker;
 consistent later metadata capture and remaining synchronous storage reads are
 separate [remaining work](../PLAN.md).
 
+A large-object protocol call waiting for admission keeps its original statement
+clock and timeout. It creates no object before admission. An expired wait
+returns `57014` and can be rolled back; a successful retry performs the call once.
+
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
 or abort and restores the captured read position for each chunk. When statement
 triggers need the inserted values, COPY encodes them after BEFORE triggers,

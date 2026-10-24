@@ -1,6 +1,5 @@
 //! Statement admission and the last completely installed transaction share an owner.
 
-use core::num::NonZeroU64;
 use std::sync::Arc;
 
 use super::{LockState, SnapshotState, Storage};
@@ -12,16 +11,12 @@ use crate::sql_err;
 #[derive(Clone, Copy)]
 enum Phase {
     Open,
-    Installing {
-        identity: NonZeroU64,
-        owner: WaitOwner,
-    },
+    Installing { owner: WaitOwner },
     RecoveryRequired,
 }
 
 pub(super) struct TransactionAdmission {
     visible_lsn: u64,
-    next_identity: u64,
     phase: Phase,
 }
 
@@ -29,7 +24,6 @@ impl TransactionAdmission {
     pub(super) fn new(visible_lsn: u64) -> Self {
         Self {
             visible_lsn,
-            next_identity: 0,
             phase: Phase::Open,
         }
     }
@@ -41,7 +35,7 @@ impl TransactionAdmission {
     ) -> Result<u64, SqlError> {
         match self.phase {
             Phase::Open => Ok(self.visible_lsn),
-            Phase::Installing { owner, .. } if owner != waiter => {
+            Phase::Installing { owner } if owner != waiter => {
                 // Register while the admission owner is held. Completion cannot
                 // wake the reader before its wait edge exists.
                 locks
@@ -70,7 +64,6 @@ fn recovery_required() -> SqlError {
 pub(crate) struct TransactionInstallation {
     snapshots: Arc<Mutex<SnapshotState>>,
     locks: Arc<Mutex<LockState>>,
-    identity: NonZeroU64,
     owner: WaitOwner,
     lsn: u64,
     completed: bool,
@@ -81,18 +74,20 @@ impl TransactionInstallation {
         let mut snapshots = self.snapshots.lock().expect("snapshot state lock poisoned");
         let admission = &mut snapshots.admission;
         assert!(
-            matches!(admission.phase, Phase::Installing { identity, .. } if identity == self.identity),
-            "installation owns its admission identity"
+            matches!(admission.phase, Phase::Installing { owner } if owner == self.owner),
+            "installation owns reader admission"
         );
         admission.visible_lsn = admission.visible_lsn.max(self.lsn);
         admission.phase = Phase::Open;
         self.completed = true;
-        drop(snapshots);
+        // Wake before releasing admission: a reused connection owner must not
+        // have a later publication's wait edges removed by this completion.
         self.locks
             .lock()
             .expect("lock state lock poisoned")
             .row
-            .resource_released(self.owner);
+            .publication_finished(self.owner);
+        drop(snapshots);
     }
 }
 
@@ -104,16 +99,16 @@ impl Drop for TransactionInstallation {
         let mut snapshots = self.snapshots.lock().expect("snapshot state lock poisoned");
         let admission = &mut snapshots.admission;
         assert!(
-            matches!(admission.phase, Phase::Installing { identity, .. } if identity == self.identity),
-            "installation owns its admission identity"
+            matches!(admission.phase, Phase::Installing { owner } if owner == self.owner),
+            "installation owns reader admission"
         );
         admission.phase = Phase::RecoveryRequired;
-        drop(snapshots);
         self.locks
             .lock()
             .expect("lock state lock poisoned")
             .row
-            .resource_released(self.owner);
+            .publication_finished(self.owner);
+        drop(snapshots);
     }
 }
 
@@ -156,22 +151,10 @@ impl Storage {
         if !matches!(admission.phase, Phase::Open) {
             return Err(recovery_required());
         }
-        let identity = admission
-            .next_identity
-            .checked_add(1)
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "transaction publication identity exhausted"
-                )
-            })?;
-        admission.next_identity = identity.get();
-        admission.phase = Phase::Installing { identity, owner };
+        admission.phase = Phase::Installing { owner };
         Ok(TransactionInstallation {
             snapshots: Arc::clone(&self.snapshots),
             locks: Arc::clone(&self.locks),
-            identity,
             owner,
             lsn,
             completed: false,
@@ -364,7 +347,41 @@ mod tests {
     }
 
     #[test]
-    fn transaction_admission_rejects_overlapping_owners_and_exhaustion_without_changes() {
+    fn transaction_admission_completion_wakes_after_intermediate_owner_cleanup() {
+        for success in [true, false] {
+            let (storage, _) = fixture(TransactionMode::Mvcc);
+            crate::mem::guard::forbid_alloc(|| {
+                let installing = storage.begin_transaction_installation(8, 9).unwrap();
+                assert_eq!(
+                    storage.statement_snapshot_lsn(99).unwrap_err().sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                storage.end_transaction_snapshots(8, crate::storage::SnapshotCleanup::Schedule);
+                let generation = storage.lock_generation();
+                if success {
+                    installing.complete();
+                } else {
+                    drop(installing);
+                }
+                assert_ne!(
+                    storage.lock_generation(),
+                    generation,
+                    "a parked reader missed final publication after its wait edge was removed"
+                );
+                if success {
+                    assert_eq!(storage.statement_snapshot_lsn(99).unwrap(), 9);
+                } else {
+                    assert_eq!(
+                        storage.statement_snapshot_lsn(99).unwrap_err().sqlstate,
+                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn transaction_admission_rejects_empty_and_overlapping_owners_without_changes() {
         let (storage, _) = fixture(TransactionMode::Mvcc);
         crate::mem::guard::forbid_alloc(|| {
             assert!(storage.begin_transaction_installation(0, 9).is_err());
@@ -375,14 +392,12 @@ mod tests {
                 sqlstate::TRANSACTION_RESOLUTION_UNKNOWN
             );
             installing.complete();
-            storage.snapshot_state().admission.next_identity = u64::MAX;
-            let error = storage.begin_transaction_installation(9, 10).err().unwrap();
-            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(
-                error.message.as_str(),
-                "transaction publication identity exhausted"
-            );
             assert_eq!(storage.statement_snapshot_lsn(99).unwrap(), 9);
+            storage
+                .begin_transaction_installation(9, 10)
+                .unwrap()
+                .complete();
+            assert_eq!(storage.statement_snapshot_lsn(99).unwrap(), 10);
         });
     }
 
@@ -399,7 +414,9 @@ mod tests {
                 scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
                         let reader = storage
-                            .retain_statement_snapshot(100 + index, |lsn| lsn)
+                            .retain_statement_snapshot(100 + u32::try_from(index).unwrap(), |lsn| {
+                                lsn
+                            })
                             .unwrap();
                         captured.wait();
                         published.wait();

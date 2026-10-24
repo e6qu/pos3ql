@@ -219,6 +219,144 @@ fn transaction_admission_sql_wait_does_not_advance_command_or_take_a_snapshot() 
     writer.success(&mut engine, "ROLLBACK", true);
 }
 
+#[test]
+fn transaction_admission_fast_path_yields_before_effects_and_resumes_once() {
+    let config = test_config("admission-fast-path-resume");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN", true);
+    let command = reader.transaction.command_id();
+    let installing = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    let call = |engine: &mut Engine, reader: &mut ConfiguredTransactionSession| {
+        reader.send.clear();
+        let mut responder = Responder::new(&mut reader.send);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_large_object_fast_path(
+                715,
+                &[Datum::Oid(4242)],
+                true,
+                &reader.arena,
+                &mut reader.transaction,
+                &reader.guc,
+                &mut responder,
+                reader.connection_id,
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Blocked {
+            wait: StatementWait::Lock
+        }
+    );
+    assert!(reader.send.readable().is_empty());
+    assert_eq!(reader.transaction.command_id(), command);
+    assert!(reader.transaction.suspended_statement_context().is_some());
+    assert_eq!(query::statement_deadline(), 0);
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        0
+    );
+    installing.complete();
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Complete(true)
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    assert!(reader.transaction.suspended_statement_context().is_none());
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        1
+    );
+    reader.success(&mut engine, "COMMIT", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT oid FROM pg_largeobject_metadata", true)),
+        ["4242"]
+    );
+    writer.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn transaction_admission_fast_path_expired_wait_has_no_effects_and_can_roll_back() {
+    let config = test_config("admission-fast-path-timeout");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN", true);
+    let installing = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    let call = |engine: &mut Engine, reader: &mut ConfiguredTransactionSession| {
+        reader.send.clear();
+        let mut responder = Responder::new(&mut reader.send);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_large_object_fast_path(
+                715,
+                &[Datum::Oid(4242)],
+                true,
+                &reader.arena,
+                &mut reader.transaction,
+                &reader.guc,
+                &mut responder,
+                reader.connection_id,
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Blocked {
+            wait: StatementWait::Lock
+        }
+    );
+    // Expire the saved deadline without sleeping or changing timeout limits.
+    reader.transaction.release_suspended_statement();
+    reader.transaction.suspend_statement(
+        None,
+        datetime::statement_clock(),
+        1,
+        exec::PlpgsqlTransactionContext::Atomic,
+    );
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Complete(false)
+    );
+    assert!(String::from_utf8_lossy(reader.send.readable()).contains("57014"));
+    assert!(reader.transaction.failed);
+    assert!(reader.transaction.suspended_statement_context().is_none());
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        0
+    );
+    assert_eq!(query::statement_deadline(), 0);
+    installing.complete();
+    reader.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT lo_create(4242)", true)),
+        ["4242"]
+    );
+    writer.success(&mut engine, "ROLLBACK", true);
+}
+
 fn inject_definitions(
     engine: &Engine,
     point: PublicationPoint,

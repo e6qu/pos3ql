@@ -5337,9 +5337,10 @@ impl Engine {
         let lease = if retained_lease.is_some() {
             retained_lease
         } else if takes_snapshot && retain_snapshot {
-            Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| {
-                txn.statement_snapshot(lsn)
-            })?)
+            Some(
+                self.storage
+                    .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
+            )
         } else {
             None
         };
@@ -10935,15 +10936,23 @@ impl Engine {
         let _atomic_reads = self.atomic_block_read_scope();
         self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
+        if let Some(deadline) = txn.suspended_statement_deadline() {
+            query::restore_statement_deadline(deadline);
+        } else {
+            query::arm_timeout(guc.statement_timeout_ms());
+        }
+        let outcome = (|| {
         if let Err(error) = self
             .check_writer_fence()
             .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
         {
+            txn.release_suspended_statement();
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
         }
         if txn.failed {
+            txn.release_suspended_statement();
             responder.error(
                 sqlstate::IN_FAILED_SQL_TRANSACTION,
                 "current transaction is aborted, commands ignored until end of transaction block",
@@ -10951,14 +10960,23 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
         }
-        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
+        let _snapshot_lease = match query::check_timeout()
+            .and_then(|()| self.begin_command_snapshot(txn, true, true, true, false))
+        {
             Ok(lease) => lease,
             Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                txn.suspend_statement(
+                    None,
+                    datetime::statement_clock(),
+                    query::statement_deadline(),
+                    exec::PlpgsqlTransactionContext::Atomic,
+                );
                 return Ok(ExtendedExecutionStatus::Blocked {
                     wait: StatementWait::Lock,
                 });
             }
             Err(error) => {
+                txn.release_suspended_statement();
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
@@ -10969,6 +10987,7 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
+        txn.release_suspended_statement();
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         let result = if arguments.iter().any(Datum::is_null) {
             Ok(Datum::Null)
@@ -10978,6 +10997,10 @@ impl Engine {
             }
             large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
         };
+        let result = result.and_then(|value| {
+            query::check_timeout()?;
+            Ok(value)
+        });
         let value = match result {
             Ok(value) => value,
             Err(error) => {
@@ -11012,6 +11035,9 @@ impl Engine {
         }
         responder.ready_for_query(txn.status_byte())?;
         Ok(ExtendedExecutionStatus::Complete(true))
+        })();
+        query::disarm_timeout();
+        outcome
     }
 
     /// Infers each `$n` parameter's type OID from how it is used, as

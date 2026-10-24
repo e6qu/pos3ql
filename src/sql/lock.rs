@@ -266,6 +266,16 @@ impl LockManager {
         }
     }
 
+    /// Earlier snapshot or lock cleanup may already have removed an admission
+    /// wait edge. The final visibility transition must still wake its reader.
+    pub(crate) fn publication_finished(&mut self, owner: WaitOwner) {
+        let before = self.generation;
+        self.resource_released(owner);
+        if self.generation == before {
+            self.generation = self.generation.wrapping_add(1).max(1);
+        }
+    }
+
     pub(crate) fn blocker_pids(&self, waiter_pid: i32, output: &mut [i32]) -> usize {
         let waiter = connection_wait_owner(waiter_pid);
         let mut count = 0usize;

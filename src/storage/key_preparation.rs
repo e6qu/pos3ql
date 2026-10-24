@@ -105,6 +105,20 @@ impl ValueKeyPreparation {
                 )
             })
     }
+
+    pub(super) fn binding(&self, storage: &Storage, binding: usize) -> Result<Enforcer, SqlError> {
+        let table = &storage.tables[self.target.table()];
+        let (definition, publication) = row_ownership::acquire(|| {
+            Ok((
+                table.definition.try_read_for_batch()?,
+                row_ownership::try_mutex(&table.publication, "table publication lock poisoned")?,
+            ))
+        });
+        self.validate_definition(storage, &definition)?;
+        publication.enforcers.get(binding).and_then(Option::as_ref).cloned().ok_or_else(|| {
+            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
+        })
+    }
 }
 
 pub(super) struct PreparedRowKeys {
@@ -115,6 +129,9 @@ pub(super) struct PreparedRowKeys {
 }
 
 pub(super) struct PreparedCommittedRow {
+    pub(super) table: usize,
+    pub(super) rowid: u64,
+    pub(super) transaction: u32,
     pub(super) head: u64,
     pub(super) keys: Option<PreparedRowKeys>,
 }
@@ -258,6 +275,72 @@ mod tests {
     }
 
     #[test]
+    fn key_preparation_expression_failure_preserves_working_bindings() {
+        let (storage, table) = fixture(4);
+        crate::mem::guard::forbid_alloc(|| {
+            let before = storage.tables[table].enforcers();
+            let mut index = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("bad_expression").unwrap(),
+                table: SqlName::parse("key_orders").unwrap(),
+                n_cols: 1,
+                ..IndexDef::EMPTY
+            };
+            index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
+            let slot = storage.create_index(index, 0).unwrap();
+            assert_eq!(storage.build_enforcers_visible(table, None).unwrap_err().sqlstate, sqlstate::DIVISION_BY_ZERO);
+            assert!(same_bindings(&before, &storage.tables[table].enforcers(), true));
+            assert_eq!(key_rows(&storage, table, 1), 1);
+            storage.commit_index_drop(slot);
+            storage.build_enforcers_visible(table, None).unwrap();
+            assert_eq!(key_rows(&storage, table, 1), 1);
+        });
+    }
+
+    #[test]
+    fn key_preparation_competing_rebuilds_keep_a_complete_published_cache() {
+        let (storage, table) = fixture(8);
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let storage = &storage;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..16 {
+                            if let Err(error) = storage.build_enforcers_visible(table, None) {
+                                assert!(matches!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE | sqlstate::PROGRAM_LIMIT_EXCEEDED));
+                            }
+                            assert_eq!(key_rows(storage, table, 1), 1);
+                        }
+                    });
+                });
+            }
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            storage.build_enforcers_visible(table, None).unwrap();
+            assert_eq!(key_rows(&storage, table, 1), 1);
+        });
+    }
+
+    #[test]
+    fn key_preparation_no_indexes_need_no_statement_image_reservation() {
+        let mut config = test_config();
+        config.query_workspace_slots = 0;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("key_orders", &[("id", ColType::Int4, false), ("amount", ColType::Int4, false)])).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            pending(&storage, table, 1, 8, 2);
+            storage.commit_row(table, 1, 8, 7).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert_eq!(row.committed_lsn, 7);
+            assert!(row.pending_last().is_none());
+        });
+    }
+
+    #[test]
     fn key_preparation_replaced_bindings_reject_publication_without_changing_rows() {
         let (storage, table) = fixture(4);
         crate::mem::guard::forbid_alloc(|| {
@@ -266,7 +349,7 @@ mod tests {
             let prepared = storage.prepare_committed_row(table, 1, 8, false, selected).unwrap().unwrap();
             storage.build_enforcers_visible(table, None).unwrap();
             let before = storage.tables[table].generation();
-            let error = storage.publish_prepared_row(table, 1, 8, 9, prepared).unwrap_err();
+            let error = storage.publish_prepared_row(9, prepared).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert_eq!(storage.tables[table].generation(), before);
             assert_eq!(key_rows(&storage, table, 1), 1);
@@ -291,7 +374,7 @@ mod tests {
             let prepared = storage.prepare_committed_row(table, 1, 8, false, selected).unwrap().unwrap();
             pending(&storage, table, 2, 10, 3);
             storage.commit_row(table, 2, 10, 9).unwrap();
-            storage.publish_prepared_row(table, 1, 8, 10, prepared).unwrap();
+            storage.publish_prepared_row(10, prepared).unwrap();
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
             assert_eq!(key_rows(&storage, table, 3), 1);

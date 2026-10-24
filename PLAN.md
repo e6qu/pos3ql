@@ -38,7 +38,9 @@ Connect reader admission, schema changes and type retirement to that transaction
 publication boundary. Keep rewrite history cleanup paced during concurrent publication.
 Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
-preparation. Keep old row, index and backup data until their readers have finished.
+preparation across all catalog consumers. Extend the selected table-shape
+checks used by index keys to the whole statement's reader admission.
+Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may
 retain exclusive startup access; ordinary publication must let unrelated
 operations progress under their own owners.

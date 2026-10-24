@@ -32569,7 +32569,7 @@ impl Storage {
         let Some(prepared) = self.prepare_committed_row(table_index, rowid, txid, rewritten, selected)? else {
             return Ok(());
         };
-        self.publish_prepared_row(table_index, rowid, txid, commit_lsn, prepared)
+        self.publish_prepared_row(commit_lsn, prepared)
     }
 
     fn prepare_committed_row(
@@ -32605,19 +32605,16 @@ impl Storage {
             None
         };
 
-        Ok(Some(key_preparation::PreparedCommittedRow { head, keys: prepared_keys }))
+        Ok(Some(key_preparation::PreparedCommittedRow { table: table_index, rowid, transaction: txid, head, keys: prepared_keys }))
     }
 
     fn publish_prepared_row(
         &self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
         commit_lsn: u64,
         prepared: key_preparation::PreparedCommittedRow,
     ) -> Result<(), SqlError> {
+        let key_preparation::PreparedCommittedRow { table: table_index, rowid, transaction: txid, head, keys: prepared_keys } = prepared;
         let table = &self.tables[table_index];
-        let key_preparation::PreparedCommittedRow { head, keys: prepared_keys } = prepared;
         let rewritten = prepared_keys.is_none();
 
         let (snapshots, definition, mut publication, generations, mut versions, mut rows) =
@@ -32848,9 +32845,7 @@ impl Storage {
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
-        let enforcer = self.tables[table_index].enforcer(binding).ok_or_else(|| {
-            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
-        })?;
+        let enforcer = selection.binding(self, binding)?;
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = selection.definition().schema(&mut schema);
         let home = home.into();
@@ -32886,9 +32881,7 @@ impl Storage {
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
-        let enforcer = self.tables[table_index].enforcer(binding).ok_or_else(|| {
-            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
-        })?;
+        let enforcer = selection.binding(self, binding)?;
         self.with_value_binding_values_for(arena, &selection, &enforcer, values, visit)
     }
 

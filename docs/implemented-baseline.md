@@ -1043,13 +1043,29 @@ are prerequisites for the planned execution workers.
 A selected in-memory index cache owns its storage. Rebuilding or dropping a table
 cannot reuse that cache slot until its last reader releases it. A replacement
 binding list and its count publish together after population; failed builds
-release their claims and publish no partial list. A cache whose row map fills is
+release their claims and leave the working list intact. A competing replacement,
+changed table definition, or newer publication rejects installation with `40001`
+before changing the published list. A cache whose row map fills is
 marked incomplete, so it cannot supply an authoritative negative lookup.
 
 Cache owners and their buffers are reserved at startup. Retained readers count
 against `max_value_indexes`; a full claim pool returns `54000`. For example, a
 replacement that runs out of slots can be retried after an older lookup releases
-its cache. Allocation controls release before clearing a claimed cache.
+its cache. The pool must also fit the complete replacement beside the published
+set: a table with two distinct key bindings needs two free buffers to rebuild
+while its existing two remain usable. A failed claim returns `54000` and keeps
+the working caches. Change this capacity before restarting; it never grows
+automatically. Allocation controls release before clearing a claimed cache.
+
+Index-key preparation retains one table definition for decoding the row and
+evaluating its expressions and membership predicate. A row from an older physical
+layout is rejected with `40001` before decoding. Committing a row rechecks that
+definition and the selected cache bindings before changing row history or caches.
+An ordinary commit to another row does not invalidate prepared keys. For example,
+rebuilding an order index between preparing and publishing a new order forces
+that stale publication to fail with `40001`; it cannot insert an old binding's
+hash into a new cache. These checks do not yet provide the roadmap's
+whole-statement catalog capture or SQL execution on several CPU workers.
 
 ### How statistics reads and journal batches stay consistent
 

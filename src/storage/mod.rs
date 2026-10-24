@@ -12842,6 +12842,7 @@ pub enum StoredRelKind {
 pub struct PendingComment {
     pub txid: u32,
     pub text: Option<StackStr<COMMENT_MAX>>,
+    root: core::num::NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -12866,6 +12867,7 @@ pub struct CommentEntry {
     pub name: SqlName,
     pub subid: u32,
     pub live: Option<StackStr<COMMENT_MAX>>,
+    root: Option<core::num::NonZeroU64>,
     pub pending: Option<PendingComment>,
     pending_identity: Option<PendingCommentIdentity>,
     pending_drop: Option<PendingCommentDrop>,
@@ -12879,9 +12881,21 @@ struct PendingCommentDrop {
 
 struct CommentCatalog {
     entries: FixedVec<CommentEntry>,
+    next_root: core::num::NonZeroU64,
 }
 
 impl CommentCatalog {
+    fn reserve_root(&mut self) -> Result<core::num::NonZeroU64, SqlError> {
+        let root = self.next_root;
+        self.next_root = root.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "comment tuple identity exhausted"
+            )
+        })?;
+        Ok(root)
+    }
+
     fn reap(&mut self, slot: usize) {
         let comment = &mut self.entries[slot];
         if comment.live.is_none()
@@ -12954,6 +12968,7 @@ pub(crate) struct CatalogComment {
     pub(crate) subid: u32,
     pub(crate) text: Option<StackStr<COMMENT_MAX>>,
     pub(crate) private: bool,
+    pub(crate) root: Option<core::num::NonZeroU64>,
     pub(crate) lookup_transaction: u32,
 }
 
@@ -13012,6 +13027,7 @@ impl Iterator for CatalogCommentIter<'_> {
                 subid: comment.subid,
                 text,
                 private,
+                root: pending.map(|pending| pending.root).or(comment.root),
                 lookup_transaction: if removed { 0 } else { self.txid },
             });
         }
@@ -13029,6 +13045,7 @@ impl CommentEntry {
             name: SqlName::EMPTY,
             subid: 0,
             live: None,
+            root: None,
             pending: None,
             pending_identity: None,
             pending_drop: None,
@@ -18315,6 +18332,7 @@ impl Storage {
             + config.max_databases * size_of::<DatabaseDef>()
             + config.max_tablespaces * size_of::<TablespaceDef>()
             + config.max_comments * size_of::<CommentEntry>()
+            + size_of::<core::num::NonZeroU64>()
             + config.max_connections as usize * size_of::<BackendActivity>()
             + config.max_connections as usize * size_of::<BackendSignal>()
             + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
@@ -18372,6 +18390,10 @@ impl Storage {
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
+        budget.draw(
+            size_of::<core::num::NonZeroU64>(),
+            "comment tuple identity counter",
+        )?;
         budget.draw(size_of::<usize>(), "routine catalog capacity")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
@@ -19287,7 +19309,10 @@ impl Storage {
                 parameters: parameter_acl_entries,
                 parameter_rows: ParameterAclRows::new(config, budget, catalog_origin)?,
             }),
-            comments: Mutex::new(CommentCatalog { entries: comments }),
+            comments: Mutex::new(CommentCatalog {
+                entries: comments,
+                next_root: core::num::NonZeroU64::new(1).unwrap(),
+            }),
             catalog_sequence: CatalogSequence::new(0),
             catalog_sources,
             transaction_mode: config.transaction_mode,
@@ -27651,6 +27676,12 @@ impl Storage {
         text: Option<StackStr<COMMENT_MAX>>,
         txid: u32,
     ) -> Result<Option<(usize, Option<PendingComment>)>, SqlError> {
+        if txid == 0 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "comment write requires a transaction owner"
+            ));
+        }
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
@@ -27673,8 +27704,17 @@ impl Storage {
             if text.is_none() && visible.is_none() {
                 return Ok(None);
             }
-            let prior = comments.entries[slot].pending.take();
-            comments.entries[slot].pending = Some(PendingComment { txid, text });
+            let root = if visible.is_some() {
+                comments.entries[slot]
+                    .pending
+                    .map(|pending| pending.root)
+                    .or(comments.entries[slot].root)
+                    .expect("a visible comment has a tuple identity")
+            } else {
+                comments.reserve_root()?
+            };
+            let prior = comments.entries[slot].pending;
+            comments.entries[slot].pending = Some(PendingComment { txid, text, root });
             return Ok(Some((slot, prior)));
         }
         if text.is_none() {
@@ -27687,6 +27727,7 @@ impl Storage {
                 comments.entries.capacity()
             ));
         };
+        let root = comments.reserve_root()?;
         comments.entries[slot] = CommentEntry {
             used: true,
             database,
@@ -27695,7 +27736,8 @@ impl Storage {
             name,
             subid,
             live: None,
-            pending: Some(PendingComment { txid, text }),
+            root: None,
+            pending: Some(PendingComment { txid, text, root }),
             pending_identity: None,
             pending_drop: None,
         };
@@ -27748,6 +27790,7 @@ impl Storage {
                 }
                 entry.pending = None;
                 entry.live = p.text;
+                entry.root = entry.live.map(|_| p.root);
                 let out = (
                     entry.class,
                     entry.schema,
@@ -27780,13 +27823,22 @@ impl Storage {
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
-            c.database == database
+            c.used
+                && c.database == database
                 && c.class == class
                 && c.subid == subid
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches(database, class, schema.as_str(), name.as_str(), subid))
         }) {
+            let root = if text.is_some() && comments.entries[slot].live.is_none() {
+                Some(comments.reserve_root()?)
+            } else if text.is_some() {
+                comments.entries[slot].root
+            } else {
+                None
+            };
             comments.entries[slot].live = text;
+            comments.entries[slot].root = root;
             comments.reap(slot);
             return Ok(());
         }
@@ -27800,6 +27852,7 @@ impl Storage {
                 comments.entries.capacity()
             ));
         };
+        let root = comments.reserve_root()?;
         comments.entries[slot] = CommentEntry {
             used: true,
             database,
@@ -27808,6 +27861,7 @@ impl Storage {
             name,
             subid,
             live: text,
+            root: Some(root),
             pending: None,
             pending_identity: None,
             pending_drop: None,
@@ -57944,12 +57998,38 @@ mod tests {
                     .is_none()
             );
             assert!(storage.commit_comment(slot, 7).is_some());
+            let original_root = storage.catalog_comments(0).next().unwrap().root.unwrap();
             let (same_slot, prior) = storage
                 .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
                 .unwrap()
                 .unwrap();
             assert_eq!(same_slot, slot);
             assert!(storage.catalog_comments(8).next().unwrap().private);
+            assert_eq!(
+                storage.catalog_comments(8).next().unwrap().root,
+                Some(original_root)
+            );
+            let (removed_slot, removed_prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, None, 8)
+                .unwrap()
+                .unwrap();
+            let (inserted_slot, inserted_prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap()
+                .unwrap();
+            let inserted_root = storage.catalog_comments(8).next().unwrap().root.unwrap();
+            assert_ne!(inserted_root, original_root);
+            assert_eq!(
+                storage.catalog_comments(0).next().unwrap().root,
+                Some(original_root)
+            );
+            storage.restore_comment_pending(inserted_slot, inserted_prior);
+            assert!(storage.catalog_comments(8).next().unwrap().text.is_none());
+            storage.restore_comment_pending(removed_slot, removed_prior);
+            assert_eq!(
+                storage.catalog_comments(8).next().unwrap().root,
+                Some(original_root)
+            );
             storage.restore_comment_pending(same_slot, prior);
             assert!(!storage.catalog_comments(8).next().unwrap().private);
             let (slot, _) = storage
@@ -57963,6 +58043,16 @@ mod tests {
                     .set_comment(CommentClass::Relation, schema, name, 0, None, 10)
                     .unwrap()
                     .is_none()
+            );
+            assert_eq!(storage.catalog_comments(10).count(), 0);
+            storage.comment_catalog().next_root = core::num::NonZeroU64::new(u64::MAX).unwrap();
+            let exhausted = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 10)
+                .unwrap_err();
+            assert_eq!(exhausted.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                exhausted.message.as_str(),
+                "comment tuple identity exhausted"
             );
             assert_eq!(storage.catalog_comments(10).count(), 0);
         });

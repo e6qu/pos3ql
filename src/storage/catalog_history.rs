@@ -15,7 +15,7 @@ use crate::mem::mutex::Mutex;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-const HEADER_BYTES: usize = 40;
+const HEADER_BYTES: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CatalogPublication {
@@ -34,6 +34,8 @@ pub(crate) struct CatalogRelationIdentity {
 pub(crate) struct CatalogRowImage<'a> {
     pub(crate) bytes: &'a [u8],
     pub(crate) count: NonZeroU32,
+    /// Updates retain their index root; delete followed by insert gets a new one.
+    pub(crate) root: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +90,7 @@ fn frames(bytes: &[u8]) -> impl Iterator<Item = Frame<'_>> {
         let committed_at = u64::from_le_bytes(header[24..32].try_into().unwrap());
         let key_length = u32::from_le_bytes(header[32..36].try_into().unwrap()) as usize;
         let row_length = u32::from_le_bytes(header[36..40].try_into().unwrap()) as usize;
+        let root = NonZeroU64::new(u64::from_le_bytes(header[40..48].try_into().unwrap()));
         assert_eq!(length, HEADER_BYTES + key_length + row_length);
         let key_start = offset + HEADER_BYTES;
         let row_start = key_start + key_length;
@@ -106,6 +109,7 @@ fn frames(bytes: &[u8]) -> impl Iterator<Item = Frame<'_>> {
                 before: NonZeroU32::new(count).map(|count| CatalogRowImage {
                     bytes: &bytes[row_start..row_end],
                     count,
+                    root,
                 }),
             },
         };
@@ -300,6 +304,7 @@ impl CatalogHistory {
                             .alloc_slice_copy(before.bytes)
                             .map_err(|_| crate::sql::eval::arena_full())?,
                         count: before.count,
+                        root: before.root,
                     })
                 })
                 .transpose()?;
@@ -436,6 +441,12 @@ impl CatalogHistoryBatch {
         header[16..24].copy_from_slice(&self.identity.get().to_le_bytes());
         header[32..36].copy_from_slice(&(key.len() as u32).to_le_bytes());
         header[36..40].copy_from_slice(&(row.len() as u32).to_le_bytes());
+        header[40..48].copy_from_slice(
+            &before
+                .and_then(|row| row.root)
+                .map_or(0, NonZeroU64::get)
+                .to_le_bytes(),
+        );
         assert!(state.bytes.append(&header));
         assert!(state.bytes.append(key));
         assert!(state.bytes.append(row));
@@ -505,6 +516,7 @@ mod tests {
         Some(CatalogRowImage {
             bytes,
             count: NonZeroU32::new(1).unwrap(),
+            root: None,
         })
     }
 
@@ -768,6 +780,7 @@ mod tests {
             let duplicates = Some(CatalogRowImage {
                 bytes: b"dependency",
                 count: NonZeroU32::new(3).unwrap(),
+                root: None,
             });
             first.record(table, &[0], duplicates).unwrap();
             first.record(table, &[16], None).unwrap();

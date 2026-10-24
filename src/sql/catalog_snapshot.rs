@@ -1,7 +1,7 @@
 //! Catalog row keys, committed before-images, and transaction-private overlays.
 
 use core::hash::Hasher;
-use core::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroU64};
 
 use crate::mem::arena::Arena;
 use crate::mem::fixed_map::Fnv1aHasher;
@@ -21,6 +21,73 @@ pub(crate) enum CatalogRowKey<'a> {
     Columns(&'a [&'a str]),
     /// Dependency catalogs can contain repeated identical tuples.
     Tuple,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogScan {
+    Index,
+    Sequential,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogImageSource {
+    Committed,
+    Private,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogRowState {
+    pub(crate) root: Option<NonZeroU64>,
+    pub(crate) private: bool,
+}
+
+impl CatalogRowState {
+    pub(crate) const UNTRACKED: Self = Self {
+        root: None,
+        private: false,
+    };
+}
+
+pub(crate) struct DescriptionKey {
+    pub(crate) object: u32,
+    pub(crate) class: u32,
+    pub(crate) column: i32,
+}
+
+impl DescriptionKey {
+    pub(crate) fn decode(bytes: &[u8], shared: bool) -> Result<Self, SqlError> {
+        // Canonical tagged rows: oid, oid, and (for local comments) int4.
+        let count = if shared { 2u16 } else { 3u16 };
+        let valid = bytes.len() == 2 + usize::from(count) * 5
+            && bytes[..2] == count.to_le_bytes()
+            && bytes[2] == 35
+            && bytes[7] == 35
+            && (shared || bytes[12] == 2);
+        if !valid {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid description catalog key"
+            ));
+        }
+        let object = u32::from_le_bytes(bytes[3..7].try_into().unwrap());
+        let class = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let column = if shared {
+            0
+        } else {
+            i32::from_le_bytes(bytes[13..17].try_into().unwrap())
+        };
+        if object == 0 || class == 0 || column < 0 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid description catalog key identity"
+            ));
+        }
+        Ok(Self {
+            object,
+            class,
+            column,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -337,13 +404,15 @@ pub(crate) fn capture_transaction(
                 &committed,
                 &private,
                 &mut batch,
-                |key| {
-                    super::catalog::private_catalog_row(
+                |key, source| {
+                    super::catalog::catalog_row_state(
                         storage,
-                        transaction.txid,
+                        match source {
+                            CatalogImageSource::Committed => 0,
+                            CatalogImageSource::Private => transaction.txid,
+                        },
                         relation.name,
                         key,
-                        arena,
                     )
                 },
                 arena,
@@ -450,6 +519,7 @@ mod key_definitions {
                     Some("pg_catalog"),
                     relation.name,
                     0,
+                    CatalogScan::Sequential,
                     &arena,
                 )?;
                 let indexed = KeyedRows::from_catalog(&catalog, relation.key, &arena)?;
@@ -612,6 +682,7 @@ impl<'a> KeyedRows<'a> {
                         image: Some(CatalogRowImage {
                             bytes,
                             count: NonZeroU32::new(1).unwrap(),
+                            root: None,
                         }),
                     });
                     output.len += 1;
@@ -652,18 +723,22 @@ pub(crate) fn capture_rows(
     committed: &SynthTable<'_>,
     private: &SynthTable<'_>,
     batch: &mut CatalogHistoryBatch,
-    private_change: impl Fn(&[u8]) -> Result<bool, SqlError>,
+    row_state: impl Fn(&[u8], CatalogImageSource) -> Result<CatalogRowState, SqlError>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let committed = KeyedRows::from_catalog(committed, key, arena)?;
     let private = KeyedRows::from_catalog(private, key, arena)?;
     for row in committed.iter() {
-        if private_change(row.key)?
+        if row_state(row.key, CatalogImageSource::Private)?.private
             || private
                 .get(row.key)
                 .is_none_or(|after| after.image != row.image)
         {
-            batch.record(relation, row.key, row.image)?;
+            let mut before = row.image;
+            if let Some(image) = &mut before {
+                image.root = row_state(row.key, CatalogImageSource::Committed)?.root;
+            }
+            batch.record(relation, row.key, before)?;
         }
     }
     for row in private.iter() {
@@ -680,20 +755,26 @@ fn selected_image<'a>(
     current: Option<CatalogRowImage<'a>>,
     private: Option<CatalogRowImage<'a>>,
     historical: Option<KeyedRow<'a>>,
-    private_change: bool,
-) -> Result<Option<CatalogRowImage<'a>>, SqlError> {
+    state: CatalogRowState,
+    scan: CatalogScan,
+) -> Result<[Option<CatalogRowImage<'a>>; 2], SqlError> {
     let snapshot = historical.map_or(current, |row| row.image);
     match key {
         CatalogRowKey::Columns(_) => Ok(match historical {
             Some(KeyedRow {
                 image: Some(before),
                 ..
-            }) => Some(before),
-            _ if private_change || current != private => private,
-            _ => snapshot,
+            }) => {
+                let own = (state.private || current != private)
+                    && (scan == CatalogScan::Sequential
+                        || state.root.is_some_and(|root| before.root != Some(root)));
+                [Some(before), if own { private } else { None }]
+            }
+            _ if state.private || current != private => [private, None],
+            _ => [snapshot, None],
         }),
         CatalogRowKey::Tuple => {
-            if private_change {
+            if state.private {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "multiset catalog rows require counted private changes"
@@ -703,7 +784,7 @@ fn selected_image<'a>(
                 + i64::from(private.map_or(0, |row| row.count.get()))
                 - i64::from(current.map_or(0, |row| row.count.get()));
             if count <= 0 {
-                return Ok(None);
+                return Ok([None, None]);
             }
             let count = u32::try_from(count)
                 .ok()
@@ -714,10 +795,14 @@ fn selected_image<'a>(
                         "catalog row multiplicity exceeds u32"
                     )
                 })?;
-            Ok(Some(CatalogRowImage {
-                bytes: encoded_key,
-                count,
-            }))
+            Ok([
+                Some(CatalogRowImage {
+                    bytes: encoded_key,
+                    count,
+                    root: None,
+                }),
+                None,
+            ])
         }
     }
 }
@@ -726,10 +811,11 @@ fn selected_image<'a>(
 /// catalog tuple selected by the statement. Own creations remain visible.
 pub(crate) fn restore_rows<'a>(
     key: CatalogRowKey<'_>,
+    scan: CatalogScan,
     committed: &SynthTable<'a>,
     private: &SynthTable<'a>,
     history: &[HistoricalCatalogRow<'a>],
-    private_change: impl Fn(&[u8]) -> Result<bool, SqlError>,
+    row_state: impl Fn(&[u8]) -> Result<CatalogRowState, SqlError>,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let committed_rows = KeyedRows::from_catalog(committed, key, arena)?;
@@ -740,7 +826,7 @@ pub(crate) fn restore_rows<'a>(
         .checked_add(historical_rows.len)
         .ok_or_else(arena_full)?;
     let chosen = arena
-        .alloc_slice_with(capacity, |_| None::<CatalogRowImage<'a>>)
+        .alloc_slice_with(capacity, |_| [None::<CatalogRowImage<'a>>; 2])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for row in private_rows.iter() {
@@ -750,7 +836,8 @@ pub(crate) fn restore_rows<'a>(
             committed_rows.get(row.key).and_then(|row| row.image),
             row.image,
             historical_rows.get(row.key),
-            private_change(row.key)?,
+            row_state(row.key)?,
+            scan,
         )?;
         count += 1;
     }
@@ -762,25 +849,28 @@ pub(crate) fn restore_rows<'a>(
                 committed_rows.get(row.key).and_then(|row| row.image),
                 None,
                 Some(row),
-                private_change(row.key)?,
+                row_state(row.key)?,
+                scan,
             )?;
             count += 1;
         }
     }
-    let row_count = chosen[..count]
-        .iter()
-        .flatten()
-        .try_fold(0usize, |total, image| {
-            total
-                .checked_add(image.count.get() as usize)
-                .ok_or_else(arena_full)
-        })?;
+    let row_count =
+        chosen[..count]
+            .iter()
+            .flatten()
+            .flatten()
+            .try_fold(0usize, |total, image| {
+                total
+                    .checked_add(image.count.get() as usize)
+                    .ok_or_else(arena_full)
+            })?;
     let output = arena
         .alloc_slice_with(row_count, |_| &[] as &[Datum<'a>])
         .map_err(|_| arena_full())?;
     let columns = private.def.n_columns + private.hidden_columns;
     let mut output_index = 0;
-    for image in chosen[..count].iter().flatten() {
+    for image in chosen[..count].iter().flatten().flatten() {
         if image
             .bytes
             .get(..2)
@@ -888,23 +978,39 @@ mod tests {
                 &before,
                 &current,
                 &mut batch,
-                |_| Ok(false),
+                |_, _| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
             batch.publish(NonZeroU64::new(7).unwrap());
             let changes = history.rows_at(relation(), 6, &arena).unwrap();
             assert_eq!(changes.len(), 3);
-            let restored =
-                restore_rows(KEY, &current, &current, changes, |_| Ok(false), &arena).unwrap();
+            let restored = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &current,
+                changes,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 3);
             assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), Some("same"));
             assert_eq!(comment(&restored, 3), None);
             assert_eq!(comment(&restored, 4), Some("deleted"));
             let fresh = history.rows_at(relation(), 7, &arena).unwrap();
-            let restored =
-                restore_rows(KEY, &current, &current, fresh, |_| Ok(false), &arena).unwrap();
+            let restored = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &current,
+                fresh,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(comment(&restored, 1), Some("new"));
             assert_eq!(comment(&restored, 3), Some("created"));
             assert_eq!(comment(&restored, 4), None);
@@ -932,7 +1038,7 @@ mod tests {
                 &before,
                 &current,
                 &mut batch,
-                |_| Ok(false),
+                |_, _| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
@@ -942,22 +1048,46 @@ mod tests {
                 &arena,
                 &[description(1, "my change"), description(4, "my new object")],
             );
-            let restored =
-                restore_rows(KEY, &current, &private, changes, |_| Ok(false), &arena).unwrap();
+            let restored = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &private,
+                changes,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 3);
             assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), None);
             assert_eq!(comment(&restored, 3), Some("old deleted object"));
             assert_eq!(comment(&restored, 4), Some("my new object"));
             let deleted = table(&arena, &[description(2, "new other object")]);
-            let restored =
-                restore_rows(KEY, &current, &deleted, changes, |_| Ok(false), &arena).unwrap();
+            let restored = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &deleted,
+                changes,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(restored.rows.len(), 2);
             assert_eq!(comment(&restored, 1), Some("old"));
             assert_eq!(comment(&restored, 2), None);
             assert_eq!(comment(&restored, 3), Some("old deleted object"));
-            let rolled_back =
-                restore_rows(KEY, &current, &current, changes, |_| Ok(false), &arena).unwrap();
+            let rolled_back = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &current,
+                changes,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(rolled_back.rows.len(), 2);
             assert_eq!(comment(&rolled_back, 1), Some("old"));
             assert_eq!(comment(&rolled_back, 3), Some("old deleted object"));
@@ -969,22 +1099,83 @@ mod tests {
                     .unwrap();
             let own_equal_values = restore_rows(
                 KEY,
+                CatalogScan::Index,
                 &current,
                 &current,
                 changes,
-                |key| Ok(key == overwritten || key == removed),
+                |key| {
+                    Ok(CatalogRowState {
+                        root: None,
+                        private: key == overwritten || key == removed,
+                    })
+                },
                 &arena,
             )
             .unwrap();
             assert_eq!(own_equal_values.rows.len(), 2);
             assert_eq!(comment(&own_equal_values, 1), Some("old"));
             assert_eq!(comment(&own_equal_values, 3), Some("old deleted object"));
-            let selected_tuple =
-                restore_rows(KEY, &before, &private, &[], |_| Ok(false), &arena).unwrap();
+            let selected_tuple = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &before,
+                &private,
+                &[],
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
             assert_eq!(selected_tuple.rows.len(), 2);
             assert_eq!(comment(&selected_tuple, 1), Some("my change"));
             assert_eq!(comment(&selected_tuple, 3), None);
             assert_eq!(comment(&selected_tuple, 4), Some("my new object"));
+            let scan = restore_rows(
+                KEY,
+                CatalogScan::Sequential,
+                &current,
+                &private,
+                changes,
+                |_| Ok(CatalogRowState::UNTRACKED),
+                &arena,
+            )
+            .unwrap();
+            assert_eq!(scan.rows.len(), 4);
+            assert!(scan.rows.iter().any(|row| row[3] == Datum::Text("old")));
+            assert!(
+                scan.rows
+                    .iter()
+                    .any(|row| row[3] == Datum::Text("my change"))
+            );
+            // A separate insertion has its own index root and remains visible
+            // even when an older tuple satisfies the same logical key.
+            let reinserted = restore_rows(
+                KEY,
+                CatalogScan::Index,
+                &current,
+                &private,
+                changes,
+                |key| {
+                    Ok(CatalogRowState {
+                        root: NonZeroU64::new(19),
+                        private: key == overwritten,
+                    })
+                },
+                &arena,
+            )
+            .unwrap();
+            assert_eq!(reinserted.rows.len(), 4);
+            assert!(
+                reinserted
+                    .rows
+                    .iter()
+                    .any(|row| row[3] == Datum::Text("old"))
+            );
+            assert!(
+                reinserted
+                    .rows
+                    .iter()
+                    .any(|row| row[3] == Datum::Text("my change"))
+            );
         });
     }
 
@@ -1011,7 +1202,7 @@ mod tests {
                 &before,
                 &current,
                 &mut batch,
-                |_| Ok(false),
+                |_, _| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
@@ -1031,7 +1222,12 @@ mod tests {
                 &current,
                 &current,
                 &mut batch,
-                |_| Ok(true),
+                |_, _| {
+                    Ok(CatalogRowState {
+                        root: None,
+                        private: true,
+                    })
+                },
                 &arena,
             )
             .unwrap();
@@ -1039,6 +1235,28 @@ mod tests {
             batch.publish(NonZeroU64::new(8).unwrap());
             let physical_update = history.rows_at(relation(), 7, &arena).unwrap();
             assert_eq!(physical_update.len(), 1);
+            let encoded =
+                encode_projected_pub(&[Datum::Oid(1), Datum::Oid(1259), Datum::Int4(0)], &arena)
+                    .unwrap();
+            let decoded = DescriptionKey::decode(encoded, false).unwrap();
+            assert_eq!(
+                (decoded.object, decoded.class, decoded.column),
+                (1, 1259, 0)
+            );
+            for end in 0..encoded.len() {
+                assert!(DescriptionKey::decode(&encoded[..end], false).is_err());
+            }
+            assert!(DescriptionKey::decode(encoded, true).is_err());
+            let mut invalid = [0; 17];
+            invalid.copy_from_slice(encoded);
+            invalid[2] = 2;
+            assert!(DescriptionKey::decode(&invalid, false).is_err());
+            invalid.copy_from_slice(encoded);
+            invalid[3..7].fill(0);
+            assert!(DescriptionKey::decode(&invalid, false).is_err());
+            invalid.copy_from_slice(encoded);
+            invalid[13..17].copy_from_slice(&(-1i32).to_le_bytes());
+            assert!(DescriptionKey::decode(&invalid, false).is_err());
         });
     }
 
@@ -1064,7 +1282,7 @@ mod tests {
                 &before,
                 &current,
                 &mut batch,
-                |_| Ok(false),
+                |_, _| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
@@ -1074,10 +1292,11 @@ mod tests {
             assert_eq!(changes[0].before.unwrap().count.get(), 3);
             let restored = restore_rows(
                 CatalogRowKey::Tuple,
+                CatalogScan::Sequential,
                 &current,
                 &current,
                 changes,
-                |_| Ok(false),
+                |_| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
@@ -1091,10 +1310,11 @@ mod tests {
             let added = table(&arena, &[description(1, "same"), description(1, "same")]);
             let restored = restore_rows(
                 CatalogRowKey::Tuple,
+                CatalogScan::Sequential,
                 &current,
                 &added,
                 changes,
-                |_| Ok(false),
+                |_| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();
@@ -1102,10 +1322,11 @@ mod tests {
             let removed = table(&arena, &[]);
             let restored = restore_rows(
                 CatalogRowKey::Tuple,
+                CatalogScan::Sequential,
                 &current,
                 &removed,
                 changes,
-                |_| Ok(false),
+                |_| Ok(CatalogRowState::UNTRACKED),
                 &arena,
             )
             .unwrap();

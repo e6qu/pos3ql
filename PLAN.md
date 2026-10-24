@@ -45,6 +45,10 @@ Own creations must be visible. If another connection already replaced a comment,
 editing its newer version can leave an older transaction's comment lookup
 returning the old text until commit. Check this separately from ordinary private
 edits and savepoint rollback against PostgreSQL.
+Check direct lookups separately from row listings: a listing can contain both
+the selected older comment and an own edit. Deleting and inserting the comment
+again can expose both rows even to a direct lookup. Preserve that distinction
+through savepoints and prepared-transaction recovery, within startup memory.
 Parameter permission rows must preserve their identity through edits and restart,
 and receive a new identity after their removal. Check empty permission lists
 separately from restored default permissions, which remove the catalog row.

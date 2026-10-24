@@ -21328,6 +21328,34 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         "{}",
         String::from_utf8_lossy(&private)
     );
+    let scans = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+        &format!("SAVEPOINT before_scan;
+            COMMENT ON TABLE described_orders IS 'own table';
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            COMMENT ON TABLE described_orders IS NULL;
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            COMMENT ON TABLE described_orders IS 'inserted own table';
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            {query}; ROLLBACK TO before_scan; {query}"));
+    assert_eq!(
+        data_rows(&scans),
+        [
+            "old table",
+            "own table",
+            "old table",
+            "old table",
+            "inserted own table",
+            "old table",
+            "inserted own table",
+            "old table",
+            "old table|old table|old column",
+            "old table|old table|old column"
+        ],
+        "{}",
+        String::from_utf8_lossy(&scans)
+    );
     let removed = run_with(
         &mut engine,
         &mut budget,
@@ -23762,6 +23790,7 @@ fn catalog_schema_resolution_retains_only_its_owned_definition() {
                 Some("pg_catalog"),
                 catalog,
                 0,
+                crate::sql::catalog_snapshot::CatalogScan::Sequential,
                 &arena,
             )
             .unwrap();

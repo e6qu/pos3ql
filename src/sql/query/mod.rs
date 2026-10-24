@@ -5979,7 +5979,15 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec(storage, from, txid, arena, params, seq) {
+    let scope = match QueryScope::resolve_exec(
+        storage,
+        from,
+        statement.where_clause,
+        txid,
+        arena,
+        params,
+        seq,
+    ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -7307,7 +7315,16 @@ fn select_into_rows_mode<'a>(
             emit(&vals[..n])?;
             return Ok(());
         };
-        let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
+        let scope = QueryScope::resolve_exec_outer(
+            storage,
+            from,
+            statement.where_clause,
+            txid,
+            arena,
+            params,
+            seq,
+            outer,
+        )?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena)?;
         let sub_exprs = arena
@@ -7477,7 +7494,16 @@ fn select_into_rows_mode<'a>(
     };
 
     collect_table_sample_expressions(from, &mut sub_exprs[1 + statement.items.len()..]);
-    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        statement.where_clause,
+        txid,
+        arena,
+        params,
+        seq,
+        outer,
+    )?;
     let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
@@ -9634,8 +9660,16 @@ pub fn first_from_match<'a>(
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
 ) -> Result<bool, SqlError> {
-    let scope =
-        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, None, Some(target))?;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        where_clause,
+        txid,
+        arena,
+        params,
+        None,
+        Some(target),
+    )?;
     let subquery_expressions = arena
         .alloc_slice_with(1 + 2 * scope.n, |_| None)
         .map_err(|_| arena_full())?;

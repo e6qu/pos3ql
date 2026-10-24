@@ -20850,7 +20850,39 @@ fn replay_transaction_batches(
                                 )?;
                             }
                             if let Some(history) = transaction.catalog_history.as_mut() {
-                                history.record(relation, row.key, row.before)?;
+                                let mut before = row.before;
+                                if let Some(image) = &mut before
+                                    && image.root.is_some()
+                                {
+                                    if !matches!(
+                                        definition.name,
+                                        "pg_description" | "pg_shdescription"
+                                    ) {
+                                        return Err(sql_err!(
+                                            sqlstate::INTERNAL_ERROR,
+                                            "prepared catalog tuple identity belongs to an unsupported relation"
+                                        ));
+                                    }
+                                    // Cache identities are local to this startup. Retained
+                                    // clients do not survive restart; match the restored row.
+                                    image.root =
+                                        Some(
+                                            catalog::catalog_row_state(
+                                                storage,
+                                                0,
+                                                definition.name,
+                                                row.key,
+                                            )?
+                                            .root
+                                            .ok_or_else(|| {
+                                                sql_err!(
+                                                    sqlstate::INTERNAL_ERROR,
+                                                    "prepared catalog tuple has no committed source"
+                                                )
+                                            })?,
+                                        );
+                                }
+                                history.record(relation, row.key, before)?;
                             }
                         }
                         WalOp::SetParameterAcl {

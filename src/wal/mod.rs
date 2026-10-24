@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 8;
+pub(crate) const RECORD_VERSION: u8 = 9;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -4023,7 +4023,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             1 + parameter.len() + 4 + 1 + image.map_or(0, |image| 8 + image.grants().encoded_len())
         }
-        WalOp::PreparedCatalogRow { row, .. } => 20usize
+        WalOp::PreparedCatalogRow { row, .. } => 28usize
             .saturating_add(row.key.len())
             .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
     }
@@ -6361,6 +6361,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                         .to_le_bytes(),
                 )
                 && buffer.append(&row_length.to_le_bytes())
+                && buffer.append(
+                    &row.before
+                        .and_then(|image| image.root)
+                        .map_or(0, core::num::NonZeroU64::get)
+                        .to_le_bytes(),
+                )
                 && buffer.append(row.key)
                 && buffer.append(row.before.map_or(&[], |image| image.bytes))
         }
@@ -11514,17 +11520,21 @@ fn decode_op_inner<'a>(
             .get();
             let count = u32::from_le_bytes(payload.get(12..16)?.try_into().ok()?);
             let row_length = u32::from_le_bytes(payload.get(16..20)?.try_into().ok()?) as usize;
-            let key_end = 20usize.checked_add(key_length)?;
+            let root = core::num::NonZeroU64::new(u64::from_le_bytes(
+                payload.get(20..28)?.try_into().ok()?,
+            ));
+            let key_end = 28usize.checked_add(key_length)?;
             let row_end = key_end.checked_add(row_length)?;
             if row_end != payload.len() {
                 return None;
             }
-            let key = payload.get(20..key_end)?;
+            let key = payload.get(28..key_end)?;
             let before = match (NonZeroU32::new(count), row_length) {
-                (None, 0) => None,
+                (None, 0) if root.is_none() => None,
                 (Some(count), length) if length > 0 => Some(crate::storage::CatalogRowImage {
                     bytes: payload.get(key_end..row_end)?,
                     count,
+                    root,
                 }),
                 _ => return None,
             };
@@ -13717,6 +13727,7 @@ mod tests {
                 Some(CatalogRowImage {
                     bytes: b"old catalog row",
                     count: NonZeroU32::new(3).unwrap(),
+                    root: core::num::NonZeroU64::new(19),
                 }),
             ] {
                 let relation = CatalogRelationIdentity {
@@ -13751,6 +13762,13 @@ mod tests {
                 invalid[..payload.len()].copy_from_slice(payload);
                 invalid[12..16].copy_from_slice(&u32::from(before.is_none()).to_le_bytes());
                 assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none());
+                if before.is_none() {
+                    invalid[..payload.len()].copy_from_slice(payload);
+                    invalid[20..28].copy_from_slice(&19u64.to_le_bytes());
+                    assert!(
+                        decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none()
+                    );
+                }
             }
         }
     }

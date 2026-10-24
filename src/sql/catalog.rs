@@ -8960,11 +8960,12 @@ pub(crate) fn synthesize_definition<'a>(
 
 /// Builds the requested catalog relation. `qualifier` is the schema (or
 /// None). Allocates rows in `arena`.
-pub fn synthesize<'a>(
+pub(crate) fn synthesize<'a>(
     storage: &Storage,
     qualifier: Option<&str>,
     name: &'a str,
     txid: u32,
+    scan: super::catalog_snapshot::CatalogScan,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     if qualifier != Some("information_schema")
@@ -8989,10 +8990,11 @@ pub fn synthesize<'a>(
             };
             return super::catalog_snapshot::restore_rows(
                 relation.key,
+                scan,
                 &committed,
                 selected,
                 history,
-                |key| private_catalog_row(storage, txid, relation.name, key, arena),
+                |key| catalog_row_state(storage, txid, relation.name, key),
                 arena,
             );
         }
@@ -14488,33 +14490,27 @@ pub fn comment_text_for<'a>(
         let mut rows = [None; super::catalog_snapshot_keys::RELATIONS.len()];
         let mut owned = [false; super::catalog_snapshot_keys::RELATIONS.len()];
         let mut seen = [false; super::catalog_snapshot_keys::RELATIONS.len()];
-        visit_comments_for_object(
-            storage,
-            transaction,
-            target,
-            oid,
-            |catalog, text, private| {
-                let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "comment refers to an unknown catalog"
-                    )
-                })? as u32;
-                let index = ordinal(classoid)?;
-                let row = &mut rows[index];
-                owned[index] |= private;
-                if core::mem::replace(&mut seen[index], true) {
-                    return Err(sql_err!(
-                        sqlstate::CARDINALITY_VIOLATION,
-                        "more than one row returned by a subquery used as an expression"
-                    ));
-                }
-                *row = text
-                    .map(|text| arena.alloc_str(text).map_err(|_| arena_full()))
-                    .transpose()?;
-                Ok(())
-            },
-        )?;
+        visit_comments_for_object(storage, transaction, target, oid, |catalog, text, state| {
+            let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "comment refers to an unknown catalog"
+                )
+            })? as u32;
+            let index = ordinal(classoid)?;
+            let row = &mut rows[index];
+            owned[index] |= state.private;
+            if core::mem::replace(&mut seen[index], true) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "description catalog contains duplicate unique row keys"
+                ));
+            }
+            *row = text
+                .map(|text| arena.alloc_str(text).map_err(|_| arena_full()))
+                .transpose()?;
+            Ok(())
+        })?;
         Ok::<_, SqlError>((rows, owned))
     };
     let (private, owned) = collect(txid)?;
@@ -14552,6 +14548,7 @@ pub fn comment_text_for<'a>(
         });
     }
     let mut found = None;
+    let mut found_class = u32::MAX;
     for index in 0..private.len() {
         let selected = match older[index] {
             Some(Some(before)) => Some(before),
@@ -14559,38 +14556,29 @@ pub fn comment_text_for<'a>(
             Some(None) => None,
             None => committed[index],
         };
+        let class = super::catalog_snapshot_keys::RELATIONS[index].oid.get();
         if let Some(text) = selected
-            && found.replace(text).is_some()
+            && class < found_class
         {
-            return Err(sql_err!(
-                sqlstate::CARDINALITY_VIOLATION,
-                "more than one row returned by a subquery used as an expression"
-            ));
+            found = Some(text);
+            found_class = class;
         }
     }
     Ok(found)
 }
 
-pub(crate) fn private_catalog_row(
+pub(crate) fn catalog_row_state(
     storage: &Storage,
     txid: u32,
     relation: &str,
     key: &[u8],
-    arena: &Arena,
-) -> Result<bool, SqlError> {
-    if txid == 0 || !matches!(relation, "pg_description" | "pg_shdescription") {
-        return Ok(false);
+) -> Result<super::catalog_snapshot::CatalogRowState, SqlError> {
+    use super::catalog_snapshot::CatalogRowState;
+    if !matches!(relation, "pg_description" | "pg_shdescription") {
+        return Ok(CatalogRowState::UNTRACKED);
     }
-    let oid_at = |index| match super::exec::decode_projected_col_record(key, index, arena)? {
-        Datum::Oid(oid) => Ok(oid),
-        _ => Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "invalid private description key"
-        )),
-    };
-    let oid = oid_at(0)?;
-    let classoid = oid_at(1)?;
-    let catalog = i32::try_from(classoid)
+    let key = super::catalog_snapshot::DescriptionKey::decode(key, relation == "pg_shdescription")?;
+    let catalog = i32::try_from(key.class)
         .ok()
         .and_then(catalog_relation_name)
         .ok_or_else(|| {
@@ -14602,26 +14590,22 @@ pub(crate) fn private_catalog_row(
     let target = if relation == "pg_shdescription" {
         super::eval::DescriptionTarget::Shared { catalog }
     } else {
-        let column = match super::exec::decode_projected_col_record(key, 2, arena)? {
-            Datum::Int4(column) => column,
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "invalid private description column key"
-                ));
-            }
-        };
         super::eval::DescriptionTarget::Local {
             catalog: Some(catalog),
-            column,
+            column: key.column,
         }
     };
-    let mut owned = false;
-    visit_comments_for_object(storage, txid, target, oid, |_, _, private| {
-        owned |= private;
+    let mut selected = None;
+    visit_comments_for_object(storage, txid, target, key.object, |_, _, state| {
+        if selected.replace(state).is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "description catalog contains duplicate unique row keys"
+            ));
+        }
         Ok(())
     })?;
-    Ok(owned)
+    Ok(selected.unwrap_or(CatalogRowState::UNTRACKED))
 }
 
 fn visit_comments_for_object(
@@ -14629,7 +14613,11 @@ fn visit_comments_for_object(
     txid: u32,
     target: super::eval::DescriptionTarget<'_>,
     oid: u32,
-    mut visit: impl FnMut(&str, Option<&str>, bool) -> Result<(), SqlError>,
+    mut visit: impl FnMut(
+        &str,
+        Option<&str>,
+        super::catalog_snapshot::CatalogRowState,
+    ) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let (catalog_name, subid, shared) = match target {
         super::eval::DescriptionTarget::Local { catalog, column } => (catalog, column, false),
@@ -14978,7 +14966,10 @@ fn visit_comments_for_object(
             visit(
                 selected_catalog,
                 comment.text.as_ref().map(|text| text.as_str()),
-                comment.private,
+                super::catalog_snapshot::CatalogRowState {
+                    root: comment.root,
+                    private: comment.private,
+                },
             )?;
         }
     }

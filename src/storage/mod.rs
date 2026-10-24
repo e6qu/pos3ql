@@ -32566,7 +32566,9 @@ impl Storage {
         rewritten: bool,
         selected: RowRead<'_>,
     ) -> Result<(), SqlError> {
-        let Some(prepared) = self.prepare_committed_row(table_index, rowid, txid, rewritten, selected)? else {
+        let Some(prepared) =
+            self.prepare_committed_row(table_index, rowid, txid, rewritten, selected)?
+        else {
             return Ok(());
         };
         self.publish_prepared_row(commit_lsn, prepared)
@@ -32599,13 +32601,24 @@ impl Storage {
         )?;
         drop(selected);
         let prepared_keys = if !rewritten {
-            Some(key_preparation::PreparedRowKeys::capture(self, table_index, rowid, image)?)
+            Some(key_preparation::PreparedRowKeys::capture(
+                self,
+                table_index,
+                rowid,
+                image,
+            )?)
         } else {
             drop(image);
             None
         };
 
-        Ok(Some(key_preparation::PreparedCommittedRow { table: table_index, rowid, transaction: txid, head, keys: prepared_keys }))
+        Ok(Some(key_preparation::PreparedCommittedRow {
+            table: table_index,
+            rowid,
+            transaction: txid,
+            head,
+            keys: prepared_keys,
+        }))
     }
 
     fn publish_prepared_row(
@@ -32613,7 +32626,13 @@ impl Storage {
         commit_lsn: u64,
         prepared: key_preparation::PreparedCommittedRow,
     ) -> Result<(), SqlError> {
-        let key_preparation::PreparedCommittedRow { table: table_index, rowid, transaction: txid, head, keys: prepared_keys } = prepared;
+        let key_preparation::PreparedCommittedRow {
+            table: table_index,
+            rowid,
+            transaction: txid,
+            head,
+            keys: prepared_keys,
+        } = prepared;
         let table = &self.tables[table_index];
         let rewritten = prepared_keys.is_none();
 
@@ -32710,7 +32729,9 @@ impl Storage {
                 }
                 let mut index = enforcer.cache.write();
                 index.remove_rowid(rowid);
-                let prepared = prepared_keys.as_ref().expect("ordinary publication prepared keys");
+                let prepared = prepared_keys
+                    .as_ref()
+                    .expect("ordinary publication prepared keys");
                 for &(_, hash) in prepared.hashes[..prepared.count]
                     .iter()
                     .filter(|&&(candidate, _)| candidate == binding)
@@ -32757,7 +32778,14 @@ impl Storage {
         let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let bindings = self.tables[table_index].enforcers();
         let count = bindings.iter().take_while(|entry| entry.is_some()).count();
-        self.row_enforcer_hashes_for(table_index, rowid, home, &selection, &bindings[..count], out)
+        self.row_enforcer_hashes_for(
+            table_index,
+            rowid,
+            home,
+            &selection,
+            &bindings[..count],
+            out,
+        )
     }
 
     fn row_enforcer_hashes_for(
@@ -32781,13 +32809,7 @@ impl Storage {
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.values_enforcer_hashes_for(
-                &arena,
-                selection,
-                bindings,
-                &values[..n_columns],
-                out,
-            )
+            self.values_enforcer_hashes_for(&arena, selection, bindings, &values[..n_columns], out)
         });
         // SAFETY: callers receive only hashes and binding ordinals; expression
         // evaluation cannot retain values allocated above this row-local mark.
@@ -34629,7 +34651,10 @@ impl Storage {
             let (definition, publication) = row_ownership::acquire(|| {
                 Ok((
                     self.tables[table_index].definition.try_read_for_batch()?,
-                    row_ownership::try_mutex(&self.tables[table_index].publication, "table publication lock poisoned")?,
+                    row_ownership::try_mutex(
+                        &self.tables[table_index].publication,
+                        "table publication lock poisoned",
+                    )?,
                 ))
             });
             selection.validate_definition(self, &definition)?;
@@ -34880,7 +34905,10 @@ impl Storage {
         let (definition, mut publication) = row_ownership::acquire(|| {
             Ok((
                 self.tables[table_index].definition.try_read_for_batch()?,
-                row_ownership::try_mutex(&self.tables[table_index].publication, "table publication lock poisoned")?,
+                row_ownership::try_mutex(
+                    &self.tables[table_index].publication,
+                    "table publication lock poisoned",
+                )?,
             ))
         });
         selection.validate_definition(self, &definition)?;
@@ -34948,8 +34976,14 @@ impl Storage {
             let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
-            let count =
-                self.row_enforcer_hashes_for(table_index, rowid, home, selection, bindings, &mut buf)?;
+            let count = self.row_enforcer_hashes_for(
+                table_index,
+                rowid,
+                home,
+                selection,
+                bindings,
+                &mut buf,
+            )?;
             Ok(insert_hashes(rowid, lsn, &buf[..count]))
         })?;
         if overlay.is_continue() {
@@ -34987,13 +35021,8 @@ impl Storage {
                         }
                         SpilledRowRepresentation::Values(values) => values,
                     };
-                    let hashes = self.values_enforcer_hashes_for(
-                        &arena,
-                        selection,
-                        bindings,
-                        values,
-                        &mut buf,
-                    );
+                    let hashes = self
+                        .values_enforcer_hashes_for(&arena, selection, bindings, values, &mut buf);
                     // SAFETY: `hashes` retains only fixed hash values and
                     // binding ordinals from expression evaluation.
                     unsafe { arena.rewind_to(mark) };

@@ -1057,8 +1057,10 @@ while its existing two remain usable. A failed claim returns `54000` and keeps
 the working caches. Change this capacity before restarting; it never grows
 automatically. Allocation controls release before clearing a claimed cache.
 
-Index-key preparation retains one table definition for decoding the row and
-evaluating its expressions and membership predicate. A row from an older physical
+Index-key preparation uses one selected table shape for decoding the row and
+evaluating its expressions and membership predicate. Ordinary column keys copy
+only column types; they do not claim or copy a complete definition image.
+A row from an older physical
 layout is rejected with `40001` before decoding. Committing a row rechecks that
 definition and the selected cache bindings before changing row history or caches.
 An ordinary commit to another row does not invalidate prepared keys. For example,

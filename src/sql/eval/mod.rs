@@ -3349,10 +3349,7 @@ fn eval_full_inner<'a>(
                 }
                 Datum::Int2Vector(raw) => {
                     let index = integer_index(&i)?;
-                    let Some(slot) = index
-                        .checked_sub(1)
-                        .and_then(|value| usize::try_from(value).ok())
-                    else {
+                    let Ok(slot) = usize::try_from(index) else {
                         return Ok(Datum::Null);
                     };
                     Ok(raw
@@ -3364,10 +3361,7 @@ fn eval_full_inner<'a>(
                 }
                 Datum::OidVector(raw) => {
                     let index = integer_index(&i)?;
-                    let Some(slot) = index
-                        .checked_sub(1)
-                        .and_then(|value| usize::try_from(value).ok())
-                    else {
+                    let Ok(slot) = usize::try_from(index) else {
                         return Ok(Datum::Null);
                     };
                     Ok(raw
@@ -7071,12 +7065,7 @@ fn regtype_of_oid_with_catalog<'a>(
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
     } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
-        match ctype {
-            ColType::Array(element) => arena
-                .alloc_str(crate::stack_format!(128, "{}[]", element.to_coltype().name()).as_str())
-                .map_err(|_| arena_full())?,
-            scalar => scalar.name(),
-        }
+        ctype.name()
     } else {
         return arena
             .alloc_str_display(unsigned)
@@ -7114,10 +7103,11 @@ pub(crate) fn regtype_cast<'a>(
             if let Some(catalog) = catalog
                 && let Some(referenced_oid) = catalog.user_type_oid(name)
             {
-                return Ok(Datum::Regtype {
-                    referenced_oid,
-                    name: catalog.user_type_name(name, arena)?.unwrap_or(name),
-                });
+                return regtype_of_oid_with_catalog(
+                    i64::from(referenced_oid),
+                    Some(catalog),
+                    arena,
+                );
             }
             regtype_of_name(name)
         }

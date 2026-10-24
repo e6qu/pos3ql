@@ -40,8 +40,6 @@ CATALOG_SCALAR_COLUMNS = (
     ('pg_sequences', ('schemaname', 'sequencename', 'sequenceowner')),
     ('pg_shdescription', ('objoid', 'classoid')),
     ('pg_shseclabel', ('objoid', 'classoid')),
-    ('pg_stat_subscription', ('inhrelid', 'inhparent')),
-    ('pg_stat_subscription_stats', ('inhrelid', 'inhparent')),
     ('pg_statistic_ext', ('stxrelid', 'stxnamespace', 'stxowner')),
     ('pg_statistic_ext_data', ('stxoid',)),
     ('pg_subscription_rel', ('srsubid', 'srrelid', 'srsubstate', 'srsublsn')),
@@ -116,6 +114,14 @@ def transcript(reader, writer):
                        indcollation[0]=0::oid,indcollation[1]='"C"'::regcollation::oid
                   FROM pg_index WHERE indexrelid='catalog_index_vectors_diff_idx'::regclass
             """)
+            record(writer, f"{prefix}.catalog_index_vector_arrays", """
+                SELECT array_dims(indoption::smallint[]),array_dims(indcollation::oid[]),
+                       (indoption::smallint[])::text,(indoption::smallint[])[0],
+                       indoption[-1] IS NULL,indoption[2] IS NULL,
+                       '[0:1]={1,2}'::integer[]::bigint[]::text
+                  FROM pg_index WHERE indexrelid='catalog_index_vectors_diff_idx'::regclass
+            """)
+            record(writer, f"{prefix}.catalog_array_type_names", "SELECT 1009::oid::regtype::text,1115::oid::regtype::text,1002::oid::regtype::text,'timestamp[]'::regtype::text")
         finally:
             writer.execute("DROP TABLE catalog_index_vectors_diff")
 
@@ -512,7 +518,9 @@ def transcript(reader, writer):
                 domain_value catalog_metadata_domain_diff,
                 enum_value catalog_metadata_enum_diff,
                 default_value integer DEFAULT 42,
-                generated_value bigint GENERATED ALWAYS AS (id + 1) STORED
+                generated_value bigint GENERATED ALWAYS AS (id + 1) STORED,
+                redundant_value bigint GENERATED ALWAYS AS (((id+1))) STORED,
+                product_value bigint GENERATED ALWAYS AS ((id+1)*(id-1)) STORED
             )""")
             record(writer, f"{prefix}.metadata.full_columns", "SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff' ORDER BY ordinal_position")
             record(writer, f"{prefix}.metadata.bit_modifiers", "SELECT attname,atttypmod,format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='catalog_metadata_columns_diff'::regclass AND attname IN ('fixed_bits','variable_bits') ORDER BY attnum")

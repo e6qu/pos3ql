@@ -21585,6 +21585,34 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
 }
 
 #[test]
+fn catalog_snapshot_generated_expressions_have_operator_parentheses() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_expression_display (
+             id bigint,
+             ordinary bigint GENERATED ALWAYS AS (id + 1) STORED,
+             redundant bigint GENERATED ALWAYS AS (((id+1))) STORED,
+             product bigint GENERATED ALWAYS AS ((id+1)*(id-1)) STORED
+         );
+         SELECT column_name,generation_expression FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='catalog_expression_display'
+            AND is_generated='ALWAYS' ORDER BY ordinal_position;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ordinary|(id + 1)",
+            "redundant|(id + 1)",
+            "product|((id + 1) * (id - 1))",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn catalog_snapshot_bit_modifiers_preserve_wire_values() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -21648,11 +21676,22 @@ fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
                 pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
                 indoption[0],indoption[1],
                 indcollation[0]=0::oid,indcollation[1]='\"C\"'::regcollation::oid
-           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;",
+           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;
+         SELECT array_dims(indoption::smallint[]),array_dims(indcollation::oid[]),
+                (indoption::smallint[])::text,(indoption::smallint[])[0],
+                indoption[-1] IS NULL,indoption[2] IS NULL,
+                '[0:1]={1,2}'::integer[]::bigint[]::text
+           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;
+         SELECT 1009::oid::regtype::text,1115::oid::regtype::text,
+                1002::oid::regtype::text,'timestamp[]'::regtype::text;",
     );
     assert_eq!(
         data_rows(&output),
-        ["3|2|1 2|0 950|int2vector|oidvector|1|2|t|t"],
+        [
+            "3|2|1 2|0 950|int2vector|oidvector|1|2|t|t",
+            "[0:1]|[0:1]|[0:1]={1,2}|1|t|t|[0:1]={1,2}",
+            "text[]|timestamp without time zone[]|\"char\"[]|timestamp without time zone[]",
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );

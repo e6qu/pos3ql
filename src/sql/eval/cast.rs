@@ -602,11 +602,12 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Array { element: e, .. } if e == element => v,
             // A different element type: re-encode each element cast to it.
             Datum::Array { element: e, raw } => {
+                let shape = crate::sql::array::shape(raw).expect("array datum invariant");
                 let items = crate::sql::array::alloc_items(arena, crate::sql::array::len(raw))?;
                 let n = load_array(raw, e, element, &mut *items, 0, arena)?;
                 Datum::Array {
                     element,
-                    raw: crate::sql::array::build(&items[..n], arena)?,
+                    raw: crate::sql::array::build_shaped(&items[..n], shape, arena)?,
                 }
             }
             Datum::Text(s) => Datum::Array {
@@ -858,7 +859,11 @@ fn int2vector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sq
     }
     Ok(Datum::Array {
         element: ArrElem::Int2,
-        raw: crate::sql::array::build(&items[..values.len()], arena)?,
+        raw: crate::sql::array::build_shaped(
+            &items[..values.len()],
+            crate::sql::array::Shape::new(&[values.len()], &[0])?,
+            arena,
+        )?,
     })
 }
 
@@ -882,7 +887,11 @@ fn oidvector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sql
     }
     Ok(Datum::Array {
         element: ArrElem::Oid,
-        raw: crate::sql::array::build(&items[..values.len()], arena)?,
+        raw: crate::sql::array::build_shaped(
+            &items[..values.len()],
+            crate::sql::array::Shape::new(&[values.len()], &[0])?,
+            arena,
+        )?,
     })
 }
 

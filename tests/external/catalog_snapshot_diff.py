@@ -137,6 +137,36 @@ def transcript(reader, writer):
         finally:
             reader.execute("ROLLBACK")
             writer.execute("DROP SEQUENCE catalog_sequence_diff")
+
+        writer.execute("CREATE TABLE catalog_statistics_diff(id integer)")
+        writer.execute("INSERT INTO catalog_statistics_diff SELECT generate_series(1,8)")
+        writer.execute("ANALYZE catalog_statistics_diff")
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        try:
+            index_query = "SELECT c.relhasindex, (SELECT count(*) FROM pg_index i WHERE i.indrelid=c.oid) FROM pg_class c WHERE c.relname='catalog_statistics_diff'"
+            estimates_query = "SELECT reltuples::bigint FROM pg_class WHERE relname='catalog_statistics_diff'"
+            record(f"{prefix}.statistics.index_before", index_query)
+            writer.execute("CREATE INDEX catalog_statistics_index_diff ON catalog_statistics_diff(id)")
+            record(f"{prefix}.statistics.index_created", index_query)
+            writer.execute("DROP INDEX catalog_statistics_index_diff")
+            record(f"{prefix}.statistics.index_dropped", index_query)
+            record(f"{prefix}.statistics.estimate_before", estimates_query)
+            writer.execute("INSERT INTO catalog_statistics_diff SELECT generate_series(9,16)")
+            writer.execute("ANALYZE catalog_statistics_diff")
+            record(f"{prefix}.statistics.estimate_analyzed", estimates_query)
+            writer.execute("BEGIN")
+            writer.execute("INSERT INTO catalog_statistics_diff SELECT generate_series(17,24)")
+            writer.execute("ANALYZE catalog_statistics_diff")
+            writer.execute("ROLLBACK")
+            record(f"{prefix}.statistics.estimate_rolled_back", estimates_query)
+            reader.execute("COMMIT")
+            record(f"{prefix}.statistics.fresh", estimates_query)
+            writer.execute("VACUUM catalog_statistics_diff")
+            record(f"{prefix}.statistics.vacuumed", "SELECT relhasindex,reltuples::bigint FROM pg_class WHERE relname='catalog_statistics_diff'")
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            writer.execute("DROP TABLE catalog_statistics_diff")
     return observed
 
 
@@ -154,6 +184,13 @@ def main():
         if arguments.metadata_output is not None:
             metadata = {
                 "version": reader.execute("SELECT version()").fetchone()[0],
+                "catalog_relations": reader.execute("""
+                    SELECT c.relname, c.oid, c.relisshared
+                      FROM pg_class c
+                     WHERE c.relnamespace = 'pg_catalog'::regnamespace
+                       AND c.relkind = 'r'
+                     ORDER BY c.relname
+                """).fetchall(),
                 "catalog_keys": reader.execute("""
                     SELECT c.relname, idx.relname,
                            array_agg(a.attname ORDER BY k.ordinality)

@@ -19,7 +19,7 @@ const HEADER_BYTES: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CatalogRelationIdentity {
-    pub(super) database: DatabaseOid,
+    pub(super) database: Option<DatabaseOid>,
     pub(super) relation: NonZeroU32,
 }
 
@@ -41,6 +41,7 @@ struct HistoryState {
     reservations: FixedVec<NonZeroU64>,
     next_reservation: u64,
     max_versions_per_key: usize,
+    latest_publication: u64,
 }
 
 pub(super) struct CatalogHistory {
@@ -85,7 +86,9 @@ fn frames(bytes: &[u8]) -> impl Iterator<Item = Frame<'_>> {
         let row_end = row_start + row_length;
         let frame = Frame {
             relation: CatalogRelationIdentity {
-                database: DatabaseOid::parse(database).expect("catalog history database identity"),
+                database: (database != 0).then(|| {
+                    DatabaseOid::parse(database).expect("catalog history database identity")
+                }),
                 relation: NonZeroU32::new(relation).expect("catalog history relation identity"),
             },
             batch: NonZeroU64::new(batch).expect("catalog history reservation identity"),
@@ -173,6 +176,7 @@ impl CatalogHistory {
                 reservations,
                 next_reservation: 0,
                 max_versions_per_key,
+                latest_publication: 0,
             }),
         }))
     }
@@ -210,6 +214,9 @@ impl CatalogHistory {
         arena: &'a Arena,
     ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
         let state = self.state.lock().expect("catalog history lock poisoned");
+        if snapshot >= state.latest_publication {
+            return Ok(&[]);
+        }
         let eligible =
             |frame: &Frame<'_>| frame.relation == relation && frame.committed_at > snapshot;
         let candidates = frames(state.bytes.readable()).filter(eligible).count();
@@ -333,7 +340,7 @@ impl CatalogHistoryBatch {
         }
         let mut header = [0; HEADER_BYTES];
         header[..4].copy_from_slice(&length.to_le_bytes());
-        header[4..8].copy_from_slice(&relation.database.get().to_le_bytes());
+        header[4..8].copy_from_slice(&relation.database.map_or(0, DatabaseOid::get).to_le_bytes());
         header[8..12].copy_from_slice(&relation.relation.get().to_le_bytes());
         header[12..16].copy_from_slice(&before.map_or(0, |row| row.count.get()).to_le_bytes());
         header[16..24].copy_from_slice(&self.identity.get().to_le_bytes());
@@ -352,6 +359,7 @@ impl CatalogHistoryBatch {
             .lock()
             .expect("catalog history lock poisoned");
         let mut offset = 0;
+        let mut changed = false;
         while offset < state.bytes.len() {
             let frame = frames(&state.bytes.readable()[offset..])
                 .next()
@@ -363,8 +371,12 @@ impl CatalogHistoryBatch {
                 assert_eq!(frame.committed_at, 0);
                 state.bytes.filled_mut()[offset + 24..offset + 32]
                     .copy_from_slice(&committed_at.get().to_le_bytes());
+                changed = true;
             }
             offset += length;
+        }
+        if changed {
+            state.latest_publication = state.latest_publication.max(committed_at.get());
         }
         state.release(self.identity);
         self.finished = true;
@@ -393,7 +405,7 @@ mod tests {
 
     fn relation(database: DatabaseOid, oid: u32) -> CatalogRelationIdentity {
         CatalogRelationIdentity {
-            database,
+            database: Some(database),
             relation: NonZeroU32::new(oid).unwrap(),
         }
     }
@@ -469,6 +481,13 @@ mod tests {
                     relation(DatabaseOid::POSTGRES, 1249),
                     &b"postgres attribute"[..],
                 ),
+                (
+                    CatalogRelationIdentity {
+                        database: None,
+                        relation: NonZeroU32::new(1260).unwrap(),
+                    },
+                    &b"shared role"[..],
+                ),
             ] {
                 batch.record(identity, b"same key", image(value)).unwrap();
             }
@@ -483,6 +502,17 @@ mod tests {
                     before: image(b"postgres class")
                 }]
             );
+            let shared = history
+                .rows_at(
+                    CatalogRelationIdentity {
+                        database: None,
+                        relation: NonZeroU32::new(1260).unwrap(),
+                    },
+                    6,
+                    &arena,
+                )
+                .unwrap();
+            assert_eq!(shared[0].before, image(b"shared role"));
         });
     }
 

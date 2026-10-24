@@ -24104,6 +24104,37 @@ impl Storage {
         }
     }
 
+    pub(crate) fn begin_object_acl_restore(&mut self) -> Result<(), SqlError> {
+        let catalog = self
+            .acl_catalog
+            .get_mut()
+            .expect("ACL catalog lock poisoned");
+        if catalog.next_object_change != 0
+            || catalog.objects.len() != 3
+            || catalog.objects.iter().enumerate().any(|(slot, entry)| {
+                entry.object
+                    != (AccessObject {
+                        class: AccessClass::Schema,
+                        slot: slot as u16,
+                    })
+                    || entry.grantee != PUBLIC_ROLE
+                    || entry.grantor != BOOTSTRAP_ROLE
+                    || entry.privileges != PrivilegeSet::USAGE
+                    || entry.pending.is_some()
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "object ACL restoration requires initial catalog state"
+            ));
+        }
+        // A manifest is a complete image. Keeping startup grants here would
+        // revive a grant omitted after its revocation and slot reclamation.
+        catalog.objects.clear();
+        catalog.next_object_order = 0;
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_column_acls(
         &self,
     ) -> impl Iterator<Item = (usize, ColumnAclEntry)> + '_ {

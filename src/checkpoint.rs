@@ -3728,6 +3728,9 @@ impl Checkpointer {
         text: &str,
     ) -> Result<u64, CheckpointSetupError> {
         let metadata = parse_manifest_metadata(text).map_err(CheckpointSetupError::Corrupt)?;
+        storage.begin_object_acl_restore().map_err(|_| {
+            CheckpointSetupError::Corrupt("object ACL restoration requires initial catalog state")
+        })?;
         let lsn = metadata.lsn;
         let next_rowid = metadata.next_rowid;
         storage.restore_catalog_identity_sequence(metadata.catalog_sequence);

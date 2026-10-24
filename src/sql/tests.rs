@@ -70787,8 +70787,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          COMMENT ON TABLE template_app.items IS 'copied template table';
          GRANT USAGE ON SCHEMA template_app TO template_reader;
          GRANT SELECT ON template_app.items TO template_reader;
-         CREATE TABLE template_app.empty_permissions(id integer);
-         REVOKE ALL PRIVILEGES ON template_app.empty_permissions FROM postgres;",
+         REVOKE ALL PRIVILEGES ON template_app.item_audit FROM postgres;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -70838,7 +70837,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT relacl::text FROM pg_class WHERE oid='template_app.empty_permissions'::regclass;
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.item_audit'::regclass;
          SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),
@@ -71056,7 +71055,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT relacl::text FROM pg_class WHERE oid='template_app.empty_permissions'::regclass;
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.item_audit'::regclass;
          SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),

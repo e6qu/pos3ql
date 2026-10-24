@@ -21347,7 +21347,7 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
     );
     let scopes = run_with(&mut engine, &mut budget,
         "SELECT shobj_description('described_orders'::regclass, 'pg_class') IS NULL;
-         SELECT obj_description(oid, 'pg_authid') IS NULL, obj_description(oid) IS NULL, shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'described_role';");
+         SELECT obj_description(oid, 'pg_authid') IS NULL, obj_description(oid) IS DISTINCT FROM 'shared role', shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'described_role';");
     assert_eq!(
         data_rows(&scopes),
         ["t", "t|t|shared role"],

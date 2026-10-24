@@ -344,7 +344,7 @@ pub(crate) fn capture_transaction(
         unsafe { arena.rewind_to(mark) };
         result?;
     }
-    Ok(Some(batch))
+    Ok(batch.has_rows().then_some(batch))
 }
 
 #[cfg(test)]

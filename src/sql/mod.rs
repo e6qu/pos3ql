@@ -6486,20 +6486,22 @@ impl Engine {
             self.prepared_transactions.claim_resolution(slot, txn.txid);
         }
         let journal = prepared_slot.is_some() || staged_bytes != 0;
-        let publication_lsn =
-            if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-                // Position zero denotes an absent deletion marker. Temporary data
-                // needs a real position even before the first durable transaction.
-                let visible = self.storage.visible_lsn();
-                if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
-                    self.storage.observe_lsn(1);
-                    1
-                } else {
-                    visible
-                }
+        let publication_lsn = if !journal && txn.catalog_history.is_some() {
+            self.storage.bump_lsn()
+        } else if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor
+        {
+            // Position zero denotes an absent deletion marker. Temporary data
+            // needs a real position even before the first durable transaction.
+            let visible = self.storage.visible_lsn();
+            if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
+                self.storage.observe_lsn(1);
+                1
             } else {
-                commit_lsn
-            };
+                visible
+            }
+        } else {
+            commit_lsn
+        };
         txn.stage_commit(
             publication_lsn,
             target,
@@ -6625,10 +6627,10 @@ impl Engine {
                     .begin_transaction_installation(txn.txid, staged.lsn)?,
             );
             if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
-                let committed_at = core::num::NonZeroU64::new(staged.lsn)
-                    .expect("a staged transaction has a journal commit identity");
+                let committed_at = core::num::NonZeroU64::new(staged.lsn);
                 if let Some(history) = txn.catalog_history.take() {
-                    history.publish(committed_at);
+                    history
+                        .publish(committed_at.expect("catalog history has a publication identity"));
                 }
                 if let txn::CommitTarget::CommitPrepared { slot, .. } = staged.target
                     && let Some(history) = self
@@ -6638,7 +6640,9 @@ impl Engine {
                         .catalog_history
                         .take()
                 {
-                    history.publish(committed_at);
+                    history.publish(
+                        committed_at.expect("prepared catalog history has a publication identity"),
+                    );
                 }
             }
             match staged.target {

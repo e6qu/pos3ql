@@ -62,6 +62,7 @@ pub(crate) struct CatalogHistoryBatch {
     history: Arc<CatalogHistory>,
     identity: NonZeroU64,
     finished: bool,
+    rows_present: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +210,7 @@ impl CatalogHistory {
             history: Arc::clone(self),
             identity,
             finished: false,
+            rows_present: false,
         })
     }
 
@@ -360,6 +362,9 @@ impl Storage {
 }
 
 impl CatalogHistoryBatch {
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows_present
+    }
     /// Visitors may copy into reserved RAM buffers; they must not perform I/O
     /// or call another history operation while the row owner is held.
     pub(crate) fn visit_rows(
@@ -434,6 +439,7 @@ impl CatalogHistoryBatch {
         assert!(state.bytes.append(&header));
         assert!(state.bytes.append(key));
         assert!(state.bytes.append(row));
+        self.rows_present = true;
         Ok(())
     }
 

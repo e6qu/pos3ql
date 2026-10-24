@@ -4871,7 +4871,10 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
         return Some(a);
     }
     if matches!((a, b), (Name, Text) | (Text, Name)) {
-        return Some(Text);
+        return Some(a);
+    }
+    if matches!((a, b), (Name, Varchar | Bpchar) | (Varchar | Bpchar, Name)) {
+        return Some(Name);
     }
     if let (ColType::Composite(slot), ColType::Record)
     | (ColType::Record, ColType::Composite(slot)) = (a, b)

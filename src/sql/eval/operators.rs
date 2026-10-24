@@ -866,12 +866,14 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
         Datum::Multirange { .. } => hasher.write(&[24]),
         Datum::Geometry { .. } => hasher.write(&[39]),
         Datum::Array { .. } => hasher.write(&[25]),
-        Datum::Int2Vector(raw) => {
+        Datum::Int2Vector { raw, lower_bound } => {
             hasher.write(&[32]);
+            hasher.write(&lower_bound.to_le_bytes());
             hasher.write(raw);
         }
-        Datum::OidVector(raw) => {
+        Datum::OidVector { raw, lower_bound } => {
             hasher.write(&[33]);
+            hasher.write(&lower_bound.to_le_bytes());
             hasher.write(raw);
         }
         Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
@@ -913,6 +915,48 @@ pub(crate) fn compare_datums_as(
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     let ord = match (l, r) {
+        (
+            Datum::Int2Vector {
+                raw: a,
+                lower_bound: a_bound,
+            },
+            Datum::Int2Vector {
+                raw: b,
+                lower_bound: b_bound,
+            },
+        ) => a
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_le_bytes(*bytes))
+            .cmp(
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| i16::from_le_bytes(*bytes)),
+            )
+            .then_with(|| a_bound.cmp(b_bound)),
+        (
+            Datum::OidVector {
+                raw: a,
+                lower_bound: a_bound,
+            },
+            Datum::OidVector {
+                raw: b,
+                lower_bound: b_bound,
+            },
+        ) => a
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .cmp(
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| u32::from_le_bytes(*bytes)),
+            )
+            .then_with(|| a_bound.cmp(b_bound)),
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
         (Datum::Xid8(a), Datum::Xid8(b)) => a.cmp(b),
         (Datum::PgLsn(a), Datum::PgLsn(b)) => a.cmp(b),

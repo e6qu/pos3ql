@@ -31,8 +31,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v24` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `11` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog images use declared field types and hidden system-column positions, and retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v25` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Journal record | Version `12` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog images use declared field types and hidden system-column positions, and retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -49,7 +49,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v23 and older manifests are rejected before their references are used.
+Manifest v24 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -80,6 +80,13 @@ needed extent. These mechanisms are implemented. Their effect on latency,
 downloaded bytes, and rewritten bytes must still be measured for representative
 workloads. They do not promise that every query reads only projected columns:
 filters and exact result checks can need more data.
+
+Catalog vectors retain their signed lower bounds in rows, projected values, and
+constant defaults. Each stored vector adds four bytes for this bound; writers
+and readers use manifest v25, journal v12, and table-definition payload v8.
+For example, an array starting at subscript -3 retains that subscript after a
+cast to `oidvector`, checkpoint, and recovery with empty local caches.
+Existing startup buffers remain fixed; exhaustion fails explicitly.
 
 ## Format details for implementers
 
@@ -310,7 +317,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 7.
+contracts share this encoding. Table definition payloads use version 8.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.
@@ -393,7 +400,7 @@ changes, routine definition/name/drop changes, and materialized-view changes car
 this selected identity. Materialized-view creation also carries its backing table's
 position. Restore checks configured capacity, database, lifetime and occupied slots;
 it never moves an object to a different position to make room. User table payloads
-start with version 7 and this ten-byte position. The internal large-object page
+start with version 8 and this ten-byte position. The internal large-object page
 table alone keeps its reserved slot and zero creation stamp in the manifest.
 
 Checkpoint records use `table2` (slot and creation stamp), `sq7` (slot and stamp),
@@ -433,7 +440,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v24. Startup, backup retention, and
+The only accepted checkpoint manifest is v25. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

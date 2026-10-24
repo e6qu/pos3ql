@@ -790,10 +790,12 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     Int2Vector {
+        lower_bound: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     OidVector {
+        lower_bound: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
@@ -952,13 +954,21 @@ impl OwnedDatum {
                     "cannot store a pseudo-type value in a column"
                 ));
             }
-            Datum::Int2Vector(raw) => {
+            Datum::Int2Vector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "int2vector")?;
-                Self::Int2Vector { len, bytes }
+                Self::Int2Vector {
+                    lower_bound: *lower_bound,
+                    len,
+                    bytes,
+                }
             }
-            Datum::OidVector(raw) => {
+            Datum::OidVector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "oidvector")?;
-                Self::OidVector { len, bytes }
+                Self::OidVector {
+                    lower_bound: *lower_bound,
+                    len,
+                    bytes,
+                }
             }
             Datum::Regtype {
                 referenced_oid,
@@ -1221,8 +1231,22 @@ impl OwnedDatum {
                 element: *element,
                 raw: &bytes[..*len as usize],
             },
-            Self::Int2Vector { len, bytes } => Datum::Int2Vector(&bytes[..*len as usize]),
-            Self::OidVector { len, bytes } => Datum::OidVector(&bytes[..*len as usize]),
+            Self::Int2Vector {
+                lower_bound,
+                len,
+                bytes,
+            } => Datum::Int2Vector {
+                lower_bound: *lower_bound,
+                raw: &bytes[..*len as usize],
+            },
+            Self::OidVector {
+                lower_bound,
+                len,
+                bytes,
+            } => Datum::OidVector {
+                lower_bound: *lower_bound,
+                raw: &bytes[..*len as usize],
+            },
             Self::Range {
                 kind,
                 multirange,
@@ -20816,7 +20840,9 @@ impl Storage {
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
 
-            for source_slot in 0..self.tables.len() {
+            // The reserved large-object page table stores database-tagged rows
+            // for all databases and has no user catalog identity to clone.
+            for source_slot in 0..self.table_count() {
                 if self.tables[source_slot].database() != source || !self.tables[source_slot].live()
                 {
                     continue;

@@ -451,13 +451,13 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
             display_len(value)
         }
-        Datum::Int2Vector(raw) => {
+        Datum::Int2Vector { raw, .. } => {
             let count = raw.len() / 2;
             12usize
                 .saturating_add(usize::from(count != 0).saturating_mul(8))
                 .saturating_add(count.saturating_mul(6))
         }
-        Datum::OidVector(raw) => {
+        Datum::OidVector { raw, .. } => {
             let count = raw.len() / 4;
             12usize
                 .saturating_add(usize::from(count != 0).saturating_mul(8))
@@ -1645,7 +1645,7 @@ impl<'b> Responder<'b> {
                         }
                     });
                 }
-                Datum::Int2Vector(raw) => {
+                Datum::Int2Vector { raw, lower_bound } => {
                     let count = raw.len() / 2;
                     m.field(|m| {
                         m.i32(if count == 0 { 0 } else { 1 });
@@ -1653,7 +1653,7 @@ impl<'b> Responder<'b> {
                         m.i32(crate::sql::types::oid::INT2);
                         if count > 0 {
                             m.i32(count as i32);
-                            m.i32(0);
+                            m.i32(*lower_bound);
                         }
                         for bytes in raw.as_chunks::<2>().0 {
                             m.i32(2);
@@ -1661,7 +1661,7 @@ impl<'b> Responder<'b> {
                         }
                     });
                 }
-                Datum::OidVector(raw) => {
+                Datum::OidVector { raw, lower_bound } => {
                     let count = raw.len() / 4;
                     m.field(|m| {
                         m.i32(if count == 0 { 0 } else { 1 });
@@ -1669,7 +1669,7 @@ impl<'b> Responder<'b> {
                         m.i32(crate::sql::types::oid::OID);
                         if count > 0 {
                             m.i32(count as i32);
-                            m.i32(0);
+                            m.i32(*lower_bound);
                         }
                         for bytes in raw.as_chunks::<4>().0 {
                             m.i32(4);

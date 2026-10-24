@@ -15001,6 +15001,9 @@ fn run_with_fixed_memory_and_ddl_capacity(
     arena_bytes: usize,
     ddl_capacity: usize,
 ) -> Vec<u8> {
+    // Simulated object-store uploads allocate; drain startup recovery before
+    // checking the request itself for post-startup heap allocation.
+    engine.commit_wal().unwrap();
     let mut request_budget = Budget::new(budget.remaining());
     let mut buffer = crate::mem::FixedBuf::new(&mut request_budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(&mut request_budget, "sql", arena_bytes).unwrap();
@@ -34255,7 +34258,7 @@ fn column_collation_survives_wal_and_checkpoint_recovery() {
                  SELECT indcollation FROM pg_index \
                  WHERE indexrelid = 'collation_values_bytewise_index'::regclass",
             )),
-            ["{950}"],
+            ["950"],
         );
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
@@ -34286,7 +34289,7 @@ fn expression_index_collation_is_derived_from_its_text_argument() {
     );
     assert_eq!(
         data_rows(&output),
-        ["{950}"],
+        ["950"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -44483,7 +44486,7 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 }
 
 #[test]
-fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
+fn revoke_all_functions_rolls_back_default_acl_materialization_at_capacity() {
     const ROUTINES: usize = 65;
     let mut config = test_config("revoke-all-functions-public-acl");
     config.max_catalog_versions_per_object = 1;
@@ -44526,11 +44529,15 @@ fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
              'EXECUTE'
          );",
     );
+    assert_eq!(error_sqlstates(&revoked), ["54000"]);
+    let after = run_with(&mut engine, &mut budget,
+        "SELECT has_function_privilege('routine_acl_unrelated_reader', 'routine_acl_unrelated_0()', 'EXECUTE');
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'routine_acl_unrelated_%' AND proacl IS NULL");
     assert_eq!(
-        data_rows(&revoked),
-        ["t"],
+        data_rows(&after),
+        ["t", "65"],
         "{}",
-        String::from_utf8_lossy(&revoked)
+        String::from_utf8_lossy(&after)
     );
 }
 
@@ -75229,7 +75236,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
-            "t|t|t|{0,950}|1978 3126|{0,1}",
+            "t|t|t|0 950|1978 3126|0 1",
         ]
     );
     run_with(
@@ -75376,8 +75383,8 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
             &mut budget,
             "CREATE TABLE durable_catalog_vectors (\
                  id integer PRIMARY KEY,\
-                 attributes int2vector DEFAULT '3 -4',\
-                 identifiers oidvector DEFAULT '7 8'); \
+                 attributes int2vector DEFAULT ('[-3:-2]={3,-4}'::int2[]::int2vector),\
+                 identifiers oidvector DEFAULT ('[8:9]={7,8}'::oid[]::oidvector)); \
              INSERT INTO durable_catalog_vectors VALUES \
                  (1, ARRAY[1::int2, 2::int2]::int2vector, '9 10'::oidvector), \
                  (2, DEFAULT, DEFAULT)",
@@ -75400,7 +75407,10 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
         "SELECT attributes::int2[]::text, identifiers::oid[]::text \
            FROM durable_catalog_vectors ORDER BY id",
     );
-    assert_eq!(data_rows(&rows), ["{1,2}|{9,10}", "{3,-4}|{7,8}"]);
+    assert_eq!(
+        data_rows(&rows),
+        ["{1,2}|[0:1]={9,10}", "[-3:-2]={3,-4}|[8:9]={7,8}"]
+    );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -75475,7 +75485,7 @@ fn pg_dump_bootstrap_surface() {
                JOIN pg_catalog.pg_publication pub ON pub.oid = pr.prpubid \
               WHERE pub.pubname = 'pg_dump_publication_changes'",
         )),
-        ["{1,2}"]
+        ["[0:1]={1,2}"]
     );
     let catalog_vector_casts = run_with(
         &mut engine,
@@ -80769,7 +80779,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v24\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v25\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -80982,7 +80992,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v24\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v25\n"))
     );
     drop(recovered);
 

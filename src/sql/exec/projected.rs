@@ -179,7 +179,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Snapshot { value, .. } => 5 + value.raw().len(),
         // element code + user-type slot + domain base code/slot + byte length
         Datum::Array { raw, .. } => 10 + raw.len(),
-        Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
+        Datum::Int2Vector { raw, .. } | Datum::OidVector { raw, .. } => 8 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
         Datum::Range { text, .. } => 5 + text.len(),
@@ -448,17 +448,19 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[11..11 + raw.len()].copy_from_slice(raw);
             11 + raw.len()
         }
-        Datum::Int2Vector(raw) => {
+        Datum::Int2Vector { raw, lower_bound } => {
             out[0] = 29;
             out[1..5].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            out[5..5 + raw.len()].copy_from_slice(raw);
-            5 + raw.len()
+            out[5..9].copy_from_slice(&lower_bound.to_le_bytes());
+            out[9..9 + raw.len()].copy_from_slice(raw);
+            9 + raw.len()
         }
-        Datum::OidVector(raw) => {
+        Datum::OidVector { raw, lower_bound } => {
             out[0] = 34;
             out[1..5].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            out[5..5 + raw.len()].copy_from_slice(raw);
-            5 + raw.len()
+            out[5..9].copy_from_slice(&lower_bound.to_le_bytes());
+            out[9..9 + raw.len()].copy_from_slice(raw);
+            9 + raw.len()
         }
         Datum::Uuid(b) => {
             out[0] = 9;
@@ -972,11 +974,23 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         29 => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            (Datum::Int2Vector(&bytes[at + 4..at + 4 + len]), 4 + len)
+            (
+                Datum::Int2Vector {
+                    lower_bound: i32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                    raw: &bytes[at + 8..at + 8 + len],
+                },
+                8 + len,
+            )
         }
         34 => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            (Datum::OidVector(&bytes[at + 4..at + 4 + len]), 4 + len)
+            (
+                Datum::OidVector {
+                    lower_bound: i32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                    raw: &bytes[at + 8..at + 8 + len],
+                },
+                8 + len,
+            )
         }
         32 => {
             let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
@@ -1277,6 +1291,26 @@ mod tests {
             Datum::Array {
                 element: ArrElem::Composite(1281),
                 raw: b"composite",
+            },
+        ];
+        let encoded = encode_projected_pub(&values, &arena).unwrap();
+        for (column, expected) in values.iter().enumerate() {
+            assert_eq!(decode_projected_pub(encoded, column), *expected);
+        }
+    }
+
+    #[test]
+    fn projected_vectors_preserve_bounds_and_value_identity() {
+        let mut budget = Budget::new(4096);
+        let arena = Arena::new(&mut budget, "projected vectors", 2048).unwrap();
+        let values = [
+            Datum::Int2Vector {
+                raw: &[1, 0, 254, 255],
+                lower_bound: -3,
+            },
+            Datum::OidVector {
+                raw: &[9, 0, 0, 0, 10, 0, 0, 0],
+                lower_bound: 8,
             },
         ];
         let encoded = encode_projected_pub(&values, &arena).unwrap();

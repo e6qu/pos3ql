@@ -4724,9 +4724,15 @@ pub enum Datum<'a> {
         raw: &'a [u8],
     },
     /// The fixed-width integer vector used by PostgreSQL system catalogs.
-    Int2Vector(&'a [u8]),
+    Int2Vector {
+        raw: &'a [u8],
+        lower_bound: i32,
+    },
     /// The fixed-width OID vector used by PostgreSQL system catalogs.
-    OidVector(&'a [u8]),
+    OidVector {
+        raw: &'a [u8],
+        lower_bound: i32,
+    },
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
@@ -4848,8 +4854,8 @@ impl<'a> Datum<'a> {
             Datum::TsVector(_) => oid::TSVECTOR,
             Datum::TsQuery(_) => oid::TSQUERY,
             Datum::Array { element, .. } => element.array_oid(),
-            Datum::Int2Vector(_) => oid::INT2VECTOR,
-            Datum::OidVector(_) => oid::OIDVECTOR,
+            Datum::Int2Vector { .. } => oid::INT2VECTOR,
+            Datum::OidVector { .. } => oid::OIDVECTOR,
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
@@ -5099,7 +5105,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Bit { bits, .. } => f.write_str(bits),
             Datum::Multirange { text, .. } => f.write_str(text),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
-            Datum::Int2Vector(raw) => {
+            Datum::Int2Vector { raw, .. } => {
                 for (index, bytes) in raw.as_chunks::<2>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;
@@ -5109,7 +5115,7 @@ impl fmt::Display for Datum<'_> {
                 }
                 Ok(())
             }
-            Datum::OidVector(raw) => {
+            Datum::OidVector { raw, .. } => {
                 for (index, bytes) in raw.as_chunks::<4>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;

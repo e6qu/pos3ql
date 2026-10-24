@@ -54727,7 +54727,10 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
         if !reader.done() {
             return Err(bad());
         }
-        return Ok(Datum::Int2Vector(&[]));
+        return Ok(Datum::Int2Vector {
+            lower_bound: 0,
+            raw: &[],
+        });
     }
     if ndim != 1 {
         return Err(bad());
@@ -54759,7 +54762,10 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
     if !reader.done() {
         return Err(bad());
     }
-    Ok(Datum::Int2Vector(raw))
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw: raw,
+    })
 }
 
 /// Decodes PostgreSQL's `oidvector` send format. It is an `oid` array on the
@@ -54779,7 +54785,10 @@ fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datu
         if !reader.done() {
             return Err(bad());
         }
-        return Ok(Datum::OidVector(&[]));
+        return Ok(Datum::OidVector {
+            lower_bound: 0,
+            raw: &[],
+        });
     }
     if ndim != 1 {
         return Err(bad());
@@ -54811,7 +54820,10 @@ fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datu
     if !reader.done() {
         return Err(bad());
     }
-    Ok(Datum::OidVector(raw))
+    Ok(Datum::OidVector {
+        lower_bound: 0,
+        raw: raw,
+    })
 }
 
 /// Decodes PostgreSQL's binary array receive format.
@@ -72056,7 +72068,13 @@ mod tests {
         let arena = Arena::new(&mut budget, "binary int2vector", 1 << 12).unwrap();
 
         let datum = decode_binary_field(ColType::Int2Vector, &bytes, &arena).unwrap();
-        assert_eq!(datum, Datum::Int2Vector(&[1, 0, 2, 0]));
+        assert_eq!(
+            datum,
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0]
+            }
+        );
         assert_eq!(datum.to_string(), "1 2");
     }
 
@@ -72096,7 +72114,13 @@ mod tests {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "binary oidvector", 1 << 12).unwrap();
         let datum = decode_binary_field(ColType::OidVector, &bytes, &arena).unwrap();
-        assert_eq!(datum, Datum::OidVector(&[23, 0, 0, 0, 54, 12, 0, 0]));
+        assert_eq!(
+            datum,
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[23, 0, 0, 0, 54, 12, 0, 0]
+            }
+        );
         assert_eq!(datum.to_string(), "23 3126");
     }
 

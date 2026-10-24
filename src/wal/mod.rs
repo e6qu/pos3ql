@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 11;
+pub(crate) const RECORD_VERSION: u8 = 12;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 7;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 8;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -11658,7 +11658,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
-            1 + *len as usize
+            5 + *len as usize
         }
         Some(OwnedDatum::Range { len, .. }) => 3 + *len as usize,
     }
@@ -12104,17 +12104,27 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
         }
-        Some(OwnedDatum::Int2Vector { len, bytes }) => {
+        Some(OwnedDatum::Int2Vector {
+            lower_bound,
+            len,
+            bytes,
+        }) => {
             out[0] = 31;
             out[1] = *len;
-            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            2 + *len as usize
+            out[2..6].copy_from_slice(&lower_bound.to_le_bytes());
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
         }
-        Some(OwnedDatum::OidVector { len, bytes }) => {
+        Some(OwnedDatum::OidVector {
+            lower_bound,
+            len,
+            bytes,
+        }) => {
             out[0] = 32;
             out[1] = *len;
-            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            2 + *len as usize
+            out[2..6].copy_from_slice(&lower_bound.to_le_bytes());
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
         }
     }
 }
@@ -12451,18 +12461,22 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         }
         31 | 32 => {
             let len = *payload.get(*at)? as usize;
-            *at += 1;
+            let lower_bound =
+                i32::from_le_bytes(payload.get(*at + 1..*at + 5)?.try_into().unwrap());
+            *at += 5;
             if (tag == 31 && !len.is_multiple_of(2)) || (tag == 32 && !len.is_multiple_of(4)) {
                 return None;
             }
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(if tag == 31 {
                 OwnedDatum::Int2Vector {
+                    lower_bound,
                     len: len as u8,
                     bytes,
                 }
             } else {
                 OwnedDatum::OidVector {
+                    lower_bound,
                     len: len as u8,
                     bytes,
                 }
@@ -13094,10 +13108,12 @@ mod tests {
                 bytes: text,
             }),
             Some(OwnedDatum::Int2Vector {
+                lower_bound: -3,
                 len: 4,
                 bytes: vector,
             }),
             Some(OwnedDatum::OidVector {
+                lower_bound: -3,
                 len: 4,
                 bytes: vector,
             }),

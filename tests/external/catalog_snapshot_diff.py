@@ -104,6 +104,18 @@ def transcript(reader, writer):
                 f"SELECT {','.join(fields)} FROM pg_catalog.{relation} LIMIT 0",
             )
 
+        record(writer, f"{prefix}.vector_bound_round_trip", """
+            SELECT ('[8:9]={9,10}'::oid[]::oidvector)::oid[]::text,
+                   ('[-3:-2]={1,-2}'::smallint[]::int2vector)::smallint[]::text,
+                   array_dims('[8:9]={9,10}'::oid[]::oidvector),
+                   array_lower('[-3:-2]={1,-2}'::smallint[]::int2vector,1),
+                   array_upper('[-3:-2]={1,-2}'::smallint[]::int2vector,1),
+                   ('[-3:-2]={1,-2}'::smallint[]::int2vector)[-2],
+                   ('[8:9]={9,10}'::oid[]::oidvector)[8],
+                   '1 2'::int2vector < '1 10'::int2vector,
+                   '9 10'::oidvector <> '[8:9]={9,10}'::oid[]::oidvector
+        """)
+
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
         try:
             writer.execute('CREATE INDEX catalog_index_vectors_diff_idx ON catalog_index_vectors_diff (id DESC NULLS LAST, note COLLATE "C" ASC NULLS FIRST) INCLUDE (extra)')
@@ -437,6 +449,9 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.permissions.wrapped_columns_again", "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1)")
             record(reader, f"{prefix}.permissions.column_lookup", "SELECT pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,1)::text, (SELECT attacl::text FROM pg_attribute WHERE attrelid='catalog_permission_diff'::regclass AND attnum=1), has_column_privilege('catalog_permission_renamed_diff','catalog_permission_diff','id','SELECT')")
             writer.execute("CREATE FUNCTION catalog_permission_function_diff() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+            record(writer, f"{prefix}.permissions.function_default_before", "SELECT proacl IS NULL FROM pg_proc WHERE oid='catalog_permission_function_diff()'::regprocedure")
+            writer.execute("REVOKE EXECUTE ON FUNCTION catalog_permission_function_diff() FROM catalog_permission_renamed_diff")
+            record(writer, f"{prefix}.permissions.function_ungranted_revoke", "SELECT proacl::text,has_function_privilege('catalog_permission_renamed_diff','catalog_permission_function_diff()','EXECUTE') FROM pg_proc WHERE oid='catalog_permission_function_diff()'::regprocedure")
             writer.execute("GRANT EXECUTE ON FUNCTION catalog_permission_function_diff() TO catalog_permission_renamed_diff")
             record(reader, f"{prefix}.permissions.function_subid", "SELECT pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 0)::text, pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 7)::text")
             large_object = writer.execute("SELECT lo_create(0)").fetchone()[0]

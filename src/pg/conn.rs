@@ -5795,6 +5795,9 @@ mod tests {
                 std::fs::remove_dir_all(&directory).unwrap();
                 let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
+                // Drain recovery uploads before the guarded client command;
+                // the simulated remote store allocates its fixture objects.
+                engine.commit_wal().unwrap();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
                 conn.phase = Phase::Ready;
                 assert!(matches!(
@@ -8351,7 +8354,10 @@ mod tests {
         assert_eq!(
             decode_binary_param(crate::sql::types::oid::INT2VECTOR, &bytes, &arena)
                 .expect("int2vector decodes"),
-            Datum::Int2Vector(&[1, 0, 2, 0])
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0]
+            }
         );
     }
 
@@ -8370,7 +8376,10 @@ mod tests {
         assert_eq!(
             decode_binary_param(crate::sql::types::oid::OIDVECTOR, &bytes, &arena)
                 .expect("oidvector decodes"),
-            Datum::OidVector(&[54, 12, 0, 0])
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[54, 12, 0, 0]
+            }
         );
     }
 

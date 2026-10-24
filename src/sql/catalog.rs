@@ -17429,7 +17429,12 @@ fn pg_publication_namespace<'a>(
             let schema = storage.schema_def(*schema_slot as usize);
             rows[count] = row(
                 &[
-                    Datum::Int4(6105),
+                    Datum::Oid(
+                        definition
+                            .relation
+                            .expect("catalog relation has an identity")
+                            .get(),
+                    ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
                     Datum::Int4(namespace_oid(storage, schema.name.as_str())),
@@ -21677,7 +21682,10 @@ fn pg_index<'a>(
                 Datum::Int4(2),
                 Datum::Int4(2),
                 int2vector(&keys, arena)?,
-                Datum::Int2Vector(&[0; 4]),
+                Datum::Int2Vector {
+                    lower_bound: 0,
+                    raw: &[0; 4],
+                },
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
@@ -21714,7 +21722,10 @@ fn pg_index<'a>(
                 Datum::Int4(attributes.len() as i32),
                 Datum::Int4(attributes.len() as i32),
                 int2vector(attributes, arena)?,
-                Datum::Int2Vector(&[0; 4][..attributes.len() * 2]),
+                Datum::Int2Vector {
+                    lower_bound: 0,
+                    raw: &[0; 4][..attributes.len() * 2],
+                },
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
@@ -21743,11 +21754,12 @@ fn index_options<'a>(info: &IdxInfo, arena: &'a Arena) -> Result<Datum<'a>, SqlE
             i16::from(info.descending[position]) | (i16::from(info.nulls_first[position]) << 1);
         value.copy_from_slice(&flags.to_le_bytes());
     }
-    Ok(Datum::Int2Vector(
-        arena
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw: arena
             .alloc_slice_copy(&raw[..info.n_cols * 2])
             .map_err(|_| arena_full())?,
-    ))
+    })
 }
 
 fn index_collations<'a>(
@@ -21850,7 +21862,10 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
         };
         raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
-    Ok(Datum::Int2Vector(raw))
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw: raw,
+    })
 }
 
 fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -21860,7 +21875,10 @@ fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> 
     for (index, oid) in oids.iter().enumerate() {
         raw[index * 4..index * 4 + 4].copy_from_slice(&oid.to_le_bytes());
     }
-    Ok(Datum::OidVector(raw))
+    Ok(Datum::OidVector {
+        lower_bound: 0,
+        raw: raw,
+    })
 }
 
 fn catalog_column_type_oid(
@@ -26197,9 +26215,24 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 });
             argument_oids[index] = argument_oid;
         }
-        let mut all_argument_types = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
-        let mut argument_modes = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
-        let mut argument_names = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
+        let output_count = if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+            routine.result_column_count
+        } else {
+            0
+        };
+        let parameter_capacity = routine
+            .parameter_count
+            .checked_add(output_count)
+            .ok_or_else(|| catalog_capacity_exceeded("pg_proc arguments"))?;
+        let all_argument_types = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let argument_modes = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let argument_names = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut all_parameter_count = routine.parameter_count;
         let mut has_modes = false;
         let mut has_names = false;

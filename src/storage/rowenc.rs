@@ -36,7 +36,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
                 text,
                 ..
             } => physical_field_count_len(*physical_fields) + 4 + text.len(),
-            Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
+            Datum::Int2Vector { raw, .. } | Datum::OidVector { raw, .. } => 8 + raw.len(),
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
@@ -117,10 +117,11 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[prefix + 4..prefix + 4 + text.len()].copy_from_slice(text.as_bytes());
                 take = prefix + 4 + text.len();
             }
-            Datum::Int2Vector(raw) | Datum::OidVector(raw) => {
+            Datum::Int2Vector { raw, lower_bound } | Datum::OidVector { raw, lower_bound } => {
                 rest[..4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-                rest[4..4 + raw.len()].copy_from_slice(raw);
-                take = 4 + raw.len();
+                rest[4..8].copy_from_slice(&lower_bound.to_le_bytes());
+                rest[8..8 + raw.len()].copy_from_slice(raw);
+                take = 8 + raw.len();
             }
             Datum::Regtype {
                 referenced_oid,
@@ -456,7 +457,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         }
         ColType::Int2Vector | ColType::OidVector => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
-            Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            Some(8 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
         ColType::Void
         | ColType::Internal
@@ -516,19 +517,26 @@ pub(crate) fn decode<'a>(
             ColType::Int2Vector | ColType::OidVector => {
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
-                at += 4;
+                let lower_bound = i32::from_le_bytes(
+                    bytes
+                        .get(at + 4..at + 8)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                at += 8;
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 out[i] = if matches!(schema[i], ColType::Int2Vector) {
                     if !raw.len().is_multiple_of(2) {
                         return Err(corrupt());
                     }
-                    Datum::Int2Vector(raw)
+                    Datum::Int2Vector { lower_bound, raw }
                 } else {
                     if !raw.len().is_multiple_of(4) {
                         return Err(corrupt());
                     }
-                    Datum::OidVector(raw)
+                    Datum::OidVector { lower_bound, raw }
                 };
             }
             ColType::PgNodeTree => {
@@ -1126,8 +1134,14 @@ mod tests {
     fn catalog_vectors_round_trip_as_durable_values() {
         let schema = [ColType::Int2Vector, ColType::OidVector];
         let values = [
-            Datum::Int2Vector(&[1, 0, 254, 255]),
-            Datum::OidVector(&[1, 0, 0, 0, 2, 0, 0, 0]),
+            Datum::Int2Vector {
+                lower_bound: -3,
+                raw: &[1, 0, 254, 255],
+            },
+            Datum::OidVector {
+                lower_bound: 8,
+                raw: &[1, 0, 0, 0, 2, 0, 0, 0],
+            },
         ];
         let mut buffer = vec![0u8; encoded_len(&values)];
         encode(&values, &mut buffer);

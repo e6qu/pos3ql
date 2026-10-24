@@ -3347,9 +3347,12 @@ fn eval_full_inner<'a>(
                         raw: super::array::build_shaped(items, shape.without_first()?, arena)?,
                     })
                 }
-                Datum::Int2Vector(raw) => {
+                Datum::Int2Vector { raw, lower_bound } => {
                     let index = integer_index(&i)?;
-                    let Ok(slot) = usize::try_from(index) else {
+                    let Some(slot) = index
+                        .checked_sub(i64::from(lower_bound))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                    else {
                         return Ok(Datum::Null);
                     };
                     Ok(raw
@@ -3359,9 +3362,12 @@ fn eval_full_inner<'a>(
                         .map(|value| Datum::Int2(i16::from_le_bytes(*value)))
                         .unwrap_or(Datum::Null))
                 }
-                Datum::OidVector(raw) => {
+                Datum::OidVector { raw, lower_bound } => {
                     let index = integer_index(&i)?;
-                    let Ok(slot) = usize::try_from(index) else {
+                    let Some(slot) = index
+                        .checked_sub(i64::from(lower_bound))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                    else {
                         return Ok(Datum::Null);
                     };
                     Ok(raw
@@ -3705,10 +3711,10 @@ fn eval_full_inner<'a>(
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let mut array = eval_full(array, arena, params, row, hooks)?;
             array = match array {
-                Datum::Int2Vector(_) => {
+                Datum::Int2Vector { .. } => {
                     cast_to(array, ColType::Array(super::types::ArrElem::Int2), arena)?
                 }
-                Datum::OidVector(_) => {
+                Datum::OidVector { .. } => {
                     cast_to(array, ColType::Array(super::types::ArrElem::Oid), arena)?
                 }
                 value => value,
@@ -4810,13 +4816,13 @@ fn call<'a>(
                 Datum::Array { element, raw } => {
                     super::array::get(raw, element, k - 1).unwrap_or(Datum::Null)
                 }
-                Datum::Int2Vector(raw) => raw
+                Datum::Int2Vector { raw, .. } => raw
                     .as_chunks::<2>()
                     .0
                     .get(k - 1)
                     .map(|bytes| Datum::Int4(i16::from_le_bytes(*bytes) as i32))
                     .unwrap_or(Datum::Null),
-                Datum::OidVector(raw) => raw
+                Datum::OidVector { raw, .. } => raw
                     .as_chunks::<4>()
                     .0
                     .get(k - 1)
@@ -7572,8 +7578,8 @@ fn coerce_enum_literal<'a>(
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Array { element, .. } => element.array_name(),
-        Datum::Int2Vector(_) => "int2vector",
-        Datum::OidVector(_) => "oidvector",
+        Datum::Int2Vector { .. } => "int2vector",
+        Datum::OidVector { .. } => "oidvector",
         Datum::Null => "unknown",
         Datum::PgDdlCommand => "pg_ddl_command",
         Datum::Bool(_) => "boolean",

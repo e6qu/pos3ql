@@ -18,9 +18,11 @@ use super::super::{
     load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
 };
 
+#[allow(clippy::too_many_arguments)]
 fn vector_bounds<'a>(
     name: &str,
     length: usize,
+    lower_bound: i32,
     args: &[&Expr<'a>],
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
@@ -42,8 +44,8 @@ fn vector_bounds<'a>(
     }
     Ok(match name {
         "array_length" => Datum::Int4(length as i32),
-        "array_upper" => Datum::Int4(length as i32 - 1),
-        "array_lower" => Datum::Int4(0),
+        "array_upper" => Datum::Int4((i64::from(lower_bound) + length as i64 - 1) as i32),
+        "array_lower" => Datum::Int4(lower_bound),
         _ => unreachable!(),
     })
 }
@@ -128,12 +130,26 @@ pub(crate) fn dispatch<'a>(
                             _ => unreachable!(),
                         })
                     }
-                    Datum::Int2Vector(raw) => {
-                        vector_bounds(name, raw.len() / 2, args, arena, params, row, hooks)
-                    }
-                    Datum::OidVector(raw) => {
-                        vector_bounds(name, raw.len() / 4, args, arena, params, row, hooks)
-                    }
+                    Datum::Int2Vector { raw, lower_bound } => vector_bounds(
+                        name,
+                        raw.len() / 2,
+                        lower_bound,
+                        args,
+                        arena,
+                        params,
+                        row,
+                        hooks,
+                    ),
+                    Datum::OidVector { raw, lower_bound } => vector_bounds(
+                        name,
+                        raw.len() / 4,
+                        lower_bound,
+                        args,
+                        arena,
+                        params,
+                        row,
+                        hooks,
+                    ),
                     Datum::Null => Ok(Datum::Null),
                     _ => Err(type_mismatch("array_length requires an array", &a)),
                 }
@@ -483,20 +499,30 @@ pub(crate) fn dispatch<'a>(
                 let arr = eval_full(args[0], arena, params, row, hooks)?;
                 let raw = match arr {
                     Datum::Array { raw, .. } => raw,
-                    Datum::Int2Vector(raw) => {
+                    Datum::Int2Vector { raw, lower_bound } => {
                         if name == "array_ndims" {
                             return Ok(Datum::Int4(1));
                         }
-                        let bounds = crate::stack_format!(32, "[0:{}]", raw.len() as i64 / 2 - 1);
+                        let bounds = crate::stack_format!(
+                            32,
+                            "[{}:{}]",
+                            lower_bound,
+                            i64::from(lower_bound) + raw.len() as i64 / 2 - 1
+                        );
                         return Ok(Datum::Text(
                             arena.alloc_str(bounds.as_str()).map_err(|_| arena_full())?,
                         ));
                     }
-                    Datum::OidVector(raw) => {
+                    Datum::OidVector { raw, lower_bound } => {
                         if name == "array_ndims" {
                             return Ok(Datum::Int4(1));
                         }
-                        let bounds = crate::stack_format!(32, "[0:{}]", raw.len() as i64 / 4 - 1);
+                        let bounds = crate::stack_format!(
+                            32,
+                            "[{}:{}]",
+                            lower_bound,
+                            i64::from(lower_bound) + raw.len() as i64 / 4 - 1
+                        );
                         return Ok(Datum::Text(
                             arena.alloc_str(bounds.as_str()).map_err(|_| arena_full())?,
                         ));

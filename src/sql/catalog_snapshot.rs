@@ -59,30 +59,38 @@ mod key_definitions {
             11
         );
         let mut matched = 0;
-        forbid_alloc(|| {
-            for relation in relations {
-                let identity = relation.identity(DatabaseOid::POSTGRES);
-                assert_eq!(identity.database.is_none(), relation.shared);
-                let baseline = super::super::catalog_metadata::RELATIONS
-                    .iter()
-                    .find(|definition| definition.name == relation.name)
-                    .unwrap();
-                assert_eq!(baseline.oid as u32, identity.relation.get());
-                if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
-                    continue;
-                }
-                arena.reset();
+        let mut errors = Vec::new();
+        for relation in relations {
+            let identity = relation.identity(DatabaseOid::POSTGRES);
+            assert_eq!(identity.database.is_none(), relation.shared);
+            let baseline = super::super::catalog_metadata::RELATIONS
+                .iter()
+                .find(|definition| definition.name == relation.name)
+                .unwrap();
+            assert_eq!(baseline.oid as u32, identity.relation.get());
+            if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+                continue;
+            }
+            arena.reset();
+            let result = forbid_alloc(|| {
                 let definition = super::super::catalog::synthesize_definition(
                     Some("pg_catalog"),
                     relation.name,
                     &arena,
-                )
-                .unwrap();
-                let indexed = KeyedRows::from_catalog(&definition, relation.key, &arena).unwrap();
-                assert_eq!(indexed.len, 0);
-                matched += 1;
+                )?;
+                let indexed = KeyedRows::from_catalog(&definition, relation.key, &arena)?;
+                Ok::<_, SqlError>(indexed.len)
+            });
+            match result {
+                Ok(count) => assert_eq!(count, 0),
+                Err(error) => errors.push(format!("{}: {}", relation.name, error.message.as_str())),
             }
-        });
+            matched += 1;
+        }
+        assert!(
+            errors.is_empty(),
+            "catalog key contract failures: {errors:#?}"
+        );
         assert!(matched > 40);
     }
 
@@ -114,31 +122,39 @@ mod key_definitions {
         )
         .unwrap();
         let mut matched = 0;
-        forbid_alloc(|| {
-            for relation in super::super::catalog_snapshot_keys::RELATIONS {
-                if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
-                    continue;
-                }
-                arena.reset();
+        let mut errors = Vec::new();
+        for relation in super::super::catalog_snapshot_keys::RELATIONS {
+            if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+                continue;
+            }
+            arena.reset();
+            let result = forbid_alloc(|| {
                 let catalog = super::super::catalog::synthesize(
                     &storage,
                     Some("pg_catalog"),
                     relation.name,
                     0,
                     &arena,
-                )
-                .unwrap();
-                let indexed = KeyedRows::from_catalog(&catalog, relation.key, &arena).unwrap();
-                assert_eq!(
+                )?;
+                let indexed = KeyedRows::from_catalog(&catalog, relation.key, &arena)?;
+                Ok::<_, SqlError>((
                     indexed
                         .iter()
                         .map(|row| row.image.unwrap().count.get() as usize)
                         .sum::<usize>(),
-                    catalog.rows.len()
-                );
-                matched += 1;
+                    catalog.rows.len(),
+                ))
+            });
+            match result {
+                Ok((indexed, source)) => assert_eq!(indexed, source),
+                Err(error) => errors.push(format!("{}: {}", relation.name, error.message.as_str())),
             }
-        });
+            matched += 1;
+        }
+        assert!(
+            errors.is_empty(),
+            "materialized catalog key failures: {errors:#?}"
+        );
         assert!(matched > 40);
     }
 }

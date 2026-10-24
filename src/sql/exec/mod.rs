@@ -11596,41 +11596,6 @@ fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Res
     }
 }
 
-/// PostgreSQL records the bootstrap role's `SET, ALTER SYSTEM` ACL whenever a
-/// parameter first gains explicit ACL state.  Materializing it with the first
-/// mutation keeps catalog output, WAL, and checkpoint recovery identical.
-fn materialize_parameter_acl_default(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    parameter: crate::sql::ast::ParameterName,
-) -> Result<(), SqlError> {
-    let (privileges, _) = storage.parameter_acl_from(
-        parameter,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::storage::BOOTSTRAP_ROLE,
-        txn.txid,
-    );
-    if privileges == crate::sql::ast::ParameterPrivileges::ALL {
-        return Ok(());
-    }
-    let (slot, prior) = storage.change_parameter_acl(
-        parameter,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::sql::ast::ParameterPrivileges::ALL,
-        crate::sql::ast::ParameterPrivileges::NONE,
-        txn.txid,
-    )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.restore_parameter_acl_pending(slot, prior);
-        return Err(error);
-    }
-    Ok(())
-}
-
 pub struct ParameterPrivilegeTarget<'a> {
     pub privileges: crate::sql::ast::ParameterPrivileges,
     pub names: &'a [crate::sql::ast::ParameterName],
@@ -11675,9 +11640,6 @@ pub fn grant_parameter_privileges(
         if let Err(error) = ensure_parameter_acl_target(*parameter) {
             return sql_fail(error);
         }
-        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
-            return sql_fail(error);
-        }
         let can_grant = storage.role(grantor).attributes_to(txn.txid).superuser
             || storage.has_parameter_grant_option(
                 *parameter,
@@ -11718,7 +11680,9 @@ pub fn grant_parameter_privileges(
                 slot: slot as u32,
                 prior,
             }) {
-                storage.restore_parameter_acl_pending(slot, prior);
+                storage
+                    .restore_parameter_acl_pending(slot, prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
         }
@@ -11783,7 +11747,9 @@ fn cascade_parameter_acl_grants(
                 slot: changed as u32,
                 prior,
             }) {
-                storage.restore_parameter_acl_pending(changed, prior);
+                storage
+                    .restore_parameter_acl_pending(changed, prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return Err(error);
             }
             if grantee != crate::storage::PUBLIC_ROLE
@@ -11848,9 +11814,6 @@ pub fn revoke_parameter_privileges(
         if let Err(error) = ensure_parameter_acl_target(*parameter) {
             return sql_fail(error);
         }
-        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
-            return sql_fail(error);
-        }
         let can_revoke = storage.role(grantor).attributes_to(txn.txid).superuser
             || storage.has_parameter_grant_option(
                 *parameter,
@@ -11901,7 +11864,9 @@ pub fn revoke_parameter_privileges(
                 slot: slot as u32,
                 prior,
             }) {
-                storage.restore_parameter_acl_pending(slot, prior);
+                storage
+                    .restore_parameter_acl_pending(slot, prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
             let removed_options = crate::sql::ast::ParameterPrivileges::from_bits(
@@ -11926,7 +11891,9 @@ pub fn revoke_parameter_privileges(
                     &mut scratch,
                 )
             {
-                storage.restore_parameter_acl_pending(slot, prior);
+                storage
+                    .restore_parameter_acl_pending(slot, prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
         }

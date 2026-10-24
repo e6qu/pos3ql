@@ -6197,56 +6197,36 @@ impl Engine {
                 return Err(error);
             }
         }
-        for (position, undo) in txn.ddl().iter().enumerate() {
-            let DdlUndo::ParameterAclChanged { slot, .. } = *undo else {
-                continue;
-            };
-            if txn.ddl()[position + 1..].iter().any(
-                |later| matches!(later, DdlUndo::ParameterAclChanged { slot: later, .. } if *later == slot),
-            ) {
-                continue;
-            }
-            let entry = self.storage.parameter_acl_entry(slot as usize);
-            let (grantee, grantor) = self.storage.parameter_acl_identity(slot as usize, txn.txid);
-            if txn.ddl()[..position].iter().any(|earlier| {
-                let DdlUndo::ParameterAclChanged {
-                    slot: earlier_slot, ..
-                } = *earlier
-                else {
-                    return false;
-                };
-                if earlier_slot == slot {
-                    return false;
-                }
-                let earlier_entry = self.storage.parameter_acl_entry(earlier_slot as usize);
-                earlier_entry.parameter == entry.parameter
-                    && self
+        let parameter_acl_staging = (|| {
+            for (parameter, expected) in self.storage.pending_parameter_acl_rows(txn.txid) {
+                let mark = self.work.mark();
+                let result = (|| {
+                    let image = self
                         .storage
-                        .parameter_acl_identity(earlier_slot as usize, txn.txid)
-                        == (grantee, grantor)
-            }) {
-                continue;
+                        .snapshot_parameter_acl_row(parameter, txn.txid, &self.work)?;
+                    if expected.is_none() && image.is_none() {
+                        return Ok(());
+                    }
+                    let lsn = self.storage.bump_lsn();
+                    self.wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::SetParameterAcl {
+                            parameter: parameter.as_str(),
+                            expected,
+                            image,
+                        },
+                    )
+                })();
+                // stage_reserved copies the complete row into its reserved journal buffer.
+                unsafe { self.work.rewind_to(mark) };
+                result?;
             }
-            let (privileges, grant_options) =
-                self.storage.parameter_acl_state(slot as usize, txn.txid);
-            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| self.storage.role_name(grantee as usize, txn.txid));
-            let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
-            let lsn = self.storage.bump_lsn();
-            if let Err(error) = self.wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::SetParameterAcl {
-                    parameter: entry.parameter.as_str(),
-                    grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
-                    grantor: grantor_name.as_str(),
-                    privileges,
-                    grant_options,
-                },
-            ) {
-                self.rollback_txn(txn, guc);
-                return Err(error);
-            }
+            Ok::<(), SqlError>(())
+        })();
+        if let Err(error) = parameter_acl_staging {
+            self.rollback_txn(txn, guc);
+            return Err(error);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
@@ -7220,8 +7200,8 @@ impl Engine {
                 DdlUndo::DefaultAclChanged { slot, .. } => {
                     self.storage.commit_default_acl(*slot as usize, txn.txid);
                 }
-                DdlUndo::ParameterAclChanged { slot, .. } => {
-                    self.storage.commit_parameter_acl(*slot as usize, txn.txid);
+                DdlUndo::ParameterAclChanged { .. } => {
+                    self.storage.commit_parameter_acls(txn.txid);
                 }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
@@ -20166,7 +20146,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.restore_default_acl_pending(slot as usize, prior);
         }
         DdlUndo::ParameterAclChanged { slot, prior } => {
-            storage.restore_parameter_acl_pending(slot as usize, prior);
+            storage
+                .restore_parameter_acl_pending(slot as usize, prior)
+                .expect("transaction owns its parameter ACL undo");
         }
         DdlUndo::CommentSet { slot, prior } => {
             storage.restore_comment_pending(slot as usize, prior);
@@ -23454,40 +23436,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SetParameterAcl {
             parameter,
-            grantee,
-            grantor,
-            privileges,
-            grant_options,
+            expected,
+            image,
         } => {
             let parameter = crate::sql::ast::ParameterName::parse(parameter).ok_or_else(|| {
                 sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL parameter ACL name")
             })?;
-            let grantee = if grantee.eq_ignore_ascii_case("public") {
-                crate::storage::PUBLIC_ROLE
-            } else {
-                storage.find_role(grantee).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "journal configures unknown role \"{}\"",
-                        grantee
-                    )
-                })? as u16
-            };
-            let grantor = storage.find_role(grantor).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "journal configures unknown role \"{}\"",
-                    grantor
-                )
-            })? as u16;
-            storage.change_parameter_acl(
-                parameter,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
-                0,
-            )?;
+            storage.restore_parameter_acl_row(parameter, expected, image)?;
         }
         WalOp::SetObjectOwner {
             class,

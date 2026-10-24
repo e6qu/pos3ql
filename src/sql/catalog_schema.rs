@@ -136,6 +136,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("data", ColType::Bytea),
         ],
         (false, "pg_parameter_acl") => &[
+            ("oid", ColType::Oid),
             ("parname", ColType::Text),
             (
                 "paracl",

@@ -9,6 +9,7 @@ No defects currently meet this boundary. Repair reproducible admission,
 publication, cancellation and recovery failures in the change that finds them.
 Catalog visibility repairs must preserve both explicit catalog-query snapshots
 and current object resolution; neither boundary is a reason to defer the other.
+Permission row identity, rollback and durable replay are part of that repair.
 
 Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
 and [storage format guide](docs/durable-format.md). Keep regression evidence in

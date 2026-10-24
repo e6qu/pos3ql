@@ -10083,49 +10083,44 @@ fn pg_parameter_acl<'a>(
     use core::fmt::Write;
     let definition = schema::require("pg_parameter_acl", false);
     let rows = arena
-        .alloc_slice_with(storage.parameter_acl_entry_count(), |_| &[] as &[Datum])
+        .alloc_slice_with(storage.parameter_acl_row_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
-    for (slot, entry) in storage.parameter_acl_entries_visible(txid) {
+    for entry in storage.parameter_acl_rows_visible(txid) {
         let parameter = entry.parameter;
-        if storage
-            .parameter_acl_entries_visible(txid)
-            .take(slot)
-            .any(|(_, earlier)| earlier.parameter == parameter)
-        {
-            continue;
-        }
-        let value_capacity = storage
-            .parameter_acl_entries_visible(txid)
-            .filter(|(_, candidate)| candidate.parameter == parameter)
-            .count();
+        let image = storage
+            .snapshot_parameter_acl_row(parameter, txid, arena)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "parameter ACL row disappeared during catalog rendering"
+                )
+            })?;
         let values = arena
-            .alloc_slice_with(value_capacity, |_| Datum::Null)
+            .alloc_slice_with(image.grants().len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
         let mut count = 0usize;
-        for (candidate_slot, candidate) in storage.parameter_acl_entries_visible(txid) {
-            if candidate.parameter != parameter {
-                continue;
-            }
-            let (grantee, grantor) = storage.parameter_acl_identity(candidate_slot, txid);
-            if storage
-                .parameter_acl_entries_visible(txid)
-                .take(candidate_slot)
-                .any(|(earlier_slot, earlier)| {
-                    earlier.parameter == parameter
-                        && storage.parameter_acl_identity(earlier_slot, txid) == (grantee, grantor)
-                })
-            {
-                continue;
-            }
-            let (privileges, grant_options) =
-                storage.parameter_acl_from(parameter, grantee, grantor, txid);
-            if privileges.bits() == 0 {
-                continue;
-            }
-            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| storage.role_name(grantee as usize, txid));
-            let grantor_name = storage.role_name(grantor as usize, txid);
+        for grant in image.grants().iter() {
+            let privileges = grant.privileges();
+            let grant_options = grant.options();
+            let grantee_name = if grant.grantee() == 0 {
+                None
+            } else {
+                Some(
+                    storage
+                        .role_slot_by_oid(grant.grantee() as i32, txid)
+                        .map(|slot| storage.role_name(slot, txid))
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "parameter ACL grantee is missing")
+                        })?,
+                )
+            };
+            let grantor_name = storage
+                .role_slot_by_oid(grant.grantor() as i32, txid)
+                .map(|slot| storage.role_name(slot, txid))
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "parameter ACL grantor is missing")
+                })?;
             let grantee_name =
                 super::types::acl_identifier(grantee_name.as_ref().map_or("", SqlName::as_str));
             let grantor_name = super::types::acl_identifier(grantor_name.as_str());
@@ -10148,6 +10143,7 @@ fn pg_parameter_acl<'a>(
         }
         rows[row_count] = row(
             &[
+                Datum::Oid(entry.oid.get()),
                 text(parameter.as_str(), arena)?,
                 Datum::Array {
                     element: super::types::ArrElem::AclItem,

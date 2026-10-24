@@ -13,6 +13,12 @@ pub(crate) use catalog_history::{
     HistoricalCatalogRow,
 };
 mod catalog_sources;
+mod parameter_acls;
+use parameter_acls::ParameterAclGrantIdentity;
+use parameter_acls::ParameterAclRows;
+pub(crate) use parameter_acls::{
+    ParameterAclGrant, ParameterAclGrants, ParameterAclImage, ParameterAclOid, ParameterAclUndo,
+};
 mod database_clone_positions;
 pub(crate) use database_clone_positions::{
     DatabaseCloneAllocation, DatabaseCloneKind, DatabaseClonePositions, WalDatabaseClonePositions,
@@ -12095,6 +12101,8 @@ pub(crate) struct ParameterAclEntry {
     pub grant_options: crate::sql::ast::ParameterPrivileges,
     pub live: bool,
     pub pending: Option<PendingParameterAcl>,
+    identity: ParameterAclGrantIdentity,
+    order: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12104,6 +12112,8 @@ pub(crate) struct PendingParameterAcl {
     pub grantor: u16,
     pub privileges: crate::sql::ast::ParameterPrivileges,
     pub grant_options: crate::sql::ast::ParameterPrivileges,
+    identity: ParameterAclGrantIdentity,
+    order: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12200,6 +12210,7 @@ struct AclCatalog {
     columns: FixedVec<ColumnAclEntry>,
     defaults: FixedVec<DefaultAclEntry>,
     parameters: FixedVec<ParameterAclEntry>,
+    parameter_rows: ParameterAclRows,
 }
 
 struct ObjectAclIter<'a> {
@@ -18299,6 +18310,7 @@ impl Storage {
             + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
             + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
             + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
+            + ParameterAclRows::budget_bytes(config)
             + config.max_sequences * (size_of::<SequenceDef>() + size_of::<SequenceValues>())
             + config.max_domains * size_of::<DomainDef>()
             + config.max_enums * size_of::<EnumDef>()
@@ -19279,6 +19291,7 @@ impl Storage {
                 columns: column_acl_entries,
                 defaults: default_acl_entries,
                 parameters: parameter_acl_entries,
+                parameter_rows: ParameterAclRows::new(config, budget, catalog_origin)?,
             }),
             comments: Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
@@ -24996,82 +25009,6 @@ impl Storage {
         }
     }
 
-    pub(crate) fn change_parameter_acl(
-        &self,
-        parameter: crate::sql::ast::ParameterName,
-        grantee: u16,
-        grantor: u16,
-        privileges: crate::sql::ast::ParameterPrivileges,
-        grant_options: crate::sql::ast::ParameterPrivileges,
-        txid: u32,
-    ) -> Result<(usize, Option<PendingParameterAcl>), SqlError> {
-        if grantee != PUBLIC_ROLE {
-            self.role_reference_ready(usize::from(grantee), txid)?;
-        }
-        self.role_reference_ready(usize::from(grantor), txid)?;
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let slot = catalog
-            .parameters
-            .iter()
-            .position(|entry| {
-                let (_, visible_grantee, visible_grantor, _, _) =
-                    Self::parameter_acl_visible(entry, txid);
-                entry.parameter == parameter
-                    && visible_grantee == grantee
-                    && visible_grantor == grantor
-                    && (entry.live || entry.pending.is_some())
-            })
-            .or_else(|| {
-                catalog.parameters.iter().position(|entry| {
-                    entry.parameter.is_empty() && !entry.live && entry.pending.is_none()
-                })
-            })
-            .unwrap_or(catalog.parameters.len());
-        if slot == catalog.parameters.len() {
-            catalog
-                .parameters
-                .push(ParameterAclEntry {
-                    parameter,
-                    grantee,
-                    grantor,
-                    privileges: crate::sql::ast::ParameterPrivileges::NONE,
-                    grant_options: crate::sql::ast::ParameterPrivileges::NONE,
-                    live: false,
-                    pending: None,
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many parameter privilege entries (limit {})",
-                        catalog.parameters.capacity()
-                    )
-                })?;
-        } else if catalog.parameters[slot].parameter.is_empty() {
-            catalog.parameters[slot].parameter = parameter;
-            catalog.parameters[slot].grantee = grantee;
-            catalog.parameters[slot].grantor = grantor;
-        }
-        let entry = &mut catalog.parameters[slot];
-        let prior = entry.pending;
-        if txid == 0 {
-            entry.grantee = grantee;
-            entry.grantor = grantor;
-            entry.privileges = privileges;
-            entry.grant_options = grant_options;
-            entry.live = privileges.bits() != 0;
-            entry.pending = None;
-        } else {
-            entry.pending = Some(PendingParameterAcl {
-                txid,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
-            });
-        }
-        Ok((slot, prior))
-    }
-
     pub(crate) fn parameter_acl_from(
         &self,
         parameter: crate::sql::ast::ParameterName,
@@ -25083,6 +25020,15 @@ impl Storage {
         crate::sql::ast::ParameterPrivileges,
     ) {
         let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if catalog.parameter_rows.oid_to(parameter, txid).is_none()
+            && grantee == BOOTSTRAP_ROLE
+            && grantor == BOOTSTRAP_ROLE
+        {
+            return (
+                crate::sql::ast::ParameterPrivileges::ALL,
+                crate::sql::ast::ParameterPrivileges::NONE,
+            );
+        }
         catalog
             .parameters
             .iter()
@@ -25281,40 +25227,6 @@ impl Storage {
             catalog: &self.acl_catalog,
             next_slot: 0,
             mode: ParameterAclIterMode::Checkpoint,
-        }
-    }
-
-    pub(crate) fn commit_parameter_acl(&self, slot: usize, txid: u32) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let Some(pending) = catalog.parameters[slot].pending else {
-            return;
-        };
-        if pending.txid != txid {
-            return;
-        }
-        let entry = &mut catalog.parameters[slot];
-        entry.grantee = pending.grantee;
-        entry.grantor = pending.grantor;
-        entry.privileges = pending.privileges;
-        entry.grant_options = pending.grant_options;
-        entry.live = pending.privileges.bits() != 0;
-        entry.pending = None;
-        if !entry.live {
-            entry.parameter = crate::sql::ast::ParameterName::EMPTY;
-            entry.privileges = crate::sql::ast::ParameterPrivileges::NONE;
-            entry.grant_options = crate::sql::ast::ParameterPrivileges::NONE;
-        }
-    }
-
-    pub(crate) fn restore_parameter_acl_pending(
-        &self,
-        slot: usize,
-        prior: Option<PendingParameterAcl>,
-    ) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        catalog.parameters[slot].pending = prior;
-        if !catalog.parameters[slot].live && prior.is_none() {
-            catalog.parameters[slot].parameter = crate::sql::ast::ParameterName::EMPTY;
         }
     }
 
@@ -57853,7 +57765,7 @@ mod tests {
         config.max_acl_entries = 3 + WORKERS;
         config.max_column_acl_entries = WORKERS;
         config.max_default_acl_entries = WORKERS;
-        config.max_parameter_acl_entries = WORKERS;
+        config.max_parameter_acl_entries = 2 * WORKERS;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let grantees = ["acl_a", "acl_b", "acl_c", "acl_d", "acl_e"].map(|name| {
@@ -57924,7 +57836,7 @@ mod tests {
 
                     let parameter = crate::sql::ast::ParameterName::parse(parameter)
                         .expect("parameter name fits");
-                    let (parameter_slot, _) = storage
+                    let _ = storage
                         .change_parameter_acl(
                             parameter,
                             grantee,
@@ -57934,7 +57846,7 @@ mod tests {
                             txid,
                         )
                         .unwrap();
-                    storage.commit_parameter_acl(parameter_slot, txid);
+                    storage.commit_parameter_acls(txid);
                 });
             }
         });
@@ -57946,7 +57858,7 @@ mod tests {
         assert_eq!(catalog.objects.capacity(), 3 + WORKERS);
         assert_eq!(catalog.columns.capacity(), WORKERS);
         assert_eq!(catalog.defaults.capacity(), WORKERS);
-        assert_eq!(catalog.parameters.capacity(), WORKERS);
+        assert_eq!(catalog.parameters.capacity(), 2 * WORKERS);
         drop(catalog);
 
         let mut seen = 0;
@@ -57957,7 +57869,8 @@ mod tests {
         assert_eq!(seen, WORKERS);
         assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
-        assert_eq!(storage.checkpoint_parameter_acls().count(), WORKERS);
+        assert_eq!(storage.checkpoint_parameter_acls().count(), 2 * WORKERS);
+        assert_eq!(storage.parameter_acl_rows_visible(0).count(), WORKERS);
         assert_eq!(
             storage
                 .change_parameter_acl(
@@ -57966,7 +57879,7 @@ mod tests {
                     BOOTSTRAP_ROLE,
                     crate::sql::ast::ParameterPrivileges::SET,
                     crate::sql::ast::ParameterPrivileges::NONE,
-                    0,
+                    (WORKERS + 1) as u32,
                 )
                 .unwrap_err()
                 .sqlstate,

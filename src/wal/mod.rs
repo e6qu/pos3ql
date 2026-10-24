@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 7;
+pub(crate) const RECORD_VERSION: u8 = 8;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1784,10 +1784,8 @@ pub(crate) enum WalOp<'a> {
     },
     SetParameterAcl {
         parameter: &'a str,
-        grantee: &'a str,
-        grantor: &'a str,
-        privileges: crate::sql::ast::ParameterPrivileges,
-        grant_options: crate::sql::ast::ParameterPrivileges,
+        expected: Option<crate::storage::ParameterAclOid>,
+        image: Option<crate::storage::ParameterAclImage<'a>>,
     },
 }
 
@@ -4015,11 +4013,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
         WalOp::SetParameterAcl {
-            parameter,
-            grantee,
-            grantor,
-            ..
-        } => 1 + parameter.len() + 1 + grantee.len() + 1 + grantor.len() + 2,
+            parameter, image, ..
+        } => {
+            1 + parameter.len() + 4 + 1 + image.map_or(0, |image| 8 + image.grants().encoded_len())
+        }
     }
 }
 
@@ -6316,15 +6313,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::SetParameterAcl {
             parameter,
-            grantee,
-            grantor,
-            privileges,
-            grant_options,
+            expected,
+            image,
         } => {
-            name_bytes(buffer, parameter)
-                && name_bytes(buffer, grantee)
-                && name_bytes(buffer, grantor)
-                && buffer.append(&[privileges.bits(), grant_options.bits()])
+            let mut ok = name_bytes(buffer, parameter)
+                && buffer.append(&expected.map_or(0, |oid| oid.get()).to_le_bytes())
+                && buffer.append(&[u8::from(image.is_some())]);
+            if let Some(image) = image {
+                let Ok(count) = u32::try_from(image.grants().len()) else {
+                    return false;
+                };
+                ok &= buffer.append(&image.oid().get().to_le_bytes())
+                    && buffer.append(&count.to_le_bytes());
+                for grant in image.grants().iter() {
+                    ok &= buffer.append(&grant.encode());
+                }
+            }
+            ok
         }
         WalOp::Analyze {
             schema,
@@ -11463,21 +11468,38 @@ fn decode_op_inner<'a>(
         KIND_SET_PARAMETER_ACL => decode_large_op(|| {
             let parameter = take_name(&mut at)?;
             crate::sql::ast::ParameterName::parse(parameter)?;
-            let grantee = take_name(&mut at)?;
-            let grantor = take_name(&mut at)?;
-            let privileges = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
+            let expected = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let expected = if expected == 0 {
+                None
+            } else {
+                Some(crate::storage::ParameterAclOid::parse(expected)?)
+            };
+            let present = *payload.get(at)?;
             at += 1;
-            let grant_options = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
-            at += 1;
-            if !privileges.contains(grant_options) {
-                return None;
-            }
+            let image = match present {
+                0 => None,
+                1 => {
+                    let oid = crate::storage::ParameterAclOid::parse(u32::from_le_bytes(
+                        payload.get(at..at + 4)?.try_into().ok()?,
+                    ))?;
+                    at += 4;
+                    let count =
+                        u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                    at += 4;
+                    let end = count
+                        .checked_mul(crate::storage::ParameterAclGrant::BYTES)?
+                        .checked_add(at)?;
+                    let grants = crate::storage::ParameterAclGrants::parse(payload.get(at..end)?)?;
+                    at = end;
+                    Some(crate::storage::ParameterAclImage::new(oid, grants)?)
+                }
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::SetParameterAcl {
                 parameter,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
+                expected,
+                image,
             })
         }),
         _ => None,
@@ -13617,26 +13639,32 @@ mod tests {
 
     #[test]
     fn parameter_acl_codec_is_typed_and_strict() {
+        use crate::storage::{
+            ParameterAclGrant, ParameterAclGrants, ParameterAclImage, ParameterAclOid,
+        };
+        let oid = ParameterAclOid::parse(17001).unwrap();
+        let grants = [ParameterAclGrant::parse(17002, 10, 3, 1).unwrap()];
         let operation = WalOp::SetParameterAcl {
             parameter: "event_triggers",
-            grantee: "reader",
-            grantor: "postgres",
-            privileges: crate::sql::ast::ParameterPrivileges::ALL,
-            grant_options: crate::sql::ast::ParameterPrivileges::SET,
+            expected: None,
+            image: Some(
+                ParameterAclImage::new(oid, ParameterAclGrants::from_slice(&grants)).unwrap(),
+            ),
         };
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
-        assert!(matches!(
-            decode_op(KIND_SET_PARAMETER_ACL, payload),
-            Some(WalOp::SetParameterAcl {
-                parameter: "event_triggers",
-                grantee: "reader",
-                grantor: "postgres",
-                privileges,
-                grant_options,
-            }) if privileges == crate::sql::ast::ParameterPrivileges::ALL
-                && grant_options == crate::sql::ast::ParameterPrivileges::SET
-        ));
+        let Some(WalOp::SetParameterAcl {
+            parameter,
+            expected,
+            image: Some(image),
+        }) = decode_op(KIND_SET_PARAMETER_ACL, payload)
+        else {
+            panic!("parameter ACL row did not round trip");
+        };
+        assert_eq!(parameter, "event_triggers");
+        assert_eq!(expected, None);
+        assert_eq!(image.oid(), oid);
+        assert_eq!(image.grants().iter().next(), Some(grants[0]));
 
         let mut invalid = [0; 4096];
         invalid[..payload.len()].copy_from_slice(payload);

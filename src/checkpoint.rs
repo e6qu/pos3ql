@@ -172,7 +172,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v21";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v22";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -1254,6 +1254,7 @@ pub(crate) struct Checkpointer {
     blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
+    parameter_acl_arena: Arena,
     /// Spill-list updates computed during a checkpoint, applied to storage
     /// only after the manifest CAS lands.
     pending_installs: Vec<(usize, SlotInstall)>,
@@ -1524,6 +1525,7 @@ impl Checkpointer {
             + Self::credential_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
+            + Storage::parameter_acl_image_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
             + ExternalRunReader::budget_bytes()
             + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
@@ -2243,6 +2245,12 @@ impl Checkpointer {
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
+            parameter_acl_arena: Arena::new(
+                budget,
+                "checkpoint parameter ACL row",
+                Storage::parameter_acl_image_budget_bytes(config),
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             pending_installs: Vec::with_capacity(
                 table_capacity.saturating_mul(config.max_spill_generations_per_table),
             ),
@@ -5168,46 +5176,31 @@ impl Checkpointer {
                 }
                 Some("pacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
-                    };
-                    let parameter = decode(words.next(), "pacl parameter missing")?;
+                    let oid: u32 = parse_field(words.next(), "pacl oid")?;
+                    let oid = crate::storage::ParameterAclOid::parse(oid)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl oid"))?;
+                    let parameter = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("pacl parameter missing"))?,
+                    )?;
                     let parameter = crate::sql::ast::ParameterName::parse(&parameter)
                         .ok_or(CheckpointSetupError::Corrupt("invalid pacl parameter"))?;
-                    let grantee = decode(words.next(), "pacl grantee missing")?;
-                    let grantor = decode(words.next(), "pacl grantor missing")?;
-                    let privileges: u8 = parse_field(words.next(), "pacl privileges")?;
-                    let grant_options: u8 = parse_field(words.next(), "pacl grant options")?;
-                    let privileges = crate::sql::ast::ParameterPrivileges::from_bits(privileges)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl privileges"))?;
-                    let grant_options =
-                        crate::sql::ast::ParameterPrivileges::from_bits(grant_options)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid pacl grant options"))?;
-                    if words.next().is_some() || !privileges.contains(grant_options) {
+                    let bytes = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("pacl grants missing"))?,
+                    )?;
+                    let grants = crate::storage::ParameterAclGrants::parse(&bytes)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl grants"))?;
+                    let image = crate::storage::ParameterAclImage::new(oid, grants).ok_or(
+                        CheckpointSetupError::Corrupt("pacl row contains implicit defaults"),
+                    )?;
+                    if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid pacl record"));
                     }
-                    let grantee = if grantee == "PUBLIC" {
-                        crate::storage::PUBLIC_ROLE
-                    } else {
-                        storage
-                            .find_role(&grantee)
-                            .ok_or(CheckpointSetupError::Corrupt("pacl grantee does not exist"))?
-                            as u16
-                    };
-                    let grantor = storage
-                        .find_role(&grantor)
-                        .ok_or(CheckpointSetupError::Corrupt("pacl grantor does not exist"))?
-                        as u16;
                     storage
-                        .change_parameter_acl(
-                            parameter,
-                            grantee,
-                            grantor,
-                            privileges,
-                            grant_options,
-                            0,
-                        )
+                        .restore_parameter_acl_row(parameter, None, Some(image))
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest parameter ACL rejected: {}",
@@ -12459,35 +12452,37 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, acl) in storage.checkpoint_parameter_acls() {
-            use core::fmt::Write;
-            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
-                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
-            } else {
-                storage.role(acl.grantee as usize).name
-            };
-            let grantor = storage.role(acl.grantor as usize).name;
-            let mut parameter_hex = StackStr::<130>::new();
-            let mut grantee_hex = StackStr::<130>::new();
-            let mut grantor_hex = StackStr::<130>::new();
-            for byte in acl.parameter.as_str().as_bytes() {
-                let _ = write!(parameter_hex, "{byte:02x}");
-            }
-            for byte in grantee.as_str().as_bytes() {
-                let _ = write!(grantee_hex, "{byte:02x}");
-            }
-            for byte in grantor.as_str().as_bytes() {
-                let _ = write!(grantor_hex, "{byte:02x}");
+        for row in storage.parameter_acl_rows_visible(0) {
+            self.parameter_acl_arena.reset();
+            let image = storage
+                .snapshot_parameter_acl_row(row.parameter, 0, &self.parameter_acl_arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "checkpoint parameter ACL row disappeared"
+                    )
+                })?;
+            struct GrantsHex<'a>(crate::storage::ParameterAclGrants<'a>);
+            impl core::fmt::Display for GrantsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    if self.0.is_empty() {
+                        return out.write_str("-");
+                    }
+                    for grant in self.0.iter() {
+                        for byte in grant.encode() {
+                            write!(out, "{byte:02x}")?;
+                        }
+                    }
+                    Ok(())
+                }
             }
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "pacl {} {} {} {} {}",
-                    parameter_hex.as_str(),
-                    grantee_hex.as_str(),
-                    grantor_hex.as_str(),
-                    acl.privileges.bits(),
-                    acl.grant_options.bits()
+                    "pacl {} {} {}",
+                    image.oid().get(),
+                    manifest_hex::<130>(row.parameter.as_str()),
+                    GrantsHex(image.grants())
                 ),
             )?;
         }
@@ -16733,20 +16728,30 @@ fn rest_of(line: &str, skip: usize) -> Result<&str, CheckpointSetupError> {
 /// Decodes a hex-encoded identifier from the manifest (startup only, so the
 /// allocation is fine).
 fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
+    String::from_utf8(decode_manifest_hex_bytes(hex)?)
+        .map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+}
+
+fn decode_manifest_hex_bytes(hex: &str) -> Result<Vec<u8>, CheckpointSetupError> {
     if hex == "-" {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     if !hex.len().is_multiple_of(2) {
-        return Err(CheckpointSetupError::Corrupt("odd-length hex name"));
+        return Err(CheckpointSetupError::Corrupt("odd-length hex bytes"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in 0..hex.len() / 2 {
-        bytes.push(
-            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| CheckpointSetupError::Corrupt("bad hex name"))?,
-        );
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let high = digit(pair[0]).ok_or(CheckpointSetupError::Corrupt("bad hex bytes"))?;
+        let low = digit(pair[1]).ok_or(CheckpointSetupError::Corrupt("bad hex bytes"))?;
+        bytes.push((high << 4) | low);
     }
-    String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+    Ok(bytes)
 }
 
 fn decode_optional_hex_name(value: &str) -> Result<Option<String>, CheckpointSetupError> {
@@ -19393,7 +19398,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v22\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19797,7 +19802,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v22\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19823,7 +19828,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v22\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19832,7 +19837,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v22\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -19998,7 +20003,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v19",
                 "pos3ql-manifest-v20",
                 "pos3ql-manifest-v22",
-                "pos3ql-manifest-v21 trailing",
+                "pos3ql-manifest-v22 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20080,11 +20085,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v22\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v22\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20321,7 +20326,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v22\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

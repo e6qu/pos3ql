@@ -46,6 +46,21 @@ def transcript(reader, writer):
         prefix = isolation.lower().replace(" ", "_")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:
+            record(reader, f"{prefix}.own_create.before", "SELECT count(*) FROM pg_class WHERE relname='catalog_own_create_diff'")
+            reader.execute("CREATE TABLE catalog_own_create_diff(id integer)")
+            record(reader, f"{prefix}.own_create.catalog", "SELECT count(*) FROM pg_class WHERE relname='catalog_own_create_diff'")
+            reader.execute("COMMENT ON TABLE catalog_own_create_diff IS 'own created comment'")
+            record(reader, f"{prefix}.own_create.comment", "SELECT obj_description('catalog_own_create_diff'::regclass, 'pg_class')")
+            reader.execute("INSERT INTO catalog_own_create_diff VALUES(1)")
+            record(reader, f"{prefix}.own_create.rows", "SELECT count(*) FROM catalog_own_create_diff")
+            reader.execute("ROLLBACK")
+            record(reader, f"{prefix}.own_create.rolled_back", "SELECT count(*) FROM pg_class WHERE relname='catalog_own_create_diff'")
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("DROP TABLE IF EXISTS catalog_own_create_diff")
+
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        try:
             record(reader, f"{prefix}.create.before", "SELECT count(*) FROM pg_class WHERE relname = 'catalog_new_diff'")
             writer.execute("BEGIN")
             writer.execute("CREATE TABLE catalog_new_diff(id integer PRIMARY KEY, note text)")

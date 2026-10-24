@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn table_definition_sources_reject_stale_versions_without_touching_other_tables() {
-        let (mut storage, table, other) = fixture();
+        let (storage, table, other) = fixture();
         crate::mem::guard::forbid_alloc(|| {
             let (original_target, mut first) = storage.select_table_definition(table, 7);
             let (other_target, mut other_definition) = storage.select_table_definition(other, 7);

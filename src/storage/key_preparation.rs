@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn key_preparation_old_row_layout_is_rejected_before_key_decoding() {
-        let (mut storage, table) = fixture(4);
+        let (storage, table) = fixture(4);
         crate::mem::guard::forbid_alloc(|| {
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             let selected = storage

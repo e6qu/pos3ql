@@ -382,6 +382,24 @@ impl Storage {
     }
 
 
+    pub(super) fn promote_private_index_bindings_locked(
+        &self,
+        indexes: &mut [IndexDef],
+        source: CatalogObjectIdentity,
+        state: &table_definitions::DefinitionState,
+        transaction: u32,
+    ) {
+        for index in indexes.iter_mut().filter(|index| {
+            index.database == state.identity.database
+                && index.ddl_state == (CatalogDdlState::PendingCreate { txid: transaction })
+                && index.table_binding.is_some_and(|binding| binding.source == source)
+        }) {
+            let mut promoted = self.project_index_binding_locked(*index, state, transaction)
+                .expect("private index retains its table lifetime through commit");
+            promoted.table_binding.as_mut().expect("projected binding exists").revision = 0;
+            *index = promoted;
+        }
+    }
 }
 
 #[cfg(test)]

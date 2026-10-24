@@ -176,6 +176,8 @@ mod tests {
         config.max_tables = 2;
         config.table_rows = 2;
         config.txn_rows = 2;
+        // This row-publication fixture does not stage catalog edits.
+        config.max_ddl_per_transaction = 1;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let reset = storage.shared_statistics_reset_times();

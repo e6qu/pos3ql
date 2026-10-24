@@ -423,6 +423,29 @@ def transcript(reader, writer):
             for role in order_roles:
                 writer.execute(f"DROP ROLE {role}")
 
+        writer.execute("CREATE DOMAIN catalog_metadata_domain_diff AS varchar(5) NOT NULL")
+        writer.execute("CREATE TYPE catalog_metadata_enum_diff AS ENUM ('ready','done')")
+        try:
+            writer.execute("""CREATE TABLE catalog_metadata_columns_diff(
+                id bigint GENERATED ALWAYS AS IDENTITY (START WITH 5 INCREMENT BY 2),
+                short_text varchar(7), unlimited_text text, fixed_text char(3),
+                fixed_bits bit(6), variable_bits varbit(8),
+                amount numeric(12,2), unlimited_numeric numeric,
+                day date, clock time, moment timestamptz(3), span interval day to second(2),
+                domain_value catalog_metadata_domain_diff,
+                enum_value catalog_metadata_enum_diff,
+                default_value integer DEFAULT 42,
+                generated_value bigint GENERATED ALWAYS AS (id + 1) STORED
+            )""")
+            record(writer, f"{prefix}.metadata.full_columns", "SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff' ORDER BY ordinal_position")
+            record(writer, f"{prefix}.metadata.full_table", "SELECT * FROM information_schema.tables WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff'")
+            record(writer, f"{prefix}.metadata.hidden_catalog_columns", "SELECT attname FROM pg_attribute WHERE attrelid='pg_namespace'::regclass AND attnum>0 ORDER BY attnum")
+            record(writer, f"{prefix}.metadata.catalog_tableoids", "SELECT tableoid='pg_namespace'::regclass FROM pg_namespace WHERE nspname='public'")
+        finally:
+            writer.execute("DROP TABLE IF EXISTS catalog_metadata_columns_diff")
+            writer.execute("DROP DOMAIN catalog_metadata_domain_diff")
+            writer.execute("DROP TYPE catalog_metadata_enum_diff")
+
         writer.execute("CREATE ROLE catalog_parameter_reader_diff")
         writer.execute("CREATE ROLE catalog_parameter_writer_diff")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
@@ -507,6 +530,15 @@ def main():
                      WHERE n.nspname IN ('pg_catalog', 'information_schema')
                        AND c.relkind = 'v'
                      ORDER BY n.nspname, c.relname
+                """).fetchall(),
+                "catalog_columns": reader.execute("""
+                    SELECT n.nspname, c.relname, a.attnum, a.attname,
+                           a.atttypid, format_type(a.atttypid, NULL), a.atttypmod
+                      FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+                      JOIN pg_namespace n ON n.oid=c.relnamespace
+                     WHERE n.nspname IN ('pg_catalog','information_schema')
+                       AND c.relkind IN ('r','v') AND a.attnum>0 AND NOT a.attisdropped
+                     ORDER BY n.nspname,c.relname,a.attnum
                 """).fetchall(),
             }
             arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")

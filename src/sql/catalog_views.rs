@@ -13,15 +13,21 @@ pub(super) enum Read {
 }
 
 #[derive(Clone, Copy)]
-enum Base {
+pub(super) enum Base {
     Class,
     Namespace,
     Tablespace,
     RoleSettings,
+    Type,
+    Attribute,
+    Defaults,
+    Collation,
+    Dependencies,
+    Sequence,
 }
 
 impl Read {
-    fn base<'a>(
+    pub(super) fn base<'a>(
         self,
         storage: &Storage,
         base: Base,
@@ -33,6 +39,12 @@ impl Read {
             Base::Namespace => "pg_namespace",
             Base::Tablespace => "pg_tablespace",
             Base::RoleSettings => "pg_db_role_setting",
+            Base::Type => "pg_type",
+            Base::Attribute => "pg_attribute",
+            Base::Defaults => "pg_attrdef",
+            Base::Collation => "pg_collation",
+            Base::Dependencies => "pg_depend",
+            Base::Sequence => "pg_sequence",
         };
         match self {
             Self::Statement => super::synthesize(
@@ -72,7 +84,7 @@ impl Read {
     }
 }
 
-fn columns<const N: usize>(table: &SynthTable<'_>, names: [&str; N]) -> [usize; N] {
+pub(super) fn columns<const N: usize>(table: &SynthTable<'_>, names: [&str; N]) -> [usize; N] {
     names.map(|name| {
         table
             .def
@@ -154,13 +166,13 @@ pub(super) fn tables<'a>(
     let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
     let mut at = 0;
     for class in selected() {
-        let Datum::Int4(owner_oid) = class[owner] else {
+        let Datum::Oid(owner_oid) = class[owner] else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_ERROR,
                 "invalid pg_class owner identifier"
             ));
         };
-        let owner_name = Datum::Text(super::user_name_by_oid(&catalog, owner_oid, arena)?);
+        let owner_name = Datum::Text(super::user_name_by_oid(&catalog, owner_oid as i32, arena)?);
         for namespace in left_rows(namespaces.rows, move |row| {
             row[namespace_oid] == class[namespace]
         }) {
@@ -228,7 +240,7 @@ pub(super) fn roles<'a>(
     let mut count = 0usize;
     for role in roles.rows.iter().copied() {
         let joined = left_rows(settings.rows, move |row| {
-            row[setting_role] == role[oid] && row[setting_database] == Datum::Int4(0)
+            row[setting_role] == role[oid] && row[setting_database] == Datum::Oid(0)
         })
         .count();
         count = count.checked_add(joined).ok_or_else(arena_full)?;
@@ -238,7 +250,7 @@ pub(super) fn roles<'a>(
     let mut at = 0;
     for role in roles.rows.iter().copied() {
         for setting in left_rows(settings.rows, move |row| {
-            row[setting_role] == role[oid] && row[setting_database] == Datum::Int4(0)
+            row[setting_role] == role[oid] && row[setting_database] == Datum::Oid(0)
         }) {
             output[at] = row(
                 &[

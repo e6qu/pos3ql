@@ -28,6 +28,9 @@ mod schema;
 #[path = "catalog_views.rs"]
 mod views;
 
+#[path = "catalog_information.rs"]
+mod information;
+
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
@@ -8972,13 +8975,12 @@ pub(crate) fn synthesize_definition<'a>(
         )
     })?;
     let hidden = schema::hidden_columns(name, information_schema);
-    let definition = arena
-        .alloc(materialize_with_hidden(specification, hidden)?)
-        .map_err(|_| arena_full())?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
+    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
     Ok(SynthTable {
         def: definition,
         rows: &[],
-        hidden_columns: hidden.len(),
+        hidden_columns,
     })
 }
 
@@ -8992,6 +8994,15 @@ pub(crate) fn synthesize<'a>(
     scan: super::catalog_snapshot::CatalogScan,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    if qualifier == Some("information_schema") {
+        match name {
+            "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
+            "columns" => {
+                return information::columns_view(storage, txid, views::Read::Statement, arena);
+            }
+            _ => {}
+        }
+    }
     if qualifier != Some("information_schema") {
         match name {
             "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
@@ -9331,8 +9342,8 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_rules") => pg_rules(storage, txid, arena),
         (false, "pg_timezone_abbrevs") => pg_timezone_abbrevs(arena),
         (false, "pg_timezone_names") => pg_timezone_names(arena),
-        (true, "tables") => info_tables(storage, txid, arena),
-        (true, "columns") => info_columns(storage, txid, arena),
+        (true, "tables") => information::tables(storage, txid, views::Read::Current, arena),
+        (true, "columns") => information::columns_view(storage, txid, views::Read::Current, arena),
         (true, "column_options") => info_column_options(storage, txid, arena),
         (true, "foreign_data_wrapper_options") => {
             info_foreign_data_wrapper_options(storage, txid, arena)
@@ -10281,7 +10292,7 @@ fn pg_default_acl<'a>(
         if !defined
             || storage
                 .default_acl_entries()
-                .take(entry_slot)
+                .take_while(|(slot, _)| *slot < entry_slot)
                 .any(|(_, earlier)| {
                     let (earlier_defined, _, _) = storage.default_acl_state(
                         earlier.owner,
@@ -10339,8 +10350,8 @@ fn pg_default_acl<'a>(
             let mut rendered = StackStr::<256>::new();
             let _ = write!(rendered, "{}=", grantee_name.as_str());
             for (privilege, letter) in [
-                (PrivilegeSet::SELECT, 'r'),
                 (PrivilegeSet::INSERT, 'a'),
+                (PrivilegeSet::SELECT, 'r'),
                 (PrivilegeSet::UPDATE, 'w'),
                 (PrivilegeSet::DELETE, 'd'),
                 (PrivilegeSet::TRUNCATE, 'D'),
@@ -16109,16 +16120,26 @@ pub fn index_def_text<'a>(
 struct SynthDef<'a> {
     name: &'a str,
     columns: &'a [(&'a str, ColType)],
+    relation: Option<core::num::NonZeroU32>,
 }
 
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
         name: SqlName::parse(specification.name).expect("catalog name fits"),
         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
-        n_columns: specification.columns.len(),
+        n_columns: specification
+            .columns
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+            .count(),
         ..TableDef::empty()
     };
-    for (index, (name, column_type)) in specification.columns.iter().enumerate() {
+    for (index, (name, column_type)) in specification
+        .columns
+        .iter()
+        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+        .enumerate()
+    {
         definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
         definition.columns[index].ctype = *column_type;
         definition.columns[index].collation = if column_type.is_collatable() {
@@ -16136,15 +16157,7 @@ fn finish<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = arena
-        .alloc(materialize_def(specification))
-        .map_err(|_| arena_full())?;
-    let rows = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
-    Ok(SynthTable {
-        def,
-        rows: &*rows,
-        hidden_columns: 0,
-    })
+    finish_with_hidden(specification, &[], rows, arena)
 }
 
 /// Materializes an exact visible relation shape plus addressable PostgreSQL
@@ -16153,18 +16166,55 @@ fn finish<'a>(
 fn materialize_with_hidden(
     specification: SynthDef<'_>,
     hidden: &[(&str, ColType)],
-) -> Result<TableDef, SqlError> {
-    if specification.columns.len() + hidden.len() > MAX_COLUMNS {
+) -> Result<(TableDef, usize), SqlError> {
+    let visible = specification
+        .columns
+        .iter()
+        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+        .count();
+    let system = usize::from(specification.relation.is_some())
+        + hidden
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+            .count();
+    if visible + system > MAX_COLUMNS {
         return Err(catalog_capacity_exceeded(specification.name));
     }
     let mut definition = materialize_def(specification);
-    for (index, (name, column_type)) in hidden.iter().enumerate() {
-        let column = &mut definition.columns[definition.n_columns + index];
+    let mut count = 0;
+    if specification.relation.is_some() {
+        let column = &mut definition.columns[definition.n_columns];
+        column.name = SqlName::parse("tableoid").expect("system-column name fits");
+        column.ctype = ColType::Oid;
+        column.collation = crate::sql::ast::Collation::None;
+        count += 1;
+    }
+    for (name, column_type) in hidden {
+        if specification.relation.is_some() && *name == "tableoid" {
+            if *column_type != ColType::Oid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog tableoid must have type oid"
+                ));
+            }
+            continue;
+        }
+        if definition.columns[..definition.n_columns + count]
+            .iter()
+            .any(|column| column.name.as_str() == *name)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "duplicate catalog system-column name"
+            ));
+        }
+        let column = &mut definition.columns[definition.n_columns + count];
         column.name = SqlName::parse(name).expect("catalog system-column name fits");
         column.ctype = *column_type;
         column.collation = crate::sql::ast::Collation::None;
+        count += 1;
     }
-    Ok(definition)
+    Ok((definition, count))
 }
 
 fn finish_with_hidden<'a>(
@@ -16173,32 +16223,60 @@ fn finish_with_hidden<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = arena
-        .alloc(materialize_with_hidden(specification, hidden)?)
-        .map_err(|_| arena_full())?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
+    let def = arena.alloc(definition).map_err(|_| arena_full())?;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    let width = def.n_columns + hidden.len();
+    let width = def.n_columns + hidden_columns;
     for (target, source) in typed.iter_mut().zip(rows) {
-        if source.len() != width {
+        if source.len() != specification.columns.len() + hidden.len() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid catalog row width"
             ));
         }
         let mut values = [Datum::Null; MAX_COLUMNS];
-        for (index, value) in source.iter().copied().enumerate() {
+        for ((name, column_type), value) in specification
+            .columns
+            .iter()
+            .chain(hidden)
+            .zip(source.iter().copied())
+        {
             // Tagged derived rows must carry the advertised representation,
             // notably oid rather than int4, before hashing or wire encoding.
-            values[index] = super::eval::cast_to(value, def.columns[index].ctype, arena)?;
+            let value = super::eval::cast_to(value, *column_type, arena)?;
+            if *name == "tableoid"
+                && let Some(relation) = specification.relation
+            {
+                if value != Datum::Oid(relation.get()) {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "catalog {} row has an incorrect tableoid",
+                        specification.name
+                    ));
+                }
+            }
+            let index = def.columns[..width]
+                .iter()
+                .position(|column| column.name.as_str() == *name)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "catalog source field has no declared destination"
+                    )
+                })?;
+            values[index] = value;
+        }
+        if let Some(relation) = specification.relation {
+            values[def.n_columns] = Datum::Oid(relation.get());
         }
         *target = row(&values[..width], arena)?;
     }
     Ok(SynthTable {
         def,
         rows: typed,
-        hidden_columns: hidden.len(),
+        hidden_columns,
     })
 }
 
@@ -31148,82 +31226,6 @@ fn info_user_mapping_options<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn info_tables<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("tables", true);
-    let visible_tables = (0..storage.table_count())
-        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
-        .count();
-    let out = catalog_rows(
-        arena,
-        visible_tables + storage.views_visible_to(txid).count(),
-    )?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        if n == out.len() {
-            return Err(catalog_capacity_exceeded("information_schema.tables"));
-        }
-        out[n] = row(
-            &[
-                text("postgres", arena)?,
-                text(
-                    arena
-                        .alloc_str(table.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(table.name.as_str(), arena)?,
-                text(
-                    if table.kind == crate::storage::TableKind::Foreign {
-                        "FOREIGN"
-                    } else {
-                        "BASE TABLE"
-                    },
-                    arena,
-                )?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    for (_, view) in storage.views_visible_to(txid) {
-        if n == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "information_schema.tables exceeds static capacity"
-            ));
-        }
-        out[n] = row(
-            &[
-                text("postgres", arena)?,
-                text(
-                    arena
-                        .alloc_str(view.schema_for(txid).as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(
-                    arena
-                        .alloc_str(view.name_for(txid).as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text("VIEW", arena)?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn routine_specific_name(
     routine: &crate::storage::RoutineDef,
     txid: u32,
@@ -31688,128 +31690,6 @@ fn info_view_column_usage<'a>(
     finish(def, out, arena)
 }
 
-fn info_columns<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("columns", true);
-    let table_columns = (0..storage.table_count())
-        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
-        .map(|slot| storage.table_def(slot, txid).columns().len())
-        .sum::<usize>();
-    let view_columns = storage
-        .views_visible_to(txid)
-        .map(|(_, view)| view.columns_for(txid).len())
-        .sum::<usize>();
-    let out = catalog_rows(arena, table_columns + view_columns)?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        let foreign_updatable = storage
-            .foreign_table(slot as u16, txid)
-            .map(|(_, binding)| {
-                if let Some(value) = binding.options.get("updatable") {
-                    return super::eval::parse_bool(value);
-                }
-                let server = storage
-                    .foreign_server_by_slot(binding.server as usize, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "foreign table references a missing foreign server"
-                        )
-                    })?;
-                server
-                    .options
-                    .get("updatable")
-                    .map_or(Ok(true), super::eval::parse_bool)
-            })
-            .transpose()?
-            .unwrap_or(true);
-        for (i, c) in table.columns().iter().enumerate() {
-            if n == out.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "information_schema.columns exceeds static capacity"
-                ));
-            }
-            out[n] = info_column_row(
-                storage,
-                txid,
-                InformationSchemaColumnSource {
-                    schema: table.schema.as_str(),
-                    table: table.name.as_str(),
-                    name: c.name.as_str(),
-                    position: i + 1,
-                    column: c,
-                    updatable: foreign_updatable,
-                },
-                arena,
-            )?;
-            n += 1;
-        }
-    }
-    // A view's row type is derived from its SELECT under the path captured at
-    // CREATE VIEW time. Reusing that resolver keeps information_schema,
-    // pg_attribute, Describe, and execution on one source of truth.
-    for (_, view) in storage.views_visible_to(txid) {
-        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, txid, &view, arena, &mut columns)?;
-        for (index, column) in columns[..count].iter().enumerate() {
-            if n == out.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "information_schema.columns exceeds static capacity"
-                ));
-            }
-            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
-            let column_meta = ColumnMeta {
-                name: SqlName::EMPTY,
-                ctype,
-                type_mod: column.type_mod,
-                collation: if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
-                storage: crate::sql::ast::ColumnStorage::Plain,
-                compression: crate::sql::ast::ColumnCompression::Default,
-                not_null: crate::storage::NotNullOrigin::Nullable,
-                not_null_inheritable: true,
-                unique: false,
-                primary: false,
-                auto_increment: false,
-                default: crate::storage::ColumnDefault::NONE,
-                is_identity: false,
-                identity_always: false,
-                auto_increment_step: 1,
-                user_type,
-                statistics_target: -1,
-                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
-            };
-            out[n] = info_column_row(
-                storage,
-                txid,
-                InformationSchemaColumnSource {
-                    schema: view.schema_for(txid).as_str(),
-                    table: view.name_for(txid).as_str(),
-                    name: column.name,
-                    position: index + 1,
-                    column: &column_meta,
-                    updatable: false,
-                },
-                arena,
-            )?;
-            n += 1;
-        }
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn view_column_catalog_type(
     storage: &Storage,
     txid: u32,
@@ -31822,260 +31702,6 @@ fn view_column_catalog_type(
             oid
         )
     })
-}
-
-/// The type-dependent portion of `information_schema.columns`.  `TypeMod`
-/// keeps the several PostgreSQL wire encodings from leaking into catalog code.
-struct InformationSchemaColumnSource<'a> {
-    schema: &'a str,
-    table: &'a str,
-    name: &'a str,
-    position: usize,
-    column: &'a ColumnMeta,
-    updatable: bool,
-}
-
-fn info_column_row<'a>(
-    storage: &Storage,
-    txid: u32,
-    source: InformationSchemaColumnSource<'_>,
-    arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
-    use crate::sql::types::oid;
-    let InformationSchemaColumnSource {
-        schema,
-        table,
-        name,
-        position,
-        column,
-        updatable,
-    } = source;
-    let declared_oid = catalog_column_type_oid(storage, column, txid)?;
-    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32)
-        .contains(&declared_oid);
-    let domain =
-        is_domain.then(|| storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid));
-    let type_mod = TypeMod::decode(column.ctype, column.type_mod);
-    let data_type = information_schema_data_type(storage, txid, declared_oid)?;
-    let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
-        match type_mod {
-            TypeMod::Length(length)
-                if matches!(column.ctype, ColType::Varchar | ColType::Bpchar) =>
-            {
-                (Some(length as i32), None, None, None, None)
-            }
-            TypeMod::NumericPS { precision, scale } => (
-                None,
-                Some(precision as i32),
-                Some(10),
-                Some(scale as i32),
-                None,
-            ),
-            TypeMod::TemporalPrecision(precision) => {
-                (None, None, None, None, Some(precision as i32))
-            }
-            TypeMod::IntervalMod { precision, .. } => {
-                (None, None, None, None, Some(precision.map_or(6, i32::from)))
-            }
-            _ => match column.ctype {
-                ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
-                ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
-                ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
-                ColType::Float4 => (None, Some(24), Some(2), None, None),
-                ColType::Float8 => (None, Some(53), Some(2), None, None),
-                ColType::Interval => (None, None, None, None, Some(6)),
-                _ => (None, None, None, None, None),
-            },
-        };
-    let interval_type = information_schema_interval_type(type_mod);
-    let user_type = column.user_type;
-    let (udt_schema, udt_name) = if let Some(identity) = user_type {
-        let mut type_name = StackStr::<64>::new();
-        if matches!(column.ctype, ColType::Array(_)) {
-            use core::fmt::Write as _;
-            let _ = write!(type_name, "_{}", identity.name.as_str());
-        } else {
-            use core::fmt::Write as _;
-            let _ = write!(type_name, "{}", identity.name.as_str());
-        }
-        (identity.schema, type_name)
-    } else {
-        (
-            SqlName::parse("pg_catalog").expect("catalog schema fits"),
-            StackStr::from_str(column.ctype.catalog_name()),
-        )
-    };
-    let default = if column.default.is_generated() {
-        None
-    } else {
-        super::enum_values::default_expression(
-            &column.default,
-            Some(column.ctype),
-            storage,
-            txid,
-            arena,
-        )?
-    };
-    let generated = column.default.is_generated();
-    let generated_expression = generated.then(|| column.default.expression()).flatten();
-    let nullable =
-        !column.not_null.is_required() && !domain.is_some_and(|definition| definition.not_null);
-    let identity = column.is_identity;
-    let identity_sequence = identity
-        .then(|| {
-            (0..storage.sequence_count())
-                .map(|slot| storage.sequence_for(slot, txid))
-                .find(|sequence| {
-                    sequence.generator_for.is_some_and(|owner| {
-                        owner.table_schema.as_str() == schema
-                            && owner.table.as_str() == table
-                            && owner.column.as_str() == name
-                    })
-                })
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "identity column \"{}.{}.{}\" has no generator sequence",
-                        schema,
-                        table,
-                        name
-                    )
-                })
-        })
-        .transpose()?;
-    let identity_start = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.start_value));
-    let identity_increment = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.increment));
-    let identity_maximum = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.max_value));
-    let identity_minimum = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.min_value));
-    let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
-    let default_datum = match default {
-        Some(value) => Datum::Text(value),
-        None => Datum::Null,
-    };
-    let domain_catalog = match domain {
-        Some(_) => text("postgres", arena)?,
-        None => Datum::Null,
-    };
-    let domain_schema = match domain {
-        Some(value) => text(value.schema.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    let domain_name = match domain {
-        Some(value) => text(value.name.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    let generated_expression = match generated_expression {
-        Some(value) => text(value.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    row(
-        &[
-            text("postgres", arena)?,
-            text(schema, arena)?,
-            text(table, arena)?,
-            text(name, arena)?,
-            Datum::Int4(position as i32),
-            default_datum,
-            text(if nullable { "YES" } else { "NO" }, arena)?,
-            text(data_type.as_str(), arena)?,
-            character_length.map_or(Datum::Null, Datum::Int4),
-            character_length.map_or(Datum::Null, Datum::Int4),
-            numeric_precision.map_or(Datum::Null, Datum::Int4),
-            numeric_radix.map_or(Datum::Null, Datum::Int4),
-            numeric_scale.map_or(Datum::Null, Datum::Int4),
-            datetime_precision.map_or(Datum::Null, Datum::Int4),
-            match interval_type {
-                Some(value) => text(value.as_str(), arena)?,
-                None => Datum::Null,
-            },
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            domain_catalog,
-            domain_schema,
-            domain_name,
-            text("postgres", arena)?,
-            text(udt_schema.as_str(), arena)?,
-            text(udt_name.as_str(), arena)?,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            text(stack_format!(32, "{}", position).as_str(), arena)?,
-            text("NO", arena)?,
-            text(if identity { "YES" } else { "NO" }, arena)?,
-            if identity {
-                text(
-                    if column.identity_always {
-                        "ALWAYS"
-                    } else {
-                        "BY DEFAULT"
-                    },
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_start.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_increment
-                        .expect("identity has a sequence")
-                        .as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_maximum.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_minimum.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            text(
-                if identity_cycle == Some(true) {
-                    "YES"
-                } else {
-                    "NO"
-                },
-                arena,
-            )?,
-            text(if generated { "ALWAYS" } else { "NEVER" }, arena)?,
-            generated_expression,
-            text(if updatable { "YES" } else { "NO" }, arena)?,
-        ],
-        arena,
-    )
 }
 
 /// The SQL-standard `data_type` spelling is intentionally less specific than
@@ -33292,8 +32918,13 @@ fn info_domains<'a>(
             continue;
         }
         let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
-        let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
-            information_schema_scalar_metadata(domain.base, type_mod);
+        let scalar = information::ScalarMetadata::new(
+            domain.base.oid() as i32,
+            domain.base_type_mod,
+            storage
+                .current_database_encoding(txid)
+                .maximum_character_bytes(),
+        )?;
         let interval_type = information_schema_interval_type(type_mod);
         let (data_type, udt_schema, udt_name) = match domain.base_domain {
             Some(parent) => (
@@ -33320,18 +32951,18 @@ fn info_domains<'a>(
                 text(domain.schema.as_str(), arena)?,
                 text(domain.name.as_str(), arena)?,
                 text(data_type, arena)?,
-                character_length.map_or(Datum::Null, Datum::Int4),
-                character_length.map_or(Datum::Null, Datum::Int4),
+                scalar.character_length.map_or(Datum::Null, Datum::Int4),
+                scalar.octet_length.map_or(Datum::Null, Datum::Int4),
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
-                numeric_precision.map_or(Datum::Null, Datum::Int4),
-                numeric_radix.map_or(Datum::Null, Datum::Int4),
-                numeric_scale.map_or(Datum::Null, Datum::Int4),
-                datetime_precision.map_or(Datum::Null, Datum::Int4),
+                scalar.precision.map_or(Datum::Null, Datum::Int4),
+                scalar.radix.map_or(Datum::Null, Datum::Int4),
+                scalar.scale.map_or(Datum::Null, Datum::Int4),
+                scalar.datetime_precision.map_or(Datum::Null, Datum::Int4),
                 match interval_type {
                     Some(value) => text(value.as_str(), arena)?,
                     None => Datum::Null,
@@ -33728,45 +33359,6 @@ fn info_domain_udt_usage<'a>(
         count += 1;
     }
     finish(definition, &output[..count], arena)
-}
-
-type InformationSchemaScalarMetadata = (
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-);
-
-fn information_schema_scalar_metadata(
-    ctype: ColType,
-    type_mod: TypeMod,
-) -> InformationSchemaScalarMetadata {
-    match type_mod {
-        TypeMod::Length(length) if matches!(ctype, ColType::Varchar | ColType::Bpchar) => {
-            (Some(length as i32), None, None, None, None)
-        }
-        TypeMod::NumericPS { precision, scale } => (
-            None,
-            Some(precision as i32),
-            Some(10),
-            Some(scale as i32),
-            None,
-        ),
-        TypeMod::TemporalPrecision(precision) => (None, None, None, None, Some(precision as i32)),
-        TypeMod::IntervalMod { precision, .. } => {
-            (None, None, None, None, Some(precision.map_or(6, i32::from)))
-        }
-        _ => match ctype {
-            ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
-            ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
-            ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
-            ColType::Float4 => (None, Some(24), Some(2), None, None),
-            ColType::Float8 => (None, Some(53), Some(2), None, None),
-            ColType::Interval => (None, None, None, None, Some(6)),
-            _ => (None, None, None, None, None),
-        },
-    }
 }
 
 fn information_schema_interval_type(type_mod: TypeMod) -> Option<StackStr<48>> {

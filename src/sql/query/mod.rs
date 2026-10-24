@@ -4041,7 +4041,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 }
 
-fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
+pub(super) fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
     name.rsplit_once('.')
         .map_or((None, name), |(schema, object)| (Some(schema), object))
 }

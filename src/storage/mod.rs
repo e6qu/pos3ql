@@ -2843,6 +2843,15 @@ impl PgEncoding {
         self.0 as i32
     }
 
+    pub(crate) const fn maximum_character_bytes(self) -> i32 {
+        // PostgreSQL REL_18_6 src/common/wchar.c, pg_wchar_table.maxmblen.
+        const WIDTHS: [i32; 42] = [
+            1, 3, 3, 3, 4, 3, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 3, 2,
+        ];
+        WIDTHS[self.0 as usize]
+    }
+
     pub(crate) fn from_code(code: u8) -> Option<Self> {
         (code <= 41).then_some(Self(code))
     }

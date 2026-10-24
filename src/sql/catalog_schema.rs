@@ -52,8 +52,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("rngmultitypid", ColType::Int4),
         ],
         (false, "pg_foreign_data_wrapper") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("fdwname", ColType::Name),
             ("fdwowner", ColType::Int4),
             ("fdwhandler", ColType::Int4),
@@ -68,8 +68,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ),
         ],
         (false, "pg_foreign_server") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("srvname", ColType::Name),
             ("srvowner", ColType::Int4),
             ("srvfdw", ColType::Int4),
@@ -93,7 +93,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ),
         ],
         (false, "pg_user_mapping") => &[
-            ("oid", ColType::Int4),
+            ("oid", ColType::Oid),
             ("umuser", ColType::Int4),
             ("umserver", ColType::Int4),
             (
@@ -144,11 +144,11 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ),
         ],
         (false, "pg_default_acl") => &[
-            ("oid", ColType::Int4),
-            ("tableoid", ColType::Int4),
-            ("defaclrole", ColType::Int4),
-            ("defaclnamespace", ColType::Int4),
-            ("defaclobjtype", ColType::Bpchar),
+            ("oid", ColType::Oid),
+            ("tableoid", ColType::Oid),
+            ("defaclrole", ColType::Oid),
+            ("defaclnamespace", ColType::Oid),
+            ("defaclobjtype", ColType::Char),
             (
                 "defaclacl",
                 ColType::Array(crate::sql::types::ArrElem::AclItem),
@@ -194,8 +194,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("range_bounds_histogram", ColType::AnyArray),
         ],
         (false, "pg_statistic_ext") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("stxrelid", ColType::Int4),
             ("stxname", ColType::Name),
             ("stxnamespace", ColType::Int4),
@@ -206,7 +206,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("stxexprs", ColType::PgNodeTree),
         ],
         (false, "pg_statistic_ext_data") => &[
-            ("tableoid", ColType::Int4),
+            ("tableoid", ColType::Oid),
             ("stxoid", ColType::Int4),
             ("stxdinherit", ColType::Bool),
             ("stxdndistinct", ColType::PgNdistinct),
@@ -272,8 +272,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ),
         ],
         (false, "pg_policy") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("polname", ColType::Name),
             ("polrelid", ColType::Int4),
             ("polcmd", ColType::Bpchar),
@@ -293,8 +293,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("with_check", ColType::Text),
         ],
         (false, "pg_publication") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("pubname", ColType::Text),
             ("pubowner", ColType::Int4),
             ("puballtables", ColType::Bool),
@@ -306,14 +306,14 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("pubgencols", ColType::Bpchar),
         ],
         (false, "pg_publication_namespace") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("pnpubid", ColType::Int4),
             ("pnnspid", ColType::Int4),
         ],
         (false, "pg_publication_rel") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("prpubid", ColType::Int4),
             ("prrelid", ColType::Int4),
             ("prqual", ColType::Text),
@@ -332,8 +332,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
         (false, "pg_stat_replication") => PG_STAT_REPLICATION_COLUMNS,
         (false, "pg_stat_replication_slots") => PG_STAT_REPLICATION_SLOTS_COLUMNS,
         (false, "pg_subscription") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("subdbid", ColType::Int4),
             ("subskiplsn", ColType::Text),
             ("subname", ColType::Name),
@@ -422,10 +422,10 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("relpartbound", ColType::PgNodeTree),
         ],
         (false, "pg_tablespace") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("spcname", ColType::Name),
-            ("spcowner", ColType::Int4),
+            ("spcowner", ColType::Oid),
             (
                 "spcacl",
                 ColType::Array(crate::sql::types::ArrElem::AclItem),
@@ -469,8 +469,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("conbin", ColType::PgNodeTree),
         ],
         (false, "pg_rewrite") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("rulename", ColType::Text),
             ("ev_class", ColType::Int4),
             ("ev_type", ColType::Bpchar),
@@ -495,8 +495,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("comment", ColType::Text),
         ],
         (false, "pg_extension") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("extname", ColType::Name),
             ("extowner", ColType::Int4),
             ("extnamespace", ColType::Int4),
@@ -515,11 +515,11 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("refclassid", ColType::Oid),
             ("refobjid", ColType::Oid),
             ("refobjsubid", ColType::Int4),
-            ("deptype", ColType::Bpchar),
+            ("deptype", ColType::Char),
         ],
         (false, "pg_index") => &[
-            ("indexrelid", ColType::Int4),
-            ("indrelid", ColType::Int4),
+            ("indexrelid", ColType::Oid),
+            ("indrelid", ColType::Oid),
             ("indisprimary", ColType::Bool),
             ("indisunique", ColType::Bool),
             ("indisclustered", ColType::Bool),
@@ -695,8 +695,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("amtype", ColType::Char),
         ],
         (false, "pg_language") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("lanname", ColType::Name),
             ("lanowner", ColType::Int4),
             ("lanpltrusted", ColType::Bool),
@@ -842,8 +842,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("collversion", ColType::Text),
         ],
         (false, "pg_conversion") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
             ("conname", ColType::Name),
             ("connamespace", ColType::Int4),
             ("conowner", ColType::Int4),
@@ -853,7 +853,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("condefault", ColType::Bool),
         ],
         (false, "pg_enum") => &[
-            ("oid", ColType::Int4),
+            ("oid", ColType::Oid),
             ("enumtypid", ColType::Int4),
             ("enumsortorder", ColType::Float8),
             ("enumlabel", ColType::Text),
@@ -948,17 +948,17 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("is_dst", ColType::Bool),
         ],
         (false, "pg_type") => &[
-            ("oid", ColType::Int4),
+            ("oid", ColType::Oid),
             ("typname", ColType::Name),
-            ("typlen", ColType::Int4),
-            ("typcollation", ColType::Int4),
-            ("typnamespace", ColType::Int4),
-            ("typtype", ColType::Bpchar), // 'b' = base type
-            ("typcategory", ColType::Bpchar),
-            ("typbasetype", ColType::Int4), // 0 unless a domain
-            ("typelem", ColType::Int4),     // element type of an array, else 0
-            ("typarray", ColType::Int4),    // the array type over this type, else 0
-            ("typrelid", ColType::Int4),    // 0 unless a composite type
+            ("typlen", ColType::Int2),
+            ("typcollation", ColType::Oid),
+            ("typnamespace", ColType::Oid),
+            ("typtype", ColType::Char), // 'b' = base type
+            ("typcategory", ColType::Char),
+            ("typbasetype", ColType::Oid), // 0 unless a domain
+            ("typelem", ColType::Oid),     // element type of an array, else 0
+            ("typarray", ColType::Oid),    // the array type over this type, else 0
+            ("typrelid", ColType::Oid),    // 0 unless a composite type
             ("typtypmod", ColType::Int4),
             ("typnotnull", ColType::Bool),
             ("typdefault", ColType::Text),
@@ -968,17 +968,17 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
                 "typacl",
                 ColType::Array(crate::sql::types::ArrElem::AclItem),
             ),
-            ("tableoid", ColType::Int4),
-            ("typowner", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("typowner", ColType::Oid),
             ("typisdefined", ColType::Bool),
-            ("typstorage", ColType::Bpchar),
+            ("typstorage", ColType::Char),
             ("typdefaultbin", ColType::Text),
         ],
         (false, "pg_namespace") => &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("nspname", ColType::Text),
-            ("nspowner", ColType::Int4),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("nspname", ColType::Name),
+            ("nspowner", ColType::Oid),
             (
                 "nspacl",
                 ColType::Array(crate::sql::types::ArrElem::AclItem),
@@ -1053,35 +1053,35 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("rolvaliduntil", ColType::Timestamptz),
         ],
         (false, "pg_auth_members") => &[
-            ("oid", ColType::Int4),
-            ("roleid", ColType::Int4),
-            ("member", ColType::Int4),
-            ("grantor", ColType::Int4),
+            ("oid", ColType::Oid),
+            ("roleid", ColType::Oid),
+            ("member", ColType::Oid),
+            ("grantor", ColType::Oid),
             ("admin_option", ColType::Bool),
             ("inherit_option", ColType::Bool),
             ("set_option", ColType::Bool),
         ],
         (false, "pg_db_role_setting") => &[
-            ("setdatabase", ColType::Int4),
-            ("setrole", ColType::Int4),
+            ("setdatabase", ColType::Oid),
+            ("setrole", ColType::Oid),
             (
                 "setconfig",
                 ColType::Array(crate::sql::types::ArrElem::Text),
             ),
         ],
         (false, "pg_database") => &[
-            ("oid", ColType::Int4),
+            ("oid", ColType::Oid),
             ("datname", ColType::Name),
-            ("datdba", ColType::Int4),
+            ("datdba", ColType::Oid),
             ("encoding", ColType::Int4),
-            ("datlocprovider", ColType::Bpchar),
+            ("datlocprovider", ColType::Char),
             ("datistemplate", ColType::Bool),
             ("datallowconn", ColType::Bool),
             ("dathasloginevt", ColType::Bool),
             ("datconnlimit", ColType::Int4),
             ("datfrozenxid", ColType::Int4),
             ("datminmxid", ColType::Int4),
-            ("dattablespace", ColType::Int4),
+            ("dattablespace", ColType::Oid),
             ("datcollate", ColType::Text),
             ("datctype", ColType::Text),
             ("datlocale", ColType::Text),
@@ -1153,8 +1153,8 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("last_value", ColType::Int8),
         ],
         (false, "pg_sequence") => &[
-            ("seqrelid", ColType::Int4),
-            ("seqtypid", ColType::Int4),
+            ("seqrelid", ColType::Oid),
+            ("seqtypid", ColType::Oid),
             ("seqstart", ColType::Int8),
             ("seqincrement", ColType::Int8),
             ("seqmax", ColType::Int8),
@@ -1225,10 +1225,18 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("option_value", ColType::Text),
         ],
         (true, "tables") => &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("table_type", ColType::Text),
+            ("table_catalog", ColType::Name),
+            ("table_schema", ColType::Name),
+            ("table_name", ColType::Name),
+            ("table_type", ColType::Varchar),
+            ("self_referencing_column_name", ColType::Name),
+            ("reference_generation", ColType::Varchar),
+            ("user_defined_type_catalog", ColType::Name),
+            ("user_defined_type_schema", ColType::Name),
+            ("user_defined_type_name", ColType::Name),
+            ("is_insertable_into", ColType::Varchar),
+            ("is_typed", ColType::Varchar),
+            ("commit_action", ColType::Varchar),
         ],
         (true, "routines") => &[
             ("specific_catalog", ColType::Text),
@@ -1538,7 +1546,19 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
         ],
         _ => return None,
     };
-    Some(SynthDef { name, columns })
+    let relation = (!information_schema)
+        .then(|| {
+            crate::sql::catalog_snapshot_keys::RELATIONS
+                .iter()
+                .find(|relation| relation.name == name)
+                .map(|relation| relation.oid)
+        })
+        .flatten();
+    Some(SynthDef {
+        name,
+        columns,
+        relation,
+    })
 }
 
 pub(super) fn require(name: &str, information_schema: bool) -> SynthDef<'_> {
@@ -1549,9 +1569,14 @@ pub(super) fn hidden_columns(
     name: &str,
     information_schema: bool,
 ) -> &'static [(&'static str, ColType)] {
-    match (information_schema, name) {
-        (false, "pg_class" | "pg_constraint" | "pg_attrdef") => &[("tableoid", ColType::Oid)],
-        _ => &[],
+    if !information_schema
+        && crate::sql::catalog_snapshot_keys::RELATIONS
+            .iter()
+            .any(|relation| relation.name == name)
+    {
+        &[("tableoid", ColType::Oid)]
+    } else {
+        &[]
     }
 }
 
@@ -1579,6 +1604,21 @@ mod tests {
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
                 assert_eq!(arena.used(), bytes);
                 assert!(table.rows.is_empty());
+                if definition.relation.is_some() {
+                    assert_eq!(table.hidden_columns, 1);
+                    assert!(
+                        table
+                            .def
+                            .columns()
+                            .iter()
+                            .all(|column| column.name.as_str() != "tableoid")
+                    );
+                    assert_eq!(
+                        table.def.columns[table.def.n_columns].name.as_str(),
+                        "tableoid"
+                    );
+                    assert_eq!(table.def.columns[table.def.n_columns].ctype, ColType::Oid);
+                }
             });
             // No descriptor from this iteration remains live.
             unsafe { arena.rewind_to(mark) };

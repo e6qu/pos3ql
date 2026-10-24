@@ -436,6 +436,14 @@ terminator. Missing, repeated, malformed or trailing metadata fails explicitly,
 before catalog restoration or root publication. Promotion never inserts a
 missing writer identity.
 
+Startup validates the complete saved catalog and its immutable references before
+promoting the writer. It retains the manifest and commit-head versions read by
+that validation. A changed version stops promotion with a named error; startup
+does not retag a different root while serving the previously restored state.
+Malformed catalog records leave the manifest, commit-head and writer fence
+unchanged. Offline restore and export explicitly capture current destination
+roots under their own promotion protocol.
+
 There is no old-manifest writer, mode selector, or conversion that retires enum
 indexes during recovery. Current enum identities and index references are
 restored directly. For example, a saved enum value still reads as its renamed

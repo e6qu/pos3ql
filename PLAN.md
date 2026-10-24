@@ -52,7 +52,11 @@ through savepoints and prepared-transaction recovery, within startup memory.
 Parameter permission rows must preserve their identity through edits and restart,
 and receive a new identity after their removal. Check empty permission lists
 separately from restored default permissions, which remove the catalog row.
-Check readers admitted while a commit waits for object storage. After a restart,
+Check readers admitted while a commit waits for object storage.
+Validate saved catalogs before writer promotion and pin the root versions used
+for restoration. A changed root must require a fresh startup, and rejected
+catalog records must leave durable roots unchanged.
+After a restart,
 an unresolved prepared transaction must still preserve a reader's older catalog
 rows when that transaction is finally committed. Keep current role-name rendering.
 Compare permission listings with `pg_get_acl` and privilege checks: a listing

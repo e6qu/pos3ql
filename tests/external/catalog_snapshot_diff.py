@@ -323,6 +323,7 @@ def transcript(reader, writer):
         writer.execute("CREATE ROLE catalog_permission_reader_diff")
         writer.execute("CREATE TABLE catalog_permission_diff(id integer)")
         writer.execute("GRANT SELECT ON catalog_permission_diff TO catalog_permission_reader_diff")
+        large_object = None
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:
             role_oid = reader.execute("SELECT oid FROM pg_authid WHERE rolname='catalog_permission_reader_diff'").fetchone()[0]
@@ -336,11 +337,25 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.permissions.renamed_acl", query)
             record(reader, f"{prefix}.permissions.renamed_current_acl", current_query)
             record(reader, f"{prefix}.permissions.role_catalog", "SELECT rolname FROM pg_authid WHERE oid=%s::oid", (role_oid,))
+            writer.execute("GRANT SELECT(id) ON catalog_permission_diff TO catalog_permission_renamed_diff")
+            record(reader, f"{prefix}.permissions.wrapped_columns", "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65536) IS NULL")
+            writer.execute("CREATE FUNCTION catalog_permission_function_diff() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+            writer.execute("GRANT EXECUTE ON FUNCTION catalog_permission_function_diff() TO catalog_permission_renamed_diff")
+            record(reader, f"{prefix}.permissions.function_subid", "SELECT pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 0)::text, pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 7)::text")
+            large_object = writer.execute("SELECT lo_create(0)").fetchone()[0]
+            writer.execute(f"GRANT SELECT ON LARGE OBJECT {large_object} TO catalog_permission_renamed_diff")
+            record(reader, f"{prefix}.permissions.large_object_alias", "SELECT pg_get_acl('pg_largeobject'::regclass, %s::oid, -7)::text, pg_get_acl('pg_largeobject_metadata'::regclass, %s::oid, 7)::text", (large_object, large_object))
+            record(reader, f"{prefix}.permissions.no_acl", "SELECT pg_get_acl('pg_authid'::regclass, %s::oid, 99) IS NULL, pg_get_acl(0,0,99) IS NULL", (role_oid,))
+            for class_oid in (0, 1249, 6243, 999999):
+                record_outcome(reader, f"{prefix}.permissions.invalid_class_{class_oid}", "SELECT pg_get_acl(%s::oid, %s::oid, 0)", (class_oid, role_oid))
             reader.execute("COMMIT")
             record(reader, f"{prefix}.permissions.fresh", query)
         finally:
             reader.execute("ROLLBACK")
             writer.execute("ROLLBACK")
+            if large_object is not None:
+                writer.execute("SELECT lo_unlink(%s::oid)", (large_object,))
+            writer.execute("DROP FUNCTION IF EXISTS catalog_permission_function_diff()")
             writer.execute("DROP TABLE catalog_permission_diff")
             writer.execute("DROP ROLE IF EXISTS catalog_permission_reader_diff")
             writer.execute("DROP ROLE IF EXISTS catalog_permission_renamed_diff")

@@ -123,5 +123,12 @@ jobs:
         if: always()
         with:
           name: catalog-comparison-${{ github.sha }}
-          path: ${{ runner.temp }}/catalog-comparison/
+          path: |
+            ${{ runner.temp }}/catalog-comparison/*.json
+            ${{ runner.temp }}/catalog-comparison/*.log
+            ${{ runner.temp }}/catalog-comparison/pos3ql.conf
+            ${{ runner.temp }}/catalog-comparison/revision
+            ${{ runner.temp }}/catalog-comparison/candidate-revision
+            ${{ runner.temp }}/catalog-comparison/candidate-SHA256SUMS
+            ${{ runner.temp }}/catalog-comparison/postgresql-image
           if-no-files-found: error

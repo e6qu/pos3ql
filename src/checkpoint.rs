@@ -64,6 +64,43 @@ struct WriterFence {
     etag: EntityTag,
 }
 
+#[derive(Clone, Copy)]
+enum PromotionRoots {
+    Current,
+    Validated {
+        manifest: Option<EntityTag>,
+        head: Option<EntityTag>,
+    },
+}
+
+impl PromotionRoots {
+    fn check(
+        self,
+        root: MutableRoot,
+        current: Option<EntityTag>,
+    ) -> Result<(), CheckpointSetupError> {
+        if let Self::Validated { manifest, head } = self {
+            let expected = match root {
+                MutableRoot::Manifest => manifest,
+                MutableRoot::CommitHead => head,
+            };
+            if current != expected {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "{} changed after startup validation",
+                    root.key()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct WriterPromotion {
+    fence: WriterFence,
+    manifest: EntityTag,
+    head: EntityTag,
+}
+
 fn new_writer_token() -> std::io::Result<WriterToken> {
     use std::io::Read;
 
@@ -2521,13 +2558,19 @@ impl Checkpointer {
     }
 
     fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {
-        let fence = promote_writer(
+        let promoted = promote_writer(
             &mut self.client,
             self.writer_token,
             &mut self.manifest_buf,
             &mut self.root_buf,
+            PromotionRoots::Validated {
+                manifest: self.manifest_etag,
+                head: self.commit_head_etag,
+            },
         )?;
-        self.writer_fence_etag = Some(fence.etag);
+        self.writer_fence_etag = Some(promoted.fence.etag);
+        self.manifest_etag = Some(promoted.manifest);
+        self.commit_head_etag = Some(promoted.head);
         Ok(())
     }
 
@@ -3617,77 +3660,64 @@ impl Checkpointer {
                 }
             }
         }
-        self.claim_writer()?;
-        let floor = match self.client.get(MANIFEST_KEY, None) {
-            Ok(r) => {
-                self.manifest_etag = Some(r.etag);
-                if is_empty_manifest(self.client.body_bytes())
-                    .map_err(CheckpointSetupError::Corrupt)?
-                {
-                    self.manifest_present = false;
-                    0
-                } else {
-                    self.manifest_present = true;
-                    let text = core::str::from_utf8(self.client.body_bytes())
-                        .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
-                        .to_string();
-                    self.load_manifest_text(storage, &text)?
-                }
+        self.manifest_etag = read_mutable_root(
+            &mut self.client,
+            MutableRoot::Manifest,
+            &mut self.manifest_buf,
+        )?;
+        self.manifest_present = false;
+        let floor = if self.manifest_etag.is_some() {
+            if is_empty_manifest(self.manifest_buf.readable())
+                .map_err(CheckpointSetupError::Corrupt)?
+            {
+                0
+            } else {
+                let text = core::str::from_utf8(self.manifest_buf.readable())
+                    .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
+                    .to_owned();
+                let floor = self.load_manifest_text(storage, &text)?;
+                self.manifest_present = true;
+                floor
             }
-            Err(e) if e.is_not_found() => 0,
-            Err(e) => {
-                return Err(CheckpointSetupError::ObjectStore(format!(
-                    "load manifest: {e}"
-                )));
-            }
+        } else {
+            0
         };
-        match self.client.get(COMMIT_HEAD_KEY, None) {
-            Ok(result) => {
-                self.commit_head_etag = Some(result.etag);
-                if is_empty_commit_head(self.client.body_bytes())
+        self.commit_head_etag = read_mutable_root(
+            &mut self.client,
+            MutableRoot::CommitHead,
+            &mut self.root_buf,
+        )?;
+        self.commit_head = if self.commit_head_etag.is_some()
+            && !is_empty_commit_head(self.root_buf.readable())
+                .map_err(CheckpointSetupError::Corrupt)?
+        {
+            Some(
+                parse_commit_head(self.root_buf.readable())
                     .map_err(CheckpointSetupError::Corrupt)?
-                {
-                    self.commit_head = None;
-                    let mut has_orphaned_batches = false;
-                    self.client
-                        .list("commits/", |_| has_orphaned_batches = true)
-                        .map_err(|error| {
-                            CheckpointSetupError::ObjectStore(format!(
-                                "list orphaned commit batches: {error}"
-                            ))
-                        })?;
-                    if has_orphaned_batches {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "commit batches exist without a commit-head",
-                        ));
-                    }
-                } else {
-                    let (_, batch) = parse_commit_head(self.client.body_bytes())
-                        .map_err(CheckpointSetupError::Corrupt)?;
-                    self.commit_head = Some(batch);
-                }
-            }
-            Err(error) if error.is_not_found() => {
-                let mut has_orphaned_batches = false;
-                self.client
-                    .list("commits/", |_| has_orphaned_batches = true)
-                    .map_err(|error| {
-                        CheckpointSetupError::ObjectStore(format!(
-                            "list orphaned commit batches: {error}"
-                        ))
-                    })?;
-                if has_orphaned_batches {
-                    return Err(CheckpointSetupError::Corrupt(
-                        "commit batches exist without a commit-head",
-                    ));
-                }
-            }
-            Err(error) => {
-                return Err(CheckpointSetupError::ObjectStore(format!(
-                    "load commit-head: {error}"
-                )));
+                    .1,
+            )
+        } else {
+            None
+        };
+        if self.commit_head.is_none() {
+            let mut has_orphaned_batches = false;
+            self.client
+                .list("commits/", |_| has_orphaned_batches = true)
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "list orphaned commit batches: {error}"
+                    ))
+                })?;
+            if has_orphaned_batches {
+                return Err(CheckpointSetupError::Corrupt(
+                    "commit batches exist without a commit-head",
+                ));
             }
         }
+        // Catalog and immutable references are valid before changing any root.
+        // Promotion checks both captured versions again after fencing: a racing
+        // writer requires a fresh startup, never publication from stale storage.
+        self.claim_writer()?;
         Ok(floor)
     }
 
@@ -15515,7 +15545,14 @@ pub(crate) fn restore_backup_to(
     .map_err(CheckpointSetupError::Budget)?;
     let mut fence_head = FixedBuf::new(budget, "restore writer-fence head", 128)
         .map_err(CheckpointSetupError::Budget)?;
-    let mut fence = promote_writer(&mut client, token, &mut fence_manifest, &mut fence_head)?;
+    let mut fence = promote_writer(
+        &mut client,
+        token,
+        &mut fence_manifest,
+        &mut fence_head,
+        PromotionRoots::Current,
+    )?
+    .fence;
 
     replace_root(
         &mut client,
@@ -15946,7 +15983,9 @@ pub(crate) fn export_backup(
         token,
         &mut fence_manifest,
         &mut fence_head,
-    )?;
+        PromotionRoots::Current,
+    )?
+    .fence;
 
     replace_root(
         &mut destination,
@@ -16255,12 +16294,15 @@ fn promote_writer(
     token: WriterToken,
     manifest: &mut FixedBuf,
     head: &mut FixedBuf,
-) -> Result<WriterFence, CheckpointSetupError> {
+    roots: PromotionRoots,
+) -> Result<WriterPromotion, CheckpointSetupError> {
     // Reject incompatible or malformed root records before displacing a writer.
     // Publication re-reads them after fencing so intervening commits are preserved.
-    let _ = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    let manifest_etag = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    roots.check(MutableRoot::Manifest, manifest_etag)?;
     retag_manifest_root(manifest, token)?;
-    let _ = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    let head_etag = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    roots.check(MutableRoot::CommitHead, head_etag)?;
     retag_commit_head_root(head, token)?;
 
     let current = match client.get(WRITER_FENCE_KEY, None) {
@@ -16281,8 +16323,8 @@ fn promote_writer(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
 
-    fence_mutable_root(client, MutableRoot::Manifest, manifest, token)?;
-    fence_mutable_root(client, MutableRoot::CommitHead, head, token)?;
+    let manifest_etag = fence_mutable_root(client, MutableRoot::Manifest, manifest, token, roots)?;
+    let head_etag = fence_mutable_root(client, MutableRoot::CommitHead, head, token, roots)?;
 
     let active = writer_fence_record("active", token);
     let etag = put_fence_record(
@@ -16290,7 +16332,11 @@ fn promote_writer(
         active.as_str().as_bytes(),
         Precondition::IfMatch(&transition_etag),
     )?;
-    Ok(WriterFence { token, etag })
+    Ok(WriterPromotion {
+        fence: WriterFence { token, etag },
+        manifest: manifest_etag,
+        head: head_etag,
+    })
 }
 
 fn put_fence_record(
@@ -16435,10 +16481,12 @@ fn fence_mutable_root(
     root: MutableRoot,
     scratch: &mut FixedBuf,
     token: WriterToken,
+    roots: PromotionRoots,
 ) -> Result<EntityTag, CheckpointSetupError> {
     let key = root.key();
     for _ in 0..16 {
         let current = read_mutable_root(client, root, scratch)?;
+        roots.check(root, current)?;
         match root {
             MutableRoot::Manifest => retag_manifest_root(scratch, token)?,
             MutableRoot::CommitHead => retag_commit_head_root(scratch, token)?,
@@ -20383,6 +20431,131 @@ mod stored_dependency_tests {
             parse_commit_head(current.as_str().as_bytes()).unwrap().0,
             token
         );
+    }
+
+    #[test]
+    fn promotion_validated_roots_reject_changes_before_displacing_a_writer() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("validated-root-promotion-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = Budget::new(8 << 20);
+        let mut client = ObjectStore::new(&config, &mut budget).unwrap();
+        let mut manifest =
+            FixedBuf::new(&mut budget, "validated promotion manifest", 1024).unwrap();
+        let mut head = FixedBuf::new(&mut budget, "validated promotion head", 128).unwrap();
+        let active = writer_fence_record("active", WriterToken(1));
+        client
+            .put(
+                WRITER_FENCE_KEY,
+                active.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let original_manifest = empty_manifest_record(WriterToken(1));
+        let original_head = empty_commit_head_record(WriterToken(1));
+        let manifest_etag = client
+            .put(
+                MANIFEST_KEY,
+                original_manifest.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let head_etag = client
+            .put(
+                COMMIT_HEAD_KEY,
+                original_head.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let changed_manifest = empty_manifest_record(WriterToken(2));
+        let changed_manifest_etag = client
+            .put(
+                MANIFEST_KEY,
+                changed_manifest.as_str().as_bytes(),
+                Precondition::IfMatch(&manifest_etag),
+            )
+            .unwrap();
+        let error = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(manifest_etag),
+                head: Some(head_etag),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, CheckpointSetupError::ObjectStore(message) if message == "manifest changed after startup validation")
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), active.as_str().as_bytes());
+        client.get(MANIFEST_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), changed_manifest.as_str().as_bytes());
+        let changed_head = empty_commit_head_record(WriterToken(2));
+        let changed_head_etag = client
+            .put(
+                COMMIT_HEAD_KEY,
+                changed_head.as_str().as_bytes(),
+                Precondition::IfMatch(&head_etag),
+            )
+            .unwrap();
+        let error = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(changed_manifest_etag),
+                head: Some(head_etag),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, CheckpointSetupError::ObjectStore(message) if message == "commit-head changed after startup validation")
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), active.as_str().as_bytes());
+        client.get(COMMIT_HEAD_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), changed_head.as_str().as_bytes());
+        let promoted = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(changed_manifest_etag),
+                head: Some(changed_head_etag),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client.get(MANIFEST_KEY, None).unwrap().etag,
+            promoted.manifest
+        );
+        assert_eq!(
+            empty_manifest_writer(client.body_bytes()).unwrap(),
+            Some(WriterToken(3))
+        );
+        assert_eq!(
+            client.get(COMMIT_HEAD_KEY, None).unwrap().etag,
+            promoted.head
+        );
+        assert_eq!(
+            empty_commit_head_writer(client.body_bytes()).unwrap(),
+            Some(WriterToken(3))
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(
+            parse_writer_fence(client.body_bytes()).unwrap(),
+            ("active", WriterToken(3))
+        );
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 
     #[test]

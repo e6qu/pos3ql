@@ -8867,22 +8867,44 @@ pub(crate) fn object_acl_by_address<'a>(
     objsubid: i32,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (catalog, id_columns, acl_column): (&str, &[&str], &str) = match classid as i32 {
-        PG_CLASS_OID if objsubid == 0 => ("pg_class", &["oid"], "relacl"),
-        PG_CLASS_OID if objsubid > 0 => ("pg_attribute", &["attrelid", "attnum"], "attacl"),
-        PG_PROC_OID if objsubid == 0 => ("pg_proc", &["oid"], "proacl"),
-        PG_TYPE_OID if objsubid == 0 => ("pg_type", &["oid"], "typacl"),
-        PG_NAMESPACE_OID if objsubid == 0 => ("pg_namespace", &["oid"], "nspacl"),
-        1262 if objsubid == 0 => ("pg_database", &["oid"], "datacl"),
-        1213 if objsubid == 0 => ("pg_tablespace", &["oid"], "spcacl"),
-        PG_LANGUAGE_OID if objsubid == 0 => ("pg_language", &["oid"], "lanacl"),
-        PG_LARGEOBJECT_METADATA_OID if objsubid == 0 => {
-            ("pg_largeobject_metadata", &["oid"], "lomacl")
-        }
-        2328 if objsubid == 0 => ("pg_foreign_data_wrapper", &["oid"], "fdwacl"),
-        1417 if objsubid == 0 => ("pg_foreign_server", &["oid"], "srvacl"),
-        6243 if objsubid == 0 => ("pg_parameter_acl", &["oid"], "paracl"),
-        _ => return Ok(None),
+    if classid == 0 && objid == 0 {
+        return Ok(None);
+    }
+    let unknown_class = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "unrecognized class ID: {}",
+            classid
+        )
+    };
+    let class = if classid == 2613 {
+        "pg_largeobject_metadata"
+    } else {
+        i32::try_from(classid)
+            .ok()
+            .and_then(catalog_relation_name)
+            .ok_or_else(unknown_class)?
+    };
+    // PostgreSQL 18.6 objectaddress.c ObjectProperty[] and pg_get_acl().
+    let (catalog, id_columns, acl_column): (&str, &[&str], &str) = match class {
+        "pg_class" if objsubid == 0 => (class, &["oid"], "relacl"),
+        "pg_class" => ("pg_attribute", &["attrelid", "attnum"], "attacl"),
+        "pg_proc" => (class, &["oid"], "proacl"),
+        "pg_type" => (class, &["oid"], "typacl"),
+        "pg_namespace" => (class, &["oid"], "nspacl"),
+        "pg_database" => (class, &["oid"], "datacl"),
+        "pg_tablespace" => (class, &["oid"], "spcacl"),
+        "pg_language" => (class, &["oid"], "lanacl"),
+        "pg_largeobject_metadata" => (class, &["oid"], "lomacl"),
+        "pg_foreign_data_wrapper" => (class, &["oid"], "fdwacl"),
+        "pg_foreign_server" => (class, &["oid"], "srvacl"),
+        "pg_am" | "pg_amop" | "pg_amproc" | "pg_cast" | "pg_collation" | "pg_constraint"
+        | "pg_conversion" | "pg_default_acl" | "pg_extension" | "pg_opclass" | "pg_operator"
+        | "pg_opfamily" | "pg_authid" | "pg_auth_members" | "pg_rewrite" | "pg_transform"
+        | "pg_trigger" | "pg_policy" | "pg_event_trigger" | "pg_ts_config" | "pg_ts_dict"
+        | "pg_ts_parser" | "pg_ts_template" | "pg_publication" | "pg_subscription"
+        | "pg_statistic_ext" | "pg_user_mapping" => return Ok(None),
+        _ => return Err(unknown_class()),
     };
     let table = synthesize_current(storage, Some("pg_catalog"), catalog, txid, arena)?;
     let column = |name: &str| {
@@ -8924,7 +8946,7 @@ pub(crate) fn object_acl_by_address<'a>(
         if !matches_oid(row[identities[0]], objid) {
             continue;
         }
-        if id_columns.len() == 2 && !matches_i32(row[identities[1]], objsubid) {
+        if id_columns.len() == 2 && !matches_i32(row[identities[1]], i32::from(objsubid as i16)) {
             continue;
         }
         return Ok(Some(row[acl_index]));

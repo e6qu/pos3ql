@@ -1141,6 +1141,10 @@ list. `pg_get_acl`, like PostgreSQL's object lookup, reads current permissions;
 an explicit catalog query still follows its statement snapshot. For example,
 an older repeatable-read query can list a role's SELECT grant while
 `pg_get_acl` also reports a later UPDATE grant for the same object.
+Its accepted object classes, large-object alias and sub-object numbers follow
+[PostgreSQL 18.6's object lookup](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/objectaddress.c).
+For example, a class without an ACL returns NULL, while an unrecognized class
+raises `XX000`; these cases are distinct.
 
 ### How statistics reads and journal batches stay consistent
 

@@ -21407,6 +21407,97 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
 }
 
 #[test]
+fn catalog_snapshot_acl_addresses_match_postgresql_object_classes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE acl_address_reader;
+         CREATE TABLE acl_addresses(id integer);
+         CREATE FUNCTION acl_address_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         GRANT SELECT(id) ON acl_addresses TO acl_address_reader;
+         GRANT EXECUTE ON FUNCTION acl_address_function() TO acl_address_reader;
+         SELECT lo_create(50001);
+         GRANT SELECT ON LARGE OBJECT 50001 TO acl_address_reader;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(&mut engine, &mut budget,
+        "SELECT pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 1),
+                pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 1),
+                pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 65536) IS NULL;
+         SELECT pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 7) = pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 0);
+         SELECT pg_get_acl('pg_largeobject'::regclass, 50001, -7) = pg_get_acl('pg_largeobject_metadata'::regclass, 50001, 0), pg_get_acl('pg_largeobject'::regclass, 50001, -7) IS NOT NULL;
+         SELECT pg_get_acl('pg_authid'::regclass, 10, 3) IS NULL;
+         SELECT pg_get_acl(0, 0, 99) IS NULL;");
+    assert_eq!(
+        data_rows(&output),
+        ["t|t|t", "t", "t|t", "t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for class in [0, 1249, 6243, 999999] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_get_acl({class}::oid, 1::oid, 0)"),
+        );
+        assert!(
+            output.windows(7).any(|bytes| bytes == b"CXX000\0"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!("unrecognized class ID: {class}"))
+        );
+    }
+    for class in [
+        "pg_am",
+        "pg_amop",
+        "pg_amproc",
+        "pg_cast",
+        "pg_collation",
+        "pg_constraint",
+        "pg_conversion",
+        "pg_default_acl",
+        "pg_extension",
+        "pg_opclass",
+        "pg_operator",
+        "pg_opfamily",
+        "pg_authid",
+        "pg_auth_members",
+        "pg_rewrite",
+        "pg_transform",
+        "pg_trigger",
+        "pg_policy",
+        "pg_event_trigger",
+        "pg_ts_config",
+        "pg_ts_dict",
+        "pg_ts_parser",
+        "pg_ts_template",
+        "pg_publication",
+        "pg_subscription",
+        "pg_statistic_ext",
+        "pg_user_mapping",
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_get_acl('{class}'::regclass, 1::oid, 99) IS NULL"),
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["t"],
+            "{class}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
 fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups() {
     for (isolation, historical) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
         let (mut engine, mut budget) = test_engine();
@@ -21812,12 +21903,18 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
         "{}",
         String::from_utf8_lossy(&retained)
     );
+    for command in ["VACUUM retained_index_hint", "VACUUM relation_estimates"] {
+        let output = run_with(&mut engine, &mut budget, command);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     let vacuumed = run_with(
         &mut engine,
         &mut budget,
-        "VACUUM retained_index_hint;
-         VACUUM relation_estimates;
-         SELECT relhasindex FROM pg_class WHERE relname='retained_index_hint';
+        "SELECT relhasindex FROM pg_class WHERE relname='retained_index_hint';
          SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';",
     );
     assert_eq!(
@@ -80414,10 +80511,9 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
                 } else {
                     bytes.as_slice()
                 };
-                assert_eq!(
-                    saved.object_bytes(&full_key),
-                    Some(expected_bytes),
-                    "rejected {key} must not rewrite {saved_key}"
+                assert!(
+                    saved.object_bytes(&full_key) == Some(expected_bytes),
+                    "rejected {key} ({expected}) must not rewrite {saved_key}"
                 );
             }
         }

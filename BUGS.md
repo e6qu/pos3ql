@@ -16,6 +16,8 @@ Index hints and relation counts must survive recovery without turning private
 column estimates into committed data or reusing a replacement table's identity.
 Permission history must retain role identities and refresh their displayed names,
 while current permission lookup functions use PostgreSQL's object-lookup rules.
+Reject malformed catalogs before changing durable roots, and reject stale
+startup restoration when those roots change during validation.
 
 Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
 and [storage format guide](docs/durable-format.md). Keep regression evidence in

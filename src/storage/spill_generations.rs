@@ -2662,7 +2662,7 @@ mod tests {
         let handle = writer.finish(&mut store, 7).unwrap().unwrap();
         let blocks = Arc::new(Mutex::new(store));
         let reader = SpillReader::new(&mut budget, 3, Some(Arc::clone(&blocks)), None).unwrap();
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.attach_spill(reader);
         let mut definition = make_def(label, &[("id", ColType::Int4, false)]);
         definition.columns[0].unique = true;
@@ -3530,7 +3530,7 @@ mod tests {
         let mut config = test_config();
         config.max_spill_generations_per_table = 3;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("coherent", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -3628,7 +3628,7 @@ mod tests {
         let replacement = writer.finish(&mut blocks).unwrap().unwrap();
         let blocks = Arc::new(Mutex::new(blocks));
         let reader = SpillReader::new(&mut budget, 3, None, Some(blocks)).unwrap();
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.attach_spill(reader);
         let mut definition = make_def(label, &[("id", ColType::Int4, true)]);
         definition.persistence = RelationPersistence::Temporary;
@@ -3727,7 +3727,7 @@ mod tests {
     #[test]
     fn statement_files_exhaustion_precedes_snapshot_selection_and_registration() {
         let config = test_config();
-        let storage = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        let storage = Storage::new(&config, &mut test_budget(&config), 0).unwrap();
         let capacity = storage.spill_roots.roots.lock().unwrap().statements.len();
         let mut owners = Vec::with_capacity(capacity);
         crate::mem::guard::forbid_alloc(|| {
@@ -3763,8 +3763,8 @@ mod tests {
     #[test]
     fn statement_files_reject_a_foreign_snapshot_before_changing_execution_context() {
         let config = test_config();
-        let first = Storage::new(&config, &mut test_budget(&config)).unwrap();
-        let second = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        let first = Storage::new(&config, &mut test_budget(&config), 0).unwrap();
+        let second = Storage::new(&config, &mut test_budget(&config), 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let first_lease = first.retain_statement_snapshot(71, |_| 7).unwrap();
             let second_lease = second.retain_statement_snapshot(71, |_| 9).unwrap();
@@ -4768,12 +4768,12 @@ mod tests {
         let mut config = test_config();
         config.max_spill_generations_per_table = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("receipt", &[("id", ColType::Int4, true)]))
             .unwrap();
         let mut other_budget = test_budget(&config);
-        let other = Storage::new(&config, &mut other_budget).unwrap();
+        let other = Storage::new(&config, &mut other_budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let receipt = storage
                 .reserve_spill_generation(
@@ -5486,7 +5486,7 @@ mod tests {
         config.query_workspace_slots = 1;
         config.max_spill_generations_per_table = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("query_roots", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -5532,7 +5532,7 @@ mod tests {
     fn retained_object_rows_preserve_scan_capacity_and_reuse_only_after_last_reader() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("source_capacity", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -5608,7 +5608,7 @@ mod tests {
         let mut config = test_config();
         config.max_spill_generations_per_table = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "query_root_failure",
@@ -5679,7 +5679,7 @@ mod tests {
         let root = writer.finish(&mut blocks).unwrap().unwrap();
         let blocks = Arc::new(Mutex::new(blocks));
         let reader = SpillReader::new(&mut budget, 2, None, Some(blocks)).unwrap();
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.attach_spill(reader);
         let mut definition = make_def("retiring_query", &[("id", ColType::Int4, true)]);
         definition.persistence = RelationPersistence::Temporary;
@@ -5907,7 +5907,7 @@ mod tests {
         let mut config = test_config();
         config.max_spill_generations_per_table = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("retained_sst", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -5918,7 +5918,7 @@ mod tests {
         let mut too_small = SpillGenerationSnapshot::new(0);
         let mut roots = Vec::with_capacity(1);
         let mut other_budget = test_budget(&config);
-        let other = Storage::new(&config, &mut other_budget).unwrap();
+        let other = Storage::new(&config, &mut other_budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let error = too_small.capture(&storage, table).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);

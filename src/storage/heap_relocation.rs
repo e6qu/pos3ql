@@ -1080,7 +1080,7 @@ mod tests {
     fn fixture() -> (Storage, usize, RowLoc) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "heap_jobs",

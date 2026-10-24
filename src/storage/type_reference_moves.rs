@@ -1127,7 +1127,7 @@ mod tests {
         let mut config = test_config();
         config.max_catalog_versions_per_object = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let prior = UserTypeName::declaration(
             SqlName::parse("public").unwrap(),
             SqlName::parse("prior_type").unwrap(),

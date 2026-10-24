@@ -733,7 +733,7 @@ mod tests {
         config.max_catalog_versions_per_object = versions;
         config.query_workspace_slots = 1;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn create(storage: &mut Storage, source: NamedTypeSlot) -> Result<usize, SqlError> {

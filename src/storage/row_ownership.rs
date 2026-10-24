@@ -382,7 +382,7 @@ mod tests {
         config.max_prepared_transactions = 0;
         config.max_row_versions_per_row = 1;
         let mut budget = test_budget(&config);
-        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let mut storage = super::super::Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def("owner_first", &[("id", ColType::Int4, false)]))
             .unwrap();

@@ -338,7 +338,7 @@ mod tests {
     fn fixture() -> (Storage, usize, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def("cleanup_first", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -665,7 +665,7 @@ mod tests {
         config.table_rows = 1024;
         config.large_object_pages = 2048;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "cleanup_deletions",
@@ -1057,7 +1057,7 @@ mod tests {
         config.table_rows = 128;
         config.large_object_pages = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("bounded_deleted", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 3;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "pressure_during_scan",
@@ -1330,7 +1330,7 @@ mod tests {
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("one_history_slot", &[("id", ColType::Int4, true)]))
             .unwrap();

@@ -3674,7 +3674,7 @@ impl Engine {
                     ))
                 })?;
         }
-        let mut storage = Storage::new(config, budget)?;
+        let mut storage = Storage::new(config, budget, datetime::now_micros())?;
         storage.configure_collation(config, budget)?;
         storage.load_extension_packages(config)?;
         let temporary_spiller = (config.temporary_spill_bytes != 0)

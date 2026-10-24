@@ -354,7 +354,7 @@ mod tests {
     fn fixture() -> (Storage, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("statement_lease", &[("id", ColType::Int4, true)]))
             .unwrap();

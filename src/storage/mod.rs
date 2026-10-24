@@ -13668,8 +13668,7 @@ pub(crate) struct SharedStatisticsResetTimes {
 }
 
 impl SharedStatisticsResetTimes {
-    fn new() -> Self {
-        let now = crate::sql::datetime::now_micros();
+    fn new(now: i64) -> Self {
         Self {
             archiver: now,
             background_writer: now,
@@ -18347,7 +18346,11 @@ impl Storage {
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
-    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, StorageSetupError> {
+    pub(crate) fn new(
+        config: &Config,
+        budget: &mut Budget,
+        initial_statistics_micros: i64,
+    ) -> Result<Self, StorageSetupError> {
         let catalog_origin = type_references::CatalogOrigin::new()?;
         budget.draw(
             size_of::<type_references::CatalogOrigin>(),
@@ -19239,7 +19242,7 @@ impl Storage {
                 databases: database_cumulative_statistics,
                 functions: function_cumulative_statistics,
                 function_transactions: function_transaction_statistics,
-                reset_times: SharedStatisticsResetTimes::new(),
+                reset_times: SharedStatisticsResetTimes::new(initial_statistics_micros),
             }),
             temporary_transactions,
             tablespaces: Mutex::new(tablespaces),
@@ -51599,7 +51602,7 @@ mod tests {
     fn visible_row_heap_ownership_statistics_exhaustion_reverts_pending_append() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "write_statistics",
@@ -51645,7 +51648,7 @@ mod tests {
     fn visible_row_heap_ownership_pins_before_metadata_owner_releases() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("pinned", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -51708,7 +51711,7 @@ mod tests {
     fn visible_row_heap_ownership_committed_snapshot_freezes_selected_lsn() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "committed_snapshot",
@@ -51789,7 +51792,7 @@ mod tests {
     fn visible_row_heap_ownership_same_command_versions_and_undo_reject_reuse() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("same_command", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -51892,7 +51895,7 @@ mod tests {
     fn visible_row_heap_ownership_deferred_snapshot_survives_relocation_and_rejects_reuse() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("snapshot", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -52083,7 +52086,7 @@ mod tests {
     fn committed_image_obeys_an_lsn_snapshot() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.heap.append(24).unwrap();
         let location = RowLoc::test(12, 4);
         let state = RowState::committed_only_at(location, 42);
@@ -52291,7 +52294,7 @@ mod tests {
     fn row_read_ownership_walk_releases_guards_on_break_and_error() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.heap.append(4).unwrap();
         storage.tables[0]
             .rows
@@ -52341,7 +52344,7 @@ mod tests {
             config.large_object_pages = pages;
             let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
             let mut budget = Budget::new(bytes);
-            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             storage.configure_collation(&config, &mut budget).unwrap();
             assert_eq!(budget.remaining(), 0);
             assert!(size_of::<RowMap>() > size_of::<RowEntries>());
@@ -52398,7 +52401,7 @@ mod tests {
         assert_send_sync::<Mutex<FixedVec<SystemSetting>>>();
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let names = ["setting_a", "setting_b", "setting_c", "setting_d"];
         let barrier = std::sync::Barrier::new(names.len() + 1);
         std::thread::scope(|scope| {
@@ -52508,7 +52511,7 @@ mod tests {
         let mut config = test_config();
         config.max_tables = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let definition = make_def("lifecycle_original", &[("id", ColType::Int4, true)]);
             let slot = storage.create_table_in(definition, 7).unwrap();
@@ -52567,7 +52570,7 @@ mod tests {
         let mut config = test_config();
         config.max_value_indexes = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("owned_cache", &[("id", ColType::Int4, true)]);
         definition.columns[0].unique = true;
         let table = storage.create_table(definition).unwrap();
@@ -52596,7 +52599,7 @@ mod tests {
         let mut config = test_config();
         config.max_value_indexes = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def(
             "cache_candidate",
             &[("id", ColType::Int4, true), ("other", ColType::Int4, true)],
@@ -52639,7 +52642,7 @@ mod tests {
         let mut config = test_config();
         config.max_value_indexes = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut retained = make_def("retained", &[("id", ColType::Int4, true)]);
         retained.columns[0].unique = true;
         let retained_slot = storage.create_table(retained).unwrap();
@@ -52690,7 +52693,7 @@ mod tests {
     fn catalog_creation_role_dependencies_wait_for_pending_owners() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let (role, _) = storage
             .create_role(
                 SqlName::parse("pending_owner").unwrap(),
@@ -52759,7 +52762,7 @@ mod tests {
     fn catalog_creation_role_install_rejects_identity_conflicts_and_pending_sources() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let name = SqlName::parse("installed_actor").unwrap();
         let (slot, _) = storage
             .create_role(name, RoleAttributes::ORDINARY, 7)
@@ -52809,7 +52812,7 @@ mod tests {
     fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .restore_role_identity_sequence(i32::MAX as u64)
             .unwrap();
@@ -52837,7 +52840,7 @@ mod tests {
     fn catalog_creation_known_name_requires_an_authenticated_identity() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let actor = SessionIdentity::unauthenticated("postgres");
         let _actor = crate::sql::eval::funcs::system::enter_current_user(actor);
         crate::mem::guard::forbid_alloc(|| {
@@ -52854,7 +52857,7 @@ mod tests {
     fn catalog_creation_role_identity_survives_rename_but_rejects_slot_reuse() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let name = SqlName::parse("source_actor").unwrap();
         let renamed = SqlName::parse("renamed_actor").unwrap();
         let slot = storage
@@ -52912,9 +52915,9 @@ mod tests {
     fn catalog_creation_role_identity_rejects_rollback_and_foreign_storage() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut other_budget = test_budget(&config);
-        let other = Storage::new(&config, &mut other_budget).unwrap();
+        let other = Storage::new(&config, &mut other_budget, 0).unwrap();
         let name = SqlName::parse("aborted_actor").unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let (slot, prior) = storage
@@ -52959,7 +52962,7 @@ mod tests {
     fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let wrapper = storage
             .create_foreign_wrapper(
                 foreign::ForeignDataWrapperDefinition {
@@ -53043,7 +53046,7 @@ mod tests {
     fn catalog_creation_replay_uses_its_explicit_owner_without_a_session_actor() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let _actor = crate::sql::eval::funcs::system::enter_current_user(
             SessionIdentity::unauthenticated("missing_creator"),
         );
@@ -53066,7 +53069,7 @@ mod tests {
     fn cluster_metadata_table_names_reserve_only_within_their_database() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let prior_database = current_database();
             crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
@@ -53119,7 +53122,7 @@ mod tests {
     fn cluster_metadata_system_settings_reserve_reset_names_and_reject_truncation() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let name = SqlName::parse("pending_setting").unwrap();
             let (slot, prior) = storage
@@ -53224,7 +53227,7 @@ mod tests {
         let mut config = test_config();
         config.max_prepared_transactions = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut arena = Arena::new(&mut budget, "prepared reader", 4096).unwrap();
         let initial = [
             test_prepared_catalog_entry(10, "first", 1),
@@ -53295,7 +53298,7 @@ mod tests {
         let mut config = test_config();
         config.max_prepared_transactions = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let tiny_arena = Arena::new(&mut budget, "small prepared snapshot", 8).unwrap();
         let mut tiny_snapshot = FixedVec::new(&mut budget, "small prepared roster", 1).unwrap();
         let initial = [
@@ -53404,7 +53407,7 @@ mod tests {
         let mut config = test_config();
         config.max_prepared_transactions = 0;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let entry = test_prepared_catalog_entry(10, "disabled", 1);
             assert_eq!(
@@ -53444,7 +53447,7 @@ mod tests {
         let mut config = test_config();
         config.max_databases = 3 + WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let barrier = std::sync::Barrier::new(WORKERS + 1);
         let finished = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -53558,7 +53561,7 @@ mod tests {
         let mut config = test_config();
         config.max_databases = 7;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let first = storage
                 .reserve_database(None, test_database_definition("pending_database"), 0, 11)
@@ -53664,7 +53667,7 @@ mod tests {
         config.max_schemas = 5;
         config.max_spill_generations_per_table = 3;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let source = storage
             .create_table(make_def("saved_orders", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -53755,7 +53758,7 @@ mod tests {
         config.max_databases = 4;
         config.max_schemas = 5;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for committed in [false, true] {
                 let slot = storage
@@ -53883,7 +53886,7 @@ mod tests {
         let mut config = test_config();
         config.max_indexes = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -53972,7 +53975,7 @@ mod tests {
         let mut config = test_config();
         config.max_indexes = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -54039,7 +54042,7 @@ mod tests {
     fn index_rename_checks_only_its_database() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -54135,7 +54138,7 @@ mod tests {
         config.max_rules = WORKERS;
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
         let barrier = std::sync::Barrier::new(WORKERS + 1);
         let finished = std::sync::atomic::AtomicUsize::new(0);
@@ -54261,7 +54264,7 @@ mod tests {
         config.max_rules = 1;
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(make_def("rule_target", &[])).unwrap();
         let definition = RuleDefinition {
             name: SqlName::parse("test_rule").unwrap(),
@@ -54325,7 +54328,7 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("policy_target", &[]))
             .unwrap();
@@ -54460,7 +54463,7 @@ mod tests {
         config.max_stored_query_dependencies_per_object = 1;
         config.max_catalog_versions_per_object = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("test_view").unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -54602,7 +54605,7 @@ mod tests {
         config.max_views = 3;
         config.max_rules = 3;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("test_view").unwrap();
         storage
@@ -54652,7 +54655,7 @@ mod tests {
         config.max_rules = 2;
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(make_def("rule_target", &[])).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("test_view").unwrap();
@@ -54714,7 +54717,7 @@ mod tests {
         config.max_views = 2;
         config.max_rules = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let old = SqlName::parse("old_view").unwrap();
         let new = SqlName::parse("new_view").unwrap();
@@ -54776,7 +54779,7 @@ mod tests {
         config.max_views = 2;
         config.max_rules = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let schema = SqlName::parse("public").unwrap();
         let name = SqlName::parse("test_view").unwrap();
         let publication_slot = storage
@@ -54833,7 +54836,7 @@ mod tests {
     fn table_serial_state_concurrent_advances_are_unique_and_allocation_free() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("serial_counter", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -54872,7 +54875,7 @@ mod tests {
     fn table_serial_state_staging_preserves_later_advances_and_retry_positions() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("serial_staging", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -54907,7 +54910,7 @@ mod tests {
     fn table_serial_state_slot_reuse_and_replay_do_not_inherit_staging() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("old_serial", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -54944,7 +54947,7 @@ mod tests {
     fn table_serial_state_range_errors_leave_counters_and_staging_unchanged() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("serial_limits", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -54999,7 +55002,7 @@ mod tests {
     fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("original", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -55093,8 +55096,8 @@ mod tests {
         let config = test_config();
         let mut first_budget = test_budget(&config);
         let mut second_budget = test_budget(&config);
-        let mut first = Storage::new(&config, &mut first_budget).unwrap();
-        let mut second = Storage::new(&config, &mut second_budget).unwrap();
+        let mut first = Storage::new(&config, &mut first_budget, 0).unwrap();
+        let mut second = Storage::new(&config, &mut second_budget, 0).unwrap();
         let table = first
             .create_table(make_def("first", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -55119,7 +55122,7 @@ mod tests {
     fn table_definition_images_keep_their_pool_alive_after_storage_drops() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("retained", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -55136,7 +55139,7 @@ mod tests {
     fn table_definition_images_exhaustion_preserves_readers_and_releases_capacity() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("bounded", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -55175,7 +55178,7 @@ mod tests {
     fn table_definition_images_concurrent_owners_reuse_cells_without_allocation() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("shared", &[("id", ColType::Int8, true)]))
             .unwrap();
@@ -55331,7 +55334,7 @@ mod tests {
         config.max_foreign_sessions = 3;
         let expected_budget = config.memtable_bytes + Storage::extra_budget_bytes(&config);
         let mut budget = Budget::new(expected_budget);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.configure_collation(&config, &mut budget).unwrap();
 
         assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
@@ -55569,7 +55572,7 @@ mod tests {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let identities = &storage.transaction_identities;
         std::thread::scope(|scope| {
             for worker in 0..4u64 {
@@ -55617,7 +55620,7 @@ mod tests {
         config.max_connections = 1;
         config.max_prepared_transactions = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let first = storage.start_transaction_identity().unwrap();
             storage.assign_transaction_identity(first);
@@ -55666,7 +55669,7 @@ mod tests {
         config.max_connections = 2;
         config.max_prepared_transactions = 0;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         std::thread::scope(|scope| {
             let mut workers = Vec::with_capacity(3);
             for worker in 0..3 {
@@ -55715,7 +55718,7 @@ mod tests {
         config.max_connections = 1;
         config.max_prepared_transactions = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let previous = crate::sql::execution_connection_id();
         crate::sql::set_execution_connection_id(42);
         crate::mem::guard::forbid_alloc(|| {
@@ -55770,7 +55773,7 @@ mod tests {
     fn relation_publication_rule_history_rejects_foreign_owners_and_restores_savepoints() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(make_def("rule_history", &[])).unwrap();
         let target = RuleTarget::Table(table as u16);
         let first = RuleDefinition {
@@ -55840,7 +55843,7 @@ mod tests {
     fn relation_publication_retained_definition_does_not_block_another_table() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table_in(make_def("selected", &[]), 7)
             .unwrap();
@@ -55885,7 +55888,7 @@ mod tests {
         config.max_prepared_transactions = 0;
         config.max_views = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .lock_table(7, 0, TableLockMode::AccessExclusive, false)
@@ -55955,7 +55958,7 @@ mod tests {
         use crate::sql::ast::TableLockMode;
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(make_def("lock_table", &[])).unwrap();
         let publication_view = storage
             .create_view(
@@ -56068,7 +56071,7 @@ mod tests {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let locks = &storage.locks;
         std::thread::scope(|scope| {
             for worker in 0..4u32 {
@@ -56113,7 +56116,7 @@ mod tests {
         let mut config = test_config();
         config.max_connections = 4;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let backends = &storage.backend_state;
         std::thread::scope(|scope| {
             for worker in 0..4i32 {
@@ -56170,7 +56173,7 @@ mod tests {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let temporary = &storage.temporary_transactions;
         let foreign = &storage.foreign_statement_contexts[0];
         std::thread::scope(|scope| {
@@ -56311,7 +56314,7 @@ mod tests {
         config.max_role_memberships = WORKERS;
         config.max_role_settings = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for (worker, worker_name) in names.iter().copied().enumerate() {
@@ -56439,7 +56442,7 @@ mod tests {
         config.max_operator_families = WORKERS;
         config.max_operator_classes = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for (worker, worker_name) in names.iter().copied().enumerate() {
@@ -56572,7 +56575,7 @@ mod tests {
         config.max_enum_labels_per_type = WORKERS;
         config.max_composites = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -56673,7 +56676,7 @@ mod tests {
         let mut config = test_config();
         config.max_routines = 4;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         {
             let mut catalog = storage.routines.lock().unwrap();
             for slot in 1..4 {
@@ -56749,7 +56752,7 @@ mod tests {
         let mut config = test_config();
         config.max_routines = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -56833,7 +56836,7 @@ mod tests {
         let mut config = test_config();
         config.max_casts = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -56903,7 +56906,7 @@ mod tests {
         let mut config = test_config();
         config.max_event_triggers = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         {
             let mut routines = storage
                 .routines
@@ -57009,7 +57012,7 @@ mod tests {
         config.max_triggers = WORKERS;
         let max_tables = config.max_tables;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -57113,7 +57116,7 @@ mod tests {
         config.max_connections = WORKERS as u32;
         config.set_extended_statistics_capacity(WORKERS);
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "statistics_table",
@@ -57272,7 +57275,7 @@ mod tests {
         config.max_connections = WORKERS as u32;
         config.max_publications = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -57384,7 +57387,7 @@ mod tests {
         config.max_connections = WORKERS as u32;
         config.max_replication_slots = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -57488,7 +57491,7 @@ mod tests {
         config.max_subscriptions = WORKERS;
         config.subscription_relation_capacity = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let connection = SubscriptionConnInfo::parse(
             "host=127.0.0.1 port=1 user=test dbname=test sslmode=disable",
         )
@@ -57659,7 +57662,7 @@ mod tests {
         config.max_conversions = WORKERS;
         config.max_text_search_objects = BUILTINS + WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -57755,7 +57758,7 @@ mod tests {
         let mut config = test_config();
         config.max_large_objects = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let (owner, _) = storage
             .create_role(
                 SqlName::parse("large_object_owner").unwrap(),
@@ -57845,7 +57848,7 @@ mod tests {
         config.max_default_acl_entries = WORKERS;
         config.max_parameter_acl_entries = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let grantees = ["acl_a", "acl_b", "acl_c", "acl_d", "acl_e"].map(|name| {
             let (slot, _) = storage
                 .create_role(SqlName::parse(name).unwrap(), RoleAttributes::ORDINARY, 1)
@@ -57978,7 +57981,7 @@ mod tests {
         let mut config = test_config();
         config.max_comments = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -58044,7 +58047,7 @@ mod tests {
         config.max_roles = 4;
         config.query_workspace_slots = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let roles = &storage.role_graph_scratch[0];
         let domains = &storage.domain_graph_scratch;
         std::thread::scope(|scope| {
@@ -58402,7 +58405,7 @@ mod tests {
 
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         std::thread::scope(|scope| {
             for worker in 0..4u8 {
                 let arena = &storage.index_arena;
@@ -58440,7 +58443,7 @@ mod tests {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let snapshots = &storage.snapshots;
         std::thread::scope(|scope| {
             for worker in 0..4u32 {
@@ -58503,7 +58506,7 @@ mod tests {
         let mut config = test_config();
         config.max_brin_unsummarized_ranges_per_index = 4;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let maintenance = &storage.brin_maintenance;
         std::thread::scope(|scope| {
             for worker in 0..4 {
@@ -58542,7 +58545,7 @@ mod tests {
 
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let sequence = storage
             .create_sequence(
                 SequenceCreateSpec {
@@ -58613,7 +58616,7 @@ mod tests {
         let mut config = test_config();
         config.max_tablespaces = 2 + WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for (worker, worker_name) in names.iter().copied().enumerate() {
@@ -58773,7 +58776,7 @@ mod tests {
         let mut config = test_config();
         config.max_schemas = 3 + WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker_name in names.iter().copied() {
@@ -58930,7 +58933,7 @@ mod tests {
         ];
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let namespace = storage.find_schema("public").unwrap();
         let sequences: [usize; WORKERS] = std::array::from_fn(|worker| {
             let slot = storage
@@ -59177,7 +59180,7 @@ mod tests {
         config.max_foreign_servers = WORKERS;
         config.max_user_mappings = WORKERS;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
 
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
@@ -59452,7 +59455,7 @@ mod tests {
         config.max_stored_query_dependencies_per_object = 2;
         config.max_catalog_versions_per_object = 2;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let pending_slots =
             core::array::from_fn::<_, WORKERS, _>(|_| std::sync::atomic::AtomicU32::new(u32::MAX));
         let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
@@ -59565,7 +59568,7 @@ mod tests {
         let mut config = test_config();
         config.max_policies = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let target = storage
             .create_table(make_def("policy_target", &[]))
             .unwrap();
@@ -59682,7 +59685,7 @@ mod tests {
         let mut config = test_config();
         config.max_materialized_views = WORKERS;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         for name in [
             "materialized_a",
             "materialized_b",
@@ -59772,7 +59775,7 @@ mod tests {
 
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let statistics = &storage.cumulative_statistics;
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -59810,7 +59813,7 @@ mod tests {
         config.foreign_receive_bytes = 256;
         config.foreign_send_bytes = 128;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         for _ in 0..config.max_foreign_sessions {
             let client = crate::pg::replication_client::ReplicationClient::new_unbound(
                 &mut budget,
@@ -59916,7 +59919,7 @@ mod tests {
     fn user_type_identity_is_atomic() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut column = ColumnMeta::EMPTY;
         column.ctype = ColType::Enum(0);
         assert_eq!(
@@ -59943,7 +59946,7 @@ mod tests {
     fn create_find_drop_reuse() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut s = Storage::new(&config, &mut budget).unwrap();
+        let mut s = Storage::new(&config, &mut budget, 0).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
         let index = s.create_table(def).unwrap();
         assert_eq!(s.find_table("public", "t1"), Some(index));
@@ -59969,7 +59972,7 @@ mod tests {
     fn published_generation_cleanup_keeps_newer_table_writes_dirty() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let slot = storage
             .create_table(make_def(
                 "checkpoint_generation",
@@ -60022,7 +60025,7 @@ mod tests {
     fn replay_table_rewrite_marker_must_be_paired_exactly_once() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_table(make_def("t", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60113,7 +60116,7 @@ mod tests {
     fn shared_table_creation_wait_does_not_reserve_row_reads_or_publication() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("independent_rows", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60193,7 +60196,7 @@ mod tests {
         let mut config = test_config();
         config.max_tables = 5;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let names = ["parallel_a", "parallel_b", "parallel_c", "parallel_d"];
         let ready = std::sync::Barrier::new(5);
         let storage = &storage;
@@ -60252,7 +60255,7 @@ mod tests {
         let mut config = test_config();
         config.max_tables = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let old = storage
             .create_table(make_def("retired_creation", &[]))
             .unwrap();
@@ -60291,7 +60294,7 @@ mod tests {
         let mut config = test_config();
         config.max_value_indexes = 1;
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut def = make_def(
                 "retry_creation",
@@ -60329,7 +60332,7 @@ mod tests {
     fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage.create_table(make_def("held_cleanup", &[])).unwrap();
         let second = storage
             .create_table(make_def("other_cleanup", &[]))
@@ -60428,7 +60431,7 @@ mod tests {
         const ROWS: usize = 128;
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def("retiring_rows", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60577,7 +60580,7 @@ mod tests {
     fn owned_row_lookup_selects_pending_history_and_current_after_retirement() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("lookup_old", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60668,7 +60671,7 @@ mod tests {
     fn owned_heap_rows_survive_table_slot_reuse_and_storage_teardown() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("old_heap", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60739,7 +60742,7 @@ mod tests {
     fn owned_heap_rows_compaction_rotation_preserves_versions_and_busy_retry() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("pinned_heap", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60841,7 +60844,7 @@ mod tests {
     fn owned_heap_rows_failed_consumers_release_ownership_and_check_identity() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("error_heap", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -60903,7 +60906,7 @@ mod tests {
     fn row_heap_ownership_retained_images_survive_compaction_and_arena_exhaustion() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let _ = storage.heap.append(4).unwrap();
         let (location, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
@@ -60960,7 +60963,7 @@ mod tests {
         for retained in [false, true] {
             let config = test_config();
             let mut budget = test_budget(&config);
-            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let _ = storage.heap.append(4).unwrap();
             let (empty, _) = storage.heap.append(0).unwrap();
             let (location, bytes) = storage.heap.append(4).unwrap();
@@ -61010,7 +61013,7 @@ mod tests {
     fn row_heap_ownership_compaction_preflight_preserves_bytes_and_handles() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let (_, bytes) = storage.heap.append(8).unwrap();
         bytes.copy_from_slice(b"original");
         storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
@@ -61035,7 +61038,7 @@ mod tests {
         for retained in [false, true] {
             let config = test_config();
             let mut budget = test_budget(&config);
-            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let (_, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"dead");
             let (history, bytes) = storage.heap.append(4).unwrap();
@@ -61141,7 +61144,7 @@ mod tests {
     fn row_heap_generation_stale_publication_and_preflight_preserve_all_state() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let (_, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"dead");
         let (old, bytes) = storage.heap.append(4).unwrap();
@@ -61199,7 +61202,7 @@ mod tests {
         let mut config = test_config();
         config.memtable_bytes = 64;
         let mut budget = test_budget(&config);
-        let mut s = Storage::new(&config, &mut budget).unwrap();
+        let mut s = Storage::new(&config, &mut budget, 0).unwrap();
         let (loc, slice) = s.heap.append(10).unwrap();
         slice.copy_from_slice(b"0123456789");
         assert_eq!(&*s.heap.get(loc).unwrap(), b"0123456789");
@@ -61211,7 +61214,7 @@ mod tests {
     fn heap_compaction_preserves_rows_of_a_pending_create() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let slot = storage
             .create_table_in(make_def("pending", &[("id", ColType::Int4, true)]), 7)
             .unwrap();
@@ -61273,7 +61276,7 @@ mod tests {
         let mut config = test_config();
         config.max_replication_slots = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_replication_slot(
                 ReplicationSlotName::parse("changes").unwrap(),

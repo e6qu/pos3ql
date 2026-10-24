@@ -559,7 +559,7 @@ mod tests {
     fn fixture() -> (Storage, Budget, usize) {
         let config = super::super::tests::test_config();
         let mut budget = super::super::tests::test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(super::super::tests::make_def(
                 "statistics_owner",
@@ -662,7 +662,7 @@ mod tests {
         let mut config = super::super::tests::test_config();
         config.max_catalog_versions_per_object = 2;
         let mut budget = super::super::tests::test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(super::super::tests::make_def(
                 "statistics_limits",

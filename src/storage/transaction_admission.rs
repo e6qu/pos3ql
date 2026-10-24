@@ -177,7 +177,20 @@ mod tests {
         config.table_rows = 2;
         config.txn_rows = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let reset = storage.shared_statistics_reset_times();
+        assert_eq!(
+            [
+                reset.archiver,
+                reset.background_writer,
+                reset.checkpointer,
+                reset.io,
+                reset.recovery_prefetch,
+                reset.wal
+            ],
+            [0; 6]
+        );
+        assert_eq!(reset.slru, [0; 8]);
         let tables = ["admission_orders", "admission_invoices"].map(|name| {
             let table = storage
                 .create_table(make_def(name, &[("total", ColType::Int4, true)]))

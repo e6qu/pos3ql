@@ -648,7 +648,7 @@ mod tests {
     fn fixture() -> (Storage, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("retained_walk", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -871,7 +871,7 @@ mod tests {
     fn checkpoint_fixture() -> (Storage, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("checkpoint_walk", &[("id", ColType::Int4, true)]);
         definition.columns[0].primary = true;
         definition.columns[0].unique = true;

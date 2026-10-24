@@ -489,7 +489,7 @@ mod tests {
     fn fixture() -> (Storage, usize, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def(
                 "first_edit",
@@ -604,7 +604,7 @@ mod tests {
         let mut config = test_config();
         config.max_catalog_versions_per_object = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "composed_edit",
@@ -1082,7 +1082,7 @@ mod tests {
         let mut config = test_config();
         config.max_ddl_per_transaction = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "owned_edit",

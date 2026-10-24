@@ -579,7 +579,7 @@ mod tests {
 
     fn fixture(config: &Config) -> (Storage, usize) {
         let mut budget = test_budget(config);
-        let mut storage = Storage::new(config, &mut budget).unwrap();
+        let mut storage = Storage::new(config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("publication", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -1828,7 +1828,7 @@ mod tests {
     fn shared_row_publication_admission_preserves_pending_create_and_drop_rollback() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let table = storage
                 .create_table_in(

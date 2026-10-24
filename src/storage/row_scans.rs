@@ -290,7 +290,7 @@ mod tests {
         assert_send_sync::<CapturedRowScan<'static>>();
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("captured_old", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -417,7 +417,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "captured_progress",
@@ -508,7 +508,7 @@ mod tests {
     fn analyze_snapshot_nesting_and_failed_capture_restore_visibility_and_owners() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("analyze_snapshot", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -565,7 +565,7 @@ mod tests {
         let _clear = ClearDeadline;
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "captured_deadline",
@@ -635,7 +635,7 @@ mod tests {
     fn captured_resident_byte_scans_release_failed_capture_and_callbacks() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "captured_capacity",

@@ -1024,7 +1024,7 @@ mod tests {
         let (versions, rows) = owners();
         let config = super::super::tests::test_config();
         let mut budget = super::super::tests::test_budget(&config);
-        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let mut storage = super::super::Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(super::super::tests::make_def(
                 "immutable_row",

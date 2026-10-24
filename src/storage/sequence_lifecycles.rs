@@ -880,7 +880,7 @@ mod tests {
         let mut config = test_config();
         config.max_sequences = 1;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn create(storage: &mut Storage, name: &str, transaction: u32) -> SequenceChange {

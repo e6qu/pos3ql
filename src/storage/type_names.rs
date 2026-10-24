@@ -323,7 +323,7 @@ mod tests {
     fn fixture() -> Storage {
         let config = test_config();
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn create(

@@ -32,6 +32,7 @@ pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod definition_pool;
 mod index_bindings;
+mod key_preparation;
 use index_bindings::{IndexTableBinding, PendingIndexTable};
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
@@ -3684,7 +3685,7 @@ impl SelectedValueIndex {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EnforcerMetadata {
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
@@ -32565,12 +32566,25 @@ impl Storage {
         rewritten: bool,
         selected: RowRead<'_>,
     ) -> Result<(), SqlError> {
-        let table = &self.tables[table_index];
+        let Some(prepared) = self.prepare_committed_row(table_index, rowid, txid, rewritten, selected)? else {
+            return Ok(());
+        };
+        self.publish_prepared_row(table_index, rowid, txid, commit_lsn, prepared)
+    }
+
+    fn prepare_committed_row(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        rewritten: bool,
+        selected: RowRead<'_>,
+    ) -> Result<Option<key_preparation::PreparedCommittedRow>, SqlError> {
         let Some(pending) = selected
             .pending_last()
             .filter(|pending| pending.txid == txid)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let head = selected
             .pending_head_identity()
@@ -32584,21 +32598,33 @@ impl Storage {
             )),
         )?;
         drop(selected);
-        let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        let count = if !rewritten {
-            match image {
-                Some(image) => self.row_enforcer_hashes(table_index, rowid, image, &mut inserts)?,
-                None => 0,
-            }
+        let prepared_keys = if !rewritten {
+            Some(key_preparation::PreparedRowKeys::capture(self, table_index, rowid, image)?)
         } else {
             drop(image);
-            0
+            None
         };
 
-        let (snapshots, mut publication, generations, mut versions, mut rows) =
+        Ok(Some(key_preparation::PreparedCommittedRow { head, keys: prepared_keys }))
+    }
+
+    fn publish_prepared_row(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        commit_lsn: u64,
+        prepared: key_preparation::PreparedCommittedRow,
+    ) -> Result<(), SqlError> {
+        let table = &self.tables[table_index];
+        let key_preparation::PreparedCommittedRow { head, keys: prepared_keys } = prepared;
+        let rewritten = prepared_keys.is_none();
+
+        let (snapshots, definition, mut publication, generations, mut versions, mut rows) =
             row_ownership::acquire(|| {
                 Ok((
                     row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
+                    table.definition.try_read_for_batch()?,
                     row_ownership::try_mutex(
                         &table.publication,
                         "table publication lock poisoned",
@@ -32608,6 +32634,10 @@ impl Storage {
                     table.rows.try_write_for_batch()?,
                 ))
             });
+        if let Some(prepared) = &prepared_keys {
+            prepared.validate_definition(self, &definition)?;
+            prepared.validate_bindings(&publication)?;
+        }
         let n_enforcers = publication.n_enforcers;
         let generation = publication.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
@@ -32683,7 +32713,8 @@ impl Storage {
                 }
                 let mut index = enforcer.cache.write();
                 index.remove_rowid(rowid);
-                for &(_, hash) in inserts[..count]
+                let prepared = prepared_keys.as_ref().expect("ordinary publication prepared keys");
+                for &(_, hash) in prepared.hashes[..prepared.count]
                     .iter()
                     .filter(|&&(candidate, _)| candidate == binding)
                 {
@@ -32718,6 +32749,7 @@ impl Storage {
     /// all non-NULL, writing `(enforcer_index, hash)` for each into `out`.
     /// NULL keys remain in durable ordered generations but cannot satisfy an
     /// equality probe, so the resident exact map deliberately omits them.
+    #[cfg(test)]
     fn row_enforcer_hashes(
         &self,
         table_index: usize,
@@ -32725,9 +32757,10 @@ impl Storage {
         home: impl Into<RowByteRead>,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let bindings = self.tables[table_index].enforcers();
         let count = bindings.iter().take_while(|entry| entry.is_some()).count();
-        self.row_enforcer_hashes_for(table_index, rowid, home, &bindings[..count], out)
+        self.row_enforcer_hashes_for(table_index, rowid, home, &selection, &bindings[..count], out)
     }
 
     fn row_enforcer_hashes_for(
@@ -32735,11 +32768,14 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = self.tables[table_index].definition().schema(&mut schema);
+        let n_columns = selection.definition().schema(&mut schema);
+        let home = home.into();
+        selection.validate_row(&home)?;
         let arena = self
             .index_arena
             .lock()
@@ -32750,7 +32786,7 @@ impl Storage {
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
             self.values_enforcer_hashes_for(
                 &arena,
-                table_index,
+                selection,
                 bindings,
                 &values[..n_columns],
                 out,
@@ -32765,7 +32801,7 @@ impl Storage {
     fn values_enforcer_hashes_for(
         &self,
         arena: &Arena,
-        table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
         values: &[Datum],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
@@ -32775,7 +32811,7 @@ impl Storage {
             let selected = selected.as_ref().expect("candidate binding");
             self.with_value_binding_values_for(
                 arena,
-                table_index,
+                selection,
                 selected,
                 values,
                 |key, _, enforcer| {
@@ -32811,9 +32847,14 @@ impl Storage {
         home: impl Into<RowByteRead>,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = &self.tables[table_index];
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
+        let enforcer = self.tables[table_index].enforcer(binding).ok_or_else(|| {
+            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
+        })?;
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = table.definition().schema(&mut schema);
+        let n_columns = selection.definition().schema(&mut schema);
+        let home = home.into();
+        selection.validate_row(&home)?;
         let arena = self
             .index_arena
             .lock()
@@ -32822,10 +32863,10 @@ impl Storage {
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.with_value_binding_values(
+            self.with_value_binding_values_for(
                 &arena,
-                table_index,
-                binding,
+                &selection,
+                &enforcer,
                 &values[..n_columns],
                 visit,
             )
@@ -32844,43 +32885,31 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        self.with_value_binding_values_for(arena, table_index, &enforcer, values, visit)
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
+        let enforcer = self.tables[table_index].enforcer(binding).ok_or_else(|| {
+            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
+        })?;
+        self.with_value_binding_values_for(arena, &selection, &enforcer, values, visit)
     }
 
     fn with_value_binding_values_for<R>(
         &self,
         arena: &Arena,
-        table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         enforcer: &Enforcer,
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = &self.tables[table_index];
         let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
         if let Some(created_at) = enforcer.index_created_at {
-            index = self
-                .index_catalog()
-                .iter()
-                .find(|index| {
-                    index.ddl_state != CatalogDdlState::Absent
-                        && index.created_at == created_at
-                        && index.database == table.database()
-                })
-                .copied()
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "physical index binding has no catalog definition"
-                    )
-                })?;
+            index = selection.index(self, created_at)?;
             if let Some(source) = index.predicate {
                 let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     enforcer.evaluation_txid,
-                    &table.definition(),
+                    selection.definition(),
                     values,
                     predicate,
                     arena,
@@ -32898,7 +32927,7 @@ impl Storage {
             key = crate::sql::exec::constraints::index_key_values(
                 self,
                 enforcer.evaluation_txid,
-                &table.definition(),
+                selection.definition(),
                 values,
                 &index.columns[..index.n_cols],
                 &expressions[..index.n_cols],
@@ -34599,21 +34628,20 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let new_dirty_lsn = self.lsn().saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
         let (published, n_published, expected_generation) = {
-            let mut publication = self.tables[table_index].publication();
-            let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] =
-                core::array::from_fn(|index| {
-                    publication.enforcers[index]
-                        .as_ref()
-                        .map(|entry| entry.metadata)
-                });
+            let (definition, publication) = row_ownership::acquire(|| {
+                Ok((
+                    self.tables[table_index].definition.try_read_for_batch()?,
+                    row_ownership::try_mutex(&self.tables[table_index].publication, "table publication lock poisoned")?,
+                ))
+            });
+            selection.validate_definition(self, &definition)?;
             let count = publication.n_enforcers;
-            publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
-            publication.n_enforcers = 0;
-            (metadata, count, publication.generation)
+            (publication.enforcers.clone(), count, publication.generation)
         };
         #[derive(Clone, Copy)]
         struct WantedBinding {
@@ -34646,7 +34674,7 @@ impl Storage {
             )
         };
         {
-            let def = &*self.tables[table_index].definition();
+            let def = selection.definition();
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
                     if n_want == MAX_VALUE_ENFORCERS {
@@ -34679,16 +34707,10 @@ impl Storage {
         // share one enforcer: PostgreSQL permits redundant indexes, but a
         // second copy cannot improve the equality probe and would waste a
         // startup-reserved pool slot.
-        let table_schema = {
-            let definition = self.tables[table_index].definition();
-            definition.schema
-        };
-        let table_name = {
-            let definition = self.tables[table_index].definition();
-            definition.name
-        };
-        let table_database = self.tables[table_index].database();
-        let table_definition = *self.tables[table_index].definition();
+        let table_definition = selection.definition();
+        let table_schema = table_definition.schema;
+        let table_name = table_definition.name;
+        let table_database = current_database();
         for index in self
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
@@ -34700,6 +34722,7 @@ impl Storage {
             })
             .map(|(_, index)| index)
         {
+            selection.index(self, index.created_at)?;
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
                 .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
@@ -34839,7 +34862,7 @@ impl Storage {
                             == wanted.collations[..wanted.n_columns]
                         && enforcer.columns[..enforcer.n_cols] == wanted.columns[..wanted.n_columns]
                 })
-                .copied();
+                .map(|enforcer| enforcer.metadata);
             candidate[w] = Some(Enforcer {
                 cache,
                 metadata: EnforcerMetadata {
@@ -34860,9 +34883,17 @@ impl Storage {
                 },
             });
         }
-        self.populate_enforcers(table_index, &candidate[..n_want])?;
-        let mut publication = self.tables[table_index].publication();
-        if publication.generation != expected_generation {
+        self.populate_enforcers(table_index, &selection, &candidate[..n_want])?;
+        let (definition, mut publication) = row_ownership::acquire(|| {
+            Ok((
+                self.tables[table_index].definition.try_read_for_batch()?,
+                row_ownership::try_mutex(&self.tables[table_index].publication, "table publication lock poisoned")?,
+            ))
+        });
+        selection.validate_definition(self, &definition)?;
+        if publication.generation != expected_generation
+            || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+        {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table changed while its value caches were being built"
@@ -34877,6 +34908,7 @@ impl Storage {
     fn populate_enforcers(
         &self,
         table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
     ) -> Result<(), SqlError> {
         let n_enf = bindings.len();
@@ -34924,12 +34956,12 @@ impl Storage {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             let count =
-                self.row_enforcer_hashes_for(table_index, rowid, home, bindings, &mut buf)?;
+                self.row_enforcer_hashes_for(table_index, rowid, home, selection, bindings, &mut buf)?;
             Ok(insert_hashes(rowid, lsn, &buf[..count]))
         })?;
         if overlay.is_continue() {
             let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let n_columns = self.tables[table_index].definition().schema(&mut schema);
+            let n_columns = selection.definition().schema(&mut schema);
             let dependency_mask = bindings
                 .iter()
                 .flatten()
@@ -34964,7 +34996,7 @@ impl Storage {
                     };
                     let hashes = self.values_enforcer_hashes_for(
                         &arena,
-                        table_index,
+                        selection,
                         bindings,
                         values,
                         &mut buf,

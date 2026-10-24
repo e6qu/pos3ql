@@ -19,7 +19,7 @@ pub(crate) struct TableDefinitionTarget {
 }
 
 impl TableDefinitionTarget {
-    fn matches_definition(
+    pub(super) fn matches_definition(
         self,
         storage: &Storage,
         definition: &super::table_definitions::DefinitionState,

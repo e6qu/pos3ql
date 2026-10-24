@@ -1,0 +1,43 @@
+name: Key preparation focus
+
+on:
+  push:
+    branches: [coherent-statement-capture]
+  workflow_dispatch:
+
+concurrency:
+  group: key-preparation-focus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: key-preparation-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            coherent-readers-${{ runner.os }}-
+            ${{ runner.os }}-cargo-
+      - name: Format and retain exact patch
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/format.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: key-preparation-format
+          path: ${{ runner.temp }}/format.patch
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Key preparation, ownership, rows and index regressions
+        run: >-
+          cargo test --release --lib --locked --
+          key_preparation_ row_layout_ shared_row_publication_ private_index_bindings_
+          row_walk_ value_index_ expression_index partial_index
+          --test-threads=1 --color=never --format=pretty

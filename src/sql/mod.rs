@@ -10942,111 +10942,118 @@ impl Engine {
             query::arm_timeout(guc.statement_timeout_ms());
         }
         let outcome = (|| {
-        if let Err(error) = self
-            .check_writer_fence()
-            .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
-        {
-            txn.release_suspended_statement();
-            responder.error(error.sqlstate, error.message.as_str())?;
-            responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        if txn.failed {
-            txn.release_suspended_statement();
-            responder.error(
+            if let Err(error) = self
+                .check_writer_fence()
+                .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
+            {
+                txn.release_suspended_statement();
+                responder.error(error.sqlstate, error.message.as_str())?;
+                responder.ready_for_query(txn.status_byte())?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+            if txn.failed {
+                txn.release_suspended_statement();
+                responder.error(
                 sqlstate::IN_FAILED_SQL_TRANSACTION,
                 "current transaction is aborted, commands ignored until end of transaction block",
             )?;
-            responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        let mut snapshot = match query::check_timeout()
-            .and_then(|()| self.begin_command_snapshot(txn, true, true, true, true))
-        {
-            Ok(lease) => lease,
-            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
-                txn.suspend_statement(
-                    None,
-                    datetime::statement_clock(),
-                    query::statement_deadline(),
-                    exec::PlpgsqlTransactionContext::Atomic,
-                );
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: StatementWait::Lock,
-                });
-            }
-            Err(error) => {
-                txn.release_suspended_statement();
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
-                }
-                responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
-        };
-        txn.release_suspended_statement();
-        let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-        let result = if arguments.iter().any(Datum::is_null) {
-            Ok(Datum::Null)
-        } else {
-            if large_object::is_mutating(function_oid) {
-                self.storage.assign_transaction_identity(txn.txid);
-            }
-            large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
-        };
-        let result = result.and_then(|value| {
-            query::check_timeout()?;
-            Ok(value)
-        });
-        let value = match result {
-            Ok(value) => value,
-            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT || error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
-                self.rollback_waiting_statement(txn, mark);
-                txn.suspend_statement(
-                    snapshot.lease.take(),
-                    datetime::statement_clock(),
-                    query::statement_deadline(),
-                    exec::PlpgsqlTransactionContext::Atomic,
-                );
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT { StatementWait::Lock } else { StatementWait::ObjectIo },
-                });
-            }
-            Err(error) => {
-                if txn.owns_statement_mark(mark) {
+            let mut snapshot = match query::check_timeout()
+                .and_then(|()| self.begin_command_snapshot(txn, true, true, true, true))
+            {
+                Ok(lease) => lease,
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                    txn.suspend_statement(
+                        None,
+                        datetime::statement_clock(),
+                        query::statement_deadline(),
+                        exec::PlpgsqlTransactionContext::Atomic,
+                    );
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: StatementWait::Lock,
+                    });
+                }
+                Err(error) => {
+                    txn.release_suspended_statement();
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    responder.ready_for_query(txn.status_byte())?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
+            };
+            txn.release_suspended_statement();
+            let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let result = if arguments.iter().any(Datum::is_null) {
+                Ok(Datum::Null)
+            } else {
+                if large_object::is_mutating(function_oid) {
+                    self.storage.assign_transaction_identity(txn.txid);
+                }
+                large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
+            };
+            let result = result.and_then(|value| {
+                query::check_timeout()?;
+                Ok(value)
+            });
+            let value = match result {
+                Ok(value) => value,
+                Err(error)
+                    if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT =>
+                {
                     self.rollback_waiting_statement(txn, mark);
+                    txn.suspend_statement(
+                        snapshot.lease.take(),
+                        datetime::statement_clock(),
+                        query::statement_deadline(),
+                        exec::PlpgsqlTransactionContext::Atomic,
+                    );
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                            StatementWait::Lock
+                        } else {
+                            StatementWait::ObjectIo
+                        },
+                    });
                 }
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
+                Err(error) => {
+                    if txn.owns_statement_mark(mark) {
+                        self.rollback_waiting_statement(txn, mark);
+                    }
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    responder.ready_for_query(txn.status_byte())?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
                 }
+            };
+            txn.compact_completed_constraints();
+            let response_mark = responder.buffer.mark();
+            responder.function_call_response(&value, binary_result)?;
+            if txn.mode == TxnMode::Implicit
+                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
+            {
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: crate::sql::StatementWait::ObjectIo,
+                    });
+                }
+                responder.buffer.truncate_to(response_mark);
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
-        };
-        txn.compact_completed_constraints();
-        let response_mark = responder.buffer.mark();
-        responder.function_call_response(&value, binary_result)?;
-        if txn.mode == TxnMode::Implicit
-            && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
-        {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: crate::sql::StatementWait::ObjectIo,
-                });
-            }
-            responder.buffer.truncate_to(response_mark);
-            responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        responder.ready_for_query(txn.status_byte())?;
-        Ok(ExtendedExecutionStatus::Complete(true))
+            Ok(ExtendedExecutionStatus::Complete(true))
         })();
         query::disarm_timeout();
         outcome

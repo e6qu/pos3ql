@@ -1840,7 +1840,7 @@ mod tests {
         config.max_views = views;
         config.max_rules = views;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn name(value: &str) -> SqlName {

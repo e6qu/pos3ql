@@ -71895,7 +71895,7 @@ mod tests {
         config.extension_script_bytes = 1 << 16;
         let mut budget =
             Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config) + (1 << 20));
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = TableDef::empty();
         definition.schema = SqlName::parse("public").unwrap();
         definition.name = SqlName::parse("replication_original_source").unwrap();

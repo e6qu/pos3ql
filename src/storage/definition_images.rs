@@ -297,7 +297,7 @@ mod tests {
         use crate::storage::tests::{make_def, test_budget, test_config};
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "description_owner",
@@ -362,7 +362,7 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.query_workspace_slots = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "description_capacity",

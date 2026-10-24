@@ -262,6 +262,7 @@ impl Storage {
     ) -> Result<StatementSnapshotLease, SqlError> {
         let owner = self.transaction_wait_owner(transaction);
         let mut snapshots = self.snapshot_state();
+        let visible = snapshots.admission.select(owner, &self.locks)?;
         let next = snapshots
             .next_statement
             .checked_add(1)
@@ -280,7 +281,7 @@ impl Storage {
             ));
         }
         let files = self.spill_roots.retain_statement()?;
-        let lsn = select(self.lsn());
+        let lsn = select(visible);
         snapshots
             .statements
             .push(StatementSnapshot {
@@ -353,7 +354,7 @@ mod tests {
     fn fixture() -> (Storage, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("statement_lease", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -363,6 +364,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         (storage, table)
     }
 

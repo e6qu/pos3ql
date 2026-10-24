@@ -338,7 +338,7 @@ mod tests {
     fn fixture() -> (Storage, usize, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def("cleanup_first", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -351,6 +351,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         (storage, first, second)
     }
 
@@ -402,6 +403,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(first, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let selected = storage.resident_row_state(first, 1).unwrap().unwrap();
             let retained = storage
                 .visible_row_home_at(first, 1, selected, 99, SNAPSHOT_ALL, 7)
@@ -494,6 +496,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(first, 1, 8, 9).unwrap();
             storage.set_lsn(9);
+            storage.restore_visible_lsn(9);
             assert!(
                 !storage.tables[first]
                     .rows
@@ -662,7 +665,7 @@ mod tests {
         config.table_rows = 1024;
         config.large_object_pages = 2048;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "cleanup_deletions",
@@ -760,6 +763,7 @@ mod tests {
                     .unwrap();
                 storage.commit_row(table, 1, txid, lsn).unwrap();
                 storage.observe_lsn(lsn);
+                storage.advance_visible_lsn(lsn).unwrap();
             }
             drop(old_reader);
         });
@@ -858,6 +862,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             drop(reader);
         });
         let versions = storage.row_versions.test_write().unwrap();
@@ -1006,6 +1011,7 @@ mod tests {
                     .unwrap();
                 storage.commit_row(table, 1, 8, lsn).unwrap();
                 storage.observe_lsn(lsn);
+                storage.advance_visible_lsn(lsn).unwrap();
             });
             let start = std::sync::Barrier::new(2);
             std::thread::scope(|scope| {
@@ -1051,11 +1057,12 @@ mod tests {
         config.table_rows = 128;
         config.large_object_pages = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("bounded_deleted", &[("id", ColType::Int4, true)]))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         crate::mem::guard::forbid_alloc(|| {
             let mut deleted = RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
             deleted.committed = None;
@@ -1122,6 +1129,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             drop(released);
             let one = NonZeroUsize::new(1).unwrap();
@@ -1205,6 +1213,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             drop(released);
             assert_eq!(
@@ -1256,7 +1265,7 @@ mod tests {
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 3;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "pressure_during_scan",
@@ -1269,6 +1278,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
@@ -1290,6 +1300,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             assert!(storage.history_pressure());
             finish_history_work(&storage);
             assert!(
@@ -1319,7 +1330,7 @@ mod tests {
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("one_history_slot", &[("id", ColType::Int4, true)]))
             .unwrap();
@@ -1329,6 +1340,7 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         storage.set_lsn(7);
+        storage.restore_visible_lsn(7);
         let old = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
@@ -1343,6 +1355,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.observe_lsn(9);
+            storage.advance_visible_lsn(9).unwrap();
             drop(old);
             let current = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
             assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
@@ -1358,6 +1371,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 10, 11).unwrap();
             storage.observe_lsn(11);
+            storage.advance_visible_lsn(11).unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             let selected = storage
                 .visible_row_home_at(table, 1, state, 100, SNAPSHOT_ALL, current.snapshot())

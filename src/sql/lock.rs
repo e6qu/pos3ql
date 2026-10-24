@@ -90,6 +90,16 @@ impl LockManager {
         self.generation
     }
 
+    /// Zero forces a retry if release raced with handing the wait to the reactor.
+    /// Live generations are always nonzero.
+    pub(crate) fn wait_generation(&self, waiter: WaitOwner) -> u64 {
+        if self.waits.iter().any(|edge| edge.waiter == waiter) {
+            self.generation
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn visit_owner(
         &self,
         owner: u32,
@@ -262,6 +272,16 @@ impl LockManager {
             }
         }
         if changed {
+            self.generation = self.generation.wrapping_add(1).max(1);
+        }
+    }
+
+    /// Earlier snapshot or lock cleanup may already have removed an admission
+    /// wait edge. The final visibility transition must still wake its reader.
+    pub(crate) fn publication_finished(&mut self, owner: WaitOwner) {
+        let before = self.generation;
+        self.resource_released(owner);
+        if self.generation == before {
             self.generation = self.generation.wrapping_add(1).max(1);
         }
     }
@@ -1225,5 +1245,36 @@ mod tests {
             );
         }
         assert_eq!(advisory.view_count(), 3, "replay did not add holds");
+    }
+
+    #[test]
+    fn lock_wait_handoff_handles_release_before_or_after_parking_and_generation_wrap() {
+        let mut budget = Budget::new(4096);
+        let mut graph = LockManager::new(&mut budget, 4, 4).unwrap();
+        let writer = connection_wait_owner(11);
+        let reader = connection_wait_owner(22);
+        crate::mem::guard::forbid_alloc(|| {
+            graph.wait_for(reader, writer).unwrap();
+            let parked = graph.wait_generation(reader);
+            assert_ne!(parked, 0);
+            graph.resource_released(writer);
+            assert_ne!(
+                graph.generation(),
+                parked,
+                "release after parking must wake the connection"
+            );
+            assert_eq!(
+                graph.wait_generation(reader),
+                0,
+                "release before parking must request an immediate retry"
+            );
+            assert_ne!(graph.wait_generation(reader), graph.generation());
+            graph.generation = u64::MAX;
+            graph.wait_for(reader, writer).unwrap();
+            assert_eq!(graph.wait_generation(reader), u64::MAX);
+            graph.publication_finished(writer);
+            assert_eq!(graph.generation(), 1);
+            assert_eq!(graph.wait_generation(reader), 0);
+        });
     }
 }

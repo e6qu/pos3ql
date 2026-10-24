@@ -536,7 +536,6 @@ pub struct Engine {
     publication_observer: Option<(commit::PublicationObserver, u32)>,
     commit_queue: Option<commit::Queue>,
     read_owner: Option<crate::store::ReadOwner>,
-    visible_lsn: u64,
     /// Scratch buffer for reading committed WAL batches before the
     /// provider-neutral object PUT.
     wal_seg_buf: Vec<u8>,
@@ -3675,7 +3674,7 @@ impl Engine {
                     ))
                 })?;
         }
-        let mut storage = Storage::new(config, budget)?;
+        let mut storage = Storage::new(config, budget, datetime::now_micros())?;
         storage.configure_collation(config, budget)?;
         storage.load_extension_packages(config)?;
         let temporary_spiller = (config.temporary_spill_bytes != 0)
@@ -3878,6 +3877,7 @@ impl Engine {
             size_of::<commit::PublicationState>(),
             "transaction publication owner",
         )?;
+        storage.restore_visible_lsn(recovered_durable_lsn);
         Ok(Self {
             storage,
             wal,
@@ -3904,7 +3904,6 @@ impl Engine {
                 None
             },
             read_owner: None,
-            visible_lsn: recovered_durable_lsn,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: DmlWorkspaces::new(config, budget)?,
@@ -3976,7 +3975,7 @@ impl Engine {
 
     pub(crate) fn replication_identity(&self) -> (u64, u64) {
         let lsn = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn.min(self.durable_lsn)
+            self.storage.visible_lsn().min(self.durable_lsn)
         } else {
             self.wal.last_lsn()
         };
@@ -4536,7 +4535,7 @@ impl Engine {
         } = emission;
         self.validate_replication_publications(publication_names)?;
         let ceiling = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn.min(self.durable_lsn)
+            self.storage.visible_lsn().min(self.durable_lsn)
         } else {
             u64::MAX
         };
@@ -5324,11 +5323,6 @@ impl Engine {
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        let visible = if self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-            self.visible_lsn
-        } else {
-            self.storage.lsn()
-        };
         let resumed = if resume_statement {
             txn.resume_statement()
         } else {
@@ -5345,16 +5339,19 @@ impl Engine {
         let lease = if retained_lease.is_some() {
             retained_lease
         } else if takes_snapshot && retain_snapshot {
-            Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| {
-                txn.statement_snapshot(lsn.min(visible))
-            })?)
+            Some(
+                self.storage
+                    .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
+            )
         } else {
             None
         };
         let snapshot = if takes_snapshot {
-            let snapshot = lease
-                .as_ref()
-                .map_or_else(|| txn.statement_snapshot(visible), |lease| lease.snapshot());
+            let snapshot = if let Some(lease) = &lease {
+                lease.snapshot()
+            } else {
+                txn.statement_snapshot(self.storage.statement_snapshot_lsn(txn.txid)?)
+            };
             if matches!(
                 txn.isolation,
                 TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -5366,7 +5363,7 @@ impl Engine {
             }
             snapshot
         } else {
-            self.storage.lsn()
+            self.storage.statement_snapshot_lsn(txn.txid)?
         };
         self.storage.set_commit_snapshot(snapshot);
         let files = lease
@@ -6478,11 +6475,13 @@ impl Engine {
             if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
                 // Position zero denotes an absent deletion marker. Temporary data
                 // needs a real position even before the first durable transaction.
-                if self.visible_lsn == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
+                let visible = self.storage.visible_lsn();
+                if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
                     self.storage.observe_lsn(1);
-                    self.visible_lsn = 1;
+                    1
+                } else {
+                    visible
                 }
-                self.visible_lsn
             } else {
                 commit_lsn
             };
@@ -6597,6 +6596,7 @@ impl Engine {
             });
             return Err(error);
         }
+        let mut installation = None;
         let result = (|| {
             if self.wal_upload
                 && self.commit_progress == CommitProgressMode::Inline
@@ -6605,6 +6605,10 @@ impl Engine {
             {
                 self.commit_wal()?;
             }
+            installation = Some(
+                self.storage
+                    .begin_transaction_installation(txn.txid, staged.lsn)?,
+            );
             match staged.target {
                 txn::CommitTarget::Prepare { slot, .. } => {
                     txn.take_staged_commit();
@@ -6648,9 +6652,6 @@ impl Engine {
                 }
             }
         })();
-        if result.is_ok() && staged.barrier == txn::CommitBarrier::Journal {
-            self.visible_lsn = self.visible_lsn.max(staged.lsn);
-        }
         #[cfg(test)]
         let result = result.and_then(|()| {
             if matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
@@ -6674,6 +6675,10 @@ impl Engine {
                     release_transaction_locks(&self.storage, transaction);
                 }
             }
+            installation
+                .take()
+                .expect("successful publication owns reader admission")
+                .complete();
         }
         self.unpromoted_commits -= 1;
         if let Err(error) = &result {
@@ -6729,7 +6734,7 @@ impl Engine {
             .transaction_publication
             .pending_lsn()
             .map_or(frontier, |lsn| frontier.min(lsn.saturating_sub(1)));
-        self.visible_lsn = self.visible_lsn.max(frontier);
+        self.storage.advance_visible_lsn(frontier)?;
         Ok(())
     }
 
@@ -9436,9 +9441,10 @@ impl Engine {
         self.cache_capacity_generation
     }
 
-    pub(crate) fn statement_wait_generation(&self, wait: StatementWait) -> u64 {
+    pub(crate) fn statement_wait_generation(&self, wait: StatementWait, connection: i32) -> u64 {
         match wait {
-            StatementWait::Lock | StatementWait::ObjectIo => self.lock_generation(),
+            StatementWait::Lock => self.storage.lock_wait_generation(connection),
+            StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
         }
     }
@@ -10930,78 +10936,127 @@ impl Engine {
         let _atomic_reads = self.atomic_block_read_scope();
         self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
-        if let Err(error) = self
-            .check_writer_fence()
-            .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
-        {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
+        if let Some(deadline) = txn.suspended_statement_deadline() {
+            query::restore_statement_deadline(deadline);
+        } else {
+            query::arm_timeout(guc.statement_timeout_ms());
         }
-        if txn.failed {
-            responder.error(
+        let outcome = (|| {
+            if let Err(error) = self
+                .check_writer_fence()
+                .and_then(|()| self.ensure_txn(txn, TxnMode::Implicit, guc))
+            {
+                txn.release_suspended_statement();
+                responder.error(error.sqlstate, error.message.as_str())?;
+                responder.ready_for_query(txn.status_byte())?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+            if txn.failed {
+                txn.release_suspended_statement();
+                responder.error(
                 sqlstate::IN_FAILED_SQL_TRANSACTION,
                 "current transaction is aborted, commands ignored until end of transaction block",
             )?;
-            responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
-            Ok(lease) => lease,
-            Err(error) => {
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
-                }
-                responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
-        };
-        let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-        let result = if arguments.iter().any(Datum::is_null) {
-            Ok(Datum::Null)
-        } else {
-            if large_object::is_mutating(function_oid) {
-                self.storage.assign_transaction_identity(txn.txid);
-            }
-            large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
-        };
-        let value = match result {
-            Ok(value) => value,
-            Err(error) => {
-                if txn.owns_statement_mark(mark) {
+            let mut snapshot = match query::check_timeout()
+                .and_then(|()| self.begin_command_snapshot(txn, true, true, true, true))
+            {
+                Ok(lease) => lease,
+                Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                    txn.suspend_statement(
+                        None,
+                        datetime::statement_clock(),
+                        query::statement_deadline(),
+                        exec::PlpgsqlTransactionContext::Atomic,
+                    );
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: StatementWait::Lock,
+                    });
+                }
+                Err(error) => {
+                    txn.release_suspended_statement();
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    responder.ready_for_query(txn.status_byte())?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
+            };
+            txn.release_suspended_statement();
+            let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let result = if arguments.iter().any(Datum::is_null) {
+                Ok(Datum::Null)
+            } else {
+                if large_object::is_mutating(function_oid) {
+                    self.storage.assign_transaction_identity(txn.txid);
+                }
+                large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
+            };
+            let result = result.and_then(|value| {
+                query::check_timeout()?;
+                Ok(value)
+            });
+            let value = match result {
+                Ok(value) => value,
+                Err(error)
+                    if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT =>
+                {
                     self.rollback_waiting_statement(txn, mark);
+                    txn.suspend_statement(
+                        snapshot.lease.take(),
+                        datetime::statement_clock(),
+                        query::statement_deadline(),
+                        exec::PlpgsqlTransactionContext::Atomic,
+                    );
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
+                            StatementWait::Lock
+                        } else {
+                            StatementWait::ObjectIo
+                        },
+                    });
                 }
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
+                Err(error) => {
+                    if txn.owns_statement_mark(mark) {
+                        self.rollback_waiting_statement(txn, mark);
+                    }
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    responder.ready_for_query(txn.status_byte())?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
                 }
+            };
+            txn.compact_completed_constraints();
+            let response_mark = responder.buffer.mark();
+            responder.function_call_response(&value, binary_result)?;
+            if txn.mode == TxnMode::Implicit
+                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
+            {
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: crate::sql::StatementWait::ObjectIo,
+                    });
+                }
+                responder.buffer.truncate_to(response_mark);
                 responder.error(error.sqlstate, error.message.as_str())?;
                 responder.ready_for_query(txn.status_byte())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
-        };
-        txn.compact_completed_constraints();
-        let response_mark = responder.buffer.mark();
-        responder.function_call_response(&value, binary_result)?;
-        if txn.mode == TxnMode::Implicit
-            && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
-        {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: crate::sql::StatementWait::ObjectIo,
-                });
-            }
-            responder.buffer.truncate_to(response_mark);
-            responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        responder.ready_for_query(txn.status_byte())?;
-        Ok(ExtendedExecutionStatus::Complete(true))
+            Ok(ExtendedExecutionStatus::Complete(true))
+        })();
+        query::disarm_timeout();
+        outcome
     }
 
     /// Infers each `$n` parameter's type OID from how it is used, as

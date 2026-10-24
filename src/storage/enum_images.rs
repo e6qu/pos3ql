@@ -325,7 +325,7 @@ mod tests {
         config.max_databases = 4;
         config.max_schemas = 8;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn create(storage: &mut Storage, name: &str) -> usize {

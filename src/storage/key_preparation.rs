@@ -368,7 +368,7 @@ mod tests {
         let mut config = test_config();
         config.max_value_indexes = caches;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def(
             "key_orders",
             &[
@@ -543,7 +543,7 @@ mod tests {
         let mut config = test_config();
         config.query_workspace_slots = 0;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "key_orders",
@@ -576,7 +576,7 @@ mod tests {
             let capacity =
                 table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
             let mut budget = test_budget(&config);
-            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let mut definition = make_def(
                 "key_orders",
                 &[
@@ -663,7 +663,7 @@ mod tests {
         config.max_tables = 2;
         config.max_value_indexes = 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut tables = [0; 2];
             for (position, database) in [DatabaseOid::POSTGRES, DatabaseOid::TEMPLATE1]

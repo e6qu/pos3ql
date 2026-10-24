@@ -341,7 +341,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = table_rows;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("cleanup_owned", &[("id", ColType::Int4, false)]);
         definition.persistence = persistence;
         let first = storage.create_table(definition).unwrap();
@@ -407,7 +407,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = count * 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
             .create_table(make_def("bounded_first", &[("id", ColType::Int4, false)]))
             .unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = 2048;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def("cleanup_deleted", &[("id", ColType::Int4, false)]))
             .unwrap();

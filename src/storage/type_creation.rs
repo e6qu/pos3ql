@@ -224,7 +224,7 @@ mod tests {
         config.transaction_mode = mode;
         config.max_roles = 4;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn role(storage: &Storage, name: &str) -> usize {

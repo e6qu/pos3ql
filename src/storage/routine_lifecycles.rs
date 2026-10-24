@@ -939,7 +939,7 @@ mod tests {
         let mut config = test_config();
         config.max_routines = 1;
         let mut budget = test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn name(value: &str) -> SqlName {

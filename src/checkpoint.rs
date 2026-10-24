@@ -18933,7 +18933,7 @@ mod stored_dependency_tests {
                 + crate::storage::SpillReader::budget_bytes(true, 3),
         );
         let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let reader = crate::storage::SpillReader::new(
             &mut budget,
             3,
@@ -19795,7 +19795,7 @@ mod stored_dependency_tests {
                     (100_001, 100_002, "first", "first"),
                 ] {
                     let mut budget = Budget::new(bytes);
-                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     let mut manifest = String::from("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
@@ -19820,7 +19820,7 @@ mod stored_dependency_tests {
                 }
                 {
                     let mut budget = Budget::new(bytes);
-                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
                         "pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
@@ -19830,7 +19830,7 @@ mod stored_dependency_tests {
                 }
                 for (transaction_id, gid) in [(10, "7365636f6e64"), (11, "6669727374")] {
                     let mut budget = Budget::new(bytes);
-                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     let manifest = format!("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {

@@ -1,6 +1,12 @@
 use super::*;
 use crate::sql::commit::{PublicationPoint, PublicationState};
 
+impl Engine {
+    pub(crate) fn publication_storage_for_tests(&self) -> &Storage {
+        &self.storage
+    }
+}
+
 const SETUP: &str = "CREATE TABLE publication_orders(id integer PRIMARY KEY, total integer); \
     CREATE TABLE publication_invoices(id integer PRIMARY KEY, total integer); \
     INSERT INTO publication_orders VALUES(1,10); INSERT INTO publication_invoices VALUES(1,10)";
@@ -40,6 +46,27 @@ fn transaction_publication_rows_definitions_indexes_and_comments_match_postgresq
 }
 
 fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Result<(), SqlError> {
+    match engine.transaction_publication {
+        PublicationState::Installing(_) => assert_eq!(
+            engine
+                .storage
+                .statement_snapshot_lsn(observer)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT,
+            "new reader entered unfinished publication at {point:?}"
+        ),
+        PublicationState::RecoveryRequired(_) => assert_eq!(
+            engine
+                .storage
+                .statement_snapshot_lsn(observer)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+            "new reader entered failed publication at {point:?}"
+        ),
+        PublicationState::Idle => {}
+    }
     if let PublicationState::Installing(publication) = engine.transaction_publication {
         if publication.transactions().count() == 2 {
             assert_eq!(
@@ -58,7 +85,7 @@ fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Re
         }
         if point != PublicationPoint::Visible {
             assert!(
-                engine.visible_lsn < publication.lsn,
+                engine.storage.visible_lsn() < publication.lsn,
                 "visible journal position crossed unfinished installation at {point:?}"
             );
         }
@@ -105,6 +132,303 @@ fn observe_owners(engine: &Engine, point: PublicationPoint, observer: u32) -> Re
         "transaction advisory lock released at {point:?}"
     );
     Ok(())
+}
+
+#[test]
+fn transaction_admission_sql_preserves_complete_transactions_across_isolation_levels() {
+    for isolation in ["READ COMMITTED", "REPEATABLE READ"] {
+        let config = test_config(&format!("admission-isolation-{isolation}"));
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, SETUP, true);
+        reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL {isolation}"),
+            true,
+        );
+        let query = "SELECT o.total,i.total FROM publication_orders o JOIN publication_invoices i ON o.id=i.id";
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["10|10"]
+        );
+        writer.success(
+            &mut engine,
+            "BEGIN; UPDATE publication_orders SET total=20",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["10|10"]
+        );
+        writer.success(
+            &mut engine,
+            "UPDATE publication_invoices SET total=20; COMMIT",
+            true,
+        );
+        let expected = if isolation == "REPEATABLE READ" {
+            "10|10"
+        } else {
+            "20|20"
+        };
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            [expected]
+        );
+        reader.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["20|20"]
+        );
+        writer.success(&mut engine, "BEGIN; UPDATE publication_orders SET total=30; UPDATE publication_invoices SET total=30; ROLLBACK", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["20|20"]
+        );
+    }
+}
+
+#[test]
+fn transaction_admission_sql_retries_keep_one_command_and_do_not_repeat_effects() {
+    let config = test_config("admission-wait-before-command");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, SETUP, true);
+    writer.success(&mut engine, "CREATE SEQUENCE admission_counter", true);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    let command = reader.transaction.command_id();
+    let installation = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    for _ in 0..2 {
+        let output = reader.execute(&mut engine, "SELECT nextval('admission_counter')", true);
+        assert!(
+            output.is_empty(),
+            "an unadmitted statement emitted a response"
+        );
+        assert_eq!(reader.transaction.command_id(), command + 1);
+        assert!(!reader.transaction.snapshot_taken());
+        assert_eq!(reader.transaction.snapshot_lsn(), None);
+    }
+    installation.complete();
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT nextval('admission_counter')", true)),
+        ["1"]
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT nextval('admission_counter')", true)),
+        ["2"]
+    );
+    reader.success(&mut engine, "ROLLBACK", true);
+    writer.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn transaction_admission_fast_path_yields_before_effects_and_resumes_once() {
+    let config = test_config("admission-fast-path-resume");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN", true);
+    let command = reader.transaction.command_id();
+    let installing = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    let call = |engine: &mut Engine, reader: &mut ConfiguredTransactionSession| {
+        reader.send.clear();
+        let mut responder = Responder::new(&mut reader.send);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_large_object_fast_path(
+                715,
+                &[Datum::Oid(4242)],
+                true,
+                &reader.arena,
+                &mut reader.transaction,
+                &reader.guc,
+                &mut responder,
+                reader.connection_id,
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Blocked {
+            wait: StatementWait::Lock
+        }
+    );
+    assert!(reader.send.readable().is_empty());
+    assert_eq!(
+        engine.statement_wait_generation(StatementWait::Lock, reader.connection_id),
+        engine.lock_generation()
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    assert!(reader.transaction.suspended_statement_context().is_some());
+    assert_eq!(query::statement_deadline(), 0);
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        0
+    );
+    installing.complete();
+    assert_eq!(
+        engine.statement_wait_generation(StatementWait::Lock, reader.connection_id),
+        0,
+        "release before reactor parking must force an immediate retry"
+    );
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Complete(true)
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    assert!(reader.transaction.suspended_statement_context().is_none());
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        1
+    );
+    reader.success(&mut engine, "COMMIT", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT oid FROM pg_largeobject_metadata", true)),
+        ["4242"]
+    );
+    writer.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn transaction_admission_fast_path_expired_wait_has_no_effects_and_can_roll_back() {
+    let config = test_config("admission-fast-path-timeout");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "BEGIN", true);
+    reader.success(&mut engine, "BEGIN", true);
+    let installing = engine
+        .storage
+        .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
+        .unwrap();
+    let call = |engine: &mut Engine, reader: &mut ConfiguredTransactionSession| {
+        reader.send.clear();
+        let mut responder = Responder::new(&mut reader.send);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_large_object_fast_path(
+                715,
+                &[Datum::Oid(4242)],
+                true,
+                &reader.arena,
+                &mut reader.transaction,
+                &reader.guc,
+                &mut responder,
+                reader.connection_id,
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Blocked {
+            wait: StatementWait::Lock
+        }
+    );
+    // Expire the saved deadline without sleeping or changing timeout limits.
+    reader.transaction.release_suspended_statement();
+    reader.transaction.suspend_statement(
+        None,
+        datetime::statement_clock(),
+        1,
+        exec::PlpgsqlTransactionContext::Atomic,
+    );
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Complete(false)
+    );
+    assert!(String::from_utf8_lossy(reader.send.readable()).contains("57014"));
+    assert!(reader.transaction.failed);
+    assert!(reader.transaction.suspended_statement_context().is_none());
+    assert_eq!(
+        engine
+            .storage
+            .large_objects_visible_to(reader.transaction.txid)
+            .count(),
+        0
+    );
+    assert_eq!(query::statement_deadline(), 0);
+    installing.complete();
+    reader.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT lo_create(4242)", true)),
+        ["4242"]
+    );
+    writer.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn transaction_admission_fast_path_private_object_wait_resumes_once() {
+    let config = test_config("admission-fast-path-object-owner");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "BEGIN; SELECT lo_create(4242)", true);
+    reader.success(&mut engine, "BEGIN", true);
+    let command = reader.transaction.command_id();
+    let call = |engine: &mut Engine, reader: &mut ConfiguredTransactionSession| {
+        reader.send.clear();
+        let mut responder = Responder::new(&mut reader.send);
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_large_object_fast_path(
+                715,
+                &[Datum::Oid(4242)],
+                true,
+                &reader.arena,
+                &mut reader.transaction,
+                &reader.guc,
+                &mut responder,
+                reader.connection_id,
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Blocked {
+            wait: StatementWait::Lock
+        }
+    );
+    assert!(
+        reader.send.readable().is_empty(),
+        "an internal wait escaped onto the wire"
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    writer.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        call(&mut engine, &mut reader),
+        ExtendedExecutionStatus::Complete(true)
+    );
+    assert_eq!(reader.transaction.command_id(), command + 1);
+    reader.success(&mut engine, "COMMIT", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT oid FROM pg_largeobject_metadata", true)),
+        ["4242"]
+    );
+    let duplicate = reader.execute(&mut engine, "SELECT lo_create(4242)", true);
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    assert!(String::from_utf8_lossy(&duplicate).contains("pg_largeobject_metadata_oid_index"));
 }
 
 fn inject_definitions(
@@ -523,7 +847,7 @@ fn transaction_publication_queued_failure_preserves_later_durable_work_for_recov
             .sqlstate,
             sqlstate::INTERNAL_IO_WAIT
         );
-        let frontier = engine.visible_lsn;
+        let frontier = engine.storage.visible_lsn();
         engine.publication_observer = Some((inject_row, observer.transaction.txid));
         let mut failed = false;
         for _ in 0..16 {
@@ -536,7 +860,7 @@ fn transaction_publication_queued_failure_preserves_later_durable_work_for_recov
             }
         }
         assert!(failed, "injected publication failure was not reached");
-        assert_eq!(engine.visible_lsn, frontier);
+        assert_eq!(engine.storage.visible_lsn(), frontier);
         assert!(engine.durable_lsn >= later.transaction.staged_commit().unwrap().lsn);
         assert!(writer.transaction.staged_commit().is_some());
         assert!(engine.transaction_publication.owns(transaction));

@@ -895,7 +895,7 @@ mod tests {
     fn fixture() -> Storage {
         let config = crate::storage::tests::test_config();
         let mut budget = crate::storage::tests::test_budget(&config);
-        Storage::new(&config, &mut budget).unwrap()
+        Storage::new(&config, &mut budget, 0).unwrap()
     }
 
     fn create(storage: &mut Storage, kind: NamedTypeKind) -> TypeDdlUndo {

@@ -248,7 +248,7 @@ mod tests {
         let mut config = test_config();
         config.max_tables = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let slot = storage
             .create_table(make_def("original_table", &[]))
             .unwrap();

@@ -1838,7 +1838,7 @@ mod tests {
     fn query_definition_ownership_preserves_images_across_storage_lifecycle() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("original", 1)).unwrap();
         let mut sources = [Some(ScopeDefinition::Retained {
             table,
@@ -1894,7 +1894,7 @@ mod tests {
     fn query_definition_ownership_wide_aliases_share_one_image_and_keep_names() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(definition(
                 "wide_source",
@@ -1948,7 +1948,7 @@ mod tests {
     fn query_definition_ownership_keeps_transaction_visible_shapes() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("source", 1)).unwrap();
         storage
             .write_table_def(
@@ -1982,7 +1982,7 @@ mod tests {
     fn query_definition_ownership_failed_resolution_releases_capacity() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("first", 1)).unwrap();
         storage.create_table(definition("second", 1)).unwrap();
         let capacity = crate::storage::table_slot_capacity(&config)
@@ -2034,7 +2034,7 @@ mod tests {
     fn query_definition_ownership_rejects_aliases_and_using_without_leaks() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage.create_table(definition("source", 1)).unwrap();
         let mut arena_budget = Budget::new(1 << 22);
         let arena = Arena::new(&mut arena_budget, "query errors", 1 << 22).unwrap();

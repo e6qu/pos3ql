@@ -467,7 +467,7 @@ mod tests {
     fn fixture() -> (Storage, usize, usize, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let parent = storage
             .create_table(make_def(
                 "publication_parent",
@@ -908,7 +908,7 @@ mod tests {
         }
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let child = storage
             .create_table(make_def(
                 "publication_release_child",

@@ -53,7 +53,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = count * 2;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("layout_orders", &[("id", ColType::Int4, false)]);
         definition.persistence = persistence;
         let table = storage.create_table(definition).unwrap();

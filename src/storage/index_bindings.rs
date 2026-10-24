@@ -431,7 +431,7 @@ mod tests {
     fn private_index_names_reserve_schema_moves_and_restore_comments_without_partial_edits() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let target_schema = SqlName::parse("binding_destination").unwrap();
         storage.create_schema(target_schema).unwrap();
         let source = make_def(
@@ -587,9 +587,9 @@ mod tests {
     fn private_index_bindings_do_not_select_a_reused_table_or_another_storage() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut other_budget = test_budget(&config);
-        let mut other = Storage::new(&config, &mut other_budget).unwrap();
+        let mut other = Storage::new(&config, &mut other_budget, 0).unwrap();
         let definition = make_def(
             "binding_source",
             &[
@@ -638,7 +638,7 @@ mod tests {
         for replace in [false, true] {
             let config = test_config();
             let mut budget = test_budget(&config);
-            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let definition = make_def(
                 "binding_source",
                 &[
@@ -737,7 +737,7 @@ mod tests {
     fn private_index_bindings_follow_their_selected_definition_through_rollback_and_commit() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "binding_source",

@@ -13,7 +13,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
     ] {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         storage
             .create_schema(SqlName::parse("binding_schema").unwrap())
             .unwrap();
@@ -87,7 +87,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
 fn fixture() -> (Storage, usize, usize) {
     let config = test_config();
     let mut budget = test_budget(&config);
-    let mut storage = Storage::new(&config, &mut budget).unwrap();
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let unrelated = storage
         .create_table(make_def(
             "unrelated_lookup",
@@ -343,7 +343,7 @@ fn table_name_lookup_views_are_included_in_exact_startup_memory() {
     config.query_workspace_slots = 2;
     let expected = config.memtable_bytes + Storage::extra_budget_bytes(&config);
     let mut budget = Budget::new(expected);
-    let mut storage = Storage::new(&config, &mut budget).unwrap();
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     storage.configure_collation(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
     crate::mem::guard::forbid_alloc(|| {

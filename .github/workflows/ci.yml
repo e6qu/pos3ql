@@ -88,6 +88,8 @@ jobs:
             type_publication_workspace_exact_startup_budget
             bound_type_origin_never_reuses_an_exhausted_identifier
             storage::catalog_sources::tests
+            transaction_admission_does_not_wait_for_existing_queries_to_finish
+            lock_wait_handoff_
             mem::mutex::tests
           )
           # All libtest filters share one interpreter startup.

@@ -99,12 +99,12 @@ next statement.
 | Journal positions | Checked shared reservations and observations that never move backward; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
 | Catalogs and table definitions | Readers retain selected definitions and identities; tables have separate cleanup owners. Table and routine submission validate type lifetimes under installation owners. Typed tables and saved queries retain source lifetimes through recovery and database cloning. | Consistent reader capture across transactions and concurrent maintenance |
-| Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Complete shared commit, retirement and remaining metadata preparation before removing the SQL barrier |
+| Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Consistent type and table versions across later statement lookups and maintenance |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
-| Read positions | Statement and transaction retention; replication export validity and import protection share one guard, with separate fixed capacities | Integrate every remaining table lifecycle path and engine publication |
+| Read positions | Statement admission and the last fully installed commit share an owner; existing statement and transaction snapshots retain history. Replication export validity and import protection share that guard, with separate fixed capacities | Extend admission to coherent later catalog lookups and every table lifecycle path |
 | Deferred reads | Scans and rewrites keep their original byte sources; UPDATE, DELETE, and MERGE copy selected values into fixed statement memory | Finish coherent table lifecycle changes |
 
 ### How long reads keep data alive
@@ -116,6 +116,28 @@ the same synchronization as row publication, so it cannot miss an intervening
 commit. Nested statements do not replace a transaction's snapshot. Completion,
 errors, and transaction end release retention, wake schema waiters, and
 schedule pruning.
+
+**User example:** a transaction updates an order and its invoice from 10 to 20.
+A report already reading the old versions can finish while the commit installs
+both changes. A new report reaching this installation step yields through the
+existing lock-wait mechanism and resumes after both values are installed. It
+cannot select the position of an unfinished commit. Choosing that position and
+retaining its history happen under the same owner, so cleanup cannot slip
+between them. Journal position reservations do not advance the visible position.
+
+Installation starts after the object-store durability wait and ends after the
+ordinary or prepared transaction's changes and outcome are installed. It does
+not wait for existing reports to finish. An abandoned partial installation wakes
+waiting connections but rejects new admission with `08007` until recovery;
+it does not expose the partial result. Lock-only mode uses the same admission
+boundary without reserving row-history slots. These controls are charged at
+startup, with no new pool or configuration limit. SQL still uses one CPU worker;
+consistent later metadata capture and remaining synchronous storage reads are
+separate [remaining work](../PLAN.md).
+
+A large-object protocol call waiting for admission keeps its original statement
+clock and timeout. It creates no object before admission. An expired wait
+returns `57014` and can be rolled back; a successful retry performs the call once.
 
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
 or abort and restores the captured read position for each chunk. When statement
@@ -329,8 +351,8 @@ without restoring sequence numbers already issued.
 amount column in one transaction. Its indexes, comments, owned sequence and
 invoice foreign keys follow the committed names, including after recovery with
 an empty local directory. A private invoice-table edit cannot later restore the
-old parent name. These storage ownership checks prepare for several SQL workers;
-transaction-wide reader capture remains [planned work](../PLAN.md).
+old parent name. Several SQL workers still require consistent later catalog
+lookups within each statement; see the [remaining work](../PLAN.md).
 
 **User example:** create an order table, save a transaction position, then drop
 and recreate that table with different rows. Rolling back to the saved position

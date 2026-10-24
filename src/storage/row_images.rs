@@ -754,7 +754,7 @@ mod tests {
         use super::super::tests::{make_def, test_budget, test_config};
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let mut storage = super::super::Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "ordered_old",
@@ -830,7 +830,7 @@ mod tests {
         use super::super::tests::{make_def, test_budget, test_config};
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let mut storage = super::super::Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
             .create_table(make_def(
                 "ordered_owner",
@@ -938,7 +938,7 @@ mod tests {
         let arena = crate::mem::arena::Arena::new(&mut budget, "ordered source", 1024).unwrap();
         let config = super::super::tests::test_config();
         let mut object_budget = super::super::tests::test_budget(&config);
-        let mut storage = super::super::Storage::new(&config, &mut object_budget).unwrap();
+        let mut storage = super::super::Storage::new(&config, &mut object_budget, 0).unwrap();
         let slot = storage
             .create_table(super::super::tests::make_def(
                 "ordered_row",

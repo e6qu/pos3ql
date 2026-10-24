@@ -138,6 +138,32 @@ def transcript(reader, writer):
             reader.execute("ROLLBACK")
             writer.execute("DROP SEQUENCE catalog_sequence_diff")
 
+        writer.execute("CREATE TABLE catalog_statistics_version_diff(id integer)")
+        writer.execute("INSERT INTO catalog_statistics_version_diff SELECT generate_series(1,8)")
+        writer.execute("ANALYZE catalog_statistics_version_diff")
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        try:
+            oid = reader.execute("SELECT oid FROM pg_class WHERE relname='catalog_statistics_version_diff'").fetchone()[0]
+            query = "SELECT relname, reltuples::bigint, relhasindex FROM pg_class WHERE oid=%s"
+            record(reader, f"{prefix}.statistics_version.before", query, (oid,))
+            writer.execute("CREATE INDEX catalog_statistics_version_index_diff ON catalog_statistics_version_diff(id)")
+            record(reader, f"{prefix}.statistics_version.index_created", query, (oid,))
+            writer.execute("ALTER TABLE catalog_statistics_version_diff RENAME TO catalog_statistics_version_new_diff")
+            record(reader, f"{prefix}.statistics_version.renamed", query, (oid,))
+            writer.execute("INSERT INTO catalog_statistics_version_new_diff SELECT generate_series(9,16)")
+            writer.execute("ANALYZE catalog_statistics_version_new_diff")
+            record(reader, f"{prefix}.statistics_version.analyzed", query, (oid,))
+            writer.execute("DROP INDEX catalog_statistics_version_index_diff")
+            writer.execute("VACUUM catalog_statistics_version_new_diff")
+            record(reader, f"{prefix}.statistics_version.vacuumed", query, (oid,))
+            reader.execute("COMMIT")
+            record(reader, f"{prefix}.statistics_version.fresh", query, (oid,))
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            writer.execute("DROP TABLE IF EXISTS catalog_statistics_version_diff")
+            writer.execute("DROP TABLE IF EXISTS catalog_statistics_version_new_diff")
+
         writer.execute("CREATE TABLE catalog_statistics_diff(id integer)")
         writer.execute("INSERT INTO catalog_statistics_diff SELECT generate_series(1,8)")
         writer.execute("ANALYZE catalog_statistics_diff")

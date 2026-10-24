@@ -8670,7 +8670,7 @@ impl Checkpointer {
         }
         // Named indexes are serialized after tables, so establish the final
         // tuple-binding shape before attaching physical generations.
-        storage.rebuild_all_enforcers().map_err(|error| {
+        storage.rebuild_recovered_enforcers().map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
                 "manifest value-index bindings rejected: {}",
                 error.message.as_str()

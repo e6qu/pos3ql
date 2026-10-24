@@ -2,6 +2,12 @@
 
 use super::*;
 
+pub(super) enum EnforcerRows {
+    Rebuild,
+    ReusePrepared,
+    RebuildRecovered,
+}
+
 pub(super) struct ValueKeyPreparation {
     definitions: TableDefinitionImages,
     target: TableDefinitionTarget,
@@ -355,7 +361,9 @@ mod tests {
             index.columns[0] = 1;
             let slot = storage.create_index(index, 0).unwrap();
             storage.commit_index_create(slot);
-            let error = storage.build_enforcers_visible(table, None).unwrap_err();
+            let error = storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(same_bindings(
                 &before,
@@ -370,8 +378,14 @@ mod tests {
             assert!(storage.value_indexes.acquire().is_none());
             drop(spare);
             drop(before);
+            assert_eq!(
+                storage.drop_index("public", "amount_index", 8).unwrap(),
+                Some(slot)
+            );
             storage.commit_index_drop(slot);
-            storage.build_enforcers_visible(table, None).unwrap();
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
     }
@@ -393,7 +407,7 @@ mod tests {
             storage.commit_index_create(slot);
             assert_eq!(
                 storage
-                    .build_enforcers_visible(table, None)
+                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::DIVISION_BY_ZERO
@@ -404,8 +418,14 @@ mod tests {
                 true
             ));
             assert_eq!(key_rows(&storage, table, 1), 1);
+            assert_eq!(
+                storage.drop_index("public", "bad_expression", 8).unwrap(),
+                Some(slot)
+            );
             storage.commit_index_drop(slot);
-            storage.build_enforcers_visible(table, None).unwrap();
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
     }
@@ -422,7 +442,9 @@ mod tests {
                     start.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for _ in 0..16 {
-                            if let Err(error) = storage.build_enforcers_visible(table, None) {
+                            if let Err(error) =
+                                storage.build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                            {
                                 assert!(
                                     error.sqlstate == sqlstate::SERIALIZATION_FAILURE
                                         || error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -435,13 +457,15 @@ mod tests {
             }
         });
         crate::mem::guard::forbid_alloc(|| {
-            storage.build_enforcers_visible(table, None).unwrap();
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
     }
 
     #[test]
-    fn key_preparation_no_indexes_need_no_statement_image_reservation() {
+    fn key_preparation_unindexed_creation_needs_no_statement_image_reservation() {
         let mut config = test_config();
         config.query_workspace_slots = 0;
         let mut budget = test_budget(&config);
@@ -456,52 +480,93 @@ mod tests {
             ))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            pending(&storage, table, 1, 8, 2);
-            storage.commit_row(table, 1, 8, 7).unwrap();
-            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
-            assert_eq!(row.committed_lsn, 7);
-            assert!(row.pending_last().is_none());
+            assert_eq!(storage.tables[table].enforcer_count(), 0);
+            let prepared = PreparedRowKeys::capture(&storage, table, 1, None).unwrap();
+            assert_eq!(prepared.count, 0);
+            prepared
+                .validate_bindings(&storage.tables[table].publication())
+                .unwrap();
+            prepared
+                .validate_definition(&storage, &storage.tables[table].definition.read())
+                .unwrap();
         });
     }
 
     #[test]
     fn key_preparation_plain_indexes_do_not_copy_or_reserve_complete_definitions() {
-        let mut config = test_config();
-        config.max_tables = 1;
-        config.max_catalog_versions_per_object = 1;
-        config.query_workspace_slots = 1;
-        let capacity = table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let mut definition = make_def(
-            "key_orders",
-            &[
-                ("id", ColType::Int4, true),
-                ("amount", ColType::Int4, false),
-            ],
-        );
-        definition.columns[0].primary = true;
-        definition.columns[0].unique = true;
-        let table = storage.create_table(definition).unwrap();
-        storage.refresh_enforcers(table).unwrap();
-        let mut readers = Vec::with_capacity(capacity);
-        crate::mem::guard::forbid_alloc(|| {
-            for _ in 0..capacity {
-                let reader = storage.table_definition_images();
-                reader.definition(&storage, table, 0).unwrap();
-                readers.push(reader);
-            }
-            let exhausted = storage.table_definition_images();
-            assert_eq!(
-                exhausted
-                    .definition(&storage, table, 0)
-                    .unwrap_err()
-                    .sqlstate,
-                sqlstate::PROGRAM_LIMIT_EXCEEDED
+        for indexed in [false, true] {
+            let mut config = test_config();
+            config.max_tables = 1;
+            config.max_catalog_versions_per_object = 1;
+            config.query_workspace_slots = 1;
+            let capacity =
+                table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+            let mut budget = test_budget(&config);
+            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            let mut definition = make_def(
+                "key_orders",
+                &[
+                    ("id", ColType::Int4, true),
+                    ("amount", ColType::Int4, false),
+                ],
             );
-            pending(&storage, table, 1, 8, 2);
-            storage.commit_row(table, 1, 8, 7).unwrap();
-            assert_eq!(key_rows(&storage, table, 2), 1);
+            definition.columns[0].primary = indexed;
+            definition.columns[0].unique = indexed;
+            let table = storage.create_table(definition).unwrap();
+            storage.refresh_enforcers(table).unwrap();
+            let mut readers = Vec::with_capacity(capacity);
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..capacity {
+                    let reader = storage.table_definition_images();
+                    reader.definition(&storage, table, 0).unwrap();
+                    readers.push(reader);
+                }
+                let exhausted = storage.table_definition_images();
+                assert_eq!(
+                    exhausted
+                        .definition(&storage, table, 0)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                pending(&storage, table, 1, 8, 2);
+                storage.commit_row(table, 1, 8, 7).unwrap();
+                if indexed {
+                    assert_eq!(key_rows(&storage, table, 2), 1);
+                } else {
+                    let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+                    assert_eq!(row.committed_lsn, 7);
+                    assert!(row.pending_last().is_none());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn key_preparation_recovery_reuses_unexposed_buffers_and_keeps_durable_identity() {
+        let (mut storage, table) = fixture(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let handle = crate::store::ValueIndexHandle {
+                roster: crate::store::BlockId([9; 32]),
+                entries: 1,
+                published_lsn: 7,
+            };
+            {
+                let mut publication = storage.tables[table].publication();
+                let enforcer = publication.enforcers[0].as_mut().unwrap();
+                enforcer.durable = Some(handle);
+                enforcer.durable_dirty = false;
+                enforcer.durable_rebuild = false;
+            }
+            let held = storage.value_indexes.acquire().unwrap();
+            assert!(storage.value_indexes.acquire().is_none());
+            storage.rebuild_recovered_enforcers().unwrap();
+            let enforcer = storage.tables[table].enforcer(0).unwrap();
+            assert_eq!(enforcer.durable, Some(handle));
+            assert!(!enforcer.durable_dirty);
+            assert!(!enforcer.durable_rebuild);
+            assert_eq!(key_rows(&storage, table, 1), 1);
+            drop(held);
         });
     }
 
@@ -515,7 +580,9 @@ mod tests {
                 .prepare_committed_row(table, 1, 8, false, selected)
                 .unwrap()
                 .unwrap();
-            storage.build_enforcers_visible(table, None).unwrap();
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .unwrap();
             let before = storage.tables[table].generation();
             let error = storage.publish_prepared_row(9, prepared).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
@@ -530,6 +597,94 @@ mod tests {
             storage.commit_row(table, 1, 8, 9).unwrap();
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
+        });
+    }
+
+    #[test]
+    fn key_preparation_index_commit_preserves_prepared_rows_without_another_reservation() {
+        let (mut storage, table) = fixture(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let index = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("prepared_order_index").unwrap(),
+                table: SqlName::parse("key_orders").unwrap(),
+                n_cols: 1,
+                ..IndexDef::EMPTY
+            };
+            let slot = storage.create_index(index, 8).unwrap();
+            storage.prepare_index_enforcers(table, 8).unwrap();
+            storage.commit_index_create(slot);
+            pending(&storage, table, 1, 8, 2);
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            let before = storage.tables[table].enforcers();
+            let spare = storage.value_indexes.acquire().unwrap();
+            assert!(storage.value_indexes.acquire().is_none());
+            storage.finish_index_enforcers(table).unwrap();
+            let after = storage.tables[table].enforcers();
+            assert!(same_bindings(&before, &after, false));
+            assert_eq!(after[0].as_ref().unwrap().evaluation_txid, 0);
+            assert_eq!(key_rows(&storage, table, 1), 0);
+            assert_eq!(key_rows(&storage, table, 2), 1);
+            assert_eq!(
+                storage
+                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(key_rows(&storage, table, 2), 1);
+            drop(spare);
+        });
+    }
+
+    #[test]
+    fn key_preparation_index_drop_retains_remaining_caches_with_a_full_pool() {
+        let (mut storage, table) = fixture(4);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut index = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("dropped_amount_index").unwrap(),
+                table: SqlName::parse("key_orders").unwrap(),
+                n_cols: 1,
+                ..IndexDef::EMPTY
+            };
+            index.columns[0] = 1;
+            let slot = storage.create_index(index, 8).unwrap();
+            storage.prepare_index_enforcers(table, 8).unwrap();
+            storage.commit_index_create(slot);
+            let selected = storage.tables[table].enforcers();
+            let held = [
+                storage.value_indexes.acquire().unwrap(),
+                storage.value_indexes.acquire().unwrap(),
+            ];
+            assert!(storage.value_indexes.acquire().is_none());
+            assert_eq!(
+                storage
+                    .drop_index("public", "dropped_amount_index", 8)
+                    .unwrap(),
+                Some(slot)
+            );
+            storage.commit_index_drop(slot);
+            storage.finish_index_enforcers(table).unwrap();
+            let current = storage.tables[table].enforcers();
+            assert_eq!(storage.tables[table].enforcer_count(), 1);
+            assert_eq!(
+                current[0].as_ref().unwrap().cache.slot(),
+                selected[0].as_ref().unwrap().cache.slot()
+            );
+            assert_eq!(key_rows(&storage, table, 1), 1);
+            assert_eq!(selected[1].as_ref().unwrap().cache.read().len(), 1);
+            assert!(
+                storage.value_indexes.acquire().is_none(),
+                "the old reader still owns the dropped cache"
+            );
+            drop(selected);
+            let released = storage
+                .value_indexes
+                .acquire()
+                .expect("last reader releases the dropped cache");
+            drop(released);
+            drop(held);
         });
     }
 

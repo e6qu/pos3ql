@@ -1056,6 +1056,12 @@ set: a table with two distinct key bindings needs two free buffers to rebuild
 while its existing two remain usable. A failed claim returns `54000` and keeps
 the working caches. Change this capacity before restarting; it never grows
 automatically. Allocation controls release before clearing a claimed cache.
+Committing an index change keeps its already prepared caches when all remaining
+key definitions match; row publication has already installed the transaction's
+row changes there. This finalization needs no second buffer set or row scan.
+Dropped bindings release after their readers finish.
+Startup recovery recycles its unexposed cache buffers while keeping durable index
+identities. It does not need space for two copies of every recovered cache.
 
 Index-key preparation uses one selected table shape for decoding the row and
 evaluating its expressions and membership predicate. Ordinary column keys copy

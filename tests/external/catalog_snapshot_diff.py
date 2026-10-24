@@ -27,15 +27,26 @@ def transcript(reader, writer):
     observed = []
 
     def record(connection, label, sql, parameters=()):
-        rows = connection.execute(sql, parameters).fetchall()
-        observed.append({"step": label, "rows": rows})
+        cursor = connection.execute(sql, parameters)
+        rows = cursor.fetchall()
+        observed.append({
+            "step": label,
+            "types": [column.type_code for column in cursor.description],
+            "rows": rows,
+        })
 
     def record_outcome(connection, label, sql, parameters):
         connection.execute("SAVEPOINT catalog_statement_outcome")
         try:
             cursor = connection.execute(sql, parameters)
             rows = cursor.fetchall() if cursor.description is not None else []
-            observed.append({"step": label, "rows": rows})
+            observed.append({
+                "step": label,
+                "types": [] if cursor.description is None else [
+                    column.type_code for column in cursor.description
+                ],
+                "rows": rows,
+            })
         except psycopg.Error as error:
             observed.append({"step": label, "sqlstate": error.sqlstate})
             connection.execute("ROLLBACK TO catalog_statement_outcome")

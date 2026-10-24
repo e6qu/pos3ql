@@ -49,7 +49,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v22 and older manifests are rejected before their references are used.
+Manifest v23 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -313,7 +313,8 @@ composites, routine signatures/results, aggregate types, casts and operator
 contracts share this encoding. Table definition payloads use version 7.
 
 Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
-0–15; byte 16 selects the operation; byte 17 is version 7; bytes 18–23 are zero.
+0–15; byte 16 selects the operation; byte 17 stores the version listed in the
+compatibility matrix; bytes 18–23 are zero.
 A checksum-valid unsupported version stops local replay without truncating the
 journal. Uploaded records validate the same version before decoding. Update all
 recovery candidates together and use a fresh prefix or verified logical transfer
@@ -361,8 +362,8 @@ unknown kinds and invalid modes stop recovery explicitly.
 For example, a prepared transaction that created a type keeps its owner from
 being deleted after the server loses its local caches. A prepared view read
 continues to block a conflicting rule change. Committing or rolling back the
-prepared transaction releases its recovered locks. The current journal framing
-is version 7; earlier frames are rejected. Replayed view replacement edits the
+prepared transaction releases its recovered locks. Unsupported journal framing
+versions are rejected. Replayed view replacement edits the
 existing view and return rule, preserving their object identifiers. A
 materialized-view refresh publishes its population flag with the transaction's
 rows; prepared recovery must retain that pending decision.
@@ -428,7 +429,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v23. Startup, backup retention, and
+The only accepted checkpoint manifest is v24. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

@@ -3,7 +3,7 @@ INSERT INTO key_orders_sql VALUES (1, 11), (2, 22);
 DO $body$
 BEGIN
   BEGIN
-    CREATE INDEX key_orders_bad ON key_orders_sql ((id / (amount - 11)));
+    EXECUTE 'CREATE INDEX key_orders_bad ON key_orders_sql ((id / (amount - 11)))';
     RAISE EXCEPTION 'index creation did not reject division by zero';
   EXCEPTION WHEN SQLSTATE '22012' THEN
     NULL;

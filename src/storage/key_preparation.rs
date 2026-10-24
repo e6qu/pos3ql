@@ -298,6 +298,7 @@ mod tests {
             ],
         );
         definition.columns[0].primary = true;
+        definition.columns[0].unique = true;
         let table = storage.create_table(definition).unwrap();
         let home = storage
             .heap
@@ -352,6 +353,7 @@ mod tests {
             };
             index.columns[0] = 1;
             let slot = storage.create_index(index, 0).unwrap();
+            storage.commit_index_create(slot);
             let error = storage.build_enforcers_visible(table, None).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(same_bindings(
@@ -387,6 +389,7 @@ mod tests {
             };
             index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
             let slot = storage.create_index(index, 0).unwrap();
+            storage.commit_index_create(slot);
             assert_eq!(
                 storage
                     .build_enforcers_visible(table, None)
@@ -477,6 +480,7 @@ mod tests {
             ],
         );
         definition.columns[0].primary = true;
+        definition.columns[0].unique = true;
         let table = storage.create_table(definition).unwrap();
         storage.refresh_enforcers(table).unwrap();
         let mut readers = Vec::with_capacity(capacity);
@@ -587,6 +591,7 @@ mod tests {
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 0).unwrap();
+            storage.commit_index_create(slot);
             let created_at = storage.index(slot).created_at;
             let selection = ValueKeyPreparation::capture(&storage, table).unwrap();
             assert!(selection.index(&storage, created_at).is_ok());

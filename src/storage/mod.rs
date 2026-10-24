@@ -34643,6 +34643,30 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        {
+            let table = &self.tables[table_index];
+            let (definition, mut publication, indexes) = row_ownership::acquire(|| {
+                Ok((
+                    table.definition.try_read_for_batch()?,
+                    row_ownership::try_mutex(&table.publication, "table publication lock poisoned")?,
+                    row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
+                ))
+            });
+            let has_constraints = definition.committed().columns().iter().any(|column| column.unique)
+                || definition.committed().n_uniques != 0;
+            let has_indexes = indexes.iter().any(|index| {
+                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| index.visible_to(owner))
+                    && index.table_binding.is_some_and(|binding| {
+                        binding.source.slot() == catalog_sources::CatalogObjectSlot::Table(table_index)
+                            && binding.source.matches_lifetime(self, definition.identity.database, definition.identity.created_at, definition.identity.existence)
+                    })
+            });
+            if !has_constraints && !has_indexes {
+                publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
+                publication.n_enforcers = 0;
+                return Ok(());
+            }
+        }
         let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let new_dirty_lsn = self.lsn().saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps

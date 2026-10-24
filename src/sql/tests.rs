@@ -21263,6 +21263,100 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objects() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE described_orders(id integer);
+         COMMENT ON TABLE described_orders IS 'old table';
+         COMMENT ON COLUMN described_orders.id IS 'old column';
+         CREATE ROLE described_role;
+         COMMENT ON ROLE described_role IS 'shared role';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let table_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'described_orders'::regclass::oid",
+    ))[0]
+        .clone();
+    let query = format!(
+        "SELECT obj_description({table_oid}::oid, 'pg_class'), obj_description({table_oid}::oid), col_description({table_oid}::oid, 1)"
+    );
+    let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let initial = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {query}"),
+    );
+    assert_eq!(data_rows(&initial), ["old table|old table|old column"]);
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON TABLE described_orders IS 'new table'; COMMENT ON COLUMN described_orders.id IS 'new column'",
+    );
+    assert!(!String::from_utf8_lossy(&changed).contains("ERROR"));
+    let private = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!(
+            "SAVEPOINT before_comment; COMMENT ON TABLE described_orders IS 'own table'; {query}; ROLLBACK TO before_comment; {query}"
+        ),
+    );
+    assert_eq!(
+        data_rows(&private),
+        [
+            "own table|own table|old column",
+            "old table|old table|old column"
+        ],
+        "{}",
+        String::from_utf8_lossy(&private)
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE described_orders; CREATE TABLE described_orders(replacement text); COMMENT ON TABLE described_orders IS 'replacement table'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    let old = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!("{query}; ROLLBACK"),
+    );
+    assert_eq!(
+        data_rows(&old),
+        ["old table|old table|old column"],
+        "{}",
+        String::from_utf8_lossy(&old)
+    );
+    let scopes = run_with(&mut engine, &mut budget,
+        "SELECT shobj_description('described_orders'::regclass, 'pg_class') IS NULL;
+         SELECT obj_description(oid, 'pg_authid') IS NULL, obj_description(oid) IS NULL, shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'described_role';");
+    assert_eq!(
+        data_rows(&scopes),
+        ["t", "t|t|shared role"],
+        "{}",
+        String::from_utf8_lossy(&scopes)
+    );
+}
+
+#[test]
 fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
     for (isolation, expected) in [
         ("REPEATABLE READ", "orders|id"),

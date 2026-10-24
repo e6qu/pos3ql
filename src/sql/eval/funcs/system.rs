@@ -2099,14 +2099,15 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     None
                 };
-                if matches!(
-                    catalog_name,
-                    Some("pg_database" | "pg_tablespace" | "pg_authid")
-                ) {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(catalog_name, oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: catalog_name,
+                            column: 0,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2126,7 +2127,14 @@ pub(crate) fn dispatch<'a>(
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
-                    .comment(Some("pg_class"), oid, col, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: Some("pg_class"),
+                            column: col,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2143,11 +2151,14 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(name) => name,
                     _ => return Ok(Datum::Null),
                 };
-                if !matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(Some(catalog_name), oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Shared {
+                            catalog: catalog_name,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

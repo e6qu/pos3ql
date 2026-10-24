@@ -14409,14 +14409,176 @@ pub fn user_type_name_text<'a>(
 pub fn comment_text_for<'a>(
     storage: &Storage,
     txid: u32,
-    catalog_name: Option<&str>,
+    target: super::eval::DescriptionTarget<'_>,
     oid: u32,
-    subid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let signed_oid = i32::try_from(oid).ok();
+    use super::eval::DescriptionTarget;
+    use super::exec::decode_projected_col_record;
+    let (catalog, column, description_catalog) = match target {
+        DescriptionTarget::Local { catalog, column } => (catalog, column, "pg_description"),
+        DescriptionTarget::Shared { catalog } => (Some(catalog), 0, "pg_shdescription"),
+    };
+    let classoid = match catalog {
+        Some(catalog) => match catalog_relation_oid(catalog) {
+            Some(oid) => Some(oid as u32),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let definition = super::catalog_snapshot_keys::RELATIONS
+        .iter()
+        .find(|relation| relation.name == description_catalog)
+        .expect("description catalog has a PostgreSQL row identity");
+    let key_classoid = |key: &[u8]| -> Result<u32, SqlError> {
+        match decode_projected_col_record(key, 1, arena)? {
+            Datum::Oid(oid) => Ok(oid),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid description catalog class identifier"
+            )),
+        }
+    };
+    let history = storage.catalog_rows_matching(
+        definition.identity(storage.current_database_oid()),
+        storage.commit_snapshot(),
+        |key| {
+            let candidate = match decode_projected_col_record(key, 0, arena)? {
+                Datum::Oid(oid) => oid,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid description catalog object identifier"
+                    ));
+                }
+            };
+            if candidate != oid {
+                return Ok(false);
+            }
+            let candidate_class = key_classoid(key)?;
+            if classoid.is_some_and(|classoid| candidate_class != classoid) {
+                return Ok(false);
+            }
+            if !definition.shared {
+                return match decode_projected_col_record(key, 2, arena)? {
+                    Datum::Int4(subid) => Ok(subid == column),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid description catalog column identifier"
+                    )),
+                };
+            }
+            Ok(true)
+        },
+        arena,
+    )?;
+    let ordinal = |classoid: u32| {
+        super::catalog_snapshot_keys::RELATIONS
+            .iter()
+            .position(|relation| relation.oid.get() == classoid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "description refers to an unknown catalog"
+                )
+            })
+    };
+    let collect = |transaction| {
+        let mut rows = [None; super::catalog_snapshot_keys::RELATIONS.len()];
+        visit_comments_for_object(storage, transaction, target, oid, |catalog, text| {
+            let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "comment refers to an unknown catalog"
+                )
+            })? as u32;
+            let row = &mut rows[ordinal(classoid)?];
+            if row.is_some() {
+                return Err(sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "more than one row returned by a subquery used as an expression"
+                ));
+            }
+            *row = Some(arena.alloc_str(text).map_err(|_| arena_full())?);
+            Ok(())
+        })?;
+        Ok::<_, SqlError>(rows)
+    };
+    let private = collect(txid)?;
+    let committed = if history.is_empty() {
+        private
+    } else {
+        collect(0)?
+    };
+    let mut older = [None; super::catalog_snapshot_keys::RELATIONS.len()];
+    for row in history {
+        let index = ordinal(key_classoid(row.key)?)?;
+        older[index] = Some(match row.before {
+            None => None,
+            Some(image) => {
+                if image.count.get() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "description catalog row has duplicate values"
+                    ));
+                }
+                match decode_projected_col_record(
+                    image.bytes,
+                    if definition.shared { 2 } else { 3 },
+                    arena,
+                )? {
+                    Datum::Text(text) => Some(text),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "invalid historical description text"
+                        ));
+                    }
+                }
+            }
+        });
+    }
     let mut found = None;
+    for index in 0..private.len() {
+        let selected = if private[index] != committed[index] {
+            private[index]
+        } else {
+            older[index].unwrap_or(committed[index])
+        };
+        if let Some(text) = selected
+            && found.replace(text).is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::CARDINALITY_VIOLATION,
+                "more than one row returned by a subquery used as an expression"
+            ));
+        }
+    }
+    Ok(found)
+}
+
+fn visit_comments_for_object(
+    storage: &Storage,
+    txid: u32,
+    target: super::eval::DescriptionTarget<'_>,
+    oid: u32,
+    mut visit: impl FnMut(&str, &str) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let (catalog_name, subid, shared) = match target {
+        super::eval::DescriptionTarget::Local { catalog, column } => (catalog, column, false),
+        super::eval::DescriptionTarget::Shared { catalog } => (Some(catalog), 0, true),
+    };
+    let signed_oid = i32::try_from(oid).ok();
     for (class, schema, name, csub, text) in storage.comments_visible(txid) {
+        let is_shared = matches!(
+            class,
+            crate::storage::CommentClass::Role
+                | crate::storage::CommentClass::Database
+                | crate::storage::CommentClass::Tablespace
+        );
+        if is_shared != shared {
+            continue;
+        }
         let schema = schema.as_str();
         let name = name.as_str();
         let text = text.as_str();
@@ -14742,21 +14904,10 @@ pub fn comment_text_for<'a>(
             _ => false,
         };
         if hit {
-            let bytes = arena
-                .alloc_slice_copy(text.as_bytes())
-                .map_err(|_| arena_full())?;
-            if found
-                .replace(unsafe { core::str::from_utf8_unchecked(bytes) })
-                .is_some()
-            {
-                return Err(sql_err!(
-                    sqlstate::CARDINALITY_VIOLATION,
-                    "more than one row returned by a subquery used as an expression"
-                ));
-            }
+            visit(selected_catalog, text)?;
         }
     }
-    Ok(found)
+    Ok(())
 }
 
 /// One materialized foreign-key constraint.

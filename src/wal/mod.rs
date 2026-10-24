@@ -12653,7 +12653,7 @@ fn decode_bounded_default_bytes(
 mod tests {
     use super::*;
 
-    fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8; 4096]) -> &'a [u8] {
+    fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8]) -> &'a [u8] {
         let mut budget = Budget::new(bytes.len());
         let mut payload = FixedBuf::new(
             &mut budget,

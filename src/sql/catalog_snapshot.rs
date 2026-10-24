@@ -217,7 +217,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
             "pg_subscription",
             "pg_subscription_rel",
             "pg_shdepend",
-            "pg_shdescription",
+            "pg_description",
         ],
         SequenceChanged(_) => &[
             "pg_sequence",

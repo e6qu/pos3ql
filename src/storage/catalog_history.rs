@@ -220,13 +220,28 @@ impl CatalogHistory {
         snapshot: u64,
         arena: &'a Arena,
     ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
+        self.rows_matching(relation, snapshot, |_| Ok(true), arena)
+    }
+
+    /// Filter before copying so repeated point lookups do not copy an entire
+    /// catalog into statement memory. The predicate runs under the RAM owner.
+    pub(crate) fn rows_matching<'a>(
+        &self,
+        relation: CatalogRelationIdentity,
+        snapshot: u64,
+        matches: impl Fn(&[u8]) -> Result<bool, SqlError>,
+        arena: &'a Arena,
+    ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
         let state = self.state.lock().expect("catalog history lock poisoned");
         if snapshot >= state.latest_publication {
             return Ok(&[]);
         }
         let eligible =
             |frame: &Frame<'_>| frame.relation == relation && frame.committed_at > snapshot;
-        let candidates = frames(state.bytes.readable()).filter(eligible).count();
+        let mut candidates = 0;
+        for frame in frames(state.bytes.readable()).filter(eligible) {
+            candidates += usize::from(matches(frame.row.key)?);
+        }
         if candidates == 0 {
             return Ok(&[]);
         }
@@ -239,6 +254,9 @@ impl CatalogHistory {
             .map_err(|_| crate::sql::eval::arena_full())?;
         let mut count = 0;
         for frame in frames(state.bytes.readable()).filter(eligible) {
+            if !matches(frame.row.key)? {
+                continue;
+            }
             let mut hash = Fnv1aHasher::default();
             hash.write(frame.row.key);
             let mut slot = hash.finish() as usize & (slots - 1);
@@ -327,6 +345,17 @@ impl Storage {
         arena: &'a Arena,
     ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
         self.catalog_history.rows_at(relation, snapshot, arena)
+    }
+
+    pub(crate) fn catalog_rows_matching<'a>(
+        &self,
+        relation: CatalogRelationIdentity,
+        snapshot: u64,
+        matches: impl Fn(&[u8]) -> Result<bool, SqlError>,
+        arena: &'a Arena,
+    ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
+        self.catalog_history
+            .rows_matching(relation, snapshot, matches, arena)
     }
 }
 
@@ -471,6 +500,43 @@ mod tests {
             bytes,
             count: NonZeroU32::new(1).unwrap(),
         })
+    }
+
+    #[test]
+    fn catalog_history_filtered_lookup_bounds_copies_and_propagates_key_errors() {
+        let mut budget = Budget::new(16 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 1, 8).unwrap();
+        let arena = Arena::new(&mut budget, "catalog point lookup", 256).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 2609);
+        forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            for key in 0u8..12 {
+                batch.record(table, &[key], image(&[42; 128])).unwrap();
+            }
+            batch.record(table, b"target", image(b"old")).unwrap();
+            batch.publish(NonZeroU64::new(7).unwrap());
+            let rows = history
+                .rows_matching(table, 6, |key| Ok(key == b"target"), &arena)
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].before, image(b"old"));
+            let error = history
+                .rows_matching(
+                    table,
+                    6,
+                    |_| {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "invalid point lookup key"
+                        ))
+                    },
+                    &arena,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            history.reclaim(None);
+            assert_eq!(rows[0].before, image(b"old"));
+        });
     }
 
     #[test]

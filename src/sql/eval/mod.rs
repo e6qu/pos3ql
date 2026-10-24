@@ -777,6 +777,17 @@ pub trait SequenceAccess {
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
+#[derive(Clone, Copy)]
+pub enum DescriptionTarget<'a> {
+    Local {
+        catalog: Option<&'a str>,
+        column: i32,
+    },
+    Shared {
+        catalog: &'a str,
+    },
+}
+
 pub trait CatalogAccess {
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
@@ -1501,9 +1512,8 @@ pub trait CatalogAccess {
     /// `obj_description`/`col_description`.
     fn comment<'a>(
         &self,
-        catalog_name: Option<&str>,
+        target: DescriptionTarget<'_>,
         oid: u32,
-        subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
     /// SQL spelling of a user-defined type OID for `format_type`.

@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod key_preparation;
 mod row_layout;
 mod transaction_publication;
 
@@ -59203,7 +59204,8 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
             .prepare_index_enforcers(table, txid)
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-        assert_eq!(engine.storage.table(table).enforcer_count(), 0);
+        assert_eq!(engine.storage.table(table).enforcer_count(), 1);
+        assert!(engine.storage.value_cache_complete(table, &[0]));
         engine.storage.rollback_index_create(slot);
         engine.storage.prepare_index_enforcers(table, txid).unwrap();
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);

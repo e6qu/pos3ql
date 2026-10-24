@@ -3814,7 +3814,7 @@ impl Engine {
         // Replay's row installs bypass the per-row value-index maintenance, so
         // rebuild every table's uniqueness indexes from the recovered committed
         // rows before serving queries.
-        storage.rebuild_all_enforcers()?;
+        storage.rebuild_recovered_enforcers()?;
         let mut active_system_settings = [None; crate::storage::MAX_SYSTEM_SETTINGS];
         let mut active_system_setting_count = 0usize;
         for (_, setting) in storage.system_settings() {
@@ -7229,7 +7229,7 @@ impl Engine {
         for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
             if self.storage.table(table).live()
-                && let Err(error) = self.storage.refresh_enforcers(table)
+                && let Err(error) = self.storage.finish_table_enforcers(table, rewrote_rows)
             {
                 index_result = Err(error);
                 break;
@@ -7244,7 +7244,7 @@ impl Engine {
                 {
                     continue;
                 }
-                if let Err(error) = self.storage.refresh_enforcers(table) {
+                if let Err(error) = self.storage.finish_index_enforcers(table) {
                     index_result = Err(error);
                     break;
                 }

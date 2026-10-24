@@ -1043,13 +1043,43 @@ are prerequisites for the planned execution workers.
 A selected in-memory index cache owns its storage. Rebuilding or dropping a table
 cannot reuse that cache slot until its last reader releases it. A replacement
 binding list and its count publish together after population; failed builds
-release their claims and publish no partial list. A cache whose row map fills is
+release their claims and leave the working list intact. A competing replacement,
+changed table definition, or newer publication rejects installation with `40001`
+before changing the published list. A cache whose row map fills is
 marked incomplete, so it cannot supply an authoritative negative lookup.
 
 Cache owners and their buffers are reserved at startup. Retained readers count
 against `max_value_indexes`; a full claim pool returns `54000`. For example, a
 replacement that runs out of slots can be retried after an older lookup releases
-its cache. Allocation controls release before clearing a claimed cache.
+its cache. The pool must also fit the complete replacement beside the published
+set: a table with two distinct key bindings needs two free buffers to rebuild
+while its existing two remain usable. A failed claim returns `54000` and keeps
+the working caches. Change this capacity before restarting; it never grows
+automatically. Allocation controls release before clearing a claimed cache.
+Committing an index change keeps its already prepared caches when all remaining
+key definitions match; row publication has already installed the transaction's
+row changes there. This finalization needs no second buffer set or row scan.
+Dropped bindings release after their readers finish.
+Creating an index also shares unchanged bindings and builds only new lookup data;
+for example, adding an amount index keeps the existing order-number cache usable.
+Table changes can keep these caches when rows were not rewritten, or when both
+the table and its caches are empty. Changed key definitions still need new buffers.
+Startup recovery recycles its unexposed cache buffers while keeping durable index
+identities. It does not need space for two copies of every recovered cache.
+Each table rebuild runs in its owning database; success and errors restore the
+caller's database context. Runtime table-identity checks remain strict.
+
+Index-key preparation uses one selected table shape for decoding the row and
+evaluating its expressions and membership predicate. Ordinary column keys copy
+only column types; they do not claim or copy a complete definition image.
+A row from an older physical
+layout is rejected with `40001` before decoding. Committing a row rechecks that
+definition and the selected cache bindings before changing row history or caches.
+An ordinary commit to another row does not invalidate prepared keys. For example,
+rebuilding an order index between preparing and publishing a new order forces
+that stale publication to fail with `40001`; it cannot insert an old binding's
+hash into a new cache. These checks do not yet provide the roadmap's
+whole-statement catalog capture or SQL execution on several CPU workers.
 
 ### How statistics reads and journal batches stay consistent
 

@@ -32,6 +32,7 @@ pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod definition_pool;
 mod index_bindings;
+mod key_preparation;
 use index_bindings::{IndexTableBinding, PendingIndexTable};
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
@@ -3684,7 +3685,7 @@ impl SelectedValueIndex {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EnforcerMetadata {
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
@@ -4042,6 +4043,7 @@ impl Table {
     fn enforcer(&self, binding: usize) -> Option<Enforcer> {
         self.publication().enforcers[binding].clone()
     }
+    #[cfg(test)]
     fn enforcers(&self) -> [Option<Enforcer>; MAX_VALUE_ENFORCERS] {
         self.publication().enforcers.clone()
     }
@@ -32565,12 +32567,27 @@ impl Storage {
         rewritten: bool,
         selected: RowRead<'_>,
     ) -> Result<(), SqlError> {
-        let table = &self.tables[table_index];
+        let Some(prepared) =
+            self.prepare_committed_row(table_index, rowid, txid, rewritten, selected)?
+        else {
+            return Ok(());
+        };
+        self.publish_prepared_row(commit_lsn, prepared)
+    }
+
+    fn prepare_committed_row(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        rewritten: bool,
+        selected: RowRead<'_>,
+    ) -> Result<Option<key_preparation::PreparedCommittedRow>, SqlError> {
         let Some(pending) = selected
             .pending_last()
             .filter(|pending| pending.txid == txid)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let head = selected
             .pending_head_identity()
@@ -32584,21 +32601,55 @@ impl Storage {
             )),
         )?;
         drop(selected);
-        let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        let count = if !rewritten {
-            match image {
-                Some(image) => self.row_enforcer_hashes(table_index, rowid, image, &mut inserts)?,
-                None => 0,
-            }
+        let prepared_keys = if !rewritten {
+            Some(key_preparation::PreparedRowKeys::capture(
+                self,
+                table_index,
+                rowid,
+                image,
+            )?)
         } else {
             drop(image);
-            0
+            None
         };
 
-        let (snapshots, mut publication, generations, mut versions, mut rows) =
+        Ok(Some(key_preparation::PreparedCommittedRow {
+            origin: self.catalog_sources.origin(),
+            table: table_index,
+            rowid,
+            transaction: txid,
+            head,
+            keys: prepared_keys,
+        }))
+    }
+
+    fn publish_prepared_row(
+        &self,
+        commit_lsn: u64,
+        prepared: key_preparation::PreparedCommittedRow,
+    ) -> Result<(), SqlError> {
+        let key_preparation::PreparedCommittedRow {
+            origin,
+            table: table_index,
+            rowid,
+            transaction: txid,
+            head,
+            keys: prepared_keys,
+        } = prepared;
+        if origin != self.catalog_sources.origin() {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "prepared row publication belongs to another storage instance"
+            ));
+        }
+        let table = &self.tables[table_index];
+        let rewritten = prepared_keys.is_none();
+
+        let (snapshots, definition, mut publication, generations, mut versions, mut rows) =
             row_ownership::acquire(|| {
                 Ok((
                     row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
+                    table.definition.try_read_for_batch()?,
                     row_ownership::try_mutex(
                         &table.publication,
                         "table publication lock poisoned",
@@ -32608,6 +32659,10 @@ impl Storage {
                     table.rows.try_write_for_batch()?,
                 ))
             });
+        if let Some(prepared) = &prepared_keys {
+            prepared.validate_definition(self, &definition)?;
+            prepared.validate_bindings(&publication)?;
+        }
         let n_enforcers = publication.n_enforcers;
         let generation = publication.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
@@ -32683,7 +32738,10 @@ impl Storage {
                 }
                 let mut index = enforcer.cache.write();
                 index.remove_rowid(rowid);
-                for &(_, hash) in inserts[..count]
+                let prepared = prepared_keys
+                    .as_ref()
+                    .expect("ordinary publication prepared keys");
+                for &(_, hash) in prepared.hashes[..prepared.count]
                     .iter()
                     .filter(|&&(candidate, _)| candidate == binding)
                 {
@@ -32718,6 +32776,7 @@ impl Storage {
     /// all non-NULL, writing `(enforcer_index, hash)` for each into `out`.
     /// NULL keys remain in durable ordered generations but cannot satisfy an
     /// equality probe, so the resident exact map deliberately omits them.
+    #[cfg(test)]
     fn row_enforcer_hashes(
         &self,
         table_index: usize,
@@ -32725,9 +32784,17 @@ impl Storage {
         home: impl Into<RowByteRead>,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let bindings = self.tables[table_index].enforcers();
         let count = bindings.iter().take_while(|entry| entry.is_some()).count();
-        self.row_enforcer_hashes_for(table_index, rowid, home, &bindings[..count], out)
+        self.row_enforcer_hashes_for(
+            table_index,
+            rowid,
+            home,
+            &selection,
+            &bindings[..count],
+            out,
+        )
     }
 
     fn row_enforcer_hashes_for(
@@ -32735,11 +32802,14 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = self.tables[table_index].definition().schema(&mut schema);
+        let n_columns = selection.definition().schema(&mut schema);
+        let home = home.into();
+        selection.validate_row(&home)?;
         let arena = self
             .index_arena
             .lock()
@@ -32748,13 +32818,7 @@ impl Storage {
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.values_enforcer_hashes_for(
-                &arena,
-                table_index,
-                bindings,
-                &values[..n_columns],
-                out,
-            )
+            self.values_enforcer_hashes_for(&arena, selection, bindings, &values[..n_columns], out)
         });
         // SAFETY: callers receive only hashes and binding ordinals; expression
         // evaluation cannot retain values allocated above this row-local mark.
@@ -32765,17 +32829,19 @@ impl Storage {
     fn values_enforcer_hashes_for(
         &self,
         arena: &Arena,
-        table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
         values: &[Datum],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut n_out = 0;
         for (binding, selected) in bindings.iter().enumerate() {
-            let selected = selected.as_ref().expect("candidate binding");
+            let Some(selected) = selected.as_ref() else {
+                continue;
+            };
             self.with_value_binding_values_for(
                 arena,
-                table_index,
+                selection,
                 selected,
                 values,
                 |key, _, enforcer| {
@@ -32811,9 +32877,10 @@ impl Storage {
         home: impl Into<RowByteRead>,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = &self.tables[table_index];
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = table.definition().schema(&mut schema);
+        let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
+        let schema = selection.schema();
+        let home = home.into();
+        selection.validate_row(&home)?;
         let arena = self
             .index_arena
             .lock()
@@ -32821,14 +32888,8 @@ impl Storage {
         let mark = arena.mark();
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.with_value_binding_values(
-                &arena,
-                table_index,
-                binding,
-                &values[..n_columns],
-                visit,
-            )
+            rowenc::decode(bytes, schema, &mut values)?;
+            selection.with_values(self, &arena, &values[..schema.len()], visit)
         });
         // SAFETY: `visit` cannot return a borrowed key, and all expression
         // values have been encoded or hashed before this row-local rewind.
@@ -32844,43 +32905,27 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        self.with_value_binding_values_for(arena, table_index, &enforcer, values, visit)
+        let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
+        selection.with_values(self, arena, values, visit)
     }
 
     fn with_value_binding_values_for<R>(
         &self,
         arena: &Arena,
-        table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         enforcer: &Enforcer,
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = &self.tables[table_index];
-        let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
-        if let Some(created_at) = enforcer.index_created_at {
-            index = self
-                .index_catalog()
-                .iter()
-                .find(|index| {
-                    index.ddl_state != CatalogDdlState::Absent
-                        && index.created_at == created_at
-                        && index.database == table.database()
-                })
-                .copied()
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "physical index binding has no catalog definition"
-                    )
-                })?;
+        let key = if let Some(created_at) = enforcer.index_created_at {
+            index = selection.index(self, created_at)?;
             if let Some(source) = index.predicate {
                 let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     enforcer.evaluation_txid,
-                    &table.definition(),
+                    selection.definition(),
                     values,
                     predicate,
                     arena,
@@ -32895,19 +32940,29 @@ impl Storage {
                         Some(crate::sql::parser::parse_expr(source.as_str(), arena)?);
                 }
             }
-            key = crate::sql::exec::constraints::index_key_values(
+            crate::sql::exec::constraints::index_key_values(
                 self,
                 enforcer.evaluation_txid,
-                &table.definition(),
+                selection.definition(),
                 values,
                 &index.columns[..index.n_cols],
                 &expressions[..index.n_cols],
                 arena,
-            )?;
+            )?
         } else {
-            for (position, column) in enforcer.columns().iter().enumerate() {
-                key[position] = values[*column as usize];
-            }
+            return Self::with_plain_value_binding_values(enforcer, values, visit);
+        };
+        visit(Some(&key[..enforcer.n_cols]), values, enforcer)
+    }
+
+    fn with_plain_value_binding_values<R>(
+        enforcer: &Enforcer,
+        values: &[Datum],
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let mut key = [Datum::Null; MAX_INDEX_COLS];
+        for (position, column) in enforcer.columns().iter().enumerate() {
+            key[position] = values[usize::from(*column)];
         }
         visit(Some(&key[..enforcer.n_cols]), values, enforcer)
     }
@@ -34557,13 +34612,23 @@ impl Storage {
     /// rows. Called once at startup after journal replay (whose row installs
     /// bypass the per-row commit maintenance), so the indexes reflect the
     /// recovered committed state before any query runs.
-    pub fn rebuild_all_enforcers(&mut self) -> Result<(), SqlError> {
-        for i in 0..self.tables.len() {
-            if self.tables[i].live() {
-                self.refresh_enforcers(i)?;
+    pub fn rebuild_recovered_enforcers(&mut self) -> Result<(), SqlError> {
+        let prior_database = current_database();
+        let result = (|| {
+            for i in 0..self.tables.len() {
+                if self.tables[i].live() {
+                    self.select_database_for_recovery(self.tables[i].database())?;
+                    self.build_enforcers_visible(
+                        i,
+                        None,
+                        key_preparation::EnforcerRows::RebuildRecovered,
+                    )?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        crate::sql::set_execution_database_oid(prior_database);
+        result
     }
 
     /// Rebuilds a table's value-cache enforcers from its current definition and
@@ -34583,7 +34648,11 @@ impl Storage {
         table_index: usize,
         txid: u32,
     ) -> Result<(), SqlError> {
-        self.refresh_enforcers_visible(table_index, Some(txid))
+        self.build_enforcers_visible(
+            table_index,
+            Some(txid),
+            key_preparation::EnforcerRows::ReusePrepared,
+        )
     }
 
     fn refresh_enforcers_visible(
@@ -34591,29 +34660,118 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
-        self.build_enforcers_visible(table_index, txid)
+        self.build_enforcers_visible(table_index, txid, key_preparation::EnforcerRows::Rebuild)
+    }
+
+    /// Row publication already updated prepared index caches. Finalize their
+    /// catalog owner without rescanning rows when the complete shape matches.
+    pub(crate) fn finish_index_enforcers(&self, table_index: usize) -> Result<(), SqlError> {
+        self.build_enforcers_visible(
+            table_index,
+            None,
+            key_preparation::EnforcerRows::ReusePrepared,
+        )
+    }
+
+    pub(crate) fn finish_table_enforcers(
+        &mut self,
+        table_index: usize,
+        rewrote_rows: bool,
+    ) -> Result<(), SqlError> {
+        let empty = self.tables[table_index].rows.is_empty()
+            && self.tables[table_index].spill_generations().is_empty();
+        let empty_caches = if empty {
+            let bindings = self.tables[table_index].publication().enforcers.clone();
+            bindings
+                .iter()
+                .flatten()
+                .all(|enforcer| enforcer.cache.read().is_empty())
+        } else {
+            false
+        };
+        let rows = if rewrote_rows && !(empty && empty_caches) {
+            key_preparation::EnforcerRows::Rebuild
+        } else {
+            key_preparation::EnforcerRows::ReusePrepared
+        };
+        self.build_enforcers_visible(table_index, None, rows)
     }
 
     fn build_enforcers_visible(
         &self,
         table_index: usize,
         txid: Option<u32>,
+        rows: key_preparation::EnforcerRows,
     ) -> Result<(), SqlError> {
+        {
+            let table = &self.tables[table_index];
+            let (definition, mut publication, indexes) = row_ownership::acquire(|| {
+                Ok((
+                    table.definition.try_read_for_batch()?,
+                    row_ownership::try_mutex(
+                        &table.publication,
+                        "table publication lock poisoned",
+                    )?,
+                    row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
+                ))
+            });
+            let has_constraints = definition
+                .committed()
+                .columns()
+                .iter()
+                .any(|column| column.unique)
+                || definition.committed().n_uniques != 0;
+            let has_indexes = indexes.iter().any(|index| {
+                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                    index.visible_to(owner)
+                }) && index.table_binding.is_some_and(|binding| {
+                    binding.source.slot() == catalog_sources::CatalogObjectSlot::Table(table_index)
+                        && binding.source.matches_lifetime(
+                            self,
+                            definition.identity.database,
+                            definition.identity.created_at,
+                            definition.identity.existence,
+                        )
+                })
+            });
+            if !has_constraints && !has_indexes {
+                publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
+                publication.n_enforcers = 0;
+                return Ok(());
+            }
+        }
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
         let new_dirty_lsn = self.lsn().saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
-        let (published, n_published, expected_generation) = {
-            let mut publication = self.tables[table_index].publication();
+        let (published, prior_metadata, n_published, expected_generation) = {
+            let (definition, mut publication) = row_ownership::acquire(|| {
+                Ok((
+                    self.tables[table_index].definition.try_read_for_batch()?,
+                    row_ownership::try_mutex(
+                        &self.tables[table_index].publication,
+                        "table publication lock poisoned",
+                    )?,
+                ))
+            });
+            selection.validate_definition(self, &definition)?;
+            let count = publication.n_enforcers;
             let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] =
                 core::array::from_fn(|index| {
                     publication.enforcers[index]
                         .as_ref()
-                        .map(|entry| entry.metadata)
+                        .map(|enforcer| enforcer.metadata)
                 });
-            let count = publication.n_enforcers;
-            publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
-            publication.n_enforcers = 0;
-            (metadata, count, publication.generation)
+            let published = if matches!(rows, key_preparation::EnforcerRows::RebuildRecovered) {
+                // Recovery has exclusive access before serving clients. Keep
+                // durable identities while recycling its unexposed buffers.
+                publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
+                publication.n_enforcers = 0;
+                [const { None }; MAX_VALUE_ENFORCERS]
+            } else {
+                publication.enforcers.clone()
+            };
+            (published, metadata, count, publication.generation)
         };
         #[derive(Clone, Copy)]
         struct WantedBinding {
@@ -34625,6 +34783,18 @@ impl Storage {
             ordered: bool,
             include_mask: ColumnSet,
             dependency_mask: ColumnSet,
+        }
+        impl WantedBinding {
+            fn matches(&self, enforcer: &EnforcerMetadata) -> bool {
+                enforcer.n_cols == self.n_columns
+                    && enforcer.index_created_at == self.index_created_at
+                    && enforcer.include_mask == self.include_mask
+                    && enforcer.dependency_mask == self.dependency_mask
+                    && enforcer.ordered == self.ordered
+                    && enforcer.key_types[..enforcer.n_cols] == self.key_types[..self.n_columns]
+                    && enforcer.collations[..enforcer.n_cols] == self.collations[..self.n_columns]
+                    && enforcer.columns[..enforcer.n_cols] == self.columns[..self.n_columns]
+            }
         }
         const EMPTY_BINDING: WantedBinding = WantedBinding {
             columns: [0; MAX_INDEX_COLS],
@@ -34646,7 +34816,7 @@ impl Storage {
             )
         };
         {
-            let def = &*self.tables[table_index].definition();
+            let def = selection.definition();
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
                     if n_want == MAX_VALUE_ENFORCERS {
@@ -34679,16 +34849,10 @@ impl Storage {
         // share one enforcer: PostgreSQL permits redundant indexes, but a
         // second copy cannot improve the equality probe and would waste a
         // startup-reserved pool slot.
-        let table_schema = {
-            let definition = self.tables[table_index].definition();
-            definition.schema
-        };
-        let table_name = {
-            let definition = self.tables[table_index].definition();
-            definition.name
-        };
-        let table_database = self.tables[table_index].database();
-        let table_definition = *self.tables[table_index].definition();
+        let table_definition = selection.definition();
+        let table_schema = table_definition.schema;
+        let table_name = table_definition.name;
+        let table_database = selection.database();
         for index in self
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
@@ -34700,6 +34864,7 @@ impl Storage {
             })
             .map(|(_, index)| index)
         {
+            selection.index(self, index.created_at)?;
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
                 .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
@@ -34778,11 +34943,11 @@ impl Storage {
                             want[n_want].dependency_mask |=
                                 crate::sql::exec::check_referenced_columns(
                                     expression,
-                                    &table_definition,
+                                    table_definition,
                                 )?;
                             let (type_oid, _) = crate::sql::exec::infer_type_catalog(
                                 expression,
-                                Some(&table_definition),
+                                Some(table_definition),
                                 self,
                                 txid.unwrap_or(0),
                             )?;
@@ -34800,7 +34965,7 @@ impl Storage {
                 if let Some(source) = index.predicate {
                     let predicate = crate::sql::parser::parse_expr(source.as_str(), &arena)?;
                     want[n_want].dependency_mask |=
-                        crate::sql::exec::check_referenced_columns(predicate, &table_definition)?;
+                        crate::sql::exec::check_referenced_columns(predicate, table_definition)?;
                 }
                 Ok(())
             })();
@@ -34814,7 +34979,61 @@ impl Storage {
         }
         let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] =
             [const { None }; MAX_VALUE_ENFORCERS];
+        let mut populate = [true; MAX_VALUE_ENFORCERS];
+        if matches!(rows, key_preparation::EnforcerRows::ReusePrepared) {
+            let mut used = [false; MAX_VALUE_ENFORCERS];
+            let mut count = 0;
+            for (position, wanted) in want[..n_want].iter().enumerate() {
+                let Some((slot, enforcer)) =
+                    published[..n_published]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, enforcer)| {
+                            enforcer
+                                .as_ref()
+                                .filter(|enforcer| {
+                                    !used[slot] && wanted.matches(&enforcer.metadata)
+                                })
+                                .map(|enforcer| (slot, enforcer))
+                        })
+                else {
+                    continue;
+                };
+                used[slot] = true;
+                let mut enforcer = enforcer.clone();
+                enforcer.evaluation_txid = txid.unwrap_or(0);
+                candidate[position] = Some(enforcer);
+                populate[position] = false;
+                count += 1;
+            }
+            if count == n_want {
+                let (definition, mut publication) = row_ownership::acquire(|| {
+                    Ok((
+                        self.tables[table_index].definition.try_read_for_batch()?,
+                        row_ownership::try_mutex(
+                            &self.tables[table_index].publication,
+                            "table publication lock poisoned",
+                        )?,
+                    ))
+                });
+                selection.validate_definition(self, &definition)?;
+                if publication.generation != expected_generation
+                    || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "table changed while its prepared index caches were being finalized"
+                    ));
+                }
+                publication.enforcers = candidate;
+                publication.n_enforcers = n_want;
+                return Ok(());
+            }
+        }
         for (w, wanted) in want.iter().take(n_want).enumerate() {
+            if candidate[w].is_some() {
+                continue;
+            }
             let cache = match self.value_indexes.acquire() {
                 Some(s) => s,
                 None => {
@@ -34824,21 +35043,10 @@ impl Storage {
                     ));
                 }
             };
-            let prior = published[..n_published]
+            let prior = prior_metadata[..n_published]
                 .iter()
                 .flatten()
-                .find(|enforcer| {
-                    enforcer.n_cols == wanted.n_columns
-                        && enforcer.index_created_at == wanted.index_created_at
-                        && enforcer.include_mask == wanted.include_mask
-                        && enforcer.dependency_mask == wanted.dependency_mask
-                        && enforcer.ordered == wanted.ordered
-                        && enforcer.key_types[..enforcer.n_cols]
-                            == wanted.key_types[..wanted.n_columns]
-                        && enforcer.collations[..enforcer.n_cols]
-                            == wanted.collations[..wanted.n_columns]
-                        && enforcer.columns[..enforcer.n_cols] == wanted.columns[..wanted.n_columns]
-                })
+                .find(|enforcer| wanted.matches(enforcer))
                 .copied();
             candidate[w] = Some(Enforcer {
                 cache,
@@ -34860,9 +35068,27 @@ impl Storage {
                 },
             });
         }
-        self.populate_enforcers(table_index, &candidate[..n_want])?;
-        let mut publication = self.tables[table_index].publication();
-        if publication.generation != expected_generation {
+        let fresh: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = core::array::from_fn(|index| {
+            if populate[index] {
+                candidate[index].clone()
+            } else {
+                None
+            }
+        });
+        self.populate_enforcers(table_index, &selection, &fresh[..n_want])?;
+        let (definition, mut publication) = row_ownership::acquire(|| {
+            Ok((
+                self.tables[table_index].definition.try_read_for_batch()?,
+                row_ownership::try_mutex(
+                    &self.tables[table_index].publication,
+                    "table publication lock poisoned",
+                )?,
+            ))
+        });
+        selection.validate_definition(self, &definition)?;
+        if publication.generation != expected_generation
+            || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+        {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table changed while its value caches were being built"
@@ -34877,32 +35103,24 @@ impl Storage {
     fn populate_enforcers(
         &self,
         table_index: usize,
+        selection: &key_preparation::ValueKeyPreparation,
         bindings: &[Option<Enforcer>],
     ) -> Result<(), SqlError> {
         let n_enf = bindings.len();
-        if n_enf == 0 {
+        if bindings.iter().all(Option::is_none) {
             return Ok(());
         }
         let mut slots: [Option<ValueIndexLease>; MAX_VALUE_ENFORCERS] =
             [const { None }; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = Some(
-                bindings[i]
-                    .as_ref()
-                    .expect("candidate binding")
-                    .cache
-                    .clone(),
-            );
+            *s = bindings[i].as_ref().map(|enforcer| enforcer.cache.clone());
         }
         let boundary = self.tables[table_index]
             .rows
             .iter()
             .fold(self.lsn(), |lsn, (_, state)| lsn.max(state.committed_lsn));
-        for slot in &slots[..n_enf] {
-            slot.as_ref()
-                .expect("selected cache")
-                .write()
-                .publish_at(boundary);
+        for slot in slots[..n_enf].iter().flatten() {
+            slot.write().publish_at(boundary);
         }
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
@@ -34923,13 +35141,19 @@ impl Storage {
             let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
-            let count =
-                self.row_enforcer_hashes_for(table_index, rowid, home, bindings, &mut buf)?;
+            let count = self.row_enforcer_hashes_for(
+                table_index,
+                rowid,
+                home,
+                selection,
+                bindings,
+                &mut buf,
+            )?;
             Ok(insert_hashes(rowid, lsn, &buf[..count]))
         })?;
         if overlay.is_continue() {
             let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let n_columns = self.tables[table_index].definition().schema(&mut schema);
+            let n_columns = selection.definition().schema(&mut schema);
             let dependency_mask = bindings
                 .iter()
                 .flatten()
@@ -34962,13 +35186,8 @@ impl Storage {
                         }
                         SpilledRowRepresentation::Values(values) => values,
                     };
-                    let hashes = self.values_enforcer_hashes_for(
-                        &arena,
-                        table_index,
-                        bindings,
-                        values,
-                        &mut buf,
-                    );
+                    let hashes = self
+                        .values_enforcer_hashes_for(&arena, selection, bindings, values, &mut buf);
                     // SAFETY: `hashes` retains only fixed hash values and
                     // binding ordinals from expression evaluation.
                     unsafe { arena.rewind_to(mark) };
@@ -34980,11 +35199,8 @@ impl Storage {
         if incomplete {
             // A stopped walk can leave any cache without later rows, including
             // one that still had room when another binding filled.
-            for slot in &slots[..n_enf] {
-                slot.as_ref()
-                    .expect("selected cache")
-                    .write()
-                    .mark_incomplete();
+            for slot in slots[..n_enf].iter().flatten() {
+                slot.write().mark_incomplete();
             }
         }
         Ok(())
@@ -52660,8 +52876,12 @@ mod tests {
             assert!(error.message.as_str().contains("max_value_indexes"));
             {
                 let publication = storage.tables[table].publication();
-                assert_eq!(publication.n_enforcers, 0);
-                assert!(publication.enforcers.iter().all(Option::is_none));
+                assert_eq!(publication.n_enforcers, 1);
+                assert_eq!(
+                    publication.enforcers[0].as_ref().unwrap().cache.slot(),
+                    selected.cache.slot()
+                );
+                assert!(publication.enforcers[1..].iter().all(Option::is_none));
             }
             let free = storage.value_indexes.acquire().unwrap();
             assert!(storage.value_indexes.acquire().is_none());
@@ -52670,7 +52890,7 @@ mod tests {
             selected.cache.read().probe(41, |row| original = row);
             assert_eq!(original, 99);
             drop(selected);
-            storage.refresh_enforcers(table).unwrap();
+            storage.prepare_index_enforcers(table, 0).unwrap();
             let publication = storage.tables[table].publication();
             assert_eq!(publication.n_enforcers, 2);
             assert!(publication.enforcers[..2].iter().all(Option::is_some));

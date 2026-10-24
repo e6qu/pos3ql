@@ -249,8 +249,9 @@ pub struct Config {
     /// This controls performance coverage, never table size or correctness.
     pub value_index_rows: usize,
     /// Total value-index buffers shared across all tables (one per distinct
-    /// constrained or named-index column tuple). Exhausting the pool at DDL is
-    /// a loud static-capacity error.
+    /// constrained or named-index column tuple). Full rebuilds reserve their
+    /// new set while readers keep the old set. Index changes share unchanged bindings.
+    /// Exhausting the pool at DDL is a loud static-capacity error.
     pub max_value_indexes: usize,
     /// RAM cache of object-storage blocks.
     pub block_cache_bytes: usize,

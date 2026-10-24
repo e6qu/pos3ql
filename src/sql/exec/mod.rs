@@ -65840,10 +65840,13 @@ fn alter_table_relation(
         {
             return sql_fail(error);
         }
-        if let Err(error) = stage_inbound_foreign_key_moves(storage, txn, table_index, &def, &new_def) {
+        if let Err(error) =
+            stage_inbound_foreign_key_moves(storage, txn, table_index, &def, &new_def)
+        {
             return sql_fail(error);
         }
-        if let Err(error) = stage_table_sequence_links(storage, wal, txn, &def, &new_def, &mapping) {
+        if let Err(error) = stage_table_sequence_links(storage, wal, txn, &def, &new_def, &mapping)
+        {
             return sql_fail(error);
         }
         if emit_completion {
@@ -68139,7 +68142,9 @@ fn alter_table_relation(
         }
         seq_session.invalidate_cache(alteration.slot);
     }
-    if let Err(error) = stage_table_sequence_links(storage, wal, txn, &def, &new_def, &column_mapping) {
+    if let Err(error) =
+        stage_table_sequence_links(storage, wal, txn, &def, &new_def, &column_mapping)
+    {
         return sql_fail(error);
     }
 
@@ -68520,7 +68525,6 @@ fn alter_table_relation(
     sql_ok()
 }
 
-
 fn stage_inbound_foreign_key_moves(
     storage: &Storage,
     txn: &mut TxnState,
@@ -68548,7 +68552,9 @@ fn stage_inbound_foreign_key_moves(
                 changed = true;
             }
         }
-        if !changed { continue; }
+        if !changed {
+            continue;
+        }
         let mut mapping = [None; MAX_COLUMNS];
         for (column, target) in mapping.iter_mut().enumerate().take(current.n_columns) {
             *target = Some(current.columns()[column].name);
@@ -68571,35 +68577,72 @@ fn stage_table_sequence_links(
         if sequence.database != storage.current_database_oid() || !sequence.visible_to(txn.txid) {
             continue;
         }
-        let owner = crate::storage::rebind_sequence_column(sequence.owner, old, new, mapping, false);
-        let generator_for = crate::storage::rebind_sequence_column(sequence.generator_for, old, new, mapping, true);
-        let schema = if old.schema != new.schema && sequence.owner.is_some_and(|owner| {
-            owner.table_schema == old.schema && owner.table == old.name
-        }) { new.schema } else { sequence.schema };
-        if owner == sequence.owner && generator_for == sequence.generator_for && schema == sequence.schema {
+        let owner =
+            crate::storage::rebind_sequence_column(sequence.owner, old, new, mapping, false);
+        let generator_for =
+            crate::storage::rebind_sequence_column(sequence.generator_for, old, new, mapping, true);
+        let schema = if old.schema != new.schema
+            && sequence
+                .owner
+                .is_some_and(|owner| owner.table_schema == old.schema && owner.table == old.name)
+        {
+            new.schema
+        } else {
+            sequence.schema
+        };
+        if owner == sequence.owner
+            && generator_for == sequence.generator_for
+            && schema == sequence.schema
+        {
             continue;
         }
         let spec = SeqSpec {
-            data_type: sequence.data_type, increment: sequence.increment,
-            min_value: sequence.min_value, max_value: sequence.max_value,
-            start_value: sequence.start_value, cache: sequence.cache, cycle: sequence.cycle,
+            data_type: sequence.data_type,
+            increment: sequence.increment,
+            min_value: sequence.min_value,
+            max_value: sequence.max_value,
+            start_value: sequence.start_value,
+            cache: sequence.cache,
+            cycle: sequence.cycle,
         };
         let target = storage.prepare_sequence_edit(slot, txn.txid)?;
-        let change = storage.stage_sequence_alter(target, crate::storage::SequenceAlteration {
-            schema, name: sequence.name, spec, owner, generator_for,
-            persistence: sequence.persistence, restart: None,
-        }, txn.txid)?;
+        let change = storage.stage_sequence_alter(
+            target,
+            crate::storage::SequenceAlteration {
+                schema,
+                name: sequence.name,
+                spec,
+                owner,
+                generator_for,
+                persistence: sequence.persistence,
+                restart: None,
+            },
+            txn.txid,
+        )?;
         if sequence.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSequence {
-                restart: None, identity: storage.sequence_position(slot),
-                schema: schema.as_str(), name: sequence.name.as_str(),
-                data_type: spec.data_type, increment: spec.increment,
-                min_value: spec.min_value, max_value: spec.max_value,
-                start_value: spec.start_value, cache: spec.cache, cycle: spec.cycle,
-                owner, generator_for, persistence: sequence.persistence,
-            }) {
-                storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            if let Err(error) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::CreateSequence {
+                    restart: None,
+                    identity: storage.sequence_position(slot),
+                    schema: schema.as_str(),
+                    name: sequence.name.as_str(),
+                    data_type: spec.data_type,
+                    increment: spec.increment,
+                    min_value: spec.min_value,
+                    max_value: spec.max_value,
+                    start_value: spec.start_value,
+                    cache: spec.cache,
+                    cycle: spec.cycle,
+                    owner,
+                    generator_for,
+                    persistence: sequence.persistence,
+                },
+            ) {
+                storage
+                    .finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
                 return Err(error);
             }
         }

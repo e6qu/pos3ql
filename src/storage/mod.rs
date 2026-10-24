@@ -5,6 +5,8 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
+#[cfg(test)]
+mod catalog_history;
 mod catalog_sources;
 mod database_clone_positions;
 pub(crate) use database_clone_positions::{

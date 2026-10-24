@@ -1,0 +1,548 @@
+//! Before-images of changed catalog rows, reserved before commit durability.
+
+use core::hash::Hasher;
+use core::mem::size_of;
+use core::num::{NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+
+use super::DatabaseOid;
+use crate::mem::arena::Arena;
+use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::buffer::FixedBuf;
+use crate::mem::fixed_map::Fnv1aHasher;
+use crate::mem::fixed_vec::FixedVec;
+use crate::mem::mutex::Mutex;
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
+
+const HEADER_BYTES: usize = 40;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CatalogRelationIdentity {
+    pub(super) database: DatabaseOid,
+    pub(super) relation: NonZeroU32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CatalogRowImage<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) count: NonZeroU32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HistoricalCatalogRow<'a> {
+    pub(super) key: &'a [u8],
+    /// None means the object did not exist before this committed change.
+    pub(super) before: Option<CatalogRowImage<'a>>,
+}
+
+struct HistoryState {
+    bytes: FixedBuf,
+    reservations: FixedVec<NonZeroU64>,
+    next_reservation: u64,
+}
+
+pub(super) struct CatalogHistory {
+    state: Mutex<HistoryState>,
+}
+
+/// A unique reservation moves with its transaction, including queue handoff.
+/// Dropping it before publication removes all of its unpublished images.
+#[must_use = "catalog history must publish with its transaction or roll back"]
+pub(super) struct CatalogHistoryBatch {
+    history: Arc<CatalogHistory>,
+    identity: NonZeroU64,
+    finished: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Frame<'a> {
+    relation: CatalogRelationIdentity,
+    batch: NonZeroU64,
+    committed_at: u64,
+    row: HistoricalCatalogRow<'a>,
+}
+
+fn frames(bytes: &[u8]) -> impl Iterator<Item = Frame<'_>> {
+    let mut offset = 0;
+    core::iter::from_fn(move || {
+        if offset == bytes.len() {
+            return None;
+        }
+        let header = &bytes[offset..offset + HEADER_BYTES];
+        let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        let database = i32::from_le_bytes(header[4..8].try_into().unwrap());
+        let relation = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let count = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let batch = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let committed_at = u64::from_le_bytes(header[24..32].try_into().unwrap());
+        let key_length = u32::from_le_bytes(header[32..36].try_into().unwrap()) as usize;
+        let row_length = u32::from_le_bytes(header[36..40].try_into().unwrap()) as usize;
+        assert_eq!(length, HEADER_BYTES + key_length + row_length);
+        let key_start = offset + HEADER_BYTES;
+        let row_start = key_start + key_length;
+        let row_end = row_start + row_length;
+        let frame = Frame {
+            relation: CatalogRelationIdentity {
+                database: DatabaseOid::parse(database).expect("catalog history database identity"),
+                relation: NonZeroU32::new(relation).expect("catalog history relation identity"),
+            },
+            batch: NonZeroU64::new(batch).expect("catalog history reservation identity"),
+            committed_at,
+            row: HistoricalCatalogRow {
+                key: &bytes[key_start..row_start],
+                before: NonZeroU32::new(count).map(|count| CatalogRowImage {
+                    bytes: &bytes[row_start..row_end],
+                    count,
+                }),
+            },
+        };
+        offset = row_end;
+        Some(frame)
+    })
+}
+
+fn history_full(capacity: usize) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "catalog_history_bytes exhausted (capacity {})",
+        capacity
+    )
+}
+
+impl HistoryState {
+    fn remove(&mut self, mut discard: impl FnMut(Frame<'_>) -> bool) {
+        // Offsets never escape the owner. Compaction cannot invalidate a
+        // transaction reservation or a query's copied statement-arena rows.
+        let mut destination = 0;
+        let mut source = 0;
+        while source < self.bytes.len() {
+            let frame = frames(&self.bytes.readable()[source..])
+                .next()
+                .expect("history frame at the scan frontier");
+            let length = HEADER_BYTES
+                + frame.row.key.len()
+                + frame.row.before.map_or(0, |before| before.bytes.len());
+            if !discard(frame) {
+                self.bytes
+                    .filled_mut()
+                    .copy_within(source..source + length, destination);
+                destination += length;
+            }
+            source += length;
+        }
+        self.bytes.truncate_to(destination);
+    }
+
+    fn release(&mut self, identity: NonZeroU64) {
+        let slot = self
+            .reservations
+            .iter()
+            .position(|candidate| *candidate == identity)
+            .expect("catalog history batch owns a live reservation");
+        self.reservations.swap_remove(slot);
+    }
+}
+
+impl CatalogHistory {
+    pub(super) fn budget_bytes(bytes: usize, transactions: usize) -> usize {
+        size_of::<Arc<Self>>()
+            .saturating_add(size_of::<Self>())
+            .saturating_add(2 * size_of::<core::sync::atomic::AtomicUsize>())
+            .saturating_add(bytes)
+            .saturating_add(transactions.saturating_mul(size_of::<NonZeroU64>()))
+    }
+
+    pub(super) fn new(
+        budget: &mut Budget,
+        bytes: usize,
+        transactions: usize,
+    ) -> Result<Arc<Self>, BudgetError> {
+        budget.draw(Self::budget_bytes(0, 0), "catalog history owner")?;
+        let bytes = FixedBuf::new(budget, "catalog history bytes", bytes)?;
+        let reservations = FixedVec::new(
+            budget,
+            "catalog history transaction reservations",
+            transactions,
+        )?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(HistoryState {
+                bytes,
+                reservations,
+                next_reservation: 0,
+            }),
+        }))
+    }
+
+    pub(super) fn reserve(self: &Arc<Self>) -> Result<CatalogHistoryBatch, SqlError> {
+        let mut state = self.state.lock().expect("catalog history lock poisoned");
+        let identity = state
+            .next_reservation
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "catalog history reservation identity space exhausted"
+                )
+            })?;
+        state
+            .reservations
+            .push(identity)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        state.next_reservation = identity.get();
+        Ok(CatalogHistoryBatch {
+            history: Arc::clone(self),
+            identity,
+            finished: false,
+        })
+    }
+
+    /// Copy the earliest committed before-image after the selected snapshot
+    /// for each changed key. A later catalog update must not replace it.
+    pub(super) fn rows_at<'a>(
+        &self,
+        relation: CatalogRelationIdentity,
+        snapshot: u64,
+        arena: &'a Arena,
+    ) -> Result<&'a [HistoricalCatalogRow<'a>], SqlError> {
+        let state = self.state.lock().expect("catalog history lock poisoned");
+        let eligible =
+            |frame: &Frame<'_>| frame.relation == relation && frame.committed_at > snapshot;
+        let candidates = frames(state.bytes.readable()).filter(eligible).count();
+        if candidates == 0 {
+            return Ok(&[]);
+        }
+        let slots = candidates
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| history_full(state.bytes.capacity()))?;
+        let selected = arena
+            .alloc_slice_with(slots, |_| None::<Frame<'_>>)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let mut count = 0;
+        for frame in frames(state.bytes.readable()).filter(eligible) {
+            let mut hash = Fnv1aHasher::default();
+            hash.write(frame.row.key);
+            let mut slot = hash.finish() as usize & (slots - 1);
+            loop {
+                match selected[slot] {
+                    Some(previous) if previous.row.key != frame.row.key => {
+                        slot = (slot + 1) & (slots - 1);
+                    }
+                    Some(previous) => {
+                        if frame.committed_at < previous.committed_at {
+                            selected[slot] = Some(frame);
+                        }
+                        break;
+                    }
+                    None => {
+                        selected[slot] = Some(frame);
+                        count += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        let output = arena
+            .alloc_slice_with(count, |_| HistoricalCatalogRow {
+                key: &[],
+                before: None,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        for (row, frame) in output.iter_mut().zip(selected.iter().flatten()) {
+            row.key = arena
+                .alloc_slice_copy(frame.row.key)
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            row.before = frame
+                .row
+                .before
+                .map(|before| {
+                    Ok(CatalogRowImage {
+                        bytes: arena
+                            .alloc_slice_copy(before.bytes)
+                            .map_err(|_| crate::sql::eval::arena_full())?,
+                        count: before.count,
+                    })
+                })
+                .transpose()?;
+        }
+        Ok(output)
+    }
+
+    /// A statement copies its rows before releasing this owner; surviving
+    /// transactions and exported snapshots supply the retention floor.
+    pub(super) fn reclaim(&self, oldest_snapshot: Option<u64>) {
+        let mut state = self.state.lock().expect("catalog history lock poisoned");
+        state.remove(|frame| {
+            frame.committed_at != 0
+                && oldest_snapshot.is_none_or(|oldest| frame.committed_at <= oldest)
+        });
+    }
+}
+
+impl CatalogHistoryBatch {
+    pub(super) fn record(
+        &mut self,
+        relation: CatalogRelationIdentity,
+        key: &[u8],
+        before: Option<CatalogRowImage<'_>>,
+    ) -> Result<(), SqlError> {
+        if key.is_empty() || before.is_some_and(|row| row.bytes.is_empty()) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "catalog history requires an encoded row key and nonempty row images"
+            ));
+        }
+        let mut state = self
+            .history
+            .state
+            .lock()
+            .expect("catalog history lock poisoned");
+        if frames(state.bytes.readable()).any(|frame| {
+            frame.batch == self.identity && frame.relation == relation && frame.row.key == key
+        }) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "catalog history batch contains a duplicate row key"
+            ));
+        }
+        let row = before.map_or(&[][..], |row| row.bytes);
+        let length = HEADER_BYTES
+            .checked_add(key.len())
+            .and_then(|length| length.checked_add(row.len()))
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| history_full(state.bytes.capacity()))?;
+        if length as usize > state.bytes.capacity() - state.bytes.len() {
+            return Err(history_full(state.bytes.capacity()));
+        }
+        let mut header = [0; HEADER_BYTES];
+        header[..4].copy_from_slice(&length.to_le_bytes());
+        header[4..8].copy_from_slice(&relation.database.get().to_le_bytes());
+        header[8..12].copy_from_slice(&relation.relation.get().to_le_bytes());
+        header[12..16].copy_from_slice(&before.map_or(0, |row| row.count.get()).to_le_bytes());
+        header[16..24].copy_from_slice(&self.identity.get().to_le_bytes());
+        header[32..36].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        header[36..40].copy_from_slice(&(row.len() as u32).to_le_bytes());
+        assert!(state.bytes.append(&header));
+        assert!(state.bytes.append(key));
+        assert!(state.bytes.append(row));
+        Ok(())
+    }
+
+    pub(super) fn publish(mut self, committed_at: NonZeroU64) {
+        let mut state = self
+            .history
+            .state
+            .lock()
+            .expect("catalog history lock poisoned");
+        let mut offset = 0;
+        while offset < state.bytes.len() {
+            let frame = frames(&state.bytes.readable()[offset..])
+                .next()
+                .expect("catalog history frame at publication frontier");
+            let length = HEADER_BYTES
+                + frame.row.key.len()
+                + frame.row.before.map_or(0, |before| before.bytes.len());
+            if frame.batch == self.identity {
+                assert_eq!(frame.committed_at, 0);
+                state.bytes.filled_mut()[offset + 24..offset + 32]
+                    .copy_from_slice(&committed_at.get().to_le_bytes());
+            }
+            offset += length;
+        }
+        state.release(self.identity);
+        self.finished = true;
+    }
+}
+
+impl Drop for CatalogHistoryBatch {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = self
+            .history
+            .state
+            .lock()
+            .expect("catalog history lock poisoned");
+        state.remove(|frame| frame.batch == self.identity);
+        state.release(self.identity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::guard::forbid_alloc;
+
+    fn relation(database: DatabaseOid, oid: u32) -> CatalogRelationIdentity {
+        CatalogRelationIdentity {
+            database,
+            relation: NonZeroU32::new(oid).unwrap(),
+        }
+    }
+
+    fn image(bytes: &[u8]) -> Option<CatalogRowImage<'_>> {
+        Some(CatalogRowImage {
+            bytes,
+            count: NonZeroU32::new(1).unwrap(),
+        })
+    }
+
+    #[test]
+    fn catalog_history_preserves_oldest_future_row_and_creation_absence() {
+        let mut budget = Budget::new(32 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 2).unwrap();
+        let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            let mut first = history.reserve().unwrap();
+            first
+                .record(table, b"orders", image(b"old columns"))
+                .unwrap();
+            first.record(table, b"created", None).unwrap();
+            assert!(history.rows_at(table, 1, &arena).unwrap().is_empty());
+            first.publish(NonZeroU64::new(7).unwrap());
+            let mut second = history.reserve().unwrap();
+            second
+                .record(table, b"orders", image(b"new columns"))
+                .unwrap();
+            second.publish(NonZeroU64::new(9).unwrap());
+            let rows = history.rows_at(table, 6, &arena).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows.iter().find(|row| row.key == b"orders").unwrap().before,
+                image(b"old columns")
+            );
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.key == b"created")
+                    .unwrap()
+                    .before,
+                None
+            );
+            let rows = history.rows_at(table, 7, &arena).unwrap();
+            assert_eq!(
+                rows,
+                &[HistoricalCatalogRow {
+                    key: b"orders",
+                    before: image(b"new columns")
+                }]
+            );
+            assert!(history.rows_at(table, 9, &arena).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn catalog_history_scopes_rows_by_database_and_relation() {
+        let mut budget = Budget::new(32 * 1024);
+        let history = CatalogHistory::new(&mut budget, 4096, 1).unwrap();
+        let arena = Arena::new(&mut budget, "catalog history test", 8192).unwrap();
+        forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            for (identity, value) in [
+                (
+                    relation(DatabaseOid::POSTGRES, 1259),
+                    &b"postgres class"[..],
+                ),
+                (
+                    relation(DatabaseOid::TEMPLATE1, 1259),
+                    &b"template class"[..],
+                ),
+                (
+                    relation(DatabaseOid::POSTGRES, 1249),
+                    &b"postgres attribute"[..],
+                ),
+            ] {
+                batch.record(identity, b"same key", image(value)).unwrap();
+            }
+            batch.publish(NonZeroU64::new(7).unwrap());
+            let rows = history
+                .rows_at(relation(DatabaseOid::POSTGRES, 1259), 6, &arena)
+                .unwrap();
+            assert_eq!(
+                rows,
+                &[HistoricalCatalogRow {
+                    key: b"same key",
+                    before: image(b"postgres class")
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_history_rollback_and_reclamation_preserve_copied_rows() {
+        let bytes = HEADER_BYTES + b"key".len() + b"old".len();
+        let mut budget = Budget::new(8192);
+        let history = CatalogHistory::new(&mut budget, bytes * 2, 2).unwrap();
+        let arena = Arena::new(&mut budget, "catalog history test", 4096).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            let mut pending = history.reserve().unwrap();
+            pending.record(table, b"key", image(b"old")).unwrap();
+            let mut committed = history.reserve().unwrap();
+            committed.record(table, b"key", image(b"new")).unwrap();
+            committed.publish(NonZeroU64::new(7).unwrap());
+            let rows = history.rows_at(table, 6, &arena).unwrap();
+            drop(pending);
+            history.reclaim(Some(6));
+            assert_eq!(history.rows_at(table, 6, &arena).unwrap(), rows);
+            history.reclaim(Some(7));
+            assert!(history.rows_at(table, 6, &arena).unwrap().is_empty());
+            assert_eq!(rows[0].before, image(b"new"));
+            let mut reused = history.reserve().unwrap();
+            reused.record(table, b"key", image(b"old")).unwrap();
+            history.reclaim(None);
+            reused.publish(NonZeroU64::new(9).unwrap());
+            assert_eq!(
+                history.rows_at(table, 8, &arena).unwrap()[0].before,
+                image(b"old")
+            );
+            history.reclaim(None);
+            assert!(history.rows_at(table, 8, &arena).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn catalog_history_rejects_capacity_and_duplicate_keys_without_partial_records() {
+        let bytes = HEADER_BYTES + b"key".len() + b"old".len();
+        let mut budget = Budget::new(8192);
+        let before = budget.remaining();
+        let history = CatalogHistory::new(&mut budget, bytes, 1).unwrap();
+        assert_eq!(
+            before - budget.remaining(),
+            CatalogHistory::budget_bytes(bytes, 1)
+        );
+        let arena = Arena::new(&mut budget, "catalog history test", 4096).unwrap();
+        let table = relation(DatabaseOid::POSTGRES, 1259);
+        forbid_alloc(|| {
+            let mut batch = history.reserve().unwrap();
+            assert!(history.reserve().is_err());
+            batch.record(table, b"key", image(b"old")).unwrap();
+            assert_eq!(
+                batch
+                    .record(table, b"key", image(b"other"))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            let error = batch.record(table, b"new", None).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("catalog_history_bytes"));
+            batch.publish(NonZeroU64::new(7).unwrap());
+            assert_eq!(
+                history.rows_at(table, 6, &arena).unwrap(),
+                &[HistoricalCatalogRow {
+                    key: b"key",
+                    before: image(b"old")
+                }]
+            );
+            history.reclaim(None);
+            let mut empty = history.reserve().unwrap();
+            assert!(empty.record(table, &[], None).is_err());
+            assert!(empty.record(table, b"key", image(&[])).is_err());
+            empty.publish(NonZeroU64::new(9).unwrap());
+        });
+    }
+}

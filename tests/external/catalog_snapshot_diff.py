@@ -122,6 +122,32 @@ def transcript(reader, writer):
             writer.execute("ROLLBACK")
             writer.execute("DROP TABLE IF EXISTS catalog_comment_private_diff")
 
+        for concurrent in (False, True):
+            for scope in ("top", "savepoint"):
+                label = f"{prefix}.comment_own.{int(concurrent)}.{scope}"
+                writer.execute("CREATE TABLE catalog_comment_own_diff(id integer)")
+                writer.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'old comment'")
+                reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+                try:
+                    oid = reader.execute("SELECT oid FROM pg_class WHERE relname='catalog_comment_own_diff'").fetchone()[0]
+                    query = "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description"
+                    record(reader, f"{label}.before", query, (oid,))
+                    if concurrent:
+                        writer.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'concurrent comment'")
+                    if scope == "savepoint":
+                        reader.execute("SAVEPOINT own_comment_write")
+                    reader.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'own comment'")
+                    record(reader, f"{label}.written", query, (oid,))
+                    if scope == "savepoint":
+                        reader.execute("RELEASE own_comment_write")
+                        record(reader, f"{label}.released", query, (oid,))
+                    reader.execute("COMMIT")
+                    record(reader, f"{label}.committed", query, (oid,))
+                finally:
+                    reader.execute("ROLLBACK")
+                    writer.execute("ROLLBACK")
+                    writer.execute("DROP TABLE IF EXISTS catalog_comment_own_diff")
+
         writer.execute("CREATE TABLE catalog_replace_diff(old_column integer)")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:
@@ -332,9 +358,13 @@ def main():
         expected = json.loads(arguments.reference.read_text())
         actual = json.loads(serialized)
         if expected != actual:
-            for left, right in zip(expected, actual, strict=True):
+            if len(expected) != len(actual):
+                print(f"MISMATCH: observation count: PostgreSQL={len(expected)}, pos3ql={len(actual)}")
+            for left, right in zip(expected, actual, strict=False):
                 if left != right:
-                    print(f"MISMATCH: {left['step']}: PostgreSQL={left['rows']!r}, pos3ql={right['rows']!r}")
+                    expected_outcome = {key: value for key, value in left.items() if key != "step"}
+                    actual_outcome = {key: value for key, value in right.items() if key != "step"}
+                    print(f"MISMATCH: {left['step']}: PostgreSQL={expected_outcome!r}, pos3ql={actual_outcome!r}")
             raise SystemExit(1)
     print(f"PASS: {len(observed)} catalog snapshot observations on port {arguments.port}")
 

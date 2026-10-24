@@ -206,15 +206,12 @@ impl Storage {
         }
     }
 
-    pub(super) fn commit_index_table_names(&self, table: usize, transaction: u32) {
-        let identity = self.tables[table].identity();
-        let source = self.catalog_object_identity(
-            CatalogObjectSlot::Table(table),
-            identity.database,
-            identity.created_at,
-        );
-        let mut comments = self.comment_catalog();
-        let mut indexes = self.index_catalog();
+    pub(super) fn commit_index_table_names_locked(
+        indexes: &mut [IndexDef],
+        comments: &mut CommentCatalog,
+        source: CatalogObjectIdentity,
+        transaction: u32,
+    ) {
         for index in indexes.iter_mut().filter(|index| {
             index
                 .table_binding
@@ -307,7 +304,7 @@ impl Storage {
 
     pub(super) fn project_index_binding(
         &self,
-        mut index: IndexDef,
+        index: IndexDef,
         transaction: u32,
     ) -> Option<IndexDef> {
         if index.ddl_state.pending_drop_txid() == Some(transaction) {
@@ -318,6 +315,19 @@ impl Storage {
             return None;
         };
         let state = self.tables.get(table)?.definition.read();
+        self.project_index_binding_locked(index, &state, transaction)
+    }
+
+    pub(super) fn project_index_binding_locked(
+        &self,
+        mut index: IndexDef,
+        state: &table_definitions::DefinitionState,
+        transaction: u32,
+    ) -> Option<IndexDef> {
+        if index.ddl_state.pending_drop_txid() == Some(transaction) {
+            return Some(index);
+        }
+        let binding = index.table_binding?;
         if !binding.source.matches(
             self,
             state.identity.database,
@@ -339,7 +349,7 @@ impl Storage {
         count += index.n_include_cols;
         assert!(
             self.pending_table_defs.project_columns(
-                &state,
+                state,
                 transaction,
                 binding.revision,
                 &mut columns[..count]
@@ -366,24 +376,27 @@ impl Storage {
             source: binding.source,
             revision: self
                 .pending_table_defs
-                .selected_revision(&state, transaction),
+                .selected_revision(state, transaction),
         });
         Some(index)
     }
 
-    pub(super) fn promote_private_index_bindings(&self, table: usize, transaction: u32) {
-        let mut indexes = self.index_catalog();
-        for index in indexes.iter_mut() {
-            if index.database != current_database()
-                || index.ddl_state != (CatalogDdlState::PendingCreate { txid: transaction })
-                || !index
+    pub(super) fn promote_private_index_bindings_locked(
+        &self,
+        indexes: &mut [IndexDef],
+        source: CatalogObjectIdentity,
+        state: &table_definitions::DefinitionState,
+        transaction: u32,
+    ) {
+        for index in indexes.iter_mut().filter(|index| {
+            index.database == state.identity.database
+                && index.ddl_state == (CatalogDdlState::PendingCreate { txid: transaction })
+                && index
                     .table_binding
-                    .is_some_and(|binding| binding.source.slot() == CatalogObjectSlot::Table(table))
-            {
-                continue;
-            }
+                    .is_some_and(|binding| binding.source == source)
+        }) {
             let mut promoted = self
-                .project_index_binding(*index, transaction)
+                .project_index_binding_locked(*index, state, transaction)
                 .expect("private index retains its table lifetime through commit");
             promoted
                 .table_binding
@@ -645,7 +658,7 @@ mod tests {
                 .unwrap();
             let held = storage.tables[table].lifecycle();
             let waits = storage
-                .type_publication
+                .definition_publication
                 .waits
                 .load(core::sync::atomic::Ordering::Acquire);
             let (send, receive) = std::sync::mpsc::sync_channel(1);
@@ -658,7 +671,7 @@ mod tests {
                 });
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while storage
-                    .type_publication
+                    .definition_publication
                     .waits
                     .load(core::sync::atomic::Ordering::Acquire)
                     == waits
@@ -667,7 +680,7 @@ mod tests {
                     std::thread::yield_now();
                 }
                 let waited = storage
-                    .type_publication
+                    .definition_publication
                     .waits
                     .load(core::sync::atomic::Ordering::Acquire)
                     > waits;

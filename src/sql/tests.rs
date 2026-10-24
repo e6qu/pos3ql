@@ -9,6 +9,7 @@ use crate::mem::mutex::Mutex;
 
 mod key_preparation;
 mod row_layout;
+mod table_publication;
 mod transaction_publication;
 
 #[test]

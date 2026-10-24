@@ -394,10 +394,21 @@ impl Storage {
             values.committed = values.pending;
         }
         if let Some(prior) = undo.prior {
+            // An ordinary edit must carry issued values through every earlier
+            // edit in the rollback chain. RESTART restores its saved image.
+            let (last_value, is_called, log_count) = if current.restarted {
+                (prior.last_value, prior.is_called, prior.log_count)
+            } else {
+                (
+                    values.pending.last_value,
+                    values.pending.is_called,
+                    values.pending.log_count,
+                )
+            };
             values.pending = SequenceValue {
-                last_value: prior.last_value,
-                is_called: prior.is_called,
-                log_count: prior.log_count,
+                last_value,
+                is_called,
+                log_count,
                 dirty: false,
                 generation: values.pending.generation.wrapping_add(1),
                 staged_generation: 0,

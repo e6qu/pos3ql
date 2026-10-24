@@ -304,6 +304,44 @@ impl DefinitionVersions {
         false
     }
 
+    pub(super) fn references_table(
+        &self,
+        state: &DefinitionState,
+        movement: super::table_publication::TableReferenceMove,
+    ) -> bool {
+        if movement.references(state.committed()) {
+            return true;
+        }
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.read(slot as usize);
+            if movement.references(&entry.version.def) {
+                return true;
+            }
+            tail = entry.previous;
+        }
+        false
+    }
+
+    pub(super) fn move_table_references_locked(
+        &self,
+        state: &mut DefinitionState,
+        movement: super::table_publication::TableReferenceMove,
+        revision: TableDefinitionRevision,
+    ) -> bool {
+        let mut changed = movement.rewrite(state.edit_committed(revision));
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let mut owner = self.slots[slot as usize]
+                .write()
+                .expect("definition slot lock poisoned");
+            let entry = owner.as_mut().expect("published definition slot exists");
+            changed |= movement.rewrite(&mut entry.version.def);
+            tail = entry.previous;
+        }
+        changed
+    }
+
     pub(super) fn move_type_references_locked(
         &self,
         state: &mut DefinitionState,
@@ -552,7 +590,7 @@ impl DefinitionVersions {
         self.clear_locked(&mut definition.write());
     }
 
-    fn clear_locked(&self, state: &mut DefinitionState) {
+    pub(super) fn clear_locked(&self, state: &mut DefinitionState) {
         let _allocation = self
             .allocation
             .lock()

@@ -307,6 +307,31 @@ layout; table, index and comment names follow the selected shape. Rule history
 and pending shapes check transaction owners under the same definition guard.
 Comment text publication preserves name changes owned by another transaction.
 
+Table-definition commit and journal replay use the same installer. It owns the
+affected table definitions, index bindings, comments, sequences and saved-query
+references before changing them. A parent-table rename updates foreign keys in
+both committed definitions and every private version, including versions submitted
+during preparation. Owned sequences follow the table and column through pending
+sequence changes too. Waiting releases the earlier table and catalog owners;
+unrelated row commits can progress. A rolled-back or replaced source is checked
+again after the wait. An exhausted publication counter returns `54000` before
+any index binding or catalog entry changes.
+The parent's name view is published before any dependent definition is released.
+A foreign-key lookup can wait for the parent; it cannot miss the moved parent
+because a child with an earlier internal slot became readable first.
+
+Renames and schema moves share the same SQL dependency preparation. Inside the
+transaction, invoice foreign keys use the moved table and an owned sequence is
+already available in its new schema. Rolling back restores the earlier names
+without restoring sequence numbers already issued.
+
+**User example:** rename `orders`, move it to another schema, and rename its
+amount column in one transaction. Its indexes, comments, owned sequence and
+invoice foreign keys follow the committed names, including after recovery with
+an empty local directory. A private invoice-table edit cannot later restore the
+old parent name. These storage ownership checks prepare for several SQL workers;
+transaction-wide reader capture remains [planned work](../PLAN.md).
+
 **User example:** create an order table, save a transaction position, then drop
 and recreate that table with different rows. Rolling back to the saved position
 restores the original table and rows. Earlier column changes and a type rename
@@ -572,9 +597,14 @@ waits for that one, then selects the current references again. An unrelated
 definition can stay open for reading. Waiting holds no table lifecycle, shared
 catalog or definition allocator. All pending images receive the new type name
 before their owner can roll back.
-The ownership workspace is reserved at startup for every configured table plus
-the internal large-object relation: one optional table-owner record per slot,
+Table and type publication share one ownership workspace, reserved at startup
+for every configured table plus the internal large-object relation: one optional table-owner record per slot,
 alignment padding and its mutex/arena controls. It never grows at runtime.
+Finishing a type deletion also releases the type catalog while waiting for
+comments or enum-label ownership, then rechecks the original type lifetime and
+transaction. An unrelated type can be created during that wait. Rolling back
+the deletion prevents the waiting completion from removing the restored type;
+retained enum labels remain readable after a completed deletion.
 Saved type references carry the source catalog, database, type slot and creation
 stamp. A definition submitted after a rename receives the source's current name.
 A reference to a dropped type fails with `42704`, even if another type has reused

@@ -702,7 +702,7 @@ impl Storage {
                 Ok(owners) => return owners,
                 Err(wait) => {
                     #[cfg(test)]
-                    self.type_publication
+                    self.definition_publication
                         .waits
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
                     wait.wait();
@@ -727,7 +727,7 @@ impl Storage {
                 Err(TryLockError::WouldBlock) => {
                     drop(catalog);
                     #[cfg(test)]
-                    self.type_publication
+                    self.definition_publication
                         .waits
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
                     drop(

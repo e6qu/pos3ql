@@ -615,7 +615,9 @@ impl super::Storage {
         }
         drop(catalog);
         if has_identity_moves {
-            super::type_reference_moves::TypePublication::validate_generations(self, changes)?;
+            super::type_reference_moves::DefinitionPublication::validate_generations(
+                self, changes,
+            )?;
         }
         Ok(())
     }
@@ -625,62 +627,109 @@ impl super::Storage {
         use TypeDdlDecision::{Commit, Rollback};
         use TypeDdlOperation::{Create, Drop};
 
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        if !catalog.contains_type_source(undo.source)
-            || undo.source.database() != super::current_database()
-        {
-            return;
-        }
-        let (state, schema, name) = match undo.source.slot() {
-            NamedTypeSlot::Domain(slot) => {
-                let definition = &catalog.domains[slot];
-                (definition.ddl_state, definition.schema, definition.name)
+        let (mut catalog, next, schema, name, mut comments, mut images) = loop {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            if !catalog.contains_type_source(undo.source)
+                || undo.source.database() != super::current_database()
+            {
+                return;
             }
-            NamedTypeSlot::Enum(slot) => {
-                let definition = &catalog.enums[slot];
-                (definition.ddl_state, definition.schema, definition.name)
+            let (state, schema, name) = match undo.source.slot() {
+                NamedTypeSlot::Domain(slot) => {
+                    let definition = &catalog.domains[slot];
+                    (definition.ddl_state, definition.schema, definition.name)
+                }
+                NamedTypeSlot::Enum(slot) => {
+                    let definition = &catalog.enums[slot];
+                    (definition.ddl_state, definition.schema, definition.name)
+                }
+                NamedTypeSlot::Composite(slot) => {
+                    let definition = &catalog.composites[slot];
+                    (definition.ddl_state, definition.schema, definition.name)
+                }
+            };
+            if state.pending_txid() != Some(undo.transaction) {
+                return;
             }
-            NamedTypeSlot::Composite(slot) => {
-                let definition = &catalog.composites[slot];
-                (definition.ddl_state, definition.schema, definition.name)
+            if catalog.versions.ddl(undo.source.slot()) != undo.version
+                && !matches!(
+                    (undo.operation, decision, state),
+                    (Create, Commit, State::PendingCreateDrop { .. })
+                )
+            {
+                return;
             }
-        };
-        if state.pending_txid() != Some(undo.transaction) {
-            return;
-        }
-        if catalog.versions.ddl(undo.source.slot()) != undo.version
-            && !matches!(
-                (undo.operation, decision, state),
-                (Create, Commit, State::PendingCreateDrop { .. })
-            )
-        {
-            return;
-        }
-        let next = match (undo.operation, decision, state) {
-            (Create, Commit, State::PendingCreate { .. } | State::PendingCreateDrop { .. }) => {
-                state.commit_create()
+            let next = match (undo.operation, decision, state) {
+                (Create, Commit, State::PendingCreate { .. } | State::PendingCreateDrop { .. }) => {
+                    state.commit_create()
+                }
+                (Create, Rollback, State::PendingCreate { .. }) => state.rollback_create(),
+                (Drop, Commit, State::PendingDrop { .. }) => state.commit_drop(),
+                (Drop, Rollback, State::PendingDrop { .. } | State::PendingCreateDrop { .. }) => {
+                    state.rollback_drop(undo.transaction)
+                }
+                _ => return,
+            };
+            let attempt: Result<_, super::row_ownership::LockWait<'_>> = (|| {
+                let images = if matches!(undo.source.slot(), NamedTypeSlot::Enum(_))
+                    && next == State::Absent
+                {
+                    Some(super::row_ownership::try_mutex(
+                        &self.enum_member_images,
+                        "enum member-image lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
+                let comments = if undo.operation == Drop && decision == Commit {
+                    Some(super::row_ownership::try_mutex(
+                        &self.comments,
+                        "comment catalog lock poisoned",
+                    )?)
+                } else {
+                    None
+                };
+                Ok((comments, images))
+            })();
+            match attempt {
+                Ok((comments, images)) => break (catalog, next, schema, name, comments, images),
+                Err(wait) => {
+                    drop(catalog);
+                    #[cfg(test)]
+                    self.definition_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                }
             }
-            (Create, Rollback, State::PendingCreate { .. }) => state.rollback_create(),
-            (Drop, Commit, State::PendingDrop { .. }) => state.commit_drop(),
-            (Drop, Rollback, State::PendingDrop { .. } | State::PendingCreateDrop { .. }) => {
-                state.rollback_drop(undo.transaction)
-            }
-            _ => return,
         };
         if undo.operation == Drop && decision == Rollback {
             catalog
                 .versions
                 .set_ddl(undo.source.slot(), undo.prior_version);
         }
-        // Keep the source owner until metadata removal and enum image release finish.
-        if undo.operation == Drop && decision == Commit {
-            self.drop_object_comments(super::CommentClass::Type, schema.as_str(), name.as_str());
+        // All destination owners are present before the first mutation. A
+        // blocked destination releases the source and revalidates on retry.
+        if let Some(comments) = &mut comments {
+            for slot in 0..comments.entries.len() {
+                let comment = &comments.entries[slot];
+                if comment.used
+                    && comment.database == Some(undo.source.database())
+                    && comment.class == super::CommentClass::Type
+                    && comment.pending.is_none()
+                    && comment.schema == schema
+                    && comment.name == name
+                {
+                    comments.entries[slot].live = None;
+                    comments.reap(slot);
+                }
+            }
         }
-        if matches!(undo.source.slot(), NamedTypeSlot::Enum(_)) && next == State::Absent {
-            self.release_enum_definition_images(&mut catalog, undo.slot());
+        if let Some(images) = &mut images {
+            Self::release_enum_definition_images_locked(&mut catalog, images, undo.slot());
         }
         let ownership = match undo.source.slot() {
             NamedTypeSlot::Domain(slot) => {
@@ -908,6 +957,108 @@ mod tests {
             NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state,
             NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state,
             NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state,
+        }
+    }
+
+    #[test]
+    fn type_retirement_wait_releases_catalog_and_revalidates_rollback() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        for (kind, block_images) in [
+            (NamedTypeKind::Domain, false),
+            (NamedTypeKind::Enum, false),
+            (NamedTypeKind::Composite, false),
+            (NamedTypeKind::Enum, true),
+        ] {
+            for rollback in [false, true] {
+                let mut storage = fixture();
+                let created = create(&mut storage, kind);
+                storage.finish_type_ddl(created, TypeDdlDecision::Commit);
+                let retained =
+                    (kind == NamedTypeKind::Enum).then(|| storage.enum_for(created.slot(), 0));
+                storage
+                    .apply_comment(
+                        crate::storage::CommentClass::Type,
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("owned_type").unwrap(),
+                        0,
+                        Some(crate::storage::comment_stackstr("retained type comment").unwrap()),
+                    )
+                    .unwrap();
+                let dropped = storage
+                    .stage_type_drop(kind, "public", "owned_type", 7)
+                    .unwrap()
+                    .unwrap();
+                let before = storage.definition_publication.waits.load(Ordering::Acquire);
+                let comments = (!block_images).then(|| storage.comments.lock().unwrap());
+                let images = block_images.then(|| storage.enum_member_images.lock().unwrap());
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        crate::mem::guard::forbid_alloc(|| {
+                            storage.finish_type_ddl(dropped, TypeDdlDecision::Commit)
+                        })
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while storage.definition_publication.waits.load(Ordering::Acquire) == before
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    let waiting =
+                        storage.definition_publication.waits.load(Ordering::Acquire) != before;
+                    let released = waiting
+                        && storage.type_catalog.try_lock().is_ok()
+                        && (block_images || storage.enum_member_images.try_lock().is_ok());
+                    if released {
+                        crate::mem::guard::forbid_alloc(|| {
+                            let other = storage
+                                .create_composite(
+                                    SqlName::parse("public").unwrap(),
+                                    SqlName::parse("unrelated_retirement_type").unwrap(),
+                                    crate::storage::CompositeSpec {
+                                        fields: [crate::storage::CompositeFieldDef::EMPTY;
+                                            crate::storage::MAX_COMPOSITE_FIELDS],
+                                        n_fields: 0,
+                                    },
+                                    9,
+                                )
+                                .unwrap();
+                            storage.finish_type_ddl(other, TypeDdlDecision::Commit);
+                            if rollback {
+                                storage.finish_type_ddl(dropped, TypeDdlDecision::Rollback);
+                            }
+                        });
+                    }
+                    drop((comments, images));
+                    writer.join().unwrap();
+                    assert!(waiting && released);
+                });
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_eq!(
+                        state(&storage, dropped),
+                        if rollback {
+                            CatalogDdlState::Present
+                        } else {
+                            CatalogDdlState::Absent
+                        }
+                    );
+                    assert_eq!(
+                        storage
+                            .comment_text(
+                                crate::storage::CommentClass::Type,
+                                "public",
+                                "owned_type",
+                                0,
+                                0
+                            )
+                            .is_some(),
+                        rollback
+                    );
+                    if let Some(retained) = &retained {
+                        assert_eq!(retained.members().next().unwrap().label.as_str(), "ready");
+                    }
+                });
+            }
         }
     }
 

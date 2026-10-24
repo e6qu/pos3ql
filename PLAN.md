@@ -34,8 +34,8 @@ boundary before several CPU workers run statements. A query must
 not see only half of a confirmed transaction: an order's new state and its
 invoice must appear together when that transaction changes both.
 
-Connect reader admission, schema changes and type retirement to that transaction
-publication boundary. Keep rewrite history cleanup paced during concurrent publication.
+Connect reader admission and the guarded table/type publication and retirement
+paths to that transaction boundary. Keep rewrite history cleanup paced during concurrent publication.
 Keep a statement's retained definitions and rows consistent with the same
 committed transaction, including later metadata lookups and index-key
 preparation across all catalog consumers. Extend the selected table-shape

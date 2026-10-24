@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn row_layout_definition_exhaustion_precedes_catalog_mutation() {
-        let (mut storage, table, _) = fixture(RelationPersistence::Permanent, 2);
+        let (storage, table, _) = fixture(RelationPersistence::Permanent, 2);
         crate::mem::guard::forbid_alloc(|| {
             let rewrite = change(&storage, table, ColType::Int8, true);
             let original = storage.select_table_definition(table, 0).0;
@@ -446,7 +446,7 @@ mod tests {
                     .write_table_def(target, definition, &mapping, true)
                     .unwrap();
                 let exhausted = if dependent_exhausted { other } else { table };
-                storage.tables[exhausted].publication().generation = u64::MAX - 1;
+                storage.tables[exhausted].publication().generation = u64::MAX;
                 let error = storage.commit_table_def(change).err().unwrap();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 let committed = storage.table_def(table, 0);

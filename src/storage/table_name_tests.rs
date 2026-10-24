@@ -197,7 +197,7 @@ fn table_name_lookup_selected_writer_revalidates_name_and_incarnation() {
 
 #[test]
 fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
-    let (mut storage, _, target) = fixture();
+    let (storage, _, target) = fixture();
     crate::mem::guard::forbid_alloc(|| {
         let created = storage
             .create_table_in(make_def("private_lookup", &[]), 7)

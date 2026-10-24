@@ -48,6 +48,7 @@ mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
+mod table_publication;
 mod type_contracts;
 mod type_creation;
 mod type_definitions;
@@ -10138,7 +10139,7 @@ pub struct SequenceOwner {
     pub column: SqlName,
 }
 
-fn rebind_sequence_column(
+pub(crate) fn rebind_sequence_column(
     link: Option<SequenceOwner>,
     old: &TableDef,
     new: &TableDef,
@@ -10149,8 +10150,12 @@ fn rebind_sequence_column(
     if link.table_schema != old.schema || link.table != old.name {
         return Some(link);
     }
-    let old_column = old.column_index(link.column.as_str())?;
-    let target_name = column_mapping[old_column]?;
+    // A sequence for a column added by this ALTER already names the final
+    // column and has no position in the committed source definition.
+    let target_name = match old.column_index(link.column.as_str()) {
+        Some(column) => column_mapping[column]?,
+        None => link.column,
+    };
     let target = new
         .column_index(target_name.as_str())
         .filter(|&column| !require_generator || new.columns()[column].auto_increment)?;
@@ -14057,7 +14062,7 @@ pub struct Storage {
     row_walks: std::sync::Arc<RowWalkPool>,
     snapshot_reclamation: SnapshotReclamation,
     heap_row_ownership: row_ownership::HeapRowOwnership,
-    type_publication: type_reference_moves::TypePublication,
+    definition_publication: type_reference_moves::DefinitionPublication,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: Mutex<LargeObjectCatalog>,
@@ -18220,7 +18225,7 @@ impl Storage {
             + Self::retained_row_walk_budget_bytes(config)
             + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
-            + type_reference_moves::TypePublication::budget_bytes(config)
+            + type_reference_moves::DefinitionPublication::budget_bytes(config)
             + type_edits::TypeRevisions::budget_bytes(config)
             + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::CatalogOrigin>()
@@ -18361,7 +18366,8 @@ impl Storage {
         let row_walks = RowWalkPool::new(config, budget)?;
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
-        let type_publication = type_reference_moves::TypePublication::new(config, budget)?;
+        let definition_publication =
+            type_reference_moves::DefinitionPublication::new(config, budget)?;
         let type_definition_versions = type_edits::TypeRevisions::new(config, budget)?;
         let type_definition_images =
             type_definitions::TypeDefinitionImagePools::new(config, budget)?;
@@ -19126,7 +19132,7 @@ impl Storage {
             row_walks,
             snapshot_reclamation,
             heap_row_ownership,
-            type_publication,
+            definition_publication,
             spill_roots,
             query_roots,
             large_objects: Mutex::new(LargeObjectCatalog {
@@ -35506,76 +35512,11 @@ impl Storage {
     /// Promotes the latest pending definition after its WAL batch is durable.
     /// Row images are promoted separately by the transaction coordinator.
     pub(crate) fn commit_table_def(
-        &mut self,
+        &self,
         change: TableDefinitionChange,
     ) -> Result<Option<bool>, SqlError> {
-        let index = change.table();
-        let Some(table) = self.tables.get(index) else {
-            return Ok(None);
-        };
-        let identity = table.identity();
-        if !change.source.matches(
-            self,
-            identity.database,
-            identity.created_at,
-            identity.existence,
-        ) {
-            return Ok(None);
-        }
-        {
-            let definition = self.tables[index].definition.read();
-            if !self.pending_table_defs.contains_revision(
-                &definition,
-                change.transaction,
-                change.revision,
-            ) {
-                return Ok(None);
-            }
-        }
-        let Some(pending) = self.pending_table_def(index).map(|pending| *pending) else {
-            return Ok(None);
-        };
-        let txid = change.transaction;
-        let mut definition = pending.def;
-        definition.has_toast |= {
-            let definition = self.tables[index].definition();
-            definition.has_toast
-        };
-        definition.has_rules |= {
-            let definition = self.tables[index].definition();
-            definition.has_rules
-        };
-        self.promote_private_index_bindings(index, txid);
-        self.set_table_def(
-            index,
-            definition,
-            &pending.column_mapping,
-            TableDefinitionRevision::catalog(pending.revision),
-            pending.rewrites_rows,
-        )?;
-        self.commit_index_table_names(index, txid);
-        self.clear_pending_table_defs(index);
-        self.commit_constraint_comment_identities(index, txid);
-        Ok(Some(pending.rewrites_rows))
-    }
-
-    fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
-        for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
-            comment.used
-                && comment.database == Some(current_database())
-                && comment.class == CommentClass::Constraint
-                && comment.subid == table as u32
-                && comment
-                    .pending_identity
-                    .is_some_and(|identity| identity.txid == txid)
-        }) {
-            let identity = comment
-                .pending_identity
-                .take()
-                .expect("filtered pending constraint comment identity");
-            comment.schema = identity.schema;
-            comment.name = identity.name;
-        }
+        self.definition_publication
+            .publish_table(self, table_publication::DefinitionSource::Pending(change))
     }
 
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
@@ -35809,7 +35750,7 @@ impl Storage {
                     drop(state);
                     drop(lifecycle);
                     #[cfg(test)]
-                    self.type_publication
+                    self.definition_publication
                         .waits
                         .fetch_add(1, core::sync::atomic::Ordering::Release);
                     wait.wait();
@@ -40002,28 +39943,28 @@ impl Storage {
         pending.previous
     }
 
-    fn clear_pending_enum_member_chain(
-        &self,
-        catalog: &mut TypeCatalog,
-        mut tail: Option<u32>,
-        keep: Option<u32>,
-    ) {
-        while let Some(slot) = tail {
-            tail = self.release_pending_enum_members(catalog, slot, keep);
-        }
+    fn release_enum_definition_images(&self, catalog: &mut TypeCatalog, slot: usize) {
+        let mut images = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned");
+        Self::release_enum_definition_images_locked(catalog, &mut images, slot);
     }
 
-    fn release_enum_definition_images(&self, catalog: &mut TypeCatalog, slot: usize) {
-        let pending = catalog.enums[slot]
+    fn release_enum_definition_images_locked(
+        catalog: &mut TypeCatalog,
+        images: &mut EnumMemberImages,
+        slot: usize,
+    ) {
+        let mut pending = catalog.enums[slot]
             .pending_definition
             .take()
             .map(|pending| pending.member_slot);
-        self.clear_pending_enum_member_chain(catalog, pending, None);
+        while let Some(slot) = pending {
+            pending = Self::release_pending_enum_members_locked(catalog, images, slot, None);
+        }
         if let Some(image) = catalog.enums[slot].member_image.take() {
-            self.enum_member_images
-                .lock()
-                .expect("enum member-image lock poisoned")
-                .release(image);
+            images.release(image);
         }
         catalog.enums[slot].member_count = 0;
     }
@@ -44949,7 +44890,7 @@ impl Storage {
                 Ok(owner) => break owner,
                 Err(wait) => {
                     #[cfg(test)]
-                    self.type_publication
+                    self.definition_publication
                         .waits
                         .fetch_add(1, core::sync::atomic::Ordering::Release);
                     wait.wait();
@@ -46199,116 +46140,46 @@ impl Storage {
         tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.rollback_drop(txid);
     }
 
-    /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
-    /// and its indexes change schema, and every inbound foreign key follows —
-    /// deterministically, so WAL replay reproduces it from the names alone.
+    /// Schema moves use the same dependent publication as ALTER TABLE replay.
     pub(crate) fn move_table_schema(
-        &mut self,
+        &self,
         index: usize,
         new_schema: SqlName,
         revision: TableDefinitionRevision,
-    ) {
-        let database_oid = self.tables[index].database();
-        let database = Some(database_oid);
-        let old_schema = {
-            let definition = self.tables[index].definition();
-            definition.schema
-        };
-        let name = {
-            let definition = self.tables[index].definition();
-            definition.name
-        };
-        self.tables[index].definition_mut(revision).schema = new_schema;
-        self.tables[index].mark_dirty();
-        let mut index_comments = self.comment_catalog();
-        for x in self.index_catalog().iter_mut() {
-            if x.database == database_oid
-                && x.ddl_state == CatalogDdlState::Present
-                && x.schema.as_str() == old_schema.as_str()
-                && x.table.as_str() == name.as_str()
-            {
-                for comment in index_comments.entries.iter_mut().filter(|comment| {
-                    comment.used
-                        && comment.database == database
-                        && comment.class == CommentClass::Relation
-                        && comment.subid == 0
-                        && comment.schema == x.schema
-                        && comment.name == x.name
-                }) {
-                    comment.schema = new_schema;
-                }
-                x.schema = new_schema;
-            }
+    ) -> Result<(), SqlError> {
+        let state = self.tables[index].definition.read();
+        let mut definition = *state.committed();
+        let source = self.catalog_object_identity(
+            catalog_sources::CatalogObjectSlot::Table(index),
+            state.identity.database,
+            state.identity.created_at,
+        );
+        let committed_revision = state.committed_revision;
+        drop(state);
+        let mut mapping = [None; MAX_COLUMNS];
+        for (column, target) in mapping.iter_mut().enumerate().take(definition.n_columns) {
+            *target = Some(definition.columns[column].name);
         }
-        drop(index_comments);
-        let mut sequence_catalog = self.sequence_catalog();
-        for sequence in sequence_catalog.definitions.iter_mut() {
-            if sequence.database != database_oid || sequence.ddl_state != CatalogDdlState::Present {
-                continue;
-            }
-            let moves_with_table = matches!(
-                sequence.owner,
-                Some(owner)
-                    if owner.table_schema == old_schema && owner.table == name
-            );
-            if moves_with_table {
-                sequence.schema = new_schema;
-                let owner = sequence.owner.as_mut().expect("matched Some owner");
-                owner.table_schema = new_schema;
-            }
-            if matches!(
-                sequence.generator_for,
-                Some(generator)
-                    if generator.table_schema == old_schema && generator.table == name
-            ) {
-                let generator = sequence
-                    .generator_for
-                    .as_mut()
-                    .expect("matched Some generator");
-                generator.table_schema = new_schema;
-            }
-        }
-        drop(sequence_catalog);
-        for t in self.tables.iter_mut() {
-            if t.database() != database_oid || !t.live() {
-                continue;
-            }
-            if !t
-                .definition()
-                .fkeys()
-                .iter()
-                .any(|key| key.parent_schema == old_schema && key.parent == name)
-            {
-                continue;
-            }
-            let mut changed = false;
-            let mut definition_owner = t.definition_mut(revision);
-            let definition = &mut *definition_owner;
-            for fk in &mut definition.fkeys[..definition.n_fkeys] {
-                if fk.parent_schema.as_str() == old_schema.as_str()
-                    && fk.parent.as_str() == name.as_str()
-                {
-                    fk.parent_schema = new_schema;
-                    changed = true;
-                }
-            }
-            drop(definition_owner);
-            if changed {
-                t.mark_dirty();
-            }
-        }
-        for comment in self.comment_catalog().entries.iter_mut() {
-            if comment.used
-                && comment.database == database
-                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
-                && comment.schema == old_schema
-                && comment.name == name
-            {
-                comment.schema = new_schema;
-                comment.pending_identity = None;
-            }
-        }
-        self.rename_stored_query_dependency(DependencyClass::Table, index, None, new_schema, name);
+        definition.schema = new_schema;
+        self.definition_publication
+            .publish_table(
+                self,
+                table_publication::DefinitionSource::Committed {
+                    source,
+                    committed_revision,
+                    definition: &definition,
+                    column_mapping: &mapping,
+                    revision,
+                    rewrites_rows: false,
+                },
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition source changed before schema publication"
+                )
+            })?;
+        Ok(())
     }
 
     /// Removes one foreign key from a table's definition by constraint name
@@ -46333,184 +46204,41 @@ impl Storage {
         Some(removed)
     }
 
-    /// Replaces a table's definition in place (ALTER TABLE).
+    /// Runtime publication and replay share the same catalog installation.
     fn set_table_def(
-        &mut self,
+        &self,
         index: usize,
-        def: TableDef,
+        definition: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         revision: TableDefinitionRevision,
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        let old = *self.tables[index].definition();
-        let database_oid = self.tables[index].database();
-        let database = Some(database_oid);
-        // Schema moves and inbound foreign-key rebinding also publish definitions.
-        // Check every affected counter before changing any catalog entry.
-        for (slot, table) in self.tables.iter().enumerate() {
-            if table.database() != database_oid {
-                continue;
-            }
-            let definition = table.definition();
-            let schema_change = old.schema != def.schema;
-            let follows_schema = schema_change
-                && definition.identity().live()
-                && definition
-                    .fkeys()
-                    .iter()
-                    .any(|key| key.parent_schema == old.schema && key.parent == old.name);
-            let follows_name = old.name != def.name
-                && definition.fkeys().iter().any(|key| {
-                    let schema = if follows_schema
-                        && key.parent_schema == old.schema
-                        && key.parent == old.name
-                    {
-                        def.schema
-                    } else {
-                        key.parent_schema
-                    };
-                    schema == def.schema && key.parent == old.name
-                });
-            let publications = u64::from(slot == index)
-                + u64::from(schema_change && slot == index)
-                + u64::from(follows_schema)
-                + u64::from(follows_name);
-            table
-                .publication()
-                .generation
-                .checked_add(publications)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "table publication generation exhausted"
-                    )
-                })?;
-        }
-        if old.schema != def.schema {
-            self.move_table_schema(index, def.schema, revision);
-        }
-        let current = *self.tables[index].definition();
-        if current.name != def.name {
-            for table in self.tables.iter_mut() {
-                if table.database() != database_oid {
-                    continue;
-                }
-                if !table
-                    .definition()
-                    .fkeys()
-                    .iter()
-                    .any(|key| key.parent_schema == current.schema && key.parent == current.name)
-                {
-                    continue;
-                }
-                let mut changed = false;
-                let mut definition_owner = table.definition_mut(revision);
-                let definition = &mut *definition_owner;
-                for foreign_key in &mut definition.fkeys[..definition.n_fkeys] {
-                    if foreign_key.parent_schema == current.schema
-                        && foreign_key.parent == current.name
-                    {
-                        foreign_key.parent = def.name;
-                        changed = true;
-                    }
-                }
-                drop(definition_owner);
-                if changed {
-                    table.mark_dirty();
-                }
-            }
-            for comment in self.comment_catalog().entries.iter_mut() {
-                if comment.used
-                    && comment.database == database
-                    && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
-                    && comment.schema == current.schema
-                    && comment.name == current.name
-                {
-                    comment.name = def.name;
-                    comment.pending_identity = None;
-                }
-            }
-        }
-        let mut sequence_catalog = self.sequence_catalog();
-        for sequence in sequence_catalog.definitions.iter_mut() {
-            if sequence.database != database_oid {
-                continue;
-            }
-            sequence.owner =
-                rebind_sequence_column(sequence.owner, &current, &def, column_mapping, false);
-            sequence.generator_for = rebind_sequence_column(
-                sequence.generator_for,
-                &current,
-                &def,
-                column_mapping,
-                true,
-            );
-        }
-        drop(sequence_catalog);
-        for index_def in self.index_catalog().iter_mut() {
-            if index_def.database != database_oid
-                || index_def.schema != current.schema
-                || index_def.table != current.name
-            {
-                continue;
-            }
-            if index_def.ddl_state != CatalogDdlState::Present {
-                index_def.schema = def.schema;
-                index_def.table = def.name;
-                continue;
-            }
-            for (key, column) in index_def.columns[..index_def.n_cols].iter_mut().enumerate() {
-                if index_def.expressions[key].is_some() {
-                    continue;
-                }
-                let Some(target_name) = column_mapping
-                    .get(*column as usize)
-                    .and_then(|target| *target)
-                else {
-                    continue;
-                };
-                if let Some(target_column) = def.column_index(target_name.as_str()) {
-                    *column = target_column as u16;
-                }
-            }
-            for column in &mut index_def.include_columns[..index_def.n_include_cols] {
-                let Some(target_name) = column_mapping
-                    .get(*column as usize)
-                    .and_then(|target| *target)
-                else {
-                    continue;
-                };
-                if let Some(target_column) = def.column_index(target_name.as_str()) {
-                    *column = target_column as u16;
-                }
-            }
-            index_def.schema = def.schema;
-            index_def.table = def.name;
-        }
-        {
-            let table = &mut self.tables[index];
-            let mut publication = table
-                .publication
-                .lock()
-                .expect("table publication lock poisoned");
-            let next = publication
-                .generation
-                .checked_add(1)
-                .expect("definition publication was preflighted");
-            *table.definition.committed_mut(revision) = def;
-            publication.generation = next;
-            if rewrites_rows {
-                publication.row_layout = row_layout::RowLayout::installed_at(next);
-            }
-            publication.dirty = true;
-        }
-        self.rename_stored_query_dependency(
-            DependencyClass::Table,
-            index,
-            None,
-            def.schema,
-            def.name,
+        let state = self.tables[index].definition.read();
+        let source = self.catalog_object_identity(
+            catalog_sources::CatalogObjectSlot::Table(index),
+            state.identity.database,
+            state.identity.created_at,
         );
+        let committed_revision = state.committed_revision;
+        drop(state);
+        self.definition_publication
+            .publish_table(
+                self,
+                table_publication::DefinitionSource::Committed {
+                    source,
+                    committed_revision,
+                    definition: &definition,
+                    column_mapping,
+                    revision,
+                    rewrites_rows,
+                },
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition source changed before replay publication"
+                )
+            })?;
         Ok(())
     }
 

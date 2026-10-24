@@ -8,6 +8,50 @@ from pathlib import Path
 import psycopg
 
 
+# Declared fields verified against the PostgreSQL reference metadata.
+CATALOG_SCALAR_COLUMNS = (
+    ('pg_aggregate', ('aggkind', 'aggfinalmodify', 'aggmfinalmodify')),
+    ('pg_amop', ('amoppurpose',)),
+    ('pg_cast', ('castcontext', 'castmethod')),
+    ('pg_collation', ('collprovider',)),
+    ('pg_conversion', ('connamespace', 'conowner')),
+    ('pg_database', ('datfrozenxid', 'datminmxid')),
+    ('pg_enum', ('enumtypid', 'enumsortorder', 'enumlabel')),
+    ('pg_event_trigger', ('evtenabled',)),
+    ('pg_extension', ('extowner', 'extnamespace')),
+    ('pg_foreign_data_wrapper', ('fdwowner', 'fdwhandler', 'fdwvalidator')),
+    ('pg_foreign_server', ('srvowner', 'srvfdw')),
+    ('pg_foreign_table', ('ftrelid', 'ftserver')),
+    ('pg_index', ('indnatts', 'indnkeyatts', 'indpred', 'indexprs', 'indoption', 'indcollation')),
+    ('pg_indexes', ('schemaname', 'tablename', 'indexname', 'tablespace')),
+    ('pg_inherits', ('inhrelid', 'inhparent')),
+    ('pg_init_privs', ('objoid', 'classoid', 'privtype')),
+    ('pg_language', ('lanowner', 'lanplcallfoid', 'lanvalidator', 'laninline')),
+    ('pg_operator', ('oprkind',)),
+    ('pg_partitioned_table', ('partrelid', 'partdefid')),
+    ('pg_policy', ('polrelid', 'polcmd')),
+    ('pg_proc', ('pronargs', 'prokind', 'provolatile', 'proparallel', 'procost', 'prorows', 'pronargdefaults')),
+    ('pg_publication', ('pubname', 'pubowner', 'pubgencols')),
+    ('pg_publication_namespace', ('pnpubid', 'pnnspid')),
+    ('pg_publication_rel', ('prpubid', 'prrelid', 'prqual')),
+    ('pg_range', ('rngtypid', 'rngsubtype', 'rngmultitypid')),
+    ('pg_rewrite', ('rulename', 'ev_class', 'ev_type', 'ev_enabled')),
+    ('pg_seclabels', ('objoid', 'classoid', 'objnamespace')),
+    ('pg_sequences', ('schemaname', 'sequencename', 'sequenceowner')),
+    ('pg_shdescription', ('objoid', 'classoid')),
+    ('pg_shseclabel', ('objoid', 'classoid')),
+    ('pg_stat_subscription', ('inhrelid', 'inhparent')),
+    ('pg_stat_subscription_stats', ('inhrelid', 'inhparent')),
+    ('pg_statistic_ext', ('stxrelid', 'stxnamespace', 'stxowner')),
+    ('pg_statistic_ext_data', ('stxoid',)),
+    ('pg_subscription_rel', ('srsubid', 'srrelid', 'srsubstate', 'srsublsn')),
+    ('pg_trigger', ('tgenabled', 'tgqual')),
+    ('pg_type', ('typinput', 'typoutput', 'typdefaultbin')),
+    ('pg_user_mapping', ('umuser', 'umserver')),
+    ('pg_user_mappings', ('umid', 'srvid', 'umuser')),
+)
+
+
 def connect(host, port, user, database):
     connection = psycopg.connect(
         host=host,
@@ -55,6 +99,26 @@ def transcript(reader, writer):
 
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
+        for relation, fields in CATALOG_SCALAR_COLUMNS:
+            record(
+                writer,
+                f"{prefix}.catalog_types.{relation}",
+                f"SELECT {','.join(fields)} FROM pg_catalog.{relation} LIMIT 0",
+            )
+
+        writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
+        try:
+            writer.execute('CREATE INDEX catalog_index_vectors_diff_idx ON catalog_index_vectors_diff (id DESC NULLS LAST, note COLLATE "C" ASC NULLS FIRST) INCLUDE (extra)')
+            record(writer, f"{prefix}.catalog_index_vectors", """
+                SELECT indnatts,indnkeyatts,indoption::text,indcollation::text,
+                       pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
+                       indoption[0],indoption[1],
+                       indcollation[0]=0::oid,indcollation[1]='"C"'::regcollation::oid
+                  FROM pg_index WHERE indexrelid='catalog_index_vectors_diff_idx'::regclass
+            """)
+        finally:
+            writer.execute("DROP TABLE catalog_index_vectors_diff")
+
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         try:
             record(reader, f"{prefix}.own_create.before", "SELECT count(*) FROM pg_class WHERE relname='catalog_own_create_diff'")
@@ -357,6 +421,7 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.permissions.unknown_role", "SELECT pg_get_userbyid(0), pg_get_userbyid(4294967295::oid), pg_get_userbyid(NULL::oid), pg_typeof(pg_get_userbyid(0))::text")
             writer.execute("GRANT SELECT(id) ON catalog_permission_diff TO catalog_permission_renamed_diff")
             record(reader, f"{prefix}.permissions.wrapped_columns", "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65536) IS NULL")
+            record(reader, f"{prefix}.permissions.column_lookup", "SELECT pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,1)::text, (SELECT attacl::text FROM pg_attribute WHERE attrelid='catalog_permission_diff'::regclass AND attnum=1), has_column_privilege('catalog_permission_renamed_diff','catalog_permission_diff','id','SELECT')")
             writer.execute("CREATE FUNCTION catalog_permission_function_diff() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
             writer.execute("GRANT EXECUTE ON FUNCTION catalog_permission_function_diff() TO catalog_permission_renamed_diff")
             record(reader, f"{prefix}.permissions.function_subid", "SELECT pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 0)::text, pg_get_acl('pg_proc'::regclass, 'catalog_permission_function_diff()'::regprocedure, 7)::text")
@@ -368,6 +433,7 @@ def transcript(reader, writer):
                 record_outcome(reader, f"{prefix}.permissions.invalid_class_{class_oid}", "SELECT pg_get_acl(%s::oid, %s::oid, 0)", (class_oid, role_oid))
             reader.execute("COMMIT")
             record(reader, f"{prefix}.permissions.fresh", query)
+            record(reader, f"{prefix}.permissions.fresh_column_lookup", "SELECT pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,1)::text, (SELECT attacl::text FROM pg_attribute WHERE attrelid='catalog_permission_diff'::regclass AND attnum=1)")
         finally:
             reader.execute("ROLLBACK")
             writer.execute("ROLLBACK")
@@ -449,6 +515,16 @@ def transcript(reader, writer):
                 generated_value bigint GENERATED ALWAYS AS (id + 1) STORED
             )""")
             record(writer, f"{prefix}.metadata.full_columns", "SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff' ORDER BY ordinal_position")
+            record(writer, f"{prefix}.metadata.bit_modifiers", "SELECT attname,atttypmod,format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='catalog_metadata_columns_diff'::regclass AND attname IN ('fixed_bits','variable_bits') ORDER BY attnum")
+            record(writer, f"{prefix}.metadata.bit_casts", "SELECT B'101010'::bit(6),B'101'::varbit(8),B'11'::bit,123::bit(8)")
+            reader.execute("BEGIN")
+            try:
+                for type_name in ("bit(0)", "varbit(0)", "bit(83886081)", "varbit(83886081)"):
+                    record_outcome(reader, f"{prefix}.metadata.invalid_{type_name}", f"CREATE TABLE catalog_invalid_bits_diff(value {type_name})", ())
+            finally:
+                reader.execute("ROLLBACK")
+            record(writer, f"{prefix}.metadata.builtin_type_io", "SELECT typname,typinput::text,typinput::oid,typoutput::text,typoutput::oid FROM pg_type WHERE typnamespace='pg_catalog'::regnamespace AND typname IN ('int4','text','varchar','numeric','_int4') ORDER BY typname")
+            record(writer, f"{prefix}.metadata.user_type_io", "SELECT typname,typinput::text,typinput::oid,typoutput::text,typoutput::oid FROM pg_type WHERE typnamespace='public'::regnamespace AND typname IN ('catalog_metadata_domain_diff','catalog_metadata_enum_diff','_catalog_metadata_domain_diff','_catalog_metadata_enum_diff','catalog_metadata_columns_diff') ORDER BY typname")
             record(writer, f"{prefix}.metadata.full_table", "SELECT * FROM information_schema.tables WHERE table_schema='public' AND table_name='catalog_metadata_columns_diff'")
             record(writer, f"{prefix}.metadata.hidden_catalog_columns", "SELECT attname FROM pg_attribute WHERE attrelid='pg_namespace'::regclass AND attnum>0 ORDER BY attnum")
             record(writer, f"{prefix}.metadata.catalog_tableoids", "SELECT tableoid='pg_namespace'::regclass FROM pg_namespace WHERE nspname='public'")

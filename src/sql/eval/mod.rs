@@ -2551,7 +2551,7 @@ fn eval_full_inner<'a>(
                 && matches!(v, Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_))
             {
                 let n = match crate::sql::types::TypeMod::decode(ct, type_mod) {
-                    crate::sql::types::TypeMod::Length(n) => n,
+                    crate::sql::types::TypeMod::BitLength(n) => n,
                     _ => 1,
                 };
                 let value = match v {
@@ -7071,7 +7071,12 @@ fn regtype_of_oid_with_catalog<'a>(
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
     } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
-        ctype.name()
+        match ctype {
+            ColType::Array(element) => arena
+                .alloc_str(crate::stack_format!(128, "{}[]", element.to_coltype().name()).as_str())
+                .map_err(|_| arena_full())?,
+            scalar => scalar.name(),
+        }
     } else {
         return arena
             .alloc_str_display(unsigned)

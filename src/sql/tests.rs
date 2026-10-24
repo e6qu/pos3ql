@@ -18053,6 +18053,13 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
+    let modifiers = "SELECT attname,atttypmod,format_type(atttypid,atttypmod)
+        FROM pg_attribute WHERE attrelid='durable_binary_strings'::regclass
+        AND attname IN ('flags','flexible') ORDER BY attnum";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, modifiers)),
+        ["flags|8|bit(8)", "flexible|-1|bit varying"]
+    );
     assert!(engine.checkpoint().unwrap());
 
     let wal_tail = run_with(
@@ -18078,6 +18085,10 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
 
     let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, modifiers)),
+        ["flags|8|bit(8)", "flexible|-1|bit varying"]
+    );
     let recovered = run_with(
         &mut cold,
         &mut cold_budget,
@@ -21574,6 +21585,80 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
 }
 
 #[test]
+fn catalog_snapshot_bit_modifiers_preserve_wire_values() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT B'101010'::bit(6),B'101'::varbit(8),B'11'::bit,123::bit(8)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["101010|101|1|01111011"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(row_description_type_modifiers(&output), [6, 8, 1, 8]);
+}
+
+#[test]
+fn catalog_snapshot_type_io_fields_keep_routine_identities() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN catalog_io_domain AS varchar(5);
+         CREATE DOMAIN catalog_io_child AS catalog_io_domain;
+         CREATE TYPE catalog_io_enum AS ENUM ('one');
+         CREATE TABLE catalog_io_table(d catalog_io_child, e catalog_io_enum);
+         CREATE VIEW catalog_io_view AS SELECT * FROM catalog_io_table;
+         SELECT typname,typinput::text,typoutput::text,
+                pg_typeof(typinput)::text,pg_typeof(typoutput)::text
+           FROM pg_type WHERE typname IN
+             ('catalog_io_domain','catalog_io_child','catalog_io_enum',
+              '_catalog_io_domain','_catalog_io_enum','catalog_io_table','catalog_io_view')
+           ORDER BY typname;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "_catalog_io_domain|array_in|array_out|regproc|regproc",
+            "_catalog_io_enum|array_in|array_out|regproc|regproc",
+            "catalog_io_child|domain_in|varcharout|regproc|regproc",
+            "catalog_io_domain|domain_in|varcharout|regproc|regproc",
+            "catalog_io_enum|enum_in|enum_out|regproc|regproc",
+            "catalog_io_table|record_in|record_out|regproc|regproc",
+            "catalog_io_view|record_in|record_out|regproc|regproc",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_index_vectors(id integer, note text, extra integer);
+         CREATE INDEX catalog_index_vectors_idx ON catalog_index_vectors
+           (id DESC NULLS LAST, note COLLATE \"C\" ASC NULLS FIRST) INCLUDE (extra);
+         SELECT indnatts,indnkeyatts,indoption::text,indcollation::text,
+                pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
+                indoption[0],indoption[1],
+                indcollation[0]=0::oid,indcollation[1]='\"C\"'::regcollation::oid
+           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["3|2|1 2|0 950|int2vector|oidvector|1|2|t|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -24279,12 +24364,10 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
         config.sql_arena_bytes,
     )
     .unwrap();
-    for (qualifier, catalog) in crate::sql::catalog_snapshot_keys::RELATIONS
+    for (qualifier, catalog) in crate::sql::catalog::CATALOG_RELATIONS
         .iter()
-        .map(|relation| ("pg_catalog", relation.name))
+        .map(|name| ("pg_catalog", *name))
         .chain([
-            ("pg_catalog", "pg_tables"),
-            ("pg_catalog", "pg_roles"),
             ("information_schema", "tables"),
             ("information_schema", "columns"),
         ])

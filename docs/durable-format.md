@@ -312,6 +312,10 @@ original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
 contracts share this encoding. Table definition payloads use version 7.
 
+Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
+Character modifiers include their four-byte header: `varchar(7)` stores `11`.
+Journal, checkpoint and client descriptions use the same decoded modifier.
+
 Journal framing remains 24 bytes: CRC32C, payload length and LSN occupy bytes
 0–15; byte 16 selects the operation; byte 17 stores the version listed in the
 compatibility matrix; bytes 18–23 are zero.

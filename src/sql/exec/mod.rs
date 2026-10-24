@@ -70825,7 +70825,7 @@ pub fn apply_cast_typmod<'a>(
                 other => Ok(other),
             }
         }
-        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+        (ColType::Bit { varying }, TypeMod::BitLength(n), Datum::Bit { bits, .. }) => {
             super::eval::fit_bits(bits, n, varying, arena)
         }
         _ => apply_typmod(v, ctype, type_mod, arena),
@@ -70911,7 +70911,7 @@ pub fn apply_typmod<'a>(
         (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
             apply_numeric_typmod(&n, precision as usize, scale as usize, arena).map(Datum::Numeric)
         }
-        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+        (ColType::Bit { varying }, TypeMod::BitLength(n), Datum::Bit { bits, .. }) => {
             let invalid = if varying {
                 bits.len() > n
             } else {

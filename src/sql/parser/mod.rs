@@ -7483,6 +7483,8 @@ impl<'a> Parser<'a> {
             // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
             // is 'a'); only the internal name `bpchar` means unlimited.
             TypeMod::Length(1).encode()
+        } else if name == "bit" {
+            TypeMod::BitLength(1).encode()
         } else {
             -1
         };
@@ -7651,9 +7653,25 @@ impl<'a> Parser<'a> {
                     return Err(self.unexpected("length for bit type takes one argument"));
                 }
                 if nums[0] < 1 {
-                    return Err(self.unexpected("length for bit type must be at least 1"));
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "length for type {} must be at least 1", base),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
                 }
-                Ok(TypeMod::Length(nums[0] as usize).encode())
+                // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
+                if nums[0] > 83_886_080 {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "length for type {} cannot exceed 83886080",
+                            base
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                Ok(TypeMod::BitLength(nums[0] as usize).encode())
             }
             // Fractional-second precision, 0..=6. A larger value is clamped to
             // 6, and PostgreSQL warns when it does so.

@@ -31,6 +31,9 @@ mod views;
 #[path = "catalog_information.rs"]
 mod information;
 
+#[path = "catalog_type_io.rs"]
+mod type_io;
+
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
@@ -8490,7 +8493,7 @@ const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
-const CATALOG_RELATIONS: &[&str] = &[
+pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_aggregate",
     "pg_aios",
     "pg_am",
@@ -21561,8 +21564,7 @@ fn pg_index<'a>(
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
-        // indkey is the 1-based attribute numbers as an int2vector-like array;
-        // indoption is one flag per column (0 = default ascending).
+        // Include columns have attribute numbers but no option or collation entry.
         let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
         attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
         for (position, attribute) in attributes.iter_mut().enumerate().take(info.n_cols) {
@@ -21623,8 +21625,7 @@ fn pg_index<'a>(
             continue;
         }
         let keys = [1_u16, 2];
-        let options = [Datum::Int4(0), Datum::Int4(0)];
-        let collations = [Datum::Oid(0), Datum::Oid(0)];
+        let collations = [0_i32, 0];
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
             &[
@@ -21641,18 +21642,12 @@ fn pg_index<'a>(
                 Datum::Int4(2),
                 Datum::Int4(2),
                 int2vector(&keys, arena)?,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&options, arena)?,
-                },
+                Datum::Int2Vector(&[0; 4]),
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Null,
-                Datum::Array {
-                    element: super::types::ArrElem::Oid,
-                    raw: super::array::build(&collations, arena)?,
-                },
+                oidvector(&collations, arena)?,
                 oidvector(&operator_classes, arena)?,
             ],
             arena,
@@ -21668,8 +21663,7 @@ fn pg_index<'a>(
             &[1981_i32][..],
         ),
     ] {
-        let options = [Datum::Int4(0), Datum::Int4(0)];
-        let collations = [Datum::Int4(0), Datum::Int4(0)];
+        let collations = [0_i32, 0];
         out[n] = row(
             &[
                 Datum::Int4(index_oid),
@@ -21685,18 +21679,12 @@ fn pg_index<'a>(
                 Datum::Int4(attributes.len() as i32),
                 Datum::Int4(attributes.len() as i32),
                 int2vector(attributes, arena)?,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&options[..attributes.len()], arena)?,
-                },
+                Datum::Int2Vector(&[0; 4][..attributes.len() * 2]),
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Null,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&collations[..attributes.len()], arena)?,
-                },
+                oidvector(&collations[..attributes.len()], arena)?,
                 oidvector(operator_classes, arena)?,
             ],
             arena,
@@ -21708,16 +21696,17 @@ fn pg_index<'a>(
 
 /// An index-option array (one 0-flag per column) for `pg_index.indoption`.
 fn index_options<'a>(info: &IdxInfo, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (position, value) in vals.iter_mut().enumerate().take(info.n_cols) {
-        *value = Datum::Int4(
-            i32::from(info.descending[position]) | (i32::from(info.nulls_first[position]) << 1),
-        );
+    let mut raw = [0; crate::storage::MAX_INDEX_COLS * 2];
+    for (position, value) in raw.chunks_exact_mut(2).enumerate().take(info.n_cols) {
+        let flags =
+            i16::from(info.descending[position]) | (i16::from(info.nulls_first[position]) << 1);
+        value.copy_from_slice(&flags.to_le_bytes());
     }
-    Ok(Datum::Array {
-        element: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..info.n_cols], arena)?,
-    })
+    Ok(Datum::Int2Vector(
+        arena
+            .alloc_slice_copy(&raw[..info.n_cols * 2])
+            .map_err(|_| arena_full())?,
+    ))
 }
 
 fn index_collations<'a>(
@@ -21726,7 +21715,7 @@ fn index_collations<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let mut values = [0_i32; crate::storage::MAX_INDEX_COLS];
     let table = storage.table_def(info.table_slot, txid);
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
         let collation = if info.explicit_definition.is_some() {
@@ -21740,12 +21729,9 @@ fn index_collations<'a>(
         } else {
             table.columns()[info.columns[position] as usize].collation
         };
-        *value = Datum::Int4(collation.oid());
+        *value = collation.oid();
     }
-    Ok(Datum::Array {
-        element: super::types::ArrElem::Int4,
-        raw: super::array::build(&values[..info.n_cols], arena)?,
-    })
+    oidvector(&values[..info.n_cols], arena)
 }
 
 fn index_operator_classes<'a>(
@@ -28915,52 +28901,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
-                text(
-                    match t {
-                        ColType::Refcursor => "textin",
-                        ColType::Regtype => "regtypein",
-                        ColType::Regproc => "regprocin",
-                        ColType::Regprocedure => "regprocedurein",
-                        ColType::Regoper => "regoperin",
-                        ColType::Regoperator => "regoperatorin",
-                        ColType::Regclass => "regclassin",
-                        ColType::Regnamespace => "regnamespacein",
-                        ColType::Regrole => "regrolein",
-                        ColType::Regconfig => "regconfigin",
-                        ColType::Regdictionary => "regdictionaryin",
-                        ColType::Regcollation => "regcollationin",
-                        ColType::PgLsn => "pg_lsn_in",
-                        ColType::AclItem => "aclitemin",
-                        ColType::Money => "cash_in",
-                        ColType::Tid => "tidin",
-                        ColType::Cid => "cidin",
-                        _ => "",
-                    },
-                    arena,
-                )?,
-                text(
-                    match t {
-                        ColType::Refcursor => "textout",
-                        ColType::Regtype => "regtypeout",
-                        ColType::Regproc => "regprocout",
-                        ColType::Regprocedure => "regprocedureout",
-                        ColType::Regoper => "regoperout",
-                        ColType::Regoperator => "regoperatorout",
-                        ColType::Regclass => "regclassout",
-                        ColType::Regnamespace => "regnamespaceout",
-                        ColType::Regrole => "regroleout",
-                        ColType::Regconfig => "regconfigout",
-                        ColType::Regdictionary => "regdictionaryout",
-                        ColType::Regcollation => "regcollationout",
-                        ColType::PgLsn => "pg_lsn_out",
-                        ColType::AclItem => "aclitemout",
-                        ColType::Money => "cash_out",
-                        ColType::Tid => "tidout",
-                        ColType::Cid => "cidout",
-                        _ => "",
-                    },
-                    arena,
-                )?,
+                Datum::Null, // Input/output identities are assigned together below.
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -29133,8 +29075,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -29167,8 +29109,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("array_in", arena)?,
-                text("array_out", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -29219,8 +29161,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     )?,
                     None => Datum::Null,
                 },
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -29278,8 +29220,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29323,8 +29265,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -29370,8 +29312,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29415,8 +29357,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -29462,8 +29404,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29508,8 +29450,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(
@@ -29563,8 +29505,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29601,8 +29543,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29640,8 +29582,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29658,7 +29600,32 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         n += 1;
     }
-    finish(def, &out[..n], arena)
+    let fields = ["oid", "typtype", "typelem", "typbasetype"].map(|name| {
+        def.columns
+            .iter()
+            .position(|(candidate, _)| *candidate == name)
+            .expect("pg_type source field exists")
+    });
+    let routines = ["typinput", "typoutput"].map(|name| {
+        def.columns
+            .iter()
+            .position(|(candidate, _)| *candidate == name)
+            .expect("pg_type routine field exists")
+    });
+    let compatible = catalog_rows(arena, n)?;
+    for (target, source) in compatible.iter_mut().zip(&out[..n]) {
+        let functions = type_io::functions(source, &out[..n], fields)?;
+        let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
+        for (position, function) in routines.into_iter().zip(functions) {
+            values[position] = Datum::RegObject {
+                type_oid: crate::sql::types::oid::REGPROC,
+                referenced_oid: function.oid,
+                name: function.name,
+            };
+        }
+        *target = values;
+    }
+    finish(def, compatible, arena)
 }
 
 fn pg_namespace<'a>(

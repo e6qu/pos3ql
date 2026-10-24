@@ -133,6 +133,18 @@ smallest reproducer. Fix the slow work, deadlock, resource contention, or worklo
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
 
+Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference
+with explicit container and output arguments:
+
+```sh
+tools/generate-pg18-catalog-metadata.sh pos3ql-pg18-ref src/sql/catalog_metadata.rs
+```
+
+The generator rejects other server versions and records the source version and
+container image. It includes the input/output routine identities reported by
+`pg_type`; user-defined domains, enums, arrays and row types derive those
+identities from their type definitions.
+
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
 Pass the selected ownership filters together to share one interpreter startup;

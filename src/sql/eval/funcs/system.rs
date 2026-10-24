@@ -2339,7 +2339,9 @@ pub(crate) fn dispatch<'a>(
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {
                     TypeMod::None => stack_format!(80, "{}", name),
-                    TypeMod::Length(n) => stack_format!(80, "{}({})", name, n),
+                    TypeMod::Length(n) | TypeMod::BitLength(n) => {
+                        stack_format!(80, "{}({})", name, n)
+                    }
                     TypeMod::NumericPS { precision, scale } => {
                         stack_format!(80, "{}({},{})", name, precision, scale)
                     }

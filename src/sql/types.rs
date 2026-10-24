@@ -4307,8 +4307,10 @@ impl IntervalRange {
 pub enum TypeMod {
     /// No modifier: `-1` on the wire, or a value meaningless for the type.
     None,
-    /// `varchar(n)` / `char(n)` / `bit(n)`: a length in characters or bits.
+    /// `varchar(n)` / `char(n)`: a character count with a four-byte header.
     Length(usize),
+    /// `bit(n)` / `varbit(n)`: a bit count without a header.
+    BitLength(usize),
     /// `numeric(p, s)`.
     NumericPS { precision: u16, scale: u16 },
     /// `timestamp(p)` / `timestamptz(p)` / `time(p)` / `timetz(p)`:
@@ -4340,13 +4342,14 @@ impl TypeMod {
         }
         match ctype {
             ColType::Array(element) => Self::decode(element.to_coltype(), atttypmod),
-            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bit { .. } => {
+            ColType::Text | ColType::Varchar | ColType::Bpchar => {
                 if atttypmod >= 4 {
                     TypeMod::Length((atttypmod - 4) as usize)
                 } else {
                     TypeMod::None
                 }
             }
+            ColType::Bit { .. } => TypeMod::BitLength(atttypmod as usize),
             ColType::Numeric => {
                 if atttypmod >= 4 {
                     let packed = atttypmod - 4;
@@ -4388,6 +4391,7 @@ impl TypeMod {
         match *self {
             TypeMod::None => -1,
             TypeMod::Length(n) => n as i32 + 4,
+            TypeMod::BitLength(n) => n as i32,
             TypeMod::NumericPS { precision, scale } => {
                 (((precision as i32) << 16) | (scale as i32)) + 4
             }
@@ -5358,6 +5362,8 @@ mod tests {
         // The values PostgreSQL 18.4 stores in pg_attribute, byte for byte.
         assert_eq!(TypeMod::Length(5).encode(), 9); // varchar(5)
         assert_eq!(TypeMod::Length(3).encode(), 7); // char(3)
+        assert_eq!(TypeMod::BitLength(6).encode(), 6);
+        assert_eq!(TypeMod::BitLength(8).encode(), 8);
         assert_eq!(
             TypeMod::NumericPS {
                 precision: 6,
@@ -5392,7 +5398,8 @@ mod tests {
         let cases: &[(ColType, TypeMod)] = &[
             (ColType::Varchar, TypeMod::Length(5)),
             (ColType::Bpchar, TypeMod::Length(3)),
-            (ColType::Bit { varying: false }, TypeMod::Length(8)),
+            (ColType::Bit { varying: false }, TypeMod::BitLength(8)),
+            (ColType::Bit { varying: true }, TypeMod::BitLength(8)),
             (
                 ColType::Numeric,
                 TypeMod::NumericPS {

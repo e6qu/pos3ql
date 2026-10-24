@@ -1660,6 +1660,13 @@ fn typmod_change_requires_rewrite(ctype: types::ColType, old: i32, new: i32) -> 
         (_, TypeMod::None) => false,
         (TypeMod::None, _) => true,
         (TypeMod::Length(old), TypeMod::Length(new)) => new < old,
+        (TypeMod::BitLength(old), TypeMod::BitLength(new)) => {
+            let base = match ctype {
+                types::ColType::Array(element) => element.to_coltype(),
+                scalar => scalar,
+            };
+            !matches!(base, types::ColType::Bit { varying: true }) || new < old
+        }
         (
             TypeMod::NumericPS {
                 precision: old_precision,

@@ -1,0 +1,45 @@
+name: Catalog reference
+
+on:
+  push:
+    branches: [catalog-statement-visibility]
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Record actual PostgreSQL catalog visibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/catalog-reference"
+          target/external-venv/bin/python tests/external/catalog_snapshot_diff.py \
+            --host 127.0.0.1 --port 5432 --user postgres --database postgres \
+            --output "$RUNNER_TEMP/catalog-reference/postgresql.json"
+          git rev-parse HEAD > "$RUNNER_TEMP/catalog-reference/revision"
+          docker inspect '${{ job.services.postgres.id }}' --format '{{.Image}}' > "$RUNNER_TEMP/catalog-reference/postgresql-image"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: catalog-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/catalog-reference/
+          if-no-files-found: error

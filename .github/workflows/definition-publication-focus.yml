@@ -59,11 +59,15 @@ jobs:
           command = ["docker", "exec", "-i", containers[0], "psql", "-U", "postgres", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"]
           version = subprocess.run(command, input="SHOW server_version_num;", text=True, capture_output=True, check=True)
           assert 180000 <= int(version.stdout.strip()) < 190000, version.stdout
-          fixture = pathlib.Path("tests/external/differential_exact/19_key_preparation.sql").read_text()
-          result = subprocess.run(command, input=fixture, text=True, capture_output=True, check=True)
-          expected = ["1", "1|11", "3|20|23", "2|5|42"]
-          assert result.stdout.splitlines() == expected, (result.stdout, result.stderr)
-          print(f"PostgreSQL {version.stdout.strip()}: {expected}")
+          cases = [
+              ("19_key_preparation.sql", ["1", "1|11", "3|20|23", "2|5|42"]),
+              ("20_table_publication.sql", ["1|10", "1", "3", "published table", "published index", "1", "2|30", "2"]),
+          ]
+          for name, expected in cases:
+              fixture = pathlib.Path("tests/external/differential_exact", name).read_text()
+              result = subprocess.run(command, input=fixture, text=True, capture_output=True, check=True)
+              assert result.stdout.splitlines() == expected, (name, result.stdout, result.stderr)
+              print(f"PostgreSQL {version.stdout.strip()} {name}: {expected}")
           PY
       - name: Definition publication, ownership, rows and index regressions
         if: ${{ !cancelled() }}

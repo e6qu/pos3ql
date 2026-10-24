@@ -810,7 +810,7 @@ mod tests {
         for committed in [false, true] {
             for tracked in [false, true] {
                 for deletion in [false, true] {
-                    let (mut storage, table) = fixture(&test_config());
+                    let (storage, table) = fixture(&test_config());
                     let input = storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap();
                     crate::mem::guard::forbid_alloc(|| {
                         let prepared = storage

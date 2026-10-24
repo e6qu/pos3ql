@@ -46144,13 +46144,33 @@ impl Storage {
         new_schema: SqlName,
         revision: TableDefinitionRevision,
     ) -> Result<(), SqlError> {
-        let mut definition = *self.tables[index].definition();
+        let state = self.tables[index].definition.read();
+        let mut definition = *state.committed();
+        let source = self.catalog_object_identity(
+            catalog_sources::CatalogObjectSlot::Table(index),
+            state.identity.database,
+            state.identity.created_at,
+        );
+        let committed_revision = state.committed_revision;
+        drop(state);
         let mut mapping = [None; MAX_COLUMNS];
         for (column, target) in mapping.iter_mut().enumerate().take(definition.n_columns) {
             *target = Some(definition.columns[column].name);
         }
         definition.schema = new_schema;
-        self.set_table_def(index, definition, &mapping, revision, false)
+        self.definition_publication.publish_table(
+            self,
+            table_publication::DefinitionSource::Committed {
+                source,
+                committed_revision,
+                definition: &definition,
+                column_mapping: &mapping,
+                revision,
+                rewrites_rows: false,
+            },
+        )?.ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE,
+            "table definition source changed before schema publication"))?;
+        Ok(())
     }
 
     /// Removes one foreign key from a table's definition by constraint name
@@ -46202,7 +46222,8 @@ impl Storage {
                 revision,
                 rewrites_rows,
             },
-        )?;
+        )?.ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE,
+            "table definition source changed before replay publication"))?;
         Ok(())
     }
 

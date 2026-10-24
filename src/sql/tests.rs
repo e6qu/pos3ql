@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod key_preparation;
+mod table_publication;
 mod row_layout;
 mod transaction_publication;
 

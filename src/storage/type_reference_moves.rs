@@ -247,7 +247,7 @@ pub(super) struct DefinitionPublication {
     #[cfg(test)]
     pub(super) waits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    scan_pause: std::sync::atomic::AtomicU8,
+    pub(super) scan_pause: std::sync::atomic::AtomicU8,
 }
 
 pub(super) struct TableOwner<'storage> {
@@ -269,6 +269,16 @@ impl Drop for TableAttempt<'_, '_> {
 }
 
 impl DefinitionPublication {
+    #[cfg(test)]
+    pub(super) fn pause_after_scan(&self) {
+        use std::sync::atomic::Ordering;
+        if self.scan_pause.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            while self.scan_pause.load(Ordering::Acquire) == 2 {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     pub(super) fn validate_generations(
         storage: &Storage,
         changes: impl Iterator<Item = super::TypeCommitChange> + Clone,

@@ -181,6 +181,8 @@ impl DefinitionPublication {
                     name: definition.name,
                 };
                 Self::acquire_table_dependents(storage, movement, &mut owners)?;
+                #[cfg(test)]
+                self.pause_after_scan();
                 // Creation binds under the type catalog; every private table edit
                 // owns comments. Rescan while both submission gates are held.
                 let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
@@ -502,5 +504,60 @@ mod tests {
             assert!(storage.comment_text(CommentClass::Relation, "publication_destination", "publication_renamed", 0, 0).is_some());
             assert!(storage.pending_table_def(parent).is_none());
         });
+    }
+
+    #[test]
+    fn table_publication_rescans_late_creation_and_private_foreign_key_edits() {
+        struct ResumeScan<'a>(&'a std::sync::atomic::AtomicU8);
+        impl Drop for ResumeScan<'_> {
+            fn drop(&mut self) { self.0.store(0, Ordering::Release); }
+        }
+        for creation in [false, true] {
+            let (storage, parent, _, other) = fixture();
+            let change = rename(&storage, parent);
+            storage.definition_publication.scan_pause.store(1, Ordering::Release);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change)));
+                let resume = ResumeScan(&storage.definition_publication.scan_pause);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while storage.definition_publication.scan_pause.load(Ordering::Acquire) != 2
+                    && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let paused = storage.definition_publication.scan_pause.load(Ordering::Acquire) == 2;
+                let submitted = if paused {
+                    crate::mem::guard::forbid_alloc(|| {
+                        let (target, mut definition) = storage.select_table_definition(other, 9);
+                        definition.n_fkeys = 1;
+                        definition.fkeys[0] = ForeignKey {
+                            parent_schema: SqlName::parse("public").unwrap(),
+                            parent: SqlName::parse("publication_parent").unwrap(),
+                            n_cols: 1, n_parent_cols: 1, ..ForeignKey::EMPTY
+                        };
+                        if creation {
+                            definition.name = SqlName::parse("publication_late_child").unwrap();
+                            (storage.create_table_in(definition, 9).unwrap(), None)
+                        } else {
+                            let change = storage.write_table_def(target, definition, &mapping(), false).unwrap();
+                            (other, Some(change))
+                        }
+                    })
+                } else { (other, None) };
+                drop(resume);
+                let result = writer.join().unwrap();
+                assert!(paused);
+                assert_eq!(result.unwrap(), Some(false));
+                let selected = storage.table_def(submitted.0, 9);
+                assert_eq!(selected.fkeys()[0].parent.as_str(), "publication_renamed");
+                assert_eq!(selected.fkeys()[0].parent_schema.as_str(), "publication_destination");
+                drop(selected);
+                if let Some(change) = submitted.1 {
+                    assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+                } else {
+                    storage.commit_create(submitted.0);
+                }
+                assert_eq!(storage.table_def(submitted.0, 0).fkeys()[0].parent.as_str(), "publication_renamed");
+            });
+        }
     }
 }

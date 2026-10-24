@@ -3921,8 +3921,8 @@ pub fn infer_type_res(
             "ts_lexize" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "get_current_ts_config" => of(ColType::Regconfig),
             // Catalog-introspection helpers (for psql \d).
-            "pg_get_userbyid"
-            | "format_type"
+            "pg_get_userbyid" => of(ColType::Name),
+            "format_type"
             | "pg_get_expr"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"

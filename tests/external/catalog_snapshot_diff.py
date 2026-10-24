@@ -551,6 +551,14 @@ def main():
                        AND c.relkind IN ('r','v') AND a.attnum>0 AND NOT a.attisdropped
                      ORDER BY n.nspname,c.relname,a.attnum
                 """).fetchall(),
+                "type_io": reader.execute("""
+                    SELECT t.oid, t.typname, t.typtype,
+                           t.typinput::oid, t.typinput::text,
+                           t.typoutput::oid, t.typoutput::text
+                      FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
+                     WHERE n.nspname='pg_catalog'
+                     ORDER BY t.oid
+                """).fetchall(),
             }
             arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")
         observed = transcript(reader, writer)

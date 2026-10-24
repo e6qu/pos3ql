@@ -16229,19 +16229,40 @@ fn finish_with_hidden<'a>(
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let width = def.n_columns + hidden_columns;
+    let input_width = specification.columns.len() + hidden.len();
+    let destinations = arena
+        .alloc_slice_with(input_width, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    for (destination, (name, _)) in destinations
+        .iter_mut()
+        .zip(specification.columns.iter().chain(hidden))
+    {
+        *destination = def.columns[..width]
+            .iter()
+            .position(|column| column.name.as_str() == *name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog source field has no declared destination"
+                )
+            })?;
+    }
     for (target, source) in typed.iter_mut().zip(rows) {
-        if source.len() != specification.columns.len() + hidden.len() {
+        if source.len() != input_width {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid catalog row width"
             ));
         }
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        for ((name, column_type), value) in specification
+        let values = arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (((name, column_type), value), destination) in specification
             .columns
             .iter()
             .chain(hidden)
             .zip(source.iter().copied())
+            .zip(destinations.iter().copied())
         {
             // Tagged derived rows must carry the advertised representation,
             // notably oid rather than int4, before hashing or wire encoding.
@@ -16257,21 +16278,12 @@ fn finish_with_hidden<'a>(
                     ));
                 }
             }
-            let index = def.columns[..width]
-                .iter()
-                .position(|column| column.name.as_str() == *name)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "catalog source field has no declared destination"
-                    )
-                })?;
-            values[index] = value;
+            values[destination] = value;
         }
         if let Some(relation) = specification.relation {
             values[def.n_columns] = Datum::Oid(relation.get());
         }
-        *target = row(&values[..width], arena)?;
+        *target = values;
     }
     Ok(SynthTable {
         def,
@@ -31702,54 +31714,6 @@ fn view_column_catalog_type(
             oid
         )
     })
-}
-
-/// The SQL-standard `data_type` spelling is intentionally less specific than
-/// PostgreSQL's OID. Domains report their base type, named enums and
-/// composites report `USER-DEFINED`, and arrays report `ARRAY`.
-fn information_schema_data_type(
-    storage: &Storage,
-    txid: u32,
-    oid: i32,
-) -> Result<StackStr<64>, SqlError> {
-    use crate::sql::types::oid as type_oid;
-    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + storage.domain_count() as i32)
-        .contains(&oid)
-    {
-        return Ok(StackStr::from_str(
-            storage
-                .domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid)
-                .base
-                .name(),
-        ));
-    }
-    if (type_oid::FIRST_DOMAIN_ARRAY..type_oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
-        .contains(&oid)
-        || (type_oid::FIRST_ENUM_ARRAY..type_oid::FIRST_ENUM_ARRAY + storage.enum_count() as i32)
-            .contains(&oid)
-        || (type_oid::FIRST_COMPOSITE_ARRAY
-            ..type_oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
-            .contains(&oid)
-    {
-        return Ok(StackStr::from_str("ARRAY"));
-    }
-    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + storage.enum_count() as i32).contains(&oid)
-        || (type_oid::FIRST_COMPOSITE..type_oid::FIRST_COMPOSITE + storage.composite_count() as i32)
-            .contains(&oid)
-    {
-        return Ok(StackStr::from_str("USER-DEFINED"));
-    }
-    if let Some(ctype) = super::exec::coltype_of_oid(oid) {
-        if matches!(ctype, ColType::Array(_)) {
-            return Ok(StackStr::from_str("ARRAY"));
-        }
-        return Ok(StackStr::from_str(ctype.name()));
-    }
-    Err(sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "information_schema.columns cannot describe type oid {}",
-        oid
-    ))
 }
 
 fn info_table_constraints<'a>(

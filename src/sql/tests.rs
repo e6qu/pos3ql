@@ -24270,8 +24270,15 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
 
 #[test]
 fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
-    let (engine, mut budget) = test_engine();
-    let arena = Arena::new(&mut budget, "catalog schema scratch", 4 << 20).unwrap();
+    let config = test_config("catalog-schema-resolution");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes((1 << 27) + (1 << 20)));
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let arena = Arena::new(
+        &mut budget,
+        "catalog schema scratch",
+        config.sql_arena_bytes,
+    )
+    .unwrap();
     for (qualifier, catalog) in crate::sql::catalog_snapshot_keys::RELATIONS
         .iter()
         .map(|relation| ("pg_catalog", relation.name))
@@ -24284,55 +24291,56 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
     {
         let mark = arena.mark();
         let before = arena.used();
-        crate::mem::guard::forbid_alloc(|| {
-            let shape =
-                crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)
-                    .unwrap();
-            assert!(shape.rows.is_empty());
-            assert_eq!(shape.def.name.as_str(), catalog);
-            assert_eq!(
-                arena.used() - before,
-                core::mem::size_of::<crate::storage::TableDef>()
-            );
-            let materialized = crate::sql::catalog::synthesize(
-                &engine.storage,
-                Some(qualifier),
-                catalog,
-                0,
-                crate::sql::catalog_snapshot::CatalogScan::Sequential,
-                &arena,
-            )
-            .unwrap();
-            assert_eq!(shape.hidden_columns, materialized.hidden_columns);
-            assert_eq!(shape.def.n_columns, materialized.def.n_columns);
-            let width = shape.def.n_columns + shape.hidden_columns;
-            for (actual, expected) in shape.def.columns[..width]
-                .iter()
-                .zip(&materialized.def.columns[..width])
-            {
-                assert_eq!(actual.name, expected.name);
-                assert_eq!(actual.ctype, expected.ctype);
-                assert_eq!(actual.type_mod, expected.type_mod);
-                assert_eq!(actual.collation, expected.collation);
-            }
-            for row in materialized.rows {
-                assert_eq!(row.len(), width, "{qualifier}.{catalog}");
-                if materialized.hidden_columns == 1 {
-                    assert_eq!(
-                        row[materialized.def.n_columns],
-                        Datum::Oid(
-                            crate::sql::catalog_snapshot_keys::RELATIONS
-                                .iter()
-                                .find(|relation| relation.name == catalog)
-                                .unwrap()
-                                .oid
-                                .get(),
-                        ),
-                        "{qualifier}.{catalog}"
-                    );
+        let result =
+            crate::mem::guard::forbid_alloc(|| -> Result<(), crate::sql::eval::SqlError> {
+                let shape =
+                    crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)?;
+                assert!(shape.rows.is_empty());
+                assert_eq!(shape.def.name.as_str(), catalog);
+                assert_eq!(
+                    arena.used() - before,
+                    core::mem::size_of::<crate::storage::TableDef>()
+                );
+                let materialized = crate::sql::catalog::synthesize(
+                    &engine.storage,
+                    Some(qualifier),
+                    catalog,
+                    0,
+                    crate::sql::catalog_snapshot::CatalogScan::Sequential,
+                    &arena,
+                )?;
+                assert_eq!(shape.hidden_columns, materialized.hidden_columns);
+                assert_eq!(shape.def.n_columns, materialized.def.n_columns);
+                let width = shape.def.n_columns + shape.hidden_columns;
+                for (actual, expected) in shape.def.columns[..width]
+                    .iter()
+                    .zip(&materialized.def.columns[..width])
+                {
+                    assert_eq!(actual.name, expected.name);
+                    assert_eq!(actual.ctype, expected.ctype);
+                    assert_eq!(actual.type_mod, expected.type_mod);
+                    assert_eq!(actual.collation, expected.collation);
                 }
-            }
-        });
+                for row in materialized.rows {
+                    assert_eq!(row.len(), width, "{qualifier}.{catalog}");
+                    if materialized.hidden_columns == 1 {
+                        assert_eq!(
+                            row[materialized.def.n_columns],
+                            Datum::Oid(
+                                crate::sql::catalog_snapshot_keys::RELATIONS
+                                    .iter()
+                                    .find(|relation| relation.name == catalog)
+                                    .unwrap()
+                                    .oid
+                                    .get(),
+                            ),
+                            "{qualifier}.{catalog}"
+                        );
+                    }
+                }
+                Ok(())
+            });
+        result.unwrap_or_else(|error| panic!("{qualifier}.{catalog}: {error:?}"));
         // Every descriptor and row from this iteration was consumed above.
         unsafe { arena.rewind_to(mark) };
     }

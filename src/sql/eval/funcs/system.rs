@@ -69,6 +69,10 @@ impl ObjectOid {
         match value {
             Datum::Null => Ok(None),
             Datum::Oid(oid) => Ok(Some(Self(oid))),
+            Datum::Int2(oid) => u32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
                 .map(Self)
                 .map(Some)
@@ -1637,23 +1641,22 @@ pub(crate) fn dispatch<'a>(
                 arity(0)?;
                 Ok(Datum::Text(current_user_str(arena)?))
             }
-            // Catalog helpers for psql introspection. Every user object lives in the
-            // single visible schema owned by the connection role.
             "pg_get_userbyid" => {
                 arity(1)?;
-                let Some(cat) = hooks.catalog else {
-                    return Ok(Datum::Null);
-                };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
-                    Some(oid) => oid.0,
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0 as i32,
                     None => return Ok(Datum::Null),
                 };
+                let cat = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_get_userbyid requires catalog access"
+                    )
+                })?;
                 Ok(Datum::Text(crate::sql::catalog::user_name_by_oid(
                     cat, oid, arena,
                 )?))
             }
-            // A non-partitioned table is its own only ancestor/root; we have no
-            // partitioning, so these return the argument unchanged.
             "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)

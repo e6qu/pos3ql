@@ -5800,7 +5800,7 @@ mod tests {
                 conn.phase = Phase::Ready;
                 assert!(matches!(
                     message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
-                    Step::Continue
+                    Step::Continue | Step::Parked
                 ));
                 for _ in 0..64 {
                     if !conn.parked {

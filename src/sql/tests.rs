@@ -21375,6 +21375,103 @@ fn catalog_snapshot_view_columns_survive_table_column_rename() {
 }
 
 #[test]
+fn catalog_snapshot_column_rename_keeps_view_bindings_through_rollback_and_recovery() {
+    let mut config = test_config("catalog-view-column-bindings");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-view-column-bindings-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let query = "SELECT * FROM renamed_bindings; SELECT * FROM renamed_cte";
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        r#"
+        CREATE TABLE rename_source(id integer, tenant text, "We""ird" text);
+        CREATE TABLE rename_other(id integer, tenant text, account_name text);
+        INSERT INTO rename_source VALUES(1,'source','quoted');
+        INSERT INTO rename_other VALUES(1,'other','unrelated');
+        CREATE VIEW renamed_bindings AS
+          SELECT a.tenant AS tenant, b.tenant AS other_tenant,
+                 stable.tenant AS aliased_tenant,
+                 (SELECT a.tenant) AS correlated, a."We""ird" AS quoted
+            FROM rename_source a JOIN rename_other b ON a.id=b.id
+            JOIN rename_source AS stable(id,tenant,quoted) ON stable.id=a.id;
+        CREATE VIEW renamed_cte AS
+          WITH chosen AS (SELECT tenant FROM rename_source)
+          SELECT tenant FROM chosen;
+    "#,
+    );
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for finish in ["ROLLBACK", "COMMIT"] {
+        let changed = session.success(
+            &mut engine,
+            "BEGIN; ALTER TABLE rename_source RENAME tenant TO account_name",
+            false,
+        );
+        assert!(
+            error_sqlstates(&changed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let output = session.success(&mut engine, query, false);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["source|other|source|source|quoted", "source"]
+        );
+        let completed = session.success(&mut engine, finish, false);
+        assert!(
+            error_sqlstates(&completed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&completed)
+        );
+    }
+    drop(session);
+    let quoted = run_with(
+        &mut engine,
+        &mut budget,
+        r#"ALTER TABLE rename_source RENAME "We""ird" TO "Moved""field""#,
+    );
+    assert!(
+        error_sqlstates(&quoted).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quoted)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(&mut recovered, &mut recovered_budget, query);
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["source|other|source|source|quoted", "source"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}
+
+#[test]
 fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objects() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -24473,7 +24570,7 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
         "SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend \
          UNION ALL \
          SELECT 'pg_opfamily'::regclass, amopfamily, 'pg_operator'::regclass, \
-                amopopr, 'n'::character \
+                amopopr, 'n'::\"char\" \
          FROM pg_amop WHERE oid = 10299",
     );
     assert!(
@@ -24488,7 +24585,7 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
             crate::sql::types::oid::OID,
             crate::sql::types::oid::OID,
             crate::sql::types::oid::OID,
-            crate::sql::types::oid::BPCHAR,
+            crate::sql::types::oid::CHAR,
         ]
     );
 }
@@ -29421,7 +29518,7 @@ fn information_schema_columns_exposes_complete_column_metadata() {
             "occurred|NULL|NULL|NULL|NULL|2|timestamp without time zone|NULL|pg_catalog|timestamp|NO|NULL|NULL|NULL|NO|NEVER|3|YES",
             "generated|NULL|32|2|0|NULL|integer|NULL|pg_catalog|int4|NO|NULL|NULL|NULL|NO|ALWAYS|4|YES",
             "identity|NULL|64|2|0|NULL|bigint|NULL|pg_catalog|int8|YES|BY DEFAULT|9223372036854775807|1|NO|NEVER|5|YES",
-            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|public|information_schema_column_domain|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
+            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|pg_catalog|varchar|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
             "enum_value|NULL|NULL|NULL|NULL|NULL|USER-DEFINED|NULL|public|information_schema_column_enum|NO|NULL|NULL|NULL|NO|NEVER|7|YES",
         ]
     );

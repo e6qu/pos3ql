@@ -37133,7 +37133,6 @@ fn rewrite_view_column_dependents(
             continue;
         }
 
-        let view = storage.view(view_slot);
         let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
@@ -37143,80 +37142,155 @@ fn rewrite_view_column_dependents(
                 "dependent view column binding has no matching stored identifier"
             ));
         }
-        let creation_path = query.creation_path;
-        let user = super::eval::funcs::system::session_user_owned();
-        let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
-        let rebound = super::query::stored_query_dependencies(
-            rewritten.as_str(),
-            storage,
-            txn.txid,
-            path,
-            arena,
-        )?;
-        if rebound.entries() != query.dependencies.entries() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column rename would change a dependent view binding"
-            ));
-        }
+        publish_rewritten_view(storage, wal, txn, view_slot, rewritten, arena)?;
+    }
+    Ok(())
+}
 
-        let dependent_columns = view.columns.with_aliases(true);
-        let undo = storage.replace_view_definition(
-            storage.view_edit_target(view_slot, &view, txn.txid),
-            crate::storage::ViewDefinition {
-                persistence: view.persistence,
-                columns: dependent_columns,
-                query: crate::storage::StoredQueryDefinition {
-                    sql: rewritten,
-                    creation_path,
-                    dependencies: rebound,
-                },
-                options: crate::storage::ViewOptions {
-                    ..view.options_for(txn.txid)
-                },
+#[derive(Clone, Copy)]
+struct PreparedViewColumnRewrite {
+    slot: usize,
+    sql: crate::util::StackStr<{ crate::storage::VIEW_SQL_MAX }>,
+}
+
+fn prepare_table_column_view_rewrites<'arena>(
+    storage: &Storage,
+    transaction: u32,
+    table: usize,
+    definition: &TableDef,
+    renames: &[(SqlName, SqlName)],
+    arena: &'arena Arena,
+) -> Result<&'arena [PreparedViewColumnRewrite], SqlError> {
+    let mut prepared = crate::mem::arena::ArenaList::new(arena);
+    for &(from, to) in renames {
+        let column = definition
+            .columns()
+            .iter()
+            .position(|column| column.name == from)
+            .expect("a selected rename has an original column");
+        for slot in 0..storage.view_count() {
+            if !storage.view(slot).visible_to(transaction)
+                || !storage
+                    .view_dependencies(slot, transaction)
+                    .entries()
+                    .iter()
+                    .any(|dependency| {
+                        dependency.class == crate::storage::DependencyClass::Table
+                            && usize::from(dependency.slot) == table
+                            && dependency.referenced_columns.contains(column)
+                    })
+            {
+                continue;
+            }
+            let query = storage.snapshot_view_query(slot, transaction, arena)?;
+            let user = super::eval::funcs::system::session_user_owned();
+            let path =
+                storage.compute_path(query.creation_path.as_str(), user.as_str(), transaction);
+            let rewritten = super::query::stored_query_table_column_rename(
+                query.sql.as_str(),
+                path,
+                query.dependencies.view(),
+                storage,
+                transaction,
+                table,
+                column,
+                to.as_str(),
+                arena,
+            )?;
+            if rewritten != query.sql {
+                prepared
+                    .push(PreparedViewColumnRewrite {
+                        slot,
+                        sql: rewritten,
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+        }
+    }
+    Ok(prepared.as_slice())
+}
+
+fn publish_rewritten_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    view_slot: usize,
+    rewritten: crate::util::StackStr<{ crate::storage::VIEW_SQL_MAX }>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let view = storage.view(view_slot);
+    let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
+    let creation_path = query.creation_path;
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
+    let rebound = super::query::stored_query_dependencies(
+        rewritten.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
+    )?;
+    if rebound.entries() != query.dependencies.entries() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "view column rename would change a dependent view binding"
+        ));
+    }
+
+    let dependent_columns = view.columns_for(txn.txid).with_aliases(true);
+    let undo = storage.replace_view_definition(
+        storage.view_edit_target(view_slot, &view, txn.txid),
+        crate::storage::ViewDefinition {
+            persistence: view.persistence,
+            columns: dependent_columns,
+            query: crate::storage::StoredQueryDefinition {
+                sql: rewritten,
+                creation_path,
+                dependencies: rebound,
             },
+            options: crate::storage::ViewOptions {
+                ..view.options_for(txn.txid)
+            },
+        },
+        txn.txid,
+    )?;
+    let publication = crate::storage::ViewPublication::Altered(undo);
+    let new_slot = publication.slot();
+    let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
+        Ok(())
+    } else {
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
             txn.txid,
-        )?;
-        let publication = crate::storage::ViewPublication::Altered(undo);
-        let new_slot = publication.slot();
-        let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
-            Ok(())
-        } else {
-            let lsn = storage.bump_lsn();
-            wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::CreateView {
-                    identity: storage.view_catalog_identity(new_slot),
-                    schema: view.schema_for(txn.txid).as_str(),
-                    name: view.name_for(txn.txid).as_str(),
-                    columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
-                    sql: rewritten.as_str(),
-                    path: creation_path.as_str(),
-                    security_invoker: matches!(
-                        view.security_for(txn.txid),
-                        crate::storage::ViewSecurity::Invoker
-                    ),
-                    security_barrier: view.security_barrier_for(txn.txid).code(),
-                    check_option: view
-                        .check_option_for(txn.txid)
-                        .map_or(0, |option| option.code()),
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot, txn.txid).view(),
-                    ),
-                },
-            )
-        };
-        if let Err(error) = staged {
-            storage
-                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
-            return Err(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
-            storage
-                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
-            return Err(error);
-        }
+            lsn,
+            &WalOp::CreateView {
+                identity: storage.view_catalog_identity(new_slot),
+                schema: view.schema_for(txn.txid).as_str(),
+                name: view.name_for(txn.txid).as_str(),
+                columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
+                sql: rewritten.as_str(),
+                path: creation_path.as_str(),
+                security_invoker: matches!(
+                    view.security_for(txn.txid),
+                    crate::storage::ViewSecurity::Invoker
+                ),
+                security_barrier: view.security_barrier_for(txn.txid).code(),
+                check_option: view
+                    .check_option_for(txn.txid)
+                    .map_or(0, |option| option.code()),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    storage.view_dependencies(new_slot, txn.txid).view(),
+                ),
+            },
+        )
+    };
+    if let Err(error) = staged {
+        storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+        storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
+        return Err(error);
     }
     Ok(())
 }
@@ -46665,11 +46739,13 @@ fn rewrite_composite_dependent_views(
             view_sql.as_str(),
             path,
             dependencies.view(),
-            &super::query::StoredQueryCompositeFieldRename {
+            &super::query::StoredQueryRename {
                 storage,
                 txid: txn.txid,
-                composite_slot,
-                from: rename.from.as_str(),
+                target: super::query::StoredQueryRenameTarget::CompositeField {
+                    slot: composite_slot,
+                    from: rename.from.as_str(),
+                },
                 arena,
             },
             &mut sites,
@@ -47083,7 +47159,10 @@ fn raw_identifier_end(text: &str, start: usize) -> Option<usize> {
     Some(start + length)
 }
 
-fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, identifier: &str) {
+pub(super) fn write_identifier<const N: usize>(
+    output: &mut crate::util::StackStr<N>,
+    identifier: &str,
+) {
     use core::fmt::Write;
 
     if !super::eval::ident_needs_quotes(identifier) {
@@ -68022,6 +68101,18 @@ fn alter_table_relation(
         return sql_fail(error);
     }
 
+    let view_column_rewrites = match prepare_table_column_view_rewrites(
+        storage,
+        txn.txid,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        Ok(rewrites) => rewrites,
+        Err(error) => return sql_fail(error),
+    };
+
     // Journal the in-place shape change and the re-homed rows. Every fallible
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
@@ -68349,6 +68440,13 @@ fn alter_table_relation(
             prior,
         }) {
             storage.restore_comment_identity_pending(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    for rewrite in view_column_rewrites {
+        if let Err(error) =
+            publish_rewritten_view(storage, wal, txn, rewrite.slot, rewrite.sql, arena)
+        {
             return sql_fail(error);
         }
     }

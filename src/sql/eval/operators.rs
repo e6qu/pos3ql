@@ -871,9 +871,8 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&lower_bound.to_le_bytes());
             hasher.write(raw);
         }
-        Datum::OidVector { raw, lower_bound } => {
+        Datum::OidVector { raw, .. } => {
             hasher.write(&[33]);
-            hasher.write(&lower_bound.to_le_bytes());
             hasher.write(raw);
         }
         Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
@@ -936,27 +935,21 @@ pub(crate) fn compare_datums_as(
                     .map(|bytes| i16::from_le_bytes(*bytes)),
             )
             .then_with(|| a_bound.cmp(b_bound)),
-        (
-            Datum::OidVector {
-                raw: a,
-                lower_bound: a_bound,
-            },
-            Datum::OidVector {
-                raw: b,
-                lower_bound: b_bound,
-            },
-        ) => a
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|bytes| u32::from_le_bytes(*bytes))
-            .cmp(
-                b.as_chunks::<4>()
+        // PostgreSQL btoidvectorcmp sorts by length first and ignores bounds.
+        (Datum::OidVector { raw: a, .. }, Datum::OidVector { raw: b, .. }) => {
+            a.len().cmp(&b.len()).then_with(|| {
+                a.as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|bytes| u32::from_le_bytes(*bytes)),
-            )
-            .then_with(|| a_bound.cmp(b_bound)),
+                    .map(|bytes| u32::from_le_bytes(*bytes))
+                    .cmp(
+                        b.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|bytes| u32::from_le_bytes(*bytes)),
+                    )
+            })
+        }
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
         (Datum::Xid8(a), Datum::Xid8(b)) => a.cmp(b),
         (Datum::PgLsn(a), Datum::PgLsn(b)) => a.cmp(b),
@@ -3051,6 +3044,16 @@ mod hash_tests {
         // equal values hash equal, so the index never misses a true collision.
         for (a, b) in [
             (Datum::Float8(0.0), Datum::Float8(-0.0)),
+            (
+                Datum::OidVector {
+                    raw: &[9, 0, 0, 0],
+                    lower_bound: 0,
+                },
+                Datum::OidVector {
+                    raw: &[9, 0, 0, 0],
+                    lower_bound: 8,
+                },
+            ),
             (Datum::Bpchar("a"), Datum::Bpchar("a  ")),
             (Datum::Text("a"), Datum::Bpchar("a ")),
             (

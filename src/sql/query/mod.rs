@@ -124,20 +124,76 @@ pub(crate) fn dml_input_dependencies(
     dependencies::collect_dml_input(statement, storage, txid, path, arena)
 }
 
-pub(crate) struct StoredQueryCompositeFieldRename<'a> {
+#[derive(Clone, Copy)]
+pub(crate) enum StoredQueryRenameTarget<'a> {
+    CompositeField {
+        slot: u16,
+        from: &'a str,
+    },
+    TableColumn {
+        table: usize,
+        column: usize,
+        sources: &'a [super::parser::ColumnSource<'a>],
+    },
+}
+
+pub(crate) struct StoredQueryRename<'a> {
     pub storage: &'a Storage,
     pub txid: u32,
-    pub composite_slot: u16,
-    pub from: &'a str,
+    pub target: StoredQueryRenameTarget<'a>,
     pub arena: &'a Arena,
 }
 
-impl<'a> StoredQueryCompositeFieldRename<'a> {
+struct StoredQueryRenameScope<'scope, 'arena> {
+    current: &'scope QueryScope<'arena>,
+    from: &'scope FromClause<'arena>,
+    outer: Option<&'scope StoredQueryRenameScope<'scope, 'arena>>,
+}
+
+impl StoredQueryRenameScope<'_, '_> {
+    fn references_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        table: usize,
+        column: usize,
+    ) -> Result<bool, SqlError> {
+        match self.current.find_column(qualifier, name) {
+            Ok(ResolvedColumn::Table(source, selected)) => {
+                let reference = if source == 0 {
+                    &self.from.base
+                } else {
+                    &self.from.joins[source - 1].table
+                };
+                Ok(self.current.derived[source].is_none()
+                    && self.current.slots[source] == table
+                    && selected == column
+                    && reference
+                        .col_alias
+                        .is_none_or(|aliases| selected >= aliases.len()))
+            }
+            Ok(ResolvedColumn::Merged(_)) => Ok(false),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                self.outer.map_or(Ok(false), |outer| {
+                    outer.references_column(qualifier, name, table, column)
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<'a> StoredQueryRename<'a> {
     fn collect_expression(
         &self,
         expression: &'a Expr<'a>,
         columns: &dyn super::exec::ColTypeResolver,
-        outer_scope: Option<&QueryScope<'a>>,
+        outer_scope: Option<&StoredQueryRenameScope<'_, 'a>>,
         sites: &mut [bool],
         count: &mut usize,
     ) -> Result<(), SqlError> {
@@ -171,21 +227,57 @@ impl<'a> StoredQueryCompositeFieldRename<'a> {
         super::query::walk_children(expression, &mut |child| {
             self.collect_expression(child, columns, outer_scope, sites, count)
         })?;
-        super::exec::collect_composite_field_rename_site(
-            expression,
-            columns,
-            self.composite_slot,
-            self.from,
-            sites,
-            count,
-        )
+        match self.target {
+            StoredQueryRenameTarget::CompositeField { slot, from } => {
+                super::exec::collect_composite_field_rename_site(
+                    expression, columns, slot, from, sites, count,
+                )
+            }
+            StoredQueryRenameTarget::TableColumn {
+                table,
+                column,
+                sources,
+            } => {
+                let (qualifier, name) = match expression {
+                    Expr::Column { qualifier, name } => (*qualifier, *name),
+                    Expr::SchemaColumn {
+                        schema,
+                        table,
+                        name,
+                    } => {
+                        let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+                        (
+                            Some(
+                                self.arena
+                                    .alloc_str(qualifier.as_str())
+                                    .map_err(|_| arena_full())?,
+                            ),
+                            *name,
+                        )
+                    }
+                    _ => return Ok(()),
+                };
+                if outer_scope.map_or(Ok(false), |scope| {
+                    scope.references_column(qualifier, name, table, column)
+                })? {
+                    for (index, source) in sources.iter().enumerate() {
+                        if core::ptr::eq(source.name.as_ptr(), name.as_ptr())
+                            && source.name.len() == name.len()
+                        {
+                            sites[index] = true;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 
 fn collect_stored_query_composite_field_rename_set_tree<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
-    rename: &StoredQueryCompositeFieldRename<'a>,
-    outer_scope: Option<&QueryScope<'a>>,
+    rename: &StoredQueryRename<'a>,
+    outer_scope: Option<&StoredQueryRenameScope<'_, 'a>>,
     sites: &mut [bool],
     count: &mut usize,
 ) -> Result<(), SqlError> {
@@ -220,8 +312,8 @@ fn collect_stored_query_composite_field_rename_set_tree<'a>(
 
 fn collect_stored_query_composite_field_rename_select<'a>(
     select: &'a Select<'a>,
-    rename: &StoredQueryCompositeFieldRename<'a>,
-    outer_scope: Option<&QueryScope<'a>>,
+    rename: &StoredQueryRename<'a>,
+    outer_scope: Option<&StoredQueryRenameScope<'_, 'a>>,
     sites: &mut [bool],
     count: &mut usize,
 ) -> Result<(), SqlError> {
@@ -234,7 +326,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             count,
         )?;
         let columns: &dyn super::exec::ColTypeResolver = match outer_scope {
-            Some(scope) => &ScopeCols(scope),
+            Some(scope) => &ScopeCols(scope.current),
             None => &super::exec::NoCols,
         };
         for expression in select
@@ -260,16 +352,21 @@ fn collect_stored_query_composite_field_rename_select<'a>(
     };
     let catalog_columns = scope.as_ref().map(|scope| CatalogScopeCols {
         scope,
-        outer_scope,
+        outer_scope: outer_scope.map(|scope| scope.current),
         storage: rename.storage,
         txid: rename.txid,
     });
     let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
         (Some(columns), _) => columns,
-        (None, Some(scope)) => &ScopeCols(scope),
+        (None, Some(scope)) => &ScopeCols(scope.current),
         (None, None) => &super::exec::NoCols,
     };
-    let nested_outer = scope.as_ref().or(outer_scope);
+    let scope_chain = scope.as_ref().map(|current| StoredQueryRenameScope {
+        current,
+        from: select.from.as_ref().expect("a resolved scope has FROM"),
+        outer: outer_scope,
+    });
+    let nested_outer = scope_chain.as_ref().or(outer_scope);
 
     // Follow source order: selector flags are paired with lexer positions in
     // the unchanged stored SQL, including nested queries and set-op leaves.
@@ -354,7 +451,7 @@ pub(crate) fn stored_query_composite_field_rename_sites<'a>(
     sql: &'a str,
     path: crate::storage::PathContext,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-    rename: &StoredQueryCompositeFieldRename<'a>,
+    rename: &StoredQueryRename<'a>,
     sites: &mut [bool],
 ) -> Result<usize, SqlError> {
     let parsed = super::parser::parse_query(sql, rename.arena)?;
@@ -369,6 +466,107 @@ pub(crate) fn stored_query_composite_field_rename_sites<'a>(
     let mut count = 0usize;
     collect_stored_query_composite_field_rename_select(expanded, rename, None, sites, &mut count)?;
     Ok(count)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query and selected column identity are explicit"
+)]
+pub(crate) fn stored_query_table_column_rename<'a>(
+    sql: &'a str,
+    path: crate::storage::PathContext,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    storage: &'a Storage,
+    txid: u32,
+    table: usize,
+    column: usize,
+    to: &str,
+    arena: &'a Arena,
+) -> Result<crate::util::StackStr<{ crate::storage::VIEW_SQL_MAX }>, SqlError> {
+    use core::fmt::Write as _;
+    let (parsed, source_map) = super::parser::parse_query_with_column_sources(sql, arena)?;
+    let sources = source_map.columns;
+    let expanded = cte::expand_stored_query(parsed, storage, txid, path, dependencies, arena)?;
+    let sites = arena
+        .alloc_slice_with(sources.len(), |_| false)
+        .map_err(|_| arena_full())?;
+    let rename = StoredQueryRename {
+        storage,
+        txid,
+        arena,
+        target: StoredQueryRenameTarget::TableColumn {
+            table,
+            column,
+            sources,
+        },
+    };
+    collect_stored_query_composite_field_rename_select(expanded, &rename, None, sites, &mut 0)?;
+    #[derive(Clone, Copy)]
+    struct Edit {
+        start: usize,
+        end: usize,
+        projection: Option<usize>,
+    }
+    let mut edits = ArenaList::new(arena);
+    for (source, selected) in sources.iter().zip(sites.iter()) {
+        if !selected {
+            continue;
+        }
+        edits
+            .push(Edit {
+                start: source.start,
+                end: source.end,
+                projection: None,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    // A subquery's implicit output name is a binding used by its parent.
+    // Preserve it explicitly when changing the column that supplied its name.
+    for (index, projection) in source_map.projections.iter().enumerate() {
+        if sources.iter().zip(sites.iter()).any(|(source, selected)| {
+            *selected
+                && source.start >= projection.start
+                && source.end <= projection.end
+                && source.name == projection.name
+        }) {
+            edits
+                .push(Edit {
+                    start: projection.end,
+                    end: projection.end,
+                    projection: Some(index),
+                })
+                .map_err(|_| arena_full())?;
+        }
+    }
+    let edits = edits.into_mut_slice().map_err(|_| arena_full())?;
+    edits.sort_unstable_by_key(|edit| (edit.start, edit.end));
+    let mut rewritten = crate::util::StackStr::new();
+    let mut copied = 0;
+    for edit in edits {
+        if edit.start < copied || edit.end > sql.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored column source spans overlap"
+            ));
+        }
+        let _ = rewritten.write_str(&sql[copied..edit.start]);
+        let name = if let Some(index) = edit.projection {
+            let _ = rewritten.write_str(" AS ");
+            source_map.projections[index].name
+        } else {
+            to
+        };
+        super::exec::write_identifier(&mut rewritten, name);
+        copied = edit.end;
+    }
+    let _ = rewritten.write_str(&sql[copied..]);
+    if rewritten.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "renamed view query exceeds its fixed SQL capacity"
+        ));
+    }
+    Ok(rewritten)
 }
 
 mod aggregate;

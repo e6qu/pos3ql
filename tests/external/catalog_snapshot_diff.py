@@ -113,7 +113,8 @@ def transcript(reader, writer):
                    ('[-3:-2]={1,-2}'::smallint[]::int2vector)[-2],
                    ('[8:9]={9,10}'::oid[]::oidvector)[8],
                    '1 2'::int2vector < '1 10'::int2vector,
-                   '9 10'::oidvector <> '[8:9]={9,10}'::oid[]::oidvector
+                   '9 10'::oidvector <> '[8:9]={9,10}'::oid[]::oidvector,
+                   '9'::oidvector < '1 2'::oidvector
         """)
 
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")

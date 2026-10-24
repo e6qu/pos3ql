@@ -258,12 +258,35 @@ pub(super) struct TableOwner<'storage> {
 
 pub(super) struct TableAttempt<'slots, 'storage> {
     pub(super) slots: &'slots mut [Option<TableOwner<'storage>>],
+    #[cfg(test)]
+    pub(super) pause_after_release: &'slots std::sync::atomic::AtomicU8,
 }
 
 impl Drop for TableAttempt<'_, '_> {
     fn drop(&mut self) {
         for owner in self.slots.iter_mut() {
-            drop(owner.take());
+            if let Some(owner) = owner.take() {
+                drop(owner);
+                #[cfg(test)]
+                if self
+                    .pause_after_release
+                    .compare_exchange(
+                        3,
+                        4,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    while self
+                        .pause_after_release
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 4
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
         }
     }
 }
@@ -406,7 +429,11 @@ impl DefinitionPublication {
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
             .expect("startup definition publication reservation covers every table");
         loop {
-            let mut owners = TableAttempt { slots: &mut slots };
+            let mut owners = TableAttempt {
+                slots: &mut slots,
+                #[cfg(test)]
+                pause_after_release: &self.scan_pause,
+            };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_tables(storage, movement, &mut owners)?;
                 #[cfg(test)]

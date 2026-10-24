@@ -316,6 +316,9 @@ sequence changes too. Waiting releases the earlier table and catalog owners;
 unrelated row commits can progress. A rolled-back or replaced source is checked
 again after the wait. An exhausted publication counter returns `54000` before
 any index binding or catalog entry changes.
+The parent's name view is published before any dependent definition is released.
+A foreign-key lookup can wait for the parent; it cannot miss the moved parent
+because a child with an earlier internal slot became readable first.
 
 Renames and schema moves share the same SQL dependency preparation. Inside the
 transaction, invoice foreign keys use the moved table and an owned sequence is

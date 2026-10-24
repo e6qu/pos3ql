@@ -159,7 +159,11 @@ impl DefinitionPublication {
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
             .expect("startup definition publication reservation covers every table");
         loop {
-            let mut owners = TableAttempt { slots: &mut slots };
+            let mut owners = TableAttempt {
+                slots: &mut slots,
+                #[cfg(test)]
+                pause_after_release: &self.scan_pause,
+            };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_table(storage, table, &mut owners)?;
                 let selected = &owners.slots[table].as_ref().unwrap().definition;
@@ -438,6 +442,14 @@ impl DefinitionPublication {
                 definition.schema,
                 definition.name,
             );
+            // A dependent may have an earlier slot and release first. Its new
+            // foreign key must already find the parent's name view, then wait
+            // for the parent's definition instead of reporting it missing.
+            owners.slots[table]
+                .as_ref()
+                .unwrap()
+                .definition
+                .publish_names();
             return Ok(Some(rewrites_rows));
         }
     }
@@ -883,6 +895,106 @@ mod tests {
                 storage.table_def(parent, 0).columns()[0].name.as_str(),
                 "renamed_id"
             );
+        });
+    }
+
+    #[test]
+    fn table_publication_released_child_finds_parent_before_its_definition_releases() {
+        struct ResumeRelease<'a>(&'a std::sync::atomic::AtomicU8);
+        impl Drop for ResumeRelease<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Release);
+            }
+        }
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let child = storage
+            .create_table(make_def(
+                "publication_release_child",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        let mut parent_definition =
+            make_def("publication_release_parent", &[("id", ColType::Int4, true)]);
+        parent_definition.columns[0].primary = true;
+        parent_definition.columns[0].unique = true;
+        let parent = storage.create_table(parent_definition).unwrap();
+        assert!(child < parent);
+        crate::mem::guard::forbid_alloc(|| {
+            let (target, mut definition) = storage.select_table_definition(child, 8);
+            definition.n_fkeys = 1;
+            definition.fkeys[0] = ForeignKey {
+                name: SqlName::parse("publication_parent_link").unwrap(),
+                parent_schema: parent_definition.schema,
+                parent: parent_definition.name,
+                n_cols: 1,
+                n_parent_cols: 1,
+                ..ForeignKey::EMPTY
+            };
+            let change = storage
+                .write_table_def(target, definition, &mapping(), false)
+                .unwrap();
+            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+        });
+        let change = rename(&storage, parent);
+        let database = storage.current_database_oid();
+        storage
+            .definition_publication
+            .scan_pause
+            .store(3, Ordering::Release);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                crate::sql::set_execution_database_oid(database);
+                crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change))
+            });
+            let resume = ResumeRelease(&storage.definition_publication.scan_pause);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while storage
+                .definition_publication
+                .scan_pause
+                .load(Ordering::Acquire)
+                != 4
+                && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let paused = storage
+                .definition_publication
+                .scan_pause
+                .load(Ordering::Acquire)
+                == 4;
+            let (child_moved, parent_name_visible, parent_retained) = if paused {
+                crate::mem::guard::forbid_alloc(|| {
+                    let definition = storage.table_def(child, 0);
+                    let key = definition.fkeys()[0];
+                    (
+                        key.parent.as_str() == "publication_renamed",
+                        storage.tables[parent]
+                            .definition
+                            .name_candidate(
+                                super::super::table_names::TableNameScope::Committed,
+                                database,
+                                key.parent_schema.as_str(),
+                                key.parent.as_str(),
+                            )
+                            .is_some(),
+                        storage.tables[parent].definition.test_write().is_err(),
+                    )
+                })
+            } else {
+                (false, false, false)
+            };
+            let reader = scope.spawn(|| {
+                crate::sql::set_execution_database_oid(database);
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.find_table("publication_destination", "publication_renamed")
+                })
+            });
+            drop(resume);
+            assert_eq!(writer.join().unwrap().unwrap(), Some(false));
+            assert_eq!(reader.join().unwrap(), Some(parent));
+            assert!(paused && child_moved && parent_name_visible && parent_retained);
         });
     }
 }

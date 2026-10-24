@@ -39952,16 +39952,22 @@ impl Storage {
     }
 
     fn release_enum_definition_images(&self, catalog: &mut TypeCatalog, slot: usize) {
-        let pending = catalog.enums[slot]
-            .pending_definition
-            .take()
+        let mut images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+        Self::release_enum_definition_images_locked(catalog, &mut images, slot);
+    }
+
+    fn release_enum_definition_images_locked(
+        catalog: &mut TypeCatalog,
+        images: &mut EnumMemberImages,
+        slot: usize,
+    ) {
+        let mut pending = catalog.enums[slot].pending_definition.take()
             .map(|pending| pending.member_slot);
-        self.clear_pending_enum_member_chain(catalog, pending, None);
+        while let Some(slot) = pending {
+            pending = Self::release_pending_enum_members_locked(catalog, images, slot, None);
+        }
         if let Some(image) = catalog.enums[slot].member_image.take() {
-            self.enum_member_images
-                .lock()
-                .expect("enum member-image lock poisoned")
-                .release(image);
+            images.release(image);
         }
         catalog.enums[slot].member_count = 0;
     }

@@ -29,8 +29,9 @@ fn table_publication_sql_renames_indexes_comments_sequences_and_cold_recovery() 
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT count(*), sum(amount) FROM publication_target_sql.publication_renamed_sql; \
                  SELECT count(*) FROM publication_child_sql; \
-                 SELECT obj_description('publication_target_sql.publication_key_sql'::regclass)", false)),
-                ["2|30", "2", "published index"]);
+                 SELECT obj_description('publication_target_sql.publication_key_sql'::regclass); \
+                 SELECT nextval('publication_target_sql.publication_owned_sql')", false)),
+                ["2|30", "2", "published index", "3"]);
             assert_eq!(error_sqlstates(&session.execute(&mut cold,
                 "INSERT INTO publication_child_sql VALUES (99)", false)), ["23503"]);
             session.success(&mut cold,

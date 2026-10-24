@@ -256,7 +256,7 @@ impl DefinitionPublication {
                 index.table = movement.name;
             }
             for sequence in sequences.definitions.iter_mut().filter(|sequence| sequence.database == movement.database) {
-                if sequence.ddl_state == CatalogDdlState::Present
+                if sequence.ddl_state != CatalogDdlState::Absent
                     && sequence.owner.is_some_and(|owner| {
                         owner.table_schema == movement.prior_schema && owner.table == movement.prior_name
                     })
@@ -266,6 +266,15 @@ impl DefinitionPublication {
                 }
                 sequence.owner = rebind_sequence_column(sequence.owner, selected.committed(), &definition, &mapping, false);
                 sequence.generator_for = rebind_sequence_column(sequence.generator_for, selected.committed(), &definition, &mapping, true);
+                if let Some(pending) = &mut sequence.pending_definition {
+                    if pending.owner.is_some_and(|owner| {
+                        owner.table_schema == movement.prior_schema && owner.table == movement.prior_name
+                    }) && movement.prior_schema != movement.schema {
+                        pending.schema = movement.schema;
+                    }
+                    pending.owner = rebind_sequence_column(pending.owner, selected.committed(), &definition, &mapping, false);
+                    pending.generator_for = rebind_sequence_column(pending.generator_for, selected.committed(), &definition, &mapping, true);
+                }
             }
             for comment in comments.entries.iter_mut().filter(|comment| {
                 comment.used && comment.database == Some(movement.database)

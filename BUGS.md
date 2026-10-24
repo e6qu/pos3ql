@@ -17,7 +17,9 @@ and table definitions, resumed command effects, storage ownership, slot reuse, c
 failures follow the same rule, including stale row layouts, temporary changes
 sharing a journal position, failed index-cache replacement, cross-database recovery, prepared keys
 whose binding changed, irreversible commit failures and
-checkpointing after partial installation. Fault tests must restart a terminally
+checkpointing after partial installation. This includes private foreign-key and
+owned-sequence references that could restore old names after publication waits.
+Fault tests must restart a terminally
 failed instance before checking recovery; they must reject partial transactions.
 Remove repaired entries; preserve their evidence in the implementing
 change instead of keeping a resolved-work journal.

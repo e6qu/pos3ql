@@ -8,6 +8,7 @@ COMMENT ON INDEX publication_key_sql IS 'published index';
 INSERT INTO publication_parent_sql VALUES (1, 10);
 INSERT INTO publication_child_sql VALUES (1);
 BEGIN;
+ALTER SEQUENCE publication_owned_sql INCREMENT BY 2;
 ALTER TABLE publication_parent_sql RENAME TO publication_renamed_sql;
 ALTER TABLE publication_renamed_sql SET SCHEMA publication_target_sql;
 ALTER TABLE publication_target_sql.publication_renamed_sql RENAME COLUMN extra TO amount;

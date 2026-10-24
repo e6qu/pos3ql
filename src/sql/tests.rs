@@ -1486,8 +1486,9 @@ fn catalog_database_recreation_retires_schema_permission_entries() {
             let name = format!("retired_acl_{generation}");
             let created = run_with_fixed_memory(
                 &mut engine,
-                &mut budget,
+                &budget,
                 &format!("CREATE DATABASE {name} TEMPLATE template0"),
+                4 << 20,
             );
             assert!(
                 error_sqlstates(&created).is_empty(),
@@ -1502,8 +1503,9 @@ fn catalog_database_recreation_retires_schema_permission_entries() {
             engine.select_database(database).unwrap();
             let schema = run_with_fixed_memory(
                 &mut engine,
-                &mut budget,
+                &budget,
                 "CREATE SCHEMA protected_schema; REVOKE ALL ON SCHEMA protected_schema FROM PUBLIC; SELECT has_schema_privilege('protected_schema','USAGE')",
+                4 << 20,
             );
             assert!(
                 error_sqlstates(&schema).is_empty(),
@@ -1514,8 +1516,12 @@ fn catalog_database_recreation_retires_schema_permission_entries() {
             engine
                 .select_database(crate::storage::DatabaseOid::POSTGRES)
                 .unwrap();
-            let dropped =
-                run_with_fixed_memory(&mut engine, &mut budget, &format!("DROP DATABASE {name}"));
+            let dropped = run_with_fixed_memory(
+                &mut engine,
+                &budget,
+                &format!("DROP DATABASE {name}"),
+                4 << 20,
+            );
             assert!(
                 error_sqlstates(&dropped).is_empty(),
                 "{}",
@@ -55058,7 +55064,7 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let setup = run_with_fixed_memory(
             &mut engine,
-            &mut budget,
+            &budget,
             "
             CREATE TYPE history_point AS (x integer, y integer);
             CREATE DOMAIN history_point_value AS history_point CHECK ((VALUE).x > 0);
@@ -55083,6 +55089,7 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
             SELECT observed FROM history_point_view;
             SELECT observed FROM history_point_rules;
         ",
+            4 << 20,
         );
         assert!(
             error_sqlstates(&setup).is_empty(),
@@ -55092,8 +55099,9 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
         assert_eq!(data_rows(&setup), ["3", "3", "3", "3", "6"]);
         let retired = run_with_fixed_memory(
             &mut engine,
-            &mut budget,
+            &budget,
             "SELECT (value).x FROM history_points",
+            4 << 20,
         );
         assert_eq!(error_sqlstates(&retired), ["42703"]);
         assert!(engine.checkpoint().unwrap());
@@ -55104,8 +55112,9 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let recovered = run_with_fixed_memory(
         &mut engine,
-        &mut budget,
+        &budget,
         "SELECT (value).east FROM history_points; SELECT observed FROM history_point_view; SELECT observed FROM history_point_rules",
+        4 << 20,
     );
     assert!(
         error_sqlstates(&recovered).is_empty(),
@@ -75623,7 +75632,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
 
 #[test]
 fn catalog_vectors_reject_array_casts_including_null_and_empty_inputs() {
-    let (mut engine, mut budget) = test_engine();
+    let (mut engine, budget) = test_engine();
     for target in ["int2vector", "oidvector"] {
         let source = if target == "int2vector" {
             "smallint"
@@ -75633,8 +75642,9 @@ fn catalog_vectors_reject_array_casts_including_null_and_empty_inputs() {
         for input in ["NULL", "'{}'", "'[8:9]={9,10}'"] {
             let result = run_with_fixed_memory(
                 &mut engine,
-                &mut budget,
+                &budget,
                 &format!("SELECT {input}::{source}[]::{target}"),
+                4 << 20,
             );
             assert_eq!(
                 error_sqlstates(&result),

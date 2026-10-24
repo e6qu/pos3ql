@@ -34703,7 +34703,7 @@ impl Storage {
         let table_definition = selection.definition();
         let table_schema = table_definition.schema;
         let table_name = table_definition.name;
-        let table_database = current_database();
+        let table_database = selection.database();
         for index in self
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
@@ -34794,11 +34794,11 @@ impl Storage {
                             want[n_want].dependency_mask |=
                                 crate::sql::exec::check_referenced_columns(
                                     expression,
-                                    &table_definition,
+                                    table_definition,
                                 )?;
                             let (type_oid, _) = crate::sql::exec::infer_type_catalog(
                                 expression,
-                                Some(&table_definition),
+                                Some(table_definition),
                                 self,
                                 txid.unwrap_or(0),
                             )?;
@@ -34816,7 +34816,7 @@ impl Storage {
                 if let Some(source) = index.predicate {
                     let predicate = crate::sql::parser::parse_expr(source.as_str(), &arena)?;
                     want[n_want].dependency_mask |=
-                        crate::sql::exec::check_referenced_columns(predicate, &table_definition)?;
+                        crate::sql::exec::check_referenced_columns(predicate, table_definition)?;
                 }
                 Ok(())
             })();

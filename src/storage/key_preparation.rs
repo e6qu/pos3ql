@@ -44,6 +44,13 @@ impl ValueKeyPreparation {
             .expect("key preparation owns its selected definition")
     }
 
+    pub(super) fn database(&self) -> DatabaseOid {
+        self.definitions
+            .retained_identity(self.target.table(), 0)
+            .expect("key preparation owns its selected identity")
+            .database
+    }
+
     pub(super) fn validate_definition(
         &self,
         storage: &Storage,
@@ -76,11 +83,7 @@ impl ValueKeyPreparation {
         Ok(())
     }
 
-    pub(super) fn index(
-        &self,
-        storage: &Storage,
-        created_at: u64,
-    ) -> Result<IndexDef, SqlError> {
+    pub(super) fn index(&self, storage: &Storage, created_at: u64) -> Result<IndexDef, SqlError> {
         let (definition, indexes) = row_ownership::acquire(|| {
             Ok((
                 storage.tables[self.target.table()]
@@ -115,9 +118,17 @@ impl ValueKeyPreparation {
             ))
         });
         self.validate_definition(storage, &definition)?;
-        publication.enforcers.get(binding).and_then(Option::as_ref).cloned().ok_or_else(|| {
-            sql_err!(sqlstate::SERIALIZATION_FAILURE, "selected index binding no longer exists")
-        })
+        publication
+            .enforcers
+            .get(binding)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "selected index binding no longer exists"
+                )
+            })
     }
 }
 
@@ -153,7 +164,11 @@ impl PreparedRowKeys {
             hashes: [(0, 0); MAX_VALUE_ENFORCERS],
             count: 0,
         };
-        let count = result.bindings.iter().take_while(|entry| entry.is_some()).count();
+        let count = result
+            .bindings
+            .iter()
+            .take_while(|entry| entry.is_some())
+            .count();
         if let Some(home) = home.filter(|_| count != 0) {
             let selection = ValueKeyPreparation::capture(storage, table)?;
             let definition = storage.tables[table].definition.read();
@@ -201,15 +216,18 @@ pub(super) fn same_bindings(
     current: &[Option<Enforcer>; MAX_VALUE_ENFORCERS],
     include_publication_state: bool,
 ) -> bool {
-    selected.iter().zip(current).all(|(selected, current)| match (selected, current) {
-        (None, None) => true,
-        (Some(selected), Some(current)) => {
-            // Selected leases prevent these pool slots from being reused.
-            selected.cache.slot() == current.cache.slot()
-                && (!include_publication_state || selected.metadata == current.metadata)
-        }
-        _ => false,
-    })
+    selected
+        .iter()
+        .zip(current)
+        .all(|(selected, current)| match (selected, current) {
+            (None, None) => true,
+            (Some(selected), Some(current)) => {
+                // Selected leases prevent these pool slots from being reused.
+                selected.cache.slot() == current.cache.slot()
+                    && (!include_publication_state || selected.metadata == current.metadata)
+            }
+            _ => false,
+        })
 }
 
 #[cfg(test)]
@@ -222,12 +240,24 @@ mod tests {
         config.max_value_indexes = caches;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let mut definition = make_def("key_orders", &[("id", ColType::Int4, true), ("amount", ColType::Int4, false)]);
+        let mut definition = make_def(
+            "key_orders",
+            &[
+                ("id", ColType::Int4, true),
+                ("amount", ColType::Int4, false),
+            ],
+        );
         definition.columns[0].primary = true;
         let table = storage.create_table(definition).unwrap();
-        let home = storage.heap.append_row(&[Datum::Int4(1), Datum::Int4(11)]).unwrap();
+        let home = storage
+            .heap
+            .append_row(&[Datum::Int4(1), Datum::Int4(11)])
+            .unwrap();
         let generation = storage.table(table).generation();
-        storage.tables[table].rows.insert(1, RowState::committed_in_generation(home, 7, generation)).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, RowState::committed_in_generation(home, 7, generation))
+            .unwrap();
         storage.set_lsn(7);
         storage.refresh_enforcers(table).unwrap();
         (storage, table)
@@ -236,18 +266,30 @@ mod tests {
     fn key_rows(storage: &Storage, table: usize, id: i32) -> usize {
         let hash = hash_key_catalog(storage, 0, &[Datum::Int4(id)], &[0]).unwrap();
         let mut count = 0;
-        assert!(storage.probe_value(table, &[0], hash, |_, _| { count += 1; Ok(()) }).unwrap());
+        assert!(
+            storage
+                .probe_value(table, &[0], hash, |_, _| {
+                    count += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
         count
     }
 
     fn pending(storage: &Storage, table: usize, rowid: u64, txid: u32, id: i32) {
-        let home = storage.heap.append_row(&[Datum::Int4(id), Datum::Int4(11)]).unwrap();
-        storage.write_pending(table, rowid, txid, 1, Some(home)).unwrap();
+        let home = storage
+            .heap
+            .append_row(&[Datum::Int4(id), Datum::Int4(11)])
+            .unwrap();
+        storage
+            .write_pending(table, rowid, txid, 1, Some(home))
+            .unwrap();
     }
 
     #[test]
     fn key_preparation_failed_rebuild_preserves_working_cache_and_releases_candidates() {
-        let (storage, table) = fixture(2);
+        let (mut storage, table) = fixture(2);
         crate::mem::guard::forbid_alloc(|| {
             let before = storage.tables[table].enforcers();
             assert_eq!(key_rows(&storage, table, 1), 1);
@@ -262,9 +304,16 @@ mod tests {
             let slot = storage.create_index(index, 0).unwrap();
             let error = storage.build_enforcers_visible(table, None).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(same_bindings(&before, &storage.tables[table].enforcers(), true));
+            assert!(same_bindings(
+                &before,
+                &storage.tables[table].enforcers(),
+                true
+            ));
             assert_eq!(key_rows(&storage, table, 1), 1);
-            let spare = storage.value_indexes.acquire().expect("failed candidate releases its reservation");
+            let spare = storage
+                .value_indexes
+                .acquire()
+                .expect("failed candidate releases its reservation");
             assert!(storage.value_indexes.acquire().is_none());
             drop(spare);
             drop(before);
@@ -276,7 +325,7 @@ mod tests {
 
     #[test]
     fn key_preparation_expression_failure_preserves_working_bindings() {
-        let (storage, table) = fixture(4);
+        let (mut storage, table) = fixture(4);
         crate::mem::guard::forbid_alloc(|| {
             let before = storage.tables[table].enforcers();
             let mut index = IndexDef {
@@ -288,8 +337,18 @@ mod tests {
             };
             index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
             let slot = storage.create_index(index, 0).unwrap();
-            assert_eq!(storage.build_enforcers_visible(table, None).unwrap_err().sqlstate, sqlstate::DIVISION_BY_ZERO);
-            assert!(same_bindings(&before, &storage.tables[table].enforcers(), true));
+            assert_eq!(
+                storage
+                    .build_enforcers_visible(table, None)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DIVISION_BY_ZERO
+            );
+            assert!(same_bindings(
+                &before,
+                &storage.tables[table].enforcers(),
+                true
+            ));
             assert_eq!(key_rows(&storage, table, 1), 1);
             storage.commit_index_drop(slot);
             storage.build_enforcers_visible(table, None).unwrap();
@@ -310,7 +369,10 @@ mod tests {
                     crate::mem::guard::forbid_alloc(|| {
                         for _ in 0..16 {
                             if let Err(error) = storage.build_enforcers_visible(table, None) {
-                                assert!(matches!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE | sqlstate::PROGRAM_LIMIT_EXCEEDED));
+                                assert!(
+                                    error.sqlstate == sqlstate::SERIALIZATION_FAILURE
+                                        || error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
+                                );
                             }
                             assert_eq!(key_rows(storage, table, 1), 1);
                         }
@@ -330,7 +392,15 @@ mod tests {
         config.query_workspace_slots = 0;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("key_orders", &[("id", ColType::Int4, false), ("amount", ColType::Int4, false)])).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "key_orders",
+                &[
+                    ("id", ColType::Int4, false),
+                    ("amount", ColType::Int4, false),
+                ],
+            ))
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             pending(&storage, table, 1, 8, 2);
             storage.commit_row(table, 1, 8, 7).unwrap();
@@ -346,7 +416,10 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             pending(&storage, table, 1, 8, 2);
             let selected = storage.resident_row_state(table, 1).unwrap().unwrap();
-            let prepared = storage.prepare_committed_row(table, 1, 8, false, selected).unwrap().unwrap();
+            let prepared = storage
+                .prepare_committed_row(table, 1, 8, false, selected)
+                .unwrap()
+                .unwrap();
             storage.build_enforcers_visible(table, None).unwrap();
             let before = storage.tables[table].generation();
             let error = storage.publish_prepared_row(9, prepared).unwrap_err();
@@ -371,7 +444,10 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             pending(&storage, table, 1, 8, 2);
             let selected = storage.resident_row_state(table, 1).unwrap().unwrap();
-            let prepared = storage.prepare_committed_row(table, 1, 8, false, selected).unwrap().unwrap();
+            let prepared = storage
+                .prepare_committed_row(table, 1, 8, false, selected)
+                .unwrap()
+                .unwrap();
             pending(&storage, table, 2, 10, 3);
             storage.commit_row(table, 2, 10, 9).unwrap();
             storage.publish_prepared_row(10, prepared).unwrap();
@@ -386,16 +462,23 @@ mod tests {
         let (mut storage, table) = fixture(4);
         crate::mem::guard::forbid_alloc(|| {
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-            let selected = storage.visible_row_home_at(table, 1, state, 0, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            let selected = storage
+                .visible_row_home_at(table, 1, state, 0, SNAPSHOT_ALL, 7)
+                .unwrap()
+                .unwrap();
             let (target, mut definition) = storage.select_table_definition(table, 8);
             definition.columns[0].ctype = ColType::Int8;
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
-            let change = storage.write_table_def(target, definition, &mapping, true).unwrap();
+            let change = storage
+                .write_table_def(target, definition, &mapping, true)
+                .unwrap();
             assert_eq!(storage.commit_table_def(change).unwrap(), Some(true));
             let mut output = [0; 128];
-            let error = storage.encode_value_binding_entry(table, 0, 1, selected, &mut output).unwrap_err();
+            let error = storage
+                .encode_value_binding_entry(table, 0, 1, selected, &mut output)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert!(error.message.as_str().contains("row layout"));
             assert_eq!(output, [0; 128]);
@@ -422,10 +505,19 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
-            let change = storage.write_table_def(target, definition, &mapping, false).unwrap();
+            let change = storage
+                .write_table_def(target, definition, &mapping, false)
+                .unwrap();
             storage.commit_table_def(change).unwrap();
             assert_eq!(selection.definition().name.as_str(), "key_orders");
-            assert_eq!(selection.index(&storage, created_at).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                selection
+                    .index(&storage, created_at)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
         });
     }
 }

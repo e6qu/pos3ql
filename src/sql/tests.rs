@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod row_layout;
+mod key_preparation;
 mod transaction_publication;
 
 #[test]
@@ -59171,7 +59172,8 @@ fn partition_index_validation_failed_undo_reservation_releases_every_child() {
 #[test]
 fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_index() {
     let mut config = test_config("index-create-cache-cleanup");
-    config.max_value_indexes = 1;
+    // One working binding and one replacement fit; two replacements do not.
+    config.max_value_indexes = 2;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -59203,7 +59205,8 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
             .prepare_index_enforcers(table, txid)
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-        assert_eq!(engine.storage.table(table).enforcer_count(), 0);
+        assert_eq!(engine.storage.table(table).enforcer_count(), 1);
+        assert!(engine.storage.value_cache_complete(table, &[0]));
         engine.storage.rollback_index_create(slot);
         engine.storage.prepare_index_enforcers(table, txid).unwrap();
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);
@@ -66217,7 +66220,8 @@ fn durable_value_probe_is_not_capped_by_the_resident_overlay() {
 #[test]
 fn failed_index_cache_reservation_restores_every_pool_slot() {
     let mut config = test_config("value-index-cache-pool");
-    config.max_value_indexes = 1;
+    // Keep one published cache while building its complete replacement.
+    config.max_value_indexes = 2;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
 

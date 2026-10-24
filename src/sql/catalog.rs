@@ -16272,14 +16272,13 @@ fn finish_with_hidden<'a>(
             let value = super::eval::cast_to(value, *column_type, arena)?;
             if *name == "tableoid"
                 && let Some(relation) = specification.relation
+                && value != Datum::Oid(relation.get())
             {
-                if value != Datum::Oid(relation.get()) {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "catalog {} row has an incorrect tableoid",
-                        specification.name
-                    ));
-                }
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog {} row has an incorrect tableoid",
+                    specification.name
+                ));
             }
             values[destination] = value;
         }
@@ -21697,7 +21696,13 @@ fn pg_index<'a>(
 /// An index-option array (one 0-flag per column) for `pg_index.indoption`.
 fn index_options<'a>(info: &IdxInfo, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let mut raw = [0; crate::storage::MAX_INDEX_COLS * 2];
-    for (position, value) in raw.chunks_exact_mut(2).enumerate().take(info.n_cols) {
+    for (position, value) in raw
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .enumerate()
+        .take(info.n_cols)
+    {
         let flags =
             i16::from(info.descending[position]) | (i16::from(info.nulls_first[position]) << 1);
         value.copy_from_slice(&flags.to_le_bytes());
@@ -32850,7 +32855,7 @@ fn info_domains<'a>(
         }
         let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
         let scalar = information::ScalarMetadata::new(
-            domain.base.oid() as i32,
+            domain.base.oid(),
             domain.base_type_mod,
             storage
                 .current_database_encoding(txid)

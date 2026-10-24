@@ -426,6 +426,12 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.permissions.role_oid_type", "SELECT pg_typeof(oid)::text FROM pg_authid WHERE oid=%s::oid", (role_oid,))
             record(reader, f"{prefix}.permissions.unknown_role", "SELECT pg_get_userbyid(0), pg_get_userbyid(4294967295::oid), pg_get_userbyid(NULL::oid), pg_typeof(pg_get_userbyid(0))::text")
             writer.execute("GRANT SELECT(id) ON catalog_permission_diff TO catalog_permission_renamed_diff")
+            # A newly acquired relation lock processes PostgreSQL's pending
+            # catalog invalidations (REL_18_6 lmgr.c LockRelationOid). Without
+            # this, constant-only queries can reuse an unrefreshed catcache
+            # in repeatable read. Synchronize current permission lookup while
+            # preserving the transaction snapshot used by the catalog subquery.
+            reader.execute("LOCK TABLE catalog_permission_diff IN ACCESS SHARE MODE")
             record(reader, f"{prefix}.permissions.wrapped_columns", "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65536) IS NULL")
             record(reader, f"{prefix}.permissions.wrapped_column_values", "SELECT pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,65537)::text, pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,-65535)::text, pg_get_acl('pg_class'::regclass,'catalog_permission_diff'::regclass,1)::text")
             record(reader, f"{prefix}.permissions.wrapped_columns_again", "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1), pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 1)")

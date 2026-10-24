@@ -24269,22 +24269,24 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
 }
 
 #[test]
-fn catalog_schema_resolution_retains_only_its_owned_definition() {
+fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
     let (engine, mut budget) = test_engine();
     let arena = Arena::new(&mut budget, "catalog schema scratch", 4 << 20).unwrap();
-    for catalog in [
-        "pg_amop",
-        "pg_depend",
-        "pg_partitioned_table",
-        "pg_class",
-        "pg_constraint",
-        "pg_attrdef",
-    ] {
+    for (qualifier, catalog) in crate::sql::catalog_snapshot_keys::RELATIONS
+        .iter()
+        .map(|relation| ("pg_catalog", relation.name))
+        .chain([
+            ("pg_catalog", "pg_tables"),
+            ("pg_catalog", "pg_roles"),
+            ("information_schema", "tables"),
+            ("information_schema", "columns"),
+        ])
+    {
         let mark = arena.mark();
         let before = arena.used();
         crate::mem::guard::forbid_alloc(|| {
             let shape =
-                crate::sql::catalog::synthesize_definition(Some("pg_catalog"), catalog, &arena)
+                crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)
                     .unwrap();
             assert!(shape.rows.is_empty());
             assert_eq!(shape.def.name.as_str(), catalog);
@@ -24294,7 +24296,7 @@ fn catalog_schema_resolution_retains_only_its_owned_definition() {
             );
             let materialized = crate::sql::catalog::synthesize(
                 &engine.storage,
-                Some("pg_catalog"),
+                Some(qualifier),
                 catalog,
                 0,
                 crate::sql::catalog_snapshot::CatalogScan::Sequential,
@@ -24312,6 +24314,23 @@ fn catalog_schema_resolution_retains_only_its_owned_definition() {
                 assert_eq!(actual.ctype, expected.ctype);
                 assert_eq!(actual.type_mod, expected.type_mod);
                 assert_eq!(actual.collation, expected.collation);
+            }
+            for row in materialized.rows {
+                assert_eq!(row.len(), width, "{qualifier}.{catalog}");
+                if materialized.hidden_columns == 1 {
+                    assert_eq!(
+                        row[materialized.def.n_columns],
+                        Datum::Oid(
+                            crate::sql::catalog_snapshot_keys::RELATIONS
+                                .iter()
+                                .find(|relation| relation.name == catalog)
+                                .unwrap()
+                                .oid
+                                .get(),
+                        ),
+                        "{qualifier}.{catalog}"
+                    );
+                }
             }
         });
         // Every descriptor and row from this iteration was consumed above.

@@ -193,7 +193,7 @@ impl ScalarMetadata {
     pub(super) fn new(oid: i32, modifier: i32, character_bytes: i32) -> Result<Self, SqlError> {
         let overflow = || {
             sql_err!(
-                sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+                sqlstate::NUMERIC_OUT_OF_RANGE,
                 "information schema type modifier overflow"
             )
         };
@@ -259,6 +259,7 @@ impl ScalarMetadata {
     }
 }
 
+#[derive(Clone, Copy)]
 struct OutputNode<'a> {
     values: &'a [Datum<'a>],
     previous: Option<&'a OutputNode<'a>>,

@@ -18,22 +18,22 @@ use crate::sql_err;
 const HEADER_BYTES: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CatalogRelationIdentity {
-    pub(super) database: Option<DatabaseOid>,
-    pub(super) relation: NonZeroU32,
+pub(crate) struct CatalogRelationIdentity {
+    pub(crate) database: Option<DatabaseOid>,
+    pub(crate) relation: NonZeroU32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CatalogRowImage<'a> {
-    pub(super) bytes: &'a [u8],
-    pub(super) count: NonZeroU32,
+pub(crate) struct CatalogRowImage<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) count: NonZeroU32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct HistoricalCatalogRow<'a> {
-    pub(super) key: &'a [u8],
+pub(crate) struct HistoricalCatalogRow<'a> {
+    pub(crate) key: &'a [u8],
     /// None means the object did not exist before this committed change.
-    pub(super) before: Option<CatalogRowImage<'a>>,
+    pub(crate) before: Option<CatalogRowImage<'a>>,
 }
 
 struct HistoryState {
@@ -44,14 +44,14 @@ struct HistoryState {
     latest_publication: u64,
 }
 
-pub(super) struct CatalogHistory {
+pub(crate) struct CatalogHistory {
     state: Mutex<HistoryState>,
 }
 
 /// A unique reservation moves with its transaction, including queue handoff.
 /// Dropping it before publication removes all of its unpublished images.
 #[must_use = "catalog history must publish with its transaction or roll back"]
-pub(super) struct CatalogHistoryBatch {
+pub(crate) struct CatalogHistoryBatch {
     history: Arc<CatalogHistory>,
     identity: NonZeroU64,
     finished: bool,
@@ -149,7 +149,7 @@ impl HistoryState {
 }
 
 impl CatalogHistory {
-    pub(super) fn budget_bytes(bytes: usize, transactions: usize) -> usize {
+    pub(crate) fn budget_bytes(bytes: usize, transactions: usize) -> usize {
         size_of::<Arc<Self>>()
             .saturating_add(size_of::<Self>())
             .saturating_add(2 * size_of::<core::sync::atomic::AtomicUsize>())
@@ -157,7 +157,7 @@ impl CatalogHistory {
             .saturating_add(transactions.saturating_mul(size_of::<NonZeroU64>()))
     }
 
-    pub(super) fn new(
+    pub(crate) fn new(
         budget: &mut Budget,
         bytes: usize,
         transactions: usize,
@@ -181,7 +181,7 @@ impl CatalogHistory {
         }))
     }
 
-    pub(super) fn reserve(self: &Arc<Self>) -> Result<CatalogHistoryBatch, SqlError> {
+    pub(crate) fn reserve(self: &Arc<Self>) -> Result<CatalogHistoryBatch, SqlError> {
         let mut state = self.state.lock().expect("catalog history lock poisoned");
         let identity = state
             .next_reservation
@@ -207,7 +207,7 @@ impl CatalogHistory {
 
     /// Copy the earliest committed before-image after the selected snapshot
     /// for each changed key. A later catalog update must not replace it.
-    pub(super) fn rows_at<'a>(
+    pub(crate) fn rows_at<'a>(
         &self,
         relation: CatalogRelationIdentity,
         snapshot: u64,
@@ -282,7 +282,7 @@ impl CatalogHistory {
 
     /// A statement copies its rows before releasing this owner; surviving
     /// transactions and exported snapshots supply the retention floor.
-    pub(super) fn reclaim(&self, oldest_snapshot: Option<u64>) {
+    pub(crate) fn reclaim(&self, oldest_snapshot: Option<u64>) {
         let mut state = self.state.lock().expect("catalog history lock poisoned");
         state.remove(|frame| {
             frame.committed_at != 0
@@ -292,7 +292,7 @@ impl CatalogHistory {
 }
 
 impl CatalogHistoryBatch {
-    pub(super) fn record(
+    pub(crate) fn record(
         &mut self,
         relation: CatalogRelationIdentity,
         key: &[u8],
@@ -352,7 +352,7 @@ impl CatalogHistoryBatch {
         Ok(())
     }
 
-    pub(super) fn publish(mut self, committed_at: NonZeroU64) {
+    pub(crate) fn publish(mut self, committed_at: NonZeroU64) {
         let mut state = self
             .history
             .state

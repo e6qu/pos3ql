@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           cargo clean -p pos3ql
-          cargo test --lib --release --locked -- storage::catalog_history::tests config::tests:: --nocapture --test-threads=1 \
+          cargo test --lib --release --locked -- storage::catalog_history::tests sql::catalog_snapshot::tests config::tests:: --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/catalog-history.log"
       - name: Check formatting and all-target lint
         run: |
@@ -90,9 +90,9 @@ jobs:
       - name: Interpret catalog history lifetimes and concurrent publication
         shell: bash
         run: |
-          cargo miri test --lib --locked storage::catalog_history::tests -- --test-threads=1 \
+          cargo miri test --lib --locked -- storage::catalog_history::tests sql::catalog_snapshot::tests --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/catalog-history-miri.log"
-          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/catalog-history-miri.log"
+          grep -F 'test result: ok. 14 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/catalog-history-miri.log"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

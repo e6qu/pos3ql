@@ -7,6 +7,11 @@
 
 #[cfg(test)]
 mod catalog_history;
+#[cfg(test)]
+pub(crate) use catalog_history::{
+    CatalogHistory, CatalogHistoryBatch, CatalogRelationIdentity, CatalogRowImage,
+    HistoricalCatalogRow,
+};
 mod catalog_sources;
 mod database_clone_positions;
 pub(crate) use database_clone_positions::{

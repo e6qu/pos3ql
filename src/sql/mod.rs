@@ -7,6 +7,8 @@ pub mod ast;
 mod brin_catalog;
 pub mod catalog;
 mod catalog_metadata;
+#[cfg(test)]
+mod catalog_snapshot;
 pub(crate) mod commit;
 pub mod copy;
 pub mod cursor;

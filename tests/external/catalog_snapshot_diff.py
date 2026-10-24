@@ -121,10 +121,16 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.comment_private.equal_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
             record_outcome(reader, f"{prefix}.comment_private.different_write", "COMMENT ON TABLE catalog_comment_private_diff IS 'own comment'", ())
             record(reader, f"{prefix}.comment_private.different_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record(reader, f"{prefix}.comment_private.different_scan", "SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
             record_outcome(reader, f"{prefix}.comment_private.different_function", "SELECT obj_description(%s::oid, 'pg_class')", (oid,))
             record_outcome(reader, f"{prefix}.comment_private.remove_existing", "COMMENT ON TABLE catalog_comment_private_diff IS NULL", ())
             record(reader, f"{prefix}.comment_private.removed_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record(reader, f"{prefix}.comment_private.removed_scan", "SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
             record_outcome(reader, f"{prefix}.comment_private.removed_function", "SELECT obj_description(%s::oid, 'pg_class')", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.reinsert", "COMMENT ON TABLE catalog_comment_private_diff IS 'inserted own comment'", ())
+            record(reader, f"{prefix}.comment_private.reinserted_rows", "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record(reader, f"{prefix}.comment_private.reinserted_scan", "SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description", (oid,))
+            record_outcome(reader, f"{prefix}.comment_private.reinserted_function", "SELECT obj_description(%s::oid, 'pg_class')", (oid,))
             reader.execute("ROLLBACK TO before_private_comment")
             record(reader, f"{prefix}.comment_private.rolled_back", query, (oid, oid))
             writer.execute("COMMENT ON TABLE catalog_comment_private_diff IS NULL")
@@ -137,7 +143,7 @@ def transcript(reader, writer):
             writer.execute("ROLLBACK")
             writer.execute("DROP TABLE IF EXISTS catalog_comment_private_diff")
 
-        for concurrent in (False, True):
+        for concurrent in (0, 1, 2):
             for scope in ("top", "savepoint"):
                 label = f"{prefix}.comment_own.{int(concurrent)}.{scope}"
                 writer.execute("CREATE TABLE catalog_comment_own_diff(id integer)")
@@ -147,8 +153,10 @@ def transcript(reader, writer):
                     oid = reader.execute("SELECT oid FROM pg_class WHERE relname='catalog_comment_own_diff'").fetchone()[0]
                     query = "SELECT description FROM pg_description WHERE objoid=%s::oid AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description"
                     record(reader, f"{label}.before", query, (oid,))
-                    if concurrent:
+                    if concurrent == 1:
                         writer.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'concurrent comment'")
+                    elif concurrent == 2:
+                        writer.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'old comment'")
                     if scope == "savepoint":
                         reader.execute("SAVEPOINT own_comment_write")
                     reader.execute("COMMENT ON TABLE catalog_comment_own_diff IS 'own comment'")

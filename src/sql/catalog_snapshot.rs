@@ -210,7 +210,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
         | SubscriptionDropped(_)
         | SubscriptionEnabled { .. }
         | SubscriptionBootstrapChanged { .. }
-        | SubscriptionRelationsChanged { .. }
+        | SubscriptionRelationsChanged
         | SubscriptionDefinitionChanged { .. }
         | SubscriptionOwnerChanged { .. }
         | SubscriptionRenamed { .. } => &[

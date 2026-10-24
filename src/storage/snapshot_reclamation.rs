@@ -75,6 +75,7 @@ impl SnapshotReclamation {
 
 struct SnapshotRowOwners<'storage> {
     snapshots: crate::mem::mutex::MutexGuard<'storage, super::SnapshotState>,
+    publication: crate::mem::mutex::MutexGuard<'storage, super::TablePublication>,
     generations:
         std::sync::RwLockReadGuard<'storage, super::spill_generations::SpillGenerationList>,
     versions: std::sync::RwLockWriteGuard<'storage, super::row_versions::RowVersionState>,
@@ -245,6 +246,10 @@ impl Storage {
                 &self.snapshots,
                 "snapshot state lock poisoned",
             )?,
+            publication: super::row_ownership::try_mutex(
+                &self.tables[table].publication,
+                "table publication lock poisoned",
+            )?,
             generations: self.tables[table].spill_generations.try_read_for_batch()?,
             versions: self.row_versions.try_write_for_batch()?,
             rows: self.tables[table].rows.try_write_for_batch()?,
@@ -261,6 +266,7 @@ impl Storage {
     ) -> Option<PrunedSlots> {
         let SnapshotRowOwners {
             snapshots,
+            publication,
             generations,
             mut versions,
             mut rows,
@@ -290,14 +296,15 @@ impl Storage {
         let mut pressure = false;
         for slot in start..end {
             let remove = if let Some((rowid, state)) = rows.entry_at_slot_mut(slot) {
+                let obsolete = publication.row_layout.obsolete(state);
                 prune_committed_history(
                     &mut versions.committed_row_versions,
                     &mut state.history,
-                    oldest,
+                    if obsolete { None } else { oldest },
                 );
                 pressure |= !state.history.is_empty()
                     && state.history.len().saturating_add(2) >= self.max_row_versions_per_row;
-                (oldest.is_none()
+                ((oldest.is_none() || obsolete)
                     && generations.is_empty()
                     && state.committed.is_none()
                     && state.history.is_empty()

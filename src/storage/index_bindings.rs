@@ -798,7 +798,10 @@ mod tests {
                     2
                 );
                 if commit {
-                    assert_eq!(storage.commit_table_def(second_change), Some(false));
+                    assert_eq!(
+                        storage.commit_table_def(second_change).unwrap(),
+                        Some(false)
+                    );
                 } else {
                     storage.rollback_table_def(second_change);
                     for (slot, expected) in [(before, (0, 1)), (during, (2, 1))] {

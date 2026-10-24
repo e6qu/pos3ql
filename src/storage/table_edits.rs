@@ -1115,7 +1115,7 @@ mod tests {
             let crate::sql::txn::DdlUndo::TableAltered(change) = transaction.ddl()[0] else {
                 panic!("table definition change was not registered");
             };
-            assert_eq!(storage.commit_table_def(change), Some(false));
+            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
             assert_eq!(storage.table_def(table, 0).name.as_str(), "kept_change");
         });
     }

@@ -304,26 +304,16 @@ impl Storage {
         } else {
             None
         };
-        let committed = expected.map_or_else(
-            || spilled.as_ref().and_then(|source| source.state().committed),
-            |state| state.committed,
-        );
-        let committed_lsn = expected.map_or_else(
-            || {
-                spilled
-                    .as_ref()
-                    .map_or(0, |source| source.state().committed_lsn)
-            },
-            |state| state.committed_lsn,
-        );
-        let committed_generation = expected.map_or_else(
-            || {
-                spilled
-                    .as_ref()
-                    .and_then(|source| source.state().committed_generation)
-            },
-            |state| state.committed_generation,
-        );
+        let committed_state =
+            expected.or_else(|| spilled.as_ref().map(|source| source.metadata().0));
+        let (committed, committed_lsn, committed_generation) = match committed_state {
+            Some(state) => (
+                state.committed,
+                state.committed_lsn,
+                state.committed_generation,
+            ),
+            None => (None, 0, None),
+        };
         let changes_existence = committed.is_some() != image.is_some();
         let changed_columns = if track_statistics
             && target.pending_revision == 0
@@ -402,11 +392,15 @@ impl Storage {
                     panic!("table definition lock poisoned")
                 }
             };
+            let publication = super::row_ownership::try_mutex(
+                &self.tables[table].publication,
+                "table publication lock poisoned",
+            )?;
             let versions = self.row_versions.try_write_for_batch()?;
             let rows = self.tables[table].rows.try_write_for_batch()?;
-            Ok(Some((snapshots, definition, versions, rows)))
+            Ok(Some((snapshots, definition, publication, versions, rows)))
         });
-        let Some((snapshots, definition, mut versions, mut rows)) = owners else {
+        let Some((snapshots, definition, publication, mut versions, mut rows)) = owners else {
             return Ok(PendingPublication::DefinitionBusy);
         };
         target.validate_row_write(self, &definition)?;
@@ -449,7 +443,9 @@ impl Storage {
         let current_identity = current
             .and_then(|state| state.pending.tail)
             .map(|slot| versions.pending_row_versions[slot].identity);
-        if current != expected || current_identity != pending_identity {
+        if current.map(|state| publication.row_layout.visible_state(state)) != expected
+            || current_identity != pending_identity
+        {
             return Ok(PendingPublication::Retry);
         }
         if current.is_none() && rows.len() == rows.capacity() {
@@ -470,6 +466,14 @@ impl Storage {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         });
+        if publication.row_layout.obsolete(&state) {
+            prune_committed_history(
+                &mut versions.committed_row_versions,
+                &mut state.history,
+                None,
+            );
+            state.committed = None;
+        }
         // Readers at or after the current image need no earlier boundary.
         let retained = oldest
             .filter(|snapshot| !state.has_committed_version() || *snapshot < state.committed_lsn);
@@ -821,7 +825,7 @@ mod tests {
                             .unwrap();
                         let change = rename_definition(&storage, table, 7, "renamed");
                         if committed {
-                            assert_eq!(storage.commit_table_def(change), Some(false));
+                            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
                         }
                         let error = storage.publish_pending_write(prepared).err().unwrap();
                         assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);

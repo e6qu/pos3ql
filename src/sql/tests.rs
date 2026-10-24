@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod row_layout;
 mod transaction_publication;
 
 #[test]

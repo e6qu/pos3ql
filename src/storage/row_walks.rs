@@ -131,7 +131,11 @@ impl RowScanIds<'_> {
 #[derive(Clone, Copy)]
 pub(super) enum RowMetadataTarget {
     Current(usize),
-    Captured { table: usize, created_at: u64 },
+    Captured {
+        table: usize,
+        created_at: u64,
+        generation: u64,
+    },
 }
 
 impl RowMetadataTarget {
@@ -141,7 +145,11 @@ impl RowMetadataTarget {
         }
     }
 
-    pub(super) fn validate(self, created_at: u64) -> Result<(), SqlError> {
+    pub(super) fn validate(
+        self,
+        created_at: u64,
+        layout: super::row_layout::RowLayout,
+    ) -> Result<(), SqlError> {
         if let Self::Captured {
             created_at: expected,
             ..
@@ -153,6 +161,14 @@ impl RowMetadataTarget {
                 "retained scan table identity changed"
             ));
         }
+        if let Self::Captured { generation, .. } = self
+            && !layout.accepts(generation)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained scan row layout changed"
+            ));
+        }
         Ok(())
     }
 }
@@ -162,6 +178,7 @@ pub(crate) struct RowScan<'storage> {
     storage: &'storage Storage,
     table_slot: usize,
     created_at: u64,
+    generation: u64,
     pub(super) rowids: RowScanIds<'storage>,
     pub(super) roots: super::spill_generations::CapturedSpillRoots<'storage>,
 }
@@ -212,6 +229,7 @@ impl Storage {
         let image = super::spill_generations::SpillGenerationImage::capture(
             &definition,
             publication.generation,
+            publication.row_layout,
             table_slot,
             commit_lsn,
         );
@@ -253,6 +271,7 @@ impl Storage {
                     storage: self,
                     table_slot,
                     created_at: image.created_at,
+                    generation: image.data_generation,
                     rowids: RowScanIds::Reserved(rowids),
                     roots,
                 })
@@ -304,6 +323,7 @@ impl Storage {
             storage: self,
             table_slot,
             created_at: image.created_at,
+            generation: image.data_generation,
             rowids: RowScanIds::Statement(rowids),
             roots,
         })
@@ -351,13 +371,15 @@ impl Storage {
 
 impl RowScan<'_> {
     fn validate_identity(&self) -> Result<(), SqlError> {
-        if self.storage.tables[self.table_slot].created_at() != self.created_at {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "retained scan table identity changed"
-            ));
+        let table = &self.storage.tables[self.table_slot];
+        let definition = table.definition.read();
+        let publication = table.publication();
+        RowMetadataTarget::Captured {
+            table: self.table_slot,
+            created_at: self.created_at,
+            generation: self.generation,
         }
-        Ok(())
+        .validate(definition.identity.created_at, publication.row_layout)
     }
 
     pub(crate) fn for_each_overlay(
@@ -369,6 +391,7 @@ impl RowScan<'_> {
             let target = RowMetadataTarget::Captured {
                 table: self.table_slot,
                 created_at: self.created_at,
+                generation: self.generation,
             };
             let state = match self.storage.capture_resident_row_metadata(target, rowid)? {
                 Some(state) => Some(state.with_captured_roots(&self.roots)),
@@ -1628,6 +1651,7 @@ mod tests {
         let target = RowMetadataTarget::Captured {
             table,
             created_at: storage.tables[table].created_at(),
+            generation: storage.table(table).generation(),
         };
         let state = storage
             .capture_resident_row_metadata(target, 1)
@@ -1690,10 +1714,15 @@ mod tests {
     fn metadata_walk_admission_checks_identity_before_capacity_and_releases_failures() {
         let (storage, table) = fixture();
         let created_at = storage.tables[table].created_at();
-        let current = RowMetadataTarget::Captured { table, created_at };
+        let current = RowMetadataTarget::Captured {
+            table,
+            created_at,
+            generation: storage.table(table).generation(),
+        };
         let stale = RowMetadataTarget::Captured {
             table,
             created_at: created_at + 1,
+            generation: storage.table(table).generation(),
         };
         let capacity = 64 * test_config().query_workspace_slots;
         let mut reads = Vec::with_capacity(capacity);
@@ -1750,6 +1779,7 @@ mod tests {
         let target = RowMetadataTarget::Captured {
             table,
             created_at: storage.tables[table].created_at(),
+            generation: storage.table(table).generation(),
         };
         crate::mem::guard::forbid_alloc(|| {
             let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
@@ -1792,6 +1822,7 @@ mod tests {
         let target = RowMetadataTarget::Captured {
             table,
             created_at: storage.tables[table].created_at(),
+            generation: storage.table(table).generation(),
         };
         crate::mem::guard::forbid_alloc(|| {
             storage.heap.append_row(&[Datum::Text("unreferenced row bytes that reclamation removes before relocating the pending row")]).unwrap();
@@ -1891,6 +1922,8 @@ mod tests {
                 let state = storage.resident_row_state(table, 1).unwrap().unwrap();
                 let snapshot = super::super::RowSnapshot {
                     created_at: storage.tables[table].created_at(),
+                    generation: state.generation,
+                    row_layout: state.row_layout,
                     version: if pending {
                         super::super::RowVersionIdentity::Pending(
                             state.pending_head_identity().unwrap(),

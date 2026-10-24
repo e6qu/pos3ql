@@ -73,7 +73,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
                     true,
                 )
                 .unwrap();
-            assert_eq!(storage.commit_table_def(second_change), Some(true));
+            assert_eq!(storage.commit_table_def(second_change).unwrap(), Some(true));
             let committed = storage.index_visible_to(slot, 8).unwrap();
             assert_eq!(
                 (committed.schema.as_str(), committed.table.as_str()),
@@ -290,7 +290,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
             storage.find_visible("public", "committed_lookup", 9),
             Some(target)
         );
-        assert_eq!(storage.commit_table_def(third_change), Some(false));
+        assert_eq!(storage.commit_table_def(third_change).unwrap(), Some(false));
         assert_eq!(storage.find_table("public", "lookup_target"), None);
         assert_eq!(
             storage.find_table("public", "committed_lookup"),

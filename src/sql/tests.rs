@@ -15001,6 +15001,10 @@ fn run_with_fixed_memory_and_ddl_capacity(
     arena_bytes: usize,
     ddl_capacity: usize,
 ) -> Vec<u8> {
+    // Requests and resumed commits stay guarded; the simulated remote store
+    // allocates its fixtures only while publication advances between turns.
+    let commit_progress = engine.commit_progress;
+    engine.enable_async_durability();
     let mut request_budget = Budget::new(budget.remaining());
     let mut buffer = crate::mem::FixedBuf::new(&mut request_budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(&mut request_budget, "sql", arena_bytes).unwrap();
@@ -15008,21 +15012,44 @@ fn run_with_fixed_memory_and_ddl_capacity(
     let mut pool = test_pool(&mut request_budget);
     let mut cursors = test_cursors(&mut request_budget);
     let mut guc = GucState::new();
-    let mut responder = Responder::new(&mut buffer);
-    let status = crate::mem::guard::forbid_alloc(|| {
-        engine.execute_simple(
-            sql_text,
-            &arena,
-            &mut txn,
-            &mut pool,
-            &mut cursors,
-            &mut guc,
-            &mut responder,
-            1,
-        )
-    })
-    .unwrap();
-    finish_test_request(engine, &mut txn, &guc, status);
+    let mut resume_statement = 0;
+    let mut completed = false;
+    for _ in 0..64 {
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                sql_text,
+                resume_statement,
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut Responder::new(&mut buffer),
+                1,
+                false,
+            )
+        })
+        .unwrap();
+        match status {
+            ExecutionStatus::Complete => {
+                finish_test_request(engine, &mut txn, &guc, status);
+                completed = true;
+                break;
+            }
+            ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } => {
+                assert_eq!(wait, StatementWait::ObjectIo);
+                buffer.truncate_to(output_mark);
+                resume_statement = completed_statements;
+                engine.commit_wal().unwrap();
+            }
+        }
+    }
+    assert!(completed, "fixed-memory request did not finish publication");
+    engine.commit_progress = commit_progress;
     buffer.readable().to_vec()
 }
 
@@ -18053,6 +18080,13 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
+    let modifiers = "SELECT attname,atttypmod,format_type(atttypid,atttypmod)
+        FROM pg_attribute WHERE attrelid='durable_binary_strings'::regclass
+        AND attname IN ('flags','flexible') ORDER BY attnum";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, modifiers)),
+        ["flags|8|bit(8)", "flexible|-1|bit varying"]
+    );
     assert!(engine.checkpoint().unwrap());
 
     let wal_tail = run_with(
@@ -18078,6 +18112,10 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
 
     let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, modifiers)),
+        ["flags|8|bit(8)", "flexible|-1|bit varying"]
+    );
     let recovered = run_with(
         &mut cold,
         &mut cold_budget,
@@ -21263,6 +21301,844 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn catalog_snapshot_capture_fits_two_megabyte_work_arena() {
+    let mut config = test_config("catalog-small-work-arena");
+    config.work_arena_bytes = 2 << 20;
+    config.sql_arena_bytes = 4 << 20;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "CREATE TABLE catalog_small_orders(id bigint PRIMARY KEY, tenant text, payload text)",
+        "ALTER TABLE catalog_small_orders RENAME tenant TO account_name",
+        "ALTER TABLE catalog_small_orders RENAME TO catalog_small_sales",
+        "CREATE DOMAIN catalog_small_id AS integer",
+        "ALTER DOMAIN catalog_small_id SET DEFAULT 7",
+    ] {
+        session.success(&mut engine, sql, true);
+    }
+}
+
+#[test]
+fn catalog_snapshot_role_capture_keeps_internal_access_private() {
+    let (mut engine, mut budget) = test_engine();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE ROLE catalog_creator CREATEROLE; GRANT catalog_creator TO postgres; SET ROLE catalog_creator; CREATE ROLE catalog_child; ALTER ROLE catalog_child LOGIN; COMMIT",
+    );
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE catalog_creator; SELECT rolname FROM pg_authid"
+        )),
+        ["42501"]
+    );
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+}
+
+#[test]
+fn catalog_snapshot_view_columns_survive_table_column_rename() {
+    let (mut engine, mut budget) = test_engine();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    for sql in [
+        "CREATE TABLE catalog_small_orders(id bigint PRIMARY KEY, tenant text, payload text)",
+        "CREATE VIEW catalog_small_report AS SELECT id, tenant, payload FROM catalog_small_orders",
+        "ALTER TABLE catalog_small_orders ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY catalog_small_policy ON catalog_small_orders USING (tenant = current_user)",
+        "ALTER TABLE catalog_small_orders RENAME tenant TO account_name",
+        "ALTER TABLE catalog_small_orders RENAME TO catalog_small_sales",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname FROM pg_attribute WHERE attrelid='catalog_small_report'::regclass AND attnum>0 ORDER BY attnum"
+        )),
+        ["id", "tenant", "payload"]
+    );
+}
+
+#[test]
+fn catalog_snapshot_column_rename_keeps_view_bindings_through_rollback_and_recovery() {
+    let mut config = test_config("catalog-view-column-bindings");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-view-column-bindings-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let query = "SELECT * FROM renamed_bindings; SELECT * FROM renamed_cte";
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        r#"
+        CREATE TABLE rename_source(id integer, tenant text, "We""ird" text);
+        CREATE TABLE rename_other(id integer, tenant text, account_name text);
+        INSERT INTO rename_source VALUES(1,'source','quoted');
+        INSERT INTO rename_other VALUES(1,'other','unrelated');
+        CREATE VIEW renamed_bindings AS
+          SELECT a.tenant AS tenant, b.tenant AS other_tenant,
+                 stable.tenant AS aliased_tenant,
+                 (SELECT a.tenant) AS correlated, a."We""ird" AS quoted
+            FROM rename_source a JOIN rename_other b ON a.id=b.id
+            JOIN rename_source AS stable(id,tenant,quoted) ON stable.id=a.id;
+        CREATE VIEW renamed_cte AS
+          WITH chosen AS (SELECT tenant FROM rename_source)
+          SELECT tenant FROM chosen;
+    "#,
+    );
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for finish in ["ROLLBACK", "COMMIT"] {
+        let changed = session.success(
+            &mut engine,
+            "BEGIN; ALTER TABLE rename_source RENAME tenant TO account_name",
+            false,
+        );
+        assert!(
+            error_sqlstates(&changed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let output = session.success(&mut engine, query, false);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["source|other|source|source|quoted", "source"]
+        );
+        let completed = session.success(&mut engine, finish, false);
+        assert!(
+            error_sqlstates(&completed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&completed)
+        );
+    }
+    drop(session);
+    let quoted = run_with(
+        &mut engine,
+        &mut budget,
+        r#"ALTER TABLE rename_source RENAME "We""ird" TO "Moved""field""#,
+    );
+    assert!(
+        error_sqlstates(&quoted).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&quoted)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(&mut recovered, &mut recovered_budget, query);
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["source|other|source|source|quoted", "source"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}
+
+#[test]
+fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objects() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE described_orders(id integer);
+         COMMENT ON TABLE described_orders IS 'old table';
+         COMMENT ON COLUMN described_orders.id IS 'old column';
+         CREATE ROLE described_role;
+         COMMENT ON ROLE described_role IS 'shared role';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let table_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'described_orders'::regclass::oid",
+    ))[0]
+        .clone();
+    let query = format!(
+        "SELECT obj_description({table_oid}::oid, 'pg_class'), obj_description({table_oid}::oid), col_description({table_oid}::oid, 1)"
+    );
+    let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let initial = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {query}"),
+    );
+    assert_eq!(data_rows(&initial), ["old table|old table|old column"]);
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON TABLE described_orders IS 'new table'; COMMENT ON COLUMN described_orders.id IS 'new column'",
+    );
+    assert!(!String::from_utf8_lossy(&changed).contains("ERROR"));
+    let private = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!(
+            "SAVEPOINT before_comment;
+             COMMENT ON TABLE described_orders IS 'new table'; {query};
+             SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0;
+             ROLLBACK TO before_comment;
+             COMMENT ON TABLE described_orders IS 'own table'; {query}; ROLLBACK TO before_comment; {query}"
+        ),
+    );
+    assert_eq!(
+        data_rows(&private),
+        [
+            "old table|old table|old column",
+            "old table",
+            "old table|old table|old column",
+            "old table|old table|old column"
+        ],
+        "{}",
+        String::from_utf8_lossy(&private)
+    );
+    let scans = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+        &format!("SAVEPOINT before_scan;
+            COMMENT ON TABLE described_orders IS 'own table';
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            COMMENT ON TABLE described_orders IS NULL;
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            COMMENT ON TABLE described_orders IS 'inserted own table';
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
+            {query}; ROLLBACK TO before_scan; {query}"));
+    assert_eq!(
+        data_rows(&scans),
+        [
+            "old table",
+            "own table",
+            "old table",
+            "old table",
+            "inserted own table",
+            "old table",
+            "inserted own table",
+            "old table",
+            "old table|old table|old column",
+            "old table|old table|old column"
+        ],
+        "{}",
+        String::from_utf8_lossy(&scans)
+    );
+    let removed = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON COLUMN described_orders.id IS NULL",
+    );
+    assert!(!String::from_utf8_lossy(&removed).contains("ERROR"));
+    let absent_removal = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+        &format!("SAVEPOINT before_absent_removal; COMMENT ON COLUMN described_orders.id IS NULL; {query};
+            SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 1;
+            ROLLBACK TO before_absent_removal"));
+    assert_eq!(
+        data_rows(&absent_removal),
+        ["old table|old table|old column", "old column"],
+        "{}",
+        String::from_utf8_lossy(&absent_removal)
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE described_orders; CREATE TABLE described_orders(replacement text); COMMENT ON TABLE described_orders IS 'replacement table'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    let old = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        &format!("{query}; ROLLBACK"),
+    );
+    assert_eq!(
+        data_rows(&old),
+        ["old table|old table|old column"],
+        "{}",
+        String::from_utf8_lossy(&old)
+    );
+    let scopes = run_with(&mut engine, &mut budget,
+        "SELECT shobj_description('described_orders'::regclass, 'pg_class') IS NULL;
+         SELECT obj_description(oid, 'pg_authid') IS NULL, obj_description(oid) IS DISTINCT FROM 'shared role', shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'described_role';");
+    assert_eq!(
+        data_rows(&scopes),
+        ["t", "t|t|shared role"],
+        "{}",
+        String::from_utf8_lossy(&scopes)
+    );
+}
+
+#[test]
+fn catalog_snapshot_acl_addresses_match_postgresql_object_classes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE acl_address_reader;
+         CREATE TABLE acl_addresses(id integer);
+         CREATE FUNCTION acl_address_function() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         GRANT SELECT(id) ON acl_addresses TO acl_address_reader;
+         GRANT EXECUTE ON FUNCTION acl_address_function() TO acl_address_reader;
+         SELECT lo_create(50001);
+         GRANT SELECT ON LARGE OBJECT 50001 TO acl_address_reader;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(&mut engine, &mut budget,
+        "SELECT pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 65537) = pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 1),
+                pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, -65535) = pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 1),
+                pg_get_acl('pg_class'::regclass, 'acl_addresses'::regclass, 65536) IS NULL;
+         SELECT pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 7) = pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 0);
+         SELECT pg_get_acl('pg_proc'::regclass, 'acl_address_function()'::regprocedure, 0)::text LIKE '{=X/postgres,postgres=X/postgres,%}';
+         SELECT pg_get_acl('pg_largeobject'::regclass, 50001, -7) = pg_get_acl('pg_largeobject_metadata'::regclass, 50001, 0), pg_get_acl('pg_largeobject'::regclass, 50001, -7) IS NOT NULL;
+         SELECT pg_get_acl('pg_authid'::regclass, 10, 3) IS NULL;
+         SELECT pg_get_acl(0, 0, 99) IS NULL;");
+    assert_eq!(
+        data_rows(&output),
+        ["t|t|t", "t", "t", "t|t", "t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for class in [0, 1249, 6243, 999999] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_get_acl({class}::oid, 1::oid, 0)"),
+        );
+        assert!(
+            output.windows(7).any(|bytes| bytes == b"CXX000\0"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!("unrecognized class ID: {class}"))
+        );
+    }
+    for class in [
+        "pg_am",
+        "pg_amop",
+        "pg_amproc",
+        "pg_cast",
+        "pg_collation",
+        "pg_constraint",
+        "pg_conversion",
+        "pg_default_acl",
+        "pg_extension",
+        "pg_opclass",
+        "pg_operator",
+        "pg_opfamily",
+        "pg_authid",
+        "pg_auth_members",
+        "pg_rewrite",
+        "pg_transform",
+        "pg_trigger",
+        "pg_policy",
+        "pg_event_trigger",
+        "pg_ts_config",
+        "pg_ts_dict",
+        "pg_ts_parser",
+        "pg_ts_template",
+        "pg_publication",
+        "pg_subscription",
+        "pg_statistic_ext",
+        "pg_user_mapping",
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_get_acl('{class}'::regclass, 1::oid, 99) IS NULL"),
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["t"],
+            "{class}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups() {
+    for (isolation, historical) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let (mut engine, mut budget) = test_engine();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE visibility_acl_role;
+             CREATE TABLE permission_orders(id integer);
+             GRANT SELECT ON permission_orders TO visibility_acl_role;",
+        );
+        assert!(
+            !message_types(&setup).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let role_oid = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid FROM pg_authid WHERE rolname='visibility_acl_role'",
+        ))[0]
+            .clone();
+        let mut reader = TxnState::new(&mut budget, 64).unwrap();
+        let mut guc = GucState::new();
+        let selected = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            &mut guc,
+            &format!(
+                "BEGIN ISOLATION LEVEL {isolation}; SELECT relacl IS NOT NULL FROM pg_class WHERE oid='permission_orders'::regclass"
+            ),
+        );
+        assert_eq!(data_rows(&selected), ["t"]);
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "GRANT UPDATE ON permission_orders TO visibility_acl_role;
+             ALTER ROLE visibility_acl_role RENAME TO visibility_acl_renamed;",
+        );
+        assert!(
+            !message_types(&changed).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let observed = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+            &format!("SELECT relacl::text LIKE '%visibility_acl_renamed=r/%' FROM pg_class WHERE oid='permission_orders'::regclass;
+                SELECT pg_get_acl('pg_class'::regclass, 'permission_orders'::regclass, 0)::text LIKE '%visibility_acl_renamed=rw/%';
+                SELECT has_table_privilege('visibility_acl_renamed', 'permission_orders', 'UPDATE');
+                SELECT rolname FROM pg_authid WHERE oid={role_oid}::oid;
+                SELECT rolname FROM pg_roles WHERE oid={role_oid}::oid;
+                ROLLBACK;"));
+        assert_eq!(
+            data_rows(&observed),
+            [
+                if historical { "t" } else { "f" },
+                "t",
+                "t",
+                if historical {
+                    "visibility_acl_role"
+                } else {
+                    "visibility_acl_renamed"
+                },
+                if historical {
+                    "visibility_acl_role"
+                } else {
+                    "visibility_acl_renamed"
+                }
+            ],
+            "{}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+}
+
+#[test]
+fn catalog_snapshot_generated_expressions_have_operator_parentheses() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_expression_display (
+             id bigint,
+             ordinary bigint GENERATED ALWAYS AS (id + 1) STORED,
+             redundant bigint GENERATED ALWAYS AS (((id+1))) STORED,
+             product bigint GENERATED ALWAYS AS ((id+1)*(id-1)) STORED
+         );
+         SELECT column_name,generation_expression FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='catalog_expression_display'
+            AND is_generated='ALWAYS' ORDER BY ordinal_position;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ordinary|(id + 1)",
+            "redundant|(id + 1)",
+            "product|((id + 1) * (id - 1))",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn catalog_snapshot_bit_modifiers_preserve_wire_values() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT B'101010'::bit(6),B'101'::varbit(8),B'11'::bit,123::bit(8)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["101010|101|1|01111011"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(row_description_type_modifiers(&output), [6, 8, 1, 8]);
+}
+
+#[test]
+fn catalog_snapshot_type_io_fields_keep_routine_identities() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN catalog_io_domain AS varchar(5);
+         CREATE DOMAIN catalog_io_child AS catalog_io_domain;
+         CREATE TYPE catalog_io_enum AS ENUM ('one');
+         CREATE TABLE catalog_io_table(d catalog_io_child, e catalog_io_enum);
+         CREATE VIEW catalog_io_view AS SELECT * FROM catalog_io_table;
+         SELECT typname,typinput::text,typoutput::text,
+                pg_typeof(typinput)::text,pg_typeof(typoutput)::text
+           FROM pg_type WHERE typname IN
+             ('catalog_io_domain','catalog_io_child','catalog_io_enum',
+              '_catalog_io_domain','_catalog_io_enum','catalog_io_table','catalog_io_view')
+           ORDER BY typname;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "_catalog_io_domain|array_in|array_out|regproc|regproc",
+            "_catalog_io_enum|array_in|array_out|regproc|regproc",
+            "catalog_io_child|domain_in|varcharout|regproc|regproc",
+            "catalog_io_domain|domain_in|varcharout|regproc|regproc",
+            "catalog_io_enum|enum_in|enum_out|regproc|regproc",
+            "catalog_io_table|record_in|record_out|regproc|regproc",
+            "catalog_io_view|record_in|record_out|regproc|regproc",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_index_vectors(id integer, note text, extra integer);
+         CREATE INDEX catalog_index_vectors_idx ON catalog_index_vectors
+           (id DESC NULLS LAST, note COLLATE \"C\" ASC NULLS FIRST) INCLUDE (extra);
+         SELECT indnatts,indnkeyatts,indoption::text,indcollation::text,
+                pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
+                indoption[0],indoption[1],
+                indcollation[0]=0::oid,indcollation[1]='\"C\"'::regcollation::oid
+           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;
+         SELECT array_dims(indoption::smallint[]),array_dims(indcollation::oid[]),
+                (indoption::smallint[])::text,(indoption::smallint[])[0],
+                indoption[-1] IS NULL,indoption[2] IS NULL,
+                '[0:1]={1,2}'::integer[]::bigint[]::text
+           FROM pg_index WHERE indexrelid='catalog_index_vectors_idx'::regclass;
+         SELECT 1009::oid::regtype::text,1115::oid::regtype::text,
+                1002::oid::regtype::text,'timestamp[]'::regtype::text;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "3|2|1 2|0 950|int2vector|oidvector|1|2|t|t",
+            "[0:1]|[0:1]|[0:1]={1,2}|1|t|t|[0:1]={1,2}",
+            "text[]|timestamp without time zone[]|\"char\"[]|timestamp without time zone[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE catalog_view_reader;
+         ALTER ROLE catalog_view_reader SET application_name='catalog-old';
+         CREATE TABLE catalog_view_orders(id integer);
+         CREATE INDEX catalog_view_index ON catalog_view_orders(id);
+         ALTER TABLE catalog_view_orders OWNER TO catalog_view_reader;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut reader = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let selected = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename='catalog_view_orders';
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname='catalog_view_reader';");
+    assert_eq!(
+        data_rows(&selected),
+        [
+            "catalog_view_orders|catalog_view_reader|t",
+            "catalog_view_reader|{application_name=catalog-old}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE catalog_view_orders RENAME TO catalog_view_sales;
+         ALTER ROLE catalog_view_reader RENAME TO catalog_view_renamed;
+         ALTER ROLE catalog_view_renamed SET application_name='catalog-new';
+         DROP INDEX catalog_view_index;",
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let vacuum = run_with(&mut engine, &mut budget, "VACUUM catalog_view_sales");
+    assert!(
+        !message_types(&vacuum).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&vacuum)
+    );
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename IN ('catalog_view_orders','catalog_view_sales');
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname IN ('catalog_view_reader','catalog_view_renamed');
+         ROLLBACK;");
+    assert_eq!(
+        data_rows(&retained),
+        [
+            "catalog_view_orders|catalog_view_renamed|t",
+            "catalog_view_reader|{application_name=catalog-old}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    let fresh = run_with(&mut engine, &mut budget,
+        "SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename IN ('catalog_view_orders','catalog_view_sales');
+         SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname IN ('catalog_view_reader','catalog_view_renamed');
+         SELECT pg_get_userbyid(0),pg_get_userbyid(4294967295::oid),pg_get_userbyid(NULL::oid),pg_typeof(pg_get_userbyid(0))::text;
+         SET ROLE catalog_view_renamed;
+         SELECT rolpassword FROM pg_roles WHERE rolname='catalog_view_renamed';
+         RESET ROLE;");
+    assert_eq!(
+        data_rows(&fresh),
+        [
+            "catalog_view_sales|catalog_view_renamed|f",
+            "catalog_view_renamed|{application_name=catalog-new}",
+            "unknown (OID=0)|unknown (OID=4294967295)|NULL|name",
+            "********"
+        ],
+        "{}",
+        String::from_utf8_lossy(&fresh)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE catalog_view_renamed; SELECT rolpassword FROM pg_authid",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+}
+
+#[test]
+fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
+    for (isolation, expected) in [
+        ("REPEATABLE READ", "orders|id"),
+        ("READ COMMITTED", "sales|newid"),
+    ] {
+        let (mut engine, mut budget) = test_engine();
+        let setup = run_with(&mut engine, &mut budget, "CREATE TABLE orders(id integer)");
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+        let mut guc = GucState::new();
+        let rows = "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname IN ('orders', 'sales') AND a.attnum > 0 ORDER BY a.attnum";
+        let started = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            &format!("BEGIN ISOLATION LEVEL {isolation}; {rows}"),
+        );
+        assert_eq!(data_rows(&started), ["orders|id"]);
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE orders RENAME TO sales; ALTER TABLE sales RENAME COLUMN id TO newid",
+        );
+        assert!(
+            !String::from_utf8_lossy(&changed).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let selected =
+            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, rows);
+        assert_eq!(
+            data_rows(&selected),
+            [expected],
+            "{isolation}: {}",
+            String::from_utf8_lossy(&selected)
+        );
+        let names = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "SELECT to_regclass('orders') IS NULL, to_regclass('sales')::text; CREATE TABLE private_orders(id integer); SELECT relname FROM pg_class WHERE relname = 'private_orders'; ROLLBACK",
+        );
+        assert_eq!(
+            data_rows(&names),
+            ["t|sales", "private_orders"],
+            "{}",
+            String::from_utf8_lossy(&names)
+        );
+        let fresh = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname FROM pg_class WHERE relname IN ('orders', 'sales', 'private_orders') ORDER BY relname",
+        );
+        assert_eq!(data_rows(&fresh), ["sales"]);
+    }
+}
+
+#[test]
+fn catalog_snapshot_exhaustion_rolls_back_before_durability_and_releases_owners() {
+    let mut config = test_config("catalog-history-exhaustion");
+    config.catalog_history_bytes = 64;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let started = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class",
+    );
+    assert!(!String::from_utf8_lossy(&started).contains("ERROR"));
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_catalog_rows(id integer)",
+    );
+    let failed = String::from_utf8_lossy(&failed);
+    assert!(
+        failed.contains("54000") && failed.contains("catalog_history_bytes"),
+        "{failed}"
+    );
+    assert!(
+        engine
+            .storage
+            .find_visible("public", "bounded_catalog_rows", 0)
+            .is_none()
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+    let retried = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_catalog_rows(id integer); SELECT count(*) FROM bounded_catalog_rows",
+    );
+    assert!(
+        !String::from_utf8_lossy(&retried).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&retried)
+    );
+    assert_eq!(data_rows(&retried), ["0"]);
+}
+
+#[test]
+fn parameter_acl_row_identity_default_removal_and_empty_lists_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(&mut engine, &mut budget,
+        "CREATE ROLE parameter_reader;
+         CREATE ROLE parameter_writer;
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         CREATE TABLE saved_parameter_oid AS SELECT oid FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT ALTER SYSTEM ON PARAMETER event_triggers TO parameter_writer;
+         SELECT oid = (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         REVOKE ALTER SYSTEM ON PARAMETER event_triggers FROM parameter_writer;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         SELECT oid <> (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         UPDATE saved_parameter_oid SET oid = (SELECT oid FROM pg_parameter_acl WHERE parname = 'event_triggers');
+         BEGIN;
+         SAVEPOINT before_parameter_recreation;
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         GRANT SET ON PARAMETER event_triggers TO parameter_reader;
+         SELECT oid <> (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         ROLLBACK TO before_parameter_recreation;
+         SELECT oid = (SELECT oid FROM saved_parameter_oid) FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         COMMIT;
+         REVOKE ALL ON PARAMETER event_triggers FROM postgres;
+         REVOKE SET ON PARAMETER event_triggers FROM parameter_reader;
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'event_triggers';
+         GRANT ALL ON PARAMETER event_triggers TO postgres;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'event_triggers';");
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["t", "0", "t", "t", "t", "{}", "0"]);
+}
+
+#[test]
 fn parameter_acls_are_typed_enforced_and_visible() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -21329,12 +22205,176 @@ fn parameter_acls_are_typed_enforced_and_visible() {
 }
 
 #[test]
+fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery() {
+    let mut config = test_config("catalog-relation-metadata-cold");
+    config.max_prepared_transactions = 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("catalog-relation-metadata-cold-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE relation_estimates(id integer, note text);
+         INSERT INTO relation_estimates SELECT generate_series(1,8), 'old';
+         ANALYZE relation_estimates;
+         COMMENT ON TABLE relation_estimates IS 'discarded comment';
+         COMMENT ON TABLE relation_estimates IS NULL;
+         COMMENT ON TABLE relation_estimates IS 'old comment';
+         CREATE TABLE retained_index_hint(id integer);
+         CREATE INDEX initial_hint_index ON retained_index_hint(id);
+         DROP INDEX initial_hint_index;
+         CREATE TABLE unknown_estimate(id integer);",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let table = engine
+        .storage
+        .find_table("public", "relation_estimates")
+        .unwrap();
+    let before_columns = engine.storage.table_statistics(table, 0).columns;
+    assert!(engine.checkpoint().unwrap());
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE journal_index_hint(id integer);
+         CREATE INDEX journal_hint_index ON journal_index_hint(id);
+         DROP INDEX journal_hint_index;
+         BEGIN;
+         INSERT INTO relation_estimates SELECT generate_series(9,16), NULL;
+         ANALYZE relation_estimates;
+         COMMENT ON TABLE relation_estimates IS 'prepared comment';
+         PREPARE TRANSACTION 'relation-counts-commit';
+         BEGIN;
+         CREATE INDEX rollback_hint_index ON retained_index_hint(id);
+         PREPARE TRANSACTION 'relation-hint-rollback';",
+    );
+    assert!(
+        !message_types(&prepared).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let table = engine
+        .storage
+        .find_table("public", "relation_estimates")
+        .unwrap();
+    assert_eq!(
+        engine.storage.table_statistics(table, 0).columns,
+        before_columns
+    );
+    let restored = run_with(&mut engine, &mut budget,
+        "SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';
+         SELECT count(*) FROM relation_estimates;
+         SELECT relhasindex FROM pg_class WHERE relname IN ('retained_index_hint', 'journal_index_hint') ORDER BY relname;
+         SELECT reltuples::bigint FROM pg_class WHERE relname='unknown_estimate';");
+    assert_eq!(
+        data_rows(&restored),
+        ["16", "8", "t", "t", "-1"],
+        "{}",
+        String::from_utf8_lossy(&restored)
+    );
+    let mut reader = TxnState::new(&mut budget, 64).unwrap();
+    let mut guc = GucState::new();
+    let selected = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        &mut guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');",
+    );
+    assert_eq!(data_rows(&selected), ["old comment"]);
+    for decision in [
+        "COMMIT PREPARED 'relation-counts-commit'",
+        "ROLLBACK PREPARED 'relation-hint-rollback'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, decision);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        engine.storage.table_statistics(table, 0).columns[1].null_fraction_ppm,
+        500_000
+    );
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        "COMMENT ON TABLE relation_estimates IS 'own comment';
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');
+         SELECT description FROM pg_description WHERE objoid='relation_estimates'::regclass AND classoid='pg_class'::regclass AND objsubid=0;
+         SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid='relation_estimates'::regclass AND classoid='pg_class'::regclass AND objsubid=0 ORDER BY description;
+         ROLLBACK;");
+    assert_eq!(
+        data_rows(&retained),
+        ["old comment", "old comment", "old comment", "own comment"],
+        "{}",
+        String::from_utf8_lossy(&retained)
+    );
+    for command in ["VACUUM retained_index_hint", "VACUUM relation_estimates"] {
+        let output = run_with(&mut engine, &mut budget, command);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let vacuumed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relhasindex FROM pg_class WHERE relname='retained_index_hint';
+         SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';",
+    );
+    assert_eq!(
+        data_rows(&vacuumed),
+        ["f", "16"],
+        "{}",
+        String::from_utf8_lossy(&vacuumed)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let final_rows = run_with(&mut engine, &mut budget,
+        "SELECT relhasindex FROM pg_class WHERE relname IN ('retained_index_hint', 'journal_index_hint') ORDER BY relname;
+         SELECT reltuples::bigint FROM pg_class WHERE relname='relation_estimates';
+         SELECT reltuples::bigint FROM pg_class WHERE relname='unknown_estimate';
+         SELECT obj_description('relation_estimates'::regclass, 'pg_class');");
+    assert_eq!(
+        data_rows(&final_rows),
+        ["t", "f", "16", "-1", "prepared comment"],
+        "{}",
+        String::from_utf8_lossy(&final_rows)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn parameter_acls_survive_cold_object_store_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("parameter-acl-cold-{sequence}"));
+    config.max_prepared_transactions = 2;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-parameter-acl-{}-{sequence}", std::process::id());
@@ -21352,23 +22392,110 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         &mut engine,
         &mut budget,
         "CREATE ROLE durable_parameter_operator;
-         GRANT SET ON PARAMETER event_triggers TO durable_parameter_operator;",
+         GRANT SET ON PARAMETER event_triggers, track_functions TO durable_parameter_operator;
+         REVOKE ALL ON PARAMETER track_functions FROM postgres;
+         REVOKE SET ON PARAMETER track_functions FROM durable_parameter_operator;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&output)
     );
+    let original_ids = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT parname, oid FROM pg_parameter_acl ORDER BY parname",
+    ));
+    assert_eq!(original_ids.len(), 2);
     assert!(engine.checkpoint().unwrap());
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT ALTER SYSTEM ON PARAMETER event_triggers TO durable_parameter_operator;
+         BEGIN;
+         CREATE ROLE prepared_parameter_operator;
+         GRANT SET ON PARAMETER application_name TO prepared_parameter_operator;
+         PREPARE TRANSACTION 'parameter-commit';
+         BEGIN;
+         GRANT SET ON PARAMETER datestyle TO durable_parameter_operator;
+         PREPARE TRANSACTION 'parameter-rollback';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT parname, oid FROM pg_parameter_acl ORDER BY parname"
+        )),
+        original_ids
+    );
+    let resolved = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT count(*) FROM pg_parameter_acl WHERE parname IN ('application_name', 'datestyle');
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&resolved).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&resolved)
+    );
+    assert_eq!(data_rows(&resolved), ["0", "{}"]);
+    let mut old_catalog = TxnState::new(&mut restarted_budget, 64).unwrap();
+    let mut old_catalog_guc = GucState::new();
+    let selected = run_session_transaction(
+        &mut restarted,
+        &mut restarted_budget,
+        &mut old_catalog,
+        &mut old_catalog_guc,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ;
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
+         SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';",
+    );
+    assert_eq!(data_rows(&selected), ["0", "0"]);
+    for decision in [
+        "COMMIT PREPARED 'parameter-commit'",
+        "ROLLBACK PREPARED 'parameter-rollback'",
+    ] {
+        let output = run_with(&mut restarted, &mut restarted_budget, decision);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let selected = run_session_transaction(
+        &mut restarted,
+        &mut restarted_budget,
+        &mut old_catalog,
+        &mut old_catalog_guc,
+        "SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
+         SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';
+         SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&selected),
+        ["0", "0", "t"],
+        "{}",
+        String::from_utf8_lossy(&selected)
+    );
+    assert_eq!(data_rows(&run_with(&mut restarted, &mut restarted_budget,
+        "SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         SELECT count(*) FROM pg_parameter_acl WHERE parname = 'datestyle';")), ["t", "0"]);
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT parname, paracl::text FROM pg_parameter_acl;
+        "SELECT parname, paracl::text FROM pg_parameter_acl WHERE parname = 'event_triggers';
          SELECT has_parameter_privilege('durable_parameter_operator', 'event_triggers', 'SET');
          SET ROLE durable_parameter_operator;
          SET event_triggers = off;",
@@ -21376,13 +22503,31 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     assert_eq!(
         data_rows(&output),
         [
-            "event_triggers|{postgres=sA/postgres,durable_parameter_operator=s/postgres}",
+            "event_triggers|{postgres=sA/postgres,durable_parameter_operator=sA/postgres}",
             "t"
         ],
         "{}",
         String::from_utf8_lossy(&output)
     );
+    assert!(restarted.checkpoint().unwrap());
     drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut final_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    let final_rows = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
+         SELECT paracl::text FROM pg_parameter_acl WHERE parname = 'track_functions';
+         SELECT count(*) FROM pg_prepared_xacts;",
+    );
+    assert_eq!(
+        data_rows(&final_rows),
+        ["t", "{}", "0"],
+        "{}",
+        String::from_utf8_lossy(&final_rows)
+    );
+    drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -21441,6 +22586,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("role-acl-cold-{sequence}"));
+    config.max_prepared_transactions = 1;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-role-acl-{}-{sequence}", std::process::id());
@@ -21481,7 +22627,15 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
          RESET ROLE;
          REVOKE USAGE ON TYPE durable_state FROM PUBLIC;
          GRANT SELECT ON durable_exposed TO durable_reader;
-         GRANT USAGE ON SEQUENCE durable_sequence TO durable_reader;",
+         GRANT USAGE ON SEQUENCE durable_sequence TO durable_reader;
+         CREATE TABLE durable_acl_released(id integer);
+         CREATE TABLE durable_acl_ordered(id integer);
+         GRANT SELECT ON durable_acl_released TO durable_reader;
+         GRANT SELECT ON durable_acl_ordered TO durable_reader;
+         DROP TABLE durable_acl_released;
+         GRANT UPDATE ON durable_acl_ordered TO unprivileged;
+         CREATE TABLE durable_acl_empty(id integer);
+         REVOKE ALL PRIVILEGES ON durable_acl_empty FROM postgres;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -21489,6 +22643,20 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&output)
     );
     assert!(engine.checkpoint().unwrap());
+    let journal = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_acl_journal_empty(id integer);
+         REVOKE ALL PRIVILEGES ON durable_acl_journal_empty FROM postgres;
+         BEGIN;
+         GRANT SELECT ON durable_acl_empty TO unprivileged;
+         PREPARE TRANSACTION 'durable-acl-grants';",
+    );
+    assert!(
+        !message_types(&journal).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&journal)
+    );
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -21499,6 +22667,44 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         ),
     );
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let permissions = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT relname, relacl::text FROM pg_class
+          WHERE relname IN ('durable_acl_empty','durable_acl_journal_empty','durable_acl_ordered')
+          ORDER BY relname;",
+    );
+    assert_eq!(
+        data_rows(&permissions),
+        [
+            "durable_acl_empty|{}",
+            "durable_acl_journal_empty|{}",
+            "durable_acl_ordered|{postgres=arwdDxtm/postgres,durable_reader=r/postgres,unprivileged=w/postgres}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&permissions)
+    );
+    let committed = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "COMMIT PREPARED 'durable-acl-grants'",
+    );
+    assert!(
+        !message_types(&committed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    let committed = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT relacl::text FROM pg_class WHERE relname='durable_acl_empty'",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["{unprivileged=r/postgres}"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
@@ -21534,7 +22740,29 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    assert!(restarted.checkpoint().unwrap());
     drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut final_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    let final_permissions = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "SELECT relname, relacl::text FROM pg_class
+          WHERE relname IN ('durable_acl_empty','durable_acl_journal_empty','durable_acl_ordered')
+          ORDER BY relname;",
+    );
+    assert_eq!(
+        data_rows(&final_permissions),
+        [
+            "durable_acl_empty|{unprivileged=r/postgres}",
+            "durable_acl_journal_empty|{}",
+            "durable_acl_ordered|{postgres=arwdDxtm/postgres,durable_reader=r/postgres,unprivileged=w/postgres}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&final_permissions)
+    );
+    drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -23342,7 +24570,7 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
         "SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend \
          UNION ALL \
          SELECT 'pg_opfamily'::regclass, amopfamily, 'pg_operator'::regclass, \
-                amopopr, 'n'::character \
+                amopopr, 'n'::\"char\" \
          FROM pg_amop WHERE oid = 10299",
     );
     assert!(
@@ -23357,56 +24585,82 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
             crate::sql::types::oid::OID,
             crate::sql::types::oid::OID,
             crate::sql::types::oid::OID,
-            crate::sql::types::oid::BPCHAR,
+            crate::sql::types::oid::CHAR,
         ]
     );
 }
 
 #[test]
-fn catalog_schema_resolution_retains_only_its_owned_definition() {
-    let (engine, mut budget) = test_engine();
-    let arena = Arena::new(&mut budget, "catalog schema scratch", 4 << 20).unwrap();
-    for catalog in [
-        "pg_amop",
-        "pg_depend",
-        "pg_partitioned_table",
-        "pg_class",
-        "pg_constraint",
-        "pg_attrdef",
-    ] {
+fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
+    let config = test_config("catalog-schema-resolution");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes((1 << 27) + (1 << 20)));
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let arena = Arena::new(
+        &mut budget,
+        "catalog schema scratch",
+        config.sql_arena_bytes,
+    )
+    .unwrap();
+    for (qualifier, catalog) in crate::sql::catalog::CATALOG_RELATIONS
+        .iter()
+        .map(|name| ("pg_catalog", *name))
+        .chain([
+            ("information_schema", "tables"),
+            ("information_schema", "columns"),
+        ])
+    {
         let mark = arena.mark();
         let before = arena.used();
-        crate::mem::guard::forbid_alloc(|| {
-            let shape =
-                crate::sql::catalog::synthesize_definition(Some("pg_catalog"), catalog, &arena)
-                    .unwrap();
-            assert!(shape.rows.is_empty());
-            assert_eq!(shape.def.name.as_str(), catalog);
-            assert_eq!(
-                arena.used() - before,
-                core::mem::size_of::<crate::storage::TableDef>()
-            );
-            let materialized = crate::sql::catalog::synthesize(
-                &engine.storage,
-                Some("pg_catalog"),
-                catalog,
-                0,
-                &arena,
-            )
-            .unwrap();
-            assert_eq!(shape.hidden_columns, materialized.hidden_columns);
-            assert_eq!(shape.def.n_columns, materialized.def.n_columns);
-            let width = shape.def.n_columns + shape.hidden_columns;
-            for (actual, expected) in shape.def.columns[..width]
-                .iter()
-                .zip(&materialized.def.columns[..width])
-            {
-                assert_eq!(actual.name, expected.name);
-                assert_eq!(actual.ctype, expected.ctype);
-                assert_eq!(actual.type_mod, expected.type_mod);
-                assert_eq!(actual.collation, expected.collation);
-            }
-        });
+        let result =
+            crate::mem::guard::forbid_alloc(|| -> Result<(), crate::sql::eval::SqlError> {
+                let shape =
+                    crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)?;
+                assert!(shape.rows.is_empty());
+                assert_eq!(shape.def.name.as_str(), catalog);
+                assert_eq!(
+                    arena.used() - before,
+                    core::mem::size_of::<crate::storage::TableDef>()
+                );
+                let materialized = crate::sql::catalog::synthesize(
+                    &engine.storage,
+                    Some(qualifier),
+                    catalog,
+                    0,
+                    crate::sql::catalog_snapshot::CatalogScan::Sequential,
+                    &arena,
+                )?;
+                assert_eq!(shape.hidden_columns, materialized.hidden_columns);
+                assert_eq!(shape.def.n_columns, materialized.def.n_columns);
+                let width = shape.def.n_columns + shape.hidden_columns;
+                for (actual, expected) in shape.def.columns[..width]
+                    .iter()
+                    .zip(&materialized.def.columns[..width])
+                {
+                    assert_eq!(actual.name, expected.name);
+                    assert_eq!(actual.ctype, expected.ctype);
+                    assert_eq!(actual.type_mod, expected.type_mod);
+                    assert_eq!(actual.collation, expected.collation);
+                }
+                for row in materialized.rows {
+                    assert_eq!(row.len(), width, "{qualifier}.{catalog}");
+                    if materialized.hidden_columns == 1 {
+                        assert_eq!(
+                            row[materialized.def.n_columns],
+                            Datum::Oid(
+                                crate::sql::catalog_snapshot_keys::RELATIONS
+                                    .iter()
+                                    .find(|relation| relation.name == catalog)
+                                    .unwrap()
+                                    .oid
+                                    .get(),
+                            ),
+                            "{qualifier}.{catalog}"
+                        );
+                    }
+                }
+                Ok(())
+            });
+        result.unwrap_or_else(|error| panic!("{qualifier}.{catalog}: {error:?}"));
         // Every descriptor and row from this iteration was consumed above.
         unsafe { arena.rewind_to(mark) };
     }
@@ -28264,7 +29518,7 @@ fn information_schema_columns_exposes_complete_column_metadata() {
             "occurred|NULL|NULL|NULL|NULL|2|timestamp without time zone|NULL|pg_catalog|timestamp|NO|NULL|NULL|NULL|NO|NEVER|3|YES",
             "generated|NULL|32|2|0|NULL|integer|NULL|pg_catalog|int4|NO|NULL|NULL|NULL|NO|ALWAYS|4|YES",
             "identity|NULL|64|2|0|NULL|bigint|NULL|pg_catalog|int8|YES|BY DEFAULT|9223372036854775807|1|NO|NEVER|5|YES",
-            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|public|information_schema_column_domain|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
+            "domain_value|7|NULL|NULL|NULL|NULL|character varying|information_schema_column_domain|pg_catalog|varchar|NO|NULL|NULL|NULL|NO|NEVER|6|YES",
             "enum_value|NULL|NULL|NULL|NULL|NULL|USER-DEFINED|NULL|public|information_schema_column_enum|NO|NULL|NULL|NULL|NO|NEVER|7|YES",
         ]
     );
@@ -33125,7 +34379,7 @@ fn column_collation_survives_wal_and_checkpoint_recovery() {
                  SELECT indcollation FROM pg_index \
                  WHERE indexrelid = 'collation_values_bytewise_index'::regclass",
             )),
-            ["{950}"],
+            ["950"],
         );
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
@@ -33156,7 +34410,7 @@ fn expression_index_collation_is_derived_from_its_text_argument() {
     );
     assert_eq!(
         data_rows(&output),
-        ["{950}"],
+        ["950"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -43353,7 +44607,7 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 }
 
 #[test]
-fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
+fn revoke_all_functions_rolls_back_default_acl_materialization_at_capacity() {
     const ROUTINES: usize = 65;
     let mut config = test_config("revoke-all-functions-public-acl");
     config.max_catalog_versions_per_object = 1;
@@ -43396,11 +44650,15 @@ fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
              'EXECUTE'
          );",
     );
+    assert_eq!(error_sqlstates(&revoked), ["54000"]);
+    let after = run_with(&mut engine, &mut budget,
+        "SELECT has_function_privilege('routine_acl_unrelated_reader', 'routine_acl_unrelated_0()', 'EXECUTE');
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'routine_acl_unrelated_%' AND proacl IS NULL");
     assert_eq!(
-        data_rows(&revoked),
-        ["t"],
+        data_rows(&after),
+        ["t", "65"],
         "{}",
-        String::from_utf8_lossy(&revoked)
+        String::from_utf8_lossy(&after)
     );
 }
 
@@ -62111,7 +63369,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
         ),
         (
             "CREATE INDEX bad_gin_class ON search_rows USING gin (tags jsonb_ops)",
-            "does not accept data type array",
+            "does not accept data type integer[]",
         ),
         (
             "CREATE UNIQUE INDEX bad_spgist_unique ON search_rows USING spgist (network)",
@@ -69979,7 +71237,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
          COMMENT ON TABLE template_app.items IS 'copied template table';
          GRANT USAGE ON SCHEMA template_app TO template_reader;
-         GRANT SELECT ON template_app.items TO template_reader;",
+         GRANT SELECT ON template_app.items TO template_reader;
+         REVOKE ALL PRIVILEGES ON template_app.item_audit FROM postgres;",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -70029,10 +71288,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.item_audit'::regclass;
+         SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),
-        ["t", "11|ready"]
+        ["{}", "t", "11|ready"]
     );
     let output = run_with(
         &mut engine,
@@ -70246,10 +71506,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
+            "SELECT relacl::text FROM pg_class WHERE oid='template_app.item_audit'::regclass;
+         SELECT c.reloftype = t.oid FROM pg_class c JOIN pg_type t ON t.typname = 'typed_row' \
          WHERE c.relname = 'typed_rows'; SELECT id, state FROM template_app.typed_rows"
         )),
-        ["t", "11|ready"]
+        ["{}", "t", "11|ready"]
     );
     let reloaded_session = GucState::new();
     restarted.apply_system_settings(&reloaded_session).unwrap();
@@ -70316,6 +71577,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -74093,7 +75357,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
-            "t|t|t|{0,950}|1978 3126|{0,1}",
+            "t|t|t|0 950|1978 3126|0 1",
         ]
     );
     run_with(
@@ -74240,8 +75504,8 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
             &mut budget,
             "CREATE TABLE durable_catalog_vectors (\
                  id integer PRIMARY KEY,\
-                 attributes int2vector DEFAULT '3 -4',\
-                 identifiers oidvector DEFAULT '7 8'); \
+                 attributes int2vector DEFAULT ('[-3:-2]={3,-4}'::int2[]::int2vector),\
+                 identifiers oidvector DEFAULT ('[8:9]={7,8}'::oid[]::oidvector)); \
              INSERT INTO durable_catalog_vectors VALUES \
                  (1, ARRAY[1::int2, 2::int2]::int2vector, '9 10'::oidvector), \
                  (2, DEFAULT, DEFAULT)",
@@ -74264,7 +75528,10 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
         "SELECT attributes::int2[]::text, identifiers::oid[]::text \
            FROM durable_catalog_vectors ORDER BY id",
     );
-    assert_eq!(data_rows(&rows), ["{1,2}|{9,10}", "{3,-4}|{7,8}"]);
+    assert_eq!(
+        data_rows(&rows),
+        ["{1,2}|[0:1]={9,10}", "[-3:-2]={3,-4}|[8:9]={7,8}"]
+    );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -74339,7 +75606,7 @@ fn pg_dump_bootstrap_surface() {
                JOIN pg_catalog.pg_publication pub ON pub.oid = pr.prpubid \
               WHERE pub.pubname = 'pg_dump_publication_changes'",
         )),
-        ["{1,2}"]
+        ["[0:1]={1,2}"]
     );
     let catalog_vector_casts = run_with(
         &mut engine,
@@ -79633,7 +80900,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v21\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v25\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -79670,6 +80937,30 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
     let current_text = core::str::from_utf8(&current).unwrap();
+    let internal_hint = format!("hidx {} 0\n", engine.storage.large_object_page_table());
+    assert!(current_text.contains(&internal_hint));
+    rejected_roots.push((
+        current_text.replace(&internal_hint, ""),
+        "manifest relation index hints are incomplete",
+    ));
+    rejected_roots.push((
+        current_text.replace(&internal_hint, &format!("{internal_hint}{internal_hint}")),
+        "duplicate or trailing relation index hint",
+    ));
+    rejected_roots.push((
+        current_text.replace(
+            &internal_hint,
+            &format!("hidx {} 1\n", engine.storage.large_object_page_table()),
+        ),
+        "internal large-object relation cannot have a user index hint",
+    ));
+    rejected_roots.push((
+        current_text.replace(
+            &internal_hint,
+            &format!("hidx {} 2\n", engine.storage.large_object_page_table()),
+        ),
+        "invalid relation index hint",
+    ));
     for (field, message) in [
         ("writer ", "manifest writer identity missing"),
         ("lsn ", "manifest LSN missing"),
@@ -79764,10 +81055,9 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
                 } else {
                     bytes.as_slice()
                 };
-                assert_eq!(
-                    saved.object_bytes(&full_key),
-                    Some(expected_bytes),
-                    "rejected {key} must not rewrite {saved_key}"
+                assert!(
+                    saved.object_bytes(&full_key) == Some(expected_bytes),
+                    "rejected {key} ({expected}) must not rewrite {saved_key}"
                 );
             }
         }
@@ -79823,7 +81113,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v21\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v25\n"))
     );
     drop(recovered);
 

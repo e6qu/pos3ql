@@ -205,7 +205,7 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
         Ok(home)
     }
 
-    pub(super) fn publication_generation(
+    pub(crate) fn publication_generation(
         &self,
         storage: &Storage,
         table: usize,

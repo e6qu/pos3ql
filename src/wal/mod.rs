@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 7;
+pub(crate) const RECORD_VERSION: u8 = 12;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -151,6 +151,8 @@ wal_record_kinds! {
     KIND_CREATE_VIEW_BOUND = 152;
     KIND_UPSERT_V2 = 153;
     KIND_CREATE_TYPED = 154;
+    KIND_PREPARED_CATALOG_ROW = 155;
+    KIND_SET_RELATION_INDEX_HINT = 156;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -250,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 7;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 8;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -1761,6 +1763,7 @@ pub(crate) enum WalOp<'a> {
         grantor: &'a str,
         privileges: crate::storage::PrivilegeSet,
         grant_options: crate::storage::PrivilegeSet,
+        order: core::num::NonZeroU64,
     },
     SetColumnAcl {
         class: u8,
@@ -1784,10 +1787,16 @@ pub(crate) enum WalOp<'a> {
     },
     SetParameterAcl {
         parameter: &'a str,
-        grantee: &'a str,
-        grantor: &'a str,
-        privileges: crate::sql::ast::ParameterPrivileges,
-        grant_options: crate::sql::ast::ParameterPrivileges,
+        expected: Option<crate::storage::ParameterAclOid>,
+        image: Option<crate::storage::ParameterAclImage<'a>>,
+    },
+    PreparedCatalogRow {
+        relation: crate::storage::CatalogRelationIdentity,
+        row: crate::storage::HistoricalCatalogRow<'a>,
+    },
+    SetRelationIndexHint {
+        position: crate::storage::CatalogPosition,
+        has_index: bool,
     },
 }
 
@@ -2802,6 +2811,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
+        WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
+        WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
 }
 
@@ -3999,7 +4010,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + grantee.len()
                 + 1
                 + grantor.len()
-                + 4
+                + 12
         }
         WalOp::SetColumnAcl {
             schema,
@@ -4015,11 +4026,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
         WalOp::SetParameterAcl {
-            parameter,
-            grantee,
-            grantor,
-            ..
-        } => 1 + parameter.len() + 1 + grantee.len() + 1 + grantor.len() + 2,
+            parameter, image, ..
+        } => {
+            1 + parameter.len() + 4 + 1 + image.map_or(0, |image| 8 + image.grants().encoded_len())
+        }
+        WalOp::PreparedCatalogRow { row, .. } => 28usize
+            .saturating_add(row.key.len())
+            .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
+        WalOp::SetRelationIndexHint { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1,
     }
 }
 
@@ -6268,6 +6282,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             grantor,
             privileges,
             grant_options,
+            order,
         } => {
             buffer.append(&[*class])
                 && (!access_class_has_oid(*class) || buffer.append(&object_oid.to_le_bytes()))
@@ -6277,6 +6292,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, grantor)
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
+                && buffer.append(&order.get().to_le_bytes())
         }
         WalOp::SetColumnAcl {
             class,
@@ -6316,15 +6332,57 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::SetParameterAcl {
             parameter,
-            grantee,
-            grantor,
-            privileges,
-            grant_options,
+            expected,
+            image,
         } => {
-            name_bytes(buffer, parameter)
-                && name_bytes(buffer, grantee)
-                && name_bytes(buffer, grantor)
-                && buffer.append(&[privileges.bits(), grant_options.bits()])
+            let mut ok = name_bytes(buffer, parameter)
+                && buffer.append(&expected.map_or(0, |oid| oid.get()).to_le_bytes())
+                && buffer.append(&[u8::from(image.is_some())]);
+            if let Some(image) = image {
+                let Ok(count) = u32::try_from(image.grants().len()) else {
+                    return false;
+                };
+                ok &= buffer.append(&image.oid().get().to_le_bytes())
+                    && buffer.append(&count.to_le_bytes());
+                for grant in image.grants().iter() {
+                    ok &= buffer.append(&grant.encode());
+                }
+            }
+            ok
+        }
+        WalOp::SetRelationIndexHint {
+            position,
+            has_index,
+        } => buffer.append(&position.encode()) && buffer.append(&[u8::from(*has_index)]),
+        WalOp::PreparedCatalogRow { relation, row } => {
+            let Ok(key_length) = u32::try_from(row.key.len()) else {
+                return false;
+            };
+            let Ok(row_length) = u32::try_from(row.before.map_or(0, |image| image.bytes.len()))
+            else {
+                return false;
+            };
+            buffer.append(
+                &relation
+                    .database
+                    .map_or(0, |database| database.get())
+                    .to_le_bytes(),
+            ) && buffer.append(&relation.relation.get().to_le_bytes())
+                && buffer.append(&key_length.to_le_bytes())
+                && buffer.append(
+                    &row.before
+                        .map_or(0, |image| image.count.get())
+                        .to_le_bytes(),
+                )
+                && buffer.append(&row_length.to_le_bytes())
+                && buffer.append(
+                    &row.before
+                        .and_then(|image| image.root)
+                        .map_or(0, core::num::NonZeroU64::get)
+                        .to_le_bytes(),
+                )
+                && buffer.append(row.key)
+                && buffer.append(row.before.map_or(&[], |image| image.bytes))
         }
         WalOp::Analyze {
             schema,
@@ -11373,6 +11431,10 @@ fn decode_op_inner<'a>(
             at += 2;
             let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            let order = core::num::NonZeroU64::new(u64::from_le_bytes(
+                payload.get(at..at + 8)?.try_into().ok()?,
+            ))?;
+            at += 8;
             if privileges & !crate::storage::all_object_privileges(class).0 != 0
                 || grant_options & !privileges != 0
             {
@@ -11387,6 +11449,7 @@ fn decode_op_inner<'a>(
                 grantor,
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
+                order,
             })
         }),
         KIND_SET_COLUMN_ACL => decode_large_op(|| {
@@ -11460,24 +11523,97 @@ fn decode_op_inner<'a>(
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }),
+        KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
+            let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;
+            if payload.len() != 11 {
+                return None;
+            }
+            let has_index = match payload[10] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            Some(WalOp::SetRelationIndexHint {
+                position,
+                has_index,
+            })
+        }),
+        KIND_PREPARED_CATALOG_ROW => decode_large_op(|| {
+            use core::num::{NonZeroU32, NonZeroUsize};
+            let database = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            let database = if database == 0 {
+                None
+            } else {
+                Some(crate::storage::DatabaseOid::parse(database as i32)?)
+            };
+            let relation =
+                NonZeroU32::new(u32::from_le_bytes(payload.get(4..8)?.try_into().ok()?))?;
+            let key_length = NonZeroUsize::new(u32::from_le_bytes(
+                payload.get(8..12)?.try_into().ok()?,
+            ) as usize)?
+            .get();
+            let count = u32::from_le_bytes(payload.get(12..16)?.try_into().ok()?);
+            let row_length = u32::from_le_bytes(payload.get(16..20)?.try_into().ok()?) as usize;
+            let root = core::num::NonZeroU64::new(u64::from_le_bytes(
+                payload.get(20..28)?.try_into().ok()?,
+            ));
+            let key_end = 28usize.checked_add(key_length)?;
+            let row_end = key_end.checked_add(row_length)?;
+            if row_end != payload.len() {
+                return None;
+            }
+            let key = payload.get(28..key_end)?;
+            let before = match (NonZeroU32::new(count), row_length) {
+                (None, 0) if root.is_none() => None,
+                (Some(count), length) if length > 0 && (root.is_none() || count.get() == 1) => {
+                    Some(crate::storage::CatalogRowImage {
+                        bytes: payload.get(key_end..row_end)?,
+                        count,
+                        root,
+                    })
+                }
+                _ => return None,
+            };
+            Some(WalOp::PreparedCatalogRow {
+                relation: crate::storage::CatalogRelationIdentity { database, relation },
+                row: crate::storage::HistoricalCatalogRow { key, before },
+            })
+        }),
         KIND_SET_PARAMETER_ACL => decode_large_op(|| {
             let parameter = take_name(&mut at)?;
             crate::sql::ast::ParameterName::parse(parameter)?;
-            let grantee = take_name(&mut at)?;
-            let grantor = take_name(&mut at)?;
-            let privileges = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
+            let expected = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let expected = if expected == 0 {
+                None
+            } else {
+                Some(crate::storage::ParameterAclOid::parse(expected)?)
+            };
+            let present = *payload.get(at)?;
             at += 1;
-            let grant_options = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
-            at += 1;
-            if !privileges.contains(grant_options) {
-                return None;
-            }
+            let image = match present {
+                0 => None,
+                1 => {
+                    let oid = crate::storage::ParameterAclOid::parse(u32::from_le_bytes(
+                        payload.get(at..at + 4)?.try_into().ok()?,
+                    ))?;
+                    at += 4;
+                    let count =
+                        u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                    at += 4;
+                    let end = count
+                        .checked_mul(crate::storage::ParameterAclGrant::BYTES)?
+                        .checked_add(at)?;
+                    let grants = crate::storage::ParameterAclGrants::parse(payload.get(at..end)?)?;
+                    at = end;
+                    Some(crate::storage::ParameterAclImage::new(oid, grants)?)
+                }
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::SetParameterAcl {
                 parameter,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
+                expected,
+                image,
             })
         }),
         _ => None,
@@ -11522,7 +11658,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
-            1 + *len as usize
+            5 + *len as usize
         }
         Some(OwnedDatum::Range { len, .. }) => 3 + *len as usize,
     }
@@ -11968,17 +12104,27 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
         }
-        Some(OwnedDatum::Int2Vector { len, bytes }) => {
+        Some(OwnedDatum::Int2Vector {
+            lower_bound,
+            len,
+            bytes,
+        }) => {
             out[0] = 31;
             out[1] = *len;
-            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            2 + *len as usize
+            out[2..6].copy_from_slice(&lower_bound.to_le_bytes());
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
         }
-        Some(OwnedDatum::OidVector { len, bytes }) => {
+        Some(OwnedDatum::OidVector {
+            lower_bound,
+            len,
+            bytes,
+        }) => {
             out[0] = 32;
             out[1] = *len;
-            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            2 + *len as usize
+            out[2..6].copy_from_slice(&lower_bound.to_le_bytes());
+            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            6 + *len as usize
         }
     }
 }
@@ -12315,18 +12461,24 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         }
         31 | 32 => {
             let len = *payload.get(*at)? as usize;
-            *at += 1;
+            let lower_bound =
+                i32::from_le_bytes(payload.get(*at + 1..*at + 5)?.try_into().unwrap());
+            *at += 5;
             if (tag == 31 && !len.is_multiple_of(2)) || (tag == 32 && !len.is_multiple_of(4)) {
                 return None;
             }
+            let width = if tag == 31 { 2 } else { 4 };
+            lower_bound.checked_add((len / width) as i32)?;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(if tag == 31 {
                 OwnedDatum::Int2Vector {
+                    lower_bound,
                     len: len as u8,
                     bytes,
                 }
             } else {
                 OwnedDatum::OidVector {
+                    lower_bound,
                     len: len as u8,
                     bytes,
                 }
@@ -12563,7 +12715,7 @@ fn decode_bounded_default_bytes(
 mod tests {
     use super::*;
 
-    fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8; 4096]) -> &'a [u8] {
+    fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8]) -> &'a [u8] {
         let mut budget = Budget::new(bytes.len());
         let mut payload = FixedBuf::new(
             &mut budget,
@@ -12958,10 +13110,12 @@ mod tests {
                 bytes: text,
             }),
             Some(OwnedDatum::Int2Vector {
+                lower_bound: -3,
                 len: 4,
                 bytes: vector,
             }),
             Some(OwnedDatum::OidVector {
+                lower_bound: -3,
                 len: 4,
                 bytes: vector,
             }),
@@ -13283,15 +13437,18 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::EXECUTE,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             },
         )
         .unwrap();
-        let WalOp::SetObjectAcl { object_oid, .. } =
-            decode_record(&buffer.readable()[16..]).unwrap()
+        let WalOp::SetObjectAcl {
+            object_oid, order, ..
+        } = decode_record(&buffer.readable()[16..]).unwrap()
         else {
             panic!("expected object ACL WAL operation");
         };
         assert_eq!(object_oid, 16_401);
+        assert_eq!(order.get(), 7);
 
         let mut invalid_budget = Budget::new(1024);
         let mut invalid =
@@ -13307,8 +13464,20 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::EXECUTE,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             }
         ));
+        assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+        invalid.clear();
+        assert!(invalid.append(&buffer.readable()[HEADER_LEN..]));
+        assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_some());
+        let length = invalid.len();
+        for removed in 1..=8 {
+            assert!(
+                decode_op(KIND_SET_OBJECT_ACL, &invalid.readable()[..length - removed]).is_none()
+            );
+        }
+        invalid.filled_mut()[length - 8..].fill(0);
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
     }
 
@@ -13616,27 +13785,120 @@ mod tests {
     }
 
     #[test]
+    fn prepared_catalog_row_codec_preserves_scope_absence_and_multiplicity() {
+        use crate::storage::{
+            CatalogRelationIdentity, CatalogRowImage, DatabaseOid, HistoricalCatalogRow,
+        };
+        use core::num::NonZeroU32;
+        for has_index in [false, true] {
+            let position = crate::storage::CatalogPosition::new(7, 17).unwrap();
+            let mut bytes = [0; 32];
+            let encoded = encode_catalog_operation(
+                &WalOp::SetRelationIndexHint {
+                    position,
+                    has_index,
+                },
+                &mut bytes,
+            );
+            assert!(
+                matches!(decode_op(KIND_SET_RELATION_INDEX_HINT, encoded), Some(WalOp::SetRelationIndexHint { position: actual, has_index: flag }) if actual == position && flag == has_index)
+            );
+            for end in 0..encoded.len() {
+                assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &encoded[..end]).is_none());
+            }
+            let mut invalid = [0; 11];
+            invalid.copy_from_slice(encoded);
+            invalid[10] = 2;
+            assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &invalid).is_none());
+            invalid.copy_from_slice(encoded);
+            invalid[2..10].fill(0);
+            assert!(decode_op(KIND_SET_RELATION_INDEX_HINT, &invalid).is_none());
+        }
+        for database in [None, Some(DatabaseOid::POSTGRES)] {
+            for before in [
+                None,
+                Some(CatalogRowImage {
+                    bytes: b"old catalog row",
+                    count: NonZeroU32::new(3).unwrap(),
+                    root: None,
+                }),
+                Some(CatalogRowImage {
+                    bytes: b"old catalog row",
+                    count: NonZeroU32::new(1).unwrap(),
+                    root: core::num::NonZeroU64::new(19),
+                }),
+            ] {
+                let relation = CatalogRelationIdentity {
+                    database,
+                    relation: NonZeroU32::new(1234).unwrap(),
+                };
+                let row = HistoricalCatalogRow {
+                    key: b"row key",
+                    before,
+                };
+                let mut bytes = [0; 256];
+                let payload = encode_catalog_operation(
+                    &WalOp::PreparedCatalogRow { relation, row },
+                    &mut bytes,
+                );
+                let Some(WalOp::PreparedCatalogRow {
+                    relation: decoded_relation,
+                    row: decoded_row,
+                }) = decode_op(KIND_PREPARED_CATALOG_ROW, payload)
+                else {
+                    panic!("prepared catalog row did not round trip");
+                };
+                assert_eq!(decoded_relation, relation);
+                assert_eq!(decoded_row, row);
+                for end in 0..payload.len() {
+                    assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &payload[..end]).is_none());
+                }
+                let mut invalid = [0; 256];
+                invalid[..payload.len()].copy_from_slice(payload);
+                invalid[8..12].fill(0);
+                assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none());
+                invalid[..payload.len()].copy_from_slice(payload);
+                invalid[12..16].copy_from_slice(&u32::from(before.is_none()).to_le_bytes());
+                assert!(decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none());
+                if before.is_none() {
+                    invalid[..payload.len()].copy_from_slice(payload);
+                    invalid[20..28].copy_from_slice(&19u64.to_le_bytes());
+                    assert!(
+                        decode_op(KIND_PREPARED_CATALOG_ROW, &invalid[..payload.len()]).is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parameter_acl_codec_is_typed_and_strict() {
+        use crate::storage::{
+            ParameterAclGrant, ParameterAclGrants, ParameterAclImage, ParameterAclOid,
+        };
+        let oid = ParameterAclOid::parse(17001).unwrap();
+        let grants = [ParameterAclGrant::parse(17002, 10, 3, 1).unwrap()];
         let operation = WalOp::SetParameterAcl {
             parameter: "event_triggers",
-            grantee: "reader",
-            grantor: "postgres",
-            privileges: crate::sql::ast::ParameterPrivileges::ALL,
-            grant_options: crate::sql::ast::ParameterPrivileges::SET,
+            expected: None,
+            image: Some(
+                ParameterAclImage::new(oid, ParameterAclGrants::from_slice(&grants)).unwrap(),
+            ),
         };
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
-        assert!(matches!(
-            decode_op(KIND_SET_PARAMETER_ACL, payload),
-            Some(WalOp::SetParameterAcl {
-                parameter: "event_triggers",
-                grantee: "reader",
-                grantor: "postgres",
-                privileges,
-                grant_options,
-            }) if privileges == crate::sql::ast::ParameterPrivileges::ALL
-                && grant_options == crate::sql::ast::ParameterPrivileges::SET
-        ));
+        let Some(WalOp::SetParameterAcl {
+            parameter,
+            expected,
+            image: Some(image),
+        }) = decode_op(KIND_SET_PARAMETER_ACL, payload)
+        else {
+            panic!("parameter ACL row did not round trip");
+        };
+        assert_eq!(parameter, "event_triggers");
+        assert_eq!(expected, None);
+        assert_eq!(image.oid(), oid);
+        assert_eq!(image.grants().iter().next(), Some(grants[0]));
 
         let mut invalid = [0; 4096];
         invalid[..payload.len()].copy_from_slice(payload);
@@ -13684,6 +13946,7 @@ mod tests {
                 grantor: "postgres",
                 privileges: crate::storage::PrivilegeSet::SELECT,
                 grant_options: crate::storage::PrivilegeSet::NONE,
+                order: core::num::NonZeroU64::new(7).unwrap(),
             },
         )
         .unwrap();

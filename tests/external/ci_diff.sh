@@ -4,7 +4,7 @@
 # differential.sh (which spins up its own hermetic Postgres), this expects an
 # already-running PostgreSQL — a GitHub Actions `postgres:` service — reached
 # via the standard PG* env vars, so it works headless on CI runners.
-# Usage: bash tests/external/ci_diff.sh /absolute/path/to/pos3ql
+# Usage: bash tests/external/ci_diff.sh /absolute/path/to/pos3ql /absolute/evidence-dir
 #
 # Env:
 #   PGHOST / PGPORT / PGUSER   PostgreSQL to diff against (default 127.0.0.1 / 5432 / postgres)
@@ -26,11 +26,13 @@
 # FUZZ_BUDGET so its known edge-case divergences can be ratcheted to zero.
 
 set -u
-if [[ $# != 1 || "$1" != /* || ! -f "$1" || ! -x "$1" ]]; then
-  printf '%s\n' 'usage: ci_diff.sh /absolute/path/to/executable-pos3ql' >&2
+if [[ $# != 2 || "$1" != /* || ! -f "$1" || ! -x "$1" || "$2" != /* ]]; then
+  printf '%s\n' 'usage: ci_diff.sh /absolute/path/to/executable-pos3ql /absolute/evidence-dir' >&2
   exit 2
 fi
 P3_BIN=$1
+EVIDENCE=$2
+mkdir -p "$EVIDENCE" || exit 1
 cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
 DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit 1
@@ -1591,6 +1593,20 @@ fi
 if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == types ]]; then
 restart_p3_fresh || exit 1
 echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
+if "$PY" -u "$EXT/catalog_snapshot_diff.py" \
+    --host "$PGHOST" --port "$PGPORT" --user "$PGUSER" --database postgres \
+    --metadata-output "$EVIDENCE/catalog-metadata.json" \
+    --output "$EVIDENCE/catalog-postgresql.json" > "$EVIDENCE/catalog-reference.log" 2>&1 \
+  && "$PY" -u "$EXT/catalog_snapshot_diff.py" \
+    --host 127.0.0.1 --port "$P3_PORT" --user "$PGUSER" --database postgres \
+    --reference "$EVIDENCE/catalog-postgresql.json" \
+    --output "$EVIDENCE/catalog-pos3ql.json" > "$EVIDENCE/catalog-comparison.log" 2>&1; then
+  ok "catalog row visibility ($(tail -1 "$EVIDENCE/catalog-comparison.log"))"
+else
+  bad "catalog row visibility"
+  cat "$EVIDENCE/catalog-reference.log" "$EVIDENCE/catalog-comparison.log" 2>/dev/null
+fi
+restart_p3_fresh || exit 1
 if "$PY" "$EXT/result_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/result-column-capacity.out" 2>&1; then
   ok "result-column capacity differential ($(tail -1 "$WORK/result-column-capacity.out"))"
 else

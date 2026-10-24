@@ -5,7 +5,18 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
+mod catalog_history;
+pub(crate) use catalog_history::{
+    CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
+    CatalogRowImage, HistoricalCatalogRow,
+};
 mod catalog_sources;
+mod parameter_acls;
+use parameter_acls::ParameterAclGrantIdentity;
+use parameter_acls::ParameterAclRows;
+pub(crate) use parameter_acls::{
+    ParameterAclGrant, ParameterAclGrants, ParameterAclImage, ParameterAclOid, ParameterAclUndo,
+};
 mod database_clone_positions;
 pub(crate) use database_clone_positions::{
     DatabaseCloneAllocation, DatabaseCloneKind, DatabaseClonePositions, WalDatabaseClonePositions,
@@ -779,10 +790,12 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     Int2Vector {
+        lower_bound: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     OidVector {
+        lower_bound: i32,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
@@ -941,13 +954,21 @@ impl OwnedDatum {
                     "cannot store a pseudo-type value in a column"
                 ));
             }
-            Datum::Int2Vector(raw) => {
+            Datum::Int2Vector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "int2vector")?;
-                Self::Int2Vector { len, bytes }
+                Self::Int2Vector {
+                    lower_bound: *lower_bound,
+                    len,
+                    bytes,
+                }
             }
-            Datum::OidVector(raw) => {
+            Datum::OidVector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "oidvector")?;
-                Self::OidVector { len, bytes }
+                Self::OidVector {
+                    lower_bound: *lower_bound,
+                    len,
+                    bytes,
+                }
             }
             Datum::Regtype {
                 referenced_oid,
@@ -1210,8 +1231,22 @@ impl OwnedDatum {
                 element: *element,
                 raw: &bytes[..*len as usize],
             },
-            Self::Int2Vector { len, bytes } => Datum::Int2Vector(&bytes[..*len as usize]),
-            Self::OidVector { len, bytes } => Datum::OidVector(&bytes[..*len as usize]),
+            Self::Int2Vector {
+                lower_bound,
+                len,
+                bytes,
+            } => Datum::Int2Vector {
+                lower_bound: *lower_bound,
+                raw: &bytes[..*len as usize],
+            },
+            Self::OidVector {
+                lower_bound,
+                len,
+                bytes,
+            } => Datum::OidVector {
+                lower_bound: *lower_bound,
+                raw: &bytes[..*len as usize],
+            },
             Self::Range {
                 kind,
                 multirange,
@@ -2787,7 +2822,7 @@ struct PendingTableStatisticsSlot {
     used: bool,
     previous: Option<usize>,
     depth: u32,
-    statistics: TableStatistics,
+    columns: [ColumnStatistics; MAX_COLUMNS],
 }
 
 impl TableStatistics {
@@ -2830,6 +2865,15 @@ impl PgEncoding {
 
     pub(crate) const fn code(self) -> i32 {
         self.0 as i32
+    }
+
+    pub(crate) const fn maximum_character_bytes(self) -> i32 {
+        // PostgreSQL REL_18_6 src/common/wchar.c, pg_wchar_table.maxmblen.
+        const WIDTHS: [i32; 42] = [
+            1, 3, 3, 3, 4, 3, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 3, 2,
+        ];
+        WIDTHS[self.0 as usize]
     }
 
     pub(crate) fn from_code(code: u8) -> Option<Self> {
@@ -3959,10 +4003,6 @@ impl Table {
         self.lifecycle
             .lock()
             .expect("table lifecycle lock poisoned")
-    }
-
-    pub(crate) fn committed_statistics(&self) -> TableStatistics {
-        self.statistics.committed()
     }
 
     pub(crate) fn identity(&self) -> table_definitions::TableIdentity {
@@ -12065,6 +12105,38 @@ pub(crate) struct PendingAcl {
     pub grant_options: PrivilegeSet,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectAclWrite {
+    Change {
+        transaction: u32,
+    },
+    Exact {
+        transaction: u32,
+        order: core::num::NonZeroU64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingObjectAcl {
+    pub txid: u32,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub order: core::num::NonZeroU64,
+    change: core::num::NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObjectAclUndo {
+    origin: type_references::CatalogOrigin,
+    slot: usize,
+    object: AccessObject,
+    transaction: u32,
+    change: core::num::NonZeroU64,
+    prior: Option<PendingObjectAcl>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AclEntry {
     pub object: AccessObject,
@@ -12073,7 +12145,8 @@ pub(crate) struct AclEntry {
     pub privileges: PrivilegeSet,
     pub grant_options: PrivilegeSet,
     pub live: bool,
-    pub pending: Option<PendingAcl>,
+    pub pending: Option<PendingObjectAcl>,
+    pub order: Option<core::num::NonZeroU64>,
 }
 
 /// A non-default `pg_parameter_acl` row.  Parameters have no owner or
@@ -12088,6 +12161,8 @@ pub(crate) struct ParameterAclEntry {
     pub grant_options: crate::sql::ast::ParameterPrivileges,
     pub live: bool,
     pub pending: Option<PendingParameterAcl>,
+    identity: ParameterAclGrantIdentity,
+    order: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12097,6 +12172,8 @@ pub(crate) struct PendingParameterAcl {
     pub grantor: u16,
     pub privileges: crate::sql::ast::ParameterPrivileges,
     pub grant_options: crate::sql::ast::ParameterPrivileges,
+    identity: ParameterAclGrantIdentity,
+    order: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12190,9 +12267,12 @@ pub(crate) struct DefaultAclEntry {
 /// privilege images, while every fixed vector retains its startup capacity.
 struct AclCatalog {
     objects: FixedVec<AclEntry>,
+    next_object_order: u64,
+    next_object_change: u64,
     columns: FixedVec<ColumnAclEntry>,
     defaults: FixedVec<DefaultAclEntry>,
     parameters: FixedVec<ParameterAclEntry>,
+    parameter_rows: ParameterAclRows,
 }
 
 struct ObjectAclIter<'a> {
@@ -12222,18 +12302,11 @@ impl Iterator for ObjectAclIter<'_> {
             let include = if self.checkpoint {
                 entry.object.slot != u16::MAX
                     && !self.storage.access_object_is_temporary(entry.object, 0)
+                    && entry.order.is_some()
                     && (entry.live
-                        || (entry.object.class == AccessClass::Schema
-                            && entry.grantee == PUBLIC_ROLE
-                            && entry.grantor == 0)
-                        || (matches!(
-                            entry.object.class,
-                            AccessClass::Domain
-                                | AccessClass::Enum
-                                | AccessClass::Composite
-                                | AccessClass::Routine
-                                | AccessClass::Language
-                        ) && entry.grantee == PUBLIC_ROLE))
+                        || (entry.grantee == entry.grantor
+                            && usize::from(entry.grantee)
+                                == self.storage.object_owner(entry.object, 0)))
             } else {
                 entry.object.slot != u16::MAX
                     && self.storage.access_object_in_current_database(entry.object)
@@ -12305,40 +12378,6 @@ impl Iterator for DefaultAclIter<'_> {
             let include = self
                 .database
                 .map_or(entry.defined, |database| entry.database == database);
-            if include {
-                return Some((slot, entry));
-            }
-        }
-        None
-    }
-}
-
-enum ParameterAclIterMode {
-    Visible(u32),
-    Checkpoint,
-}
-
-struct ParameterAclIter<'a> {
-    catalog: &'a Mutex<AclCatalog>,
-    next_slot: usize,
-    mode: ParameterAclIterMode,
-}
-
-impl Iterator for ParameterAclIter<'_> {
-    type Item = (usize, ParameterAclEntry);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let catalog = self.catalog.lock().expect("ACL catalog lock poisoned");
-        while self.next_slot < catalog.parameters.len() {
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            let entry = catalog.parameters[slot];
-            let include = match self.mode {
-                ParameterAclIterMode::Visible(txid) => {
-                    Storage::parameter_acl_visible(&entry, txid).0
-                }
-                ParameterAclIterMode::Checkpoint => entry.live,
-            };
             if include {
                 return Some((slot, entry));
             }
@@ -12860,6 +12899,7 @@ pub enum StoredRelKind {
 pub struct PendingComment {
     pub txid: u32,
     pub text: Option<StackStr<COMMENT_MAX>>,
+    root: core::num::NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -12884,6 +12924,7 @@ pub struct CommentEntry {
     pub name: SqlName,
     pub subid: u32,
     pub live: Option<StackStr<COMMENT_MAX>>,
+    root: Option<core::num::NonZeroU64>,
     pub pending: Option<PendingComment>,
     pending_identity: Option<PendingCommentIdentity>,
     pending_drop: Option<PendingCommentDrop>,
@@ -12897,9 +12938,21 @@ struct PendingCommentDrop {
 
 struct CommentCatalog {
     entries: FixedVec<CommentEntry>,
+    next_root: core::num::NonZeroU64,
 }
 
 impl CommentCatalog {
+    fn reserve_root(&mut self) -> Result<core::num::NonZeroU64, SqlError> {
+        let root = self.next_root;
+        self.next_root = root.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "comment tuple identity exhausted"
+            )
+        })?;
+        Ok(root)
+    }
+
     fn reap(&mut self, slot: usize) {
         let comment = &mut self.entries[slot];
         if comment.live.is_none()
@@ -12965,48 +13018,75 @@ impl Iterator for LiveCommentIter<'_> {
     }
 }
 
-struct VisibleCommentIter<'a> {
+pub(crate) struct CatalogComment {
+    pub(crate) class: CommentClass,
+    pub(crate) schema: SqlName,
+    pub(crate) name: SqlName,
+    pub(crate) subid: u32,
+    pub(crate) text: Option<StackStr<COMMENT_MAX>>,
+    pub(crate) private: bool,
+    pub(crate) root: Option<core::num::NonZeroU64>,
+    pub(crate) lookup_transaction: u32,
+}
+
+struct CatalogCommentIter<'a> {
     catalog: &'a Mutex<CommentCatalog>,
     database: DatabaseOid,
     txid: u32,
     next_slot: usize,
 }
 
-impl Iterator for VisibleCommentIter<'_> {
-    type Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>);
+impl Iterator for CatalogCommentIter<'_> {
+    type Item = CatalogComment;
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("comment catalog lock poisoned");
-        while self.next_slot < catalog.entries.len() {
-            let slot = self.next_slot;
+        while let Some(comment) = catalog.entries.get(self.next_slot).copied() {
             self.next_slot += 1;
-            let comment = catalog.entries[slot];
             if !comment.used
-                || comment
-                    .pending_drop
-                    .is_some_and(|pending| pending.txid == self.txid)
                 || comment
                     .database
                     .is_some_and(|database| database != self.database)
             {
                 continue;
             }
+            let removed = self.txid != 0
+                && comment
+                    .pending_drop
+                    .is_some_and(|pending| pending.txid == self.txid);
+            let pending = comment
+                .pending
+                .filter(|pending| self.txid != 0 && pending.txid == self.txid);
             let identity = comment
                 .pending_identity
-                .filter(|identity| identity.txid == self.txid);
-            let Some(text) = (match comment.pending {
-                Some(pending) if pending.txid == self.txid => pending.text,
-                _ => comment.live,
-            }) else {
-                continue;
+                .filter(|identity| self.txid != 0 && identity.txid == self.txid);
+            let private = removed || pending.is_some();
+            let text = if removed {
+                None
+            } else {
+                pending.map_or(comment.live, |pending| pending.text)
             };
-            return Some((
-                comment.class,
-                identity.map_or(comment.schema, |identity| identity.schema),
-                identity.map_or(comment.name, |identity| identity.name),
-                comment.subid,
+            if text.is_none() && !private {
+                continue;
+            }
+            return Some(CatalogComment {
+                class: comment.class,
+                schema: if removed {
+                    comment.schema
+                } else {
+                    identity.map_or(comment.schema, |identity| identity.schema)
+                },
+                name: if removed {
+                    comment.name
+                } else {
+                    identity.map_or(comment.name, |identity| identity.name)
+                },
+                subid: comment.subid,
                 text,
-            ));
+                private,
+                root: pending.map(|pending| pending.root).or(comment.root),
+                lookup_transaction: if removed { 0 } else { self.txid },
+            });
         }
         None
     }
@@ -13022,6 +13102,7 @@ impl CommentEntry {
             name: SqlName::EMPTY,
             subid: 0,
             live: None,
+            root: None,
             pending: None,
             pending_identity: None,
             pending_drop: None,
@@ -14053,6 +14134,7 @@ impl Iterator for MatviewIter<'_> {
 
 pub struct Storage {
     transaction_mode: crate::config::TransactionMode,
+    catalog_history: std::sync::Arc<CatalogHistory>,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     /// Serializes table-name checks and empty-slot initialization, never row I/O.
@@ -18203,6 +18285,10 @@ impl Storage {
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + CatalogHistory::budget_bytes(
+                config.catalog_history_bytes,
+                catalog_transaction_capacity(config),
+            )
             + log_positions::LogPositions::budget_bytes()
             + size_of::<CatalogSequence>()
             + size_of::<usize>()
@@ -18289,9 +18375,11 @@ impl Storage {
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
+            + 2 * size_of::<u64>()
             + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
             + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
             + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
+            + ParameterAclRows::budget_bytes(config)
             + config.max_sequences * (size_of::<SequenceDef>() + size_of::<SequenceValues>())
             + config.max_domains * size_of::<DomainDef>()
             + config.max_enums * size_of::<EnumDef>()
@@ -18302,6 +18390,7 @@ impl Storage {
             + config.max_databases * size_of::<DatabaseDef>()
             + config.max_tablespaces * size_of::<TablespaceDef>()
             + config.max_comments * size_of::<CommentEntry>()
+            + size_of::<core::num::NonZeroU64>()
             + config.max_connections as usize * size_of::<BackendActivity>()
             + config.max_connections as usize * size_of::<BackendSignal>()
             + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
@@ -18359,6 +18448,14 @@ impl Storage {
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
+        budget.draw(
+            2 * size_of::<u64>(),
+            "object ACL grant order and undo counters",
+        )?;
+        budget.draw(
+            size_of::<core::num::NonZeroU64>(),
+            "comment tuple identity counter",
+        )?;
         budget.draw(size_of::<usize>(), "routine catalog capacity")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
@@ -18947,6 +19044,7 @@ impl Storage {
                     grant_options: PrivilegeSet::NONE,
                     live: true,
                     pending: None,
+                    order: core::num::NonZeroU64::new(u64::from(slot) + 1),
                 })
                 .expect("ACL pool has room for public schema defaults");
         }
@@ -19269,14 +19367,26 @@ impl Storage {
             }),
             acl_catalog: Mutex::new(AclCatalog {
                 objects: acl_entries,
+                next_object_order: 3,
+                next_object_change: 0,
                 columns: column_acl_entries,
                 defaults: default_acl_entries,
                 parameters: parameter_acl_entries,
+                parameter_rows: ParameterAclRows::new(config, budget, catalog_origin)?,
             }),
-            comments: Mutex::new(CommentCatalog { entries: comments }),
+            comments: Mutex::new(CommentCatalog {
+                entries: comments,
+                next_root: core::num::NonZeroU64::new(1).unwrap(),
+            }),
             catalog_sequence: CatalogSequence::new(0),
             catalog_sources,
             transaction_mode: config.transaction_mode,
+            catalog_history: CatalogHistory::new(
+                budget,
+                config.catalog_history_bytes,
+                catalog_transaction_capacity(config),
+                config.max_catalog_versions_per_object,
+            )?,
             snapshots: std::sync::Arc::new(Mutex::new(SnapshotState {
                 transaction_mode: config.transaction_mode,
                 admission: transaction_admission::TransactionAdmission::new(0),
@@ -20730,7 +20840,9 @@ impl Storage {
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
 
-            for source_slot in 0..self.tables.len() {
+            // The reserved large-object page table stores database-tagged rows
+            // for all databases and has no user catalog identity to clone.
+            for source_slot in 0..self.table_count() {
                 if self.tables[source_slot].database() != source || !self.tables[source_slot].live()
                 {
                     continue;
@@ -20771,7 +20883,9 @@ impl Storage {
                 self.rebind_template_table_types(&mut definition, source, target, txid)?;
                 let created_at = self.tables[source_slot].created_at();
                 let ownership = self.tables[source_slot].ownership().committed();
-                let statistics = self.tables[source_slot].statistics.committed();
+                let statistics = self.table_statistics(source_slot, 0);
+                let has_index =
+                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?);
                 let serial_values = self.table_serial_values(source_slot);
                 let target_slot = table_creation::allocate(
                     self,
@@ -20784,6 +20898,9 @@ impl Storage {
                     target_table.identity_mut().created_at = created_at;
                     target_table.identity_mut().ownership = ownership;
                     target_table.statistics.set_image(statistics, None, false);
+                    target_table
+                        .statistics
+                        .set_index_hint(created_at, has_index, true)?;
                     *target_table
                         .serial
                         .get_mut()
@@ -21701,7 +21818,7 @@ impl Storage {
 
             for source_slot in 0..self.acl_entry_count() {
                 let entry = self.acl_entry(source_slot);
-                if !entry.live
+                if entry.order.is_none()
                     || self.access_object_database(entry.object) != Some(source)
                     || self.access_object_is_temporary(entry.object, 0)
                 {
@@ -21716,7 +21833,10 @@ impl Storage {
                     entry.grantor,
                     entry.privileges,
                     entry.grant_options,
-                    0,
+                    ObjectAclWrite::Exact {
+                        transaction: 0,
+                        order: entry.order.expect("cloned ACL is defined"),
+                    },
                 )?;
             }
             for source_slot in 0..self.column_acl_entry_count() {
@@ -24019,6 +24139,37 @@ impl Storage {
         }
     }
 
+    pub(crate) fn begin_object_acl_restore(&mut self) -> Result<(), SqlError> {
+        let catalog = self
+            .acl_catalog
+            .get_mut()
+            .expect("ACL catalog lock poisoned");
+        if catalog.next_object_change != 0
+            || catalog.objects.len() != 3
+            || catalog.objects.iter().enumerate().any(|(slot, entry)| {
+                entry.object
+                    != (AccessObject {
+                        class: AccessClass::Schema,
+                        slot: slot as u16,
+                    })
+                    || entry.grantee != PUBLIC_ROLE
+                    || entry.grantor != BOOTSTRAP_ROLE
+                    || entry.privileges != PrivilegeSet::USAGE
+                    || entry.pending.is_some()
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "object ACL restoration requires initial catalog state"
+            ));
+        }
+        // A manifest is a complete image. Keeping startup grants here would
+        // revive a grant omitted after its revocation and slot reclamation.
+        catalog.objects.clear();
+        catalog.next_object_order = 0;
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_column_acls(
         &self,
     ) -> impl Iterator<Item = (usize, ColumnAclEntry)> + '_ {
@@ -24075,6 +24226,7 @@ impl Storage {
                 entry.privileges = PrivilegeSet::NONE;
                 entry.grant_options = PrivilegeSet::NONE;
                 entry.pending = None;
+                entry.order = None;
                 entry.object.slot = u16::MAX;
             }
         }
@@ -24759,13 +24911,28 @@ impl Storage {
         grantor: u16,
         privileges: PrivilegeSet,
         grant_options: PrivilegeSet,
-        txid: u32,
-    ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        write: ObjectAclWrite,
+    ) -> Result<(usize, ObjectAclUndo), SqlError> {
+        let txid = match write {
+            ObjectAclWrite::Change { transaction } => transaction,
+            ObjectAclWrite::Exact { transaction, .. } => transaction,
+        };
+        let committed_owner = (txid == 0).then(|| self.object_owner(object, txid) as u16);
         if grantee != PUBLIC_ROLE {
             self.role_reference_ready(usize::from(grantee), txid)?;
         }
         self.role_reference_ready(usize::from(grantor), txid)?;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if let Some(blocker) = catalog.objects.iter().find_map(|entry| {
+            (entry.object == object)
+                .then_some(entry.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "object privileges"));
+        }
         let slot = catalog
             .objects
             .iter()
@@ -24774,7 +24941,7 @@ impl Storage {
                 entry.object == object
                     && visible_grantee == grantee
                     && visible_grantor == grantor
-                    && (entry.live || entry.pending.is_some())
+                    && (entry.order.is_some() || entry.pending.is_some())
             })
             .or_else(|| {
                 catalog.objects.iter().position(|entry| {
@@ -24782,6 +24949,57 @@ impl Storage {
                 })
             })
             .unwrap_or(catalog.objects.len());
+        let old_order = catalog.objects.get(slot).and_then(|entry| {
+            if entry.object == object && Self::acl_visible(entry, txid).0 {
+                match entry.pending {
+                    Some(pending) if pending.txid == txid => Some(pending.order),
+                    _ => entry.order,
+                }
+            } else {
+                None
+            }
+        });
+        let order = match write {
+            ObjectAclWrite::Exact { order, .. } => {
+                if catalog.objects.iter().enumerate().any(|(other, entry)| {
+                    let current = entry
+                        .pending
+                        .filter(|pending| pending.txid == txid)
+                        .map(|pending| pending.order)
+                        .or(entry.order);
+                    other != slot && entry.object == object && current == Some(order)
+                }) {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "duplicate object ACL grant order"
+                    ));
+                }
+                order
+            }
+            ObjectAclWrite::Change { .. } => match old_order {
+                Some(order) => order,
+                None => catalog
+                    .next_object_order
+                    .checked_add(1)
+                    .and_then(core::num::NonZeroU64::new)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "object ACL grant order space exhausted"
+                        )
+                    })?,
+            },
+        };
+        let change = catalog
+            .next_object_change
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "object ACL undo identity space exhausted"
+                )
+            })?;
         if slot == catalog.objects.len() {
             catalog
                 .objects
@@ -24793,6 +25011,7 @@ impl Storage {
                     grant_options: PrivilegeSet::NONE,
                     live: false,
                     pending: None,
+                    order: None,
                 })
                 .map_err(|_| {
                     sql_err!(
@@ -24805,9 +25024,19 @@ impl Storage {
             catalog.objects[slot].object = object;
             catalog.objects[slot].grantee = grantee;
             catalog.objects[slot].grantor = grantor;
+            catalog.objects[slot].order = None;
         }
+        catalog.next_object_order = catalog.next_object_order.max(order.get());
+        catalog.next_object_change = change.get();
         let entry = &mut catalog.objects[slot];
-        let prior = entry.pending;
+        let prior = ObjectAclUndo {
+            origin: self.catalog_sources.origin(),
+            slot,
+            object,
+            transaction: txid,
+            change,
+            prior: entry.pending,
+        };
         if txid == 0 {
             entry.grantee = grantee;
             entry.grantor = grantor;
@@ -24815,14 +25044,20 @@ impl Storage {
             entry.grant_options = grant_options;
             entry.live = privileges.0 != 0;
             entry.pending = None;
+            entry.order = Some(order);
         } else {
-            entry.pending = Some(PendingAcl {
+            entry.pending = Some(PendingObjectAcl {
                 txid,
                 grantee,
                 grantor,
                 privileges,
                 grant_options,
+                order,
+                change,
             });
+        }
+        if let Some(owner) = committed_owner {
+            Self::reclaim_revoked_acls(&mut catalog, object, owner, txid);
         }
         Ok((slot, prior))
     }
@@ -24908,10 +25143,19 @@ impl Storage {
     }
 
     pub(crate) fn commit_acl(&self, slot: usize, txid: u32) {
+        let selected = {
+            let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+            let entry = &catalog.objects[slot];
+            let Some(pending) = entry.pending.filter(|pending| pending.txid == txid) else {
+                return;
+            };
+            (entry.object, pending.change)
+        };
+        let owner = self.object_owner(selected.0, txid) as u16;
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let Some(pending) = catalog.objects[slot]
             .pending
-            .filter(|pending| pending.txid == txid)
+            .filter(|pending| pending.txid == txid && pending.change == selected.1)
         else {
             return;
         };
@@ -24923,8 +25167,40 @@ impl Storage {
             entry.grant_options = pending.grant_options;
             entry.live = pending.privileges.0 != 0;
             entry.pending = None;
+            entry.order = Some(pending.order);
         }
         Self::deduplicate_acl(&mut catalog.objects, slot);
+        Self::reclaim_revoked_acls(&mut catalog, selected.0, owner, txid);
+        drop(catalog);
+        self.wake_transaction_waiters(txid);
+    }
+
+    fn reclaim_revoked_acls(catalog: &mut AclCatalog, object: AccessObject, owner: u16, txid: u32) {
+        // The owner's entry records an explicit list even after its last grant
+        // is revoked. Other removed grants need no retained slot or role reference.
+        if !catalog.objects.iter().any(|entry| {
+            let (_, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+            entry.object == object
+                && grantee == owner
+                && grantor == owner
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
+        }) {
+            return;
+        }
+        for entry in catalog
+            .objects
+            .iter_mut()
+            .filter(|entry| entry.object == object)
+        {
+            if !entry.live
+                && entry.pending.is_none()
+                && (entry.grantee != owner || entry.grantor != owner)
+            {
+                entry.object.slot = u16::MAX;
+                entry.order = None;
+            }
+        }
     }
 
     fn deduplicate_acl(entries: &mut FixedVec<AclEntry>, slot: usize) {
@@ -24944,21 +25220,106 @@ impl Storage {
         };
         let privileges = entries[slot].privileges;
         let grant_options = entries[slot].grant_options;
+        let order = match (entries[canonical].live, entries[slot].live) {
+            (true, false) => entries[canonical].order,
+            (false, true) => entries[slot].order,
+            _ => entries[canonical].order.min(entries[slot].order),
+        };
         entries[canonical].privileges = entries[canonical].privileges.union(privileges);
         entries[canonical].grant_options = entries[canonical].grant_options.union(grant_options);
         entries[canonical].live = entries[canonical].privileges.0 != 0;
+        entries[canonical].order = order;
         entries[slot].object.slot = u16::MAX;
         entries[slot].privileges = PrivilegeSet::NONE;
         entries[slot].grant_options = PrivilegeSet::NONE;
         entries[slot].live = false;
+        entries[slot].order = None;
     }
 
-    pub(crate) fn restore_acl_pending(&self, slot: usize, prior: Option<PendingAcl>) {
+    pub(crate) fn restore_acl_pending(
+        &self,
+        slot: usize,
+        undo: ObjectAclUndo,
+    ) -> Result<(), SqlError> {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if undo.origin != self.catalog_sources.origin()
+            || undo.slot != slot
+            || catalog.objects.get(slot).is_none_or(|entry| {
+                entry.object != undo.object
+                    || !entry.pending.is_some_and(|pending| {
+                        pending.txid == undo.transaction && pending.change == undo.change
+                    })
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stale or foreign object ACL undo"
+            ));
+        }
+        catalog.objects[slot].pending = undo.prior;
+        if undo.prior.is_none() && catalog.objects[slot].order.is_none() {
+            catalog.objects[slot].object.slot = u16::MAX;
+        }
+        drop(catalog);
+        self.wake_transaction_waiters(undo.transaction);
+        Ok(())
+    }
+
+    pub(crate) fn object_acl_defined(&self, object: AccessObject, txid: u32) -> bool {
         self.acl_catalog
             .lock()
             .expect("ACL catalog lock poisoned")
-            .objects[slot]
-            .pending = prior;
+            .objects
+            .iter()
+            .any(|entry| {
+                entry.object == object
+                    && (entry.order.is_some()
+                        || entry.pending.is_some_and(|pending| pending.txid == txid))
+            })
+    }
+
+    pub(crate) fn object_acl_order(&self, slot: usize, txid: u32) -> Option<core::num::NonZeroU64> {
+        let entry = self.acl_entry(slot);
+        match entry.pending {
+            Some(pending) if pending.txid == txid => Some(pending.order),
+            _ => entry.order,
+        }
+    }
+
+    pub(crate) fn object_acl_grant_order(
+        &self,
+        object: AccessObject,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> Option<core::num::NonZeroU64> {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut defined = None;
+        let mut visible = None;
+        for entry in catalog
+            .objects
+            .iter()
+            .filter(|entry| entry.object == object)
+        {
+            let (live, to, from, _, _) = Self::acl_visible(entry, txid);
+            if to != grantee || from != grantor {
+                continue;
+            }
+            let order = match entry.pending {
+                Some(pending) if pending.txid == txid => Some(pending.order),
+                _ => entry.order,
+            };
+            if let Some(order) = order {
+                defined =
+                    Some(defined.map_or(order, |before: core::num::NonZeroU64| before.min(order)));
+                if live {
+                    visible = Some(
+                        visible.map_or(order, |before: core::num::NonZeroU64| before.min(order)),
+                    );
+                }
+            }
+        }
+        visible.or(defined)
     }
 
     fn parameter_acl_visible(
@@ -24989,82 +25350,6 @@ impl Storage {
         }
     }
 
-    pub(crate) fn change_parameter_acl(
-        &self,
-        parameter: crate::sql::ast::ParameterName,
-        grantee: u16,
-        grantor: u16,
-        privileges: crate::sql::ast::ParameterPrivileges,
-        grant_options: crate::sql::ast::ParameterPrivileges,
-        txid: u32,
-    ) -> Result<(usize, Option<PendingParameterAcl>), SqlError> {
-        if grantee != PUBLIC_ROLE {
-            self.role_reference_ready(usize::from(grantee), txid)?;
-        }
-        self.role_reference_ready(usize::from(grantor), txid)?;
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let slot = catalog
-            .parameters
-            .iter()
-            .position(|entry| {
-                let (_, visible_grantee, visible_grantor, _, _) =
-                    Self::parameter_acl_visible(entry, txid);
-                entry.parameter == parameter
-                    && visible_grantee == grantee
-                    && visible_grantor == grantor
-                    && (entry.live || entry.pending.is_some())
-            })
-            .or_else(|| {
-                catalog.parameters.iter().position(|entry| {
-                    entry.parameter.is_empty() && !entry.live && entry.pending.is_none()
-                })
-            })
-            .unwrap_or(catalog.parameters.len());
-        if slot == catalog.parameters.len() {
-            catalog
-                .parameters
-                .push(ParameterAclEntry {
-                    parameter,
-                    grantee,
-                    grantor,
-                    privileges: crate::sql::ast::ParameterPrivileges::NONE,
-                    grant_options: crate::sql::ast::ParameterPrivileges::NONE,
-                    live: false,
-                    pending: None,
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many parameter privilege entries (limit {})",
-                        catalog.parameters.capacity()
-                    )
-                })?;
-        } else if catalog.parameters[slot].parameter.is_empty() {
-            catalog.parameters[slot].parameter = parameter;
-            catalog.parameters[slot].grantee = grantee;
-            catalog.parameters[slot].grantor = grantor;
-        }
-        let entry = &mut catalog.parameters[slot];
-        let prior = entry.pending;
-        if txid == 0 {
-            entry.grantee = grantee;
-            entry.grantor = grantor;
-            entry.privileges = privileges;
-            entry.grant_options = grant_options;
-            entry.live = privileges.bits() != 0;
-            entry.pending = None;
-        } else {
-            entry.pending = Some(PendingParameterAcl {
-                txid,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
-            });
-        }
-        Ok((slot, prior))
-    }
-
     pub(crate) fn parameter_acl_from(
         &self,
         parameter: crate::sql::ast::ParameterName,
@@ -25076,6 +25361,15 @@ impl Storage {
         crate::sql::ast::ParameterPrivileges,
     ) {
         let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        if catalog.parameter_rows.oid_to(parameter, txid).is_none()
+            && grantee == BOOTSTRAP_ROLE
+            && grantor == BOOTSTRAP_ROLE
+        {
+            return (
+                crate::sql::ast::ParameterPrivileges::ALL,
+                crate::sql::ast::ParameterPrivileges::NONE,
+            );
+        }
         catalog
             .parameters
             .iter()
@@ -25248,67 +25542,12 @@ impl Storage {
         (privileges, grant_options)
     }
 
-    pub(crate) fn parameter_acl_entries_visible(
-        &self,
-        txid: u32,
-    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
-        ParameterAclIter {
-            catalog: &self.acl_catalog,
-            next_slot: 0,
-            mode: ParameterAclIterMode::Visible(txid),
-        }
-    }
-
     pub(crate) fn parameter_acl_entry_count(&self) -> usize {
         self.acl_catalog
             .lock()
             .expect("ACL catalog lock poisoned")
             .parameters
             .len()
-    }
-
-    pub(crate) fn checkpoint_parameter_acls(
-        &self,
-    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
-        ParameterAclIter {
-            catalog: &self.acl_catalog,
-            next_slot: 0,
-            mode: ParameterAclIterMode::Checkpoint,
-        }
-    }
-
-    pub(crate) fn commit_parameter_acl(&self, slot: usize, txid: u32) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let Some(pending) = catalog.parameters[slot].pending else {
-            return;
-        };
-        if pending.txid != txid {
-            return;
-        }
-        let entry = &mut catalog.parameters[slot];
-        entry.grantee = pending.grantee;
-        entry.grantor = pending.grantor;
-        entry.privileges = pending.privileges;
-        entry.grant_options = pending.grant_options;
-        entry.live = pending.privileges.bits() != 0;
-        entry.pending = None;
-        if !entry.live {
-            entry.parameter = crate::sql::ast::ParameterName::EMPTY;
-            entry.privileges = crate::sql::ast::ParameterPrivileges::NONE;
-            entry.grant_options = crate::sql::ast::ParameterPrivileges::NONE;
-        }
-    }
-
-    pub(crate) fn restore_parameter_acl_pending(
-        &self,
-        slot: usize,
-        prior: Option<PendingParameterAcl>,
-    ) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        catalog.parameters[slot].pending = prior;
-        if !catalog.parameters[slot].live && prior.is_none() {
-            catalog.parameters[slot].parameter = crate::sql::ast::ParameterName::EMPTY;
-        }
     }
 
     pub(crate) fn acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
@@ -25323,28 +25562,70 @@ impl Storage {
         grantee: u16,
         grantor: u16,
         txid: u32,
-    ) -> Option<PendingAcl> {
+    ) -> Result<ObjectAclUndo, SqlError> {
         let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let object = catalog.objects[slot].object;
+        if let Some(blocker) = catalog.objects.iter().find_map(|entry| {
+            (entry.object == object)
+                .then_some(entry.pending)
+                .flatten()
+                .filter(|pending| pending.txid != txid)
+                .map(|pending| pending.txid)
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "object privileges"));
+        }
+        let change = catalog
+            .next_object_change
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "object ACL undo identity space exhausted"
+                )
+            })?;
         let entry = &mut catalog.objects[slot];
-        let prior = entry.pending;
+        let prior = ObjectAclUndo {
+            origin: self.catalog_sources.origin(),
+            slot,
+            object,
+            transaction: txid,
+            change,
+            prior: entry.pending,
+        };
+        let order = prior
+            .prior
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.order)
+            .or(entry.order)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "object ACL identity has no grant order"
+                )
+            })?;
         let (_, _, _, privileges, grant_options) = Self::acl_visible(entry, txid);
         if txid == 0 {
             entry.grantee = grantee;
             entry.grantor = grantor;
             entry.pending = None;
         } else {
-            entry.pending = Some(PendingAcl {
+            entry.pending = Some(PendingObjectAcl {
                 txid,
                 grantee,
                 grantor,
                 privileges,
                 grant_options,
+                order,
+                change,
             });
         }
         if txid == 0 {
             Self::deduplicate_acl(&mut catalog.objects, slot);
         }
-        prior
+        catalog.next_object_change = change.get();
+        Ok(prior)
     }
 
     fn default_acl_visible(
@@ -26060,17 +26341,26 @@ impl Storage {
         privilege: PrivilegeSet,
         txid: u32,
     ) -> bool {
-        if self.role(role).attributes_to(txid).superuser || self.object_owner(object, txid) == role
-        {
+        if self.role(role).attributes_to(txid).superuser {
             return true;
         }
+        let owner = self.object_owner(object, txid) as u16;
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let acl_defined = catalog.objects.iter().any(|entry| {
             entry.object == object
                 && entry.object.slot != u16::MAX
-                && (entry.live || entry.pending.is_some())
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
+        });
+        let owner_defined = catalog.objects.iter().any(|entry| {
+            let (_, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+            entry.object == object
+                && grantee == owner
+                && grantor == owner
+                && (entry.order.is_some()
+                    || entry.pending.is_some_and(|pending| pending.txid == txid))
         });
         let mut effective = if !acl_defined {
             default_public_object_privileges(object.class)
@@ -26081,6 +26371,9 @@ impl Storage {
             if inherited {
                 effective = effective
                     .union(Self::acl_to_entries(&catalog.objects, object, slot as u16, txid).0);
+                if slot == usize::from(owner) && !owner_defined {
+                    effective = effective.union(all_object_privileges(object.class));
+                }
             }
         }
         effective.contains(privilege)
@@ -27503,7 +27796,21 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>)> + '_
     {
-        VisibleCommentIter {
+        self.catalog_comments(txid).filter_map(|comment| {
+            comment.text.map(|text| {
+                (
+                    comment.class,
+                    comment.schema,
+                    comment.name,
+                    comment.subid,
+                    text,
+                )
+            })
+        })
+    }
+
+    pub(crate) fn catalog_comments(&self, txid: u32) -> impl Iterator<Item = CatalogComment> + '_ {
+        CatalogCommentIter {
             catalog: &self.comments,
             database: current_database(),
             txid,
@@ -27729,7 +28036,7 @@ impl Storage {
     /// Sets (or, with `text == None`, removes) a comment as `txid`'s
     /// uncommitted overlay. Returns the slot and the prior overlay, for the
     /// transaction's undo log. A fresh key claims a free slot; exhausting the
-    /// slab is a loud error.
+    /// slab is a loud error. Removing an absent comment returns no change.
     pub fn set_comment(
         &self,
         class: CommentClass,
@@ -27738,7 +28045,13 @@ impl Storage {
         subid: u32,
         text: Option<StackStr<COMMENT_MAX>>,
         txid: u32,
-    ) -> Result<(usize, Option<PendingComment>), SqlError> {
+    ) -> Result<Option<(usize, Option<PendingComment>)>, SqlError> {
+        if txid == 0 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "comment write requires a transaction owner"
+            ));
+        }
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
@@ -27750,9 +28063,32 @@ impl Storage {
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid))
         }) {
-            let prior = comments.entries[slot].pending.take();
-            comments.entries[slot].pending = Some(PendingComment { txid, text });
-            return Ok((slot, prior));
+            if let Some(pending) = comments.entries[slot].pending
+                && pending.txid != txid
+            {
+                return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
+            }
+            let visible = comments.entries[slot]
+                .pending
+                .map_or(comments.entries[slot].live, |pending| pending.text);
+            if text.is_none() && visible.is_none() {
+                return Ok(None);
+            }
+            let root = if visible.is_some() {
+                comments.entries[slot]
+                    .pending
+                    .map(|pending| pending.root)
+                    .or(comments.entries[slot].root)
+                    .expect("a visible comment has a tuple identity")
+            } else {
+                comments.reserve_root()?
+            };
+            let prior = comments.entries[slot].pending;
+            comments.entries[slot].pending = Some(PendingComment { txid, text, root });
+            return Ok(Some((slot, prior)));
+        }
+        if text.is_none() {
+            return Ok(None);
         }
         let Some(slot) = comments.entries.iter().position(|c| !c.used) else {
             return Err(sql_err!(
@@ -27761,6 +28097,7 @@ impl Storage {
                 comments.entries.capacity()
             ));
         };
+        let root = comments.reserve_root()?;
         comments.entries[slot] = CommentEntry {
             used: true,
             database,
@@ -27769,19 +28106,28 @@ impl Storage {
             name,
             subid,
             live: None,
-            pending: Some(PendingComment { txid, text }),
+            root: None,
+            pending: Some(PendingComment { txid, text, root }),
             pending_identity: None,
             pending_drop: None,
         };
-        Ok((slot, None))
+        Ok(Some((slot, None)))
     }
 
     /// Rollback: restores the comment slot's prior uncommitted overlay,
     /// freeing the slot if it now holds nothing.
     pub fn restore_comment_pending(&self, slot: usize, prior: Option<PendingComment>) {
         let mut comments = self.comment_catalog();
+        let released = comments.entries[slot]
+            .pending
+            .filter(|pending| prior.is_none_or(|prior| prior.txid != pending.txid))
+            .map(|pending| pending.txid);
         comments.entries[slot].pending = prior;
         comments.reap(slot);
+        drop(comments);
+        if let Some(transaction) = released {
+            self.wake_transaction_waiters(transaction);
+        }
     }
 
     /// Commit: promotes `txid`'s overlay to the committed value and returns the
@@ -27799,7 +28145,7 @@ impl Storage {
     )> {
         let mut comments = self.comment_catalog();
         let entry = &mut comments.entries[slot];
-        match entry.pending {
+        let committed = match entry.pending {
             Some(p) if p.txid == txid => {
                 if entry
                     .pending_identity
@@ -27814,6 +28160,7 @@ impl Storage {
                 }
                 entry.pending = None;
                 entry.live = p.text;
+                entry.root = entry.live.map(|_| p.root);
                 let out = (
                     entry.class,
                     entry.schema,
@@ -27825,7 +28172,12 @@ impl Storage {
                 Some(out)
             }
             _ => None,
+        };
+        drop(comments);
+        if committed.is_some() {
+            self.wake_transaction_waiters(txid);
         }
+        committed
     }
 
     /// Committed apply (journal replay and checkpoint load): sets the committed
@@ -27841,13 +28193,22 @@ impl Storage {
         let database = self.comment_database(class);
         let mut comments = self.comment_catalog();
         if let Some(slot) = comments.entries.iter().position(|c| {
-            c.database == database
+            c.used
+                && c.database == database
                 && c.class == class
                 && c.subid == subid
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches(database, class, schema.as_str(), name.as_str(), subid))
         }) {
+            let root = if text.is_some() && comments.entries[slot].live.is_none() {
+                Some(comments.reserve_root()?)
+            } else if text.is_some() {
+                comments.entries[slot].root
+            } else {
+                None
+            };
             comments.entries[slot].live = text;
+            comments.entries[slot].root = root;
             comments.reap(slot);
             return Ok(());
         }
@@ -27861,6 +28222,7 @@ impl Storage {
                 comments.entries.capacity()
             ));
         };
+        let root = comments.reserve_root()?;
         comments.entries[slot] = CommentEntry {
             used: true,
             database,
@@ -27869,6 +28231,7 @@ impl Storage {
             name,
             subid,
             live: text,
+            root: Some(root),
             pending: None,
             pending_identity: None,
             pending_drop: None,
@@ -31519,6 +31882,50 @@ impl Storage {
         Ok(count)
     }
 
+    pub(crate) fn refresh_relation_counts(
+        &self,
+        table_slot: usize,
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        let _snapshot = self.analyze_snapshot();
+        let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
+        let mut rows = 0u64;
+        let mut row_bytes = 0u64;
+        let _ = scan.for_each_overlay(&mut |rowid, home| {
+            crate::sql::query::check_timeout()?;
+            self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for row in batch {
+                crate::sql::query::check_timeout()?;
+                let length = match row.representation {
+                    SpilledRowRepresentation::Encoded(bytes) => bytes.len(),
+                    SpilledRowRepresentation::Values(values) => rowenc::encoded_len(values),
+                };
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(length as u64);
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let generation = scan.publication_generation(self, table_slot)?;
+        drop(scan);
+        let mut statistics = self.table_statistics(table_slot, 0);
+        statistics.valid = true;
+        statistics.rows = rows;
+        statistics.average_row_width = row_bytes
+            .checked_div(rows)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        statistics.analyzed_generation = generation;
+        self.write_relation_counts(table_slot, statistics, true)
+    }
+
     /// Rebuilds statistics from current committed data and all own changes.
     /// An empty `selected_columns` means every column; otherwise
     /// only the named column statistics are replaced while table cardinality
@@ -35036,6 +35443,11 @@ impl Storage {
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
+                self.tables[table_index].statistics.set_index_hint(
+                    definition.identity.created_at,
+                    true,
+                    true,
+                )?;
                 publication.enforcers = candidate;
                 publication.n_enforcers = n_want;
                 return Ok(());
@@ -35105,6 +35517,11 @@ impl Storage {
                 "table changed while its value caches were being built"
             ));
         }
+        self.tables[table_index].statistics.set_index_hint(
+            definition.identity.created_at,
+            true,
+            true,
+        )?;
         publication.enforcers = candidate;
         publication.n_enforcers = n_want;
         Ok(())
@@ -56543,6 +56960,7 @@ mod tests {
                 Some(StackStr::from_str("comment")),
                 10,
             )
+            .unwrap()
             .unwrap();
         storage.commit_comment(comment, 10);
         assert!(
@@ -57837,7 +58255,7 @@ mod tests {
         assert_send_sync::<ObjectAclIter<'_>>();
         assert_send_sync::<ColumnAclIter<'_>>();
         assert_send_sync::<DefaultAclIter<'_>>();
-        assert_send_sync::<ParameterAclIter<'_>>();
+        assert_send_sync::<parameter_acls::ParameterAclRowIter<'_>>();
 
         const WORKERS: usize = 4;
         let parameters = ["acl.a", "acl.b", "acl.c", "acl.d"];
@@ -57846,7 +58264,7 @@ mod tests {
         config.max_acl_entries = 3 + WORKERS;
         config.max_column_acl_entries = WORKERS;
         config.max_default_acl_entries = WORKERS;
-        config.max_parameter_acl_entries = WORKERS;
+        config.max_parameter_acl_entries = 2 * WORKERS;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let grantees = ["acl_a", "acl_b", "acl_c", "acl_d", "acl_e"].map(|name| {
@@ -57872,9 +58290,9 @@ mod tests {
                             object,
                             grantee,
                             BOOTSTRAP_ROLE,
-                            PrivilegeSet::USAGE,
+                            PrivilegeSet::CONNECT,
                             PrivilegeSet::NONE,
-                            txid,
+                            ObjectAclWrite::Change { transaction: 0 },
                         )
                         .unwrap();
                     storage.commit_acl(object_slot, txid);
@@ -57917,7 +58335,7 @@ mod tests {
 
                     let parameter = crate::sql::ast::ParameterName::parse(parameter)
                         .expect("parameter name fits");
-                    let (parameter_slot, _) = storage
+                    let _ = storage
                         .change_parameter_acl(
                             parameter,
                             grantee,
@@ -57927,7 +58345,7 @@ mod tests {
                             txid,
                         )
                         .unwrap();
-                    storage.commit_parameter_acl(parameter_slot, txid);
+                    storage.commit_parameter_acls(txid);
                 });
             }
         });
@@ -57939,7 +58357,7 @@ mod tests {
         assert_eq!(catalog.objects.capacity(), 3 + WORKERS);
         assert_eq!(catalog.columns.capacity(), WORKERS);
         assert_eq!(catalog.defaults.capacity(), WORKERS);
-        assert_eq!(catalog.parameters.capacity(), WORKERS);
+        assert_eq!(catalog.parameters.capacity(), 2 * WORKERS);
         drop(catalog);
 
         let mut seen = 0;
@@ -57950,7 +58368,18 @@ mod tests {
         assert_eq!(seen, WORKERS);
         assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
         assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
-        assert_eq!(storage.checkpoint_parameter_acls().count(), WORKERS);
+        assert_eq!(
+            storage
+                .acl_catalog
+                .lock()
+                .unwrap()
+                .parameters
+                .iter()
+                .filter(|entry| entry.live)
+                .count(),
+            2 * WORKERS
+        );
+        assert_eq!(storage.parameter_acl_rows_visible(0).count(), WORKERS);
         assert_eq!(
             storage
                 .change_parameter_acl(
@@ -57959,7 +58388,7 @@ mod tests {
                     BOOTSTRAP_ROLE,
                     crate::sql::ast::ParameterPrivileges::SET,
                     crate::sql::ast::ParameterPrivileges::NONE,
-                    0,
+                    (WORKERS + 1) as u32,
                 )
                 .unwrap_err()
                 .sqlstate,
@@ -57968,12 +58397,292 @@ mod tests {
     }
 
     #[test]
+    fn object_acl_ownership_order_and_undo_are_bounded() {
+        let mut config = test_config();
+        config.max_acl_entries = 5;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut other_budget = test_budget(&config);
+        let other = Storage::new(&config, &mut other_budget, 0).unwrap();
+        let object = AccessObject {
+            class: AccessClass::Database,
+            slot: 0,
+        };
+        let unrelated = AccessObject {
+            class: AccessClass::Database,
+            slot: 1,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, undo) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 7 },
+                )
+                .unwrap();
+            let order = storage.object_acl_order(slot, 7).unwrap();
+            assert!(storage.object_acl_defined(object, 7));
+            assert!(!storage.object_acl_defined(object, 8));
+            assert_eq!(
+                storage
+                    .change_acl(
+                        object,
+                        BOOTSTRAP_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction: 8 }
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            let (other_slot, other_undo) = other
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 7 },
+                )
+                .unwrap();
+            assert_eq!(other_slot, slot);
+            assert!(other.restore_acl_pending(other_slot, undo).is_err());
+            other.restore_acl_pending(other_slot, other_undo).unwrap();
+            let (independent, independent_undo) = storage
+                .change_acl(
+                    unrelated,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 8 },
+                )
+                .unwrap();
+            storage
+                .restore_acl_pending(independent, independent_undo)
+                .unwrap();
+            storage.restore_acl_pending(slot, undo).unwrap();
+            assert!(!storage.object_acl_defined(object, 0));
+            let (reused, replacement) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 8 },
+                )
+                .unwrap();
+            assert_eq!(reused, slot);
+            assert!(storage.restore_acl_pending(slot, undo).is_err());
+            let new_order = storage.object_acl_order(slot, 8).unwrap();
+            assert!(new_order > order);
+            storage.commit_acl(slot, 8);
+            assert!(storage.restore_acl_pending(slot, replacement).is_err());
+            let (_, update) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT.union(PrivilegeSet::TEMPORARY),
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            assert_eq!(storage.object_acl_order(slot, 9), Some(new_order));
+            let (_, revoke) = storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::NONE,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            assert!(storage.restore_acl_pending(slot, update).is_err());
+            storage.restore_acl_pending(slot, revoke).unwrap();
+            storage.restore_acl_pending(slot, update).unwrap();
+            assert_eq!(storage.acl_state(slot, 0).0, PrivilegeSet::CONNECT);
+            storage
+                .change_acl(
+                    object,
+                    BOOTSTRAP_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::DATABASE_ALL,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 0 },
+                )
+                .unwrap();
+            storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::NONE,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 9 },
+                )
+                .unwrap();
+            storage.commit_acl(slot, 9);
+            assert!(storage.object_acl_defined(object, 0));
+            assert!(!storage.acl_entry_visible(slot, 0));
+            storage
+                .change_acl(
+                    object,
+                    PUBLIC_ROLE,
+                    BOOTSTRAP_ROLE,
+                    PrivilegeSet::CONNECT,
+                    PrivilegeSet::NONE,
+                    ObjectAclWrite::Change { transaction: 10 },
+                )
+                .unwrap();
+            assert!(storage.object_acl_order(slot, 10).unwrap() > new_order);
+            storage.commit_acl(slot, 10);
+            for transaction in 11..43 {
+                let (removed, _) = storage
+                    .change_acl(
+                        object,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::NONE,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction },
+                    )
+                    .unwrap();
+                storage.commit_acl(removed, transaction);
+                let (added, _) = storage
+                    .change_acl(
+                        object,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction },
+                    )
+                    .unwrap();
+                storage.commit_acl(added, transaction);
+                assert_eq!(added, slot);
+            }
+            let before = storage.acl_entry_count();
+            storage.acl_catalog.lock().unwrap().next_object_order = u64::MAX;
+            assert_eq!(
+                storage
+                    .change_acl(
+                        unrelated,
+                        PUBLIC_ROLE,
+                        BOOTSTRAP_ROLE,
+                        PrivilegeSet::CONNECT,
+                        PrivilegeSet::NONE,
+                        ObjectAclWrite::Change { transaction: 11 }
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.acl_entry_count(), before);
+            assert!(!storage.object_acl_defined(unrelated, 0));
+        });
+    }
+
+    #[test]
+    fn comment_catalog_private_writes_wait_and_absent_removals_use_no_capacity() {
+        let mut config = test_config();
+        config.max_comments = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("commented").unwrap();
+        let absent = SqlName::parse("absent").unwrap();
+        let text = Some(comment_stackstr("same text").unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, _) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 7)
+                .unwrap()
+                .unwrap();
+            let error = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            assert!(
+                storage
+                    .set_comment(CommentClass::Relation, schema, absent, 0, None, 8)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(storage.commit_comment(slot, 7).is_some());
+            let original_root = storage.catalog_comments(0).next().unwrap().root.unwrap();
+            let (same_slot, prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(same_slot, slot);
+            assert!(storage.catalog_comments(8).next().unwrap().private);
+            assert_eq!(
+                storage.catalog_comments(8).next().unwrap().root,
+                Some(original_root)
+            );
+            let (removed_slot, removed_prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, None, 8)
+                .unwrap()
+                .unwrap();
+            let (inserted_slot, inserted_prior) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 8)
+                .unwrap()
+                .unwrap();
+            let inserted_root = storage.catalog_comments(8).next().unwrap().root.unwrap();
+            assert_ne!(inserted_root, original_root);
+            assert_eq!(
+                storage.catalog_comments(0).next().unwrap().root,
+                Some(original_root)
+            );
+            storage.restore_comment_pending(inserted_slot, inserted_prior);
+            assert!(storage.catalog_comments(8).next().unwrap().text.is_none());
+            storage.restore_comment_pending(removed_slot, removed_prior);
+            assert_eq!(
+                storage.catalog_comments(8).next().unwrap().root,
+                Some(original_root)
+            );
+            storage.restore_comment_pending(same_slot, prior);
+            assert!(!storage.catalog_comments(8).next().unwrap().private);
+            let (slot, _) = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, None, 9)
+                .unwrap()
+                .unwrap();
+            assert!(storage.catalog_comments(9).next().unwrap().private);
+            storage.commit_comment(slot, 9).unwrap();
+            assert!(
+                storage
+                    .set_comment(CommentClass::Relation, schema, name, 0, None, 10)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(storage.catalog_comments(10).count(), 0);
+            storage.comment_catalog().next_root = core::num::NonZeroU64::new(u64::MAX).unwrap();
+            let exhausted = storage
+                .set_comment(CommentClass::Relation, schema, name, 0, text, 10)
+                .unwrap_err();
+            assert_eq!(exhausted.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                exhausted.message.as_str(),
+                "comment tuple identity exhausted"
+            );
+            assert_eq!(storage.catalog_comments(10).count(), 0);
+        });
+    }
+
+    #[test]
     fn comment_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Mutex<CommentCatalog>>();
         assert_send_sync::<LiveCommentIter<'_>>();
         assert_send_sync::<CheckpointCommentIter<'_>>();
-        assert_send_sync::<VisibleCommentIter<'_>>();
+        assert_send_sync::<CatalogCommentIter<'_>>();
 
         const WORKERS: usize = 4;
         let names = ["comment_a", "comment_b", "comment_c", "comment_d"];
@@ -57997,6 +58706,7 @@ mod tests {
                             Some(comment_stackstr(texts[worker]).unwrap()),
                             txid,
                         )
+                        .unwrap()
                         .unwrap();
                     assert!(prior.is_none());
                     assert!(storage.commit_comment(slot, txid).is_some());
@@ -58817,7 +59527,7 @@ mod tests {
                 BOOTSTRAP_ROLE,
                 PrivilegeSet::USAGE,
                 PrivilegeSet::NONE,
-                0,
+                crate::storage::ObjectAclWrite::Change { transaction: 0 },
             )
             .unwrap();
         assert_eq!(

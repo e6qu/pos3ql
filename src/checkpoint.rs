@@ -64,6 +64,43 @@ struct WriterFence {
     etag: EntityTag,
 }
 
+#[derive(Clone, Copy)]
+enum PromotionRoots {
+    Current,
+    Validated {
+        manifest: Option<EntityTag>,
+        head: Option<EntityTag>,
+    },
+}
+
+impl PromotionRoots {
+    fn check(
+        self,
+        root: MutableRoot,
+        current: Option<EntityTag>,
+    ) -> Result<(), CheckpointSetupError> {
+        if let Self::Validated { manifest, head } = self {
+            let expected = match root {
+                MutableRoot::Manifest => manifest,
+                MutableRoot::CommitHead => head,
+            };
+            if current != expected {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "{} changed after startup validation",
+                    root.key()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct WriterPromotion {
+    fence: WriterFence,
+    manifest: EntityTag,
+    head: EntityTag,
+}
+
 fn new_writer_token() -> std::io::Result<WriterToken> {
     use std::io::Read;
 
@@ -172,7 +209,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v21";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v25";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -1254,6 +1291,7 @@ pub(crate) struct Checkpointer {
     blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
+    parameter_acl_arena: Arena,
     /// Spill-list updates computed during a checkpoint, applied to storage
     /// only after the manifest CAS lands.
     pending_installs: Vec<(usize, SlotInstall)>,
@@ -1524,6 +1562,7 @@ impl Checkpointer {
             + Self::credential_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
+            + Storage::parameter_acl_image_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
             + ExternalRunReader::budget_bytes()
             + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
@@ -2243,6 +2282,12 @@ impl Checkpointer {
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
+            parameter_acl_arena: Arena::new(
+                budget,
+                "checkpoint parameter ACL row",
+                Storage::parameter_acl_image_budget_bytes(config),
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             pending_installs: Vec::with_capacity(
                 table_capacity.saturating_mul(config.max_spill_generations_per_table),
             ),
@@ -2513,13 +2558,19 @@ impl Checkpointer {
     }
 
     fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {
-        let fence = promote_writer(
+        let promoted = promote_writer(
             &mut self.client,
             self.writer_token,
             &mut self.manifest_buf,
             &mut self.root_buf,
+            PromotionRoots::Validated {
+                manifest: self.manifest_etag,
+                head: self.commit_head_etag,
+            },
         )?;
-        self.writer_fence_etag = Some(fence.etag);
+        self.writer_fence_etag = Some(promoted.fence.etag);
+        self.manifest_etag = Some(promoted.manifest);
+        self.commit_head_etag = Some(promoted.head);
         Ok(())
     }
 
@@ -3609,77 +3660,64 @@ impl Checkpointer {
                 }
             }
         }
-        self.claim_writer()?;
-        let floor = match self.client.get(MANIFEST_KEY, None) {
-            Ok(r) => {
-                self.manifest_etag = Some(r.etag);
-                if is_empty_manifest(self.client.body_bytes())
-                    .map_err(CheckpointSetupError::Corrupt)?
-                {
-                    self.manifest_present = false;
-                    0
-                } else {
-                    self.manifest_present = true;
-                    let text = core::str::from_utf8(self.client.body_bytes())
-                        .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
-                        .to_string();
-                    self.load_manifest_text(storage, &text)?
-                }
+        self.manifest_etag = read_mutable_root(
+            &mut self.client,
+            MutableRoot::Manifest,
+            &mut self.manifest_buf,
+        )?;
+        self.manifest_present = false;
+        let floor = if self.manifest_etag.is_some() {
+            if is_empty_manifest(self.manifest_buf.readable())
+                .map_err(CheckpointSetupError::Corrupt)?
+            {
+                0
+            } else {
+                let text = core::str::from_utf8(self.manifest_buf.readable())
+                    .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
+                    .to_owned();
+                let floor = self.load_manifest_text(storage, &text)?;
+                self.manifest_present = true;
+                floor
             }
-            Err(e) if e.is_not_found() => 0,
-            Err(e) => {
-                return Err(CheckpointSetupError::ObjectStore(format!(
-                    "load manifest: {e}"
-                )));
-            }
+        } else {
+            0
         };
-        match self.client.get(COMMIT_HEAD_KEY, None) {
-            Ok(result) => {
-                self.commit_head_etag = Some(result.etag);
-                if is_empty_commit_head(self.client.body_bytes())
+        self.commit_head_etag = read_mutable_root(
+            &mut self.client,
+            MutableRoot::CommitHead,
+            &mut self.root_buf,
+        )?;
+        self.commit_head = if self.commit_head_etag.is_some()
+            && !is_empty_commit_head(self.root_buf.readable())
+                .map_err(CheckpointSetupError::Corrupt)?
+        {
+            Some(
+                parse_commit_head(self.root_buf.readable())
                     .map_err(CheckpointSetupError::Corrupt)?
-                {
-                    self.commit_head = None;
-                    let mut has_orphaned_batches = false;
-                    self.client
-                        .list("commits/", |_| has_orphaned_batches = true)
-                        .map_err(|error| {
-                            CheckpointSetupError::ObjectStore(format!(
-                                "list orphaned commit batches: {error}"
-                            ))
-                        })?;
-                    if has_orphaned_batches {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "commit batches exist without a commit-head",
-                        ));
-                    }
-                } else {
-                    let (_, batch) = parse_commit_head(self.client.body_bytes())
-                        .map_err(CheckpointSetupError::Corrupt)?;
-                    self.commit_head = Some(batch);
-                }
-            }
-            Err(error) if error.is_not_found() => {
-                let mut has_orphaned_batches = false;
-                self.client
-                    .list("commits/", |_| has_orphaned_batches = true)
-                    .map_err(|error| {
-                        CheckpointSetupError::ObjectStore(format!(
-                            "list orphaned commit batches: {error}"
-                        ))
-                    })?;
-                if has_orphaned_batches {
-                    return Err(CheckpointSetupError::Corrupt(
-                        "commit batches exist without a commit-head",
-                    ));
-                }
-            }
-            Err(error) => {
-                return Err(CheckpointSetupError::ObjectStore(format!(
-                    "load commit-head: {error}"
-                )));
+                    .1,
+            )
+        } else {
+            None
+        };
+        if self.commit_head.is_none() {
+            let mut has_orphaned_batches = false;
+            self.client
+                .list("commits/", |_| has_orphaned_batches = true)
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "list orphaned commit batches: {error}"
+                    ))
+                })?;
+            if has_orphaned_batches {
+                return Err(CheckpointSetupError::Corrupt(
+                    "commit batches exist without a commit-head",
+                ));
             }
         }
+        // Catalog and immutable references are valid before changing any root.
+        // Promotion checks both captured versions again after fencing: a racing
+        // writer requires a fresh startup, never publication from stale storage.
+        self.claim_writer()?;
         Ok(floor)
     }
 
@@ -3690,6 +3728,9 @@ impl Checkpointer {
         text: &str,
     ) -> Result<u64, CheckpointSetupError> {
         let metadata = parse_manifest_metadata(text).map_err(CheckpointSetupError::Corrupt)?;
+        storage.begin_object_acl_restore().map_err(|_| {
+            CheckpointSetupError::Corrupt("object ACL restoration requires initial catalog state")
+        })?;
         let lsn = metadata.lsn;
         let next_rowid = metadata.next_rowid;
         storage.restore_catalog_identity_sequence(metadata.catalog_sequence);
@@ -3714,6 +3755,7 @@ impl Checkpointer {
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut value_indexes: Vec<LoadedValueIndex> = Vec::new();
         let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
+        let mut relation_index_hints: Vec<(usize, bool)> = Vec::new();
         struct LoadedExtendedStatistics {
             database: crate::storage::DatabaseOid,
             created_at: u64,
@@ -4074,6 +4116,28 @@ impl Checkpointer {
                         statistics_options,
                     };
                     *seen += 1;
+                }
+                Some("hidx") => {
+                    let table_index: usize = parse_field(words.next(), "hidx table index")?;
+                    let has_index = match words.next() {
+                        Some("0") => false,
+                        Some("1") => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid relation index hint",
+                            ));
+                        }
+                    };
+                    if words.next().is_some()
+                        || relation_index_hints
+                            .iter()
+                            .any(|(index, _)| *index == table_index)
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or trailing relation index hint",
+                        ));
+                    }
+                    relation_index_hints.push((table_index, has_index));
                 }
                 Some("stats") => {
                     let table_index: usize = parse_field(words.next(), "stats table index")?;
@@ -4983,6 +5047,9 @@ impl Checkpointer {
                     let grantor = decode(words.next(), "acl grantor missing")?;
                     let privileges: u16 = parse_field(words.next(), "acl privileges")?;
                     let grant_options: u16 = parse_field(words.next(), "acl grant options")?;
+                    let order =
+                        core::num::NonZeroU64::new(parse_field(words.next(), "acl grant order")?)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid acl grant order"))?;
                     if words.next().is_some()
                         || privileges & !crate::storage::all_object_privileges(class).0 != 0
                         || grant_options & !privileges != 0
@@ -5016,7 +5083,10 @@ impl Checkpointer {
                             grantor,
                             crate::storage::PrivilegeSet(privileges),
                             crate::storage::PrivilegeSet(grant_options),
-                            0,
+                            crate::storage::ObjectAclWrite::Exact {
+                                transaction: 0,
+                                order,
+                            },
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -5168,46 +5238,31 @@ impl Checkpointer {
                 }
                 Some("pacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
-                    };
-                    let parameter = decode(words.next(), "pacl parameter missing")?;
+                    let oid: u32 = parse_field(words.next(), "pacl oid")?;
+                    let oid = crate::storage::ParameterAclOid::parse(oid)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl oid"))?;
+                    let parameter = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("pacl parameter missing"))?,
+                    )?;
                     let parameter = crate::sql::ast::ParameterName::parse(&parameter)
                         .ok_or(CheckpointSetupError::Corrupt("invalid pacl parameter"))?;
-                    let grantee = decode(words.next(), "pacl grantee missing")?;
-                    let grantor = decode(words.next(), "pacl grantor missing")?;
-                    let privileges: u8 = parse_field(words.next(), "pacl privileges")?;
-                    let grant_options: u8 = parse_field(words.next(), "pacl grant options")?;
-                    let privileges = crate::sql::ast::ParameterPrivileges::from_bits(privileges)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl privileges"))?;
-                    let grant_options =
-                        crate::sql::ast::ParameterPrivileges::from_bits(grant_options)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid pacl grant options"))?;
-                    if words.next().is_some() || !privileges.contains(grant_options) {
+                    let bytes = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("pacl grants missing"))?,
+                    )?;
+                    let grants = crate::storage::ParameterAclGrants::parse(&bytes)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl grants"))?;
+                    let image = crate::storage::ParameterAclImage::new(oid, grants).ok_or(
+                        CheckpointSetupError::Corrupt("pacl row contains implicit defaults"),
+                    )?;
+                    if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid pacl record"));
                     }
-                    let grantee = if grantee == "PUBLIC" {
-                        crate::storage::PUBLIC_ROLE
-                    } else {
-                        storage
-                            .find_role(&grantee)
-                            .ok_or(CheckpointSetupError::Corrupt("pacl grantee does not exist"))?
-                            as u16
-                    };
-                    let grantor = storage
-                        .find_role(&grantor)
-                        .ok_or(CheckpointSetupError::Corrupt("pacl grantor does not exist"))?
-                        as u16;
                     storage
-                        .change_parameter_acl(
-                            parameter,
-                            grantee,
-                            grantor,
-                            privileges,
-                            grant_options,
-                            0,
-                        )
+                        .restore_parameter_acl_row(parameter, None, Some(image))
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest parameter ACL rejected: {}",
@@ -8701,6 +8756,33 @@ impl Checkpointer {
                     ))
                 })?;
         }
+        if relation_index_hints.len() != slot_of.iter().flatten().count() {
+            return Err(CheckpointSetupError::Corrupt(
+                "manifest relation index hints are incomplete",
+            ));
+        }
+        for (manifest_index, has_index) in relation_index_hints {
+            let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
+                CheckpointSetupError::Corrupt("relation index hint references unknown table"),
+            )?;
+            let database = storage.table(slot).database();
+            if slot == storage.large_object_page_table() {
+                if has_index {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "internal large-object relation cannot have a user index hint",
+                    ));
+                }
+                continue;
+            }
+            storage
+                .select_database_for_recovery(database)
+                .map_err(|_| {
+                    CheckpointSetupError::Corrupt("unknown relation index hint database")
+                })?;
+            storage
+                .replay_relation_index_hint(storage.table_position(slot), has_index, 0)
+                .map_err(|_| CheckpointSetupError::Corrupt("invalid relation index hint source"))?;
+        }
         for (manifest_index, statistics) in table_statistics {
             let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
                 CheckpointSetupError::Corrupt("statistics reference unknown table"),
@@ -9944,7 +10026,14 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            let table_statistics = table.committed_statistics();
+            let captured = self.checkpoint_statistics[slot]
+                .as_ref()
+                .expect("manifest captures statistics for every table slot");
+            let table_statistics = captured.image();
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!("hidx {slot} {}", u8::from(captured.has_index())),
+            )?;
             if table_statistics.valid {
                 write_manifest(
                     &mut self.manifest_output,
@@ -12335,7 +12424,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "acl {} {} {} {} {} {} {} {}",
+                        "acl {} {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
                         crate::storage::routine_oid(&storage.routine(acl.object.slot as usize)),
                         schema_hex.as_str(),
@@ -12343,21 +12432,27 @@ impl Checkpointer {
                         grantee_hex.as_str(),
                         grantor_hex.as_str(),
                         acl.privileges.0,
-                        acl.grant_options.0
+                        acl.grant_options.0,
+                        acl.order
+                            .expect("checkpoint ACL has a committed grant order")
+                            .get()
                     ),
                 )?;
             } else {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "acl {} {} {} {} {} {} {}",
+                        "acl {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         grantee_hex.as_str(),
                         grantor_hex.as_str(),
                         acl.privileges.0,
-                        acl.grant_options.0
+                        acl.grant_options.0,
+                        acl.order
+                            .expect("checkpoint ACL has a committed grant order")
+                            .get()
                     ),
                 )?;
             }
@@ -12459,35 +12554,37 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, acl) in storage.checkpoint_parameter_acls() {
-            use core::fmt::Write;
-            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
-                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
-            } else {
-                storage.role(acl.grantee as usize).name
-            };
-            let grantor = storage.role(acl.grantor as usize).name;
-            let mut parameter_hex = StackStr::<130>::new();
-            let mut grantee_hex = StackStr::<130>::new();
-            let mut grantor_hex = StackStr::<130>::new();
-            for byte in acl.parameter.as_str().as_bytes() {
-                let _ = write!(parameter_hex, "{byte:02x}");
-            }
-            for byte in grantee.as_str().as_bytes() {
-                let _ = write!(grantee_hex, "{byte:02x}");
-            }
-            for byte in grantor.as_str().as_bytes() {
-                let _ = write!(grantor_hex, "{byte:02x}");
+        for row in storage.parameter_acl_rows_visible(0) {
+            self.parameter_acl_arena.reset();
+            let image = storage
+                .snapshot_parameter_acl_row(row.parameter, 0, &self.parameter_acl_arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "checkpoint parameter ACL row disappeared"
+                    )
+                })?;
+            struct GrantsHex<'a>(crate::storage::ParameterAclGrants<'a>);
+            impl core::fmt::Display for GrantsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    if self.0.is_empty() {
+                        return out.write_str("-");
+                    }
+                    for grant in self.0.iter() {
+                        for byte in grant.encode() {
+                            write!(out, "{byte:02x}")?;
+                        }
+                    }
+                    Ok(())
+                }
             }
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "pacl {} {} {} {} {}",
-                    parameter_hex.as_str(),
-                    grantee_hex.as_str(),
-                    grantor_hex.as_str(),
-                    acl.privileges.bits(),
-                    acl.grant_options.bits()
+                    "pacl {} {} {}",
+                    image.oid().get(),
+                    manifest_hex::<130>(row.parameter.as_str()),
+                    GrantsHex(image.grants())
                 ),
             )?;
         }
@@ -15463,7 +15560,14 @@ pub(crate) fn restore_backup_to(
     .map_err(CheckpointSetupError::Budget)?;
     let mut fence_head = FixedBuf::new(budget, "restore writer-fence head", 128)
         .map_err(CheckpointSetupError::Budget)?;
-    let mut fence = promote_writer(&mut client, token, &mut fence_manifest, &mut fence_head)?;
+    let mut fence = promote_writer(
+        &mut client,
+        token,
+        &mut fence_manifest,
+        &mut fence_head,
+        PromotionRoots::Current,
+    )?
+    .fence;
 
     replace_root(
         &mut client,
@@ -15894,7 +15998,9 @@ pub(crate) fn export_backup(
         token,
         &mut fence_manifest,
         &mut fence_head,
-    )?;
+        PromotionRoots::Current,
+    )?
+    .fence;
 
     replace_root(
         &mut destination,
@@ -16203,12 +16309,15 @@ fn promote_writer(
     token: WriterToken,
     manifest: &mut FixedBuf,
     head: &mut FixedBuf,
-) -> Result<WriterFence, CheckpointSetupError> {
+    roots: PromotionRoots,
+) -> Result<WriterPromotion, CheckpointSetupError> {
     // Reject incompatible or malformed root records before displacing a writer.
     // Publication re-reads them after fencing so intervening commits are preserved.
-    let _ = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    let manifest_etag = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    roots.check(MutableRoot::Manifest, manifest_etag)?;
     retag_manifest_root(manifest, token)?;
-    let _ = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    let head_etag = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    roots.check(MutableRoot::CommitHead, head_etag)?;
     retag_commit_head_root(head, token)?;
 
     let current = match client.get(WRITER_FENCE_KEY, None) {
@@ -16229,8 +16338,8 @@ fn promote_writer(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
 
-    fence_mutable_root(client, MutableRoot::Manifest, manifest, token)?;
-    fence_mutable_root(client, MutableRoot::CommitHead, head, token)?;
+    let manifest_etag = fence_mutable_root(client, MutableRoot::Manifest, manifest, token, roots)?;
+    let head_etag = fence_mutable_root(client, MutableRoot::CommitHead, head, token, roots)?;
 
     let active = writer_fence_record("active", token);
     let etag = put_fence_record(
@@ -16238,7 +16347,11 @@ fn promote_writer(
         active.as_str().as_bytes(),
         Precondition::IfMatch(&transition_etag),
     )?;
-    Ok(WriterFence { token, etag })
+    Ok(WriterPromotion {
+        fence: WriterFence { token, etag },
+        manifest: manifest_etag,
+        head: head_etag,
+    })
 }
 
 fn put_fence_record(
@@ -16383,10 +16496,12 @@ fn fence_mutable_root(
     root: MutableRoot,
     scratch: &mut FixedBuf,
     token: WriterToken,
+    roots: PromotionRoots,
 ) -> Result<EntityTag, CheckpointSetupError> {
     let key = root.key();
     for _ in 0..16 {
         let current = read_mutable_root(client, root, scratch)?;
+        roots.check(root, current)?;
         match root {
             MutableRoot::Manifest => retag_manifest_root(scratch, token)?,
             MutableRoot::CommitHead => retag_commit_head_root(scratch, token)?,
@@ -16733,20 +16848,30 @@ fn rest_of(line: &str, skip: usize) -> Result<&str, CheckpointSetupError> {
 /// Decodes a hex-encoded identifier from the manifest (startup only, so the
 /// allocation is fine).
 fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
+    String::from_utf8(decode_manifest_hex_bytes(hex)?)
+        .map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+}
+
+fn decode_manifest_hex_bytes(hex: &str) -> Result<Vec<u8>, CheckpointSetupError> {
     if hex == "-" {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     if !hex.len().is_multiple_of(2) {
-        return Err(CheckpointSetupError::Corrupt("odd-length hex name"));
+        return Err(CheckpointSetupError::Corrupt("odd-length hex bytes"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in 0..hex.len() / 2 {
-        bytes.push(
-            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| CheckpointSetupError::Corrupt("bad hex name"))?,
-        );
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let high = digit(pair[0]).ok_or(CheckpointSetupError::Corrupt("bad hex bytes"))?;
+        let low = digit(pair[1]).ok_or(CheckpointSetupError::Corrupt("bad hex bytes"))?;
+        bytes.push((high << 4) | low);
     }
-    String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+    Ok(bytes)
 }
 
 fn decode_optional_hex_name(value: &str) -> Result<Option<String>, CheckpointSetupError> {
@@ -18872,6 +18997,17 @@ fn parse_partition_bound_manifest(
 
 #[cfg(test)]
 mod stored_dependency_tests {
+    #[test]
+    fn manifest_hex_decode_rejects_non_ascii_without_panicking() {
+        for invalid in ["é", "🦀", "0é0", "0g", "abc"] {
+            assert!(super::decode_manifest_hex_bytes(invalid).is_err());
+        }
+        assert_eq!(super::decode_manifest_hex_bytes("fe00").unwrap(), [254, 0]);
+        assert!(super::decode_hex_name("ff").is_err());
+        assert_eq!(super::decode_hex_name("c3a9").unwrap(), "é");
+        assert_eq!(super::decode_manifest_hex_bytes("-").unwrap(), []);
+    }
+
     use super::*;
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
@@ -19393,7 +19529,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v25\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19797,7 +19933,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19823,7 +19959,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19832,7 +19968,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v21\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -19998,7 +20134,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v19",
                 "pos3ql-manifest-v20",
                 "pos3ql-manifest-v22",
-                "pos3ql-manifest-v21 trailing",
+                "pos3ql-manifest-v25 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20080,11 +20216,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v25\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v21\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v25\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20313,6 +20449,131 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn promotion_validated_roots_reject_changes_before_displacing_a_writer() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("validated-root-promotion-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = Budget::new(8 << 20);
+        let mut client = ObjectStore::new(&config, &mut budget).unwrap();
+        let mut manifest =
+            FixedBuf::new(&mut budget, "validated promotion manifest", 1024).unwrap();
+        let mut head = FixedBuf::new(&mut budget, "validated promotion head", 128).unwrap();
+        let active = writer_fence_record("active", WriterToken(1));
+        client
+            .put(
+                WRITER_FENCE_KEY,
+                active.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let original_manifest = empty_manifest_record(WriterToken(1));
+        let original_head = empty_commit_head_record(WriterToken(1));
+        let manifest_etag = client
+            .put(
+                MANIFEST_KEY,
+                original_manifest.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let head_etag = client
+            .put(
+                COMMIT_HEAD_KEY,
+                original_head.as_str().as_bytes(),
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        let changed_manifest = empty_manifest_record(WriterToken(2));
+        let changed_manifest_etag = client
+            .put(
+                MANIFEST_KEY,
+                changed_manifest.as_str().as_bytes(),
+                Precondition::IfMatch(&manifest_etag),
+            )
+            .unwrap();
+        let error = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(manifest_etag),
+                head: Some(head_etag),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, CheckpointSetupError::ObjectStore(message) if message == "manifest changed after startup validation")
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), active.as_str().as_bytes());
+        client.get(MANIFEST_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), changed_manifest.as_str().as_bytes());
+        let changed_head = empty_commit_head_record(WriterToken(2));
+        let changed_head_etag = client
+            .put(
+                COMMIT_HEAD_KEY,
+                changed_head.as_str().as_bytes(),
+                Precondition::IfMatch(&head_etag),
+            )
+            .unwrap();
+        let error = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(changed_manifest_etag),
+                head: Some(head_etag),
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, CheckpointSetupError::ObjectStore(message) if message == "commit-head changed after startup validation")
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), active.as_str().as_bytes());
+        client.get(COMMIT_HEAD_KEY, None).unwrap();
+        assert_eq!(client.body_bytes(), changed_head.as_str().as_bytes());
+        let promoted = promote_writer(
+            &mut client,
+            WriterToken(3),
+            &mut manifest,
+            &mut head,
+            PromotionRoots::Validated {
+                manifest: Some(changed_manifest_etag),
+                head: Some(changed_head_etag),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client.get(MANIFEST_KEY, None).unwrap().etag,
+            promoted.manifest
+        );
+        assert_eq!(
+            empty_manifest_writer(client.body_bytes()).unwrap(),
+            Some(WriterToken(3))
+        );
+        assert_eq!(
+            client.get(COMMIT_HEAD_KEY, None).unwrap().etag,
+            promoted.head
+        );
+        assert_eq!(
+            empty_commit_head_writer(client.body_bytes()).unwrap(),
+            Some(WriterToken(3))
+        );
+        client.get(WRITER_FENCE_KEY, None).unwrap();
+        assert_eq!(
+            parse_writer_fence(client.body_bytes()).unwrap(),
+            ("active", WriterToken(3))
+        );
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
     fn promotion_retags_mutable_roots_even_when_etags_follow_content() {
         let old = WriterToken(1);
         let replacement = WriterToken(2);
@@ -20321,7 +20582,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v21\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v25\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

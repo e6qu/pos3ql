@@ -179,6 +179,7 @@ class Node:
         values = {
             "listen_addr": f"127.0.0.1:{port}", "data_dir": self.data,
             "transaction_mode": "mvcc",
+            "catalog_history_bytes": "16MiB",
             "max_connections": 4, "query_workspace_slots": 2,
             "memtable_bytes": "4MiB", "wal_bytes": "4MiB", "wal_buffer_bytes": "256KiB",
             "sql_arena_bytes": "1MiB", "work_arena_bytes": "8MiB",

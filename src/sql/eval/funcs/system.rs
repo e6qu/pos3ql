@@ -69,6 +69,10 @@ impl ObjectOid {
         match value {
             Datum::Null => Ok(None),
             Datum::Oid(oid) => Ok(Some(Self(oid))),
+            Datum::Int2(oid) => u32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
                 .map(Self)
                 .map(Some)
@@ -1637,29 +1641,22 @@ pub(crate) fn dispatch<'a>(
                 arity(0)?;
                 Ok(Datum::Text(current_user_str(arena)?))
             }
-            // Catalog helpers for psql introspection. Every user object lives in the
-            // single visible schema owned by the connection role.
             "pg_get_userbyid" => {
                 arity(1)?;
-                let Some(cat) = hooks.catalog else {
-                    return Ok(Datum::Null);
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0 as i32,
+                    None => return Ok(Datum::Null),
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
-                    Some(oid) => oid.0,
-                    None => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "pg_get_userbyid() requires an oid"
-                        ));
-                    }
-                };
-                Ok(cat
-                    .role_name(oid, arena)?
-                    .map(Datum::Text)
-                    .unwrap_or(Datum::Null))
+                let cat = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_get_userbyid requires catalog access"
+                    )
+                })?;
+                Ok(Datum::Text(crate::sql::catalog::user_name_by_oid(
+                    cat, oid, arena,
+                )?))
             }
-            // A non-partitioned table is its own only ancestor/root; we have no
-            // partitioning, so these return the argument unchanged.
             "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)
@@ -2099,14 +2096,15 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     None
                 };
-                if matches!(
-                    catalog_name,
-                    Some("pg_database" | "pg_tablespace" | "pg_authid")
-                ) {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(catalog_name, oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: catalog_name,
+                            column: 0,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2126,7 +2124,14 @@ pub(crate) fn dispatch<'a>(
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
-                    .comment(Some("pg_class"), oid, col, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: Some("pg_class"),
+                            column: col,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2143,11 +2148,14 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(name) => name,
                     _ => return Ok(Datum::Null),
                 };
-                if !matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(Some(catalog_name), oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Shared {
+                            catalog: catalog_name,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2331,7 +2339,9 @@ pub(crate) fn dispatch<'a>(
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {
                     TypeMod::None => stack_format!(80, "{}", name),
-                    TypeMod::Length(n) => stack_format!(80, "{}({})", name, n),
+                    TypeMod::Length(n) | TypeMod::BitLength(n) => {
+                        stack_format!(80, "{}({})", name, n)
+                    }
                     TypeMod::NumericPS { precision, scale } => {
                         stack_format!(80, "{}({},{})", name, precision, scale)
                     }
@@ -2683,8 +2693,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::TsVector(_) => "tsvector",
                     Datum::TsQuery(_) => "tsquery",
                     Datum::Array { element, .. } => element.typeof_name(),
-                    Datum::Int2Vector(_) => "int2vector",
-                    Datum::OidVector(_) => "oidvector",
+                    Datum::Int2Vector { .. } => "int2vector",
+                    Datum::OidVector { .. } => "oidvector",
                     Datum::Uuid(_) => "uuid",
                     Datum::Bytea(_) => "bytea",
                     Datum::Numeric(_) => "numeric",

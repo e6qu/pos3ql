@@ -6358,12 +6358,14 @@ fn rewrite_object_acl_owner(
                 grantor
             },
             txn.txid,
-        );
+        )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -6422,13 +6424,25 @@ fn preserve_object_acl(
             grantor,
             privileges,
             grant_options,
-            txn.txid,
+            crate::storage::ObjectAclWrite::Exact {
+                transaction: txn.txid,
+                order: storage
+                    .object_acl_order(acl_slot, txn.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "copied object ACL has no grant order"
+                        )
+                    })?,
+            },
         )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: changed as u32,
             prior,
         }) {
-            storage.restore_acl_pending(changed, prior);
+            storage
+                .restore_acl_pending(changed, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -8975,13 +8989,23 @@ fn apply_default_privileges_to_new_object(
         {
             continue;
         }
-        let (slot, prior) =
-            storage.change_acl(object, grantee, owner, privileges, grant_options, txn.txid)?;
+        let (slot, prior) = storage.change_acl(
+            object,
+            grantee,
+            owner,
+            privileges,
+            grant_options,
+            crate::storage::ObjectAclWrite::Change {
+                transaction: txn.txid,
+            },
+        )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -9354,13 +9378,17 @@ fn record_acl_removal(
         grantor,
         crate::storage::PrivilegeSet::NONE,
         crate::storage::PrivilegeSet::NONE,
-        txn.txid,
+        crate::storage::ObjectAclWrite::Change {
+            transaction: txn.txid,
+        },
     )?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
         slot: changed as u32,
         prior,
     }) {
-        storage.restore_acl_pending(changed, prior);
+        storage
+            .restore_acl_pending(changed, prior)
+            .expect("transaction owns its object ACL undo");
         return Err(error);
     }
     Ok(grant_options)
@@ -10827,6 +10855,34 @@ fn resolve_privilege_objects(
             }
         }
     }
+    for object in &objects[..count] {
+        let table = match object.class {
+            AccessClass::Table => Some(usize::from(object.slot)),
+            AccessClass::MaterializedView => Some(usize::from(
+                storage.matview(usize::from(object.slot)).backing_table,
+            )),
+            AccessClass::View => {
+                storage.lock_object(
+                    txid,
+                    crate::storage::ObjectLockTarget::View(usize::from(object.slot)),
+                    crate::sql::ast::TableLockMode::AccessShare,
+                    false,
+                )?;
+                None
+            }
+            _ => None,
+        };
+        if let Some(table) = table {
+            let (source, _) = storage.select_table_definition(table, txid);
+            storage.lock_table(
+                txid,
+                table,
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )?;
+            source.validate(storage)?;
+        }
+    }
     Ok(count)
 }
 
@@ -10899,7 +10955,7 @@ fn materialize_public_acl_default(
     for (slot, entry) in storage.acl_entries() {
         if entry.object != object
             || entry.object.slot == u16::MAX
-            || (!entry.live && entry.pending.is_none())
+            || storage.object_acl_order(slot, txn.txid).is_none()
         {
             continue;
         }
@@ -10917,9 +10973,10 @@ fn materialize_public_acl_default(
     } else {
         crate::storage::default_public_object_privileges(object.class)
     };
+    // PostgreSQL's initial ACL places PUBLIC before the owner when present.
     for (grantee, privileges) in [
-        (owner, owner_privileges),
         (crate::storage::PUBLIC_ROLE, public_privileges),
+        (owner, owner_privileges),
     ] {
         if privileges.0 == 0 {
             continue;
@@ -10930,13 +10987,17 @@ fn materialize_public_acl_default(
             owner,
             privileges,
             crate::storage::PrivilegeSet::NONE,
-            txn.txid,
+            crate::storage::ObjectAclWrite::Change {
+                transaction: txn.txid,
+            },
         )?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
             slot: slot as u32,
             prior,
         }) {
-            storage.restore_acl_pending(slot, prior);
+            storage
+                .restore_acl_pending(slot, prior)
+                .expect("transaction owns its object ACL undo");
             return Err(error);
         }
     }
@@ -11128,7 +11189,9 @@ pub fn grant_privileges(
                     acl_grantor as u16,
                     old_privileges.union(requested),
                     new_options,
-                    txn.txid,
+                    crate::storage::ObjectAclWrite::Change {
+                        transaction: txn.txid,
+                    },
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
@@ -11137,7 +11200,9 @@ pub fn grant_privileges(
                     slot: slot as u32,
                     prior,
                 }) {
-                    storage.restore_acl_pending(slot, prior);
+                    storage
+                        .restore_acl_pending(slot, prior)
+                        .expect("transaction owns its object ACL undo");
                     return sql_fail(error);
                 }
             }
@@ -11295,15 +11360,8 @@ pub fn revoke_privileges(
             ));
         }
     }
-    let revokes_public = grantees
-        .iter()
-        .any(|grantee| grantee.eq_ignore_ascii_case("public"));
     for object in &objects[..object_count] {
-        // Only a PUBLIC revocation changes PostgreSQL's implicit default ACL.
-        // Materializing it for another grantee consumes a durable ACL entry and
-        // transaction undo record for an otherwise untouched object.
-        if revokes_public && let Err(error) = materialize_public_acl_default(storage, txn, *object)
-        {
+        if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
         let requested = match privilege_mask(privileges, object.class, false) {
@@ -11414,7 +11472,9 @@ pub fn revoke_privileges(
                                 dependent_grantor,
                                 dependent_privileges.without(lost_options),
                                 dependent_options.without(lost_options),
-                                txn.txid,
+                                crate::storage::ObjectAclWrite::Change {
+                                    transaction: txn.txid,
+                                },
                             ) {
                                 Ok(change) => change,
                                 Err(error) => return sql_fail(error),
@@ -11425,7 +11485,9 @@ pub fn revoke_privileges(
                                     prior,
                                 })
                             {
-                                storage.restore_acl_pending(slot, prior);
+                                storage
+                                    .restore_acl_pending(slot, prior)
+                                    .expect("transaction owns its object ACL undo");
                                 return sql_fail(error);
                             }
                             if dependent_grantee != PUBLIC_ROLE && recursively_lost.0 != 0 {
@@ -11458,7 +11520,9 @@ pub fn revoke_privileges(
                     acl_grantor as u16,
                     new_privileges,
                     new_options,
-                    txn.txid,
+                    crate::storage::ObjectAclWrite::Change {
+                        transaction: txn.txid,
+                    },
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
@@ -11467,7 +11531,9 @@ pub fn revoke_privileges(
                     slot: slot as u32,
                     prior,
                 }) {
-                    storage.restore_acl_pending(slot, prior);
+                    storage
+                        .restore_acl_pending(slot, prior)
+                        .expect("transaction owns its object ACL undo");
                     return sql_fail(error);
                 }
             }
@@ -11596,41 +11662,6 @@ fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Res
     }
 }
 
-/// PostgreSQL records the bootstrap role's `SET, ALTER SYSTEM` ACL whenever a
-/// parameter first gains explicit ACL state.  Materializing it with the first
-/// mutation keeps catalog output, WAL, and checkpoint recovery identical.
-fn materialize_parameter_acl_default(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    parameter: crate::sql::ast::ParameterName,
-) -> Result<(), SqlError> {
-    let (privileges, _) = storage.parameter_acl_from(
-        parameter,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::storage::BOOTSTRAP_ROLE,
-        txn.txid,
-    );
-    if privileges == crate::sql::ast::ParameterPrivileges::ALL {
-        return Ok(());
-    }
-    let (slot, prior) = storage.change_parameter_acl(
-        parameter,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::storage::BOOTSTRAP_ROLE,
-        crate::sql::ast::ParameterPrivileges::ALL,
-        crate::sql::ast::ParameterPrivileges::NONE,
-        txn.txid,
-    )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.restore_parameter_acl_pending(slot, prior);
-        return Err(error);
-    }
-    Ok(())
-}
-
 pub struct ParameterPrivilegeTarget<'a> {
     pub privileges: crate::sql::ast::ParameterPrivileges,
     pub names: &'a [crate::sql::ast::ParameterName],
@@ -11675,9 +11706,6 @@ pub fn grant_parameter_privileges(
         if let Err(error) = ensure_parameter_acl_target(*parameter) {
             return sql_fail(error);
         }
-        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
-            return sql_fail(error);
-        }
         let can_grant = storage.role(grantor).attributes_to(txn.txid).superuser
             || storage.has_parameter_grant_option(
                 *parameter,
@@ -11699,7 +11727,7 @@ pub fn grant_parameter_privileges(
             };
             let (old_privileges, old_options) =
                 storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
-            let (slot, prior) = match storage.change_parameter_acl(
+            let prior = match storage.change_parameter_acl(
                 *parameter,
                 grantee,
                 grantor as u16,
@@ -11714,11 +11742,10 @@ pub fn grant_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.restore_parameter_acl_pending(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+                storage
+                    .restore_parameter_acl_pending(prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
         }
@@ -11771,7 +11798,7 @@ fn cascade_parameter_acl_grants(
                 old_privileges.bits() & lost.bits(),
             )
             .expect("intersection of parameter privilege bits is valid");
-            let (changed, prior) = storage.change_parameter_acl(
+            let prior = storage.change_parameter_acl(
                 entry.parameter,
                 grantee,
                 grantor,
@@ -11779,11 +11806,10 @@ fn cascade_parameter_acl_grants(
                 old_options.without(removed),
                 txn.txid,
             )?;
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: changed as u32,
-                prior,
-            }) {
-                storage.restore_parameter_acl_pending(changed, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+                storage
+                    .restore_parameter_acl_pending(prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return Err(error);
             }
             if grantee != crate::storage::PUBLIC_ROLE
@@ -11848,9 +11874,6 @@ pub fn revoke_parameter_privileges(
         if let Err(error) = ensure_parameter_acl_target(*parameter) {
             return sql_fail(error);
         }
-        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
-            return sql_fail(error);
-        }
         let can_revoke = storage.role(grantor).attributes_to(txn.txid).superuser
             || storage.has_parameter_grant_option(
                 *parameter,
@@ -11886,7 +11909,7 @@ pub fn revoke_parameter_privileges(
                     old_options.without(command.target.privileges),
                 )
             };
-            let (slot, prior) = match storage.change_parameter_acl(
+            let prior = match storage.change_parameter_acl(
                 *parameter,
                 grantee,
                 grantor as u16,
@@ -11897,11 +11920,10 @@ pub fn revoke_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.restore_parameter_acl_pending(slot, prior);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+                storage
+                    .restore_parameter_acl_pending(prior)
+                    .expect("transaction owns its parameter ACL undo");
                 return sql_fail(error);
             }
             let removed_options = crate::sql::ast::ParameterPrivileges::from_bits(
@@ -11926,7 +11948,6 @@ pub fn revoke_parameter_privileges(
                     &mut scratch,
                 )
             {
-                storage.restore_parameter_acl_pending(slot, prior);
                 return sql_fail(error);
             }
         }
@@ -37112,7 +37133,6 @@ fn rewrite_view_column_dependents(
             continue;
         }
 
-        let view = storage.view(view_slot);
         let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
@@ -37122,80 +37142,155 @@ fn rewrite_view_column_dependents(
                 "dependent view column binding has no matching stored identifier"
             ));
         }
-        let creation_path = query.creation_path;
-        let user = super::eval::funcs::system::session_user_owned();
-        let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
-        let rebound = super::query::stored_query_dependencies(
-            rewritten.as_str(),
-            storage,
-            txn.txid,
-            path,
-            arena,
-        )?;
-        if rebound.entries() != query.dependencies.entries() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column rename would change a dependent view binding"
-            ));
-        }
+        publish_rewritten_view(storage, wal, txn, view_slot, rewritten, arena)?;
+    }
+    Ok(())
+}
 
-        let dependent_columns = view.columns.with_aliases(true);
-        let undo = storage.replace_view_definition(
-            storage.view_edit_target(view_slot, &view, txn.txid),
-            crate::storage::ViewDefinition {
-                persistence: view.persistence,
-                columns: dependent_columns,
-                query: crate::storage::StoredQueryDefinition {
-                    sql: rewritten,
-                    creation_path,
-                    dependencies: rebound,
-                },
-                options: crate::storage::ViewOptions {
-                    ..view.options_for(txn.txid)
-                },
+#[derive(Clone, Copy)]
+struct PreparedViewColumnRewrite {
+    slot: usize,
+    sql: crate::util::StackStr<{ crate::storage::VIEW_SQL_MAX }>,
+}
+
+fn prepare_table_column_view_rewrites<'arena>(
+    storage: &Storage,
+    transaction: u32,
+    table: usize,
+    definition: &TableDef,
+    renames: &[(SqlName, SqlName)],
+    arena: &'arena Arena,
+) -> Result<&'arena [PreparedViewColumnRewrite], SqlError> {
+    let mut prepared = crate::mem::arena::ArenaList::new(arena);
+    for &(from, to) in renames {
+        let column = definition
+            .columns()
+            .iter()
+            .position(|column| column.name == from)
+            .expect("a selected rename has an original column");
+        for slot in 0..storage.view_count() {
+            if !storage.view(slot).visible_to(transaction)
+                || !storage
+                    .view_dependencies(slot, transaction)
+                    .entries()
+                    .iter()
+                    .any(|dependency| {
+                        dependency.class == crate::storage::DependencyClass::Table
+                            && usize::from(dependency.slot) == table
+                            && dependency.referenced_columns.contains(column)
+                    })
+            {
+                continue;
+            }
+            let query = storage.snapshot_view_query(slot, transaction, arena)?;
+            let user = super::eval::funcs::system::session_user_owned();
+            let path =
+                storage.compute_path(query.creation_path.as_str(), user.as_str(), transaction);
+            let rewritten = super::query::stored_query_table_column_rename(
+                query.sql.as_str(),
+                path,
+                query.dependencies.view(),
+                storage,
+                transaction,
+                table,
+                column,
+                to.as_str(),
+                arena,
+            )?;
+            if rewritten != query.sql {
+                prepared
+                    .push(PreparedViewColumnRewrite {
+                        slot,
+                        sql: rewritten,
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+        }
+    }
+    Ok(prepared.as_slice())
+}
+
+fn publish_rewritten_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    view_slot: usize,
+    rewritten: crate::util::StackStr<{ crate::storage::VIEW_SQL_MAX }>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let view = storage.view(view_slot);
+    let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
+    let creation_path = query.creation_path;
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
+    let rebound = super::query::stored_query_dependencies(
+        rewritten.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
+    )?;
+    if rebound.entries() != query.dependencies.entries() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "view column rename would change a dependent view binding"
+        ));
+    }
+
+    let dependent_columns = view.columns_for(txn.txid).with_aliases(true);
+    let undo = storage.replace_view_definition(
+        storage.view_edit_target(view_slot, &view, txn.txid),
+        crate::storage::ViewDefinition {
+            persistence: view.persistence,
+            columns: dependent_columns,
+            query: crate::storage::StoredQueryDefinition {
+                sql: rewritten,
+                creation_path,
+                dependencies: rebound,
             },
+            options: crate::storage::ViewOptions {
+                ..view.options_for(txn.txid)
+            },
+        },
+        txn.txid,
+    )?;
+    let publication = crate::storage::ViewPublication::Altered(undo);
+    let new_slot = publication.slot();
+    let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
+        Ok(())
+    } else {
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
             txn.txid,
-        )?;
-        let publication = crate::storage::ViewPublication::Altered(undo);
-        let new_slot = publication.slot();
-        let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
-            Ok(())
-        } else {
-            let lsn = storage.bump_lsn();
-            wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::CreateView {
-                    identity: storage.view_catalog_identity(new_slot),
-                    schema: view.schema_for(txn.txid).as_str(),
-                    name: view.name_for(txn.txid).as_str(),
-                    columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
-                    sql: rewritten.as_str(),
-                    path: creation_path.as_str(),
-                    security_invoker: matches!(
-                        view.security_for(txn.txid),
-                        crate::storage::ViewSecurity::Invoker
-                    ),
-                    security_barrier: view.security_barrier_for(txn.txid).code(),
-                    check_option: view
-                        .check_option_for(txn.txid)
-                        .map_or(0, |option| option.code()),
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot, txn.txid).view(),
-                    ),
-                },
-            )
-        };
-        if let Err(error) = staged {
-            storage
-                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
-            return Err(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
-            storage
-                .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
-            return Err(error);
-        }
+            lsn,
+            &WalOp::CreateView {
+                identity: storage.view_catalog_identity(new_slot),
+                schema: view.schema_for(txn.txid).as_str(),
+                name: view.name_for(txn.txid).as_str(),
+                columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
+                sql: rewritten.as_str(),
+                path: creation_path.as_str(),
+                security_invoker: matches!(
+                    view.security_for(txn.txid),
+                    crate::storage::ViewSecurity::Invoker
+                ),
+                security_barrier: view.security_barrier_for(txn.txid).code(),
+                check_option: view
+                    .check_option_for(txn.txid)
+                    .map_or(0, |option| option.code()),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    storage.view_dependencies(new_slot, txn.txid).view(),
+                ),
+            },
+        )
+    };
+    if let Err(error) = staged {
+        storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+        storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
+        return Err(error);
     }
     Ok(())
 }
@@ -38975,14 +39070,17 @@ fn stage_comment(
         Some("") | None => None,
         Some(text) => Some(crate::storage::comment_stackstr(text)?),
     };
-    let (slot, prior) = storage.set_comment(
+    let Some((slot, prior)) = storage.set_comment(
         identity.class,
         identity.schema,
         identity.name,
         identity.subid,
         stored_text,
         txn.txid,
-    )?;
+    )?
+    else {
+        return Ok(());
+    };
     let temporary = match identity.class {
         crate::storage::CommentClass::Relation => [
             crate::storage::AccessClass::Table,
@@ -46641,11 +46739,13 @@ fn rewrite_composite_dependent_views(
             view_sql.as_str(),
             path,
             dependencies.view(),
-            &super::query::StoredQueryCompositeFieldRename {
+            &super::query::StoredQueryRename {
                 storage,
                 txid: txn.txid,
-                composite_slot,
-                from: rename.from.as_str(),
+                target: super::query::StoredQueryRenameTarget::CompositeField {
+                    slot: composite_slot,
+                    from: rename.from.as_str(),
+                },
                 arena,
             },
             &mut sites,
@@ -47059,7 +47159,10 @@ fn raw_identifier_end(text: &str, start: usize) -> Option<usize> {
     Some(start + length)
 }
 
-fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, identifier: &str) {
+pub(super) fn write_identifier<const N: usize>(
+    output: &mut crate::util::StackStr<N>,
+    identifier: &str,
+) {
     use core::fmt::Write;
 
     if !super::eval::ident_needs_quotes(identifier) {
@@ -49257,12 +49360,16 @@ fn finish_index_creation(
     let index = storage
         .index_visible_to(slot, txn.txid)
         .expect("new index is visible to its creator");
-    if let Err(error) = validate_index_rows(storage, table, txn.txid, index.unique, arena) {
-        storage.rollback_index_create(slot);
-        return Err(error);
-    }
+    let statistics = match validate_index_rows(storage, table, txn.txid, index.unique, arena) {
+        Ok(statistics) => statistics,
+        Err(error) => {
+            storage.rollback_index_create(slot);
+            return Err(error);
+        }
+    };
     let result = (|| {
         storage.prepare_index_enforcers(table, txn.txid)?;
+        storage.write_relation_counts(table, statistics, true)?;
         if storage.table_def(table, txn.txid).persistence
             != crate::storage::RelationPersistence::Temporary
         {
@@ -49325,7 +49432,7 @@ fn validate_index_rows(
     txid: u32,
     unique: bool,
     arena: &Arena,
-) -> Result<(), SqlError> {
+) -> Result<crate::storage::TableStatistics, SqlError> {
     let mark = arena.mark();
     let result = (|| {
         let definition = *storage.table_def(table_index, txid);
@@ -49355,11 +49462,16 @@ fn validate_index_rows(
             result
         };
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+        let mut rows = 0u64;
+        let mut row_bytes = 0u64;
         let overlay = scan.for_each_overlay(&mut |rowid, home| {
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                validate_values(rowid, &values[..definition.n_columns])
+                validate_values(rowid, &values[..definition.n_columns])?;
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
@@ -49369,8 +49481,8 @@ fn validate_index_rows(
                 "index validation stopped before completing the scan"
             ));
         }
-        scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
-            for spilled in rows {
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for spilled in batch {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
@@ -49380,9 +49492,25 @@ fn validate_index_rows(
                     crate::storage::SpilledRowRepresentation::Values(values) => values,
                 };
                 validate_values(spilled.rowid, values)?;
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => bytes.len() as u64,
+                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                        rowenc::encoded_len(values) as u64
+                    }
+                });
             }
             Ok(core::ops::ControlFlow::Continue(()))
-        })
+        })?;
+        let mut statistics = storage.table_statistics(table_index, 0);
+        statistics.valid = true;
+        statistics.rows = rows;
+        statistics.average_row_width = row_bytes
+            .checked_div(rows)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        statistics.analyzed_generation = scan.publication_generation(storage, table_index)?;
+        Ok(statistics)
     })();
     // SAFETY: the retained scan and callbacks have ended. Validation publishes
     // no references; the caller's SQL and catalog state precede the mark.
@@ -50856,27 +50984,18 @@ pub fn drop_access_method(
                 Err(error) => return Err(error),
             }
         }
-        if storage
-            .comment_text(
-                crate::storage::CommentClass::AccessMethod,
-                "",
-                method.definition.name.as_str(),
-                method.oid().get() as u32,
-                txn.txid,
-            )
-            .is_some()
-        {
-            let (comment_slot, prior) = match storage.set_comment(
-                crate::storage::CommentClass::AccessMethod,
-                SqlName::EMPTY,
-                method.definition.name,
-                method.oid().get() as u32,
-                None,
-                txn.txid,
-            ) {
-                Ok(comment) => comment,
-                Err(error) => return sql_fail(error),
-            };
+        let comment = match storage.set_comment(
+            crate::storage::CommentClass::AccessMethod,
+            SqlName::EMPTY,
+            method.definition.name,
+            method.oid().get() as u32,
+            None,
+            txn.txid,
+        ) {
+            Ok(comment) => comment,
+            Err(error) => return sql_fail(error),
+        };
+        if let Some((comment_slot, prior)) = comment {
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
@@ -54450,8 +54569,8 @@ fn decode_binary_field_with_context<'a>(
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Int2(i16::from_be_bytes(b)))
         }
-        ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
-        ColType::OidVector => decode_binary_oidvector(bytes, arena),
+        ColType::Int2Vector => decode_binary_vector(BinaryVectorKind::Int2, bytes, arena),
+        ColType::OidVector => decode_binary_vector(BinaryVectorKind::Oid, bytes, arena),
         ColType::PgNodeTree => Ok(Datum::Text(core::str::from_utf8(bytes).map_err(|_| bad())?)),
         ColType::PgNdistinct
         | ColType::PgDependencies
@@ -54669,109 +54788,108 @@ fn decode_binary_field_by_oid<'a>(
     decode_binary_field_with_context(ctype, bytes, arena, context)
 }
 
-/// Decodes PostgreSQL's `int2vector` send format. It is an `int2` array on
-/// the wire, while the catalog representation stores its values packed in
-/// native little-endian order.
-fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    use crate::sql::types::oid;
-
-    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary int2vector");
-    let mut reader = crate::pg::wire::MsgIn::new(bytes);
-    let ndim = reader.i32().map_err(|_| bad())?;
-    let has_null = reader.i32().map_err(|_| bad())?;
-    let element_oid = reader.i32().map_err(|_| bad())?;
-    if has_null != 0 || element_oid != oid::INT2 {
-        return Err(bad());
-    }
-    if ndim == 0 {
-        if !reader.done() {
-            return Err(bad());
-        }
-        return Ok(Datum::Int2Vector(&[]));
-    }
-    if ndim != 1 {
-        return Err(bad());
-    }
-    let count = reader.i32().map_err(|_| bad())?;
-    let _lower_bound = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "int2vector value too large"
-        ));
-    }
-    let raw = arena
-        .alloc_slice_with(count as usize * 2, |_| 0u8)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "int2vector exceeds the statement arena"
-            )
-        })?;
-    for slot in raw.as_chunks_mut::<2>().0 {
-        let len = reader.i32().map_err(|_| bad())?;
-        if len != 2 {
-            return Err(bad());
-        }
-        let value = reader.take(2).map_err(|_| bad())?;
-        slot.copy_from_slice(&i16::from_be_bytes([value[0], value[1]]).to_le_bytes());
-    }
-    if !reader.done() {
-        return Err(bad());
-    }
-    Ok(Datum::Int2Vector(raw))
+#[derive(Clone, Copy)]
+enum BinaryVectorKind {
+    Int2,
+    Oid,
 }
 
-/// Decodes PostgreSQL's `oidvector` send format. It is an `oid` array on the
-/// wire and a packed native-endian vector inside catalog rows.
-fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    use crate::sql::types::oid;
-
-    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary oidvector");
+/// PostgreSQL receives vectors through its array receiver, then requires a
+/// nonempty, one-dimensional, zero-based value without NULL elements.
+fn decode_binary_vector<'a>(
+    kind: BinaryVectorKind,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (element_oid, width, name) = match kind {
+        BinaryVectorKind::Int2 => (crate::sql::types::oid::INT2, 2, "int2vector"),
+        BinaryVectorKind::Oid => (crate::sql::types::oid::OID, 4, "oidvector"),
+    };
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_BINARY_REPRESENTATION,
+            "invalid binary {name}"
+        )
+    };
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
-    let ndim = reader.i32().map_err(|_| bad())?;
-    let has_null = reader.i32().map_err(|_| bad())?;
-    let element_oid = reader.i32().map_err(|_| bad())?;
-    if has_null != 0 || element_oid != oid::OID {
+    let dimensions = reader.i32().map_err(|_| bad())?;
+    if dimensions > crate::sql::array::MAX_DIMENSIONS as i32 {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "vector dimensions exceed the PostgreSQL array limit"
+        ));
+    }
+    let flags = reader.i32().map_err(|_| bad())?;
+    let received_oid = reader.i32().map_err(|_| bad())? as u32;
+    if !(0..=1).contains(&flags) {
         return Err(bad());
     }
-    if ndim == 0 {
-        if !reader.done() {
-            return Err(bad());
-        }
-        return Ok(Datum::OidVector(&[]));
+    // PostgreSQL trusts only built-in OIDs in an external array header.
+    // Generated catalog OIDs are local to the sending database.
+    const FIRST_GENERATED_CATALOG_OID: u32 = 10_000;
+    if received_oid != element_oid as u32 && received_oid < FIRST_GENERATED_CATALOG_OID {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "binary vector has an unexpected built-in element type"
+        ));
     }
-    if ndim != 1 {
+    if dimensions != 1 {
         return Err(bad());
     }
     let count = reader.i32().map_err(|_| bad())?;
-    let _lower_bound = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
+    let lower_bound = reader.i32().map_err(|_| bad())?;
+    if count < 0 {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "oidvector value too large"
+            "array size exceeds the maximum allowed"
+        ));
+    }
+    if lower_bound.checked_add(count).is_none() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "array lower bound is too large: {lower_bound}"
+        ));
+    }
+    if count == 0 || lower_bound != 0 {
+        return Err(bad());
+    }
+    if count as usize > crate::sql::array::MAX_ELEMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "{name} value too large"
         ));
     }
     let raw = arena
-        .alloc_slice_with(count as usize * 4, |_| 0u8)
+        .alloc_slice_with(count as usize * width, |_| 0u8)
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "oidvector exceeds the statement arena"
+                "{name} exceeds the statement arena"
             )
         })?;
-    for slot in raw.as_chunks_mut::<4>().0 {
-        let len = reader.i32().map_err(|_| bad())?;
-        if len != 4 {
+    for slot in raw.chunks_exact_mut(width) {
+        let length = reader.i32().map_err(|_| bad())?;
+        if length != width as i32 {
             return Err(bad());
         }
-        let value = reader.take(4).map_err(|_| bad())?;
-        slot.copy_from_slice(&u32::from_be_bytes(value.try_into().unwrap()).to_le_bytes());
+        let value = reader.take(width).map_err(|_| bad())?;
+        for (output, input) in slot.iter_mut().zip(value.iter().rev()) {
+            *output = *input;
+        }
     }
     if !reader.done() {
         return Err(bad());
     }
-    Ok(Datum::OidVector(raw))
+    Ok(match kind {
+        BinaryVectorKind::Int2 => Datum::Int2Vector {
+            lower_bound: 0,
+            raw,
+        },
+        BinaryVectorKind::Oid => Datum::OidVector {
+            lower_bound: 0,
+            raw,
+        },
+    })
 }
 
 /// Decodes PostgreSQL's binary array receive format.
@@ -67970,6 +68088,18 @@ fn alter_table_relation(
         return sql_fail(error);
     }
 
+    let view_column_rewrites = match prepare_table_column_view_rewrites(
+        storage,
+        txn.txid,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        Ok(rewrites) => rewrites,
+        Err(error) => return sql_fail(error),
+    };
+
     // Journal the in-place shape change and the re-homed rows. Every fallible
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
@@ -68198,7 +68328,8 @@ fn alter_table_relation(
             None,
             txn.txid,
         ) {
-            Ok(comment) => comment,
+            Ok(Some(comment)) => comment,
+            Ok(None) => continue,
             Err(error) => return sql_fail(error),
         };
         if storage.table_def(dropped_table, txn.txid).persistence
@@ -68296,6 +68427,13 @@ fn alter_table_relation(
             prior,
         }) {
             storage.restore_comment_identity_pending(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    for rewrite in view_column_rewrites {
+        if let Err(error) =
+            publish_rewritten_view(storage, wal, txn, rewrite.slot, rewrite.sql, arena)
+        {
             return sql_fail(error);
         }
     }
@@ -70784,7 +70922,7 @@ pub fn apply_cast_typmod<'a>(
                 other => Ok(other),
             }
         }
-        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+        (ColType::Bit { varying }, TypeMod::BitLength(n), Datum::Bit { bits, .. }) => {
             super::eval::fit_bits(bits, n, varying, arena)
         }
         _ => apply_typmod(v, ctype, type_mod, arena),
@@ -70870,7 +71008,7 @@ pub fn apply_typmod<'a>(
         (_, TypeMod::NumericPS { precision, scale }, Datum::Numeric(n)) => {
             apply_numeric_typmod(&n, precision as usize, scale as usize, arena).map(Datum::Numeric)
         }
-        (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
+        (ColType::Bit { varying }, TypeMod::BitLength(n), Datum::Bit { bits, .. }) => {
             let invalid = if varying {
                 bits.len() > n
             } else {
@@ -72015,7 +72153,13 @@ mod tests {
         let arena = Arena::new(&mut budget, "binary int2vector", 1 << 12).unwrap();
 
         let datum = decode_binary_field(ColType::Int2Vector, &bytes, &arena).unwrap();
-        assert_eq!(datum, Datum::Int2Vector(&[1, 0, 2, 0]));
+        assert_eq!(
+            datum,
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0]
+            }
+        );
         assert_eq!(datum.to_string(), "1 2");
     }
 
@@ -72029,7 +72173,7 @@ mod tests {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "binary int2vector", 1 << 12).unwrap();
         let error = decode_binary_field(ColType::Int2Vector, &null_vector, &arena).unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+        assert_eq!(error.sqlstate, sqlstate::INVALID_BINARY_REPRESENTATION);
 
         let trailing = [
             0, 0, 0, 0, // dimensions
@@ -72038,7 +72182,7 @@ mod tests {
             0,  // unexpected trailing byte
         ];
         let error = decode_binary_field(ColType::Int2Vector, &trailing, &arena).unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+        assert_eq!(error.sqlstate, sqlstate::INVALID_BINARY_REPRESENTATION);
     }
 
     #[test]
@@ -72055,7 +72199,13 @@ mod tests {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "binary oidvector", 1 << 12).unwrap();
         let datum = decode_binary_field(ColType::OidVector, &bytes, &arena).unwrap();
-        assert_eq!(datum, Datum::OidVector(&[23, 0, 0, 0, 54, 12, 0, 0]));
+        assert_eq!(
+            datum,
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[23, 0, 0, 0, 54, 12, 0, 0]
+            }
+        );
         assert_eq!(datum.to_string(), "23 3126");
     }
 

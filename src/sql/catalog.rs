@@ -25,6 +25,15 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_views.rs"]
+mod views;
+
+#[path = "catalog_information.rs"]
+mod information;
+
+#[path = "catalog_type_io.rs"]
+mod type_io;
+
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
@@ -3299,7 +3308,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(6225, "multirange_agg_transfn", 2281, "2281 4537", 2, "i"),
     intrinsic!(6226, "multirange_agg_finalfn", 4537, "2281 4537", 2, "i"),
-    intrinsic!(6391, "range_sortsupport", 2278, "2281", 1, "i"),
     intrinsic!(4301, "range_agg", 4537, "3831", 1, "i"),
     intrinsic!(4389, "range_intersect_agg", 4537, "4537", 1, "i"),
     intrinsic!(4450, "range_intersect_agg", 3831, "3831", 1, "i"),
@@ -8485,7 +8493,7 @@ const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
-const CATALOG_RELATIONS: &[&str] = &[
+pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_aggregate",
     "pg_aios",
     "pg_am",
@@ -8858,9 +8866,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
 }
 
 /// Returns the ACL column addressed by PostgreSQL's `(classid, objid,
-/// objsubid)` object identity. Catalog synthesis is the single source of truth
-/// for both direct catalog reads and `pg_get_acl`, so the two surfaces cannot
-/// disagree about explicit versus default ACLs.
+/// objsubid)` object identity. Like PostgreSQL's system cache, `pg_get_acl`
+/// reads the current object; a SQL catalog listing uses its selected snapshot.
 pub(crate) fn object_acl_by_address<'a>(
     storage: &Storage,
     txid: u32,
@@ -8869,24 +8876,53 @@ pub(crate) fn object_acl_by_address<'a>(
     objsubid: i32,
     arena: &'a Arena,
 ) -> Result<Option<Datum<'a>>, SqlError> {
-    let (catalog, id_columns, acl_column): (&str, &[&str], &str) = match classid as i32 {
-        PG_CLASS_OID if objsubid == 0 => ("pg_class", &["oid"], "relacl"),
-        PG_CLASS_OID if objsubid > 0 => ("pg_attribute", &["attrelid", "attnum"], "attacl"),
-        PG_PROC_OID if objsubid == 0 => ("pg_proc", &["oid"], "proacl"),
-        PG_TYPE_OID if objsubid == 0 => ("pg_type", &["oid"], "typacl"),
-        PG_NAMESPACE_OID if objsubid == 0 => ("pg_namespace", &["oid"], "nspacl"),
-        1262 if objsubid == 0 => ("pg_database", &["oid"], "datacl"),
-        1213 if objsubid == 0 => ("pg_tablespace", &["oid"], "spcacl"),
-        PG_LANGUAGE_OID if objsubid == 0 => ("pg_language", &["oid"], "lanacl"),
-        PG_LARGEOBJECT_METADATA_OID if objsubid == 0 => {
-            ("pg_largeobject_metadata", &["oid"], "lomacl")
-        }
-        2328 if objsubid == 0 => ("pg_foreign_data_wrapper", &["oid"], "fdwacl"),
-        1417 if objsubid == 0 => ("pg_foreign_server", &["oid"], "srvacl"),
-        6243 if objsubid == 0 => ("pg_parameter_acl", &["oid"], "paracl"),
-        _ => return Ok(None),
+    if classid == 0 && objid == 0 {
+        return Ok(None);
+    }
+    let unknown_class = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "unrecognized class ID: {}",
+            classid
+        )
     };
-    let table = synthesize(storage, Some("pg_catalog"), catalog, txid, arena)?;
+    let class = if classid == 2613 {
+        "pg_largeobject_metadata"
+    } else {
+        i32::try_from(classid)
+            .ok()
+            .and_then(catalog_relation_name)
+            .ok_or_else(unknown_class)?
+    };
+    // PostgreSQL 18.6 objectaddress.c ObjectProperty[] and pg_get_acl().
+    let (catalog, id_columns, acl_column): (&str, &[&str], &str) = match class {
+        "pg_class" if objsubid == 0 => (class, &["oid"], "relacl"),
+        "pg_class" => ("pg_attribute", &["attrelid", "attnum"], "attacl"),
+        "pg_proc" => (class, &["oid"], "proacl"),
+        "pg_type" => (class, &["oid"], "typacl"),
+        "pg_namespace" => (class, &["oid"], "nspacl"),
+        "pg_database" => (class, &["oid"], "datacl"),
+        "pg_tablespace" => (class, &["oid"], "spcacl"),
+        "pg_language" => (class, &["oid"], "lanacl"),
+        "pg_largeobject_metadata" => (class, &["oid"], "lomacl"),
+        "pg_foreign_data_wrapper" => (class, &["oid"], "fdwacl"),
+        "pg_foreign_server" => (class, &["oid"], "srvacl"),
+        "pg_am" | "pg_amop" | "pg_amproc" | "pg_cast" | "pg_collation" | "pg_constraint"
+        | "pg_conversion" | "pg_default_acl" | "pg_extension" | "pg_opclass" | "pg_operator"
+        | "pg_opfamily" | "pg_authid" | "pg_auth_members" | "pg_rewrite" | "pg_transform"
+        | "pg_trigger" | "pg_policy" | "pg_event_trigger" | "pg_ts_config" | "pg_ts_dict"
+        | "pg_ts_parser" | "pg_ts_template" | "pg_publication" | "pg_subscription"
+        | "pg_statistic_ext" | "pg_user_mapping" => return Ok(None),
+        _ => return Err(unknown_class()),
+    };
+    let table = synthesize_current(
+        storage,
+        Some("pg_catalog"),
+        catalog,
+        txid,
+        Materialization::Query,
+        arena,
+    )?;
     let column = |name: &str| {
         table.def.columns()[..table.def.n_columns]
             .iter()
@@ -8926,7 +8962,7 @@ pub(crate) fn object_acl_by_address<'a>(
         if !matches_oid(row[identities[0]], objid) {
             continue;
         }
-        if id_columns.len() == 2 && !matches_i32(row[identities[1]], objsubid) {
+        if id_columns.len() == 2 && !matches_i32(row[identities[1]], i32::from(objsubid as i16)) {
             continue;
         }
         return Ok(Some(row[acl_index]));
@@ -8949,33 +8985,119 @@ pub(crate) fn synthesize_definition<'a>(
         )
     })?;
     let hidden = schema::hidden_columns(name, information_schema);
-    let definition = arena
-        .alloc(materialize_with_hidden(specification, hidden)?)
-        .map_err(|_| arena_full())?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
+    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
     Ok(SynthTable {
         def: definition,
         rows: &[],
-        hidden_columns: hidden.len(),
+        hidden_columns,
     })
 }
 
 /// Builds the requested catalog relation. `qualifier` is the schema (or
 /// None). Allocates rows in `arena`.
-pub fn synthesize<'a>(
+pub(crate) fn synthesize<'a>(
     storage: &Storage,
     qualifier: Option<&str>,
     name: &'a str,
     txid: u32,
+    scan: super::catalog_snapshot::CatalogScan,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    if qualifier == Some("information_schema") {
+        match name {
+            "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
+            "columns" => {
+                return information::columns_view(storage, txid, views::Read::Statement, arena);
+            }
+            _ => {}
+        }
+    }
+    if qualifier != Some("information_schema") {
+        match name {
+            "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
+            "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
+            _ => {}
+        }
+    }
+    select_catalog_rows(storage, qualifier, name, txid, scan, arena, |transaction| {
+        synthesize_current(
+            storage,
+            qualifier,
+            name,
+            transaction,
+            Materialization::Query,
+            arena,
+        )
+    })
+}
+
+fn select_catalog_rows<'a>(
+    storage: &Storage,
+    qualifier: Option<&str>,
+    name: &str,
+    txid: u32,
+    scan: super::catalog_snapshot::CatalogScan,
+    arena: &'a Arena,
+    build: impl Fn(u32) -> Result<SynthTable<'a>, SqlError>,
+) -> Result<SynthTable<'a>, SqlError> {
+    if qualifier != Some("information_schema")
+        && storage.commit_snapshot() != u64::MAX
+        && let Some(relation) = super::catalog_snapshot_keys::RELATIONS
+            .iter()
+            .find(|relation| relation.name == name)
+    {
+        let history = storage.catalog_rows_at(
+            relation.identity(storage.current_database_oid()),
+            storage.commit_snapshot(),
+            arena,
+        )?;
+        if !history.is_empty() {
+            let committed = build(0)?;
+            let private;
+            let selected = if txid == 0 {
+                &committed
+            } else {
+                private = build(txid)?;
+                &private
+            };
+            return super::catalog_snapshot::restore_rows(
+                relation.key,
+                scan,
+                &committed,
+                selected,
+                history,
+                |key| catalog_row_state(storage, txid, relation.name, key),
+                arena,
+            );
+        }
+    }
+    build(txid)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Materialization {
+    Query,
+    /// Immutable generated rows cannot change and need no before-image.
+    History,
+}
+
+pub(crate) fn synthesize_current<'a>(
+    storage: &Storage,
+    qualifier: Option<&str>,
+    name: &'a str,
+    txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
-    match (info, name) {
-        (false, "pg_class") => pg_class(storage, txid, arena),
-        (false, "pg_attribute") => pg_attribute(storage, txid, arena),
+    let table = match (info, name) {
+        (false, "pg_class") => pg_class(storage, txid, purpose, arena),
+        (false, "pg_attribute") => pg_attribute(storage, txid, purpose, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
         (false, "pg_collation") => pg_collation(storage, txid, arena),
         (false, "pg_conversion") => pg_conversion(storage, txid, arena),
-        (false, "pg_type") => pg_type(storage, txid, arena),
+        (false, "pg_type") => pg_type(storage, txid, purpose, arena),
         (false, "pg_locks") => pg_locks(storage, arena),
         (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_prepared_statements") => pg_prepared_statements(storage, txid, arena),
@@ -9156,7 +9278,7 @@ pub fn synthesize<'a>(
         }
         (false, "pg_stat_progress_copy") => empty_monitoring_view("pg_stat_progress_copy", arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
-        (false, "pg_tables") => pg_tables(storage, txid, arena),
+        (false, "pg_tables") => views::tables(storage, txid, views::Read::Current, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
         (false, "pg_am") => pg_am(storage, txid, arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
@@ -9222,11 +9344,16 @@ pub fn synthesize<'a>(
         }
         (false, "pg_depend") => pg_depend(storage, txid, arena),
         (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
-        (false, "pg_roles") => pg_roles(storage, txid, arena),
+        (false, "pg_roles") => views::roles(storage, txid, views::Read::Current, arena),
         (false, "pg_group") => pg_group(storage, txid, arena),
         (false, "pg_shadow") => pg_shadow(storage, txid, arena, false),
         (false, "pg_user") => pg_shadow(storage, txid, arena, true),
-        (false, "pg_authid") => pg_authid(storage, txid, arena, true),
+        (false, "pg_authid") => pg_authid(
+            storage,
+            txid,
+            arena,
+            matches!(purpose, Materialization::Query),
+        ),
         (false, "pg_seclabel") => empty_monitoring_view("pg_seclabel", arena),
         (false, "pg_shdepend") => pg_shdepend(storage, txid, arena),
         (false, "pg_description") => pg_description(storage, txid, arena),
@@ -9245,8 +9372,8 @@ pub fn synthesize<'a>(
         (false, "pg_rules") => pg_rules(storage, txid, arena),
         (false, "pg_timezone_abbrevs") => pg_timezone_abbrevs(arena),
         (false, "pg_timezone_names") => pg_timezone_names(arena),
-        (true, "tables") => info_tables(storage, txid, arena),
-        (true, "columns") => info_columns(storage, txid, arena),
+        (true, "tables") => information::tables(storage, txid, views::Read::Current, arena),
+        (true, "columns") => information::columns_view(storage, txid, views::Read::Current, arena),
         (true, "column_options") => info_column_options(storage, txid, arena),
         (true, "foreign_data_wrapper_options") => {
             info_foreign_data_wrapper_options(storage, txid, arena)
@@ -9296,7 +9423,12 @@ pub fn synthesize<'a>(
             "catalog relation \"{}\" is not implemented",
             name
         )),
-    }
+    }?;
+    super::catalog_snapshot::canonical_acl_values(
+        table,
+        &super::query::storage_catalog(storage, arena, txid),
+        arena,
+    )
 }
 
 /// Deterministic oid for a live table: slot index offset into the user
@@ -9655,6 +9787,18 @@ pub(crate) fn predefined_role_oid(name: &str) -> Option<i32> {
         .find_map(|(oid, candidate)| (*candidate == name).then_some(*oid))
 }
 
+pub(crate) fn user_name_by_oid<'a>(
+    catalog: &dyn super::eval::CatalogAccess,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    if let Some(name) = catalog.role_name(oid, arena)? {
+        return Ok(name);
+    }
+    let name = stack_format!(64, "unknown (OID={})", oid as u32);
+    arena.alloc_str(name.as_str()).map_err(|_| arena_full())
+}
+
 #[derive(Clone, Copy)]
 enum CatalogOwner {
     Role(usize),
@@ -9741,26 +9885,12 @@ fn acl<'a>(
     let explicit_owner_acl = storage.acl_entries().any(|(slot, entry)| {
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         entry.object == object
-            && storage.acl_entry_visible(slot, txid)
+            && storage.object_acl_order(slot, txid).is_some()
             && grantee == owner as u16
             && grantor == owner as u16
             && entry.object.slot != u16::MAX
     });
-    let has_entries = storage.acl_entries().any(|(slot, entry)| {
-        let (grantee, _) = storage.acl_identity(slot, txid);
-        entry.object == object
-            && storage.acl_entry_visible(slot, txid)
-            && (storage.acl_state(slot, txid).0.0 != 0
-                || (explicit_owner_acl && grantee == owner as u16)
-                || (matches!(
-                    object.class,
-                    crate::storage::AccessClass::Domain
-                        | crate::storage::AccessClass::Enum
-                        | crate::storage::AccessClass::Routine
-                        | crate::storage::AccessClass::Language
-                ) && grantee == crate::storage::PUBLIC_ROLE))
-    });
-    if !has_entries {
+    if !storage.object_acl_defined(object, txid) {
         return Ok(Datum::Null);
     }
     let values = arena
@@ -9844,7 +9974,25 @@ fn acl<'a>(
         );
         count += 1;
     }
+    let ordered = arena
+        .alloc_slice_with(storage.acl_entry_count(), |_| (0u64, 0usize))
+        .map_err(|_| arena_full())?;
+    let mut ordered_count = 0;
     for (slot, entry) in storage.acl_entries() {
+        if entry.object == object && storage.acl_entry_visible(slot, txid) {
+            let order = storage.object_acl_order(slot, txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible object ACL has no grant order"
+                )
+            })?;
+            ordered[ordered_count] = (order.get(), slot);
+            ordered_count += 1;
+        }
+    }
+    ordered[..ordered_count].sort_unstable_by_key(|(order, _)| *order);
+    for (position, (_, slot)) in ordered[..ordered_count].iter().copied().enumerate() {
+        let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         if entry.object != object || !storage.acl_entry_visible(slot, txid) {
             continue;
@@ -9853,14 +10001,9 @@ fn acl<'a>(
         if owner_entry && !explicit_owner_acl {
             continue;
         }
-        if storage
-            .acl_entries()
-            .filter(|(earlier_slot, _)| *earlier_slot < slot)
-            .any(|(earlier_slot, earlier)| {
-                earlier.object == object
-                    && storage.acl_entry_visible(earlier_slot, txid)
-                    && storage.acl_identity(earlier_slot, txid) == (grantee, grantor)
-            })
+        if ordered[..position]
+            .iter()
+            .any(|(_, earlier)| storage.acl_identity(*earlier, txid) == (grantee, grantor))
         {
             continue;
         }
@@ -10083,49 +10226,44 @@ fn pg_parameter_acl<'a>(
     use core::fmt::Write;
     let definition = schema::require("pg_parameter_acl", false);
     let rows = arena
-        .alloc_slice_with(storage.parameter_acl_entry_count(), |_| &[] as &[Datum])
+        .alloc_slice_with(storage.parameter_acl_row_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
-    for (slot, entry) in storage.parameter_acl_entries_visible(txid) {
+    for entry in storage.parameter_acl_rows_visible(txid) {
         let parameter = entry.parameter;
-        if storage
-            .parameter_acl_entries_visible(txid)
-            .take(slot)
-            .any(|(_, earlier)| earlier.parameter == parameter)
-        {
-            continue;
-        }
-        let value_capacity = storage
-            .parameter_acl_entries_visible(txid)
-            .filter(|(_, candidate)| candidate.parameter == parameter)
-            .count();
+        let image = storage
+            .snapshot_parameter_acl_row(parameter, txid, arena)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "parameter ACL row disappeared during catalog rendering"
+                )
+            })?;
         let values = arena
-            .alloc_slice_with(value_capacity, |_| Datum::Null)
+            .alloc_slice_with(image.grants().len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
         let mut count = 0usize;
-        for (candidate_slot, candidate) in storage.parameter_acl_entries_visible(txid) {
-            if candidate.parameter != parameter {
-                continue;
-            }
-            let (grantee, grantor) = storage.parameter_acl_identity(candidate_slot, txid);
-            if storage
-                .parameter_acl_entries_visible(txid)
-                .take(candidate_slot)
-                .any(|(earlier_slot, earlier)| {
-                    earlier.parameter == parameter
-                        && storage.parameter_acl_identity(earlier_slot, txid) == (grantee, grantor)
-                })
-            {
-                continue;
-            }
-            let (privileges, grant_options) =
-                storage.parameter_acl_from(parameter, grantee, grantor, txid);
-            if privileges.bits() == 0 {
-                continue;
-            }
-            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| storage.role_name(grantee as usize, txid));
-            let grantor_name = storage.role_name(grantor as usize, txid);
+        for grant in image.grants().iter() {
+            let privileges = grant.privileges();
+            let grant_options = grant.options();
+            let grantee_name = if grant.grantee() == 0 {
+                None
+            } else {
+                Some(
+                    storage
+                        .role_slot_by_oid(grant.grantee() as i32, txid)
+                        .map(|slot| storage.role_name(slot, txid))
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "parameter ACL grantee is missing")
+                        })?,
+                )
+            };
+            let grantor_name = storage
+                .role_slot_by_oid(grant.grantor() as i32, txid)
+                .map(|slot| storage.role_name(slot, txid))
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "parameter ACL grantor is missing")
+                })?;
             let grantee_name =
                 super::types::acl_identifier(grantee_name.as_ref().map_or("", SqlName::as_str));
             let grantor_name = super::types::acl_identifier(grantor_name.as_str());
@@ -10148,6 +10286,7 @@ fn pg_parameter_acl<'a>(
         }
         rows[row_count] = row(
             &[
+                Datum::Oid(entry.oid.get()),
                 text(parameter.as_str(), arena)?,
                 Datum::Array {
                     element: super::types::ArrElem::AclItem,
@@ -10183,7 +10322,7 @@ fn pg_default_acl<'a>(
         if !defined
             || storage
                 .default_acl_entries()
-                .take(entry_slot)
+                .take_while(|(slot, _)| *slot < entry_slot)
                 .any(|(_, earlier)| {
                     let (earlier_defined, _, _) = storage.default_acl_state(
                         earlier.owner,
@@ -10241,8 +10380,8 @@ fn pg_default_acl<'a>(
             let mut rendered = StackStr::<256>::new();
             let _ = write!(rendered, "{}=", grantee_name.as_str());
             for (privilege, letter) in [
-                (PrivilegeSet::SELECT, 'r'),
                 (PrivilegeSet::INSERT, 'a'),
+                (PrivilegeSet::SELECT, 'r'),
                 (PrivilegeSet::UPDATE, 'w'),
                 (PrivilegeSet::DELETE, 'd'),
                 (PrivilegeSet::TRUNCATE, 'D'),
@@ -14375,17 +14514,235 @@ pub fn user_type_name_text<'a>(
 pub fn comment_text_for<'a>(
     storage: &Storage,
     txid: u32,
-    catalog_name: Option<&str>,
+    target: super::eval::DescriptionTarget<'_>,
     oid: u32,
-    subid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let signed_oid = i32::try_from(oid).ok();
+    use super::eval::DescriptionTarget;
+    use super::exec::decode_projected_col_record;
+    let (catalog, column, description_catalog) = match target {
+        DescriptionTarget::Local { catalog, column } => (catalog, column, "pg_description"),
+        DescriptionTarget::Shared { catalog } => (Some(catalog), 0, "pg_shdescription"),
+    };
+    let classoid = match catalog {
+        Some(catalog) => match catalog_relation_oid(catalog) {
+            Some(oid) => Some(oid as u32),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let definition = super::catalog_snapshot_keys::RELATIONS
+        .iter()
+        .find(|relation| relation.name == description_catalog)
+        .expect("description catalog has a PostgreSQL row identity");
+    let key_classoid = |key: &[u8]| -> Result<u32, SqlError> {
+        match decode_projected_col_record(key, 1, arena)? {
+            Datum::Oid(oid) => Ok(oid),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid description catalog class identifier"
+            )),
+        }
+    };
+    let history = storage.catalog_rows_matching(
+        definition.identity(storage.current_database_oid()),
+        storage.commit_snapshot(),
+        |key| {
+            let candidate = match decode_projected_col_record(key, 0, arena)? {
+                Datum::Oid(oid) => oid,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid description catalog object identifier"
+                    ));
+                }
+            };
+            if candidate != oid {
+                return Ok(false);
+            }
+            let candidate_class = key_classoid(key)?;
+            if classoid.is_some_and(|classoid| candidate_class != classoid) {
+                return Ok(false);
+            }
+            if !definition.shared {
+                return match decode_projected_col_record(key, 2, arena)? {
+                    Datum::Int4(subid) => Ok(subid == column),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid description catalog column identifier"
+                    )),
+                };
+            }
+            Ok(true)
+        },
+        arena,
+    )?;
+    let ordinal = |classoid: u32| {
+        super::catalog_snapshot_keys::RELATIONS
+            .iter()
+            .position(|relation| relation.oid.get() == classoid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "description refers to an unknown catalog"
+                )
+            })
+    };
+    let collect = |transaction| {
+        let mut rows = [None; super::catalog_snapshot_keys::RELATIONS.len()];
+        let mut owned = [false; super::catalog_snapshot_keys::RELATIONS.len()];
+        let mut seen = [false; super::catalog_snapshot_keys::RELATIONS.len()];
+        visit_comments_for_object(storage, transaction, target, oid, |catalog, text, state| {
+            let classoid = catalog_relation_oid(catalog).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "comment refers to an unknown catalog"
+                )
+            })? as u32;
+            let index = ordinal(classoid)?;
+            let row = &mut rows[index];
+            owned[index] |= state.private;
+            if core::mem::replace(&mut seen[index], true) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "description catalog contains duplicate unique row keys"
+                ));
+            }
+            *row = text
+                .map(|text| arena.alloc_str(text).map_err(|_| arena_full()))
+                .transpose()?;
+            Ok(())
+        })?;
+        Ok::<_, SqlError>((rows, owned))
+    };
+    let (private, owned) = collect(txid)?;
+    let committed = if history.is_empty() {
+        private
+    } else {
+        collect(0)?.0
+    };
+    let mut older = [None; super::catalog_snapshot_keys::RELATIONS.len()];
+    for row in history {
+        let index = ordinal(key_classoid(row.key)?)?;
+        older[index] = Some(match row.before {
+            None => None,
+            Some(image) => {
+                if image.count.get() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "description catalog row has duplicate values"
+                    ));
+                }
+                match decode_projected_col_record(
+                    image.bytes,
+                    if definition.shared { 2 } else { 3 },
+                    arena,
+                )? {
+                    Datum::Text(text) => Some(text),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "invalid historical description text"
+                        ));
+                    }
+                }
+            }
+        });
+    }
     let mut found = None;
-    for (class, schema, name, csub, text) in storage.comments_visible(txid) {
+    let mut found_class = u32::MAX;
+    for index in 0..private.len() {
+        let selected = match older[index] {
+            Some(Some(before)) => Some(before),
+            _ if owned[index] || private[index] != committed[index] => private[index],
+            Some(None) => None,
+            None => committed[index],
+        };
+        let class = super::catalog_snapshot_keys::RELATIONS[index].oid.get();
+        if let Some(text) = selected
+            && class < found_class
+        {
+            found = Some(text);
+            found_class = class;
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn catalog_row_state(
+    storage: &Storage,
+    txid: u32,
+    relation: &str,
+    key: &[u8],
+) -> Result<super::catalog_snapshot::CatalogRowState, SqlError> {
+    use super::catalog_snapshot::CatalogRowState;
+    if !matches!(relation, "pg_description" | "pg_shdescription") {
+        return Ok(CatalogRowState::UNTRACKED);
+    }
+    let key = super::catalog_snapshot::DescriptionKey::decode(key, relation == "pg_shdescription")?;
+    let catalog = i32::try_from(key.class)
+        .ok()
+        .and_then(catalog_relation_name)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "private description refers to an unknown catalog"
+            )
+        })?;
+    let target = if relation == "pg_shdescription" {
+        super::eval::DescriptionTarget::Shared { catalog }
+    } else {
+        super::eval::DescriptionTarget::Local {
+            catalog: Some(catalog),
+            column: key.column,
+        }
+    };
+    let mut selected = None;
+    visit_comments_for_object(storage, txid, target, key.object, |_, _, state| {
+        if selected.replace(state).is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "description catalog contains duplicate unique row keys"
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(selected.unwrap_or(CatalogRowState::UNTRACKED))
+}
+
+fn visit_comments_for_object(
+    storage: &Storage,
+    txid: u32,
+    target: super::eval::DescriptionTarget<'_>,
+    oid: u32,
+    mut visit: impl FnMut(
+        &str,
+        Option<&str>,
+        super::catalog_snapshot::CatalogRowState,
+    ) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let (catalog_name, subid, shared) = match target {
+        super::eval::DescriptionTarget::Local { catalog, column } => (catalog, column, false),
+        super::eval::DescriptionTarget::Shared { catalog } => (Some(catalog), 0, true),
+    };
+    let signed_oid = i32::try_from(oid).ok();
+    for comment in storage.catalog_comments(txid) {
+        let class = comment.class;
+        let schema = comment.schema;
+        let name = comment.name;
+        let csub = comment.subid;
+        let txid = comment.lookup_transaction;
+        let is_shared = matches!(
+            class,
+            crate::storage::CommentClass::Role
+                | crate::storage::CommentClass::Database
+                | crate::storage::CommentClass::Tablespace
+        );
+        if is_shared != shared {
+            continue;
+        }
         let schema = schema.as_str();
         let name = name.as_str();
-        let text = text.as_str();
         let selected_catalog = match catalog_name {
             Some(name) => name,
             None => match class {
@@ -14708,21 +15065,17 @@ pub fn comment_text_for<'a>(
             _ => false,
         };
         if hit {
-            let bytes = arena
-                .alloc_slice_copy(text.as_bytes())
-                .map_err(|_| arena_full())?;
-            if found
-                .replace(unsafe { core::str::from_utf8_unchecked(bytes) })
-                .is_some()
-            {
-                return Err(sql_err!(
-                    sqlstate::CARDINALITY_VIOLATION,
-                    "more than one row returned by a subquery used as an expression"
-                ));
-            }
+            visit(
+                selected_catalog,
+                comment.text.as_ref().map(|text| text.as_str()),
+                super::catalog_snapshot::CatalogRowState {
+                    root: comment.root,
+                    private: comment.private,
+                },
+            )?;
         }
     }
-    Ok(found)
+    Ok(())
 }
 
 /// One materialized foreign-key constraint.
@@ -15797,16 +16150,26 @@ pub fn index_def_text<'a>(
 struct SynthDef<'a> {
     name: &'a str,
     columns: &'a [(&'a str, ColType)],
+    relation: Option<core::num::NonZeroU32>,
 }
 
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
         name: SqlName::parse(specification.name).expect("catalog name fits"),
         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
-        n_columns: specification.columns.len(),
+        n_columns: specification
+            .columns
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+            .count(),
         ..TableDef::empty()
     };
-    for (index, (name, column_type)) in specification.columns.iter().enumerate() {
+    for (index, (name, column_type)) in specification
+        .columns
+        .iter()
+        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+        .enumerate()
+    {
         definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
         definition.columns[index].ctype = *column_type;
         definition.columns[index].collation = if column_type.is_collatable() {
@@ -15824,15 +16187,7 @@ fn finish<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = arena
-        .alloc(materialize_def(specification))
-        .map_err(|_| arena_full())?;
-    let rows = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
-    Ok(SynthTable {
-        def,
-        rows: &*rows,
-        hidden_columns: 0,
-    })
+    finish_with_hidden(specification, &[], rows, arena)
 }
 
 /// Materializes an exact visible relation shape plus addressable PostgreSQL
@@ -15841,18 +16196,55 @@ fn finish<'a>(
 fn materialize_with_hidden(
     specification: SynthDef<'_>,
     hidden: &[(&str, ColType)],
-) -> Result<TableDef, SqlError> {
-    if specification.columns.len() + hidden.len() > MAX_COLUMNS {
+) -> Result<(TableDef, usize), SqlError> {
+    let visible = specification
+        .columns
+        .iter()
+        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+        .count();
+    let system = usize::from(specification.relation.is_some())
+        + hidden
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+            .count();
+    if visible + system > MAX_COLUMNS {
         return Err(catalog_capacity_exceeded(specification.name));
     }
     let mut definition = materialize_def(specification);
-    for (index, (name, column_type)) in hidden.iter().enumerate() {
-        let column = &mut definition.columns[definition.n_columns + index];
+    let mut count = 0;
+    if specification.relation.is_some() {
+        let column = &mut definition.columns[definition.n_columns];
+        column.name = SqlName::parse("tableoid").expect("system-column name fits");
+        column.ctype = ColType::Oid;
+        column.collation = crate::sql::ast::Collation::None;
+        count += 1;
+    }
+    for (name, column_type) in hidden {
+        if specification.relation.is_some() && *name == "tableoid" {
+            if *column_type != ColType::Oid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog tableoid must have type oid"
+                ));
+            }
+            continue;
+        }
+        if definition.columns[..definition.n_columns + count]
+            .iter()
+            .any(|column| column.name.as_str() == *name)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "duplicate catalog system-column name"
+            ));
+        }
+        let column = &mut definition.columns[definition.n_columns + count];
         column.name = SqlName::parse(name).expect("catalog system-column name fits");
         column.ctype = *column_type;
         column.collation = crate::sql::ast::Collation::None;
+        count += 1;
     }
-    Ok(definition)
+    Ok((definition, count))
 }
 
 fn finish_with_hidden<'a>(
@@ -15861,32 +16253,71 @@ fn finish_with_hidden<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = arena
-        .alloc(materialize_with_hidden(specification, hidden)?)
-        .map_err(|_| arena_full())?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
+    let def = arena.alloc(definition).map_err(|_| arena_full())?;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    let width = def.n_columns + hidden.len();
+    let width = def.n_columns + hidden_columns;
+    let input_width = specification.columns.len() + hidden.len();
+    let destinations = arena
+        .alloc_slice_with(input_width, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    for (destination, (name, _)) in destinations
+        .iter_mut()
+        .zip(specification.columns.iter().chain(hidden))
+    {
+        *destination = def.columns[..width]
+            .iter()
+            .position(|column| column.name.as_str() == *name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog source field has no declared destination"
+                )
+            })?;
+    }
     for (target, source) in typed.iter_mut().zip(rows) {
-        if source.len() != width {
+        if source.len() != input_width {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid catalog row width"
             ));
         }
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        for (index, value) in source.iter().copied().enumerate() {
+        let values = arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (((name, column_type), value), destination) in specification
+            .columns
+            .iter()
+            .chain(hidden)
+            .zip(source.iter().copied())
+            .zip(destinations.iter().copied())
+        {
             // Tagged derived rows must carry the advertised representation,
             // notably oid rather than int4, before hashing or wire encoding.
-            values[index] = super::eval::cast_to(value, def.columns[index].ctype, arena)?;
+            let value = super::eval::cast_to(value, *column_type, arena)?;
+            if *name == "tableoid"
+                && let Some(relation) = specification.relation
+                && value != Datum::Oid(relation.get())
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog {} row has an incorrect tableoid",
+                    specification.name
+                ));
+            }
+            values[destination] = value;
         }
-        *target = row(&values[..width], arena)?;
+        if let Some(relation) = specification.relation {
+            values[def.n_columns] = Datum::Oid(relation.get());
+        }
+        *target = values;
     }
     Ok(SynthTable {
         def,
         rows: typed,
-        hidden_columns: hidden.len(),
+        hidden_columns,
     })
 }
 
@@ -16570,10 +17001,14 @@ fn pg_statistic_ext_data<'a>(
                 if n_expressions == 0 {
                     Datum::Null
                 } else {
-                    Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&expressions[..n_expressions], arena)?,
-                    }
+                    super::eval::cast_to(
+                        Datum::Array {
+                            element: super::types::ArrElem::Text,
+                            raw: super::array::build(&expressions[..n_expressions], arena)?,
+                        },
+                        ColType::Text,
+                        arena,
+                    )?
                 },
             ],
             arena,
@@ -16994,7 +17429,12 @@ fn pg_publication_namespace<'a>(
             let schema = storage.schema_def(*schema_slot as usize);
             rows[count] = row(
                 &[
-                    Datum::Int4(6105),
+                    Datum::Oid(
+                        definition
+                            .relation
+                            .expect("catalog relation has an identity")
+                            .get(),
+                    ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
                     Datum::Int4(namespace_oid(storage, schema.name.as_str())),
@@ -18605,6 +19045,7 @@ fn pg_partitioned_table<'a>(
 fn pg_class<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_class", false);
@@ -18619,7 +19060,11 @@ fn pg_class<'a>(
         })
         .count()
         * 2;
-    let out_capacity = CATALOG_RELATIONS.len()
+    let catalogs: &[&str] = match purpose {
+        Materialization::Query => CATALOG_RELATIONS,
+        Materialization::History => &[],
+    };
+    let out_capacity = catalogs.len()
         + visible_tables
         + toast_relations
         + storage.composites_with_slots_visible_to(txid).count()
@@ -18633,7 +19078,7 @@ fn pg_class<'a>(
         .alloc_slice_with(out_capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
-    for name in CATALOG_RELATIONS {
+    for name in catalogs {
         let relation = catalog_relation(name).expect("catalog metadata exists");
         out[n] = row(
             &[
@@ -18688,7 +19133,10 @@ fn pg_class<'a>(
             return Err(catalog_capacity_exceeded("pg_class"));
         }
         let toid = table_oid(storage, slot);
-        let has_index = indexes.iter().any(|i| i.table_oid == toid);
+        let has_index = storage.relation_has_index(crate::storage::CatalogPosition::new(
+            slot,
+            table_def.identity().created_at,
+        )?) || indexes.iter().any(|i| i.table_oid == toid);
         let has_triggers = storage.triggers_for_table(slot, txid).next().is_some()
             || !table_def.fkeys().is_empty()
             || foreign_keys
@@ -21156,8 +21604,7 @@ fn pg_index<'a>(
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
-        // indkey is the 1-based attribute numbers as an int2vector-like array;
-        // indoption is one flag per column (0 = default ascending).
+        // Include columns have attribute numbers but no option or collation entry.
         let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
         attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
         for (position, attribute) in attributes.iter_mut().enumerate().take(info.n_cols) {
@@ -21218,8 +21665,7 @@ fn pg_index<'a>(
             continue;
         }
         let keys = [1_u16, 2];
-        let options = [Datum::Int4(0), Datum::Int4(0)];
-        let collations = [Datum::Oid(0), Datum::Oid(0)];
+        let collations = [0_i32, 0];
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
             &[
@@ -21236,18 +21682,15 @@ fn pg_index<'a>(
                 Datum::Int4(2),
                 Datum::Int4(2),
                 int2vector(&keys, arena)?,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&options, arena)?,
+                Datum::Int2Vector {
+                    lower_bound: 0,
+                    raw: &[0; 4],
                 },
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Null,
-                Datum::Array {
-                    element: super::types::ArrElem::Oid,
-                    raw: super::array::build(&collations, arena)?,
-                },
+                oidvector(&collations, arena)?,
                 oidvector(&operator_classes, arena)?,
             ],
             arena,
@@ -21263,8 +21706,7 @@ fn pg_index<'a>(
             &[1981_i32][..],
         ),
     ] {
-        let options = [Datum::Int4(0), Datum::Int4(0)];
-        let collations = [Datum::Int4(0), Datum::Int4(0)];
+        let collations = [0_i32, 0];
         out[n] = row(
             &[
                 Datum::Int4(index_oid),
@@ -21280,18 +21722,15 @@ fn pg_index<'a>(
                 Datum::Int4(attributes.len() as i32),
                 Datum::Int4(attributes.len() as i32),
                 int2vector(attributes, arena)?,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&options[..attributes.len()], arena)?,
+                Datum::Int2Vector {
+                    lower_bound: 0,
+                    raw: &[0; 4][..attributes.len() * 2],
                 },
                 Datum::Null,
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Null,
-                Datum::Array {
-                    element: super::types::ArrElem::Int4,
-                    raw: super::array::build(&collations[..attributes.len()], arena)?,
-                },
+                oidvector(&collations[..attributes.len()], arena)?,
                 oidvector(operator_classes, arena)?,
             ],
             arena,
@@ -21303,15 +21742,23 @@ fn pg_index<'a>(
 
 /// An index-option array (one 0-flag per column) for `pg_index.indoption`.
 fn index_options<'a>(info: &IdxInfo, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (position, value) in vals.iter_mut().enumerate().take(info.n_cols) {
-        *value = Datum::Int4(
-            i32::from(info.descending[position]) | (i32::from(info.nulls_first[position]) << 1),
-        );
+    let mut raw = [0; crate::storage::MAX_INDEX_COLS * 2];
+    for (position, value) in raw
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .enumerate()
+        .take(info.n_cols)
+    {
+        let flags =
+            i16::from(info.descending[position]) | (i16::from(info.nulls_first[position]) << 1);
+        value.copy_from_slice(&flags.to_le_bytes());
     }
-    Ok(Datum::Array {
-        element: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..info.n_cols], arena)?,
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw: arena
+            .alloc_slice_copy(&raw[..info.n_cols * 2])
+            .map_err(|_| arena_full())?,
     })
 }
 
@@ -21321,7 +21768,7 @@ fn index_collations<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let mut values = [0_i32; crate::storage::MAX_INDEX_COLS];
     let table = storage.table_def(info.table_slot, txid);
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
         let collation = if info.explicit_definition.is_some() {
@@ -21335,12 +21782,9 @@ fn index_collations<'a>(
         } else {
             table.columns()[info.columns[position] as usize].collation
         };
-        *value = Datum::Int4(collation.oid());
+        *value = collation.oid();
     }
-    Ok(Datum::Array {
-        element: super::types::ArrElem::Int4,
-        raw: super::array::build(&values[..info.n_cols], arena)?,
-    })
+    oidvector(&values[..info.n_cols], arena)
 }
 
 fn index_operator_classes<'a>(
@@ -21418,7 +21862,10 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
         };
         raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
-    Ok(Datum::Int2Vector(raw))
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw,
+    })
 }
 
 fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -21428,7 +21875,10 @@ fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> 
     for (index, oid) in oids.iter().enumerate() {
         raw[index * 4..index * 4 + 4].copy_from_slice(&oid.to_le_bytes());
     }
-    Ok(Datum::OidVector(raw))
+    Ok(Datum::OidVector {
+        lower_bound: 0,
+        raw,
+    })
 }
 
 fn catalog_column_type_oid(
@@ -21506,6 +21956,7 @@ fn index_attribute_options<'a>(
 fn pg_attribute<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_attribute", false);
@@ -21533,7 +21984,11 @@ fn pg_attribute<'a>(
         .map(|(_, view)| view.columns_for(txid).len())
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
-    let builtin_attributes = crate::sql::catalog_metadata::ATTRIBUTE_ROWS
+    let builtin_rows: &[_] = match purpose {
+        Materialization::Query => crate::sql::catalog_metadata::ATTRIBUTE_ROWS,
+        Materialization::History => &[],
+    };
+    let builtin_attributes = builtin_rows
         .iter()
         .filter(|attributes| {
             matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
@@ -21550,7 +22005,7 @@ fn pg_attribute<'a>(
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
-    for attributes in crate::sql::catalog_metadata::ATTRIBUTE_ROWS.iter().filter(|attributes| {
+    for attributes in builtin_rows.iter().filter(|attributes| {
         matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
     }) {
         out[n] = attributes;
@@ -25760,9 +26215,24 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 });
             argument_oids[index] = argument_oid;
         }
-        let mut all_argument_types = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
-        let mut argument_modes = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
-        let mut argument_names = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
+        let output_count = if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+            routine.result_column_count
+        } else {
+            0
+        };
+        let parameter_capacity = routine
+            .parameter_count
+            .checked_add(output_count)
+            .ok_or_else(|| catalog_capacity_exceeded("pg_proc arguments"))?;
+        let all_argument_types = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let argument_modes = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let argument_names = arena
+            .alloc_slice_with(parameter_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut all_parameter_count = routine.parameter_count;
         let mut has_modes = false;
         let mut has_names = false;
@@ -27975,7 +28445,7 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    let catalog_types = pg_type(storage, txid, arena)?;
+    let catalog_types = pg_type(storage, txid, Materialization::Query, arena)?;
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -28330,7 +28800,12 @@ fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError>
     finish(definition, rows, arena)
 }
 
-fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_type<'a>(
+    storage: &Storage,
+    txid: u32,
+    purpose: Materialization,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_type", false);
     let types = [
         ColType::Void,
@@ -28483,297 +28958,260 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .checked_add(storage.views_visible_to(txid).count())
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
-    let capacity = 512usize
+    let builtin_capacity = match purpose {
+        Materialization::Query => 512usize,
+        Materialization::History => 0,
+    };
+    let capacity = builtin_capacity
         .checked_add(user_types)
         .and_then(|count| count.checked_add(relation_types))
         .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (i, t) in types.iter().enumerate() {
-        out[i] = row(
-            &[
-                Datum::Int4(t.oid()),
-                text(t.internal_name(), arena)?,
-                Datum::Int4(i32::from(t.typlen())),
-                Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
-                text(category(t), arena)?,
-                Datum::Int4(0), // typbasetype
-                Datum::Int4(0), // typelem
-                Datum::Int4(
-                    super::types::ArrElem::from_coltype(*t)
-                        .map_or(0, super::types::ArrElem::array_oid),
-                ), // typarray
-                Datum::Int4(0), // typrelid
-                Datum::Int4(-1), // typtypmod
-                Datum::Bool(false),
-                Datum::Null, // typdefault
-                text(
-                    match t {
-                        ColType::Refcursor => "textin",
-                        ColType::Regtype => "regtypein",
-                        ColType::Regproc => "regprocin",
-                        ColType::Regprocedure => "regprocedurein",
-                        ColType::Regoper => "regoperin",
-                        ColType::Regoperator => "regoperatorin",
-                        ColType::Regclass => "regclassin",
-                        ColType::Regnamespace => "regnamespacein",
-                        ColType::Regrole => "regrolein",
-                        ColType::Regconfig => "regconfigin",
-                        ColType::Regdictionary => "regdictionaryin",
-                        ColType::Regcollation => "regcollationin",
-                        ColType::PgLsn => "pg_lsn_in",
-                        ColType::AclItem => "aclitemin",
-                        ColType::Money => "cash_in",
-                        ColType::Tid => "tidin",
-                        ColType::Cid => "cidin",
-                        _ => "",
-                    },
-                    arena,
-                )?,
-                text(
-                    match t {
-                        ColType::Refcursor => "textout",
-                        ColType::Regtype => "regtypeout",
-                        ColType::Regproc => "regprocout",
-                        ColType::Regprocedure => "regprocedureout",
-                        ColType::Regoper => "regoperout",
-                        ColType::Regoperator => "regoperatorout",
-                        ColType::Regclass => "regclassout",
-                        ColType::Regnamespace => "regnamespaceout",
-                        ColType::Regrole => "regroleout",
-                        ColType::Regconfig => "regconfigout",
-                        ColType::Regdictionary => "regdictionaryout",
-                        ColType::Regcollation => "regcollationout",
-                        ColType::PgLsn => "pg_lsn_out",
-                        ColType::AclItem => "aclitemout",
-                        ColType::Money => "cash_out",
-                        ColType::Tid => "tidout",
-                        ColType::Cid => "cidout",
-                        _ => "",
-                    },
-                    arena,
-                )?,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text(type_storage(*t), arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-    }
-    let mut n = types.len();
-    for (oid, name, length, category, element, array, relation, kind) in [
-        (18, "char", 1, "Z", 0, 1002, 0, "b"),
-        (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
-        (
-            super::types::oid::EVENT_TRIGGER,
-            "event_trigger",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::FDW_HANDLER,
-            "fdw_handler",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYELEMENT,
-            "anyelement",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYARRAY,
-            "anyarray",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYNONARRAY,
-            "anynonarray",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
-        (
-            super::types::oid::ANYRANGE,
-            "anyrange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYMULTIRANGE,
-            "anymultirange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLE,
-            "anycompatible",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLEARRAY,
-            "anycompatiblearray",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLENONARRAY,
-            "anycompatiblenonarray",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLERANGE,
-            "anycompatiblerange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLEMULTIRANGE,
-            "anycompatiblemultirange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::PG_STATISTIC_ROW,
-            "pg_statistic",
-            -1,
-            "C",
-            0,
-            super::types::oid::PG_STATISTIC_ARRAY,
-            2619,
-            "c",
-        ),
-        (
-            super::types::oid::PG_STATISTIC_ARRAY,
-            "_pg_statistic",
-            -1,
-            "A",
-            super::types::oid::PG_STATISTIC_ROW,
-            0,
-            0,
-            "b",
-        ),
-    ] {
-        out[n] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Int4(length),
-                Datum::Int4(0),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text(kind, arena)?,
-                text(category, arena)?,
-                Datum::Int4(0),
-                Datum::Int4(element),
-                Datum::Int4(array),
-                Datum::Int4(relation),
-                Datum::Int4(-1),
-                Datum::Bool(false),
-                Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text(if length < 0 { "x" } else { "p" }, arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    // Arrays are catalog types in their own right. Keeping this inventory on
-    // `ArrElem` means an accepted array OID is simultaneously visible to
-    // `pg_type`, has a matching `typelem`, and is discoverable by catalog
-    // clients such as pg_dump.
-    for element in super::types::ArrElem::BUILTIN {
-        out[n] = row(
-            &[
-                Datum::Int4(element.array_oid()),
-                text(element.catalog_name(), arena)?,
-                Datum::Int4(-1),
-                Datum::Int4(0),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text("b", arena)?,
-                text("A", arena)?,
-                Datum::Int4(0),
-                Datum::Int4(element.element_oid()),
-                Datum::Int4(0),
-                Datum::Int4(0),
-                Datum::Int4(-1),
-                Datum::Bool(false),
-                Datum::Null,
-                text("array_in", arena)?,
-                text("array_out", arena)?,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text("x", arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        n += 1;
+    let mut n = 0;
+    if matches!(purpose, Materialization::Query) {
+        for (i, t) in types.iter().enumerate() {
+            out[i] = row(
+                &[
+                    Datum::Int4(t.oid()),
+                    text(t.internal_name(), arena)?,
+                    Datum::Int4(i32::from(t.typlen())),
+                    Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
+                    text(category(t), arena)?,
+                    Datum::Int4(0), // typbasetype
+                    Datum::Int4(0), // typelem
+                    Datum::Int4(
+                        super::types::ArrElem::from_coltype(*t)
+                            .map_or(0, super::types::ArrElem::array_oid),
+                    ), // typarray
+                    Datum::Int4(0), // typrelid
+                    Datum::Int4(-1), // typtypmod
+                    Datum::Bool(false),
+                    Datum::Null, // typdefault
+                    Datum::Null, // Input/output identities are assigned together below.
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text(type_storage(*t), arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+        }
+        n = types.len();
+        for (oid, name, length, category, element, array, relation, kind) in [
+            (18, "char", 1, "Z", 0, 1002, 0, "b"),
+            (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
+            (
+                super::types::oid::EVENT_TRIGGER,
+                "event_trigger",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::FDW_HANDLER,
+                "fdw_handler",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYELEMENT,
+                "anyelement",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYARRAY,
+                "anyarray",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYNONARRAY,
+                "anynonarray",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
+            (
+                super::types::oid::ANYRANGE,
+                "anyrange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYMULTIRANGE,
+                "anymultirange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLE,
+                "anycompatible",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLEARRAY,
+                "anycompatiblearray",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLENONARRAY,
+                "anycompatiblenonarray",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLERANGE,
+                "anycompatiblerange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLEMULTIRANGE,
+                "anycompatiblemultirange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::PG_STATISTIC_ROW,
+                "pg_statistic",
+                -1,
+                "C",
+                0,
+                super::types::oid::PG_STATISTIC_ARRAY,
+                2619,
+                "c",
+            ),
+            (
+                super::types::oid::PG_STATISTIC_ARRAY,
+                "_pg_statistic",
+                -1,
+                "A",
+                super::types::oid::PG_STATISTIC_ROW,
+                0,
+                0,
+                "b",
+            ),
+        ] {
+            out[n] = row(
+                &[
+                    Datum::Int4(oid),
+                    text(name, arena)?,
+                    Datum::Int4(length),
+                    Datum::Int4(0),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text(kind, arena)?,
+                    text(category, arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(element),
+                    Datum::Int4(array),
+                    Datum::Int4(relation),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text(if length < 0 { "x" } else { "p" }, arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+        // Arrays are catalog types in their own right. Keeping this inventory on
+        // `ArrElem` means an accepted array OID is simultaneously visible to
+        // `pg_type`, has a matching `typelem`, and is discoverable by catalog
+        // clients such as pg_dump.
+        for element in super::types::ArrElem::BUILTIN {
+            out[n] = row(
+                &[
+                    Datum::Int4(element.array_oid()),
+                    text(element.catalog_name(), arena)?,
+                    Datum::Int4(-1),
+                    Datum::Int4(0),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text("b", arena)?,
+                    text("A", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(element.element_oid()),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text("x", arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
     }
     // User-defined domains: typtype 'd', with their base type and constraints.
     for slot in 0..storage.domain_count() {
@@ -28814,8 +29252,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     )?,
                     None => Datum::Null,
                 },
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -28873,8 +29311,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -28918,8 +29356,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -28965,8 +29403,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29010,8 +29448,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -29057,8 +29495,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29103,8 +29541,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(
@@ -29158,8 +29596,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29196,8 +29634,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29235,8 +29673,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(owner_oid(
@@ -29253,7 +29691,32 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         n += 1;
     }
-    finish(def, &out[..n], arena)
+    let fields = ["oid", "typtype", "typelem", "typbasetype"].map(|name| {
+        def.columns
+            .iter()
+            .position(|(candidate, _)| *candidate == name)
+            .expect("pg_type source field exists")
+    });
+    let routines = ["typinput", "typoutput"].map(|name| {
+        def.columns
+            .iter()
+            .position(|(candidate, _)| *candidate == name)
+            .expect("pg_type routine field exists")
+    });
+    let compatible = catalog_rows(arena, n)?;
+    for (target, source) in compatible.iter_mut().zip(&out[..n]) {
+        let functions = type_io::functions(source, &out[..n], fields)?;
+        let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
+        for (position, function) in routines.into_iter().zip(functions) {
+            values[position] = Datum::RegObject {
+                type_oid: crate::sql::types::oid::REGPROC,
+                referenced_oid: function.oid,
+                name: function.name,
+            };
+        }
+        *target = values;
+    }
+    finish(def, compatible, arena)
 }
 
 fn pg_namespace<'a>(
@@ -29516,78 +29979,6 @@ fn pg_indexes<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn pg_tables<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_tables", false);
-    let indexes = collect_indexes(storage, txid, arena)?;
-    let row_capacity = (0..storage.table_count())
-        .filter(|slot| {
-            if !storage.table_slot_visible_to(*slot, txid) {
-                return false;
-            }
-            let table = storage.table_def(*slot, txid);
-            table.kind != crate::storage::TableKind::Foreign
-                && storage.matview_slot_for_table(*slot, txid).is_none()
-        })
-        .count();
-    let out = catalog_rows(arena, row_capacity)?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        if table.kind == crate::storage::TableKind::Foreign
-            || storage.matview_slot_for_table(slot, txid).is_some()
-        {
-            continue;
-        }
-        if n == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "information_schema.tables exceeds static capacity"
-            ));
-        }
-        out[n] = row(
-            &[
-                text(
-                    arena
-                        .alloc_str(table.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(table.name.as_str(), arena)?,
-                owner_name(
-                    storage,
-                    crate::storage::AccessClass::Table,
-                    slot,
-                    txid,
-                    arena,
-                )?,
-                match table.tablespace {
-                    0 => Datum::Null,
-                    tablespace => storage
-                        .tablespace_name(tablespace, txid)
-                        .map_or(Ok(Datum::Null), |name| text(name.as_str(), arena))?,
-                },
-                Datum::Bool(indexes.iter().any(|index| index.table_slot == slot)),
-                Datum::Bool(storage.table_has_rules(slot, txid)),
-                Datum::Bool(
-                    storage.triggers_for_table(slot, txid).next().is_some()
-                        || !table.fkeys().is_empty(),
-                ),
-                Datum::Bool(table.row_level_security.enabled),
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn pg_group<'a>(
     storage: &Storage,
     txid: u32,
@@ -29741,77 +30132,6 @@ fn pg_shadow<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn pg_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_roles", false);
-    let output = arena
-        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
-            &[] as &[Datum]
-        })
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    for &(oid, name) in PREDEFINED_ROLES {
-        output[count] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Int4(-1),
-                text("********", arena)?,
-                Datum::Null,
-                Datum::Bool(false),
-                Datum::Bool(false),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for slot in 0..storage.role_count() {
-        let role = storage.role(slot);
-        if !role.visible_to(txid) {
-            continue;
-        }
-        let attributes = role.attributes_to(txid);
-        let valid_until = match attributes.valid_until.as_ref() {
-            None => Datum::Null,
-            Some(value) => {
-                Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
-            }
-        };
-        output[count] = row(
-            &[
-                Datum::Int4(storage.role_oid(slot)),
-                text(
-                    arena
-                        .alloc_str(role.name_to(txid).as_str())
-                        .map_err(|_| arena_full())?,
-                    arena,
-                )?,
-                Datum::Bool(attributes.superuser),
-                Datum::Bool(attributes.inherit),
-                Datum::Bool(attributes.create_role),
-                Datum::Bool(attributes.create_database),
-                Datum::Bool(attributes.can_login),
-                Datum::Int4(attributes.connection_limit),
-                text("********", arena)?,
-                valid_until,
-                Datum::Bool(attributes.replication),
-                Datum::Bool(attributes.bypass_row_level_security),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(def, &output[..count], arena)
-}
-
 fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {
     use core::fmt::Write;
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -29844,17 +30164,19 @@ fn pg_authid<'a>(
     arena: &'a Arena,
     require_superuser: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let current = storage.current_role_slot(txid).ok_or_else(|| {
-        sql_err!(
-            sqlstate::INSUFFICIENT_PRIVILEGE,
-            "current role is not present in the role catalog"
-        )
-    })?;
-    if require_superuser && !storage.role(current).attributes_to(txid).superuser {
-        return Err(sql_err!(
-            sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied for table pg_authid"
-        ));
+    if require_superuser {
+        let current = storage.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if !storage.role(current).attributes_to(txid).superuser {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for table pg_authid"
+            ));
+        }
     }
     let def = schema::require("pg_authid", false);
     let output = arena
@@ -30976,82 +31298,6 @@ fn info_user_mapping_options<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn info_tables<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("tables", true);
-    let visible_tables = (0..storage.table_count())
-        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
-        .count();
-    let out = catalog_rows(
-        arena,
-        visible_tables + storage.views_visible_to(txid).count(),
-    )?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        if n == out.len() {
-            return Err(catalog_capacity_exceeded("information_schema.tables"));
-        }
-        out[n] = row(
-            &[
-                text("postgres", arena)?,
-                text(
-                    arena
-                        .alloc_str(table.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(table.name.as_str(), arena)?,
-                text(
-                    if table.kind == crate::storage::TableKind::Foreign {
-                        "FOREIGN"
-                    } else {
-                        "BASE TABLE"
-                    },
-                    arena,
-                )?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    for (_, view) in storage.views_visible_to(txid) {
-        if n == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "information_schema.tables exceeds static capacity"
-            ));
-        }
-        out[n] = row(
-            &[
-                text("postgres", arena)?,
-                text(
-                    arena
-                        .alloc_str(view.schema_for(txid).as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(
-                    arena
-                        .alloc_str(view.name_for(txid).as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text("VIEW", arena)?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn routine_specific_name(
     routine: &crate::storage::RoutineDef,
     txid: u32,
@@ -31516,128 +31762,6 @@ fn info_view_column_usage<'a>(
     finish(def, out, arena)
 }
 
-fn info_columns<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("columns", true);
-    let table_columns = (0..storage.table_count())
-        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
-        .map(|slot| storage.table_def(slot, txid).columns().len())
-        .sum::<usize>();
-    let view_columns = storage
-        .views_visible_to(txid)
-        .map(|(_, view)| view.columns_for(txid).len())
-        .sum::<usize>();
-    let out = catalog_rows(arena, table_columns + view_columns)?;
-    let mut n = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        let foreign_updatable = storage
-            .foreign_table(slot as u16, txid)
-            .map(|(_, binding)| {
-                if let Some(value) = binding.options.get("updatable") {
-                    return super::eval::parse_bool(value);
-                }
-                let server = storage
-                    .foreign_server_by_slot(binding.server as usize, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "foreign table references a missing foreign server"
-                        )
-                    })?;
-                server
-                    .options
-                    .get("updatable")
-                    .map_or(Ok(true), super::eval::parse_bool)
-            })
-            .transpose()?
-            .unwrap_or(true);
-        for (i, c) in table.columns().iter().enumerate() {
-            if n == out.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "information_schema.columns exceeds static capacity"
-                ));
-            }
-            out[n] = info_column_row(
-                storage,
-                txid,
-                InformationSchemaColumnSource {
-                    schema: table.schema.as_str(),
-                    table: table.name.as_str(),
-                    name: c.name.as_str(),
-                    position: i + 1,
-                    column: c,
-                    updatable: foreign_updatable,
-                },
-                arena,
-            )?;
-            n += 1;
-        }
-    }
-    // A view's row type is derived from its SELECT under the path captured at
-    // CREATE VIEW time. Reusing that resolver keeps information_schema,
-    // pg_attribute, Describe, and execution on one source of truth.
-    for (_, view) in storage.views_visible_to(txid) {
-        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, txid, &view, arena, &mut columns)?;
-        for (index, column) in columns[..count].iter().enumerate() {
-            if n == out.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "information_schema.columns exceeds static capacity"
-                ));
-            }
-            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
-            let column_meta = ColumnMeta {
-                name: SqlName::EMPTY,
-                ctype,
-                type_mod: column.type_mod,
-                collation: if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
-                storage: crate::sql::ast::ColumnStorage::Plain,
-                compression: crate::sql::ast::ColumnCompression::Default,
-                not_null: crate::storage::NotNullOrigin::Nullable,
-                not_null_inheritable: true,
-                unique: false,
-                primary: false,
-                auto_increment: false,
-                default: crate::storage::ColumnDefault::NONE,
-                is_identity: false,
-                identity_always: false,
-                auto_increment_step: 1,
-                user_type,
-                statistics_target: -1,
-                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
-            };
-            out[n] = info_column_row(
-                storage,
-                txid,
-                InformationSchemaColumnSource {
-                    schema: view.schema_for(txid).as_str(),
-                    table: view.name_for(txid).as_str(),
-                    name: column.name,
-                    position: index + 1,
-                    column: &column_meta,
-                    updatable: false,
-                },
-                arena,
-            )?;
-            n += 1;
-        }
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn view_column_catalog_type(
     storage: &Storage,
     txid: u32,
@@ -31650,308 +31774,6 @@ fn view_column_catalog_type(
             oid
         )
     })
-}
-
-/// The type-dependent portion of `information_schema.columns`.  `TypeMod`
-/// keeps the several PostgreSQL wire encodings from leaking into catalog code.
-struct InformationSchemaColumnSource<'a> {
-    schema: &'a str,
-    table: &'a str,
-    name: &'a str,
-    position: usize,
-    column: &'a ColumnMeta,
-    updatable: bool,
-}
-
-fn info_column_row<'a>(
-    storage: &Storage,
-    txid: u32,
-    source: InformationSchemaColumnSource<'_>,
-    arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
-    use crate::sql::types::oid;
-    let InformationSchemaColumnSource {
-        schema,
-        table,
-        name,
-        position,
-        column,
-        updatable,
-    } = source;
-    let declared_oid = catalog_column_type_oid(storage, column, txid)?;
-    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32)
-        .contains(&declared_oid);
-    let domain =
-        is_domain.then(|| storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid));
-    let type_mod = TypeMod::decode(column.ctype, column.type_mod);
-    let data_type = information_schema_data_type(storage, txid, declared_oid)?;
-    let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
-        match type_mod {
-            TypeMod::Length(length)
-                if matches!(column.ctype, ColType::Varchar | ColType::Bpchar) =>
-            {
-                (Some(length as i32), None, None, None, None)
-            }
-            TypeMod::NumericPS { precision, scale } => (
-                None,
-                Some(precision as i32),
-                Some(10),
-                Some(scale as i32),
-                None,
-            ),
-            TypeMod::TemporalPrecision(precision) => {
-                (None, None, None, None, Some(precision as i32))
-            }
-            TypeMod::IntervalMod { precision, .. } => {
-                (None, None, None, None, Some(precision.map_or(6, i32::from)))
-            }
-            _ => match column.ctype {
-                ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
-                ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
-                ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
-                ColType::Float4 => (None, Some(24), Some(2), None, None),
-                ColType::Float8 => (None, Some(53), Some(2), None, None),
-                ColType::Interval => (None, None, None, None, Some(6)),
-                _ => (None, None, None, None, None),
-            },
-        };
-    let interval_type = information_schema_interval_type(type_mod);
-    let user_type = column.user_type;
-    let (udt_schema, udt_name) = if let Some(identity) = user_type {
-        let mut type_name = StackStr::<64>::new();
-        if matches!(column.ctype, ColType::Array(_)) {
-            use core::fmt::Write as _;
-            let _ = write!(type_name, "_{}", identity.name.as_str());
-        } else {
-            use core::fmt::Write as _;
-            let _ = write!(type_name, "{}", identity.name.as_str());
-        }
-        (identity.schema, type_name)
-    } else {
-        (
-            SqlName::parse("pg_catalog").expect("catalog schema fits"),
-            StackStr::from_str(column.ctype.catalog_name()),
-        )
-    };
-    let default = if column.default.is_generated() {
-        None
-    } else {
-        super::enum_values::default_expression(
-            &column.default,
-            Some(column.ctype),
-            storage,
-            txid,
-            arena,
-        )?
-    };
-    let generated = column.default.is_generated();
-    let generated_expression = generated.then(|| column.default.expression()).flatten();
-    let nullable =
-        !column.not_null.is_required() && !domain.is_some_and(|definition| definition.not_null);
-    let identity = column.is_identity;
-    let identity_sequence = identity
-        .then(|| {
-            (0..storage.sequence_count())
-                .map(|slot| storage.sequence_for(slot, txid))
-                .find(|sequence| {
-                    sequence.generator_for.is_some_and(|owner| {
-                        owner.table_schema.as_str() == schema
-                            && owner.table.as_str() == table
-                            && owner.column.as_str() == name
-                    })
-                })
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "identity column \"{}.{}.{}\" has no generator sequence",
-                        schema,
-                        table,
-                        name
-                    )
-                })
-        })
-        .transpose()?;
-    let identity_start = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.start_value));
-    let identity_increment = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.increment));
-    let identity_maximum = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.max_value));
-    let identity_minimum = identity_sequence
-        .as_ref()
-        .map(|sequence| stack_format!(32, "{}", sequence.min_value));
-    let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
-    let default_datum = match default {
-        Some(value) => Datum::Text(value),
-        None => Datum::Null,
-    };
-    let domain_catalog = match domain {
-        Some(_) => text("postgres", arena)?,
-        None => Datum::Null,
-    };
-    let domain_schema = match domain {
-        Some(value) => text(value.schema.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    let domain_name = match domain {
-        Some(value) => text(value.name.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    let generated_expression = match generated_expression {
-        Some(value) => text(value.as_str(), arena)?,
-        None => Datum::Null,
-    };
-    row(
-        &[
-            text("postgres", arena)?,
-            text(schema, arena)?,
-            text(table, arena)?,
-            text(name, arena)?,
-            Datum::Int4(position as i32),
-            default_datum,
-            text(if nullable { "YES" } else { "NO" }, arena)?,
-            text(data_type.as_str(), arena)?,
-            character_length.map_or(Datum::Null, Datum::Int4),
-            character_length.map_or(Datum::Null, Datum::Int4),
-            numeric_precision.map_or(Datum::Null, Datum::Int4),
-            numeric_radix.map_or(Datum::Null, Datum::Int4),
-            numeric_scale.map_or(Datum::Null, Datum::Int4),
-            datetime_precision.map_or(Datum::Null, Datum::Int4),
-            match interval_type {
-                Some(value) => text(value.as_str(), arena)?,
-                None => Datum::Null,
-            },
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            domain_catalog,
-            domain_schema,
-            domain_name,
-            text("postgres", arena)?,
-            text(udt_schema.as_str(), arena)?,
-            text(udt_name.as_str(), arena)?,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            text(stack_format!(32, "{}", position).as_str(), arena)?,
-            text("NO", arena)?,
-            text(if identity { "YES" } else { "NO" }, arena)?,
-            if identity {
-                text(
-                    if column.identity_always {
-                        "ALWAYS"
-                    } else {
-                        "BY DEFAULT"
-                    },
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_start.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_increment
-                        .expect("identity has a sequence")
-                        .as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_maximum.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            if identity {
-                text(
-                    identity_minimum.expect("identity has a sequence").as_str(),
-                    arena,
-                )?
-            } else {
-                Datum::Null
-            },
-            text(
-                if identity_cycle == Some(true) {
-                    "YES"
-                } else {
-                    "NO"
-                },
-                arena,
-            )?,
-            text(if generated { "ALWAYS" } else { "NEVER" }, arena)?,
-            generated_expression,
-            text(if updatable { "YES" } else { "NO" }, arena)?,
-        ],
-        arena,
-    )
-}
-
-/// The SQL-standard `data_type` spelling is intentionally less specific than
-/// PostgreSQL's OID. Domains report their base type, named enums and
-/// composites report `USER-DEFINED`, and arrays report `ARRAY`.
-fn information_schema_data_type(
-    storage: &Storage,
-    txid: u32,
-    oid: i32,
-) -> Result<StackStr<64>, SqlError> {
-    use crate::sql::types::oid as type_oid;
-    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + storage.domain_count() as i32)
-        .contains(&oid)
-    {
-        return Ok(StackStr::from_str(
-            storage
-                .domain_for((oid - type_oid::FIRST_DOMAIN) as usize, txid)
-                .base
-                .name(),
-        ));
-    }
-    if (type_oid::FIRST_DOMAIN_ARRAY..type_oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
-        .contains(&oid)
-        || (type_oid::FIRST_ENUM_ARRAY..type_oid::FIRST_ENUM_ARRAY + storage.enum_count() as i32)
-            .contains(&oid)
-        || (type_oid::FIRST_COMPOSITE_ARRAY
-            ..type_oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
-            .contains(&oid)
-    {
-        return Ok(StackStr::from_str("ARRAY"));
-    }
-    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + storage.enum_count() as i32).contains(&oid)
-        || (type_oid::FIRST_COMPOSITE..type_oid::FIRST_COMPOSITE + storage.composite_count() as i32)
-            .contains(&oid)
-    {
-        return Ok(StackStr::from_str("USER-DEFINED"));
-    }
-    if let Some(ctype) = super::exec::coltype_of_oid(oid) {
-        if matches!(ctype, ColType::Array(_)) {
-            return Ok(StackStr::from_str("ARRAY"));
-        }
-        return Ok(StackStr::from_str(ctype.name()));
-    }
-    Err(sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "information_schema.columns cannot describe type oid {}",
-        oid
-    ))
 }
 
 fn info_table_constraints<'a>(
@@ -33120,8 +32942,13 @@ fn info_domains<'a>(
             continue;
         }
         let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
-        let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
-            information_schema_scalar_metadata(domain.base, type_mod);
+        let scalar = information::ScalarMetadata::new(
+            domain.base.oid(),
+            domain.base_type_mod,
+            storage
+                .current_database_encoding(txid)
+                .maximum_character_bytes(),
+        )?;
         let interval_type = information_schema_interval_type(type_mod);
         let (data_type, udt_schema, udt_name) = match domain.base_domain {
             Some(parent) => (
@@ -33148,18 +32975,18 @@ fn info_domains<'a>(
                 text(domain.schema.as_str(), arena)?,
                 text(domain.name.as_str(), arena)?,
                 text(data_type, arena)?,
-                character_length.map_or(Datum::Null, Datum::Int4),
-                character_length.map_or(Datum::Null, Datum::Int4),
+                scalar.character_length.map_or(Datum::Null, Datum::Int4),
+                scalar.octet_length.map_or(Datum::Null, Datum::Int4),
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
-                numeric_precision.map_or(Datum::Null, Datum::Int4),
-                numeric_radix.map_or(Datum::Null, Datum::Int4),
-                numeric_scale.map_or(Datum::Null, Datum::Int4),
-                datetime_precision.map_or(Datum::Null, Datum::Int4),
+                scalar.precision.map_or(Datum::Null, Datum::Int4),
+                scalar.radix.map_or(Datum::Null, Datum::Int4),
+                scalar.scale.map_or(Datum::Null, Datum::Int4),
+                scalar.datetime_precision.map_or(Datum::Null, Datum::Int4),
                 match interval_type {
                     Some(value) => text(value.as_str(), arena)?,
                     None => Datum::Null,
@@ -33556,45 +33383,6 @@ fn info_domain_udt_usage<'a>(
         count += 1;
     }
     finish(definition, &output[..count], arena)
-}
-
-type InformationSchemaScalarMetadata = (
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-    Option<i32>,
-);
-
-fn information_schema_scalar_metadata(
-    ctype: ColType,
-    type_mod: TypeMod,
-) -> InformationSchemaScalarMetadata {
-    match type_mod {
-        TypeMod::Length(length) if matches!(ctype, ColType::Varchar | ColType::Bpchar) => {
-            (Some(length as i32), None, None, None, None)
-        }
-        TypeMod::NumericPS { precision, scale } => (
-            None,
-            Some(precision as i32),
-            Some(10),
-            Some(scale as i32),
-            None,
-        ),
-        TypeMod::TemporalPrecision(precision) => (None, None, None, None, Some(precision as i32)),
-        TypeMod::IntervalMod { precision, .. } => {
-            (None, None, None, None, Some(precision.map_or(6, i32::from)))
-        }
-        _ => match ctype {
-            ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
-            ColType::Int4 => (None, Some(32), Some(2), Some(0), None),
-            ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
-            ColType::Float4 => (None, Some(24), Some(2), None, None),
-            ColType::Float8 => (None, Some(53), Some(2), None, None),
-            ColType::Interval => (None, None, None, None, Some(6)),
-            _ => (None, None, None, None, None),
-        },
-    }
 }
 
 fn information_schema_interval_type(type_mod: TypeMod) -> Option<StackStr<48>> {

@@ -444,15 +444,51 @@ fn resolve_expression<'a>(
     Ok(output.as_str())
 }
 
-fn canonical_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let tokens = query_tokens(source, arena)?;
+pub(crate) fn canonical_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let expression = crate::sql::parser::parse_expr(source, arena)?;
+    let parenthesize = matches!(expression, crate::sql::ast::Expr::Binary { .. });
+    let mut tokens = query_tokens(source, arena)?;
+    // PostgreSQL's non-pretty expression output encloses root operators once.
+    // Lexer boundaries keep parentheses inside quoted text out of this test.
+    while matches!(tokens.first().map(|token| token.token), Some(Tok::Op("(")))
+        && matches!(tokens.last().map(|token| token.token), Some(Tok::Op(")")))
+    {
+        let mut depth = 0;
+        let mut enclosed = true;
+        for (position, token) in tokens.iter().enumerate() {
+            match token.token {
+                Tok::Op("(") => depth += 1,
+                Tok::Op(")") => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && position + 1 != tokens.len() {
+                enclosed = false;
+                break;
+            }
+        }
+        if !enclosed {
+            break;
+        }
+        tokens = &tokens[1..tokens.len() - 1];
+    }
     let mut output = crate::mem::arena::ArenaString::new(arena);
+    if parenthesize {
+        output
+            .write_char('(')
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+    }
     let mut previous = None;
     for token in tokens {
-        let no_space_before = matches!(
-            token.token,
-            Tok::Op("::" | "." | "(" | ")" | "[" | "]" | ",")
-        );
+        let no_space_before = matches!(token.token, Tok::Op("::" | "." | ")" | "[" | "]" | ","))
+            || (matches!(token.token, Tok::Op("("))
+                && match previous {
+                    Some(Tok::Ident(word)) => !matches!(
+                        word,
+                        "and" | "or" | "not" | "in" | "between" | "case" | "when" | "then" | "else"
+                    ),
+                    Some(Tok::QuotedIdent(_)) => true,
+                    _ => false,
+                });
         let no_space_after_previous =
             matches!(previous, None | Some(Tok::Op("::" | "." | "(" | "[")));
         if !no_space_before && !no_space_after_previous {
@@ -470,6 +506,11 @@ fn canonical_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlE
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
         }
         previous = Some(token.token);
+    }
+    if parenthesize {
+        output
+            .write_char(')')
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
     }
     Ok(output.as_str())
 }

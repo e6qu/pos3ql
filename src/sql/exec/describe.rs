@@ -160,19 +160,11 @@ fn describe_items_with_output_aliases<'q>(
         }
         fn comment<'a>(
             &self,
-            catalog_name: Option<&str>,
+            target: crate::sql::eval::DescriptionTarget<'_>,
             oid: u32,
-            subid: i32,
             arena: &'a crate::mem::arena::Arena,
         ) -> Result<Option<&'a str>, SqlError> {
-            super::super::catalog::comment_text_for(
-                self.storage,
-                self.txid,
-                catalog_name,
-                oid,
-                subid,
-                arena,
-            )
+            super::super::catalog::comment_text_for(self.storage, self.txid, target, oid, arena)
         }
     }
     let describe_catalog = storage.map(|storage| DescribeCatalog { storage, txid });
@@ -3929,8 +3921,8 @@ pub fn infer_type_res(
             "ts_lexize" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "get_current_ts_config" => of(ColType::Regconfig),
             // Catalog-introspection helpers (for psql \d).
-            "pg_get_userbyid"
-            | "format_type"
+            "pg_get_userbyid" => of(ColType::Name),
+            "format_type"
             | "pg_get_expr"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"

@@ -509,7 +509,10 @@ fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum
         raw[output * 2..output * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
         output += 1;
     }
-    Ok(Datum::Int2Vector(raw))
+    Ok(Datum::Int2Vector {
+        lower_bound: 0,
+        raw,
+    })
 }
 
 fn publication_table_rows<'a>(
@@ -1804,8 +1807,8 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
             Datum::Multirange { text, .. } => crate::sql::range::component_count(text),
-            Datum::Int2Vector(raw) => Ok(raw.len() / 2),
-            Datum::OidVector(raw) => Ok(raw.len() / 4),
+            Datum::Int2Vector { raw, .. } => Ok(raw.len() / 2),
+            Datum::OidVector { raw, .. } => Ok(raw.len() / 4),
             Datum::Null => Ok(0),
             _ => Err(srf_signature_error(name)),
         }

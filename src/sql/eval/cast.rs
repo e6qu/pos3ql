@@ -136,21 +136,27 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             _ => return Err(cast_unsupported(&v, "record")),
         },
         ColType::Int2Vector => match v {
-            Datum::Int2Vector(_) => v,
-            Datum::Text(text) => Datum::Int2Vector(parse_int2vector_text(text, arena)?),
+            Datum::Int2Vector { .. } => v,
+            Datum::Text(text) => Datum::Int2Vector {
+                lower_bound: 0,
+                raw: parse_int2vector_text(text, arena)?,
+            },
             Datum::Array {
                 element: ArrElem::Int2,
                 raw,
-            } => Datum::Int2Vector(int2vector_from_array(raw, arena)?),
+            } => int2vector_from_array(raw, arena)?,
             _ => return Err(cast_unsupported(&v, "int2vector")),
         },
         ColType::OidVector => match v {
-            Datum::OidVector(_) => v,
-            Datum::Text(text) => Datum::OidVector(parse_oidvector_text(text, arena)?),
+            Datum::OidVector { .. } => v,
+            Datum::Text(text) => Datum::OidVector {
+                lower_bound: 0,
+                raw: parse_oidvector_text(text, arena)?,
+            },
             Datum::Array {
                 element: ArrElem::Oid,
                 raw,
-            } => Datum::OidVector(oidvector_from_array(raw, arena)?),
+            } => oidvector_from_array(raw, arena)?,
             _ => return Err(cast_unsupported(&v, "oidvector")),
         },
         ColType::PgNodeTree
@@ -597,16 +603,21 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             _ => return Err(cast_unsupported(&v, "tsquery")),
         },
         ColType::Array(element) => match v {
-            Datum::Int2Vector(raw) if element == ArrElem::Int2 => int2vector_as_array(raw, arena)?,
-            Datum::OidVector(raw) if element == ArrElem::Oid => oidvector_as_array(raw, arena)?,
+            Datum::Int2Vector { raw, lower_bound } if element == ArrElem::Int2 => {
+                int2vector_as_array(raw, lower_bound, arena)?
+            }
+            Datum::OidVector { raw, lower_bound } if element == ArrElem::Oid => {
+                oidvector_as_array(raw, lower_bound, arena)?
+            }
             Datum::Array { element: e, .. } if e == element => v,
             // A different element type: re-encode each element cast to it.
             Datum::Array { element: e, raw } => {
+                let shape = crate::sql::array::shape(raw).expect("array datum invariant");
                 let items = crate::sql::array::alloc_items(arena, crate::sql::array::len(raw))?;
                 let n = load_array(raw, e, element, &mut *items, 0, arena)?;
                 Datum::Array {
                     element,
-                    raw: crate::sql::array::build(&items[..n], arena)?,
+                    raw: crate::sql::array::build_shaped(&items[..n], shape, arena)?,
                 }
             }
             Datum::Text(s) => Datum::Array {
@@ -754,16 +765,19 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
 }
 
 fn invalid_vector(name: &'static str) -> SqlError {
-    sql_err!(sqlstate::DATA_EXCEPTION, "array is not a valid {name}")
+    sql_err!(sqlstate::DATATYPE_MISMATCH, "array is not a valid {name}")
 }
 
-fn vector_array_len(raw: &[u8], name: &'static str) -> Result<usize, SqlError> {
+fn vector_array_shape(
+    raw: &[u8],
+    name: &'static str,
+) -> Result<crate::sql::array::Shape, SqlError> {
     let shape = crate::sql::array::shape(raw)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid array datum"))?;
-    if shape.dimension_count() != 1 || shape.lower_bound(0) != Some(1) {
+    if shape.dimension_count() != 1 {
         return Err(invalid_vector(name));
     }
-    Ok(shape.element_count())
+    Ok(shape)
 }
 
 fn parse_int2vector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
@@ -800,8 +814,9 @@ fn parse_oidvector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], Sq
     Ok(out)
 }
 
-fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let count = vector_array_len(raw, "int2vector")?;
+fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let shape = vector_array_shape(raw, "int2vector")?;
+    let count = shape.element_count();
     let out = arena
         .alloc_slice_with(count * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
@@ -816,11 +831,15 @@ fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], S
         };
         chunk.copy_from_slice(&value.to_le_bytes());
     }
-    Ok(out)
+    Ok(Datum::Int2Vector {
+        raw: out,
+        lower_bound: shape.lower_bound(0).expect("validated vector dimension"),
+    })
 }
 
-fn oidvector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    let count = vector_array_len(raw, "oidvector")?;
+fn oidvector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let shape = vector_array_shape(raw, "oidvector")?;
+    let count = shape.element_count();
     let out = arena
         .alloc_slice_with(count * 4, |_| 0u8)
         .map_err(|_| arena_full())?;
@@ -835,10 +854,17 @@ fn oidvector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], Sq
         };
         chunk.copy_from_slice(&value.to_le_bytes());
     }
-    Ok(out)
+    Ok(Datum::OidVector {
+        raw: out,
+        lower_bound: shape.lower_bound(0).expect("validated vector dimension"),
+    })
 }
 
-fn int2vector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn int2vector_as_array<'a>(
+    raw: &[u8],
+    lower_bound: i32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let (values, trailing) = raw.as_chunks::<2>();
     if !trailing.is_empty() {
         return Err(sql_err!(
@@ -858,11 +884,19 @@ fn int2vector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sq
     }
     Ok(Datum::Array {
         element: ArrElem::Int2,
-        raw: crate::sql::array::build(&items[..values.len()], arena)?,
+        raw: crate::sql::array::build_shaped(
+            &items[..values.len()],
+            crate::sql::array::Shape::new(&[values.len()], &[lower_bound])?,
+            arena,
+        )?,
     })
 }
 
-fn oidvector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn oidvector_as_array<'a>(
+    raw: &[u8],
+    lower_bound: i32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let (values, trailing) = raw.as_chunks::<4>();
     if !trailing.is_empty() {
         return Err(sql_err!(
@@ -882,7 +916,11 @@ fn oidvector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sql
     }
     Ok(Datum::Array {
         element: ArrElem::Oid,
-        raw: crate::sql::array::build(&items[..values.len()], arena)?,
+        raw: crate::sql::array::build_shaped(
+            &items[..values.len()],
+            crate::sql::array::Shape::new(&[values.len()], &[lower_bound])?,
+            arena,
+        )?,
     })
 }
 
@@ -1438,11 +1476,14 @@ mod tests {
     }
 
     #[test]
-    fn int2vector_casts_to_an_ordinary_smallint_array() {
+    fn int2vector_array_cast_preserves_its_zero_lower_bound() {
         let mut budget = crate::mem::Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "int2vector cast", 1 << 12).unwrap();
         let Datum::Array { element, raw } = cast_to(
-            Datum::Int2Vector(&[1, 0, 2, 0]),
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0],
+            },
             ColType::Array(ArrElem::Int2),
             &arena,
         )
@@ -1451,7 +1492,7 @@ mod tests {
         };
         assert_eq!(element, ArrElem::Int2);
         let shape = crate::sql::array::shape(raw).unwrap();
-        assert_eq!(shape.lower_bound(0), Some(1));
+        assert_eq!(shape.lower_bound(0), Some(0));
         assert_eq!(
             crate::sql::array::get(raw, element, 0),
             Some(Datum::Int2(1))
@@ -1462,7 +1503,10 @@ mod tests {
         );
         assert_eq!(
             cast_to(Datum::Array { element, raw }, ColType::Int2Vector, &arena,).unwrap(),
-            Datum::Int2Vector(&[1, 0, 2, 0])
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0]
+            }
         );
     }
 
@@ -1471,7 +1515,10 @@ mod tests {
         let mut budget = crate::mem::Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "oidvector cast", 1 << 12).unwrap();
         let Datum::Array { element, raw } = cast_to(
-            Datum::OidVector(&[1, 0, 0, 0, 2, 0, 0, 0]),
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[1, 0, 0, 0, 2, 0, 0, 0],
+            },
             ColType::Array(ArrElem::Oid),
             &arena,
         )
@@ -1482,7 +1529,10 @@ mod tests {
         assert_eq!(crate::sql::array::get(raw, element, 0), Some(Datum::Oid(1)));
         assert_eq!(
             cast_to(Datum::Array { element, raw }, ColType::OidVector, &arena).unwrap(),
-            Datum::OidVector(&[1, 0, 0, 0, 2, 0, 0, 0])
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[1, 0, 0, 0, 2, 0, 0, 0]
+            }
         );
     }
 
@@ -1492,11 +1542,17 @@ mod tests {
         let arena = Arena::new(&mut budget, "catalog vector input", 1 << 12).unwrap();
         assert_eq!(
             cast_to(Datum::Text("1 -2"), ColType::Int2Vector, &arena).unwrap(),
-            Datum::Int2Vector(&[1, 0, 254, 255])
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 254, 255]
+            }
         );
         assert_eq!(
             cast_to(Datum::Text("1 4294967295"), ColType::OidVector, &arena).unwrap(),
-            Datum::OidVector(&[1, 0, 0, 0, 255, 255, 255, 255])
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[1, 0, 0, 0, 255, 255, 255, 255]
+            }
         );
         assert!(cast_to(Datum::Text("1,2"), ColType::Int2Vector, &arena).is_err());
     }

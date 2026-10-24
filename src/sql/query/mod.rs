@@ -9662,12 +9662,16 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         ))
     }
 
-    fn composite_slot_field(
+    fn composite_field(&self, slot: u16, field: &str) -> Option<super::exec::StaticTypeMeta> {
+        super::exec::catalog_composite_field(self.storage, self.txid, slot, field)
+    }
+
+    fn visit_composite_fields(
         &self,
         slot: u16,
-        index: usize,
-    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        super::exec::catalog_composite_slot_field(self.storage, self.txid, slot, index)
+        visit: &mut dyn FnMut(&str, super::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        super::exec::visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
     }
 
     fn named_composite_field(

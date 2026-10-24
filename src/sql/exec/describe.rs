@@ -738,12 +738,16 @@ impl ColTypeResolver for CatalogCols<'_> {
         .record_column_handle(qualifier, name)
     }
 
-    fn composite_slot_field(
+    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
+        catalog_composite_field(self.storage, self.txid, slot, field)
+    }
+
+    fn visit_composite_fields(
         &self,
         slot: u16,
-        index: usize,
-    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        catalog_composite_slot_field(self.storage, self.txid, slot, index)
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Option<usize> {
+        visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
     }
 
     fn named_composite_field(
@@ -1484,22 +1488,21 @@ pub trait ColTypeResolver {
     /// One field of a named composite already resolved to its catalog slot.
     /// Catalog-free resolvers may still use the statement-scoped shape copy.
     fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
-        let mut index = 0;
-        while let Some((name, metadata)) = self.composite_slot_field(slot, index) {
-            if name.as_str().eq_ignore_ascii_case(field) {
-                return Some(metadata);
+        let mut found = None;
+        self.visit_composite_fields(slot, &mut |name, metadata| {
+            if name.eq_ignore_ascii_case(field) {
+                found = Some(metadata);
             }
-            index += 1;
-        }
-        None
+        });
+        found
     }
 
-    fn composite_slot_field(
+    fn visit_composite_fields(
         &self,
         slot: u16,
-        index: usize,
-    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        registered_composite_slot_field(slot, index)
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Option<usize> {
+        visit_registered_composite_fields(slot, visit)
     }
 
     /// One durable named-composite field, copied out of the bounded catalog.
@@ -1778,56 +1781,70 @@ pub fn register_named_composite_shape(
     })
 }
 
-pub(crate) fn catalog_composite_slot_field(
+fn composite_field_metadata(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    field: &crate::storage::CompositeFieldDef,
+) -> Option<StaticTypeMeta> {
+    Some(StaticTypeMeta {
+        ctype: field.ctype,
+        type_oid: storage.routine_type_oid(field.ctype, field.user_type, txid)?,
+        type_mod: field.type_mod,
+        collation: field.collation,
+    })
+}
+
+pub(crate) fn catalog_composite_field(
     storage: &crate::storage::Storage,
     txid: u32,
     slot: u16,
-    index: usize,
-) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+    name: &str,
+) -> Option<StaticTypeMeta> {
     if !storage.composite_slot_visible_to(usize::from(slot), txid) {
         return None;
     }
     let definition = storage.composite_for(usize::from(slot), txid);
-    let field = definition.active_field(index)?;
-    Some((
-        crate::util::StackStr::from_str(field.name.as_str()),
-        StaticTypeMeta {
-            ctype: field.ctype,
-            type_oid: storage.routine_type_oid(field.ctype, field.user_type, txid)?,
-            type_mod: field.type_mod,
-            collation: field.collation,
-        },
-    ))
+    let field = definition
+        .active_fields()
+        .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
+    composite_field_metadata(storage, txid, field)
 }
 
-fn visit_composite_slot_shape_metadata(
+pub(crate) fn visit_catalog_composite_fields(
+    storage: &crate::storage::Storage,
+    txid: u32,
     slot: u16,
-    columns: &dyn ColTypeResolver,
-    mut visit: impl FnMut(&str, StaticTypeMeta),
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
+    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
+        return None;
+    }
+    let definition = storage.composite_for(usize::from(slot), txid);
     let mut count = 0;
-    while let Some((name, meta)) = columns.composite_slot_field(slot, count) {
-        visit(name.as_str(), meta);
+    for field in definition.active_fields() {
+        visit(
+            field.name.as_str(),
+            composite_field_metadata(storage, txid, field)?,
+        );
         count += 1;
     }
     (count != 0).then_some(count)
 }
 
-fn registered_composite_slot_field(
+fn visit_registered_composite_fields(
     slot: u16,
-    index: usize,
-) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
         let shape = pool.named[..pool.named_n]
             .iter()
             .find(|candidate| candidate.slot == slot)?;
-        let field = shape.fields[..usize::from(shape.len)].get(index)?;
-        Some((
-            crate::util::StackStr::from_str(field.name.as_str()),
-            field.metadata(),
-        ))
+        for field in &shape.fields[..usize::from(shape.len)] {
+            visit(field.name.as_str(), field.metadata());
+        }
+        Some(usize::from(shape.len))
     })
 }
 
@@ -2377,7 +2394,7 @@ fn record_shape_metadata_dyn(
             let ColType::Composite(slot) = columns.resolve(*qualifier, name).ok()? else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, columns, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         Expr::Field { base, field }
             if matches!(
@@ -2388,7 +2405,7 @@ fn record_shape_metadata_dyn(
             let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, columns, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         Expr::Subscript { base: array, .. } => {
             let element = match &**array {
@@ -2420,7 +2437,7 @@ fn record_shape_metadata_dyn(
             let Some(ColType::Composite(slot)) = element else {
                 return None;
             };
-            visit_composite_slot_shape_metadata(slot, columns, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.

@@ -435,7 +435,7 @@ if want proto; then
 fi
 
 step "durability: kill -9, restart, data intact"
-"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -v ON_ERROR_STOP=1 \
   -c "CREATE TABLE crashy (id int, v text)" \
   -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')" \
   -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range, ip inet, mac macaddr)" \
@@ -471,7 +471,8 @@ step "durability: kill -9, restart, data intact"
   -c "ALTER TYPE crashy_coordinate RENAME ATTRIBUTE x TO east" \
   -c "CREATE SCHEMA crashy_types" \
   -c "ALTER TYPE crashy_coordinate SET SCHEMA crashy_types" \
-  -c "ALTER TYPE crashy_types.crashy_coordinate RENAME TO crashy_point"
+  -c "ALTER TYPE crashy_types.crashy_coordinate RENAME TO crashy_point" \
+  || { bad "crash recovery fixture setup"; exit 1; }
 # WAL upload is synchronous in durable mode. The trailing query still gives
 # the event loop an ordinary turn before this broader crash/restart fixture;
 # local recovery below replays the on-disk journal.

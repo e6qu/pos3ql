@@ -5,6 +5,11 @@ use super::{Datum, SqlError, sqlstate};
 use crate::sql::catalog_metadata::{TYPE_IO, TypeIoRoutine};
 use crate::sql_err;
 
+const DOMAIN_INPUT: TypeIoRoutine = TypeIoRoutine {
+    oid: 2597,
+    name: "domain_in",
+};
+
 pub(super) fn functions<'a>(
     row: &'a [Datum<'a>],
     rows: &[&'a [Datum<'a>]],
@@ -32,6 +37,9 @@ pub(super) fn functions<'a>(
             match current[kind] {
                 Datum::Text("d") | Datum::Char(b'd') => {
                     let identity = integer(current[base])?;
+                    if let Ok(position) = TYPE_IO.binary_search_by_key(&identity, |ty| ty.oid) {
+                        return Ok([DOMAIN_INPUT, TYPE_IO[position].output]);
+                    }
                     let mut found = None;
                     for row in rows {
                         if integer(row[oid])? == identity {
@@ -89,14 +97,7 @@ pub(super) fn functions<'a>(
             }
         };
         return Ok([
-            if domain {
-                TypeIoRoutine {
-                    oid: 2597,
-                    name: "domain_in",
-                }
-            } else {
-                functions[0]
-            },
+            if domain { DOMAIN_INPUT } else { functions[0] },
             functions[1],
         ]);
     }

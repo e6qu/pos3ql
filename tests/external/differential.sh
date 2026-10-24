@@ -135,6 +135,11 @@ bad() { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 
 WORK=$(mktemp -d /tmp/pos3ql-diff.XXXXXX)
 cleanup() {
+  local status=$?
+  if (( status != 0 || FAIL != 0 )) && [[ -f "$WORK/p3.log" ]]; then
+    printf '%s\n' 'pos3ql server log after differential failure:' >&2
+    tail -100 "$WORK/p3.log" >&2
+  fi
   [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
   if [[ "$REFERENCE_MODE" == local && -d "$WORK/pgdata" ]]; then
     "$PGBIN/pg_ctl" -D "$WORK/pgdata" stop -m immediate >/dev/null 2>&1
@@ -146,6 +151,8 @@ cleanup() {
   else
     rm -rf "$WORK"
   fi
+  trap - EXIT
+  exit "$status"
 }
 trap cleanup EXIT
 

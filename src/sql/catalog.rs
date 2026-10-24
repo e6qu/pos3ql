@@ -9092,12 +9092,12 @@ pub(crate) fn synthesize_current<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
     let table = match (info, name) {
-        (false, "pg_class") => pg_class(storage, txid, arena),
+        (false, "pg_class") => pg_class(storage, txid, purpose, arena),
         (false, "pg_attribute") => pg_attribute(storage, txid, purpose, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
         (false, "pg_collation") => pg_collation(storage, txid, arena),
         (false, "pg_conversion") => pg_conversion(storage, txid, arena),
-        (false, "pg_type") => pg_type(storage, txid, arena),
+        (false, "pg_type") => pg_type(storage, txid, purpose, arena),
         (false, "pg_locks") => pg_locks(storage, arena),
         (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_prepared_statements") => pg_prepared_statements(storage, txid, arena),
@@ -19040,6 +19040,7 @@ fn pg_partitioned_table<'a>(
 fn pg_class<'a>(
     storage: &Storage,
     txid: u32,
+    purpose: Materialization,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_class", false);
@@ -19054,7 +19055,11 @@ fn pg_class<'a>(
         })
         .count()
         * 2;
-    let out_capacity = CATALOG_RELATIONS.len()
+    let catalogs: &[&str] = match purpose {
+        Materialization::Query => CATALOG_RELATIONS,
+        Materialization::History => &[],
+    };
+    let out_capacity = catalogs.len()
         + visible_tables
         + toast_relations
         + storage.composites_with_slots_visible_to(txid).count()
@@ -19068,7 +19073,7 @@ fn pg_class<'a>(
         .alloc_slice_with(out_capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
-    for name in CATALOG_RELATIONS {
+    for name in catalogs {
         let relation = catalog_relation(name).expect("catalog metadata exists");
         out[n] = row(
             &[
@@ -28407,7 +28412,7 @@ fn pg_prepared_statements<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_statements", false);
-    let catalog_types = pg_type(storage, txid, arena)?;
+    let catalog_types = pg_type(storage, txid, Materialization::Query, arena)?;
     crate::sql::prep::with_active(|pool| {
         let rows = arena
             .alloc_slice_with(
@@ -28762,7 +28767,12 @@ fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError>
     finish(definition, rows, arena)
 }
 
-fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_type<'a>(
+    storage: &Storage,
+    txid: u32,
+    purpose: Materialization,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_type", false);
     let types = [
         ColType::Void,
@@ -28915,253 +28925,260 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .checked_add(storage.views_visible_to(txid).count())
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
-    let capacity = 512usize
+    let builtin_capacity = match purpose {
+        Materialization::Query => 512usize,
+        Materialization::History => 0,
+    };
+    let capacity = builtin_capacity
         .checked_add(user_types)
         .and_then(|count| count.checked_add(relation_types))
         .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (i, t) in types.iter().enumerate() {
-        out[i] = row(
-            &[
-                Datum::Int4(t.oid()),
-                text(t.internal_name(), arena)?,
-                Datum::Int4(i32::from(t.typlen())),
-                Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
-                text(category(t), arena)?,
-                Datum::Int4(0), // typbasetype
-                Datum::Int4(0), // typelem
-                Datum::Int4(
-                    super::types::ArrElem::from_coltype(*t)
-                        .map_or(0, super::types::ArrElem::array_oid),
-                ), // typarray
-                Datum::Int4(0), // typrelid
-                Datum::Int4(-1), // typtypmod
-                Datum::Bool(false),
-                Datum::Null, // typdefault
-                Datum::Null, // Input/output identities are assigned together below.
-                Datum::Null,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text(type_storage(*t), arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-    }
-    let mut n = types.len();
-    for (oid, name, length, category, element, array, relation, kind) in [
-        (18, "char", 1, "Z", 0, 1002, 0, "b"),
-        (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
-        (
-            super::types::oid::EVENT_TRIGGER,
-            "event_trigger",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::FDW_HANDLER,
-            "fdw_handler",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYELEMENT,
-            "anyelement",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYARRAY,
-            "anyarray",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYNONARRAY,
-            "anynonarray",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
-        (
-            super::types::oid::ANYRANGE,
-            "anyrange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYMULTIRANGE,
-            "anymultirange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLE,
-            "anycompatible",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLEARRAY,
-            "anycompatiblearray",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLENONARRAY,
-            "anycompatiblenonarray",
-            4,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLERANGE,
-            "anycompatiblerange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::ANYCOMPATIBLEMULTIRANGE,
-            "anycompatiblemultirange",
-            -1,
-            "P",
-            0,
-            0,
-            0,
-            "p",
-        ),
-        (
-            super::types::oid::PG_STATISTIC_ROW,
-            "pg_statistic",
-            -1,
-            "C",
-            0,
-            super::types::oid::PG_STATISTIC_ARRAY,
-            2619,
-            "c",
-        ),
-        (
-            super::types::oid::PG_STATISTIC_ARRAY,
-            "_pg_statistic",
-            -1,
-            "A",
-            super::types::oid::PG_STATISTIC_ROW,
-            0,
-            0,
-            "b",
-        ),
-    ] {
-        out[n] = row(
-            &[
-                Datum::Int4(oid),
-                text(name, arena)?,
-                Datum::Int4(length),
-                Datum::Int4(0),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text(kind, arena)?,
-                text(category, arena)?,
-                Datum::Int4(0),
-                Datum::Int4(element),
-                Datum::Int4(array),
-                Datum::Int4(relation),
-                Datum::Int4(-1),
-                Datum::Bool(false),
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text(if length < 0 { "x" } else { "p" }, arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    // Arrays are catalog types in their own right. Keeping this inventory on
-    // `ArrElem` means an accepted array OID is simultaneously visible to
-    // `pg_type`, has a matching `typelem`, and is discoverable by catalog
-    // clients such as pg_dump.
-    for element in super::types::ArrElem::BUILTIN {
-        out[n] = row(
-            &[
-                Datum::Int4(element.array_oid()),
-                text(element.catalog_name(), arena)?,
-                Datum::Int4(-1),
-                Datum::Int4(0),
-                Datum::Int4(PG_CATALOG_NS_OID),
-                text("b", arena)?,
-                text("A", arena)?,
-                Datum::Int4(0),
-                Datum::Int4(element.element_oid()),
-                Datum::Int4(0),
-                Datum::Int4(0),
-                Datum::Int4(-1),
-                Datum::Bool(false),
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Int4(PG_TYPE_OID),
-                Datum::Int4(10),
-                Datum::Bool(true),
-                text("x", arena)?,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        n += 1;
+    let mut n = 0;
+    if matches!(purpose, Materialization::Query) {
+        for (i, t) in types.iter().enumerate() {
+            out[i] = row(
+                &[
+                    Datum::Int4(t.oid()),
+                    text(t.internal_name(), arena)?,
+                    Datum::Int4(i32::from(t.typlen())),
+                    Datum::Int4(if t.is_collatable() { 100 } else { 0 }),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text(if t.is_pseudo() { "p" } else { "b" }, arena)?,
+                    text(category(t), arena)?,
+                    Datum::Int4(0), // typbasetype
+                    Datum::Int4(0), // typelem
+                    Datum::Int4(
+                        super::types::ArrElem::from_coltype(*t)
+                            .map_or(0, super::types::ArrElem::array_oid),
+                    ), // typarray
+                    Datum::Int4(0), // typrelid
+                    Datum::Int4(-1), // typtypmod
+                    Datum::Bool(false),
+                    Datum::Null, // typdefault
+                    Datum::Null, // Input/output identities are assigned together below.
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text(type_storage(*t), arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+        }
+        n = types.len();
+        for (oid, name, length, category, element, array, relation, kind) in [
+            (18, "char", 1, "Z", 0, 1002, 0, "b"),
+            (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
+            (
+                super::types::oid::EVENT_TRIGGER,
+                "event_trigger",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::FDW_HANDLER,
+                "fdw_handler",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYELEMENT,
+                "anyelement",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYARRAY,
+                "anyarray",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYNONARRAY,
+                "anynonarray",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (super::types::oid::ANYENUM, "anyenum", 4, "P", 0, 0, 0, "p"),
+            (
+                super::types::oid::ANYRANGE,
+                "anyrange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYMULTIRANGE,
+                "anymultirange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLE,
+                "anycompatible",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLEARRAY,
+                "anycompatiblearray",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLENONARRAY,
+                "anycompatiblenonarray",
+                4,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLERANGE,
+                "anycompatiblerange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::ANYCOMPATIBLEMULTIRANGE,
+                "anycompatiblemultirange",
+                -1,
+                "P",
+                0,
+                0,
+                0,
+                "p",
+            ),
+            (
+                super::types::oid::PG_STATISTIC_ROW,
+                "pg_statistic",
+                -1,
+                "C",
+                0,
+                super::types::oid::PG_STATISTIC_ARRAY,
+                2619,
+                "c",
+            ),
+            (
+                super::types::oid::PG_STATISTIC_ARRAY,
+                "_pg_statistic",
+                -1,
+                "A",
+                super::types::oid::PG_STATISTIC_ROW,
+                0,
+                0,
+                "b",
+            ),
+        ] {
+            out[n] = row(
+                &[
+                    Datum::Int4(oid),
+                    text(name, arena)?,
+                    Datum::Int4(length),
+                    Datum::Int4(0),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text(kind, arena)?,
+                    text(category, arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(element),
+                    Datum::Int4(array),
+                    Datum::Int4(relation),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text(if length < 0 { "x" } else { "p" }, arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+        // Arrays are catalog types in their own right. Keeping this inventory on
+        // `ArrElem` means an accepted array OID is simultaneously visible to
+        // `pg_type`, has a matching `typelem`, and is discoverable by catalog
+        // clients such as pg_dump.
+        for element in super::types::ArrElem::BUILTIN {
+            out[n] = row(
+                &[
+                    Datum::Int4(element.array_oid()),
+                    text(element.catalog_name(), arena)?,
+                    Datum::Int4(-1),
+                    Datum::Int4(0),
+                    Datum::Int4(PG_CATALOG_NS_OID),
+                    text("b", arena)?,
+                    text("A", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(element.element_oid()),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_TYPE_OID),
+                    Datum::Int4(10),
+                    Datum::Bool(true),
+                    text("x", arena)?,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
     }
     // User-defined domains: typtype 'd', with their base type and constraints.
     for slot in 0..storage.domain_count() {
@@ -30114,17 +30131,19 @@ fn pg_authid<'a>(
     arena: &'a Arena,
     require_superuser: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let current = storage.current_role_slot(txid).ok_or_else(|| {
-        sql_err!(
-            sqlstate::INSUFFICIENT_PRIVILEGE,
-            "current role is not present in the role catalog"
-        )
-    })?;
-    if require_superuser && !storage.role(current).attributes_to(txid).superuser {
-        return Err(sql_err!(
-            sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied for table pg_authid"
-        ));
+    if require_superuser {
+        let current = storage.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        if !storage.role(current).attributes_to(txid).superuser {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for table pg_authid"
+            ));
+        }
     }
     let def = schema::require("pg_authid", false);
     let output = arena

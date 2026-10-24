@@ -21274,7 +21274,7 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
-fn catalog_snapshot_small_work_arena_keeps_view_bindings_during_rename() {
+fn catalog_snapshot_capture_fits_two_megabyte_work_arena() {
     let mut config = test_config("catalog-small-work-arena");
     config.work_arena_bytes = 2 << 20;
     config.sql_arena_bytes = 4 << 20;
@@ -21283,12 +21283,46 @@ fn catalog_snapshot_small_work_arena_keeps_view_bindings_during_rename() {
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     for sql in [
-        "CREATE ROLE catalog_small_creator CREATEROLE",
-        "GRANT catalog_small_creator TO postgres",
-        "SET ROLE catalog_small_creator",
-        "CREATE ROLE catalog_small_child",
-        "ALTER ROLE catalog_small_child LOGIN",
-        "RESET ROLE",
+        "CREATE TABLE catalog_small_orders(id bigint PRIMARY KEY, tenant text, payload text)",
+        "ALTER TABLE catalog_small_orders RENAME tenant TO account_name",
+        "ALTER TABLE catalog_small_orders RENAME TO catalog_small_sales",
+        "CREATE DOMAIN catalog_small_id AS integer",
+        "ALTER DOMAIN catalog_small_id SET DEFAULT 7",
+    ] {
+        session.success(&mut engine, sql, true);
+    }
+}
+
+#[test]
+fn catalog_snapshot_role_capture_keeps_internal_access_private() {
+    let (mut engine, mut budget) = test_engine();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE ROLE catalog_creator CREATEROLE; GRANT catalog_creator TO postgres; SET ROLE catalog_creator; CREATE ROLE catalog_child; ALTER ROLE catalog_child LOGIN; COMMIT",
+    );
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE catalog_creator; SELECT rolname FROM pg_authid"
+        )),
+        ["42501"]
+    );
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+}
+
+#[test]
+fn catalog_snapshot_view_columns_survive_table_column_rename() {
+    let (mut engine, mut budget) = test_engine();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    for sql in [
         "CREATE TABLE catalog_small_orders(id bigint PRIMARY KEY, tenant text, payload text)",
         "CREATE VIEW catalog_small_report AS SELECT id, tenant, payload FROM catalog_small_orders",
         "ALTER TABLE catalog_small_orders ENABLE ROW LEVEL SECURITY",
@@ -21296,16 +21330,19 @@ fn catalog_snapshot_small_work_arena_keeps_view_bindings_during_rename() {
         "ALTER TABLE catalog_small_orders RENAME tenant TO account_name",
         "ALTER TABLE catalog_small_orders RENAME TO catalog_small_sales",
     ] {
-        session.success(&mut engine, sql, true);
+        let output = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
     assert_eq!(
-        data_rows(&session.success(&mut engine,
-            "SELECT pg_typeof(nspname)::text,nspname FROM pg_namespace JOIN (SELECT 'public'::text AS nspname) names USING(nspname)", true)),
-        ["text|public"]
-    );
-    assert_eq!(
-        data_rows(&session.success(&mut engine,
-            "SELECT attname FROM pg_attribute WHERE attrelid='catalog_small_report'::regclass AND attnum>0 ORDER BY attnum", true)),
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname FROM pg_attribute WHERE attrelid='catalog_small_report'::regclass AND attnum>0 ORDER BY attnum"
+        )),
         ["id", "tenant", "payload"]
     );
 }

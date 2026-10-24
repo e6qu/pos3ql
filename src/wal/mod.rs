@@ -12467,6 +12467,8 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             if (tag == 31 && !len.is_multiple_of(2)) || (tag == 32 && !len.is_multiple_of(4)) {
                 return None;
             }
+            let width = if tag == 31 { 2 } else { 4 };
+            lower_bound.checked_add((len / width) as i32)?;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(if tag == 31 {
                 OwnedDatum::Int2Vector {

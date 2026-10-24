@@ -8361,7 +8361,7 @@ mod tests {
             0, 0, 0, 0, // no nulls
             0, 0, 0, 21, // int2 element OID
             0, 0, 0, 2, // length
-            0, 0, 0, 1, // lower bound
+            0, 0, 0, 0, // lower bound
             0, 0, 0, 2, 0, 1, // first element
             0, 0, 0, 2, 0, 2, // second element
         ];

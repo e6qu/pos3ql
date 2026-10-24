@@ -66,17 +66,6 @@ savepoints, prepared transactions, exhaustion cleanup and cold recovery as each
 case is connected. Validate restored catalogs and their captured root versions
 before writer promotion; rejected or stale restoration must change no roots.
 
-The current PR's full CI gates remain the completion boundary. Its repairs
-preserve catalog-vector subscripts through casts and recovery, size wide routine
-metadata from the actual result width, and exclude the shared internal page
-table from database cloning. Further failures must be fixed before merging.
-Planning also uses the resident row population when a complete row map is
-available; a count recorded before later inserts must not suppress index probes.
-Table-column renames must retain a view's selected columns and output names,
-including nested queries, aliases, rollback, and recovery. The current repair
-collects parsed source positions under the old definition and checks the same
-dependency bindings again before publishing its replacement query.
-
 Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and
 rollback and exhaustion release every owner within startup reservations.

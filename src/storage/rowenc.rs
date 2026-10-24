@@ -528,12 +528,16 @@ pub(crate) fn decode<'a>(
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 out[i] = if matches!(schema[i], ColType::Int2Vector) {
-                    if !raw.len().is_multiple_of(2) {
+                    if !raw.len().is_multiple_of(2)
+                        || lower_bound.checked_add((raw.len() / 2) as i32).is_none()
+                    {
                         return Err(corrupt());
                     }
                     Datum::Int2Vector { lower_bound, raw }
                 } else {
-                    if !raw.len().is_multiple_of(4) {
+                    if !raw.len().is_multiple_of(4)
+                        || lower_bound.checked_add((raw.len() / 4) as i32).is_none()
+                    {
                         return Err(corrupt());
                     }
                     Datum::OidVector { lower_bound, raw }

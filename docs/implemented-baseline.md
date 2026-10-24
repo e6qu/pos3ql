@@ -1160,6 +1160,25 @@ column: name it explicitly rather than expecting it in `SELECT *`. Index
 vectors such as `pg_index.indoption` start at zero. For example,
 `indoption[0]` describes the first key; included columns have no option entry.
 
+Renaming a source column preserves a view's existing output names. For example,
+after `CREATE VIEW order_report AS SELECT customer_id FROM orders` and
+`ALTER TABLE orders RENAME customer_id TO account_id`, use
+`SELECT customer_id FROM order_report` as before. The view keeps reading the
+same source column. Rollback restores its earlier definition, and recovery
+retains the committed binding.
+
+Casting an ordinary array to a vector preserves that array's subscripts. For
+example, `('[8:9]={9,10}'::oid[]::oidvector)[8]` returns `9`, including after
+recovery. PostgreSQL's `oidvector` equality compares its values and ignores
+these bounds; its ordering compares length before values. The array casts and
+the [PostgreSQL 18.6 comparison implementation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/nbtree/nbtcompare.c)
+are checked separately from text rendering and storage recovery.
+Binary input follows PostgreSQL's narrower receive rules: a vector must be
+nonempty, start at zero, and contain no NULL elements. SQL array casts can retain
+other bounds. Empty vectors still have PostgreSQL's one-dimensional binary
+result header; sending that result back as binary input is rejected by
+[PostgreSQL's receiver](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/oid.c).
+
 ### What permission lookups see
 
 Catalog permission rows retain role identifiers. Renaming a role changes the

@@ -453,15 +453,11 @@ fn binary_value_len(value: &Datum) -> usize {
         }
         Datum::Int2Vector { raw, .. } => {
             let count = raw.len() / 2;
-            12usize
-                .saturating_add(usize::from(count != 0).saturating_mul(8))
-                .saturating_add(count.saturating_mul(6))
+            20usize.saturating_add(count.saturating_mul(6))
         }
         Datum::OidVector { raw, .. } => {
             let count = raw.len() / 4;
-            12usize
-                .saturating_add(usize::from(count != 0).saturating_mul(8))
-                .saturating_add(count.saturating_mul(8))
+            20usize.saturating_add(count.saturating_mul(8))
         }
         Datum::Array { element, raw } => {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
@@ -1648,13 +1644,11 @@ impl<'b> Responder<'b> {
                 Datum::Int2Vector { raw, lower_bound } => {
                     let count = raw.len() / 2;
                     m.field(|m| {
-                        m.i32(if count == 0 { 0 } else { 1 });
+                        m.i32(1);
                         m.i32(0);
                         m.i32(crate::sql::types::oid::INT2);
-                        if count > 0 {
-                            m.i32(count as i32);
-                            m.i32(*lower_bound);
-                        }
+                        m.i32(count as i32);
+                        m.i32(*lower_bound);
                         for bytes in raw.as_chunks::<2>().0 {
                             m.i32(2);
                             m.bytes(&i16::from_le_bytes(*bytes).to_be_bytes());
@@ -1664,13 +1658,11 @@ impl<'b> Responder<'b> {
                 Datum::OidVector { raw, lower_bound } => {
                     let count = raw.len() / 4;
                     m.field(|m| {
-                        m.i32(if count == 0 { 0 } else { 1 });
+                        m.i32(1);
                         m.i32(0);
                         m.i32(crate::sql::types::oid::OID);
-                        if count > 0 {
-                            m.i32(count as i32);
-                            m.i32(*lower_bound);
-                        }
+                        m.i32(count as i32);
+                        m.i32(*lower_bound);
                         for bytes in raw.as_chunks::<4>().0 {
                             m.i32(4);
                             m.bytes(&u32::from_le_bytes(*bytes).to_be_bytes());

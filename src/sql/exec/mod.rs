@@ -54569,8 +54569,8 @@ fn decode_binary_field_with_context<'a>(
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Int2(i16::from_be_bytes(b)))
         }
-        ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
-        ColType::OidVector => decode_binary_oidvector(bytes, arena),
+        ColType::Int2Vector => decode_binary_vector(BinaryVectorKind::Int2, bytes, arena),
+        ColType::OidVector => decode_binary_vector(BinaryVectorKind::Oid, bytes, arena),
         ColType::PgNodeTree => Ok(Datum::Text(core::str::from_utf8(bytes).map_err(|_| bad())?)),
         ColType::PgNdistinct
         | ColType::PgDependencies
@@ -54788,120 +54788,107 @@ fn decode_binary_field_by_oid<'a>(
     decode_binary_field_with_context(ctype, bytes, arena, context)
 }
 
-/// Decodes PostgreSQL's `int2vector` send format. It is an `int2` array on
-/// the wire, while the catalog representation stores its values packed in
-/// native little-endian order.
-fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    use crate::sql::types::oid;
-
-    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary int2vector");
-    let mut reader = crate::pg::wire::MsgIn::new(bytes);
-    let ndim = reader.i32().map_err(|_| bad())?;
-    let has_null = reader.i32().map_err(|_| bad())?;
-    let element_oid = reader.i32().map_err(|_| bad())?;
-    if has_null != 0 || element_oid != oid::INT2 {
-        return Err(bad());
-    }
-    if ndim == 0 {
-        if !reader.done() {
-            return Err(bad());
-        }
-        return Ok(Datum::Int2Vector {
-            lower_bound: 0,
-            raw: &[],
-        });
-    }
-    if ndim != 1 {
-        return Err(bad());
-    }
-    let count = reader.i32().map_err(|_| bad())?;
-    let _lower_bound = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "int2vector value too large"
-        ));
-    }
-    let raw = arena
-        .alloc_slice_with(count as usize * 2, |_| 0u8)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "int2vector exceeds the statement arena"
-            )
-        })?;
-    for slot in raw.as_chunks_mut::<2>().0 {
-        let len = reader.i32().map_err(|_| bad())?;
-        if len != 2 {
-            return Err(bad());
-        }
-        let value = reader.take(2).map_err(|_| bad())?;
-        slot.copy_from_slice(&i16::from_be_bytes([value[0], value[1]]).to_le_bytes());
-    }
-    if !reader.done() {
-        return Err(bad());
-    }
-    Ok(Datum::Int2Vector {
-        lower_bound: 0,
-        raw,
-    })
+#[derive(Clone, Copy)]
+enum BinaryVectorKind {
+    Int2,
+    Oid,
 }
 
-/// Decodes PostgreSQL's `oidvector` send format. It is an `oid` array on the
-/// wire and a packed native-endian vector inside catalog rows.
-fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    use crate::sql::types::oid;
-
-    let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary oidvector");
+/// PostgreSQL receives vectors through its array receiver, then requires a
+/// nonempty, one-dimensional, zero-based value without NULL elements.
+fn decode_binary_vector<'a>(
+    kind: BinaryVectorKind,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (element_oid, width, name) = match kind {
+        BinaryVectorKind::Int2 => (crate::sql::types::oid::INT2, 2, "int2vector"),
+        BinaryVectorKind::Oid => (crate::sql::types::oid::OID, 4, "oidvector"),
+    };
+    let bad = || {
+        sql_err!(
+            sqlstate::INVALID_BINARY_REPRESENTATION,
+            "invalid binary {name}"
+        )
+    };
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
-    let ndim = reader.i32().map_err(|_| bad())?;
-    let has_null = reader.i32().map_err(|_| bad())?;
-    let element_oid = reader.i32().map_err(|_| bad())?;
-    if has_null != 0 || element_oid != oid::OID {
+    let dimensions = reader.i32().map_err(|_| bad())?;
+    if dimensions > crate::sql::array::MAX_DIMENSIONS as i32 {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "vector dimensions exceed the PostgreSQL array limit"
+        ));
+    }
+    let flags = reader.i32().map_err(|_| bad())?;
+    let received_oid = reader.i32().map_err(|_| bad())? as u32;
+    if !(0..=1).contains(&flags) {
         return Err(bad());
     }
-    if ndim == 0 {
-        if !reader.done() {
-            return Err(bad());
-        }
-        return Ok(Datum::OidVector {
-            lower_bound: 0,
-            raw: &[],
-        });
+    // PostgreSQL trusts only built-in OIDs in an external array header.
+    // Generated catalog OIDs are local to the sending database.
+    const FIRST_GENERATED_CATALOG_OID: u32 = 10_000;
+    if received_oid != element_oid as u32 && received_oid < FIRST_GENERATED_CATALOG_OID {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "binary vector has an unexpected built-in element type"
+        ));
     }
-    if ndim != 1 {
+    if dimensions != 1 {
         return Err(bad());
     }
     let count = reader.i32().map_err(|_| bad())?;
-    let _lower_bound = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::array::MAX_ELEMENTS as i32).contains(&count) {
+    let lower_bound = reader.i32().map_err(|_| bad())?;
+    if count < 0 {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "oidvector value too large"
+            "array size exceeds the maximum allowed"
+        ));
+    }
+    if lower_bound.checked_add(count).is_none() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "array lower bound is too large: {lower_bound}"
+        ));
+    }
+    if count == 0 || lower_bound != 0 {
+        return Err(bad());
+    }
+    if count as usize > crate::sql::array::MAX_ELEMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "{name} value too large"
         ));
     }
     let raw = arena
-        .alloc_slice_with(count as usize * 4, |_| 0u8)
+        .alloc_slice_with(count as usize * width, |_| 0u8)
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "oidvector exceeds the statement arena"
+                "{name} exceeds the statement arena"
             )
         })?;
-    for slot in raw.as_chunks_mut::<4>().0 {
-        let len = reader.i32().map_err(|_| bad())?;
-        if len != 4 {
+    for slot in raw.chunks_exact_mut(width) {
+        let length = reader.i32().map_err(|_| bad())?;
+        if length != width as i32 {
             return Err(bad());
         }
-        let value = reader.take(4).map_err(|_| bad())?;
-        slot.copy_from_slice(&u32::from_be_bytes(value.try_into().unwrap()).to_le_bytes());
+        let value = reader.take(width).map_err(|_| bad())?;
+        for (output, input) in slot.iter_mut().zip(value.iter().rev()) {
+            *output = *input;
+        }
     }
     if !reader.done() {
         return Err(bad());
     }
-    Ok(Datum::OidVector {
-        lower_bound: 0,
-        raw,
+    Ok(match kind {
+        BinaryVectorKind::Int2 => Datum::Int2Vector {
+            lower_bound: 0,
+            raw,
+        },
+        BinaryVectorKind::Oid => Datum::OidVector {
+            lower_bound: 0,
+            raw,
+        },
     })
 }
 
@@ -72186,7 +72173,7 @@ mod tests {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "binary int2vector", 1 << 12).unwrap();
         let error = decode_binary_field(ColType::Int2Vector, &null_vector, &arena).unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+        assert_eq!(error.sqlstate, sqlstate::INVALID_BINARY_REPRESENTATION);
 
         let trailing = [
             0, 0, 0, 0, // dimensions
@@ -72195,7 +72182,7 @@ mod tests {
             0,  // unexpected trailing byte
         ];
         let error = decode_binary_field(ColType::Int2Vector, &trailing, &arena).unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+        assert_eq!(error.sqlstate, sqlstate::INVALID_BINARY_REPRESENTATION);
     }
 
     #[test]

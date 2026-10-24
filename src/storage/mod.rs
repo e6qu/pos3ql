@@ -4043,6 +4043,7 @@ impl Table {
     fn enforcer(&self, binding: usize) -> Option<Enforcer> {
         self.publication().enforcers[binding].clone()
     }
+    #[cfg(test)]
     fn enforcers(&self) -> [Option<Enforcer>; MAX_VALUE_ENFORCERS] {
         self.publication().enforcers.clone()
     }
@@ -32613,6 +32614,7 @@ impl Storage {
         };
 
         Ok(Some(key_preparation::PreparedCommittedRow {
+            origin: self.catalog_sources.origin(),
             table: table_index,
             rowid,
             transaction: txid,
@@ -32627,12 +32629,16 @@ impl Storage {
         prepared: key_preparation::PreparedCommittedRow,
     ) -> Result<(), SqlError> {
         let key_preparation::PreparedCommittedRow {
+            origin,
             table: table_index,
             rowid,
             transaction: txid,
             head,
             keys: prepared_keys,
         } = prepared;
+        if origin != self.catalog_sources.origin() {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "prepared row publication belongs to another storage instance"));
+        }
         let table = &self.tables[table_index];
         let rewritten = prepared_keys.is_none();
 

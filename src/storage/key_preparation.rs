@@ -140,6 +140,7 @@ pub(super) struct PreparedRowKeys {
 }
 
 pub(super) struct PreparedCommittedRow {
+    pub(super) origin: type_references::CatalogOrigin,
     pub(super) table: usize,
     pub(super) rowid: u64,
     pub(super) transaction: u32,
@@ -548,6 +549,34 @@ mod tests {
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
             assert_eq!(key_rows(&storage, table, 3), 1);
+        });
+    }
+
+    #[test]
+    fn key_preparation_rewritten_publication_rejects_another_storage_instance() {
+        let (first, table) = fixture(4);
+        let (second, other) = fixture(4);
+        crate::mem::guard::forbid_alloc(|| {
+            pending(&first, table, 1, 8, 2);
+            pending(&second, other, 1, 8, 3);
+            let selected = first.resident_row_state(table, 1).unwrap().unwrap();
+            let prepared = first
+                .prepare_committed_row(table, 1, 8, true, selected)
+                .unwrap()
+                .unwrap();
+            let generation = second.tables[other].generation();
+            assert_eq!(
+                second
+                    .publish_prepared_row(9, prepared)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(second.tables[other].generation(), generation);
+            assert_eq!(key_rows(&second, other, 1), 1);
+            let row = second.resident_row_state(other, 1).unwrap().unwrap();
+            assert_eq!(row.committed_lsn, 7);
+            assert_eq!(row.pending_last().unwrap().txid, 8);
         });
     }
 

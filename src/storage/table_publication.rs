@@ -162,7 +162,7 @@ impl DefinitionPublication {
             let mut owners = TableAttempt {
                 slots: &mut slots,
                 #[cfg(test)]
-                pause_after_release: &self.scan_pause,
+                pause_after_release: &self.release_pause,
             };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_table(storage, table, &mut owners)?;
@@ -939,31 +939,36 @@ mod tests {
         });
         let change = rename(&storage, parent);
         let database = storage.current_database_oid();
+        // A resumed scan must not arm the independent owner-release pause.
         storage
             .definition_publication
             .scan_pause
             .store(3, Ordering::Release);
+        storage
+            .definition_publication
+            .release_pause
+            .store(1, Ordering::Release);
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
                 crate::sql::set_execution_database_oid(database);
                 crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change))
             });
-            let resume = ResumeRelease(&storage.definition_publication.scan_pause);
+            let resume = ResumeRelease(&storage.definition_publication.release_pause);
             let deadline = Instant::now() + Duration::from_secs(5);
             while storage
                 .definition_publication
-                .scan_pause
+                .release_pause
                 .load(Ordering::Acquire)
-                != 4
+                != 2
                 && Instant::now() < deadline
             {
                 std::thread::yield_now();
             }
             let paused = storage
                 .definition_publication
-                .scan_pause
+                .release_pause
                 .load(Ordering::Acquire)
-                == 4;
+                == 2;
             let (child_moved, parent_name_visible, parent_retained) = if paused {
                 crate::mem::guard::forbid_alloc(|| {
                     let definition = storage.table_def(child, 0);

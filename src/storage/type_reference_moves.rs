@@ -248,6 +248,8 @@ pub(super) struct DefinitionPublication {
     pub(super) waits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(super) scan_pause: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    pub(super) release_pause: std::sync::atomic::AtomicU8,
 }
 
 pub(super) struct TableOwner<'storage> {
@@ -271,8 +273,8 @@ impl Drop for TableAttempt<'_, '_> {
                 if self
                     .pause_after_release
                     .compare_exchange(
-                        3,
-                        4,
+                        1,
+                        2,
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Acquire,
                     )
@@ -281,7 +283,7 @@ impl Drop for TableAttempt<'_, '_> {
                     while self
                         .pause_after_release
                         .load(std::sync::atomic::Ordering::Acquire)
-                        == 4
+                        == 2
                     {
                         std::thread::yield_now();
                     }
@@ -371,6 +373,8 @@ impl DefinitionPublication {
             waits: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             scan_pause: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            release_pause: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -432,7 +436,7 @@ impl DefinitionPublication {
             let mut owners = TableAttempt {
                 slots: &mut slots,
                 #[cfg(test)]
-                pause_after_release: &self.scan_pause,
+                pause_after_release: &self.release_pause,
             };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_tables(storage, movement, &mut owners)?;

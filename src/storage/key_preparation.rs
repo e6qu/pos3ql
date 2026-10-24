@@ -156,7 +156,21 @@ impl PreparedRowKeys {
     ) -> Result<Self, SqlError> {
         let definition = storage.table_def(table, 0);
         let target = storage.table_definition_target(table, 0, &definition);
-        let bindings = storage.tables[table].enforcers();
+        let (bindings, layout) = {
+            let publication = storage.tables[table].publication();
+            (publication.enforcers.clone(), publication.row_layout)
+        };
+        let plain = bindings
+            .iter()
+            .flatten()
+            .all(|binding| binding.index_created_at.is_none());
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = if plain {
+            definition.schema(&mut schema)
+        } else {
+            0
+        };
+        let created_at = definition.identity().created_at;
         drop(definition);
         let mut result = Self {
             target,
@@ -170,6 +184,42 @@ impl PreparedRowKeys {
             .take_while(|entry| entry.is_some())
             .count();
         if let Some(home) = home.filter(|_| count != 0) {
+            if plain {
+                let snapshot = home.snapshot();
+                if snapshot.created_at != created_at || snapshot.row_layout != layout {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "retained row layout does not match the selected index definition"
+                    ));
+                }
+                storage.with_row_bytes(table, rowid, home, |bytes| {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+                    for (binding, enforcer) in result.bindings[..count].iter().enumerate() {
+                        let enforcer = enforcer.as_ref().expect("selected binding");
+                        if enforcer
+                            .columns()
+                            .iter()
+                            .any(|&column| values[usize::from(column)].is_null())
+                        {
+                            continue;
+                        }
+                        result.hashes[result.count] = (
+                            binding,
+                            hash_key_collated_catalog(
+                                storage,
+                                enforcer.evaluation_txid,
+                                &values[..n_columns],
+                                enforcer.columns(),
+                                &enforcer.collations[..enforcer.n_cols],
+                            )?,
+                        );
+                        result.count += 1;
+                    }
+                    Ok(())
+                })?;
+                return Ok(result);
+            }
             let selection = ValueKeyPreparation::capture(storage, table)?;
             let definition = storage.tables[table].definition.read();
             result.validate_definition(storage, &definition)?;
@@ -407,6 +457,46 @@ mod tests {
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(row.committed_lsn, 7);
             assert!(row.pending_last().is_none());
+        });
+    }
+
+    #[test]
+    fn key_preparation_plain_indexes_do_not_copy_or_reserve_complete_definitions() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.query_workspace_slots = 1;
+        let capacity = table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut definition = make_def(
+            "key_orders",
+            &[
+                ("id", ColType::Int4, true),
+                ("amount", ColType::Int4, false),
+            ],
+        );
+        definition.columns[0].primary = true;
+        let table = storage.create_table(definition).unwrap();
+        storage.refresh_enforcers(table).unwrap();
+        let mut readers = Vec::with_capacity(capacity);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..capacity {
+                let reader = storage.table_definition_images();
+                reader.definition(&storage, table, 0).unwrap();
+                readers.push(reader);
+            }
+            let exhausted = storage.table_definition_images();
+            assert_eq!(
+                exhausted
+                    .definition(&storage, table, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            pending(&storage, table, 1, 8, 2);
+            storage.commit_row(table, 1, 8, 7).unwrap();
+            assert_eq!(key_rows(&storage, table, 2), 1);
         });
     }
 

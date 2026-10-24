@@ -75624,7 +75624,7 @@ fn pg_dump_bootstrap_surface() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT indclass[1]::oid,indclass[0] IS NULL \
+            "SELECT indclass[0]::oid,indclass[1] IS NULL \
                FROM pg_catalog.pg_index \
               WHERE indrelid = 'pg_dump_publication_rows'::regclass",
         )),
@@ -80933,6 +80933,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v19",
         "pos3ql-manifest-v20",
         "pos3ql-manifest-v22",
+        "pos3ql-manifest-v23",
+        "pos3ql-manifest-v24",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }

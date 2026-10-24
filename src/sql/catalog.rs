@@ -8885,7 +8885,14 @@ pub(crate) fn object_acl_by_address<'a>(
         6243 if objsubid == 0 => ("pg_parameter_acl", &["oid"], "paracl"),
         _ => return Ok(None),
     };
-    let table = synthesize(storage, Some("pg_catalog"), catalog, txid, arena)?;
+    let table = synthesize(
+        storage,
+        Some("pg_catalog"),
+        catalog,
+        txid,
+        super::catalog_snapshot::CatalogScan::Index,
+        arena,
+    )?;
     let column = |name: &str| {
         table.def.columns()[..table.def.n_columns]
             .iter()

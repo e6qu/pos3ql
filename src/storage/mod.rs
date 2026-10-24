@@ -34613,16 +34613,22 @@ impl Storage {
     /// bypass the per-row commit maintenance), so the indexes reflect the
     /// recovered committed state before any query runs.
     pub fn rebuild_recovered_enforcers(&mut self) -> Result<(), SqlError> {
-        for i in 0..self.tables.len() {
-            if self.tables[i].live() {
-                self.build_enforcers_visible(
-                    i,
-                    None,
-                    key_preparation::EnforcerRows::RebuildRecovered,
-                )?;
+        let prior_database = current_database();
+        let result = (|| {
+            for i in 0..self.tables.len() {
+                if self.tables[i].live() {
+                    self.select_database_for_recovery(self.tables[i].database())?;
+                    self.build_enforcers_visible(
+                        i,
+                        None,
+                        key_preparation::EnforcerRows::RebuildRecovered,
+                    )?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        crate::sql::set_execution_database_oid(prior_database);
+        result
     }
 
     /// Rebuilds a table's value-cache enforcers from its current definition and
@@ -52870,8 +52876,12 @@ mod tests {
             assert!(error.message.as_str().contains("max_value_indexes"));
             {
                 let publication = storage.tables[table].publication();
-                assert_eq!(publication.n_enforcers, 0);
-                assert!(publication.enforcers.iter().all(Option::is_none));
+                assert_eq!(publication.n_enforcers, 1);
+                assert_eq!(
+                    publication.enforcers[0].as_ref().unwrap().cache.slot(),
+                    selected.cache.slot()
+                );
+                assert!(publication.enforcers[1..].iter().all(Option::is_none));
             }
             let free = storage.value_indexes.acquire().unwrap();
             assert!(storage.value_indexes.acquire().is_none());
@@ -52880,7 +52890,7 @@ mod tests {
             selected.cache.read().probe(41, |row| original = row);
             assert_eq!(original, 99);
             drop(selected);
-            storage.refresh_enforcers(table).unwrap();
+            storage.prepare_index_enforcers(table, 0).unwrap();
             let publication = storage.tables[table].publication();
             assert_eq!(publication.n_enforcers, 2);
             assert!(publication.enforcers[..2].iter().all(Option::is_some));

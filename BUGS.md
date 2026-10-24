@@ -15,7 +15,7 @@ Each entry must include a reproducer, affected boundary, observed behavior and
 exact blocker. Schema waits, type retirement, publication, recovery, retained row
 and table definitions, resumed command effects, storage ownership, slot reuse, column bindings and capacity
 failures follow the same rule, including stale row layouts, temporary changes
-sharing a journal position, failed index-cache replacement, prepared keys
+sharing a journal position, failed index-cache replacement, cross-database recovery, prepared keys
 whose binding changed, irreversible commit failures and
 checkpointing after partial installation. Fault tests must restart a terminally
 failed instance before checking recovery; they must reject partial transactions.

@@ -658,6 +658,75 @@ mod tests {
     }
 
     #[test]
+    fn key_preparation_recovery_uses_each_database_and_restores_context_after_errors() {
+        let mut config = test_config();
+        config.max_tables = 2;
+        config.max_value_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut tables = [0; 2];
+            for (position, database) in [DatabaseOid::POSTGRES, DatabaseOid::TEMPLATE1]
+                .into_iter()
+                .enumerate()
+            {
+                storage.select_database_for_recovery(database).unwrap();
+                let mut definition = make_def(
+                    "key_orders",
+                    &[
+                        ("id", ColType::Int4, true),
+                        ("amount", ColType::Int4, false),
+                    ],
+                );
+                definition.columns[0].unique = true;
+                let table = storage.create_table(definition).unwrap();
+                let home = storage
+                    .heap
+                    .append_row(&[Datum::Int4(position as i32 + 1), Datum::Int4(11)])
+                    .unwrap();
+                let generation = storage.tables[table].generation();
+                storage.tables[table]
+                    .rows
+                    .insert(1, RowState::committed_in_generation(home, 7, generation))
+                    .unwrap();
+                tables[position] = table;
+            }
+            storage.set_lsn(7);
+            storage
+                .select_database_for_recovery(DatabaseOid::POSTGRES)
+                .unwrap();
+            storage.rebuild_recovered_enforcers().unwrap();
+            assert_eq!(storage.current_database_oid(), DatabaseOid::POSTGRES);
+            assert_eq!(key_rows(&storage, tables[0], 1), 1);
+            storage
+                .select_database_for_recovery(DatabaseOid::TEMPLATE1)
+                .unwrap();
+            assert_eq!(key_rows(&storage, tables[1], 2), 1);
+            let retained = storage.tables[tables[1]].enforcer(0).unwrap();
+            storage
+                .select_database_for_recovery(DatabaseOid::POSTGRES)
+                .unwrap();
+            assert_eq!(
+                storage.rebuild_recovered_enforcers().unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.current_database_oid(), DatabaseOid::POSTGRES);
+            assert_eq!(retained.cache.read().len(), 1);
+            drop(retained);
+            storage.rebuild_recovered_enforcers().unwrap();
+            assert_eq!(storage.current_database_oid(), DatabaseOid::POSTGRES);
+            assert_eq!(key_rows(&storage, tables[0], 1), 1);
+            storage
+                .select_database_for_recovery(DatabaseOid::TEMPLATE1)
+                .unwrap();
+            assert_eq!(key_rows(&storage, tables[1], 2), 1);
+            storage
+                .select_database_for_recovery(DatabaseOid::POSTGRES)
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn key_preparation_replaced_bindings_reject_publication_without_changing_rows() {
         let (storage, table) = fixture(4);
         crate::mem::guard::forbid_alloc(|| {

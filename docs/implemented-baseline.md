@@ -1066,6 +1066,8 @@ Table changes can keep these caches when rows were not rewritten, or when both
 the table and its caches are empty. Changed key definitions still need new buffers.
 Startup recovery recycles its unexposed cache buffers while keeping durable index
 identities. It does not need space for two copies of every recovered cache.
+Each table rebuild runs in its owning database; success and errors restore the
+caller's database context. Runtime table-identity checks remain strict.
 
 Index-key preparation uses one selected table shape for decoding the row and
 evaluating its expressions and membership predicate. Ordinary column keys copy

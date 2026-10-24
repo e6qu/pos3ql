@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   reference:
@@ -37,6 +38,51 @@ jobs:
             --output "$RUNNER_TEMP/catalog-reference/postgresql.json"
           git rev-parse HEAD > "$RUNNER_TEMP/catalog-reference/revision"
           docker inspect '${{ job.services.postgres.id }}' --format '{{.Image}}' > "$RUNNER_TEMP/catalog-reference/postgresql-image"
+      - uses: actions/download-artifact@v8
+        with:
+          name: differential-release-2d6e53b2950b1dcaaac7ace1b4aef272007217db
+          run-id: 40072890863
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/catalog-baseline/
+      - name: Verify unchanged baseline source and artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin 27f92ad3abaa33f0da6396cf6b5d7eb7a2c87dae
+          git diff --exit-code 27f92ad3abaa33f0da6396cf6b5d7eb7a2c87dae HEAD -- src Cargo.toml Cargo.lock build.rs
+          test "$(cat "$RUNNER_TEMP/catalog-baseline/revision")" = 2d6e53b2950b1dcaaac7ace1b4aef272007217db
+          artifact_tree=$(gh api repos/e6qu/pos3ql/git/commits/2d6e53b2950b1dcaaac7ace1b4aef272007217db --jq .tree.sha)
+          test "$artifact_tree" = "$(git rev-parse '27f92ad3abaa33f0da6396cf6b5d7eb7a2c87dae^{tree}')"
+          cd "$RUNNER_TEMP/catalog-baseline"
+          sha256sum --strict --check SHA256SUMS
+          chmod +x pos3ql
+      - name: Compare the verified merged baseline with PostgreSQL
+        run: |
+          cat > "$RUNNER_TEMP/catalog-reference/pos3ql.conf" <<EOF
+          listen_addr = 127.0.0.1:15599
+          data_dir = $RUNNER_TEMP/catalog-data
+          object_store = off
+          log_format = text
+          max_tables = 8
+          table_rows = 64
+          memtable_bytes = 16MiB
+          EOF
+          cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/catalog-reference/pos3ql.conf"
+          "$RUNNER_TEMP/catalog-baseline/pos3ql" --config "$RUNNER_TEMP/catalog-reference/pos3ql.conf" > "$RUNNER_TEMP/catalog-reference/pos3ql.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"; wait "$server_pid" || true' EXIT
+          for attempt in $(seq 1 100); do
+            kill -0 "$server_pid"
+            if grep -q '^startup complete:.*accepting connections$' "$RUNNER_TEMP/catalog-reference/pos3ql.log"; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep '^startup complete:.*accepting connections$' "$RUNNER_TEMP/catalog-reference/pos3ql.log"
+          target/external-venv/bin/python tests/external/catalog_snapshot_diff.py \
+            --host 127.0.0.1 --port 15599 --user postgres --database postgres \
+            --reference "$RUNNER_TEMP/catalog-reference/postgresql.json" \
+            --output "$RUNNER_TEMP/catalog-reference/pos3ql.json"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

@@ -7,6 +7,8 @@ Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
 
 No defects currently meet this boundary. Repair reproducible admission,
 publication, cancellation and recovery failures in the change that finds them.
+Catalog visibility repairs must preserve both explicit catalog-query snapshots
+and current object resolution; neither boundary is a reason to defer the other.
 
 Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
 and [storage format guide](docs/durable-format.md). Keep regression evidence in

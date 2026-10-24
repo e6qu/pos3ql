@@ -34,6 +34,13 @@ not combine its selected order rows with a replacement table's columns or
 later comments. Connect the guarded table/type publication and retirement paths
 to retained catalog versions before several CPU workers run statements.
 Extend the table-shape checks used by index keys to every later catalog lookup.
+Preserve PostgreSQL's distinction between listing catalog rows and resolving an
+object for use. For example, after another connection renames `orders` to
+`sales`, a repeatable-read query of `pg_class` still lists `orders`, while
+`to_regclass('sales')` resolves the current name. Functions use current definitions
+and sequence counters keep advancing. Do not freeze every metadata lookup at
+the row snapshot. Compare both paths with PostgreSQL 18, including replacement
+objects, comments, enum labels, private changes and rollback.
 Keep rewrite history cleanup paced during concurrent publication.
 Keep old row, index and backup data until their readers have finished.
 Check reader and backup retention while old files are replaced. Recovery may

@@ -8556,7 +8556,7 @@ impl RoutineArgumentDef {
 
 /// Name and identifier probes must not copy reserved bodies or result arrays.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RoutineIdentity {
+pub(crate) struct RoutineLookupIdentity {
     pub schema: SqlName,
     pub name: SqlName,
     pub oid: i32,
@@ -41226,11 +41226,15 @@ impl Storage {
         }
     }
 
-    pub(crate) fn routine_identity_for(&self, slot: usize, txid: u32) -> Option<RoutineIdentity> {
+    pub(crate) fn routine_identity_for(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<RoutineLookupIdentity> {
         let catalog = self.routines.lock().expect("routine catalog lock poisoned");
         let routine = catalog.get(slot)?;
         (routine.database == current_database() && routine.visible_to(txid)).then(|| {
-            RoutineIdentity {
+            RoutineLookupIdentity {
                 schema: routine.schema_for(txid),
                 name: routine.name_for(txid),
                 oid: routine_oid(routine),

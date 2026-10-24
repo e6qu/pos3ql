@@ -65826,6 +65826,11 @@ fn alter_table_relation(
         }
         let mut new_def = def;
         new_def.schema = new_name;
+        for key in new_def.fkeys.iter_mut().take(new_def.n_fkeys) {
+            if key.parent_schema == def.schema && key.parent == def.name {
+                key.parent_schema = new_def.schema;
+            }
+        }
         let mut mapping = [None; MAX_COLUMNS];
         for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
             *target = Some(def.columns()[column].name);
@@ -65833,6 +65838,12 @@ fn alter_table_relation(
         if let Err(error) =
             txn.write_table_definition(storage, edit_target, new_def, &mapping, false)
         {
+            return sql_fail(error);
+        }
+        if let Err(error) = stage_inbound_foreign_key_moves(storage, txn, table_index, &def, &new_def) {
+            return sql_fail(error);
+        }
+        if let Err(error) = stage_table_sequence_links(storage, wal, txn, &def, &new_def, &mapping) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -68128,74 +68139,8 @@ fn alter_table_relation(
         }
         seq_session.invalidate_cache(alteration.slot);
     }
-    let rebind = |link: Option<crate::storage::SequenceOwner>, require_generator: bool| {
-        let mut link = link?;
-        if link.table_schema != def.schema || link.table != def.name {
-            return Some(link);
-        }
-        // A sequence created for a column added by this same ALTER already
-        // carries the final names and has no source-column mapping.
-        let Some(old_column) = def.column_index(link.column.as_str()) else {
-            return Some(link);
-        };
-        let target_name = column_mapping[old_column]?;
-        let target_column = new_def.column_index(target_name.as_str())?;
-        if require_generator && !new_def.columns()[target_column].auto_increment {
-            return None;
-        }
-        link.table_schema = new_def.schema;
-        link.table = new_def.name;
-        link.column = new_def.columns()[target_column].name;
-        Some(link)
-    };
-    // The table shape WAL record carries no sequence dependencies. Re-journal
-    // every changed ownership/generator edge absolutely so replay observes the
-    // same rename, dropped column, or dropped identity.
-    for sequence_slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence_for(sequence_slot, txn.txid);
-        if !sequence.visible_to(txn.txid) {
-            continue;
-        }
-        let owner = rebind(sequence.owner, false);
-        let generator_for = rebind(sequence.generator_for, true);
-        if owner == sequence.owner && generator_for == sequence.generator_for {
-            continue;
-        }
-        let spec = SeqSpec {
-            data_type: sequence.data_type,
-            increment: sequence.increment,
-            min_value: sequence.min_value,
-            max_value: sequence.max_value,
-            start_value: sequence.start_value,
-            cache: sequence.cache,
-            cycle: sequence.cycle,
-        };
-        let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
-        if sequence.persistence != crate::storage::RelationPersistence::Temporary {
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::CreateSequence {
-                    restart: None,
-                    identity: storage.sequence_position(sequence_slot),
-                    schema: sequence_schema.as_str(),
-                    name: sequence_name.as_str(),
-                    data_type: spec.data_type,
-                    increment: spec.increment,
-                    min_value: spec.min_value,
-                    max_value: spec.max_value,
-                    start_value: spec.start_value,
-                    cache: spec.cache,
-                    cycle: spec.cycle,
-                    owner,
-                    generator_for,
-                    persistence: sequence.persistence,
-                },
-            ) {
-                return sql_fail(error);
-            }
-        }
+    if let Err(error) = stage_table_sequence_links(storage, wal, txn, &def, &new_def, &column_mapping) {
+        return sql_fail(error);
     }
 
     let row_write_target = match txn.write_table_definition(
@@ -68549,45 +68494,8 @@ fn alter_table_relation(
             }
         }
     }
-    if relation_moved {
-        for dependent_table in 0..storage.table_count() {
-            if dependent_table == table_index
-                || !storage.table(dependent_table).visible_to(txn.txid)
-            {
-                continue;
-            }
-            let (dependent_target, current) =
-                storage.select_table_definition(dependent_table, txn.txid);
-            let mut dependent = current;
-            let mut changed = false;
-            for foreign_key in &mut dependent.fkeys[..dependent.n_fkeys] {
-                if foreign_key.parent_schema == def.schema && foreign_key.parent == def.name {
-                    foreign_key.parent_schema = new_def.schema;
-                    foreign_key.parent = new_def.name;
-                    changed = true;
-                }
-            }
-            if !changed {
-                continue;
-            }
-            let mut identity_mapping = [None; MAX_COLUMNS];
-            for (column, target) in identity_mapping
-                .iter_mut()
-                .enumerate()
-                .take(current.n_columns)
-            {
-                *target = Some(current.columns()[column].name);
-            }
-            if let Err(error) = txn.write_table_definition(
-                storage,
-                dependent_target,
-                dependent,
-                &identity_mapping,
-                false,
-            ) {
-                return sql_fail(error);
-            }
-        }
+    if let Err(error) = stage_inbound_foreign_key_moves(storage, txn, table_index, &def, &new_def) {
+        return sql_fail(error);
     }
     for i in 0..rewritten_rows {
         let (_, rowid, _) = scratch[i].local_parts();
@@ -68610,6 +68518,94 @@ fn alter_table_relation(
         responder.command_complete(tag)?;
     }
     sql_ok()
+}
+
+
+fn stage_inbound_foreign_key_moves(
+    storage: &Storage,
+    txn: &mut TxnState,
+    table: usize,
+    old: &TableDef,
+    new: &TableDef,
+) -> Result<(), SqlError> {
+    if old.schema == new.schema && old.name == new.name {
+        return Ok(());
+    }
+    for dependent_table in 0..storage.table_count() {
+        if dependent_table == table
+            || storage.table(dependent_table).database() != storage.current_database_oid()
+            || !storage.table(dependent_table).visible_to(txn.txid)
+        {
+            continue;
+        }
+        let (target, current) = storage.select_table_definition(dependent_table, txn.txid);
+        let mut dependent = current;
+        let mut changed = false;
+        for key in dependent.fkeys.iter_mut().take(dependent.n_fkeys) {
+            if key.parent_schema == old.schema && key.parent == old.name {
+                key.parent_schema = new.schema;
+                key.parent = new.name;
+                changed = true;
+            }
+        }
+        if !changed { continue; }
+        let mut mapping = [None; MAX_COLUMNS];
+        for (column, target) in mapping.iter_mut().enumerate().take(current.n_columns) {
+            *target = Some(current.columns()[column].name);
+        }
+        txn.write_table_definition(storage, target, dependent, &mapping, false)?;
+    }
+    Ok(())
+}
+
+fn stage_table_sequence_links(
+    storage: &Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    old: &TableDef,
+    new: &TableDef,
+    mapping: &[Option<SqlName>; MAX_COLUMNS],
+) -> Result<(), SqlError> {
+    for slot in 0..storage.sequence_count() {
+        let sequence = storage.sequence_for(slot, txn.txid);
+        if sequence.database != storage.current_database_oid() || !sequence.visible_to(txn.txid) {
+            continue;
+        }
+        let owner = crate::storage::rebind_sequence_column(sequence.owner, old, new, mapping, false);
+        let generator_for = crate::storage::rebind_sequence_column(sequence.generator_for, old, new, mapping, true);
+        let schema = if old.schema != new.schema && sequence.owner.is_some_and(|owner| {
+            owner.table_schema == old.schema && owner.table == old.name
+        }) { new.schema } else { sequence.schema };
+        if owner == sequence.owner && generator_for == sequence.generator_for && schema == sequence.schema {
+            continue;
+        }
+        let spec = SeqSpec {
+            data_type: sequence.data_type, increment: sequence.increment,
+            min_value: sequence.min_value, max_value: sequence.max_value,
+            start_value: sequence.start_value, cache: sequence.cache, cycle: sequence.cycle,
+        };
+        let target = storage.prepare_sequence_edit(slot, txn.txid)?;
+        let change = storage.stage_sequence_alter(target, crate::storage::SequenceAlteration {
+            schema, name: sequence.name, spec, owner, generator_for,
+            persistence: sequence.persistence, restart: None,
+        }, txn.txid)?;
+        if sequence.persistence != crate::storage::RelationPersistence::Temporary {
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSequence {
+                restart: None, identity: storage.sequence_position(slot),
+                schema: schema.as_str(), name: sequence.name.as_str(),
+                data_type: spec.data_type, increment: spec.increment,
+                min_value: spec.min_value, max_value: spec.max_value,
+                start_value: spec.start_value, cache: spec.cache, cycle: spec.cycle,
+                owner, generator_for, persistence: sequence.persistence,
+            }) {
+                storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
+                return Err(error);
+            }
+        }
+        txn.record_sequence_change(storage, change)?;
+    }
+    Ok(())
 }
 
 fn selected_replica_identity_index(

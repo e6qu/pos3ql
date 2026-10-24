@@ -318,6 +318,16 @@ impl DefinitionPublication {
                     })
                     && movement.prior_schema != movement.schema
                 {
+                    for comment in comments.entries.iter_mut().filter(|comment| {
+                        comment.used
+                            && comment.database == Some(movement.database)
+                            && comment.class == CommentClass::Relation
+                            && comment.subid == 0
+                            && comment.schema == sequence.schema
+                            && comment.name == sequence.name
+                    }) {
+                        comment.schema = movement.schema;
+                    }
                     sequence.schema = movement.schema;
                 }
                 sequence.owner = rebind_sequence_column(

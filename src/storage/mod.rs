@@ -10139,7 +10139,7 @@ pub struct SequenceOwner {
     pub column: SqlName,
 }
 
-fn rebind_sequence_column(
+pub(crate) fn rebind_sequence_column(
     link: Option<SequenceOwner>,
     old: &TableDef,
     new: &TableDef,
@@ -10150,8 +10150,12 @@ fn rebind_sequence_column(
     if link.table_schema != old.schema || link.table != old.name {
         return Some(link);
     }
-    let old_column = old.column_index(link.column.as_str())?;
-    let target_name = column_mapping[old_column]?;
+    // A sequence for a column added by this ALTER already names the final
+    // column and has no position in the committed source definition.
+    let target_name = match old.column_index(link.column.as_str()) {
+        Some(column) => column_mapping[column]?,
+        None => link.column,
+    };
     let target = new
         .column_index(target_name.as_str())
         .filter(|&column| !require_generator || new.columns()[column].auto_increment)?;

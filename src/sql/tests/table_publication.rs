@@ -19,36 +19,23 @@ fn table_publication_sql_renames_indexes_comments_sequences_and_cold_recovery() 
             let mut budget = test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-            let response = session.execute(
+            let response = session.success(
                 &mut engine,
                 include_str!("../../../tests/external/differential_exact/20_table_publication.sql"),
                 false,
             );
-            if !error_sqlstates(&response).is_empty() {
-                let child = engine
-                    .storage
-                    .find_table("public", "publication_child_sql")
-                    .unwrap();
-                let child = engine.storage.table_def(child, 0);
-                let reference = child.fkeys()[0];
-                let parent = engine
-                    .storage
-                    .find_table(reference.parent_schema.as_str(), reference.parent.as_str());
-                panic!(
-                    "states {:?}; foreign key {reference:?}; resolved parent {parent:?}; SQL response {}",
-                    error_sqlstates(&response),
-                    String::from_utf8_lossy(&response)
-                );
-            }
             assert_eq!(
                 data_rows(&response),
                 [
+                    "1",
                     "1|10",
                     "1",
                     "3",
                     "published table",
                     "published index",
-                    "1",
+                    "published sequence",
+                    "3",
+                    "5",
                     "2|30",
                     "2"
                 ]
@@ -67,7 +54,7 @@ fn table_publication_sql_renames_indexes_comments_sequences_and_cold_recovery() 
                  SELECT count(*) FROM publication_child_sql; \
                  SELECT obj_description('publication_target_sql.publication_key_sql'::regclass); \
                  SELECT nextval('publication_target_sql.publication_owned_sql')", false)),
-                ["2|30", "2", "published index", "3"]);
+                ["2|30", "2", "published index", "7"]);
             assert_eq!(
                 error_sqlstates(&session.execute(
                     &mut cold,

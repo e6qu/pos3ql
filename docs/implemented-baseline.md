@@ -317,6 +317,11 @@ unrelated row commits can progress. A rolled-back or replaced source is checked
 again after the wait. An exhausted publication counter returns `54000` before
 any index binding or catalog entry changes.
 
+Renames and schema moves share the same SQL dependency preparation. Inside the
+transaction, invoice foreign keys use the moved table and an owned sequence is
+already available in its new schema. Rolling back restores the earlier names
+without restoring sequence numbers already issued.
+
 **User example:** rename `orders`, move it to another schema, and rename its
 amount column in one transaction. Its indexes, comments, owned sequence and
 invoice foreign keys follow the committed names, including after recovery with

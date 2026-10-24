@@ -90,6 +90,84 @@ impl DescriptionKey {
     }
 }
 
+pub(crate) fn canonical_acl_values<'a>(
+    table: SynthTable<'a>,
+    catalog: &dyn super::eval::CatalogAccess,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::types::ArrElem;
+    if !table.def.columns().iter().any(|column| {
+        matches!(
+            column.ctype,
+            ColType::AclItem | ColType::Array(ArrElem::AclItem)
+        )
+    }) {
+        return Ok(table);
+    }
+    let canonical_item = |value| -> Result<Datum<'a>, SqlError> {
+        let item = match value {
+            Datum::AclItem(item) => item,
+            Datum::Text(text) => super::acl::from_text(text, catalog, arena)?,
+            Datum::Null => return Ok(Datum::Null),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog permission value is not an aclitem"
+                ));
+            }
+        };
+        Ok(Datum::AclItem(super::acl::canonical_identity(item, arena)?))
+    };
+    let rows = arena
+        .alloc_slice_with(table.rows.len(), |_| &[] as &[Datum<'a>])
+        .map_err(|_| arena_full())?;
+    for (output, source) in rows.iter_mut().zip(table.rows) {
+        let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
+        for (value, column) in values.iter_mut().zip(table.def.columns()) {
+            match (column.ctype, *value) {
+                (ColType::AclItem, input) => *value = canonical_item(input)?,
+                (
+                    ColType::Array(ArrElem::AclItem),
+                    Datum::Array {
+                        element: ArrElem::AclItem,
+                        raw,
+                    },
+                ) => {
+                    let items = arena
+                        .alloc_slice_with(super::array::len(raw), |_| Datum::Null)
+                        .map_err(|_| arena_full())?;
+                    for (output, input) in items
+                        .iter_mut()
+                        .zip(super::array::elements(raw, ArrElem::AclItem))
+                    {
+                        *output = canonical_item(input)?;
+                    }
+                    let shape = super::array::shape(raw).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "catalog permission array has an invalid shape"
+                        )
+                    })?;
+                    *value = Datum::Array {
+                        element: ArrElem::AclItem,
+                        raw: super::array::build_shaped(items, shape, arena)?,
+                    };
+                }
+                (ColType::Array(ArrElem::AclItem), Datum::Null) => {}
+                (ColType::Array(ArrElem::AclItem), _) => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "catalog permission array has a different element type"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        *output = values;
+    }
+    Ok(SynthTable { rows, ..table })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CatalogSnapshotRelation {
     pub(crate) name: &'static str,

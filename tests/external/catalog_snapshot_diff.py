@@ -320,6 +320,31 @@ def transcript(reader, writer):
             writer.execute("ROLLBACK")
             writer.execute("DROP TABLE catalog_index_build_diff")
 
+        writer.execute("CREATE ROLE catalog_permission_reader_diff")
+        writer.execute("CREATE TABLE catalog_permission_diff(id integer)")
+        writer.execute("GRANT SELECT ON catalog_permission_diff TO catalog_permission_reader_diff")
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        try:
+            role_oid = reader.execute("SELECT oid FROM pg_authid WHERE rolname='catalog_permission_reader_diff'").fetchone()[0]
+            query = "SELECT relacl::text FROM pg_class WHERE oid='catalog_permission_diff'::regclass"
+            current_query = "SELECT pg_get_acl('pg_class'::regclass, 'catalog_permission_diff'::regclass, 0)::text"
+            record(reader, f"{prefix}.permissions.before", query)
+            writer.execute("GRANT UPDATE ON catalog_permission_diff TO catalog_permission_reader_diff")
+            record(reader, f"{prefix}.permissions.catalog", query)
+            record(reader, f"{prefix}.permissions.current_acl", current_query)
+            writer.execute("ALTER ROLE catalog_permission_reader_diff RENAME TO catalog_permission_renamed_diff")
+            record(reader, f"{prefix}.permissions.renamed_acl", query)
+            record(reader, f"{prefix}.permissions.renamed_current_acl", current_query)
+            record(reader, f"{prefix}.permissions.role_catalog", "SELECT rolname FROM pg_authid WHERE oid=%s::oid", (role_oid,))
+            reader.execute("COMMIT")
+            record(reader, f"{prefix}.permissions.fresh", query)
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            writer.execute("DROP TABLE catalog_permission_diff")
+            writer.execute("DROP ROLE IF EXISTS catalog_permission_reader_diff")
+            writer.execute("DROP ROLE IF EXISTS catalog_permission_renamed_diff")
+
         writer.execute("CREATE ROLE catalog_parameter_reader_diff")
         writer.execute("CREATE ROLE catalog_parameter_writer_diff")
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")

@@ -8857,9 +8857,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
 }
 
 /// Returns the ACL column addressed by PostgreSQL's `(classid, objid,
-/// objsubid)` object identity. Catalog synthesis is the single source of truth
-/// for both direct catalog reads and `pg_get_acl`, so the two surfaces cannot
-/// disagree about explicit versus default ACLs.
+/// objsubid)` object identity. Like PostgreSQL's system cache, `pg_get_acl`
+/// reads the current object; a SQL catalog listing uses its selected snapshot.
 pub(crate) fn object_acl_by_address<'a>(
     storage: &Storage,
     txid: u32,
@@ -8885,14 +8884,7 @@ pub(crate) fn object_acl_by_address<'a>(
         6243 if objsubid == 0 => ("pg_parameter_acl", &["oid"], "paracl"),
         _ => return Ok(None),
     };
-    let table = synthesize(
-        storage,
-        Some("pg_catalog"),
-        catalog,
-        txid,
-        super::catalog_snapshot::CatalogScan::Index,
-        arena,
-    )?;
+    let table = synthesize_current(storage, Some("pg_catalog"), catalog, txid, arena)?;
     let column = |name: &str| {
         table.def.columns()[..table.def.n_columns]
             .iter()
@@ -9017,7 +9009,7 @@ pub(crate) fn synthesize_current<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let info = qualifier == Some("information_schema");
-    match (info, name) {
+    let table = match (info, name) {
         (false, "pg_class") => pg_class(storage, txid, arena),
         (false, "pg_attribute") => pg_attribute(storage, txid, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
@@ -9344,7 +9336,12 @@ pub(crate) fn synthesize_current<'a>(
             "catalog relation \"{}\" is not implemented",
             name
         )),
-    }
+    }?;
+    super::catalog_snapshot::canonical_acl_values(
+        table,
+        &super::query::storage_catalog(storage, arena, txid),
+        arena,
+    )
 }
 
 /// Deterministic oid for a live table: slot index offset into the user

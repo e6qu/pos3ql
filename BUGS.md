@@ -14,6 +14,8 @@ Comment row identity, lookup versus listing behavior, and rejection of malformed
 stored keys belong to the same boundary.
 Index hints and relation counts must survive recovery without turning private
 column estimates into committed data or reusing a replacement table's identity.
+Permission history must retain role identities and refresh their displayed names,
+while current permission lookup functions use PostgreSQL's object-lookup rules.
 
 Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
 and [storage format guide](docs/durable-format.md). Keep regression evidence in

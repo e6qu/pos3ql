@@ -1133,6 +1133,15 @@ that stale publication to fail with `40001`; it cannot insert an old binding's
 hash into a new cache. These checks do not yet provide the roadmap's
 whole-statement catalog capture or SQL execution on several CPU workers.
 
+### What permission lookups see
+
+Catalog permission rows retain role identifiers. Renaming a role changes the
+name printed in an older permission list without adding later grants to that
+list. `pg_get_acl`, like PostgreSQL's object lookup, reads current permissions;
+an explicit catalog query still follows its statement snapshot. For example,
+an older repeatable-read query can list a role's SELECT grant while
+`pg_get_acl` also reports a later UPDATE grant for the same object.
+
 ### How statistics reads and journal batches stay consistent
 
 `ANALYZE` collects estimates used to choose query plans. Relation counts and

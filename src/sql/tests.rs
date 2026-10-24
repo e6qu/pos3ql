@@ -21407,6 +21407,75 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
 }
 
 #[test]
+fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups() {
+    for (isolation, historical) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let (mut engine, mut budget) = test_engine();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE visibility_acl_role;
+             CREATE TABLE permission_orders(id integer);
+             GRANT SELECT ON permission_orders TO visibility_acl_role;",
+        );
+        assert!(
+            !message_types(&setup).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let role_oid = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT oid FROM pg_authid WHERE rolname='visibility_acl_role'",
+        ))[0]
+            .clone();
+        let mut reader = TxnState::new(&mut budget, 64).unwrap();
+        let mut guc = GucState::new();
+        let selected = run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            &mut guc,
+            &format!(
+                "BEGIN ISOLATION LEVEL {isolation}; SELECT relacl IS NOT NULL FROM pg_class WHERE oid='permission_orders'::regclass"
+            ),
+        );
+        assert_eq!(data_rows(&selected), ["t"]);
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            "GRANT UPDATE ON permission_orders TO visibility_acl_role;
+             ALTER ROLE visibility_acl_role RENAME TO visibility_acl_renamed;",
+        );
+        assert!(
+            !message_types(&changed).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let observed = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+            &format!("SELECT relacl::text LIKE '%visibility_acl_renamed=r/%' FROM pg_class WHERE oid='permission_orders'::regclass;
+                SELECT pg_get_acl('pg_class'::regclass, 'permission_orders'::regclass, 0)::text LIKE '%visibility_acl_renamed=rw/%';
+                SELECT has_table_privilege('visibility_acl_renamed', 'permission_orders', 'UPDATE');
+                SELECT rolname FROM pg_authid WHERE oid={role_oid}::oid;
+                ROLLBACK;"));
+        assert_eq!(
+            data_rows(&observed),
+            [
+                if historical { "t" } else { "f" },
+                "t",
+                "t",
+                if historical {
+                    "visibility_acl_role"
+                } else {
+                    "visibility_acl_renamed"
+                }
+            ],
+            "{}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+}
+
+#[test]
 fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
     for (isolation, expected) in [
         ("REPEATABLE READ", "orders|id"),
@@ -80227,6 +80296,30 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
     let current_text = core::str::from_utf8(&current).unwrap();
+    let internal_hint = format!("hidx {} 0\n", engine.storage.large_object_page_table());
+    assert!(current_text.contains(&internal_hint));
+    rejected_roots.push((
+        current_text.replace(&internal_hint, ""),
+        "manifest relation index hints are incomplete",
+    ));
+    rejected_roots.push((
+        current_text.replace(&internal_hint, &format!("{internal_hint}{internal_hint}")),
+        "duplicate or trailing relation index hint",
+    ));
+    rejected_roots.push((
+        current_text.replace(
+            &internal_hint,
+            &format!("hidx {} 1\n", engine.storage.large_object_page_table()),
+        ),
+        "internal large-object relation cannot have a user index hint",
+    ));
+    rejected_roots.push((
+        current_text.replace(
+            &internal_hint,
+            &format!("hidx {} 2\n", engine.storage.large_object_page_table()),
+        ),
+        "invalid relation index hint",
+    ));
     for (field, message) in [
         ("writer ", "manifest writer identity missing"),
         ("lsn ", "manifest LSN missing"),

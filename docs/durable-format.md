@@ -18,6 +18,9 @@ records stop startup. Journal kind 156 stores a ten-byte typed table position
 a different table lifetime before applying the hint. A hint alone does not make
 an unknown row estimate valid. Prepared records older than the checkpoint floor
 cannot overwrite the checkpoint's newer relation counts or index hints.
+The internal large-object page table requires a false hint and has no user
+catalog position. Catalog history encodes permission items with role identifiers
+and numeric render caches; SQL output refreshes the current role names.
 
 Object storage is the durable tier. Immutable objects may outlive the binary
 that wrote them, so every root and row SST carries a format identity that is

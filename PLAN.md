@@ -55,6 +55,8 @@ separately from restored default permissions, which remove the catalog row.
 Check readers admitted while a commit waits for object storage. After a restart,
 an unresolved prepared transaction must still preserve a reader's older catalog
 rows when that transaction is finally committed. Keep current role-name rendering.
+Compare permission listings with `pg_get_acl` and privilege checks: a listing
+can retain an older grant while the functions inspect current permissions.
 Statistics estimates and lazy index flags belong to a particular catalog row
 version: an old reader can see an index flag change, then retain that version's
 estimates after another connection renames the table and analyzes its new version.

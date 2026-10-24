@@ -8727,6 +8727,14 @@ impl Checkpointer {
                 CheckpointSetupError::Corrupt("relation index hint references unknown table"),
             )?;
             let database = storage.table(slot).database();
+            if slot == storage.large_object_page_table() {
+                if has_index {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "internal large-object relation cannot have a user index hint",
+                    ));
+                }
+                continue;
+            }
             storage
                 .select_database_for_recovery(database)
                 .map_err(|_| {

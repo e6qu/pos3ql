@@ -24,6 +24,126 @@ pub(crate) enum CatalogRowKey<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct CatalogSnapshotRelation {
+    pub(crate) name: &'static str,
+    pub(crate) oid: NonZeroU32,
+    pub(crate) shared: bool,
+    pub(crate) key: CatalogRowKey<'static>,
+}
+
+impl CatalogSnapshotRelation {
+    pub(crate) fn identity(self, database: crate::storage::DatabaseOid) -> CatalogRelationIdentity {
+        CatalogRelationIdentity {
+            database: (!self.shared).then_some(database),
+            relation: self.oid,
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_definitions {
+    use super::*;
+    use crate::mem::budget::Budget;
+    use crate::mem::guard::forbid_alloc;
+    use crate::storage::{DatabaseOid, TableDef};
+
+    #[test]
+    fn catalog_row_keys_match_the_current_catalog_shapes_and_database_scope() {
+        let capacity = core::mem::size_of::<TableDef>() + 4096;
+        let mut budget = Budget::new(capacity);
+        let mut arena = Arena::new(&mut budget, "catalog key definition test", capacity).unwrap();
+        let relations = super::super::catalog_snapshot_keys::RELATIONS;
+        assert_eq!(relations.len(), 64);
+        assert_eq!(
+            relations.iter().filter(|relation| relation.shared).count(),
+            11
+        );
+        let mut matched = 0;
+        forbid_alloc(|| {
+            for relation in relations {
+                let identity = relation.identity(DatabaseOid::POSTGRES);
+                assert_eq!(identity.database.is_none(), relation.shared);
+                let baseline = super::super::catalog_metadata::RELATIONS
+                    .iter()
+                    .find(|definition| definition.name == relation.name)
+                    .unwrap();
+                assert_eq!(baseline.oid as u32, identity.relation.get());
+                if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+                    continue;
+                }
+                arena.reset();
+                let definition = super::super::catalog::synthesize_definition(
+                    Some("pg_catalog"),
+                    relation.name,
+                    &arena,
+                )
+                .unwrap();
+                let indexed = KeyedRows::from_catalog(&definition, relation.key, &arena).unwrap();
+                assert_eq!(indexed.len, 0);
+                matched += 1;
+            }
+        });
+        assert!(matched > 40);
+    }
+
+    #[test]
+    fn catalog_row_keys_accept_every_materialized_base_catalog_without_allocations() {
+        let mut config = crate::config::Config::default_dev();
+        config.max_connections = 2;
+        config.max_prepared_transactions = 0;
+        config.max_ddl_per_transaction = 1;
+        config.max_catalog_versions_per_object = 2;
+        config.memtable_bytes = 64 * 1024;
+        config.max_tables = 4;
+        config.table_rows = 8;
+        config.max_routines = 2;
+        config.max_views = 2;
+        config.max_materialized_views = 2;
+        config.max_enums = 2;
+        config.max_enum_labels_per_type = 4;
+        let mut budget = Budget::new(
+            crate::storage::Storage::extra_budget_bytes(&config)
+                + config.memtable_bytes
+                + 65 * 1024 * 1024,
+        );
+        let storage = crate::storage::Storage::new(&config, &mut budget, 0).unwrap();
+        let mut arena = Arena::new(
+            &mut budget,
+            "materialized catalog keys test",
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut matched = 0;
+        forbid_alloc(|| {
+            for relation in super::super::catalog_snapshot_keys::RELATIONS {
+                if !super::super::catalog::is_catalog_relation(Some("pg_catalog"), relation.name) {
+                    continue;
+                }
+                arena.reset();
+                let catalog = super::super::catalog::synthesize(
+                    &storage,
+                    Some("pg_catalog"),
+                    relation.name,
+                    0,
+                    &arena,
+                )
+                .unwrap();
+                let indexed = KeyedRows::from_catalog(&catalog, relation.key, &arena).unwrap();
+                assert_eq!(
+                    indexed
+                        .iter()
+                        .map(|row| row.image.unwrap().count.get() as usize)
+                        .sum::<usize>(),
+                    catalog.rows.len()
+                );
+                matched += 1;
+            }
+        });
+        assert!(matched > 40);
+    }
+}
+
+#[derive(Clone, Copy)]
 struct KeyedRow<'a> {
     key: &'a [u8],
     image: Option<CatalogRowImage<'a>>,

@@ -9,6 +9,8 @@ pub mod catalog;
 mod catalog_metadata;
 #[cfg(test)]
 mod catalog_snapshot;
+#[cfg(test)]
+mod catalog_snapshot_keys;
 pub(crate) mod commit;
 pub mod copy;
 pub mod cursor;

@@ -7229,7 +7229,7 @@ impl Engine {
         for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
             if self.storage.table(table).live()
-                && let Err(error) = self.storage.refresh_enforcers(table)
+                && let Err(error) = self.storage.finish_table_enforcers(table, rewrote_rows)
             {
                 index_result = Err(error);
                 break;

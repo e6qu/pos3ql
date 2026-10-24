@@ -428,6 +428,7 @@ mod tests {
                 name: SqlName::parse("amount_index").unwrap(),
                 table: SqlName::parse("key_orders").unwrap(),
                 n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
                 ..IndexDef::EMPTY
             };
             index.columns[0] = 1;
@@ -472,6 +473,7 @@ mod tests {
                 name: SqlName::parse("bad_expression").unwrap(),
                 table: SqlName::parse("key_orders").unwrap(),
                 n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
                 ..IndexDef::EMPTY
             };
             index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
@@ -694,6 +696,7 @@ mod tests {
                 name: SqlName::parse("prepared_order_index").unwrap(),
                 table: SqlName::parse("key_orders").unwrap(),
                 n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 8).unwrap();
@@ -731,6 +734,7 @@ mod tests {
                 name: SqlName::parse("dropped_amount_index").unwrap(),
                 table: SqlName::parse("key_orders").unwrap(),
                 n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
                 ..IndexDef::EMPTY
             };
             index.columns[0] = 1;
@@ -857,6 +861,7 @@ mod tests {
                 name: SqlName::parse("order_index").unwrap(),
                 table: SqlName::parse("key_orders").unwrap(),
                 n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 0).unwrap();

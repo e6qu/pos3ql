@@ -1060,6 +1060,10 @@ Committing an index change keeps its already prepared caches when all remaining
 key definitions match; row publication has already installed the transaction's
 row changes there. This finalization needs no second buffer set or row scan.
 Dropped bindings release after their readers finish.
+Creating an index also shares unchanged bindings and builds only new lookup data;
+for example, adding an amount index keeps the existing order-number cache usable.
+Table changes can keep these caches when rows were not rewritten, or when both
+the table and its caches are empty. Changed key definitions still need new buffers.
 Startup recovery recycles its unexposed cache buffers while keeping durable index
 identities. It does not need space for two copies of every recovered cache.
 

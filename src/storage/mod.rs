@@ -32833,7 +32833,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let mut n_out = 0;
         for (binding, selected) in bindings.iter().enumerate() {
-            let selected = selected.as_ref().expect("candidate binding");
+            let Some(selected) = selected.as_ref() else { continue };
             self.with_value_binding_values_for(
                 arena,
                 selection,
@@ -34633,7 +34633,7 @@ impl Storage {
         table_index: usize,
         txid: u32,
     ) -> Result<(), SqlError> {
-        self.refresh_enforcers_visible(table_index, Some(txid))
+        self.build_enforcers_visible(table_index, Some(txid), key_preparation::EnforcerRows::ReusePrepared)
     }
 
     fn refresh_enforcers_visible(
@@ -34648,6 +34648,27 @@ impl Storage {
     /// catalog owner without rescanning rows when the complete shape matches.
     pub(crate) fn finish_index_enforcers(&self, table_index: usize) -> Result<(), SqlError> {
         self.build_enforcers_visible(table_index, None, key_preparation::EnforcerRows::ReusePrepared)
+    }
+
+    pub(crate) fn finish_table_enforcers(
+        &mut self,
+        table_index: usize,
+        rewrote_rows: bool,
+    ) -> Result<(), SqlError> {
+        let empty = self.tables[table_index].rows.is_empty()
+            && self.tables[table_index].spill_generations().is_empty();
+        let empty_caches = if empty {
+            let bindings = self.tables[table_index].publication().enforcers.clone();
+            bindings.iter().flatten().all(|enforcer| enforcer.cache.read().is_empty())
+        } else {
+            false
+        };
+        let rows = if rewrote_rows && !(empty && empty_caches) {
+            key_preparation::EnforcerRows::Rebuild
+        } else {
+            key_preparation::EnforcerRows::ReusePrepared
+        };
+        self.build_enforcers_visible(table_index, None, rows)
     }
 
     fn build_enforcers_visible(
@@ -34912,20 +34933,22 @@ impl Storage {
             want[n_want].include_mask = include_mask;
             n_want += 1;
         }
+        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = [const { None }; MAX_VALUE_ENFORCERS];
+        let mut populate = [true; MAX_VALUE_ENFORCERS];
         if matches!(rows, key_preparation::EnforcerRows::ReusePrepared) {
-            let mut retained: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = [const { None }; MAX_VALUE_ENFORCERS];
             let mut used = [false; MAX_VALUE_ENFORCERS];
             let mut count = 0;
             for (position, wanted) in want[..n_want].iter().enumerate() {
                 let Some((slot, enforcer)) = published[..n_published].iter().enumerate().find_map(|(slot, enforcer)| {
                     enforcer.as_ref().filter(|enforcer| !used[slot] && wanted.matches(&enforcer.metadata)).map(|enforcer| (slot, enforcer))
                 }) else {
-                    break;
+                    continue;
                 };
                 used[slot] = true;
                 let mut enforcer = enforcer.clone();
                 enforcer.evaluation_txid = txid.unwrap_or(0);
-                retained[position] = Some(enforcer);
+                candidate[position] = Some(enforcer);
+                populate[position] = false;
                 count += 1;
             }
             if count == n_want {
@@ -34941,14 +34964,15 @@ impl Storage {
             {
                 return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "table changed while its prepared index caches were being finalized"));
             }
-            publication.enforcers = retained;
+            publication.enforcers = candidate;
             publication.n_enforcers = n_want;
             return Ok(());
             }
         }
-        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] =
-            [const { None }; MAX_VALUE_ENFORCERS];
         for (w, wanted) in want.iter().take(n_want).enumerate() {
+            if candidate[w].is_some() {
+                continue;
+            }
             let cache = match self.value_indexes.acquire() {
                 Some(s) => s,
                 None => {
@@ -34983,7 +35007,10 @@ impl Storage {
                 },
             });
         }
-        self.populate_enforcers(table_index, &selection, &candidate[..n_want])?;
+        let fresh: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = core::array::from_fn(|index| {
+            if populate[index] { candidate[index].clone() } else { None }
+        });
+        self.populate_enforcers(table_index, &selection, &fresh[..n_want])?;
         let (definition, mut publication) = row_ownership::acquire(|| {
             Ok((
                 self.tables[table_index].definition.try_read_for_batch()?,
@@ -35015,29 +35042,20 @@ impl Storage {
         bindings: &[Option<Enforcer>],
     ) -> Result<(), SqlError> {
         let n_enf = bindings.len();
-        if n_enf == 0 {
+        if bindings.iter().all(Option::is_none) {
             return Ok(());
         }
         let mut slots: [Option<ValueIndexLease>; MAX_VALUE_ENFORCERS] =
             [const { None }; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = Some(
-                bindings[i]
-                    .as_ref()
-                    .expect("candidate binding")
-                    .cache
-                    .clone(),
-            );
+            *s = bindings[i].as_ref().map(|enforcer| enforcer.cache.clone());
         }
         let boundary = self.tables[table_index]
             .rows
             .iter()
             .fold(self.lsn(), |lsn, (_, state)| lsn.max(state.committed_lsn));
-        for slot in &slots[..n_enf] {
-            slot.as_ref()
-                .expect("selected cache")
-                .write()
-                .publish_at(boundary);
+        for slot in slots[..n_enf].iter().flatten() {
+            slot.write().publish_at(boundary);
         }
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
@@ -35116,11 +35134,8 @@ impl Storage {
         if incomplete {
             // A stopped walk can leave any cache without later rows, including
             // one that still had room when another binding filled.
-            for slot in &slots[..n_enf] {
-                slot.as_ref()
-                    .expect("selected cache")
-                    .write()
-                    .mark_incomplete();
+            for slot in slots[..n_enf].iter().flatten() {
+                slot.write().mark_incomplete();
             }
         }
         Ok(())

@@ -99,7 +99,7 @@ next statement.
 | Journal positions | Checked shared reservations and observations that never move backward; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
 | Catalogs and table definitions | Readers retain selected definitions and identities; tables have separate cleanup owners. Table and routine submission validate type lifetimes under installation owners. Typed tables and saved queries retain source lifetimes through recovery and database cloning. | Consistent reader capture across transactions and concurrent maintenance |
-| Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Complete shared commit, retirement and remaining metadata preparation before removing the SQL barrier |
+| Type definitions | Queries retain selected domain, enum and composite definitions. Table reads select nested type dependencies before storage waits; nested statements select their own visible versions. | Consistent type and table versions across later statement lookups and maintenance |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
@@ -351,8 +351,8 @@ without restoring sequence numbers already issued.
 amount column in one transaction. Its indexes, comments, owned sequence and
 invoice foreign keys follow the committed names, including after recovery with
 an empty local directory. A private invoice-table edit cannot later restore the
-old parent name. These storage ownership checks prepare for several SQL workers;
-transaction-wide reader capture remains [planned work](../PLAN.md).
+old parent name. Several SQL workers still require consistent later catalog
+lookups within each statement; see the [remaining work](../PLAN.md).
 
 **User example:** create an order table, save a transaction position, then drop
 and recreate that table with different rows. Rolling back to the saved position

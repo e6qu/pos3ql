@@ -40,6 +40,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
+            Datum::PgNodeTree(node) => 4 + node.as_str().len(),
             Datum::Bool(_) => 1,
             Datum::Char(_) => 1,
             Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Cid(_) | Datum::Date(_) => 4,
@@ -104,6 +105,12 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
         }
         let take;
         match v {
+            Datum::PgNodeTree(node) => {
+                let encoded = node.as_str().as_bytes();
+                rest[..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+                rest[4..4 + encoded.len()].copy_from_slice(encoded);
+                take = 4 + encoded.len();
+            }
             Datum::Record(_) | Datum::Composite { .. } | Datum::PgDdlCommand => {
                 unreachable!("record cannot be a stored column value")
             }
@@ -421,7 +428,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Geometry(_)
         | ColType::PgSnapshot
         | ColType::TxidSnapshot
-        | ColType::Bytea => {
+        | ColType::Bytea | ColType::PgNodeTree => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
@@ -463,7 +470,6 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Internal
         | ColType::PgDdlCommand
         | ColType::AnyArray
-        | ColType::PgNodeTree
         | ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
@@ -544,10 +550,15 @@ pub(crate) fn decode<'a>(
                 };
             }
             ColType::PgNodeTree => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "pg_node_tree cannot be decoded as a stored column"
-                ));
+                let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                at += 4;
+                let encoded = core::str::from_utf8(bytes.get(at..at + length).ok_or_else(corrupt)?)
+                    .map_err(|_| corrupt())?;
+                let node = crate::sql::catalog_node::CatalogNode::from_encoded(encoded)
+                    .ok_or_else(corrupt)?;
+                out[i] = Datum::PgNodeTree(node);
+                at += length;
             }
             ColType::Bool => {
                 let b = bytes.get(at..at + 1).ok_or_else(corrupt)?;

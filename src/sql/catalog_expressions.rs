@@ -5,15 +5,14 @@ use crate::mem::arena::ArenaString;
 use crate::sql::{ast::Expr, eval::sqlstate, lexer::{Lexer, Tok}, parser};
 use crate::storage::TableDef;
 use crate::sql_err;
+use crate::sql::catalog_node::{CatalogNode, HEADER};
 use core::fmt::Write;
-
-const HEADER: &str = "pos3ql-catalog-expression-v1\n";
 
 #[derive(Clone, Copy)]
 struct Site { start: usize, end: usize, column: usize }
 
 #[derive(Clone, Copy)]
-enum Kind { Expression, List, Partition, Query }
+pub(crate) enum Kind { Expression, List, Partition, Query }
 
 pub(super) fn current<'a>(storage: &Storage, transaction: u32, table: SynthTable<'a>, arena: &'a Arena)
     -> Result<SynthTable<'a>, SqlError> {
@@ -50,7 +49,7 @@ pub(super) fn current<'a>(storage: &Storage, transaction: u32, table: SynthTable
                 .expect("catalog expression relation field exists")])).transpose()?.unwrap_or(0);
             let slot = (0..storage.table_count()).find(|&slot| storage.table_slot_visible_to(slot, transaction)
                 && super::table_oid(storage, slot) == relation);
-            row[position] = Datum::Text(if let Some(slot) = slot {
+            row[position] = Datum::PgNodeTree(if let Some(slot) = slot {
                 let definition = storage.table_def(slot, transaction);
                 bind(source, kind, Some(&definition), arena)?
             } else { bind(source, kind, None, arena)? });
@@ -78,12 +77,13 @@ fn reference_start(source: &str, site: parser::ColumnSource<'_>, arena: &Arena) 
     Err(sql_err!(sqlstate::INTERNAL_ERROR, "catalog column source is missing"))
 }
 
-fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena: &'a Arena) -> Result<&'a str, SqlError> {
+pub(crate) fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena: &'a Arena) -> Result<CatalogNode<'a>, SqlError> {
     let mut output = ArenaString::new(arena);
     output.write_str(HEADER).map_err(|_| arena_full())?;
     if matches!(kind, Kind::Partition | Kind::Query) {
         write!(output, "{}\n0\n\n{source}", if matches!(kind, Kind::Partition) { "partition" } else { "query" }).map_err(|_| arena_full())?;
-        return Ok(output.as_str());
+        return CatalogNode::from_encoded(output.as_str()).ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR,
+            "invalid constructed catalog expression node"));
     }
     let source = arena.alloc_str(source).map_err(|_| arena_full())?;
     let (parsed_source, columns, prefix) = match kind {
@@ -120,12 +120,14 @@ fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena: &'a Arena
     writeln!(output, "{}\n{count}", if matches!(kind, Kind::List) { "list" } else { "expression" }).map_err(|_| arena_full())?;
     for site in &sites[..count] { writeln!(output, "{},{},{}", site.start, site.end, site.column).map_err(|_| arena_full())?; }
     write!(output, "\n{source}").map_err(|_| arena_full())?;
-    Ok(output.as_str())
+    CatalogNode::from_encoded(output.as_str()).ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR,
+        "invalid constructed catalog expression node"))
 }
 
 pub(super) fn deparse<'a>(storage: &Storage, transaction: u32, node: &str, relation: i32, pretty: bool, arena: &'a Arena)
     -> Result<Option<&'a str>, SqlError> {
     let corrupt = || sql_err!(sqlstate::INTERNAL_ERROR, "invalid stored catalog expression node");
+    CatalogNode::from_encoded(node).ok_or_else(corrupt)?;
     let body = node.strip_prefix(HEADER).ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
         "cannot accept a value of type pg_node_tree"))?;
     let (kind, rest) = body.split_once('\n').ok_or_else(corrupt)?;

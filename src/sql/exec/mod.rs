@@ -54601,7 +54601,8 @@ fn decode_binary_field_with_context<'a>(
         }
         ColType::Int2Vector => decode_binary_vector(BinaryVectorKind::Int2, bytes, arena),
         ColType::OidVector => decode_binary_vector(BinaryVectorKind::Oid, bytes, arena),
-        ColType::PgNodeTree => Ok(Datum::Text(core::str::from_utf8(bytes).map_err(|_| bad())?)),
+        ColType::PgNodeTree => Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type pg_node_tree")),
         ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList

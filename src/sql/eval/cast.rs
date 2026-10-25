@@ -175,8 +175,12 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             _ => return Err(cast_unsupported(&v, "oidvector")),
         },
-        ColType::PgNodeTree
-        | ColType::PgNdistinct
+        ColType::PgNodeTree => match v {
+            Datum::PgNodeTree(_) => v,
+            _ => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot accept a value of type pg_node_tree")),
+        },
+        ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
         | ColType::PgStatisticArray => match v {

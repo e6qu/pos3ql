@@ -649,14 +649,9 @@ fn publication_table_rows<'a>(
             (implicit_mask(), None)
         };
         let qual = match filter {
-            Some(filter) => {
-                let rendered = crate::stack_format!(66, "({filter})");
-                Datum::Text(
-                    arena
-                        .alloc_str(rendered.as_str())
-                        .map_err(|_| arena_full())?,
-                )
-            }
+            Some(filter) => Datum::PgNodeTree(crate::sql::catalog::expressions::bind(
+                filter, crate::sql::catalog::expressions::Kind::Expression, Some(&table), arena,
+            )?),
             None => Datum::Null,
         };
         rows[row_count] = crate::sql::exec::encode_projected_pub(

@@ -1146,6 +1146,17 @@ build their results by joining the selected base rows:
 
 Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
 
+Column descriptions retain PostgreSQL's physical type properties. For example,
+`pg_attribute` reports alignment `s` for `smallint`, `d` for `bigint`, and `d`
+for `bigint[]`. These describe PostgreSQL's catalog contract; pos3ql chooses
+its object block layout separately.
+
+Catalog expression values have their own validated type. A user can copy
+`pg_constraint.conbin` into a `pg_node_tree` column and later display it with
+`pg_get_expr`. Supplying text or binary input for that type fails with `0A000`,
+including text that resembles the internal encoding. PostgreSQL makes this
+same distinction between copying a node and accepting client input.
+
 Object listings use the PostgreSQL metadata inventory independently of which
 catalog row queries are implemented. For example, `pg_statistic` appears in
 `pg_class` and resolves through `to_regclass`, while reading its raw rows fails

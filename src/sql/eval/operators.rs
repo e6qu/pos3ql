@@ -744,6 +744,10 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
     match datum {
         Datum::Null => hasher.write(&[0]),
         Datum::PgDdlCommand => hasher.write(&[36]),
+        Datum::PgNodeTree(node) => {
+            hasher.write(&[50]);
+            hasher.write(node.as_str().as_bytes());
+        }
         Datum::Bool(b) => hasher.write(&[1, *b as u8]),
         Datum::Int2(v) => {
             hasher.write(&[2]);

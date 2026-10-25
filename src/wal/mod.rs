@@ -11653,6 +11653,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Timetz(..)) => 12,
         Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::PgNodeTree { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::JsonPath { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Geometry { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::TextSearch { len, .. }) => 2 + *len as usize,
@@ -11988,6 +11989,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             3 + *len as usize
         }
+        Some(OwnedDatum::PgNodeTree { len, bytes }) => {
+            out[0] = 42;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
+        }
         Some(OwnedDatum::Numeric {
             sign,
             weight,
@@ -12207,6 +12214,13 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
             Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
+        }
+        42 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            crate::sql::catalog_node::CatalogNode::from_encoded(core::str::from_utf8(&bytes[..len]).ok()?)?;
+            Some(OwnedDatum::PgNodeTree { len: len as u8, bytes })
         }
         40 => {
             let len = *payload.get(*at)? as usize;
@@ -12942,6 +12956,27 @@ mod tests {
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
             Some(WalOp::SetTextSearch { slot: 7, .. })
         ));
+    }
+
+    #[test]
+    fn catalog_snapshot_node_defaults_validate_format_and_round_trip() {
+        use crate::sql::types::Datum;
+        let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
+        crate::mem::guard::forbid_alloc(|| {
+            let node = crate::sql::catalog_node::CatalogNode::NULL;
+            let value = OwnedDatum::from_datum(&Datum::PgNodeTree(node)).unwrap();
+            let length = encode_default_bytes(&Some(value), &mut encoded);
+            assert_eq!(length, encoded_default_len(&Some(value)));
+            let mut at = 0;
+            assert_eq!(decode_default(&encoded[..length], &mut at), Some(Some(value)));
+            assert_eq!(value.as_datum(), Datum::PgNodeTree(node));
+            assert_eq!(at, length);
+            for truncated in 0..length {
+                assert!(decode_default(&encoded[..truncated], &mut 0).is_none());
+            }
+            encoded[2] = b'x';
+            assert!(decode_default(&encoded[..length], &mut 0).is_none());
+        });
     }
 
     #[test]

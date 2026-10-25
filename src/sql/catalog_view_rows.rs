@@ -322,6 +322,7 @@ pub(super) fn integer(value: Datum<'_>) -> Result<i32, SqlError> {
 pub(super) fn string(value: Datum<'_>) -> Result<&str, SqlError> {
     match value {
         Datum::Text(value) => Ok(value),
+        Datum::PgNodeTree(node) => Ok(node.as_str()),
         _ => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "catalog field is not text"

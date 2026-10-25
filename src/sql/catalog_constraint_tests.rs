@@ -1,5 +1,27 @@
 use super::*;
 
+#[test]
+fn catalog_constraint_attributes_use_postgresql_physical_type_properties() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget,
+        "CREATE DOMAIN layout_domain AS bigint;
+         CREATE TYPE layout_enum AS ENUM ('a');
+         CREATE TYPE layout_record AS (a bigint);
+         CREATE TABLE layout_columns (
+           a boolean, b smallint, c bigint, d text, e bigint[], f smallint[],
+           g layout_domain, h layout_domain[], i layout_enum,
+           j layout_enum[], k layout_record, l layout_record[])");
+    let result = run_with(&mut engine, &mut budget,
+        "SELECT attname,attlen,attbyval,attalign,attstorage FROM pg_attribute
+           WHERE attrelid='layout_columns'::regclass AND attnum>0 ORDER BY attnum");
+    assert!(!message_types(&result).contains(&b'E'), "{}", String::from_utf8_lossy(&result));
+    assert_eq!(data_rows(&result), [
+        "a|1|t|c|p", "b|2|t|s|p", "c|8|t|d|p", "d|-1|f|i|x",
+        "e|-1|f|d|x", "f|-1|f|i|x", "g|8|t|d|p", "h|-1|f|d|x",
+        "i|4|t|i|p", "j|-1|f|i|x", "k|-1|f|d|x", "l|-1|f|d|x",
+    ]);
+}
+
 const SETUP: &str = "
     CREATE TABLE constraint_parent(a integer, b integer,
         CONSTRAINT constraint_parent_key PRIMARY KEY(a,b));
@@ -7,6 +29,38 @@ const SETUP: &str = "
         CONSTRAINT constraint_child_key UNIQUE NULLS NOT DISTINCT(x,y),
         CONSTRAINT constraint_child_parent FOREIGN KEY(x,y) REFERENCES constraint_parent(b,a));
 ";
+
+#[test]
+fn catalog_constraint_nodes_copy_as_nodes_and_reject_text_input() {
+    let config = test_config("constraint-node-input");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE node_source(a integer CONSTRAINT node_positive CHECK(a>0));
+         CREATE TABLE saved_nodes(expression pg_node_tree, relation oid);
+         INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='node_positive'", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT pg_typeof(expression),pg_get_expr(expression::pg_node_tree,relation,false) FROM saved_nodes", true)),
+        ["pg_node_tree|(a > 0)"]);
+    for command in [
+        "INSERT INTO saved_nodes VALUES('a > 0',0)",
+        "INSERT INTO saved_nodes VALUES('pos3ql-catalog-expression-v1
+expression
+0
+
+NULL',0)",
+        "UPDATE saved_nodes SET expression='a > 0'",
+        "SELECT 'a > 0'::pg_node_tree",
+        "SELECT expression::text::pg_node_tree FROM saved_nodes",
+    ] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, command, true)), ["0A000"], "{command}");
+    }
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "ALTER TABLE node_source RENAME COLUMN a TO amount;
+         SELECT pg_get_expr(expression,relation,false) FROM saved_nodes", true)), ["(amount > 0)"]);
+}
 
 const REPORT: &str = "
     SELECT table_name,constraint_name,constraint_type,nulls_distinct
@@ -379,6 +433,9 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             session.success(&mut engine,
                 "CREATE TABLE saved_nulls(a integer NOT NULL,b integer,\" spaced column\" integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
                  CREATE DOMAIN saved_domain AS integer NOT NULL;
+                 ALTER TABLE saved_nulls ADD CONSTRAINT saved_positive CHECK(a>0);
+                 CREATE TABLE saved_nodes(expression pg_node_tree, relation oid);
+                 INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='saved_positive';
                  BEGIN; ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
                  ALTER DOMAIN saved_domain RENAME TO saved_renamed_domain;
                  INSERT INTO saved_renamed_nulls(a,b) VALUES(1,NULL);
@@ -403,6 +460,9 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                 ["saved_nulls|NO"]
             );
             assert_eq!(cold.journal_lsn(), recovered_journal);
+            assert_eq!(data_rows(&session.success(&mut cold,
+                "SELECT pg_typeof(expression),pg_get_expr(expression,relation,false) FROM saved_nodes", true)),
+                ["pg_node_tree|(a > 0)"]);
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT column_name FROM information_schema.columns WHERE table_name='saved_nulls' AND column_name=' spaced column'", true)), [" spaced column"]);
             assert_eq!(data_rows(&session.success(&mut cold,

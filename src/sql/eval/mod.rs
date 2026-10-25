@@ -7606,6 +7606,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::OidVector { .. } => "oidvector",
         Datum::Null => "unknown",
         Datum::PgDdlCommand => "pg_ddl_command",
+        Datum::PgNodeTree(_) => "pg_node_tree",
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",

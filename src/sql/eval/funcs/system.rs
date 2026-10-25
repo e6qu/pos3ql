@@ -2256,14 +2256,14 @@ pub(crate) fn dispatch<'a>(
                         _ => unreachable!("expression call arity was validated"),
                     }
                 })? else { return Ok(Datum::Null); };
-                let Datum::Text(node) = values[0] else {
+                let Datum::PgNodeTree(node) = values[0] else {
                     return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "pg_get_expr requires a pg_node_tree value"));
                 };
                 let Datum::Int4(relation) = values[1] else { unreachable!("relation argument was coerced"); };
                 let pretty = args.len() == 3 && values[2] == Datum::Bool(true);
                 let catalog = hooks.catalog.ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
                     "catalog expression deparsing requires catalog access"))?;
-                Ok(catalog.expression_def(node, relation, pretty, arena)?.map_or(Datum::Null, Datum::Text))
+                Ok(catalog.expression_def(node.as_str(), relation, pretty, arena)?.map_or(Datum::Null, Datum::Text))
             }
             "pg_get_viewdef" => {
                 if !(1..=2).contains(&args.len()) {
@@ -2804,6 +2804,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Enum { .. } => "enum",
                     Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
                     Datum::PgDdlCommand => "pg_ddl_command",
+                    Datum::PgNodeTree(_) => "pg_node_tree",
                 };
                 Ok(regtype(referenced_oid, name))
             }

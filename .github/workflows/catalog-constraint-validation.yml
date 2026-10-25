@@ -63,6 +63,10 @@ jobs:
             --host 127.0.0.1 --port 5432 --user postgres --database postgres \
             --metadata-output "$RUNNER_TEMP/constraint-reference/catalog-metadata.json" \
             --output "$RUNNER_TEMP/constraint-reference/catalog-postgresql.json"
+          python3 tools/generate-pg18-type-layouts.py --mode check \
+            --metadata "$RUNNER_TEMP/constraint-reference/catalog-metadata.json" \
+            --source https://github.com/e6qu/pos3ql/actions/runs/40174211868 \
+            --output src/sql/type_layouts.rs
       - uses: actions/upload-artifact@v6
         if: always()
         with:

@@ -746,6 +746,10 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    PgNodeTree {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Geometry {
         kind: crate::sql::types::GeometryKind,
         len: u8,
@@ -947,6 +951,10 @@ impl OwnedDatum {
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store a pseudo-type value in a column"
                 ));
+            }
+            Datum::PgNodeTree(node) => {
+                let (len, bytes) = Self::bytes(node.as_str().as_bytes(), "pg_node_tree")?;
+                Self::PgNodeTree { len, bytes }
             }
             Datum::Int2Vector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "int2vector")?;
@@ -1175,6 +1183,11 @@ impl OwnedDatum {
             Self::Uuid(value) => Datum::Uuid(*value),
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+            ),
+            Self::PgNodeTree { len, bytes } => Datum::PgNodeTree(
+                crate::sql::catalog_node::CatalogNode::from_encoded(
+                    core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+                ).expect("owned catalog node was validated before storage"),
             ),
             Self::Geometry { kind, len, bytes } => Datum::Geometry {
                 kind: *kind,

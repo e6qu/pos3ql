@@ -54,6 +54,9 @@ Complete these remaining cases:
   Keep constraint names and column numbers stable through renames, column
   removal, savepoints, prepared decisions and recovery. Retained expressions
   must use those column identities when displaying current names.
+  Exercise stored expression copies and reject text and binary node input at
+  every client boundary. Compare column alignment, length, and passing rules
+  against the pinned PostgreSQL service, including domains and arrays.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

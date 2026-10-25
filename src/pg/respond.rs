@@ -428,6 +428,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::PgNodeTree(node) => node.as_str().len(),
         Datum::AclItem(_) => unreachable!("aclitem has no binary output function"),
         Datum::Xml(text) => {
             let mut length = 0usize;
@@ -1300,6 +1301,7 @@ impl<'b> Responder<'b> {
         };
         Ok(Some(match v {
             Datum::Null => return Ok(None),
+            Datum::PgNodeTree(node) => node.as_str().as_bytes(),
             Datum::PgDdlCommand => {
                 return Err(crate::sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1433,6 +1435,10 @@ impl<'b> Responder<'b> {
                 }
                 Datum::AclItem(_) => {
                     unreachable!("aclitem has no binary output function")
+                }
+                Datum::PgNodeTree(node) => {
+                    m.i32(node.as_str().len() as i32);
+                    m.bytes(node.as_str().as_bytes());
                 }
                 Datum::Bool(b) => {
                     m.i32(1);

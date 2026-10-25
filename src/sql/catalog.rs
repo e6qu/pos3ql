@@ -37,7 +37,7 @@ mod views;
 #[path = "catalog_constraints.rs"]
 mod constraints;
 #[path = "catalog_expressions.rs"]
-mod expressions;
+pub(crate) mod expressions;
 #[path = "catalog_information.rs"]
 mod information;
 
@@ -21833,10 +21833,12 @@ fn catalog_column_type_mod(column: &ColumnMeta) -> i32 {
 /// Synthetic catalog relations do not own a durable column policy; render the
 /// PostgreSQL type default for their `pg_attribute` rows.
 fn type_storage(ctype: ColType) -> &'static str {
-    if matches!(ctype, ColType::TsQuery) || ctype.typlen() >= 0 {
-        "p"
-    } else {
-        "x"
+    match ctype.physical_layout().storage {
+        b'p' => "p",
+        b'e' => "e",
+        b'x' => "x",
+        b'm' => "m",
+        _ => unreachable!("validated PostgreSQL physical storage policy"),
     }
 }
 
@@ -22383,10 +22385,10 @@ fn pg_attribute<'a>(
                 "invalid pg_attribute char field"
             )),
         };
-        let by_value = if type_oid == 0 && matches!(source[14], Datum::Bool(true)) {
-            false
+        let layout = if type_oid == 0 && matches!(source[14], Datum::Bool(true)) {
+            None
         } else {
-            super::exec::catalog_column_type(storage, txid, type_oid)
+            Some(super::exec::catalog_column_type(storage, txid, type_oid)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -22395,7 +22397,7 @@ fn pg_attribute<'a>(
                     )
                 })?
                 .0
-                .is_pass_by_value()
+                .physical_layout())
         };
         *target = row(
             &[
@@ -22406,8 +22408,8 @@ fn pg_attribute<'a>(
                 smallint(source[3])?,
                 source[6],
                 Datum::Int2(0),
-                Datum::Bool(by_value),
-                character(source[16])?,
+                Datum::Bool(layout.is_some_and(|layout| layout.by_value)),
+                layout.map_or_else(|| character(source[16]), |layout| Ok(Datum::Char(layout.alignment)))?,
                 character(source[11])?,
                 character(source[12])?,
                 source[4],

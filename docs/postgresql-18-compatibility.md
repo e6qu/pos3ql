@@ -41,6 +41,12 @@ containing an array of scalar domains is supported.
 For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
 from an unsupported `positive_ids[]` column.
 
+Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
+reject client text and binary input with `0A000`, matching PostgreSQL. Reports
+can display their generated values. Copying non-null statistics values into
+user tables, including `pg_statistic[]`, is unsupported and fails with `0A000`
+before storing unreadable data. NULL values remain valid.
+
 ## Physical access paths
 
 | Method | Object-native path |

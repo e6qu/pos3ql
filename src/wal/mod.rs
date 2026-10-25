@@ -16019,7 +16019,7 @@ mod tests {
 
     #[test]
     fn domain_payload_rejects_overlong_text_and_invalid_boolean_codes() {
-        fn payload(default: &str, expression: &str, not_null: u8) -> Vec<u8> {
+        fn payload(default: &str, expression: &str, not_null: u8, not_null_name: &str) -> Vec<u8> {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&0u16.to_le_bytes());
             bytes.extend_from_slice(&1u64.to_le_bytes());
@@ -16032,6 +16032,8 @@ mod tests {
             bytes.extend_from_slice(&NO_DOMAIN_BASE_SLOT.to_le_bytes());
             bytes.extend_from_slice(&(-1_i32).to_le_bytes());
             bytes.push(not_null);
+            bytes.push(not_null_name.len() as u8);
+            bytes.extend_from_slice(not_null_name.as_bytes());
             bytes.extend_from_slice(&(default.len() as u16).to_le_bytes());
             bytes.extend_from_slice(default.as_bytes());
             bytes.extend_from_slice(&[1, 5]);
@@ -16041,16 +16043,25 @@ mod tests {
             bytes.push(crate::storage::ConstraintValidation::EnforcedValidated.code());
             bytes
         }
-        let valid = payload("7", "VALUE > 0", 1);
+        let valid = payload("7", "VALUE > 0", 1, "bounded_domain_not_null");
         assert!(decode_op(KIND_CREATE_DOMAIN, &valid).is_some());
+        let (_, restored) = decode_domain_payload(&valid).unwrap();
+        assert_eq!(restored.not_null_name.unwrap().as_str(), "bounded_domain_not_null");
+        assert!(decode_domain_payload(&payload("7", "VALUE > 0", 0, "")).is_some());
+        for end in 0..valid.len() {
+            assert!(decode_domain_payload(&valid[..end]).is_none());
+        }
         for invalid in [
             payload(
                 &"1".repeat(crate::storage::DEFAULT_EXPR_MAX + 1),
                 "VALUE > 0",
                 1,
+                "bounded_domain_not_null",
             ),
-            payload("7", &"x".repeat(crate::storage::CHECK_SQL_MAX + 1), 1),
-            payload("7", "VALUE > 0", 2),
+            payload("7", &"x".repeat(crate::storage::CHECK_SQL_MAX + 1), 1, "bounded_domain_not_null"),
+            payload("7", "VALUE > 0", 2, "bounded_domain_not_null"),
+            payload("7", "VALUE > 0", 1, ""),
+            payload("7", "VALUE > 0", 0, "unexpected_name"),
         ] {
             assert!(decode_op(KIND_CREATE_DOMAIN, &invalid).is_none());
             assert!(decode_domain_payload(&invalid).is_none());

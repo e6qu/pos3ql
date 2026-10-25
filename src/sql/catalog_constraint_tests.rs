@@ -76,6 +76,39 @@ NULL',0)",
 }
 
 #[test]
+fn catalog_constraint_internal_statistics_types_reject_client_values() {
+    let config = test_config("catalog-statistics-input");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE opaque_statistics(a pg_ndistinct,b pg_dependencies,c pg_mcv_list);
+         INSERT INTO opaque_statistics VALUES(NULL,NULL,NULL)", true);
+    for (name, oid) in [("pg_ndistinct", crate::sql::types::oid::PG_NDISTINCT),
+        ("pg_dependencies", crate::sql::types::oid::PG_DEPENDENCIES),
+        ("pg_mcv_list", crate::sql::types::oid::PG_MCV_LIST)] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, &format!("SELECT 'invalid'::{name}"), true)), ["0A000"]);
+        let arena = Arena::new(&mut budget, "statistics input", 1 << 20).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(engine.decode_text_parameter(oid, b"invalid", &arena, 0).unwrap_err().sqlstate, "0A000");
+            assert_eq!(engine.decode_binary_parameter(oid, b"invalid", &arena, 0).unwrap_err().sqlstate, "0A000");
+        });
+    }
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "INSERT INTO opaque_statistics(a) VALUES('invalid')", true)), ["0A000"]);
+    session.success(&mut engine,
+        "CREATE TABLE statistics_source(a integer,b integer);
+         INSERT INTO statistics_source VALUES(1,1),(1,1),(2,2);
+         CREATE STATISTICS generated_statistics(ndistinct,dependencies) ON a,b FROM statistics_source;
+         ANALYZE statistics_source", true);
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "INSERT INTO opaque_statistics(a) SELECT stxdndistinct FROM pg_statistic_ext_data
+          WHERE stxoid=(SELECT oid FROM pg_statistic_ext WHERE stxname='generated_statistics')", true)), ["0A000"]);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM opaque_statistics", true)), ["1"]);
+}
+
+#[test]
 fn catalog_constraint_default_identifiers_do_not_overlap_on_wide_tables() {
     let config = test_config("constraint-default-identifiers");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

@@ -54514,6 +54514,8 @@ pub(crate) fn decode_text_input<'a>(
         return crate::sql::eval::regtype_of_name(text);
     }
     let decode_builtin = |ctype| match ctype {
+        ColType::PgNdistinct | ColType::PgDependencies | ColType::PgMcvList | ColType::PgStatisticArray =>
+            Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cannot accept a value of type {}", ctype.name())),
         target if target.is_reg_object() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
@@ -54608,7 +54610,8 @@ fn decode_binary_field_with_context<'a>(
         ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
-        | ColType::PgStatisticArray => Err(bad()),
+        | ColType::PgStatisticArray => Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}", ctype.name())),
         ColType::Int4 => via(oids::INT4),
         ColType::Oid => via(oids::OID),
         ColType::Xid => {
@@ -70042,6 +70045,10 @@ pub(crate) fn coerce<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if !v.is_null() && col.ctype == ColType::PgStatisticArray {
+        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing non-null pg_statistic[] values is not supported"));
+    }
     let mut v = v;
     if !v.is_null() {
         let source_oid = v.type_oid();

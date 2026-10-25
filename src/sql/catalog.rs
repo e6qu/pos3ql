@@ -16300,7 +16300,8 @@ fn finish_with_hidden<'a>(
             // notably oid rather than int4, before hashing or wire encoding.
             // These private source rows bind node SQL to column identities
             // in expressions::current before any catalog row is exposed.
-            let value = if *column_type == ColType::PgNodeTree && matches!(value, Datum::Text(_)) {
+            let value = if matches!(*column_type, ColType::PgNodeTree | ColType::PgNdistinct | ColType::PgDependencies | ColType::PgMcvList)
+                && matches!(value, Datum::Text(_)) {
                 value
             } else {
                 super::eval::cast_to(value, *column_type, arena)?

@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn catalog_constraint_policy_nodes_bind_views_and_outer_columns() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE policy_nodes(id integer);
+         CREATE VIEW policy_nodes_view AS SELECT id FROM policy_nodes;
+         CREATE POLICY policy_nodes_rule ON policy_nodes USING
+           (EXISTS (SELECT 1 FROM policy_nodes_view v WHERE v.id=policy_nodes.id));
+         SELECT pg_get_expr(polqual,polrelid) IS NOT NULL
+           FROM pg_policy WHERE polname='policy_nodes_rule'",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(data_rows(&setup), ["t"]);
+    let blocked = run_with(&mut engine, &mut budget, "DROP VIEW policy_nodes_view");
+    assert_eq!(error_sqlstates(&blocked), ["2BP01"]);
+    let removed = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP VIEW policy_nodes_view CASCADE;
+         SELECT count(*) FROM pg_policy WHERE polname='policy_nodes_rule'",
+    );
+    assert_eq!(data_rows(&removed), ["0"]);
+}
+
+#[test]
 fn catalog_constraint_attributes_use_postgresql_physical_type_properties() {
     let (mut engine, mut budget) = test_engine();
     run_with(

@@ -1903,6 +1903,19 @@ where
                 expression_mask |= 1 << position;
             }
         }
+        let natural_collations = crate::sql::exec::constraints::index_key_collations(
+            storage,
+            txid,
+            definition,
+            &index.columns[..index.n_cols],
+            &expressions[..index.n_cols],
+            arena,
+        )?;
+        // The matched expression excludes an outer COLLATE clause stored in
+        // the index metadata. Its natural collation must still match the key.
+        if index.collations[..index.n_cols] != natural_collations[..index.n_cols] {
+            continue;
+        }
         if let Some(source) = index.predicate {
             let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
             let predicate = crate::sql::parser::parse_expr(source, arena)?;

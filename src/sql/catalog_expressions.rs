@@ -55,6 +55,16 @@ pub(super) fn current<'a>(
         .alloc_slice_with(table.rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     for (target, values) in rows.iter_mut().zip(table.rows) {
+        if !table
+            .def
+            .columns()
+            .iter()
+            .zip(*values)
+            .any(|(column, value)| column.ctype == ColType::PgNodeTree && !value.is_null())
+        {
+            *target = values;
+            continue;
+        }
         let row = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
         for (position, column) in table.def.columns().iter().enumerate() {
             if column.ctype != ColType::PgNodeTree || row[position].is_null() {
@@ -102,7 +112,17 @@ pub(super) fn current<'a>(
             row[position] = Datum::PgNodeTree(if let Some(slot) = slot {
                 let definition = storage.table_def(slot, transaction);
                 if table.def.name.as_str() == "pg_policy" {
-                    bind_policy(storage, transaction, slot, source, &definition, arena)?
+                    let policy_oid = super::view_rows::integer(row[0])?;
+                    let policy = storage
+                        .policies_with_slots_visible_to(transaction)
+                        .find(|(_, policy)| crate::storage::policy_oid(policy) == policy_oid)
+                        .map(|(slot, _)| slot)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::DATA_EXCEPTION, "catalog policy identity is missing")
+                        })?;
+                    bind_policy(
+                        storage, transaction, slot, policy, source, &definition, arena,
+                    )?
                 } else {
                     bind(source, kind, Some(&definition), arena)?
                 }
@@ -230,6 +250,7 @@ fn bind_policy<'a>(
     storage: &Storage,
     transaction: u32,
     slot: usize,
+    policy: usize,
     source: &str,
     definition: &TableDef,
     arena: &'a Arena,
@@ -246,12 +267,14 @@ fn bind_policy<'a>(
         .alloc_str_display(format_args!("SELECT {source} FROM {}", relation.as_str()))
         .map_err(|_| arena_full())?;
     let (select, sources) = parser::parse_query_with_column_sources(query, arena)?;
+    let dependencies = storage.snapshot_policy_dependencies(policy, transaction, arena)?;
     let bindings = super::super::query::catalog_expression_bindings(
         select,
         sources.columns,
         storage,
         transaction,
         slot,
+        dependencies.view(),
         arena,
     )?;
     let mut sites = crate::mem::arena::ArenaList::new(arena);

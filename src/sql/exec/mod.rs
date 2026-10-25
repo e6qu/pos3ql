@@ -57075,17 +57075,18 @@ pub(crate) fn merge<'a>(
         set_body: None,
         locking: &[],
     };
-    // Copy the synthesized def out of the borrow (it is tied to `storage`),
-    // so the write path below can borrow storage mutably.
-    let source_all_def = match super::query::synth_derived_def(
+    // Keep temporary source descriptions by value. Retaining full copies here
+    // would consume the fixed statement arena before selecting source rows.
+    let source_all_def = match super::query::describe_derived_definition(
         storage,
         &source_all_select,
         source_alias,
         statement.source.col_alias,
         txn.txid,
         arena,
+        None,
     ) {
-        Ok(d) => *d,
+        Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
     let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
@@ -57136,15 +57137,16 @@ pub(crate) fn merge<'a>(
         }
         None => source_all_select,
     };
-    let source_def = match super::query::synth_derived_def(
+    let source_def = match super::query::describe_derived_definition(
         storage,
         &source_select,
         source_alias,
         None,
         txn.txid,
         arena,
+        None,
     ) {
-        Ok(definition) => *definition,
+        Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
     let source_def = &source_def;

@@ -209,21 +209,28 @@ pub(crate) fn materialized_definition<'a>(
             ..ColumnMeta::EMPTY
         };
     }
+    retain_query_definition(
+        TableDef {
+            name: SqlName::parse(name)?,
+            columns,
+            n_columns: column_names.len(),
+            ..TableDef::empty()
+        },
+        arena,
+    )
+}
+
+pub(super) fn retain_query_definition(
+    definition: TableDef,
+    arena: &Arena,
+) -> Result<&TableDef, SqlError> {
     arena
-        .alloc_interned(
-            TableDef {
-                name: SqlName::parse(name)?,
-                columns,
-                n_columns: column_names.len(),
-                ..TableDef::empty()
-            },
-            |left, right| {
-                // Both definitions are constructed above with empty non-column metadata.
-                left.name == right.name
-                    && left.n_columns == right.n_columns
-                    && left.columns() == right.columns()
-            },
-        )
+        .alloc_interned(definition, |left, right| {
+            // Query output definitions have empty non-column metadata.
+            left.name == right.name
+                && left.n_columns == right.n_columns
+                && left.columns() == right.columns()
+        })
         .map_err(|_| arena_full())
 }
 

@@ -1886,6 +1886,20 @@ pub(crate) fn synth_derived_def_outer<'a>(
     arena: &'a Arena,
     outer: Option<&QueryScope<'a>>,
 ) -> Result<&'a TableDef, SqlError> {
+    let definition =
+        describe_derived_definition(storage, sub, exposed, col_alias, txid, arena, outer)?;
+    super::scope::retain_query_definition(definition, arena)
+}
+
+pub(crate) fn describe_derived_definition<'a>(
+    storage: &'a Storage,
+    sub: &'a Select<'a>,
+    exposed: &'a str,
+    col_alias: Option<&'a [&'a str]>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&QueryScope<'a>>,
+) -> Result<TableDef, SqlError> {
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
@@ -2165,7 +2179,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         n_columns: n_cols,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+    Ok(def)
 }
 
 /// Synthesizes the single-column `TableDef` for a supported table function
@@ -3351,7 +3365,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         n_columns: n_out,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+    super::scope::retain_query_definition(def, arena)
 }
 
 fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
@@ -3415,7 +3429,7 @@ fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
         n_columns: count,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(definition).map_err(|_| arena_full())?)
+    super::scope::retain_query_definition(definition, arena)
 }
 
 /// Whether `name` is one of the two-column `json_each` set-returning functions.

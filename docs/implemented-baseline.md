@@ -1033,6 +1033,11 @@ transaction can reuse its old name. Savepoints restore both names and comments.
 Table deletion identifies its
 indexes by the selected table lifetime, including after a rename or schema move.
 
+An index built with a different text ordering cannot supply the column's normal
+ordering. For example, an index on `name COLLATE "C"` does not remove the need
+to sort `ORDER BY name` when that column uses another collation (text ordering).
+The same check applies after a restart.
+
 ### Changing rewrite rules
 
 A rewrite rule changes what a command does before it runs. For example, a rule

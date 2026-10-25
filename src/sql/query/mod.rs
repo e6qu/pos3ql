@@ -288,8 +288,11 @@ pub(crate) fn catalog_expression_bindings<'a>(
     storage: &'a Storage,
     txid: u32,
     table: usize,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
 ) -> Result<&'a [core::cell::Cell<Option<usize>>], SqlError> {
+    let select =
+        cte::expand_stored_query(select, storage, txid, storage.path(), dependencies, arena)?;
     let values = arena
         .alloc_slice_with(sources.len(), |_| None::<usize>)
         .map_err(|_| arena_full())?;
@@ -608,8 +611,8 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 pub(crate) use srf::{
-    expression_has_project_set, is_srf_name as is_builtin_set_routine, synth_derived_def,
-    synth_derived_def_outer, table_func_rows_outer,
+    describe_derived_definition, expression_has_project_set, is_srf_name as is_builtin_set_routine,
+    synth_derived_def, synth_derived_def_outer, table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 

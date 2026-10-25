@@ -311,6 +311,7 @@ def schema_name_binding_reports(writer, prefix, record):
 
 def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
     try:
+        writer.execute('CREATE ROLE sr_lookup_reader_diff')
         writer.execute('CREATE SCHEMA sr_hidden_relations_diff')
         writer.execute('CREATE TABLE sr_hidden_relations_diff."a.b"(id integer)')
         writer.execute('CREATE TABLE public.pg_class(id integer)')
@@ -339,13 +340,26 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
             ('strict_identifier', "SELECT parse_ident('ticket-1')"),
         ):
             record_outcome(writer, f"{prefix}.schema_binding.regclass.{label}", query, ())
+        writer.execute('SET search_path TO sr_hidden_relations_diff')
+        writer.execute('SET ROLE sr_lookup_reader_diff')
+        record(writer, f"{prefix}.schema_binding.regclass.inaccessible_path", "SELECT to_regclass('\"a.b\"') IS NULL,current_schema() IS NULL")
+        record_outcome(writer, f"{prefix}.schema_binding.regclass.denied_inquiry", "SELECT to_regclass('sr_hidden_relations_diff.\"a.b\"')", ())
+        record_outcome(writer, f"{prefix}.schema_binding.regclass.denied_cast", "SELECT 'sr_hidden_relations_diff.\"a.b\"'::regclass", ())
+        record(writer, f"{prefix}.schema_binding.regclass.missing_namespace", "SELECT to_regclass('sr_absent_lookup_diff.orders') IS NULL")
+        writer.execute('RESET ROLE')
+        writer.execute('GRANT USAGE ON SCHEMA sr_hidden_relations_diff TO sr_lookup_reader_diff')
+        writer.execute('SET ROLE sr_lookup_reader_diff')
+        record(writer, f"{prefix}.schema_binding.regclass.usage_without_select", "SELECT to_regclass('\"a.b\"') IS NOT NULL,has_table_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT')")
+        writer.execute('RESET ROLE')
     finally:
         writer.execute('ROLLBACK')
+        writer.execute('RESET ROLE')
         writer.execute('RESET search_path')
         writer.execute('DROP TABLE IF EXISTS public.pg_class')
         for name in ('ticket-1', '123', '-'):
             writer.execute(pg_sql.SQL('DROP TABLE IF EXISTS public.{}').format(pg_sql.Identifier(name)))
         writer.execute('DROP SCHEMA IF EXISTS sr_hidden_relations_diff CASCADE')
+        writer.execute('DROP ROLE IF EXISTS sr_lookup_reader_diff')
 
 
 def schema_sequence_argument_reports(writer, prefix, record, record_outcome):

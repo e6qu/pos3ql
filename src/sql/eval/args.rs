@@ -507,20 +507,25 @@ pub(crate) fn parse_qualified_ident<'a>(
     strict: bool,
 ) -> Result<usize, SqlError> {
     let mut count = 0;
-    crate::sql::identifiers::for_each_qualified_identifier(input, crate::sql::identifiers::IdentifierGrammar::Sql, strict, |part| {
-        if count == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "identifier has too many parts"
-            ));
-        }
-        let bytes = arena
-            .alloc_slice_with(part.decoded_len(), |_| 0u8)
-            .map_err(|_| arena_full())?;
-        out[count] = Datum::Text(part.decode_into(bytes)?);
-        count += 1;
-        Ok(())
-    })
+    crate::sql::identifiers::for_each_qualified_identifier(
+        input,
+        crate::sql::identifiers::IdentifierGrammar::Sql,
+        strict,
+        |part| {
+            if count == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "identifier has too many parts"
+                ));
+            }
+            let bytes = arena
+                .alloc_slice_with(part.decoded_len(), |_| 0u8)
+                .map_err(|_| arena_full())?;
+            out[count] = Datum::Text(part.decode_into(bytes)?);
+            count += 1;
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {

@@ -189,9 +189,7 @@ pub(crate) fn for_each_qualified_identifier(
                 IdentifierGrammar::Sql => {
                     byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | 0x80..=0xff)
                 }
-                IdentifierGrammar::ObjectReference => {
-                    *byte != b'.' && !byte.is_ascii_whitespace()
-                }
+                IdentifierGrammar::ObjectReference => *byte != b'.' && !byte.is_ascii_whitespace(),
             }) {
                 at += 1;
             }
@@ -228,11 +226,16 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let mut names = [SqlName::EMPTY; 2];
             let mut count = 0;
-            for_each_qualified_identifier(" \"élève\" . \"a\"\"b\" ", IdentifierGrammar::Sql, true, |part| {
-                names[count] = part.sql_name()?;
-                count += 1;
-                Ok(())
-            })
+            for_each_qualified_identifier(
+                " \"élève\" . \"a\"\"b\" ",
+                IdentifierGrammar::Sql,
+                true,
+                |part| {
+                    names[count] = part.sql_name()?;
+                    count += 1;
+                    Ok(())
+                },
+            )
             .unwrap();
             assert_eq!(names[0].as_str(), "élève");
             assert_eq!(names[1].as_str(), "a\"b");
@@ -252,15 +255,26 @@ mod tests {
             .unwrap();
             for invalid in ["", "\"\"", "x.", "x..y", "\"unterminated", "x y"] {
                 assert!(
-                    for_each_qualified_identifier(invalid, IdentifierGrammar::Sql, true, |_| Ok(())).is_err(),
+                    for_each_qualified_identifier(
+                        invalid,
+                        IdentifierGrammar::Sql,
+                        true,
+                        |_| Ok(())
+                    )
+                    .is_err(),
                     "{invalid}"
                 );
             }
             assert_eq!(
-                for_each_qualified_identifier("UPPER ignored", IdentifierGrammar::Sql, false, |part| {
-                    assert_eq!(part.sql_name()?.as_str(), "upper");
-                    Ok(())
-                })
+                for_each_qualified_identifier(
+                    "UPPER ignored",
+                    IdentifierGrammar::Sql,
+                    false,
+                    |part| {
+                        assert_eq!(part.sql_name()?.as_str(), "upper");
+                        Ok(())
+                    }
+                )
                 .unwrap(),
                 1
             );

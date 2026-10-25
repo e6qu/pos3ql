@@ -92,7 +92,10 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
         SELECT 'pg_class'::regclass='public.pg_class'::regclass;
         SELECT NOT pg_table_is_visible('hidden_relations."a.b"'::regclass);
     "#, true)), ["t", "t", "t", "t", "t", "t", "t"]);
-    assert_eq!(data_rows(&session.success(&mut engine, r#"
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            r#"
         SELECT to_regclass('broken..name') IS NULL;
         SELECT to_regclass('4294967296') IS NULL;
         SELECT to_regclass('""') IS NULL;
@@ -103,7 +106,11 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
         SELECT '123 '::text::regclass='"123"'::regclass;
         SELECT '123'::regclass::oid=123;
         SELECT '"-"'::regclass='public."-"'::regclass;
-    "#, true)), ["t", "t", "t", "t", "t", "t", "t", "t", "t", "t"]);
+    "#,
+            true
+        )),
+        ["t", "t", "t", "t", "t", "t", "t", "t", "t", "t"]
+    );
     for (query, state) in [
         ("SELECT 'broken..name'::regclass", "42602"),
         ("SELECT '4294967296'::regclass", "22003"),
@@ -116,6 +123,26 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
             "{query}"
         );
     }
+}
+
+#[test]
+fn schema_name_regclass_inquiry_preserves_permission_errors() {
+    let config = test_config("schema-regclass-lookup-permissions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE ROLE lookup_reader;
+        CREATE SCHEMA private_lookup; CREATE TABLE private_lookup.orders(id integer);
+        SET search_path TO private_lookup; SET ROLE lookup_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('orders') IS NULL, current_schema() IS NULL", true)), ["t|t"]);
+    for query in ["SELECT to_regclass('private_lookup.orders')", "SELECT 'private_lookup.orders'::regclass"] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), ["42501"]);
+    }
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('absent_lookup.orders') IS NULL", true)), ["t"]);
+    session.success(&mut engine, "RESET ROLE; GRANT USAGE ON SCHEMA private_lookup TO lookup_reader; SET ROLE lookup_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('orders') IS NOT NULL, has_table_privilege('private_lookup.orders','SELECT')", true)), ["t|f"]);
+    session.success(&mut engine, "RESET ROLE", true);
 }
 
 #[test]

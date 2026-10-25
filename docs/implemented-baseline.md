@@ -872,6 +872,11 @@ Object-name strings follow PostgreSQL lookup rules: `to_regclass('bad..name')`
 returns `NULL`, while `'bad..name'::regclass` reports invalid name syntax.
 `'ticket-1'::regclass` can name a table created as `"ticket-1"`;
 `parse_ident('ticket-1')` still rejects it as an unquoted SQL identifier.
+Looking up `private_schema.orders` requires `USAGE` on that schema.
+A missing relation returns `NULL` from `to_regclass`; a permission error remains
+an error. Schema lookup does not itself require permission to read the table.
+Schemas without `USAGE` are skipped in `search_path`, as in PostgreSQL;
+`SET search_path TO private_schema` does not grant access.
 Sequence calls also accept `regclass`, `oid` and integer identifiers, following
 [PostgreSQL 18.6's input casts](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_cast.dat#L95-L102).
 

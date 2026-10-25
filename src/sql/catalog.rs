@@ -11763,6 +11763,11 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
                     "cross-database relation references are not supported"
                 ));
             }
+            if let Some(schema) = parsed.schema.as_ref()
+                && storage.find_schema_visible(schema.as_str(), txid).is_some()
+            {
+                storage.require_schema_usage(schema.as_str(), txid)?;
+            }
             Ok(relation_oid_for_name(
                 storage,
                 txid,

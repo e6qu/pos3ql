@@ -30364,13 +30364,14 @@ impl Storage {
 
     /// Computes the effective path a raw `search_path` value denotes for this
     /// session: `"$user"` becomes the session user, missing schemas are
-    /// skipped (PostgreSQL validates lazily, not at SET), and `pg_catalog` is
+    /// skipped, as are schemas without USAGE for `user`, and `pg_catalog` is
     /// implicit first unless the path places it explicitly.
     pub fn compute_path(&self, raw: &str, user: &str, txid: u32) -> PathContext {
         assert!(
             raw.len() <= crate::sql::guc::SEARCH_PATH_BYTES,
             "search path passed to resolution has already crossed its GUC boundary"
         );
+        let role = self.find_role_visible(user, txid);
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         let mut n = 0;
         let mut explicit_catalog = false;
@@ -30414,7 +30415,14 @@ impl Storage {
                 }
                 continue;
             }
-            if let Some(slot) = self.find_schema_visible(name, txid) {
+            if let Some(slot) = self.find_schema_visible(name, txid)
+                && role.is_some_and(|role| self.has_object_privilege(
+                    AccessObject { class: AccessClass::Schema, slot: slot as u16 },
+                    role,
+                    PrivilegeSet::USAGE,
+                    txid,
+                ))
+            {
                 let entry = PathEntry::Schema(slot as u16);
                 if !entries[..n].contains(&entry) {
                     assert!(n < MAX_PATH_ENTRIES, "bounded search path fits resolver");

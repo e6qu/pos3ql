@@ -4050,19 +4050,12 @@ pub fn infer_type_res(
             "pg_event_trigger_table_rewrite_reason" => of(ColType::Int4),
             "pg_extension_config_dump" => (oid::VOID, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
+            name if super::super::eval::funcs::system::is_privilege_predicate(name) => {
+                of(ColType::Bool)
+            }
             "pg_table_is_visible"
             | "pg_type_is_visible"
             | "pg_function_is_visible"
-            | "has_table_privilege"
-            | "has_column_privilege"
-            | "has_sequence_privilege"
-            | "has_schema_privilege"
-            | "has_type_privilege"
-            | "has_database_privilege"
-            | "has_foreign_data_wrapper_privilege"
-            | "has_server_privilege"
-            | "has_largeobject_privilege"
-            | "has_parameter_privilege"
             | "pg_relation_is_publishable"
             | "pg_input_is_valid"
             | "booleq"

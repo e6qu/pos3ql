@@ -21775,6 +21775,50 @@ fn catalog_snapshot_acl_addresses_match_postgresql_object_classes() {
 }
 
 #[test]
+fn catalog_privilege_predicates_describe_boolean_results_for_null_inputs() {
+    let (mut engine, mut budget) = test_engine();
+    for name in [
+        "has_table_privilege",
+        "has_column_privilege",
+        "has_any_column_privilege",
+        "has_sequence_privilege",
+        "has_schema_privilege",
+        "has_type_privilege",
+        "has_language_privilege",
+        "has_function_privilege",
+        "has_database_privilege",
+        "has_tablespace_privilege",
+        "has_foreign_data_wrapper_privilege",
+        "has_server_privilege",
+        "has_largeobject_privilege",
+        "has_parameter_privilege",
+    ] {
+        let arguments = match name {
+            "has_column_privilege" => "NULL::oid,NULL::text,NULL::text",
+            "has_parameter_privilege" => "NULL::text,NULL::text",
+            _ => "NULL::oid,NULL::text",
+        };
+        for qualifier in ["", "pg_catalog."] {
+            let query = format!(
+                "SELECT {qualifier}{name}({arguments}), pg_typeof({qualifier}{name}({arguments}))::text"
+            );
+            let result = run_with_fixed_memory(&mut engine, &budget, &query, 4 << 20);
+            assert!(
+                error_sqlstates(&result).is_empty(),
+                "{query}: {}",
+                String::from_utf8_lossy(&result)
+            );
+            assert_eq!(row_description_type_oids(&result), [16, 25], "{query}");
+            assert_eq!(
+                row_description_type_oids(&describe_with(&mut engine, &mut budget, &query)),
+                [16, 25],
+                "{query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups() {
     for (isolation, historical) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
         let (mut engine, mut budget) = test_engine();

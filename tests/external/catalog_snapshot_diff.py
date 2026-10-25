@@ -104,6 +104,31 @@ def transcript(reader, writer):
                 f"SELECT {','.join(fields)} FROM pg_catalog.{relation} LIMIT 0",
             )
 
+        for function in (
+            "has_table_privilege",
+            "has_column_privilege",
+            "has_any_column_privilege",
+            "has_sequence_privilege",
+            "has_schema_privilege",
+            "has_type_privilege",
+            "has_language_privilege",
+            "has_function_privilege",
+            "has_database_privilege",
+            "has_tablespace_privilege",
+            "has_foreign_data_wrapper_privilege",
+            "has_server_privilege",
+            "has_largeobject_privilege",
+            "has_parameter_privilege",
+        ):
+            arguments = {
+                "has_column_privilege": "NULL::oid,NULL::text,NULL::text",
+                "has_parameter_privilege": "NULL::text,NULL::text",
+            }.get(function, "NULL::oid,NULL::text")
+            for qualifier in ("", "pg_catalog."):
+                call = f"{qualifier}{function}({arguments})"
+                record(writer, f"{prefix}.privilege_boolean.{qualifier}{function}",
+                       f"SELECT {call},pg_typeof({call})::text")
+
         record(writer, f"{prefix}.vector_array_cast", """
             SELECT ('9 10'::oidvector)::oid[]::text,
                    ('1 -2'::int2vector)::smallint[]::text,

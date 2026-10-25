@@ -847,6 +847,28 @@ rows. The report continues with its original file set and read position; a new
 scan captures the replacement. Downloads and callbacks hold none of the table
 capture guards. Cancellation and failed capture release reader registrations.
 
+### Changing schema names
+
+**User example:** inside `BEGIN`, rename the schema `orders` to `sales`. That connection
+can immediately use `sales.order_view`; other connections keep using
+`orders.order_view` until commit. A rollback or savepoint restores the earlier
+name and dependent definitions. Prepared transactions retain the private change
+after loss of local disk, until explicitly committed or rolled back.
+
+The rename updates bound table, type, sequence, view, rule, routine, index and
+policy references together. It distinguishes schema qualifiers from query
+aliases and preserves quoted names, including commas and embedded quotes.
+SQL routine bodies bound at creation follow the change. A string body such as
+`AS 'SELECT * FROM orders.items'` keeps its text and can fail when called after
+the rename, as in PostgreSQL.
+
+A schema keeps its object identifier through renames and recovery. Renaming
+`public` to `archive`, then creating another `public`, gives the replacement a
+different identifier and ordinary ownership; `archive` retains identifier 2200
+and its database-owner role until explicitly reassigned. Restart also works
+when no replacement `public` exists. See the exact identifier limits and saved
+records in the [durable format guide](durable-format.md).
+
 ### Numbering changes safely
 
 A log sequence number (LSN) gives each journal record a position. Reserving a

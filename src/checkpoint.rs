@@ -20320,6 +20320,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v22",
                 "pos3ql-manifest-v23",
                 "pos3ql-manifest-v24",
+                "pos3ql-manifest-v25",
+                "pos3ql-manifest-v26",
                 "pos3ql-manifest-v27 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
@@ -20787,6 +20789,8 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v22",
             "pos3ql-manifest-v23",
             "pos3ql-manifest-v24",
+            "pos3ql-manifest-v25",
+            "pos3ql-manifest-v26",
         ] {
             let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());

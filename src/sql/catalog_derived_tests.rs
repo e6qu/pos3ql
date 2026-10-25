@@ -45,7 +45,8 @@ fn schema_rename_without_a_public_replacement_survives_empty_disk_recovery() {
 #[test]
 fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
     for checkpoint in [false, true] {
-        let name = format!("schema-owner-recovery-{checkpoint}");
+      for decision in ["COMMIT", "ROLLBACK"] {
+        let name = format!("schema-owner-recovery-{checkpoint}-{decision}");
         let mut config = test_config(&name);
         config.max_prepared_transactions = 1;
         config.object_store_on = true;
@@ -82,13 +83,31 @@ fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
                 class: crate::storage::AccessClass::Schema, slot: slot as u16,
             }, transaction), owner, "{name}: {schema}");
         }
-        session.success(&mut cold, "ROLLBACK PREPARED 'schema_owner'", false);
+        let target = crate::storage::ObjectLockTarget::Role(cold.storage.role(owner).oid());
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(cold.storage.lock_object(1000, target,
+                ast::TableLockMode::AccessExclusive, true).unwrap_err().sqlstate,
+                crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE);
+        });
+        session.success(&mut cold, &format!("{decision} PREPARED 'schema_owner'"), false);
+        crate::mem::guard::forbid_alloc(|| {
+            cold.storage.lock_object(1000, target, ast::TableLockMode::AccessExclusive, true).unwrap();
+            cold.storage.release_object_locks(1000);
+        });
+        if decision == "COMMIT" {
+            assert_eq!(data_rows(&session.success(&mut cold, "
+                SELECT nspowner::regrole::text FROM pg_namespace
+                WHERE nspname IN ('existing_schema_owner','created_schema_owner') ORDER BY nspname
+            ", true)), ["retained_schema_owner", "retained_schema_owner"]);
+            session.success(&mut cold, "DROP SCHEMA created_schema_owner; DROP SCHEMA existing_schema_owner", false);
+        }
         session.success(&mut cold, "DROP ROLE retained_schema_owner", false);
         assert!(cold.storage.find_role_visible("retained_schema_owner", 0).is_none());
         drop(session);
         drop(cold);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
+      }
     }
 }
 

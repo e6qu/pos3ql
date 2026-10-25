@@ -148,8 +148,8 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         record(writer, f"{prefix}.constraint.ordinal.keys", "SELECT conname,conkey FROM pg_constraint WHERE conname IN ('ordinal_positive_diff','ordinal_key_diff') ORDER BY conname")
         record(writer, f"{prefix}.constraint.ordinal.width", "SELECT relnatts FROM pg_class WHERE oid='report_ordinal_diff'::regclass")
         record(writer, f"{prefix}.constraint.ordinal.comments", "SELECT objsubid,description FROM pg_description WHERE objoid='report_ordinal_diff'::regclass")
-        record_outcome(writer, f"{prefix}.constraint.ordinal.comment_lookup", "SELECT col_description('report_ordinal_diff'::regclass,2)", ())
-        record_outcome(writer, f"{prefix}.constraint.ordinal.address", "SELECT (pg_identify_object('pg_class'::regclass,'report_ordinal_diff'::regclass,2)).identity", ())
+        record(writer, f"{prefix}.constraint.ordinal.comment_lookup", "SELECT col_description('report_ordinal_diff'::regclass,2)")
+        record(writer, f"{prefix}.constraint.ordinal.address", "SELECT (pg_identify_object('pg_class'::regclass,'report_ordinal_diff'::regclass,2)).identity")
         writer.execute("DROP TABLE report_ordinal_diff")
 
         writer.execute("BEGIN")

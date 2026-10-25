@@ -29931,14 +29931,14 @@ impl Storage {
         None
     }
 
-    /// The 1-based column number of `column` in the relation at `table_slot`, or
+    /// The retained PostgreSQL column number in the relation at `table_slot`, or
     /// `None` if the relation has no such column.
     pub fn column_number(&self, table_slot: usize, column: &str, txid: u32) -> Option<u32> {
         let def = self.table_def(table_slot, txid);
         def.columns()
             .iter()
             .position(|c| c.name.as_str() == column)
-            .map(|i| i as u32 + 1)
+            .map(|i| u32::from(def.attribute_number(i)))
     }
 
     /// The schema a new relation lands in: the qualifier if it names a

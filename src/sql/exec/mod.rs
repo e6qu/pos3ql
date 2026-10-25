@@ -4206,26 +4206,27 @@ fn copy_like_comments(
         let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
         let source = *storage.table_def(source_slot, txn.txid);
         if like.comments {
-            for subid in 1..=source.n_columns {
+            for column in 0..source.n_columns {
+                let subid = u32::from(source.attribute_number(column));
                 let source_comment = storage.comment_text(
                     CommentClass::Relation,
                     source.schema.as_str(),
                     source.name.as_str(),
-                    subid as u32,
+                    subid,
                     txn.txid,
                 );
                 let Some(text) = source_comment else {
                     continue;
                 };
-                let source_column = source.columns()[subid - 1].name.as_str();
-                let target_subid = target.column_index(source_column).ok_or_else(|| {
+                let source_column = source.columns()[column].name.as_str();
+                let target_column = target.column_index(source_column).ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
                         "column \"{}\" does not exist",
                         source_column
                     )
-                })? as u32
-                    + 1;
+                })?;
+                let target_subid = u32::from(target.attribute_number(target_column));
                 stage_comment(
                     storage,
                     wal,
@@ -67926,6 +67927,17 @@ fn alter_table_relation(
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
+    for (column, destination) in column_mapping[..def.n_columns].iter().enumerate() {
+        if destination.is_none()
+            && let Err(error) = stage_comment(storage, wal, txn, CommentIdentity {
+                class: crate::storage::CommentClass::Relation,
+                schema: def.schema,
+                name: def.name,
+                subid: u32::from(def.attribute_number(column)),
+            }, None) {
+            return sql_fail(error);
+        }
+    }
     if let Err(error) = crate::storage::constraint_names::table(&mut new_def) { return sql_fail(error); }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);

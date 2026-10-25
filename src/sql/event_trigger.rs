@@ -990,16 +990,16 @@ fn comment_reference(
                 EventObjectRef::Primary(relation)
             } else {
                 let column_name = match relation {
-                    ObjectRef::Table(table) => storage
-                        .table_def(table, txid)
-                        .columns()
-                        .get(subid as usize - 1)
-                        .map(|column| column.name),
-                    ObjectRef::MaterializedView(view_slot) => storage
-                        .table_def(storage.matview_table(view_slot), txid)
-                        .columns()
-                        .get(subid as usize - 1)
-                        .map(|column| column.name),
+                    ObjectRef::Table(table) => {
+                        let table = storage.table_def(table, txid);
+                        u16::try_from(subid).ok().and_then(|number| table.attribute_column(number))
+                            .map(|column| table.columns()[column].name)
+                    }
+                    ObjectRef::MaterializedView(view_slot) => {
+                        let table = storage.table_def(storage.matview_table(view_slot), txid);
+                        u16::try_from(subid).ok().and_then(|number| table.attribute_column(number))
+                            .map(|column| table.columns()[column].name)
+                    }
                     ObjectRef::View(_) => match statement {
                         Stmt::Comment {
                             target: crate::sql::ast::CommentTarget::Column { column, .. },
@@ -1012,11 +1012,7 @@ fn comment_reference(
                 .ok_or_else(graph_full)?;
                 EventObjectRef::RelationColumn {
                     relation,
-                    attnum: match relation {
-                        ObjectRef::Table(slot) => storage.table_def(slot, txid).attribute_number(subid as usize - 1),
-                        ObjectRef::MaterializedView(slot) => storage.table_def(storage.matview_table(slot), txid).attribute_number(subid as usize - 1),
-                        _ => u16::try_from(subid).map_err(|_| graph_full())?,
-                    },
+                    attnum: u16::try_from(subid).map_err(|_| graph_full())?,
                     name: column_name,
                 }
             }

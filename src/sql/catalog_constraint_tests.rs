@@ -91,6 +91,7 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
             g bigint GENERATED ALWAYS AS(kept+1) STORED,
             CONSTRAINT ordinal_positive CHECK(kept>0), CONSTRAINT ordinal_key UNIQUE(kept));
          COMMENT ON COLUMN ordinal_columns.kept IS 'retained comment';
+         COMMENT ON COLUMN ordinal_columns.lost IS 'removed comment';
          CREATE ROLE ordinal_reader; GRANT SELECT(kept) ON ordinal_columns TO ordinal_reader", true);
     let report = "SELECT pg_get_expr(conbin,conrelid,false) FROM pg_constraint WHERE conname='ordinal_positive'";
     assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)), ["(kept > 0)"]);
@@ -110,6 +111,9 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
          SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass;
          SELECT (pg_identify_object('pg_class'::regclass,'ordinal_columns'::regclass,2)).identity", true)),
         ["t|f|retained comment", "2|retained comment", "public.ordinal_columns.kept"]);
+    assert_eq!(data_rows(&writer.success(&mut engine,
+        "COMMENT ON COLUMN ordinal_columns.kept IS 'updated comment';
+         SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass", true)), ["2|updated comment"]);
     reader.success(&mut engine, "ROLLBACK", true);
 }
 
@@ -492,6 +496,8 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             session.success(&mut engine,
                 "CREATE TABLE saved_nulls(lost text,a integer NOT NULL,b integer,\" spaced column\" integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
                  CREATE DOMAIN saved_domain AS integer NOT NULL;
+                 COMMENT ON COLUMN saved_nulls.lost IS 'removed comment';
+                 COMMENT ON COLUMN saved_nulls.a IS 'retained comment';
                  ALTER TABLE saved_nulls ADD CONSTRAINT saved_positive CHECK(a>0);
                  CREATE TABLE saved_nodes(expression pg_node_tree, relation oid);
                  INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='saved_positive';
@@ -543,6 +549,9 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             } else {
                 "saved_nulls"
             };
+            assert_eq!(data_rows(&session.success(&mut cold,
+                &format!("SELECT objsubid,description FROM pg_description WHERE objoid='{table}'::regclass ORDER BY objsubid"), true)),
+                if commit { vec!["2|retained comment"] } else { vec!["1|removed comment", "2|retained comment"] });
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT pg_typeof(expression),pg_get_expr(expression,relation,false) FROM saved_nodes", true)),
                 ["pg_node_tree|(a > 0)"]);

@@ -118,10 +118,19 @@ pub(super) fn current<'a>(
                         .find(|(_, policy)| crate::storage::policy_oid(policy) == policy_oid)
                         .map(|(slot, _)| slot)
                         .ok_or_else(|| {
-                            sql_err!(sqlstate::DATA_EXCEPTION, "catalog policy identity is missing")
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "catalog policy identity is missing"
+                            )
                         })?;
                     bind_policy(
-                        storage, transaction, slot, policy, source, &definition, arena,
+                        storage,
+                        transaction,
+                        slot,
+                        policy,
+                        source,
+                        &definition,
+                        arena,
                     )?
                 } else {
                     bind(source, kind, Some(&definition), arena)?

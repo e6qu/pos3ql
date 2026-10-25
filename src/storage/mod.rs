@@ -1598,7 +1598,9 @@ impl ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     };
-int capacity. This follows the SQL parser's complete
+}
+
+/// Per-kind table-constraint capacity. This follows the SQL parser's complete
 /// bounded list instead of imposing a smaller storage-only ceiling after DDL
 /// has already been accepted.
 pub(crate) const MAX_TABLE_CONSTRAINTS: usize = MAX_DEFINITION_ITEMS;

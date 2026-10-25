@@ -105,7 +105,9 @@ fn empty_meta() -> ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
-finition, evaluating its DEFAULT (which must be a
+}
+
+/// Resolves one column definition, evaluating its DEFAULT (which must be a
 /// constant) and coercing it to the column type.
 pub(super) fn build_column(
     c: &ColumnDef,

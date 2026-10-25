@@ -18790,7 +18790,9 @@ fn empty_column() -> ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
- in the manifest as hex of the WAL default
+}
+
+/// Column defaults travel in the manifest as hex of the WAL default
 /// encoding ("-" for none-with-no-bytes readability).
 fn default_to_hex(d: &Option<OwnedDatum>) -> StackStr<{ 2 * crate::wal::MAX_DEFAULT_ENCODED }> {
     let mut scratch = [0u8; crate::wal::MAX_DEFAULT_ENCODED];

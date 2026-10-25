@@ -32,6 +32,7 @@ struct InternedAllocation {
     previous: Option<core::ptr::NonNull<InternedAllocation>>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct InternedValue<T> {
     value: T,
     identity: InternedAllocation,

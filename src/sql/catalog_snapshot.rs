@@ -555,9 +555,8 @@ mod key_definitions {
                 .find(|definition| definition.name == relation.name)
                 .unwrap();
             assert_eq!(baseline.oid as u32, identity.relation.get());
-            if !super::super::catalog::is_catalog_relation(None, relation.name) {
-                continue;
-            }
+            assert!(super::super::catalog::is_catalog_relation(None, relation.name));
+            let supported = super::super::catalog::CATALOG_RELATIONS.contains(&relation.name);
             arena.reset();
             let result = forbid_alloc(|| {
                 let definition = super::super::catalog::synthesize_definition(
@@ -569,10 +568,16 @@ mod key_definitions {
                 Ok::<_, SqlError>(indexed.len)
             });
             match result {
-                Ok(count) => assert_eq!(count, 0),
+                Ok(count) => {
+                    assert!(supported);
+                    assert_eq!(count, 0);
+                    matched += 1;
+                }
+                Err(error) if !supported => {
+                    assert_eq!(error.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
+                }
                 Err(error) => errors.push(format!("{}: {}", relation.name, error.message.as_str())),
             }
-            matched += 1;
         }
         assert!(
             errors.is_empty(),
@@ -611,9 +616,8 @@ mod key_definitions {
         let mut matched = 0;
         let mut errors = Vec::new();
         for relation in super::super::catalog_snapshot_keys::RELATIONS {
-            if !super::super::catalog::is_catalog_relation(None, relation.name) {
-                continue;
-            }
+            assert!(super::super::catalog::is_catalog_relation(None, relation.name));
+            let supported = super::super::catalog::CATALOG_RELATIONS.contains(&relation.name);
             arena.reset();
             let result = forbid_alloc(|| {
                 let catalog = super::super::catalog::synthesize(
@@ -634,10 +638,16 @@ mod key_definitions {
                 ))
             });
             match result {
-                Ok((indexed, source)) => assert_eq!(indexed, source),
+                Ok((indexed, source)) => {
+                    assert!(supported);
+                    assert_eq!(indexed, source);
+                    matched += 1;
+                }
+                Err(error) if !supported => {
+                    assert_eq!(error.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
+                }
                 Err(error) => errors.push(format!("{}: {}", relation.name, error.message.as_str())),
             }
-            matched += 1;
         }
         assert!(
             errors.is_empty(),

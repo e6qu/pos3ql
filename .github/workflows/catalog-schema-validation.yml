@@ -213,7 +213,7 @@ jobs:
           before = 'echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="\n'
           after = before + """(
             for attempt in $(seq 1 150); do
-              if [[ -f "$EVIDENCE/catalog-comparison.log" ]] && rg -q '^PROFILE_START read_committed.constraint.dependencies$' "$EVIDENCE/catalog-comparison.log"; then
+              if [[ -f "$EVIDENCE/catalog-comparison.log" ]] && grep -q '^PROFILE_START read_committed.constraint.dependencies$' "$EVIDENCE/catalog-comparison.log"; then
                 sleep 1
                 date -u > "$EVIDENCE/dependency-query-profile.txt"
                 sudo gdb -q --batch -nx -p "$P3_PID" \

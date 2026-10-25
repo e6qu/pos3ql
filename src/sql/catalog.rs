@@ -40,10 +40,10 @@ mod constraints;
 pub(crate) mod expressions;
 #[path = "catalog_information.rs"]
 mod information;
-#[path = "catalog_routines.rs"]
-mod routines;
 #[path = "catalog_privileges.rs"]
 mod privileges;
+#[path = "catalog_routines.rs"]
+mod routines;
 
 #[path = "catalog_type_io.rs"]
 mod type_io;
@@ -8884,20 +8884,106 @@ pub(crate) fn synthesize<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     if qualifier == Some("information_schema") {
         match name {
-            "schemata" => return information::schemata(storage, txid, views::Read::Statement, arena),
+            "schemata" => {
+                return information::schemata(storage, txid, views::Read::Statement, arena);
+            }
             "routines" => return routines::routines(storage, txid, views::Read::Statement, arena),
-            "parameters" => return routines::parameters(storage, txid, views::Read::Statement, arena),
-            "routine_privileges" => return privileges::routines(storage, txid, views::Read::Statement, privileges::Visibility::Accessible, arena),
-            "role_routine_grants" => return privileges::routines(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
-            "table_privileges" => return privileges::tables(storage, txid, views::Read::Statement, privileges::Visibility::Accessible, arena),
-            "role_table_grants" => return privileges::tables(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
-            "column_privileges" => return privileges::columns_view(storage, txid, views::Read::Statement, privileges::Visibility::Accessible, arena),
-            "role_column_grants" => return privileges::columns_view(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
-            "usage_privileges" => return privileges::usage(storage, txid, views::Read::Statement, privileges::Visibility::Accessible, arena),
-            "role_usage_grants" => return privileges::usage(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
-            "enabled_roles" => return views::enabled_roles(storage, txid, views::Read::Statement, arena),
-            "applicable_roles" => return views::applicable_roles(storage, txid, views::Read::Statement, views::MembershipView::Applicable, arena),
-            "administrable_role_authorizations" => return views::applicable_roles(storage, txid, views::Read::Statement, views::MembershipView::Administrable, arena),
+            "parameters" => {
+                return routines::parameters(storage, txid, views::Read::Statement, arena);
+            }
+            "routine_privileges" => {
+                return privileges::routines(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_routine_grants" => {
+                return privileges::routines(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "table_privileges" => {
+                return privileges::tables(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_table_grants" => {
+                return privileges::tables(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "column_privileges" => {
+                return privileges::columns_view(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_column_grants" => {
+                return privileges::columns_view(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "usage_privileges" => {
+                return privileges::usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_usage_grants" => {
+                return privileges::usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "enabled_roles" => {
+                return views::enabled_roles(storage, txid, views::Read::Statement, arena);
+            }
+            "applicable_roles" => {
+                return views::applicable_roles(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::MembershipView::Applicable,
+                    arena,
+                );
+            }
+            "administrable_role_authorizations" => {
+                return views::applicable_roles(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::MembershipView::Administrable,
+                    arena,
+                );
+            }
             "views" => return information::views(storage, txid, views::Read::Statement, arena),
             "sequences" => {
                 return information::sequences(storage, txid, views::Read::Statement, arena);
@@ -8977,8 +9063,24 @@ pub(crate) fn synthesize<'a>(
             "pg_indexes" => return views::indexes(storage, txid, views::Read::Statement, arena),
             "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
             "pg_group" => return views::groups(storage, txid, views::Read::Statement, arena),
-            "pg_user" => return views::accounts(storage, txid, views::Read::Statement, views::AccountView::Users, arena),
-            "pg_shadow" => return views::accounts(storage, txid, views::Read::Statement, views::AccountView::Shadow, arena),
+            "pg_user" => {
+                return views::accounts(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::AccountView::Users,
+                    arena,
+                );
+            }
+            "pg_shadow" => {
+                return views::accounts(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::AccountView::Shadow,
+                    arena,
+                );
+            }
             _ => {}
         }
     }
@@ -9308,8 +9410,20 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
         (false, "pg_roles") => views::roles(storage, txid, views::Read::Current, arena),
         (false, "pg_group") => views::groups(storage, txid, views::Read::Current, arena),
-        (false, "pg_shadow") => views::accounts(storage, txid, views::Read::Current, views::AccountView::Shadow, arena),
-        (false, "pg_user") => views::accounts(storage, txid, views::Read::Current, views::AccountView::Users, arena),
+        (false, "pg_shadow") => views::accounts(
+            storage,
+            txid,
+            views::Read::Current,
+            views::AccountView::Shadow,
+            arena,
+        ),
+        (false, "pg_user") => views::accounts(
+            storage,
+            txid,
+            views::Read::Current,
+            views::AccountView::Users,
+            arena,
+        ),
         (false, "pg_authid") => pg_authid(
             storage,
             txid,
@@ -9371,11 +9485,35 @@ pub(crate) fn synthesize_current<'a>(
         (true, "referential_constraints") => {
             constraints::references(storage, txid, views::Read::Current, arena)
         }
-        (true, "table_privileges") => privileges::tables(storage, txid, views::Read::Current, privileges::Visibility::Accessible, arena),
-        (true, "role_table_grants") => privileges::tables(storage, txid, views::Read::Current, privileges::Visibility::EnabledRoles, arena),
+        (true, "table_privileges") => privileges::tables(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_table_grants") => privileges::tables(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
-        (true, "usage_privileges") => privileges::usage(storage, txid, views::Read::Current, privileges::Visibility::Accessible, arena),
-        (true, "role_usage_grants") => privileges::usage(storage, txid, views::Read::Current, privileges::Visibility::EnabledRoles, arena),
+        (true, "usage_privileges") => privileges::usage(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_usage_grants") => privileges::usage(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "domains") => info_domains(storage, txid, arena),
         (true, "domain_constraints") => {
             constraints::domains(storage, txid, views::Read::Current, arena)
@@ -9390,18 +9528,52 @@ pub(crate) fn synthesize_current<'a>(
         (true, "collation_character_set_applicability") => {
             info_collation_character_set_applicability(storage, txid, arena)
         }
-        (true, "applicable_roles") => views::applicable_roles(storage, txid, views::Read::Current, views::MembershipView::Applicable, arena),
-        (true, "administrable_role_authorizations") => {
-            views::applicable_roles(storage, txid, views::Read::Current, views::MembershipView::Administrable, arena)
-        }
+        (true, "applicable_roles") => views::applicable_roles(
+            storage,
+            txid,
+            views::Read::Current,
+            views::MembershipView::Applicable,
+            arena,
+        ),
+        (true, "administrable_role_authorizations") => views::applicable_roles(
+            storage,
+            txid,
+            views::Read::Current,
+            views::MembershipView::Administrable,
+            arena,
+        ),
         (true, "enabled_roles") => views::enabled_roles(storage, txid, views::Read::Current, arena),
-        (true, "column_privileges") => privileges::columns_view(storage, txid, views::Read::Current, privileges::Visibility::Accessible, arena),
-        (true, "role_column_grants") => privileges::columns_view(storage, txid, views::Read::Current, privileges::Visibility::EnabledRoles, arena),
+        (true, "column_privileges") => privileges::columns_view(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_column_grants") => privileges::columns_view(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "views") => information::views(storage, txid, views::Read::Current, arena),
         (true, "routines") => routines::routines(storage, txid, views::Read::Current, arena),
         (true, "parameters") => routines::parameters(storage, txid, views::Read::Current, arena),
-        (true, "routine_privileges") => privileges::routines(storage, txid, views::Read::Current, privileges::Visibility::Accessible, arena),
-        (true, "role_routine_grants") => privileges::routines(storage, txid, views::Read::Current, privileges::Visibility::EnabledRoles, arena),
+        (true, "routine_privileges") => privileges::routines(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_routine_grants") => privileges::routines(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "view_table_usage") => information::view_usage(
             storage,
             txid,
@@ -10580,7 +10752,13 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 }
 
 pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    for name in ["public", "pg_catalog", "pg_toast", "information_schema", "pg_temp"] {
+    for name in [
+        "public",
+        "pg_catalog",
+        "pg_toast",
+        "information_schema",
+        "pg_temp",
+    ] {
         if identifier_spelling_matches(written, name) {
             return schema_oid_by_name(storage, txid, name);
         }
@@ -11981,8 +12159,10 @@ pub fn function_oid_is_visible(oid: i32) -> bool {
 }
 
 pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
-    function_oid_is_visible(oid).then_some(!matches!(oid,
-        764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387))
+    function_oid_is_visible(oid).then_some(!matches!(
+        oid,
+        764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
+    ))
 }
 
 fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
@@ -11990,7 +12170,9 @@ fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
         2096 => (1, "0"),
         3577 | 3578 | 3960 | 3961 => (1, "false"),
         3786 => (3, "false, false, false"),
-        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => (2, "'{}'::jsonb, false"),
+        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
+            (2, "'{}'::jsonb, false")
+        }
         6212 => (2, "0, 1"),
         1268 => (1, "true"),
         4350 | 4351 => (1, "'NFC'::text"),
@@ -26466,7 +26648,9 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         name: "-",
                     },
                 },
-                Datum::Int4(intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32)),
+                Datum::Int4(
+                    intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32),
+                ),
                 Datum::Int4(match routine.oid {
                     6119 => super::types::oid::TEXT,
                     3058 | 3059 | 3539 => 2276,
@@ -26537,7 +26721,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     (_, None) => Datum::Null,
                 },
-                intrinsic_routine_defaults(routine.oid).map_or(Datum::Null, |(_, source)| Datum::Text(source)),
+                intrinsic_routine_defaults(routine.oid)
+                    .map_or(Datum::Null, |(_, source)| Datum::Text(source)),
                 Datum::Null,
             ],
             arena,
@@ -30223,18 +30408,18 @@ fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {
 }
 
 fn require_authid_read(storage: &Storage, txid: u32) -> Result<(), SqlError> {
-        let current = storage.current_role_slot(txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            )
-        })?;
-        if !storage.role(current).attributes_to(txid).superuser {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for table pg_authid"
-            ));
-        }
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if !storage.role(current).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table pg_authid"
+        ));
+    }
     Ok(())
 }
 
@@ -31184,13 +31369,12 @@ fn info_user_mapping_options<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn routine_specific_name(
-    name: &str,
-    oid: u32,
-) -> crate::util::StackStr<63> {
+fn routine_specific_name(name: &str, oid: u32) -> crate::util::StackStr<63> {
     let suffix = stack_format!(12, "_{}", oid);
     let mut end = name.len().min(63 - suffix.len());
-    while !name.is_char_boundary(end) { end -= 1; }
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
     stack_format!(63, "{}{}", &name[..end], suffix.as_str())
 }
 

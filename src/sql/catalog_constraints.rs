@@ -6,7 +6,7 @@ use super::view_rows::{CatalogRow, Index, NamespaceJoin, Output, boolean, intege
 use super::views::{Base, Read, columns};
 use super::{Arena, Datum, SqlError, Storage, SynthTable, text};
 use crate::sql::eval::{
-    CatalogAccess, PrivilegeColumn, PrivilegeRelation, PrivilegeObject, sqlstate,
+    CatalogAccess, PrivilegeColumn, PrivilegeObject, PrivilegeRelation, sqlstate,
 };
 use crate::sql_err;
 

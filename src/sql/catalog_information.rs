@@ -128,17 +128,25 @@ pub(super) fn schemata<'a>(
     let database = text(database.as_str(), arena)?;
     let mut output = Output::new(arena);
     for values in namespaces.rows {
-        let namespace = CatalogRow { definition: namespaces.def, values };
+        let namespace = CatalogRow {
+            definition: namespaces.def,
+            values,
+        };
         let owner = namespace.integer("nspowner")?;
         let visible = owner_is_enabled(storage, transaction, owner)
-            || catalog.has_schema_privilege(None,
+            || catalog.has_schema_privilege(
+                None,
                 crate::sql::eval::PrivilegeObject::Oid(namespace.integer("oid")?),
-                "CREATE, USAGE")? == Some(true);
+                "CREATE, USAGE",
+            )? == Some(true);
         if !visible {
             continue;
         }
         for values in roles.matching((owner as u32, 0)) {
-            let role = CatalogRow { definition: roles.table.def, values };
+            let role = CatalogRow {
+                definition: roles.table.def,
+                values,
+            };
             output.push(&[
                 database,
                 namespace.get("nspname")?,

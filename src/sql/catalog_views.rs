@@ -429,12 +429,20 @@ pub(super) enum AccountView {
     Shadow,
 }
 
-pub(super) fn enabled_roles<'a>(storage: &Storage, transaction: u32, read: Read, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+pub(super) fn enabled_roles<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     use super::view_rows::CatalogRow;
     let roles = read.authid_for_view(storage, transaction, arena)?;
     let mut output = Output::new(arena);
     for values in roles.rows {
-        let role = CatalogRow { definition: roles.def, values };
+        let role = CatalogRow {
+            definition: roles.def,
+            values,
+        };
         if super::information::owner_is_enabled(storage, transaction, role.integer("oid")?) {
             output.push(&[role.get("rolname")?])?;
         }
@@ -448,7 +456,13 @@ pub(super) enum MembershipView {
     Administrable,
 }
 
-pub(super) fn applicable_roles<'a>(storage: &Storage, transaction: u32, read: Read, view: MembershipView, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+pub(super) fn applicable_roles<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    view: MembershipView,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     use super::view_rows::CatalogRow;
     let roles = Index::oid(read.authid_for_view(storage, transaction, arena)?, arena)?;
     let membership = read.base(storage, Base::RoleMembers, transaction, arena)?;
@@ -456,17 +470,38 @@ pub(super) fn applicable_roles<'a>(storage: &Storage, transaction: u32, read: Re
     let database = storage.current_database_name(transaction);
     let mut union = crate::mem::arena::ArenaList::new(arena);
     for values in membership.rows {
-        let membership = CatalogRow { definition: membership.def, values };
-        union.push((membership.integer("member")? as u32, membership.integer("roleid")? as u32, membership.boolean("admin_option")?))
+        let membership = CatalogRow {
+            definition: membership.def,
+            values,
+        };
+        union
+            .push((
+                membership.integer("member")? as u32,
+                membership.integer("roleid")? as u32,
+                membership.boolean("admin_option")?,
+            ))
             .map_err(|_| arena_full())?;
     }
     for values in databases.rows {
-        let stored_database = CatalogRow { definition: databases.def, values };
-        if stored_database.string("datname")? != database.as_str() { continue; }
+        let stored_database = CatalogRow {
+            definition: databases.def,
+            values,
+        };
+        if stored_database.string("datname")? != database.as_str() {
+            continue;
+        }
         for values in roles.table.rows {
-            let role = CatalogRow { definition: roles.table.def, values };
+            let role = CatalogRow {
+                definition: roles.table.def,
+                values,
+            };
             if role.string("rolname")? == "pg_database_owner" {
-                union.push((stored_database.integer("datdba")? as u32, role.integer("oid")? as u32, false))
+                union
+                    .push((
+                        stored_database.integer("datdba")? as u32,
+                        role.integer("oid")? as u32,
+                        false,
+                    ))
                     .map_err(|_| arena_full())?;
             }
         }
@@ -476,19 +511,40 @@ pub(super) fn applicable_roles<'a>(storage: &Storage, transaction: u32, read: Re
     let mut prior = None;
     let mut output = Output::new(arena);
     for &(member, role, admin) in union.iter() {
-        if prior == Some((member, role, admin)) { continue; }
+        if prior == Some((member, role, admin)) {
+            continue;
+        }
         prior = Some((member, role, admin));
         if (matches!(view, MembershipView::Administrable) && !admin)
-            || !super::information::owner_is_enabled(storage, transaction, member as i32) { continue; }
+            || !super::information::owner_is_enabled(storage, transaction, member as i32)
+        {
+            continue;
+        }
         for values in roles.matching((member, 0)) {
-            let member = CatalogRow { definition: roles.table.def, values };
+            let member = CatalogRow {
+                definition: roles.table.def,
+                values,
+            };
             for values in roles.matching((role, 0)) {
-                let role = CatalogRow { definition: roles.table.def, values };
-                output.push(&[member.get("rolname")?,role.get("rolname")?,text(if admin { "YES" } else { "NO" }, arena)?])?;
+                let role = CatalogRow {
+                    definition: roles.table.def,
+                    values,
+                };
+                output.push(&[
+                    member.get("rolname")?,
+                    role.get("rolname")?,
+                    text(if admin { "YES" } else { "NO" }, arena)?,
+                ])?;
             }
         }
     }
-    output.finish(match view { MembershipView::Applicable => "applicable_roles", MembershipView::Administrable => "administrable_role_authorizations" }, true)
+    output.finish(
+        match view {
+            MembershipView::Applicable => "applicable_roles",
+            MembershipView::Administrable => "administrable_role_authorizations",
+        },
+        true,
+    )
 }
 
 pub(super) fn accounts<'a>(

@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn schema_rename_keeps_names_and_dependent_definitions_private_until_commit() {
+    let setup = "
+        CREATE SCHEMA private_schema_before;
+        CREATE TYPE private_schema_before.mood AS ENUM ('ready');
+        CREATE SEQUENCE private_schema_before.ticket;
+        CREATE TABLE private_schema_before.orders(id bigint DEFAULT nextval('private_schema_before.ticket'),state private_schema_before.mood);
+        INSERT INTO private_schema_before.orders(state) VALUES ('ready');
+        CREATE VIEW private_schema_before.order_view AS SELECT id,state FROM private_schema_before.orders;
+        CREATE FUNCTION private_schema_before.bound() RETURNS bigint LANGUAGE SQL
+          BEGIN ATOMIC SELECT id FROM private_schema_before.orders; END;
+        CREATE FUNCTION private_schema_before.unbound() RETURNS bigint LANGUAGE SQL AS 'SELECT id FROM private_schema_before.orders';
+        COMMENT ON SCHEMA private_schema_before IS 'private namespace';
+        COMMENT ON TABLE private_schema_before.orders IS 'private table';
+    ";
+    let old = "SELECT to_regnamespace('private_schema_before') IS NOT NULL,to_regnamespace('private_schema_after') IS NULL;
+        SELECT nspname FROM pg_namespace WHERE nspname IN ('private_schema_before','private_schema_after');
+        SELECT id,state FROM private_schema_before.order_view;
+        SELECT private_schema_before.bound();";
+    let new = "SELECT to_regnamespace('private_schema_before') IS NULL,to_regnamespace('private_schema_after') IS NOT NULL;
+        SELECT nspname FROM pg_namespace WHERE nspname IN ('private_schema_before','private_schema_after');
+        SELECT id,state FROM private_schema_after.order_view;
+        SELECT private_schema_after.bound();
+        SELECT obj_description('private_schema_after.orders'::regclass);
+        SELECT obj_description('private_schema_after'::regnamespace,'pg_namespace');";
+    for mode in [crate::config::TransactionMode::Mvcc,crate::config::TransactionMode::Locking] {
+        let mut config = test_config("private-schema-rename");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, setup, true);
+        let old_rows = ["t|t", "private_schema_before", "1|ready", "1"];
+        let new_rows = ["t|t", "private_schema_after", "1|ready", "1", "private table", "private namespace"];
+        assert_eq!(data_rows(&reader.success(&mut engine, old, true)), old_rows);
+        writer.success(&mut engine, "BEGIN; SAVEPOINT schema_change; ALTER SCHEMA private_schema_before RENAME TO private_schema_after", true);
+        assert_eq!(data_rows(&writer.success(&mut engine, new, true)), new_rows);
+        assert_eq!(data_rows(&reader.success(&mut engine, old, true)), old_rows);
+        writer.success(&mut engine, "ROLLBACK TO schema_change", true);
+        assert_eq!(data_rows(&writer.success(&mut engine, old, true)), old_rows);
+        writer.success(&mut engine, "ALTER SCHEMA private_schema_before RENAME TO private_schema_after; COMMIT", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, new, true)), new_rows);
+        assert_eq!(error_sqlstates(&reader.execute(&mut engine, "SELECT private_schema_after.unbound()", true)), ["42P01"]);
+    }
+}
+
+#[test]
 fn catalog_snapshot_privilege_reports_preserve_selected_grants_and_public_role_rows() {
     let report = "
         SELECT grantor,grantee,table_name,privilege_type,is_grantable FROM information_schema.table_privileges
@@ -12,26 +60,55 @@ fn catalog_snapshot_privilege_reports_preserve_selected_grants_and_public_role_r
         SELECT grantor,grantee,routine_name FROM information_schema.role_routine_grants
           WHERE routine_name='snapshot_grant_function' AND grantee='PUBLIC';
     ";
-    let old = ["postgres|PUBLIC|snapshot_grant_before|SELECT|NO", "postgres|PUBLIC|snapshot_grant_before|SELECT",
-        "postgres|PUBLIC|snapshot_grant_function|NO", "postgres|PUBLIC|snapshot_grant_function"];
+    let old = [
+        "postgres|PUBLIC|snapshot_grant_before|SELECT|NO",
+        "postgres|PUBLIC|snapshot_grant_before|SELECT",
+        "postgres|PUBLIC|snapshot_grant_function|NO",
+        "postgres|PUBLIC|snapshot_grant_function",
+    ];
     let new = ["postgres|snapshot_grantee|snapshot_grant_after|UPDATE|YES"];
     for isolation in ["READ COMMITTED", "REPEATABLE READ"] {
         let config = test_config("snapshot-grant-reports");
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(&mut engine, "CREATE ROLE snapshot_grantee; CREATE TABLE snapshot_grant_before(id integer);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(
+            &mut engine,
+            "CREATE ROLE snapshot_grantee; CREATE TABLE snapshot_grant_before(id integer);
             CREATE FUNCTION snapshot_grant_function() RETURNS integer LANGUAGE SQL AS 'SELECT 1';
-            GRANT SELECT ON snapshot_grant_before TO PUBLIC", true);
-        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)), old);
-        writer.success(&mut engine, "REVOKE SELECT ON snapshot_grant_before FROM PUBLIC;
+            GRANT SELECT ON snapshot_grant_before TO PUBLIC",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(
+                &mut engine,
+                &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"),
+                true
+            )),
+            old
+        );
+        writer.success(
+            &mut engine,
+            "REVOKE SELECT ON snapshot_grant_before FROM PUBLIC;
             GRANT UPDATE ON snapshot_grant_before TO snapshot_grantee WITH GRANT OPTION;
             ALTER TABLE snapshot_grant_before RENAME TO snapshot_grant_after;
-            REVOKE EXECUTE ON FUNCTION snapshot_grant_function() FROM PUBLIC", true);
+            REVOKE EXECUTE ON FUNCTION snapshot_grant_function() FROM PUBLIC",
+            true,
+        );
         let selected = data_rows(&reader.success(&mut engine, report, true));
-        assert_eq!(selected, if isolation == "REPEATABLE READ" { old.as_slice() } else { new.as_slice() }, "{isolation}");
+        assert_eq!(
+            selected,
+            if isolation == "REPEATABLE READ" {
+                old.as_slice()
+            } else {
+                new.as_slice()
+            },
+            "{isolation}"
+        );
         reader.success(&mut engine, "COMMIT", true);
         assert_eq!(data_rows(&reader.success(&mut engine, report, true)), new);
     }
@@ -40,10 +117,15 @@ fn catalog_snapshot_privilege_reports_preserve_selected_grants_and_public_role_r
 #[test]
 fn catalog_snapshot_default_acls_keep_missing_owner_identifiers() {
     let (mut engine, budget) = test_engine();
-    let output = run_with_fixed_memory(&mut engine, &budget, "
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "
         SELECT acldefault('f',12345::oid)::text,acldefault('c',12345::oid)::text,
                acldefault('r',12345::oid) IS NOT NULL;
-    ", 4 << 20);
+    ",
+        4 << 20,
+    );
     assert_eq!(data_rows(&output), ["{=X/12345,12345=X/12345}|{}|t"]);
 }
 
@@ -54,17 +136,38 @@ fn catalog_snapshot_column_grants_union_before_calculating_owner_grant_options()
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE ROLE snapshot_column_reader;
+    session.success(
+        &mut engine,
+        "CREATE ROLE snapshot_column_reader;
         CREATE TABLE snapshot_column_grants(id integer,payload text);
         GRANT SELECT ON snapshot_column_grants TO snapshot_column_reader;
-        GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader", true);
+        GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader",
+        true,
+    );
     let report = "SELECT column_name,is_grantable FROM information_schema.column_privileges
         WHERE table_name='snapshot_column_grants' AND grantee='snapshot_column_reader' ORDER BY column_name,is_grantable";
-    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|NO", "payload|NO"]);
-    session.success(&mut engine, "GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader WITH GRANT OPTION", true);
-    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|NO", "id|YES", "payload|NO"]);
-    session.success(&mut engine, "GRANT postgres TO snapshot_column_reader", true);
-    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|YES", "id|YES", "payload|YES"]);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, report, true)),
+        ["id|NO", "payload|NO"]
+    );
+    session.success(
+        &mut engine,
+        "GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader WITH GRANT OPTION",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, report, true)),
+        ["id|NO", "id|YES", "payload|NO"]
+    );
+    session.success(
+        &mut engine,
+        "GRANT postgres TO snapshot_column_reader",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, report, true)),
+        ["id|YES", "id|YES", "payload|YES"]
+    );
 }
 
 #[test]
@@ -74,18 +177,29 @@ fn catalog_snapshot_usage_reports_include_domains_collations_and_sequence_acl_ro
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE ROLE snapshot_usage_reader;
+    session.success(
+        &mut engine,
+        "CREATE ROLE snapshot_usage_reader;
         CREATE DOMAIN snapshot_usage_domain AS integer;
         CREATE COLLATION snapshot_usage_collation FROM \"C\";
-        CREATE SEQUENCE snapshot_usage_sequence", true);
+        CREATE SEQUENCE snapshot_usage_sequence",
+        true,
+    );
     let report = "SELECT object_name,object_type,grantee,is_grantable FROM information_schema.usage_privileges
         WHERE object_name LIKE 'snapshot_usage_%' ORDER BY object_name,grantee";
-    assert_eq!(data_rows(&session.success(&mut engine, report, true)), [
-        "snapshot_usage_collation|COLLATION|PUBLIC|NO",
-        "snapshot_usage_domain|DOMAIN|PUBLIC|NO",
-        "snapshot_usage_domain|DOMAIN|postgres|YES",
-    ]);
-    session.success(&mut engine, "GRANT USAGE ON SEQUENCE snapshot_usage_sequence TO snapshot_usage_reader", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, report, true)),
+        [
+            "snapshot_usage_collation|COLLATION|PUBLIC|NO",
+            "snapshot_usage_domain|DOMAIN|PUBLIC|NO",
+            "snapshot_usage_domain|DOMAIN|postgres|YES",
+        ]
+    );
+    session.success(
+        &mut engine,
+        "GRANT USAGE ON SEQUENCE snapshot_usage_sequence TO snapshot_usage_reader",
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine, "SELECT object_name,grantee,is_grantable FROM information_schema.role_usage_grants WHERE object_name='snapshot_usage_sequence' ORDER BY grantee", true)), [
         "snapshot_usage_sequence|postgres|YES", "snapshot_usage_sequence|snapshot_usage_reader|NO",
     ]);
@@ -98,22 +212,58 @@ fn catalog_snapshot_role_reports_join_selected_memberships_and_database_owners()
         SELECT grantee,role_name FROM information_schema.administrable_role_authorizations
         WHERE role_name='snapshot_role_target';
         SELECT role_name FROM information_schema.enabled_roles WHERE role_name LIKE 'snapshot_role_%' ORDER BY role_name";
-    let old = ["postgres|pg_database_owner|NO", "snapshot_role_member|snapshot_role_target|NO", "snapshot_role_member", "snapshot_role_target"];
-    let new = ["snapshot_role_target|pg_database_owner|NO", "snapshot_role_renamed|snapshot_role_target|YES", "snapshot_role_renamed|snapshot_role_target", "snapshot_role_renamed", "snapshot_role_target"];
+    let old = [
+        "postgres|pg_database_owner|NO",
+        "snapshot_role_member|snapshot_role_target|NO",
+        "snapshot_role_member",
+        "snapshot_role_target",
+    ];
+    let new = [
+        "snapshot_role_target|pg_database_owner|NO",
+        "snapshot_role_renamed|snapshot_role_target|YES",
+        "snapshot_role_renamed|snapshot_role_target",
+        "snapshot_role_renamed",
+        "snapshot_role_target",
+    ];
     for isolation in ["REPEATABLE READ", "READ COMMITTED"] {
         let config = test_config("snapshot-role-membership-reports");
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(&mut engine, "CREATE ROLE snapshot_role_target; CREATE ROLE snapshot_role_member;
-            GRANT snapshot_role_target TO snapshot_role_member", true);
-        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)), old);
-        writer.success(&mut engine, "ALTER ROLE snapshot_role_member RENAME TO snapshot_role_renamed;
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(
+            &mut engine,
+            "CREATE ROLE snapshot_role_target; CREATE ROLE snapshot_role_member;
+            GRANT snapshot_role_target TO snapshot_role_member",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(
+                &mut engine,
+                &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"),
+                true
+            )),
+            old
+        );
+        writer.success(
+            &mut engine,
+            "ALTER ROLE snapshot_role_member RENAME TO snapshot_role_renamed;
             GRANT snapshot_role_target TO snapshot_role_renamed WITH ADMIN OPTION;
-            ALTER DATABASE postgres OWNER TO snapshot_role_target", true);
-        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), if isolation == "REPEATABLE READ" { old.as_slice() } else { new.as_slice() }, "{isolation}");
+            ALTER DATABASE postgres OWNER TO snapshot_role_target",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, report, true)),
+            if isolation == "REPEATABLE READ" {
+                old.as_slice()
+            } else {
+                new.as_slice()
+            },
+            "{isolation}"
+        );
         reader.success(&mut engine, "COMMIT", true);
         assert_eq!(data_rows(&reader.success(&mut engine, report, true)), new);
     }

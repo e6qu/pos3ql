@@ -197,6 +197,42 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         writer.execute("DROP ROLE IF EXISTS report_reader_diff")
 
 
+def schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome):
+    try:
+        writer.execute("CREATE SCHEMA sr_rename_before_diff")
+        writer.execute("CREATE TABLE sr_rename_before_diff.orders(id integer)")
+        writer.execute("INSERT INTO sr_rename_before_diff.orders VALUES(17)")
+        writer.execute("CREATE VIEW sr_rename_before_diff.order_view AS SELECT id FROM sr_rename_before_diff.orders")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM sr_rename_before_diff.orders; END")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.unbound() RETURNS integer LANGUAGE SQL AS 'SELECT id FROM sr_rename_before_diff.orders'")
+        namespaces = "SELECT nspname FROM pg_namespace WHERE nspname IN ('sr_rename_before_diff','sr_rename_after_diff') ORDER BY nspname"
+        lookup = "SELECT to_regnamespace('sr_rename_before_diff') IS NOT NULL,to_regnamespace('sr_rename_after_diff') IS NOT NULL"
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        record(reader, f"{prefix}.schema_rename.before", namespaces)
+        writer.execute("BEGIN")
+        writer.execute("ALTER SCHEMA sr_rename_before_diff RENAME TO sr_rename_after_diff")
+        record(writer, f"{prefix}.schema_rename.private.owner", namespaces)
+        record(writer, f"{prefix}.schema_rename.private.view", "SELECT * FROM sr_rename_after_diff.order_view")
+        record(writer, f"{prefix}.schema_rename.private.bound", "SELECT sr_rename_after_diff.bound()")
+        record(reader, f"{prefix}.schema_rename.private.observer", namespaces)
+        record(reader, f"{prefix}.schema_rename.private.lookup", lookup)
+        record(reader, f"{prefix}.schema_rename.private.original", "SELECT * FROM sr_rename_before_diff.order_view")
+        writer.execute("ROLLBACK")
+        record(reader, f"{prefix}.schema_rename.rollback", namespaces)
+        writer.execute("ALTER SCHEMA sr_rename_before_diff RENAME TO sr_rename_after_diff")
+        record(reader, f"{prefix}.schema_rename.selected", namespaces)
+        record(reader, f"{prefix}.schema_rename.current_lookup", lookup)
+        record(reader, f"{prefix}.schema_rename.current_view", "SELECT * FROM sr_rename_after_diff.order_view")
+        record(reader, f"{prefix}.schema_rename.current_bound", "SELECT sr_rename_after_diff.bound()")
+        record_outcome(reader, f"{prefix}.schema_rename.current_unbound", "SELECT sr_rename_after_diff.unbound()", ())
+        reader.execute("COMMIT")
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP SCHEMA IF EXISTS sr_rename_before_diff CASCADE")
+        writer.execute("DROP SCHEMA IF EXISTS sr_rename_after_diff CASCADE")
+
+
 def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
     database = writer.execute("SELECT current_database()").fetchone()[0]
     roles = ("sr_owner_diff", "sr_owner_after_diff", "sr_reader_diff", "sr_account_diff", "sr_account_after_diff", "sr_group_diff")
@@ -347,6 +383,7 @@ def transcript(reader, writer, host, port, user, report_database):
         prefix = isolation.lower().replace(" ", "_")
         constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

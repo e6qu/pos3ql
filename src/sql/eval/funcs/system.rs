@@ -1448,9 +1448,14 @@ pub(crate) fn dispatch<'a>(
                 let Some(catalog) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let object = crate::sql::acl::DefaultObject::parse(object_type).ok_or_else(|| {
-                    sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "unrecognized object type abbreviation: {}", object_type)
-                })?;
+                let object =
+                    crate::sql::acl::DefaultObject::parse(object_type).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unrecognized object type abbreviation: {}",
+                            object_type
+                        )
+                    })?;
                 crate::sql::acl::default_acl(object, owner_oid as u32, catalog, arena)
             }
             "current_database" | "current_catalog" => {
@@ -1724,17 +1729,26 @@ pub(crate) fn dispatch<'a>(
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
-                if matches!(name, "has_type_privilege" | "has_schema_privilege" | "has_function_privilege") {
+                if matches!(
+                    name,
+                    "has_type_privilege" | "has_schema_privilege" | "has_function_privilege"
+                ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
                         value => super::super::PrivilegeObject::Oid(
-                            CatalogOid::parse(value)?.expect("non-null object identity").0,
+                            CatalogOid::parse(value)?
+                                .expect("non-null object identity")
+                                .0,
                         ),
                     };
                     let answer = match name {
                         "has_type_privilege" => cat.has_type_privilege(role, target, privilege)?,
-                        "has_schema_privilege" => cat.has_schema_privilege(role, target, privilege)?,
-                        "has_function_privilege" => cat.has_function_privilege(role, target, privilege)?,
+                        "has_schema_privilege" => {
+                            cat.has_schema_privilege(role, target, privilege)?
+                        }
+                        "has_function_privilege" => {
+                            cat.has_function_privilege(role, target, privilege)?
+                        }
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));

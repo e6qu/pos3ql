@@ -120,10 +120,14 @@ pub(crate) fn default_acl<'a>(
     }
     if let Some(privileges) = owner_privileges {
         let source = crate::stack_format!(256, "{}={}/{}", owner, privileges, owner);
-        values[count] = Datum::AclItem(with_identity(owner_oid, owner_oid, source.as_str(), arena)?);
+        values[count] =
+            Datum::AclItem(with_identity(owner_oid, owner_oid, source.as_str(), arena)?);
         count += 1;
     }
-    Ok(Datum::Array { element: ArrElem::AclItem, raw: crate::sql::array::build(&values[..count], arena)? })
+    Ok(Datum::Array {
+        element: ArrElem::AclItem,
+        raw: crate::sql::array::build(&values[..count], arena)?,
+    })
 }
 
 fn write_item(

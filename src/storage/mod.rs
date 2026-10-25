@@ -10047,7 +10047,9 @@ impl CompositeDef {
         self.pending_definition
             .as_ref()
             .filter(|pending| pending.txid == txid)
-            .map_or((self.schema, self.name), |pending| (pending.schema, pending.name))
+            .map_or((self.schema, self.name), |pending| {
+                (pending.schema, pending.name)
+            })
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
@@ -24257,7 +24259,10 @@ impl Storage {
                 })?
             }
             AccessClass::Composite => {
-                let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+                let catalog = self
+                    .type_catalog
+                    .lock()
+                    .expect("type catalog lock poisoned");
                 let created_at = catalog.composites[source_slot].created_at;
                 catalog.composites.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
@@ -41360,7 +41365,10 @@ impl Storage {
     }
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         catalog.composites.iter().position(|definition| {
             if definition.database != current_database() || !definition.visible_to(txid) {
                 return false;
@@ -41377,23 +41385,36 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<usize> {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
-        catalog.composites.iter().position(|definition| {
-            if definition.database != current_database() || !definition.visible_to(txid) {
-                return false;
-            }
-            let (visible_schema, visible_name) = definition.names_for(txid);
-            visible_schema.as_str() == schema && visible_name.as_str() == name
-        }).or_else(|| catalog.composites.iter().position(|definition| {
-            definition.database == current_database()
-                && definition.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-                && definition.pending_definition.as_ref().is_some_and(|pending| {
-                    pending.txid == txid
-                        && (pending.schema != definition.schema || pending.name != definition.name)
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog
+            .composites
+            .iter()
+            .position(|definition| {
+                if definition.database != current_database() || !definition.visible_to(txid) {
+                    return false;
+                }
+                let (visible_schema, visible_name) = definition.names_for(txid);
+                visible_schema.as_str() == schema && visible_name.as_str() == name
+            })
+            .or_else(|| {
+                catalog.composites.iter().position(|definition| {
+                    definition.database == current_database()
+                        && definition.visible_to(txid)
+                        && definition.schema.as_str() == schema
+                        && definition.name.as_str() == name
+                        && definition
+                            .pending_definition
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.txid == txid
+                                    && (pending.schema != definition.schema
+                                        || pending.name != definition.name)
+                            })
                 })
-        }))
+            })
     }
 
     /// Resolve the closed PostgreSQL `ALTER TYPE ... OWNER` target set.
@@ -41486,7 +41507,10 @@ impl Storage {
     }
 
     pub(crate) fn composite_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let composite = &catalog.composites[slot];
         composite.database == current_database() && composite.visible_to(txid)
     }
@@ -58048,7 +58072,7 @@ mod tests {
         assert_send_sync::<DomainIter<'_>>();
         assert_send_sync::<EnumIter<'_>>();
         assert_send_sync::<EnumMemberIter>();
-        assert_send_sync::<CompositeIter<'_>>();
+        assert_send_sync::<CompositeIter<'_, fn(&CompositeDef) -> bool>>();
 
         const WORKERS: usize = 4;
         let mut config = test_config();

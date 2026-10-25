@@ -143,20 +143,36 @@ fn schema_name_composite_lookup_preserves_private_names_and_layouts() {
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
-    writer.success(&mut engine, "CREATE SCHEMA composite_before;
+    writer.success(
+        &mut engine,
+        "CREATE SCHEMA composite_before;
         CREATE TYPE composite_before.row_type AS (id integer,label text);
         CREATE TABLE composite_holder(item composite_before.row_type);
-        INSERT INTO composite_holder VALUES(ROW(7,'original')::composite_before.row_type)", true);
-    writer.success(&mut engine, "BEGIN; ALTER SCHEMA composite_before RENAME TO composite_after", true);
+        INSERT INTO composite_holder VALUES(ROW(7,'original')::composite_before.row_type)",
+        true,
+    );
+    writer.success(
+        &mut engine,
+        "BEGIN; ALTER SCHEMA composite_before RENAME TO composite_after",
+        true,
+    );
     assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_before.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
     assert_eq!(data_rows(&reader.success(&mut engine, "SELECT to_regclass('composite_before.row_type') IS NOT NULL,to_regclass('composite_after.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
-    writer.success(&mut engine, "SAVEPOINT before_type_name; ALTER TYPE composite_after.row_type RENAME TO renamed_type", true);
+    writer.success(
+        &mut engine,
+        "SAVEPOINT before_type_name; ALTER TYPE composite_after.row_type RENAME TO renamed_type",
+        true,
+    );
     assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.renamed_type') IS NOT NULL,to_regclass('composite_after.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
     writer.success(&mut engine, "ROLLBACK TO before_type_name", true);
     assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_after.renamed_type') IS NULL", true)), ["t|t"]);
     writer.success(&mut engine, "ROLLBACK", true);
     assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_before.row_type') IS NOT NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t", "7|original"]);
-    writer.success(&mut engine, "ALTER SCHEMA composite_before RENAME TO composite_after", true);
+    writer.success(
+        &mut engine,
+        "ALTER SCHEMA composite_before RENAME TO composite_after",
+        true,
+    );
     assert_eq!(data_rows(&reader.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_before.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
 }
 

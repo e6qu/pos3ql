@@ -24864,7 +24864,7 @@ fn relation_oid_names_need_only_the_rendered_name_arena() {
     ] {
         let mark = arena.mark();
         crate::mem::guard::forbid_alloc(|| {
-            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name).unwrap();
+            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name).unwrap().unwrap();
             assert_eq!(
                 crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
                 Some(name)

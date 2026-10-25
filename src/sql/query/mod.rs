@@ -3286,7 +3286,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::relname_text(self.storage, self.txid, oid, arena)
     }
 
-    fn reloid(&self, name: &str) -> Option<i32> {
+    fn reloid(&self, name: &str) -> Result<Option<i32>, SqlError> {
         super::catalog::reloid_of_name(self.storage, self.txid, name)
     }
 

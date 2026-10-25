@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
+    let config = test_config("schema-regclass-search-path");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"CREATE SCHEMA hidden_relations;
+        CREATE TABLE hidden_relations."a.b"(id integer);
+        CREATE TABLE public.pg_class(id integer);
+    "#, true);
+    assert_eq!(data_rows(&session.success(&mut engine, r#"
+        SELECT to_regclass('"a.b"') IS NULL;
+        SELECT 'pg_class'::regclass::oid=1259;
+        SELECT to_regclass(quote_ident(current_database())||'.hidden_relations."a.b"')='hidden_relations."a.b"'::regclass;
+        SET search_path TO hidden_relations,public;
+        SELECT '"a.b"'::regclass='hidden_relations."a.b"'::regclass;
+        SELECT pg_table_is_visible('hidden_relations."a.b"'::regclass);
+        SET search_path TO public,pg_catalog;
+        SELECT 'pg_class'::regclass='public.pg_class'::regclass;
+        SELECT NOT pg_table_is_visible('hidden_relations."a.b"'::regclass);
+    "#, true)), ["t", "t", "t", "t", "t", "t", "t"]);
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "SELECT to_regclass('broken..name')", true)), ["42602"]);
+}
+
+#[test]
 fn schema_rename_preserves_typed_reference_literals_and_leaves_text_unchanged() {
     let config = test_config("schema-typed-reference-literals");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -13,7 +39,8 @@ fn schema_rename_preserves_typed_reference_literals_and_leaves_text_unchanged() 
         CREATE DOMAIN typed_before.amount AS integer;
         CREATE FUNCTION typed_before.add_values(a typed_before.amount,b typed_before.amount)
           RETURNS integer LANGUAGE SQL RETURN a+b;
-        CREATE OPERATOR typed_before.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=int4pl);
+        CREATE FUNCTION typed_before.add_integers(a integer,b integer) RETURNS integer LANGUAGE SQL RETURN a+b;
+        CREATE OPERATOR typed_before.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=typed_before.add_integers);
         CREATE COLLATION typed_before.byte_order FROM "C";
         CREATE VIEW typed_reference_view AS SELECT
           'typed_before.items'::regclass AS relation_id,

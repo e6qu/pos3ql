@@ -17910,7 +17910,7 @@ impl Engine {
                 ..
             } => referenced_oid,
             Datum::Text(name) | Datum::Bpchar(name) => {
-                catalog::reloid_of_name(&self.storage, txn.txid, name).ok_or_else(|| {
+                catalog::reloid_of_name(&self.storage, txn.txid, name)?.ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "relation \"{}\" does not exist",

@@ -1308,7 +1308,7 @@ pub trait CatalogAccess {
     /// The relation name for an OID, for rendering `oid::regclass`.
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.
-    fn reloid(&self, name: &str) -> Option<i32>;
+    fn reloid(&self, name: &str) -> Result<Option<i32>, SqlError>;
     /// Resolve a role OID to its catalog name.
     fn role_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
@@ -7249,8 +7249,7 @@ pub(crate) fn regobject_cast<'a>(
                     matches!(target, ColType::Regprocedure | ColType::Regoperator);
                 if matches!(
                     target,
-                    ColType::Regclass
-                        | ColType::Regproc
+                    ColType::Regproc
                         | ColType::Regprocedure
                         | ColType::Regoper
                         | ColType::Regoperator
@@ -7272,7 +7271,7 @@ pub(crate) fn regobject_cast<'a>(
                     )
                 })?;
                 match target {
-                    ColType::Regclass => catalog.reloid(name).ok_or_else(|| {
+                    ColType::Regclass => catalog.reloid(name)?.ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_TABLE,
                             "relation \"{}\" does not exist",

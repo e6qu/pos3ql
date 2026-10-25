@@ -309,13 +309,34 @@ def schema_name_binding_reports(writer, prefix, record):
             writer.execute(pg_sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(pg_sql.Identifier(schema)))
 
 
+def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE SCHEMA sr_hidden_relations_diff')
+        writer.execute('CREATE TABLE sr_hidden_relations_diff."a.b"(id integer)')
+        writer.execute('CREATE TABLE public.pg_class(id integer)')
+        record(writer, f"{prefix}.schema_binding.outside_path", "SELECT to_regclass('\"a.b\"') IS NULL")
+        record(writer, f"{prefix}.schema_binding.implicit_catalog", "SELECT 'pg_class'::regclass::oid=1259")
+        record(writer, f"{prefix}.schema_binding.current_database", "SELECT to_regclass(quote_ident(current_database())||'.sr_hidden_relations_diff.\"a.b\"')='sr_hidden_relations_diff.\"a.b\"'::regclass")
+        writer.execute('SET search_path TO sr_hidden_relations_diff,public')
+        record(writer, f"{prefix}.schema_binding.on_path", "SELECT '\"a.b\"'::regclass='sr_hidden_relations_diff.\"a.b\"'::regclass,pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
+        writer.execute('SET search_path TO public,pg_catalog')
+        record(writer, f"{prefix}.schema_binding.explicit_catalog", "SELECT 'pg_class'::regclass='public.pg_class'::regclass,NOT pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
+        record_outcome(writer, f"{prefix}.schema_binding.invalid_regclass", "SELECT to_regclass('broken..name')", ())
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET search_path')
+        writer.execute('DROP TABLE IF EXISTS public.pg_class')
+        writer.execute('DROP SCHEMA IF EXISTS sr_hidden_relations_diff CASCADE')
+
+
 def schema_reference_literal_reports(writer, prefix, record):
     try:
         writer.execute('CREATE SCHEMA sr_typed_before_diff')
         writer.execute('CREATE TABLE sr_typed_before_diff.items(id integer)')
         writer.execute('CREATE DOMAIN sr_typed_before_diff.amount AS integer')
         writer.execute('CREATE FUNCTION sr_typed_before_diff.add_values(a sr_typed_before_diff.amount,b sr_typed_before_diff.amount) RETURNS integer LANGUAGE SQL RETURN a+b')
-        writer.execute('CREATE OPERATOR sr_typed_before_diff.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=int4pl)')
+        writer.execute('CREATE FUNCTION sr_typed_before_diff.add_integers(a integer,b integer) RETURNS integer LANGUAGE SQL RETURN a+b')
+        writer.execute('CREATE OPERATOR sr_typed_before_diff.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=sr_typed_before_diff.add_integers)')
         writer.execute('CREATE COLLATION sr_typed_before_diff.byte_order FROM "C"')
         writer.execute("""CREATE VIEW sr_typed_reference_view_diff AS SELECT
             'sr_typed_before_diff.items'::regclass AS relation_id,
@@ -504,6 +525,7 @@ def transcript(reader, writer, host, port, user, report_database):
         schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_name_binding_reports(writer, prefix, record)
         schema_reference_literal_reports(writer, prefix, record)
+        schema_regclass_lookup_reports(writer, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

@@ -361,7 +361,9 @@ pub(crate) fn schema_namespace_sources<'arena>(
     kind: StoredSqlKind,
     arena: &'arena Arena,
 ) -> Result<SchemaSqlSources<'arena>, super::eval::SqlError> {
-    let sql = arena.alloc_str(sql).map_err(|_| super::query::arena_full_pub())?;
+    let sql = arena
+        .alloc_str(sql)
+        .map_err(|_| super::query::arena_full_pub())?;
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.namespace_sources = Some(core::cell::RefCell::new(SchemaSqlSourceCollector {
         namespaces: ArenaList::new(arena),

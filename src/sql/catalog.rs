@@ -11750,84 +11750,54 @@ pub fn relname_text<'a>(
 /// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
 /// ordinary tables, synthesized index relations, sequences, plain views, and
 /// named composite backing relations; `None` if no such relation.
-pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
-    let (requested_schema, relation) = name
-        .split_once('.')
-        .map_or((None, name), |(schema, relation)| (Some(schema), relation));
-    let current_temporary_schema = storage.temporary_schema().ok();
-    let classified_schema = storage
-        .classify_relation(requested_schema, relation, txid)
-        .map(|(schema, _)| schema);
-    let schema = match (classified_schema.as_ref(), requested_schema) {
-        (Some(schema), _) => Some(schema.as_str()),
-        (None, Some("pg_temp")) => Some(current_temporary_schema.as_ref()?.as_str()),
-        (None, Some(schema)) if schema.starts_with("pg_temp_") => {
-            if current_temporary_schema
-                .as_ref()
-                .is_none_or(|current| current.as_str() != schema)
-            {
-                return None;
+pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option<i32>, SqlError> {
+    match crate::sql::identifiers::ObjectReference::parse(name)? {
+        crate::sql::identifiers::ObjectReference::Oid(oid) => Ok(Some(oid as i32)),
+        crate::sql::identifiers::ObjectReference::Name(parsed) => {
+            if parsed.database.is_some_and(|database| database != storage.current_database_name(txid)) {
+                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cross-database relation references are not supported"));
             }
-            Some(schema)
+            Ok(relation_oid_for_name(storage, txid, parsed.schema.as_ref().map(SqlName::as_str), parsed.name.as_str()))
         }
-        (None, schema) => schema,
-    };
-    if schema.is_none_or(|schema| schema == "pg_catalog")
-        && let Some(oid) = catalog_relation_oid(relation)
-    {
+    }
+}
+
+fn relation_oid_for_name(storage: &Storage, txid: u32, schema: Option<&str>, name: &str) -> Option<i32> {
+    if let Some(schema) = schema {
+        if schema == "pg_temp" {
+            return relation_oid_in_schema(storage, txid, storage.temporary_schema().ok()?.as_str(), name);
+        }
+        if schema.starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema) { return None; }
+        return relation_oid_in_schema(storage, txid, schema, name);
+    }
+    if let Ok(temporary) = storage.temporary_schema()
+        && let Some(oid) = relation_oid_in_schema(storage, txid, temporary.as_str(), name) {
         return Some(oid);
     }
-    match storage.resolve_relation(schema, relation, txid) {
-        Some(crate::storage::ResolvedRelation::Table(slot)) => {
-            return Some(table_oid(storage, slot));
-        }
+    for entry in storage.path().entries() {
+        let schema = match entry {
+            crate::storage::PathEntry::Catalog => SqlName::parse("pg_catalog").expect("catalog name fits"),
+            crate::storage::PathEntry::Schema(slot) => {
+                let definition = storage.schema_def_for(usize::from(*slot), txid);
+                if !definition.visible_to(txid) { continue; }
+                definition.name
+            }
+        };
+        if let Some(oid) = relation_oid_in_schema(storage, txid, schema.as_str(), name) { return Some(oid); }
+    }
+    None
+}
+
+fn relation_oid_in_schema(storage: &Storage, txid: u32, schema: &str, relation: &str) -> Option<i32> {
+    if schema == "pg_catalog" && let Some(oid) = catalog_relation_oid(relation) { return Some(oid); }
+    match storage.resolve_relation(Some(schema), relation, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => return Some(table_oid(storage, slot)),
         Some(crate::storage::ResolvedRelation::View(slot)) => return Some(view_oid(slot)),
         Some(crate::storage::ResolvedRelation::Catalog) | None => {}
     }
-    for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid)
-            && storage.table_def(slot, txid).name.as_str() == relation
-            && schema.is_none_or(|schema| storage.table_def(slot, txid).schema.as_str() == schema)
-            && (storage.table_def(slot, txid).persistence
-                != crate::storage::RelationPersistence::Temporary
-                || current_temporary_schema
-                    .as_ref()
-                    .is_some_and(|current| *current == storage.table_def(slot, txid).schema))
-        {
-            return Some(table_oid(storage, slot));
-        }
-    }
-    if let Some(oid) = index_oid_by_name(storage, txid, schema, relation) {
-        return Some(oid);
-    }
-    for slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence_for(slot, txid);
-        if storage.sequence_slot_visible_to(slot, txid)
-            && sequence.name.as_str() == relation
-            && schema.is_none_or(|schema| sequence.schema.as_str() == schema)
-            && (sequence.persistence != crate::storage::RelationPersistence::Temporary
-                || current_temporary_schema
-                    .as_ref()
-                    .is_some_and(|current| *current == sequence.schema))
-        {
-            return Some(sequence_oid(slot));
-        }
-    }
-    let composite_slot = schema.map_or_else(
-        || storage.resolve_composite_slot(relation, txid),
-        |schema| storage.composite_slot(schema, relation, txid),
-    );
-    if let Some(slot) = composite_slot {
-        return Some(named_composite_relation_oid(slot));
-    }
-    (0..storage.view_count())
-        .find(|&slot| {
-            storage.view_slot_visible_to(slot, txid)
-                && storage.view(slot).name_for(txid).as_str() == relation
-                && schema
-                    .is_none_or(|schema| storage.view(slot).schema_for(txid).as_str() == schema)
-        })
-        .map(view_oid)
+    if let Some(oid) = index_oid_by_name(storage, txid, Some(schema), relation) { return Some(oid); }
+    if let Some(slot) = storage.sequence_slot(schema, relation, txid) { return Some(sequence_oid(slot)); }
+    storage.composite_slot(schema, relation, txid).map(named_composite_relation_oid)
 }
 
 fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
@@ -11934,12 +11904,12 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     if let Some(name) = catalog_relation_name(oid) {
-        return Some(reloid_of_name(storage, txid, name) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name) == Some(oid));
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid {
             let table = storage.table_def(slot, txid);
-            return Some(reloid_of_name(storage, txid, table.name.as_str()) == Some(oid));
+            return Some(relation_oid_for_name(storage, txid, None, table.name.as_str()) == Some(oid));
         }
     }
     if let Some((_, name)) = index_identity_by_oid(storage, txid, oid) {
@@ -11948,20 +11918,20 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
     for slot in 0..storage.sequence_count() {
         if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid {
             let sequence = storage.sequence_for(slot, txid);
-            return Some(reloid_of_name(storage, txid, sequence.name.as_str()) == Some(oid));
+            return Some(relation_oid_for_name(storage, txid, None, sequence.name.as_str()) == Some(oid));
         }
     }
     for slot in 0..storage.view_count() {
         if storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid {
             return Some(
-                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
+                relation_oid_for_name(storage, txid, None, storage.view(slot).name_for(txid).as_str())
                     == Some(oid),
             );
         }
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if named_composite_relation_oid(slot) == oid {
-            return Some(reloid_of_name(storage, txid, composite.name.as_str()) == Some(oid));
+            return Some(relation_oid_for_name(storage, txid, None, composite.name.as_str()) == Some(oid));
         }
     }
     None
@@ -12073,7 +12043,7 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
             || oid == FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
         {
             return Some(
-                reloid_of_name(storage, txid, table.name.as_str())
+                relation_oid_for_name(storage, txid, None, table.name.as_str())
                     == Some(table_oid(storage, slot)),
             );
         }
@@ -12086,7 +12056,7 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
             || oid == FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
         {
             return Some(
-                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
+                relation_oid_for_name(storage, txid, None, storage.view(slot).name_for(txid).as_str())
                     == Some(view_oid(slot)),
             );
         }
@@ -16249,7 +16219,7 @@ pub fn index_def_text<'a>(
     if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
             Some(
-                if pretty && reloid_of_name(storage, txid, name) == Some(relation) {
+                if pretty && relation_oid_for_name(storage, txid, None, name) == Some(relation) {
                     let (before, after) = definition
                         .split_once("pg_catalog.")
                         .expect("builtin definition names its schema");

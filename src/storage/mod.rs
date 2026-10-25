@@ -15428,6 +15428,50 @@ fn rename_routine_parameters_schema(
     }
 }
 
+fn schema_path_components(remaining: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(remaining);
+    core::iter::from_fn(move || {
+        let current = remaining.take()?;
+        let mut quoted = false;
+        let mut end = current.len();
+        for (at, character) in current.char_indices() {
+            match character {
+                '"' => quoted = !quoted,
+                ',' if !quoted => { end = at; break; }
+                _ => {}
+            }
+        }
+        let component = &current[..end];
+        remaining = if end == current.len() { None } else { Some(&current[end + 1..]) };
+        Some(component)
+    })
+}
+
+fn quoted_identifier_matches(source: &str, name: &str) -> bool {
+    let mut source = source.chars().peekable();
+    let mut name = name.chars();
+    while let Some(character) = source.next() {
+        if character == '"' && source.peek() == Some(&'"') { source.next(); }
+        if name.next() != Some(character) { return false; }
+    }
+    name.next().is_none()
+}
+
+fn write_schema_identifier<const N: usize>(out: &mut StackStr<N>, name: SqlName) {
+    use core::fmt::Write as _;
+    let text = name.as_str();
+    if !crate::sql::eval::ident_needs_quotes(text) {
+        let _ = out.write_str(text);
+        return;
+    }
+    let _ = out.write_char('"');
+    for character in text.chars() {
+        let _ = out.write_char(character);
+        if character == '"' { let _ = out.write_char('"'); }
+    }
+    let _ = out.write_char('"');
+}
+
 pub(crate) fn rename_schema_path(
     path: &mut StackStr<128>,
     old: SqlName,
@@ -15437,17 +15481,27 @@ pub(crate) fn rename_schema_path(
 
     let original = *path;
     let mut rewritten = StackStr::<128>::new();
-    for (index, component) in original.as_str().split(',').enumerate() {
+    for (index, component) in schema_path_components(original.as_str()).enumerate() {
         if index != 0 {
             let _ = rewritten.write_char(',');
         }
-        let component = component.trim();
-        let replacement = if component == old.as_str() {
-            new.as_str()
+        let name = component.trim();
+        let matches = if let Some(inner) = name.strip_prefix('"') {
+            let inner = inner.strip_suffix('"').ok_or_else(|| sql_err!(
+                sqlstate::DATA_EXCEPTION, "stored search path has an unterminated identifier"))?;
+            quoted_identifier_matches(inner, old.as_str())
         } else {
-            component
+            name == old.as_str()
         };
-        let _ = rewritten.write_str(replacement);
+        if matches {
+            let start = component.len() - component.trim_start().len();
+            let end = component.trim_end().len();
+            let _ = rewritten.write_str(&component[..start]);
+            write_schema_identifier(&mut rewritten, new);
+            let _ = rewritten.write_str(&component[end..]);
+        } else {
+            let _ = rewritten.write_str(component);
+        }
     }
     if rewritten.is_truncated() {
         return Err(sql_err!(
@@ -15491,32 +15545,6 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
             }
         }
         bytes.len()
-    }
-
-    fn quoted_identifier_matches(source: &str, name: &str) -> bool {
-        let mut source = source.chars().peekable();
-        let mut name = name.chars();
-        while let Some(character) = source.next() {
-            if character == '"' && source.peek() == Some(&'"') { source.next(); }
-            if name.next() != Some(character) { return false; }
-        }
-        name.next().is_none()
-    }
-
-    fn write_schema_identifier<const N: usize>(out: &mut StackStr<N>, name: SqlName) {
-        let text = name.as_str();
-        if !crate::sql::eval::ident_needs_quotes(text) {
-            let _ = out.write_str(text);
-            return;
-        }
-        let _ = out.write_char('"');
-        for character in text.chars() {
-            let _ = out.write_char(character);
-            if character == '"' {
-                let _ = out.write_char('"');
-            }
-        }
-        let _ = out.write_char('"');
     }
 
     let text = source.as_str();
@@ -29847,28 +29875,14 @@ impl Storage {
         let mut name_buf = [0u8; 63];
         // Elements split on commas outside double quotes (the stored form is
         // canonical: only double-quoted elements may embed commas).
-        let mut rest = raw.trim();
-        while !rest.is_empty() {
-            let mut in_quotes = false;
-            let mut split = rest.len();
-            for (i, c) in rest.char_indices() {
-                match c {
-                    '"' => in_quotes = !in_quotes,
-                    ',' if !in_quotes => {
-                        split = i;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            let element = rest[..split].trim();
-            rest = rest.get(split + 1..).unwrap_or("").trim_start();
+        for element in schema_path_components(raw).map(str::trim) {
             if element.is_empty() {
                 continue;
             }
             // Unquote a `"quoted name"` element ("" is an embedded quote).
             let name: &str = if element.starts_with('"') {
-                let inner = element.trim_matches('"');
+                let inner = element.strip_prefix('"').and_then(|inner| inner.strip_suffix('"'))
+                    .expect("validated search-path identifier has paired quotes");
                 let mut len = 0;
                 let mut bytes = inner.bytes().peekable();
                 while let Some(b) = bytes.next() {

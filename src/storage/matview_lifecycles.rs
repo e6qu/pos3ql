@@ -55,7 +55,10 @@ pub(crate) struct MatviewQueryUndo {
 
 impl core::fmt::Debug for MatviewQueryUndo {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        output.debug_struct("MatviewQueryUndo").field("target", &self.target).finish()
+        output
+            .debug_struct("MatviewQueryUndo")
+            .field("target", &self.target)
+            .finish()
     }
 }
 
@@ -154,32 +157,61 @@ impl Storage {
             },
             backing,
             usage: QueryTargetUse::Retirement,
-            query_version: view.pending_query.map_or(view.query_version, |pending| pending.version),
+            query_version: view
+                .pending_query
+                .map_or(view.query_version, |pending| pending.version),
         })
     }
 
     pub(crate) fn stage_matview_query_schema(
-        &self, target: MatviewEditTarget, old: SqlName, new: SqlName, transaction: u32,
+        &self,
+        target: MatviewEditTarget,
+        old: SqlName,
+        new: SqlName,
+        transaction: u32,
     ) -> Result<MatviewQueryUndo, SqlError> {
         let mut owners = self.catalog_dependency_owners(
-            &self.matviews, type_contracts::CatalogPublicationInput::StoredQueryEdit,
+            &self.matviews,
+            type_contracts::CatalogPublicationInput::StoredQueryEdit,
             Some(target.backing),
         );
         owners.validate_target(transaction, QueryTargetUse::Read)?;
         let slot = target.catalog.slot();
-        let view = owners.catalog.get(slot).copied().filter(|view| {
-            matches!(target.catalog.source.slot(), CatalogObjectSlot::MaterializedView(_))
-                && target.catalog.transaction == transaction
-                && target.catalog.source.matches(self, view.database, view.created_at, view.ddl_state)
-                && view.visible_to(transaction)
-                && view.ddl_version == target.catalog.version
-                && view.pending_query.map_or(view.query_version, |pending| pending.version) == target.query_version
-                && usize::from(view.backing_table) == target.backing.slot()
-                && view.backing_created_at == target.backing.created_at()
-        }).ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE,
-            "materialized query changed after edit preparation"))?;
-        if let Some(owner) = view.pending_query.map(|pending| pending.transaction)
-            .filter(|owner| *owner != transaction) {
+        let view = owners
+            .catalog
+            .get(slot)
+            .copied()
+            .filter(|view| {
+                matches!(
+                    target.catalog.source.slot(),
+                    CatalogObjectSlot::MaterializedView(_)
+                ) && target.catalog.transaction == transaction
+                    && target.catalog.source.matches(
+                        self,
+                        view.database,
+                        view.created_at,
+                        view.ddl_state,
+                    )
+                    && view.visible_to(transaction)
+                    && view.ddl_version == target.catalog.version
+                    && view
+                        .pending_query
+                        .map_or(view.query_version, |pending| pending.version)
+                        == target.query_version
+                    && usize::from(view.backing_table) == target.backing.slot()
+                    && view.backing_created_at == target.backing.created_at()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "materialized query changed after edit preparation"
+                )
+            })?;
+        if let Some(owner) = view
+            .pending_query
+            .map(|pending| pending.transaction)
+            .filter(|owner| *owner != transaction)
+        {
             drop(owners);
             return Err(self.catalog_ddl_wait_error(transaction, owner, "materialized query"));
         }
@@ -189,38 +221,72 @@ impl Storage {
         rename_schema_path(&mut creation_path, old, new)?;
         rename_schema_qualified_sql(&mut sql, &mut [], old, new)?;
         let version = self.catalog_sequence.next()?;
-        let dependency_slot = owners.allocate_preserved_query_image(self,
+        let dependency_slot = owners.allocate_preserved_query_image(
+            self,
             StoredQueryDependencyOwner::MaterializedView(slot as u16),
-            view.pending_query.map(|pending| pending.dependency_slot), transaction)?;
+            view.pending_query.map(|pending| pending.dependency_slot),
+            transaction,
+        )?;
         let count = owners.dependencies.pending[dependency_slot as usize].count;
-        rename_dependency_schema(owners.dependencies.image_mut(
-            self.stored_query_dependency_pending_base + dependency_slot as usize,
-            count, self.stored_query_dependencies_per_image,
-        ), old, new);
+        rename_dependency_schema(
+            owners.dependencies.image_mut(
+                self.stored_query_dependency_pending_base + dependency_slot as usize,
+                count,
+                self.stored_query_dependencies_per_image,
+            ),
+            old,
+            new,
+        );
         owners.catalog[slot].pending_query = Some(PendingMatviewQuery {
-            transaction, version, sql, creation_path, dependency_slot,
+            transaction,
+            version,
+            sql,
+            creation_path,
+            dependency_slot,
         });
         Ok(MatviewQueryUndo {
-            target: CatalogEditTarget { version, ..target.catalog }, prior: view.pending_query,
+            target: CatalogEditTarget {
+                version,
+                ..target.catalog
+            },
+            prior: view.pending_query,
         })
     }
 
-    pub(crate) fn finish_matview_query(&self, undo: MatviewQueryUndo, decision: CatalogDdlDecision) {
+    pub(crate) fn finish_matview_query(
+        &self,
+        undo: MatviewQueryUndo,
+        decision: CatalogDdlDecision,
+    ) {
         let mut owners = self.catalog_dependency_owners(
-            &self.matviews, type_contracts::CatalogPublicationInput::MetadataCommit, None,
+            &self.matviews,
+            type_contracts::CatalogPublicationInput::MetadataCommit,
+            None,
         );
         let slot = undo.target.slot();
         let Some(view) = owners.catalog.get(slot).copied().filter(|view| {
-            matches!(undo.target.source.slot(), CatalogObjectSlot::MaterializedView(_))
-                && undo.target.source.matches(self, view.database, view.created_at, view.ddl_state)
-        }) else { return; };
-        let Some(pending) = view.pending_query.filter(|pending|
-            pending.transaction == undo.target.transaction && pending.version == undo.target.version)
-        else { return; };
+            matches!(
+                undo.target.source.slot(),
+                CatalogObjectSlot::MaterializedView(_)
+            ) && undo
+                .target
+                .source
+                .matches(self, view.database, view.created_at, view.ddl_state)
+        }) else {
+            return;
+        };
+        let Some(pending) = view.pending_query.filter(|pending| {
+            pending.transaction == undo.target.transaction && pending.version == undo.target.version
+        }) else {
+            return;
+        };
         match decision {
             CatalogDdlDecision::Commit => {
-                self.commit_pending_dependencies_in(&mut owners.dependencies,
-                    StoredQueryDependencyOwner::MaterializedView(slot as u16), pending.dependency_slot);
+                self.commit_pending_dependencies_in(
+                    &mut owners.dependencies,
+                    StoredQueryDependencyOwner::MaterializedView(slot as u16),
+                    pending.dependency_slot,
+                );
                 let view = &mut owners.catalog[slot];
                 view.sql = pending.sql;
                 view.creation_path = pending.creation_path;
@@ -228,7 +294,8 @@ impl Storage {
                 view.pending_query = None;
             }
             CatalogDdlDecision::Rollback => {
-                owners.dependencies.pending[pending.dependency_slot as usize] = PendingStoredQueryDependencies::EMPTY;
+                owners.dependencies.pending[pending.dependency_slot as usize] =
+                    PendingStoredQueryDependencies::EMPTY;
                 owners.catalog[slot].pending_query = undo.prior;
             }
         }

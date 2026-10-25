@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn schema_rename_preserves_quoted_search_paths_and_unqualified_bound_queries() {
+    let config = test_config("quoted-schema-paths");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"
+        CREATE SCHEMA "schema,""quoted""";
+        SET search_path TO "schema,""quoted""";
+        CREATE TABLE items(id integer);
+        INSERT INTO items VALUES (12);
+        CREATE VIEW item_view AS SELECT id FROM items;
+        CREATE FUNCTION bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM items; END;
+        BEGIN;
+        ALTER SCHEMA "schema,""quoted""" RENAME TO "Next,""quoted""";
+        SET LOCAL search_path TO "Next,""quoted""";
+    "#, true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT current_schema(); SELECT id FROM item_view; SELECT bound()", true)),
+        ["Next,\"quoted\"", "12", "12"]);
+    session.success(&mut engine, "COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, r#"
+        SET search_path TO "Next,""quoted""";
+        SELECT current_schema(); SELECT id FROM item_view; SELECT bound();
+    "#, true)), ["Next,\"quoted\"", "12", "12"]);
+}
+
+#[test]
 fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss() {
     for checkpoint in [false, true] {
         for decision in ["COMMIT PREPARED", "ROLLBACK PREPARED"] {
@@ -29,7 +57,7 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
             ", false);
             session.success(&mut engine, "BEGIN; ALTER SCHEMA prepared_schema_before RENAME TO prepared_schema_after", true);
             assert_eq!(data_rows(&session.success(&mut engine,
-                "SELECT prepared_schema_after.bound(); SELECT id,state FROM prepared_schema_after.item_view", true)),
+                "SELECT prepared_schema_after.bound(); SELECT id,state FROM prepared_schema_after.items", true)),
                 ["8", "8|ready"]);
             session.success(&mut engine, "PREPARE TRANSACTION 'schema_move'", false);
             if checkpoint { assert!(engine.checkpoint().unwrap()); }
@@ -47,11 +75,16 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
             session.success(&mut cold, &format!("{decision} 'schema_move'"), false);
             let schema = if decision == "COMMIT PREPARED" { "prepared_schema_after" } else { "prepared_schema_before" };
             assert_eq!(data_rows(&session.success(&mut cold, &format!("
-                SELECT {schema}.bound(); SELECT id,state FROM {schema}.item_view;
+                SELECT {schema}.bound(); SELECT id,state FROM {schema}.items;
                 SELECT obj_description('{schema}'::regnamespace,'pg_namespace');
+            "), true)), ["8", "8|ready", "prepared namespace"], "{name}");
+            // View materialization writes simulator objects, whose fixture
+            // vectors grow. The rename and direct metadata reads stay guarded.
+            assert_eq!(data_rows(&session.success(&mut cold, &format!("
+                SELECT id,state FROM {schema}.item_view;
                 REFRESH MATERIALIZED VIEW prepared_schema_cache;
                 SELECT id FROM prepared_schema_cache;
-            "), true)), ["8", "8|ready", "prepared namespace", "8"], "{name}");
+            "), false)), ["8|ready", "8"], "{name}");
             drop(session);
             drop(cold);
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

@@ -10000,7 +10000,11 @@ fn catalog_owner(
     txid: u32,
 ) -> CatalogOwner {
     if matches!(object.class, crate::storage::AccessClass::Schema)
-        && storage.schema_def_for(usize::from(object.slot), txid).name.as_str() == "public"
+        && storage
+            .schema_def_for(usize::from(object.slot), txid)
+            .name
+            .as_str()
+            == "public"
     {
         CatalogOwner::DatabaseOwner
     } else {
@@ -10597,7 +10601,12 @@ fn pg_default_acl<'a>(
         } else {
             namespace_oid(
                 storage,
-                storage.schema_def_for(entry.schema as usize, txid).name.as_str(), txid)
+                storage
+                    .schema_def_for(entry.schema as usize, txid)
+                    .name
+                    .as_str(),
+                txid,
+            )
         };
         let object_type = match entry.class {
             DefaultPrivilegeClass::Table => "r",
@@ -10680,12 +10689,17 @@ pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i3
             storage.table_slot_visible_to(slot, txid)
                 && storage.table_def(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str(), txid) == oid
+                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str(), txid)
+                    == oid
         }) || (0..storage.sequence_count()).any(|slot| {
             storage.sequence_slot_visible_to(slot, txid)
                 && storage.sequence_for(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.sequence_for(slot, txid).schema.as_str(), txid) == oid
+                && namespace_oid(
+                    storage,
+                    storage.sequence_for(slot, txid).schema.as_str(),
+                    txid,
+                ) == oid
         }))
 }
 
@@ -11849,7 +11863,8 @@ fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Op
     }
     for entry in storage.path().entries() {
         if let crate::storage::PathEntry::Schema(schema) = entry
-            && let Some(slot) = in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
+            && let Some(slot) =
+                in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
         {
             return Some(slot);
         }
@@ -13043,9 +13058,12 @@ pub(crate) fn operator_oid_by_name(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin()?,
-            crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def_for(usize::from(*slot), txid).name.as_str())?
-            }
+            crate::storage::PathEntry::Schema(slot) => user(
+                storage
+                    .schema_def_for(usize::from(*slot), txid)
+                    .name
+                    .as_str(),
+            )?,
         };
         if found.is_some() {
             return Ok(found);
@@ -13699,9 +13717,9 @@ pub fn function_arguments_text<'a>(
             &mut output,
             parameter.ctype,
             parameter.user_type,
-            parameter
-                .user_type
-                .is_some_and(|type_identity| !storage.schema_is_on_path(type_identity.schema, txid)),
+            parameter.user_type.is_some_and(|type_identity| {
+                !storage.schema_is_on_path(type_identity.schema, txid)
+            }),
         )
         .map_err(|_| super::eval::arena_full())?;
         if !identity && let Some(default) = parameter.mode.default() {
@@ -13892,9 +13910,12 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
-            crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def_for(usize::from(*slot), txid).name.as_str())
-            }
+            crate::storage::PathEntry::Schema(slot) => user(
+                storage
+                    .schema_def_for(usize::from(*slot), txid)
+                    .name
+                    .as_str(),
+            ),
         };
         if found.is_some() {
             return found;
@@ -19764,7 +19785,9 @@ fn pg_class<'a>(
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.table_slot, txid).schema.as_str(), txid)),
+                    storage.table_def(info.table_slot, txid).schema.as_str(),
+                    txid,
+                )),
                 text(
                     if info
                         .explicit_definition
@@ -20459,7 +20482,9 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.table_slot, txid).schema.as_str(), txid)),
+                    storage.table_def(info.table_slot, txid).schema.as_str(),
+                    txid,
+                )),
                 text(" ", arena)?,
                 Datum::Bool(info.constraint_parent_oid == 0),
                 Datum::Int4(i32::from(info.constraint_parent_oid != 0)),
@@ -20542,7 +20567,9 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.child_slot, txid).schema.as_str(), txid)),
+                    storage.table_def(info.child_slot, txid).schema.as_str(),
+                    txid,
+                )),
                 text("s", arena)?,
                 Datum::Bool(constraint_parent_oid == 0),
                 Datum::Int4(i32::from(constraint_parent_oid != 0)),
@@ -20597,7 +20624,9 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(table, txid).schema.as_str(), txid)),
+                    storage.table_def(table, txid).schema.as_str(),
+                    txid,
+                )),
                 text(" ", arena)?,
                 Datum::Bool(true),
                 Datum::Int4(0),
@@ -20633,7 +20662,9 @@ fn pg_constraint_values<'a>(
             clone[2] = Datum::Int4(table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
-                storage.table_def(child, txid).schema.as_str(), txid));
+                storage.table_def(child, txid).schema.as_str(),
+                txid,
+            ));
             out[n] = row(&clone, arena)?;
             n += 1;
         }
@@ -20689,7 +20720,9 @@ fn pg_constraint_values<'a>(
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(
                         storage,
-                        storage.table_def(slot, txid).schema.as_str(), txid)),
+                        storage.table_def(slot, txid).schema.as_str(),
+                        txid,
+                    )),
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
                     Datum::Int4(inheritance_count as i32),
@@ -21118,7 +21151,12 @@ fn pg_extension<'a>(
                 )),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.schema_def_for(namespace as usize, txid).name.as_str(), txid)),
+                    storage
+                        .schema_def_for(namespace as usize, txid)
+                        .name
+                        .as_str(),
+                    txid,
+                )),
                 Datum::Bool(relocatable),
                 text(version.as_str(), arena)?,
                 extconfig,
@@ -21164,7 +21202,11 @@ fn extension_dependency_catalog_identity(
         }
         AccessClass::Schema => (
             PG_NAMESPACE_OID,
-            namespace_oid(storage, storage.schema_def_for(slot, txid).name.as_str(), txid),
+            namespace_oid(
+                storage,
+                storage.schema_def_for(slot, txid).name.as_str(),
+                txid,
+            ),
         ),
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
@@ -26837,7 +26879,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(1255),
                 Datum::Int4(crate::storage::routine_oid(&routine)),
                 text(routine.name_for(txid).as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str(), txid)),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    routine.schema_for(txid).as_str(),
+                    txid,
+                )),
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Function { .. }

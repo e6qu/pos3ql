@@ -232,6 +232,41 @@ mod tests {
     use crate::storage::tests::{test_budget, test_config};
 
     #[test]
+    fn schema_name_paths_preserve_quoted_commas_quotes_and_unrelated_spacing() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let old = SqlName::parse("schema,\"quoted\"").unwrap();
+        let new = SqlName::parse("Next,\"quoted\"").unwrap();
+        let slot = storage.create_schema(old).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut path = crate::util::StackStr::from_str(" public, \"schema,\"\"quoted\"\"\", \"$user\" ");
+            super::super::rename_schema_path(&mut path, old, new).unwrap();
+            assert_eq!(path.as_str(), " public, \"Next,\"\"quoted\"\"\", \"$user\" ");
+            let undo = storage.stage_schema_name(storage.prepare_schema_name(slot, 7).unwrap(), new).unwrap();
+            let resolved = storage.compute_path(path.as_str(), "postgres", 7);
+            assert!(resolved.entries().contains(&super::super::PathEntry::Schema(slot as u16)));
+            storage.finish_schema_name(undo, CatalogDdlDecision::Rollback).unwrap();
+            let unchanged = path;
+            super::super::rename_schema_path(&mut path, old, new).unwrap();
+            assert_eq!(path, unchanged);
+        });
+    }
+
+    #[test]
+    fn schema_name_path_exhaustion_preserves_the_complete_source() {
+        let old = SqlName::parse("old").unwrap();
+        let new = SqlName::parse(&"\"".repeat(63)).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut path = crate::util::StackStr::from_str("public,old");
+            let original = path;
+            assert_eq!(super::super::rename_schema_path(&mut path, old, new).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(path, original);
+        });
+    }
+
+    #[test]
     fn schema_name_private_versions_preserve_other_readers_and_nested_rollback() {
         let config = test_config();
         let mut budget = test_budget(&config);

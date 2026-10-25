@@ -2821,7 +2821,10 @@ impl Engine {
                         let _ = write!(
                             published.names[published.n],
                             "{}",
-                            self.storage.schema_def_for(*slot as usize, txn.txid).name.as_str()
+                            self.storage
+                                .schema_def_for(*slot as usize, txn.txid)
+                                .name
+                                .as_str()
                         );
                         published.n += 1;
                     }
@@ -3758,7 +3761,13 @@ impl Engine {
         }
         validate_checkpoint_prepared_batches(&expected_prepared, &recovered)?;
         let mut work = QueryWorkspaces::new(config, budget)?;
-        replay_transaction_batches(&mut storage, &mut prepared_transactions, &recovered, floor, &mut work)?;
+        replay_transaction_batches(
+            &mut storage,
+            &mut prepared_transactions,
+            &recovered,
+            floor,
+            &mut work,
+        )?;
         u32::try_from(storage.latest_transaction_identity()).map_err(|_| {
             EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
                 "recovered transaction identity exceeds the internal counter",
@@ -5857,7 +5866,10 @@ impl Engine {
                 )
             } else {
                 let (namespace, relocatable, version) = extension.definition_to(txn.txid);
-                let schema = self.storage.schema_def_for(namespace as usize, txn.txid).name;
+                let schema = self
+                    .storage
+                    .schema_def_for(namespace as usize, txn.txid)
+                    .name;
                 let object = crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Extension,
                     slot: slot as u16,
@@ -6295,7 +6307,9 @@ impl Engine {
             let schema = if entry.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
                 crate::storage::SqlName::EMPTY
             } else {
-                self.storage.schema_def_for(entry.schema as usize, txn.txid).name
+                self.storage
+                    .schema_def_for(entry.schema as usize, txn.txid)
+                    .name
             };
             let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
@@ -7252,12 +7266,13 @@ impl Engine {
                     self.storage.commit_schema_create(*slot as usize);
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
-                DdlUndo::MatviewQueryChanged(undo) => self.storage.finish_matview_query(
-                    *undo, crate::storage::CatalogDdlDecision::Commit,
-                ),
-                DdlUndo::SchemaRenamed(undo) => self.storage.finish_schema_name(
-                    *undo, crate::storage::CatalogDdlDecision::Commit,
-                ).expect("schema publication retains its selected source"),
+                DdlUndo::MatviewQueryChanged(undo) => self
+                    .storage
+                    .finish_matview_query(*undo, crate::storage::CatalogDdlDecision::Commit),
+                DdlUndo::SchemaRenamed(undo) => self
+                    .storage
+                    .finish_schema_name(*undo, crate::storage::CatalogDdlDecision::Commit)
+                    .expect("schema publication retains its selected source"),
                 DdlUndo::ExtensionCreated(slot) => self
                     .storage
                     .commit_extension_create(*slot as usize, txn.txid),
@@ -7305,7 +7320,9 @@ impl Engine {
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
-                DdlUndo::CommentIdentityChanged { slot, .. } => self.storage.commit_comment_identity(*slot as usize, txn.txid),
+                DdlUndo::CommentIdentityChanged { slot, .. } => self
+                    .storage
+                    .commit_comment_identity(*slot as usize, txn.txid),
             }
         }
         for &advance in txn.subscription_advances() {
@@ -20212,12 +20229,12 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         }
         DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
         DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
-        DdlUndo::MatviewQueryChanged(undo) => storage.finish_matview_query(
-            undo, crate::storage::CatalogDdlDecision::Rollback,
-        ),
-        DdlUndo::SchemaRenamed(undo) => storage.finish_schema_name(
-            undo, crate::storage::CatalogDdlDecision::Rollback,
-        ).expect("schema rollback retains its selected source"),
+        DdlUndo::MatviewQueryChanged(undo) => {
+            storage.finish_matview_query(undo, crate::storage::CatalogDdlDecision::Rollback)
+        }
+        DdlUndo::SchemaRenamed(undo) => storage
+            .finish_schema_name(undo, crate::storage::CatalogDdlDecision::Rollback)
+            .expect("schema rollback retains its selected source"),
         DdlUndo::ExtensionCreated(slot) => storage.rollback_extension_create(slot as usize),
         DdlUndo::ExtensionDropped(slot) => storage.rollback_extension_drop(slot as usize, txid),
         DdlUndo::ExtensionAltered { slot, prior } => {
@@ -20564,23 +20581,47 @@ fn replay_transaction_batches(
                         )
                     })? {
                         WalOp::CreateSchema(name) => {
-                            let selected = storage.create_schema_in(crate::storage::SqlName::parse(name)?, transaction_id)?;
-                            prepared.slot_mut(slot).transaction.record_catalog_change(storage, DdlUndo::SchemaCreated(selected as u32))?;
+                            let selected = storage.create_schema_in(
+                                crate::storage::SqlName::parse(name)?,
+                                transaction_id,
+                            )?;
+                            prepared.slot_mut(slot).transaction.record_catalog_change(
+                                storage,
+                                DdlUndo::SchemaCreated(selected as u32),
+                            )?;
                         }
                         WalOp::DropSchema(name) => {
-                            let selected = storage.find_schema_visible(name, transaction_id)
-                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction drops an unknown schema"))?;
+                            let selected = storage
+                                .find_schema_visible(name, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "prepared transaction drops an unknown schema"
+                                    )
+                                })?;
                             storage.drop_schema_in(selected, transaction_id)?;
-                            prepared.slot_mut(slot).transaction.record_catalog_change(storage, DdlUndo::SchemaDropped(selected as u32))?;
+                            prepared.slot_mut(slot).transaction.record_catalog_change(
+                                storage,
+                                DdlUndo::SchemaDropped(selected as u32),
+                            )?;
                         }
                         WalOp::RenameSchema { name, new_name } => {
-                            let selected = storage.find_schema_visible(name, transaction_id)
-                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction renames an unknown schema"))?;
+                            let selected = storage
+                                .find_schema_visible(name, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "prepared transaction renames an unknown schema"
+                                    )
+                                })?;
                             arena.reset();
-                            exec::stage_schema_rename(storage, &mut prepared.slot_mut(slot).transaction,
-                                selected, crate::storage::SqlName::parse(new_name)?, arena)?;
+                            exec::stage_schema_rename(
+                                storage,
+                                &mut prepared.slot_mut(slot).transaction,
+                                selected,
+                                crate::storage::SqlName::parse(new_name)?,
+                                arena,
+                            )?;
                             arena.reset();
                         }
                         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => {

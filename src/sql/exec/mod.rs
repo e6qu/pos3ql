@@ -692,8 +692,8 @@ mod copy_transition;
 mod partition_insert;
 mod partition_update;
 mod schema;
-pub(super) use schema::rename as stage_schema_rename;
 pub(crate) use copy_transition::CopyTransitionRows;
+pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_composite_fields};
@@ -6258,8 +6258,11 @@ pub fn alter_schema(
                 ));
             };
             if storage.find_schema_visible(new_name, txn.txid).is_some() {
-                return sql_fail(sql_err!(sqlstate::DUPLICATE_SCHEMA,
-                    "schema \"{}\" already exists", new_name));
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_SCHEMA,
+                    "schema \"{}\" already exists",
+                    new_name
+                ));
             }
             let object = crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
@@ -6269,16 +6272,23 @@ pub fn alter_schema(
                 return sql_fail(error);
             }
             let Some(role) = storage.current_role_slot(txn.txid) else {
-                return sql_fail(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "current role is not present in the role catalog"));
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                ));
             };
             if !storage.has_current_database_create_privilege(role, txn.txid) {
-                return sql_fail(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "permission denied for database"));
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for database"
+                ));
             }
             if new_name.starts_with("pg_") {
-                return sql_fail(sql_err!(sqlstate::RESERVED_NAME,
-                    "unacceptable schema name \"{}\"", new_name));
+                return sql_fail(sql_err!(
+                    sqlstate::RESERVED_NAME,
+                    "unacceptable schema name \"{}\"",
+                    new_name
+                ));
             }
             let new_name = match SqlName::parse(new_name) {
                 Ok(name) => name,
@@ -12087,9 +12097,13 @@ pub(crate) fn drop_schema(
     // Everything the drop sweeps up, across all listed schemas.
     let schema_transaction = txn.txid;
     let in_listed = |storage: &Storage, schema: &str| {
-        slots[..n_slots]
-            .iter()
-            .any(|&slot| storage.schema_def_for(slot, schema_transaction).name.as_str() == schema)
+        slots[..n_slots].iter().any(|&slot| {
+            storage
+                .schema_def_for(slot, schema_transaction)
+                .name
+                .as_str()
+                == schema
+        })
     };
     let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
     {
@@ -12769,7 +12783,11 @@ pub(crate) fn drop_schema(
     let in_path = |storage: &Storage, schema: &str| {
         storage.path().entries().iter().any(|e| match e {
             crate::storage::PathEntry::Schema(slot) => {
-                storage.schema_def_for(*slot as usize, txn.txid).name.as_str() == schema
+                storage
+                    .schema_def_for(*slot as usize, txn.txid)
+                    .name
+                    .as_str()
+                    == schema
             }
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
         })
@@ -34861,7 +34879,8 @@ pub(crate) fn resolve_routine_identity(
             let crate::storage::PathEntry::Schema(slot) = entry else {
                 continue;
             };
-            if let Some(slot) = find_in(storage.schema_def_for(*slot as usize, txid).name.as_str())? {
+            if let Some(slot) = find_in(storage.schema_def_for(*slot as usize, txid).name.as_str())?
+            {
                 found = Some(slot);
                 break;
             }
@@ -51620,7 +51639,10 @@ pub fn reindex(
                     .iter()
                     .find_map(|entry| match entry {
                         crate::storage::PathEntry::Schema(slot) => storage.index_definition(
-                            storage.schema_def_for(*slot as usize, txn.txid).name.as_str(),
+                            storage
+                                .schema_def_for(*slot as usize, txn.txid)
+                                .name
+                                .as_str(),
                             name.name,
                             txn.txid,
                         ),

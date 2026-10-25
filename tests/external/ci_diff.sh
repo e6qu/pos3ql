@@ -1597,6 +1597,11 @@ if "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --host "$PGHOST" --port "$PGPORT" --user "$PGUSER" --database postgres \
     --metadata-output "$EVIDENCE/catalog-metadata.json" \
     --output "$EVIDENCE/catalog-postgresql.json" > "$EVIDENCE/catalog-reference.log" 2>&1 \
+  && "$PY" tools/generate-pg18-view-definitions.py \
+    --metadata "$EVIDENCE/catalog-metadata.json" \
+    --source "PostgreSQL 18.6 comparison service" \
+    --mode check --output src/sql/catalog_view_definitions.rs \
+    >> "$EVIDENCE/catalog-reference.log" 2>&1 \
   && "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --host 127.0.0.1 --port "$P3_PORT" --user "$PGUSER" --database postgres \
     --reference "$EVIDENCE/catalog-postgresql.json" \

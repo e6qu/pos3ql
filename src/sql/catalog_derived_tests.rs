@@ -161,3 +161,98 @@ fn catalog_snapshot_derived_usage_is_distinct_and_checks_referenced_ownership() 
          RESET ROLE;", true)),
         ["1", "id", "payload", "derived_repeated|t", "0", "0", "0", "t"]);
 }
+
+#[test]
+fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        for decision in ["COMMIT", "COMMIT PREPARED", "ROLLBACK PREPARED"] {
+            let name = format!("derived-recovery-{checkpoint}-{decision}");
+            let mut config = test_config(&name);
+            config.max_prepared_transactions = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            // Simulator uploads own growing fixture vectors; execution and
+            // metadata reads remain under the production allocation guard.
+            session.success(&mut engine, SETUP, false);
+            session.success(&mut engine, "BEGIN", true);
+            session.success(&mut engine, CHANGE, true);
+            assert_eq!(data_rows(&session.success(&mut engine, REPORT, true)), NEW);
+            if decision == "COMMIT" {
+                session.success(&mut engine, "COMMIT", false);
+            } else {
+                session.success(&mut engine, "PREPARE TRANSACTION 'derived-reports'", false);
+                assert_eq!(data_rows(&session.success(&mut engine, REPORT, true)), OLD);
+            }
+            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            if decision != "COMMIT" {
+                assert_eq!(data_rows(&session.success(&mut cold, REPORT, true)), OLD);
+                session.success(&mut cold, &format!("{decision} 'derived-reports'"), false);
+            }
+            assert_eq!(data_rows(&session.success(&mut cold, REPORT, true)),
+                if decision == "ROLLBACK PREPARED" { OLD } else { NEW }, "{name}");
+            drop(session);
+            drop(cold);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn catalog_snapshot_derived_builtins_return_postgresql_definitions() {
+    let (mut engine, budget) = test_engine();
+    let result = run_with_fixed_memory(&mut engine, &budget,
+        "SELECT viewname,definition IS NOT NULL,definition=pg_get_viewdef(('pg_catalog.'||viewname)::regclass)
+           FROM pg_views WHERE schemaname='pg_catalog' AND viewname IN ('pg_views','pg_matviews','pg_sequences') ORDER BY viewname", 4 << 20);
+    assert_eq!(data_rows(&result), ["pg_matviews|t|t", "pg_sequences|t|t", "pg_views|t|t"]);
+}
+
+#[test]
+fn catalog_snapshot_privilege_lists_accept_any_grant_and_validate_every_item() {
+    let config = test_config("catalog-privilege-lists");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE ROLE list_reader;
+         CREATE TABLE list_table(id integer);
+         CREATE SEQUENCE list_sequence;
+         GRANT SELECT ON list_table TO list_reader;
+         GRANT UPDATE ON SEQUENCE list_sequence TO list_reader;
+         GRANT SET ON PARAMETER track_functions TO list_reader;
+         SET ROLE list_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT has_table_privilege('list_table','SELECT, INSERT'),
+                has_column_privilege('list_table','id','UPDATE, SELECT'),
+                has_any_column_privilege('list_table','SELECT, UPDATE'),
+                has_sequence_privilege('list_sequence','SELECT, UPDATE, USAGE'),
+                has_parameter_privilege('track_functions','SET, ALTER SYSTEM'),
+                has_table_privilege('list_table','SELECT WITH GRANT OPTION, INSERT');
+         SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='list_sequence';
+         SELECT last_value IS NULL FROM pg_sequences WHERE sequencename='list_sequence'", true)),
+        ["t|t|t|t|t|f", "list_sequence", "t"]);
+    for sql in [
+        "SELECT has_table_privilege('list_table','SELECT, USAGE')",
+        "SELECT has_table_privilege('list_table','ALL')",
+        "SELECT has_column_privilege('list_table','id','SELECT, DELETE')",
+        "SELECT has_sequence_privilege('list_sequence','UPDATE, INSERT')",
+        "SELECT has_parameter_privilege('track_functions','SET, ALL')",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert_eq!(error_sqlstates(&output), ["22023"], "{sql}: {}", String::from_utf8_lossy(&output));
+    }
+}

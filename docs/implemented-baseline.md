@@ -1137,16 +1137,40 @@ whole-statement catalog capture or SQL execution on several CPU workers.
 
 With `transaction_mode = mvcc`, catalog listings retain the rows selected by
 their statement or transaction. A read-committed statement can select newer
-rows; a repeatable-read transaction keeps its earlier listing. `pg_tables`,
-`pg_roles`, `information_schema.tables` and `information_schema.columns` build
-their results from those selected base rows. Remaining derived views are
-tracked in [PLAN.md](../PLAN.md).
+rows; a repeatable-read transaction keeps its earlier listing. These reports
+build their results by joining the selected base rows:
+
+- `pg_tables`, `pg_roles`, `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
+- `information_schema.tables`, `columns`, `views`, `sequences`,
+  `view_table_usage` and `view_column_usage`.
+
+Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
 
 **User example:** start a repeatable-read report listing `orders`. Another
 connection renames it to `sales` and commits. The report can still list
 `orders`, while `to_regclass('sales')` resolves the current name. An owner's
 displayed account name can also change after that account is renamed. Listing
 an old definition and resolving an object for use are different operations.
+
+The same report can keep a view's old name and check option, a materialized
+view's selected index and population flags, and a sequence's earlier increment.
+The sequence's latest value and its access checks remain current. For example,
+after another connection changes an increment from 2 to 5, an older
+`pg_sequences` listing can still show 2 while `last_value` reflects a later call
+to `nextval`.
+
+Information-schema reports apply current access checks. A user with SELECT on
+someone else's view can list it, but its definition is NULL unless its owner
+role is enabled. View dependencies list referenced tables and columns only
+when their owner role is enabled, and repeated references produce one output
+row. Identity sequences are excluded from `information_schema.sequences`.
+These joins and permission rules follow the pinned
+[PostgreSQL definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
+
+`pg_sequences.data_type` has type `regtype`; information-schema names have type
+`name`, and its textual details have type `character varying`. System view
+definitions come from retained PostgreSQL 18.6 metadata, with provenance in the
+generated source. The PostgreSQL comparison checks those definitions on each run.
 
 Set `catalog_history_bytes` explicitly before startup; `16MiB` is one example
 for MVCC mode. It reserves space for earlier catalog rows. A full reservation

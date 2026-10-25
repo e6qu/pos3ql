@@ -27,6 +27,8 @@ mod schema;
 
 #[path = "catalog_view_rows.rs"]
 mod view_rows;
+#[path = "catalog_view_definitions.rs"]
+mod view_definitions;
 #[path = "catalog_views.rs"]
 mod views;
 
@@ -13795,6 +13797,11 @@ pub fn view_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    if let Some(name) = catalog_relation_name(oid) {
+        return Ok(view_definitions::DEFINITIONS
+            .iter()
+            .find_map(|(candidate, sql)| (*candidate == name).then_some(*sql)));
+    }
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
             continue;

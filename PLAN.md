@@ -43,11 +43,11 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Finish connecting derived system and information-schema views to selected
-  base rows, beyond the views covered in the behavior guide. Preserve
-  PostgreSQL's column shapes, joins and current permission checks. For example,
-  `pg_views` and `information_schema.views` must keep the view names an older
-  report selected.
+- Finish connecting the remaining derived reports, including index, schema,
+  constraint, routine, role and privilege views, to selected base rows. Preserve
+  PostgreSQL's column shapes, joins and current permission checks. The behavior
+  guide identifies the connected table, column, view, rule, sequence and
+  view-dependency reports and their current-lookup boundaries.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

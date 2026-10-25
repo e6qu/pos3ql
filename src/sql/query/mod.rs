@@ -4258,7 +4258,7 @@ fn privilege_query(
     has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
     has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
 ) -> Result<bool, SqlError> {
-    let mut answer = true;
+    let mut answer = false;
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
@@ -4270,9 +4270,7 @@ fn privilege_query(
             (item, false)
         };
         let privilege =
-            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
-                all
-            } else if name.eq_ignore_ascii_case("select") {
+            if name.eq_ignore_ascii_case("select") {
                 crate::storage::PrivilegeSet::SELECT
             } else if name.eq_ignore_ascii_case("insert") {
                 crate::storage::PrivilegeSet::INSERT
@@ -4305,12 +4303,18 @@ fn privilege_query(
                     name
                 ));
             };
+        if !all.contains(privilege) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized privilege type: \"{}\"", name
+            ));
+        }
         let allowed = if grant_option {
             has_grant_option(privilege)
         } else {
             catalog_default.contains(privilege) || has_privilege(privilege)
         };
-        answer &= allowed;
+        answer |= allowed;
     }
     Ok(answer)
 }
@@ -4346,7 +4350,7 @@ fn parameter_privilege_query(
     has_privilege: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
     has_grant_option: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
 ) -> Result<bool, SqlError> {
-    let mut answer = true;
+    let mut answer = false;
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
@@ -4358,9 +4362,7 @@ fn parameter_privilege_query(
             (item, false)
         };
         let privilege =
-            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
-                crate::sql::ast::ParameterPrivileges::ALL
-            } else if name.eq_ignore_ascii_case("set") {
+            if name.eq_ignore_ascii_case("set") {
                 crate::sql::ast::ParameterPrivileges::SET
             } else if name.eq_ignore_ascii_case("alter system") {
                 crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM
@@ -4371,7 +4373,7 @@ fn parameter_privilege_query(
                     name
                 ));
             };
-        answer &= if grant_option {
+        answer |= if grant_option {
             has_grant_option(privilege)
         } else {
             has_privilege(privilege)

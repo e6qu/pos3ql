@@ -153,6 +153,20 @@ container image. It includes the input/output routine identities reported by
 `pg_type`; user-defined domains, enums, arrays and row types derive those
 identities from their type definitions.
 
+The catalog comparison also checks built-in view SQL against the PostgreSQL
+service. To regenerate its static definitions from retained `catalog-metadata.json`
+evidence, supply the evidence URL and destination explicitly:
+
+```sh
+python3 tools/generate-pg18-view-definitions.py --mode write \
+  --metadata /path/to/catalog-metadata.json --source https://example/evidence \
+  --output src/sql/catalog_view_definitions.rs
+```
+
+The generator requires PostgreSQL 18.6, records the metadata checksum and source,
+and retains the upstream license reference. Its `check` mode compares SQL while
+preserving the provenance of the checked-in generation.
+
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
 Pass the selected ownership filters together to share one interpreter startup;

@@ -868,6 +868,10 @@ calls `nextval('orders.ticket')` keeps using that sequence after `orders` become
 `'orders.items'::regclass`, follow the object. Ordinary text stays unchanged;
 `nextval('orders.ticket'::text)` resolves its text when called and can fail after
 the rename. Quoted names preserve their Unicode characters, dots and quotes.
+Object-name strings follow PostgreSQL lookup rules: `to_regclass('bad..name')`
+returns `NULL`, while `'bad..name'::regclass` reports invalid name syntax.
+`'ticket-1'::regclass` can name a table created as `"ticket-1"`;
+`parse_ident('ticket-1')` still rejects it as an unquoted SQL identifier.
 Sequence calls also accept `regclass`, `oid` and integer identifiers, following
 [PostgreSQL 18.6's input casts](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_cast.dat#L95-L102).
 

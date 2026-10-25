@@ -69,9 +69,11 @@ pub(crate) enum ObjectReference {
 
 impl ObjectReference {
     pub(crate) fn parse(input: &str) -> Result<Self, SqlError> {
-        let trimmed = input.trim();
-        if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-            trimmed.parse::<u32>().map(Self::Oid).map_err(|_| {
+        if input == "-" {
+            return Ok(Self::Oid(0));
+        }
+        if !input.is_empty() && input.bytes().all(|byte| byte.is_ascii_digit()) {
+            input.parse::<u32>().map(Self::Oid).map_err(|_| {
                 sql_err!(
                     sqlstate::NUMERIC_OUT_OF_RANGE,
                     "object identifier is out of range"
@@ -87,7 +89,7 @@ impl QualifiedObjectName {
     pub(crate) fn parse(input: &str) -> Result<Self, SqlError> {
         let mut names = [SqlName::EMPTY; 3];
         let mut count = 0;
-        for_each_qualified_identifier(input, true, |part| {
+        for_each_qualified_identifier(input, IdentifierGrammar::ObjectReference, true, |part| {
             if count == names.len() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -125,8 +127,15 @@ impl QualifiedObjectName {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentifierGrammar {
+    Sql,
+    ObjectReference,
+}
+
 pub(crate) fn for_each_qualified_identifier(
     input: &str,
+    grammar: IdentifierGrammar,
     strict: bool,
     mut visit: impl FnMut(IdentifierSpelling<'_>) -> Result<(), SqlError>,
 ) -> Result<usize, SqlError> {
@@ -160,7 +169,7 @@ pub(crate) fn for_each_qualified_identifier(
                     None => return Err(bad()),
                 }
             };
-            if end == inner {
+            if end == inner && grammar == IdentifierGrammar::Sql {
                 return Err(bad());
             }
             IdentifierSpelling {
@@ -168,16 +177,26 @@ pub(crate) fn for_each_qualified_identifier(
                 quoted: true,
             }
         } else {
-            if !matches!(
-                bytes.get(at),
-                Some(b'_' | b'A'..=b'Z' | b'a'..=b'z' | 0x80..=0xff)
-            ) {
+            if grammar == IdentifierGrammar::Sql
+                && !matches!(
+                    bytes.get(at),
+                    Some(b'_' | b'A'..=b'Z' | b'a'..=b'z' | 0x80..=0xff)
+                )
+            {
                 return Err(bad());
             }
-            while bytes.get(at).is_some_and(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | 0x80..=0xff)
+            while bytes.get(at).is_some_and(|byte| match grammar {
+                IdentifierGrammar::Sql => {
+                    byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | 0x80..=0xff)
+                }
+                IdentifierGrammar::ObjectReference => {
+                    *byte != b'.' && !byte.is_ascii_whitespace()
+                }
             }) {
                 at += 1;
+            }
+            if start == at {
+                return Err(bad());
             }
             IdentifierSpelling {
                 text: &input[start..at],
@@ -209,7 +228,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let mut names = [SqlName::EMPTY; 2];
             let mut count = 0;
-            for_each_qualified_identifier(" \"élève\" . \"a\"\"b\" ", true, |part| {
+            for_each_qualified_identifier(" \"élève\" . \"a\"\"b\" ", IdentifierGrammar::Sql, true, |part| {
                 names[count] = part.sql_name()?;
                 count += 1;
                 Ok(())
@@ -217,7 +236,7 @@ mod tests {
             .unwrap();
             assert_eq!(names[0].as_str(), "élève");
             assert_eq!(names[1].as_str(), "a\"b");
-            for_each_qualified_identifier(&quoted, true, |part| {
+            for_each_qualified_identifier(&quoted, IdentifierGrammar::Sql, true, |part| {
                 assert_eq!(part.decoded_len(), 1200);
                 assert_eq!(
                     part.sql_name().unwrap_err().sqlstate,
@@ -233,12 +252,12 @@ mod tests {
             .unwrap();
             for invalid in ["", "\"\"", "x.", "x..y", "\"unterminated", "x y"] {
                 assert!(
-                    for_each_qualified_identifier(invalid, true, |_| Ok(())).is_err(),
+                    for_each_qualified_identifier(invalid, IdentifierGrammar::Sql, true, |_| Ok(())).is_err(),
                     "{invalid}"
                 );
             }
             assert_eq!(
-                for_each_qualified_identifier("UPPER ignored", false, |part| {
+                for_each_qualified_identifier("UPPER ignored", IdentifierGrammar::Sql, false, |part| {
                     assert_eq!(part.sql_name()?.as_str(), "upper");
                     Ok(())
                 })

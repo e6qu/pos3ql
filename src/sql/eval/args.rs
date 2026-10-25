@@ -507,7 +507,7 @@ pub(crate) fn parse_qualified_ident<'a>(
     strict: bool,
 ) -> Result<usize, SqlError> {
     let mut count = 0;
-    crate::sql::identifiers::for_each_qualified_identifier(input, strict, |part| {
+    crate::sql::identifiers::for_each_qualified_identifier(input, crate::sql::identifiers::IdentifierGrammar::Sql, strict, |part| {
         if count == out.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,

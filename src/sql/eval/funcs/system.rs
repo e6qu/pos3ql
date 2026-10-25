@@ -2448,7 +2448,8 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 let value = eval_full(args[0], arena, params, row, hooks)?;
                 let written = match value {
-                    Datum::Text(written) | Datum::Bpchar(written) => written.trim_end_matches(' '),
+                    Datum::Text(written) => written,
+                    Datum::Bpchar(written) => written.trim_end_matches(' '),
                     Datum::Null => return Ok(Datum::Null),
                     other => return Err(type_mismatch(name, &other)),
                 };
@@ -2525,6 +2526,9 @@ pub(crate) fn dispatch<'a>(
                                 | sqlstate::UNDEFINED_TABLE
                                 | sqlstate::INVALID_SCHEMA_NAME
                                 | sqlstate::AMBIGUOUS_FUNCTION
+                                | sqlstate::INVALID_NAME
+                                | sqlstate::INVALID_TEXT_REPRESENTATION
+                                | sqlstate::NUMERIC_OUT_OF_RANGE
                         ) =>
                     {
                         Ok(Datum::Null)

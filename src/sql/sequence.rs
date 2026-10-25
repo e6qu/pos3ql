@@ -489,7 +489,12 @@ impl SequenceAccess for SeqEval<'_> {
         )
     }
 
-    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
         let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
@@ -529,7 +534,12 @@ impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
     fn lastval(&self) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.lastval())
     }
-    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError> {
         self.state
             .invoke(|| self.base.setval(name, value, is_called))
     }

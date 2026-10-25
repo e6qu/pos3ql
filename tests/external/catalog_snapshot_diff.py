@@ -314,6 +314,8 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         writer.execute('CREATE SCHEMA sr_hidden_relations_diff')
         writer.execute('CREATE TABLE sr_hidden_relations_diff."a.b"(id integer)')
         writer.execute('CREATE TABLE public.pg_class(id integer)')
+        for name in ('ticket-1', '123', '-'):
+            writer.execute(pg_sql.SQL('CREATE TABLE public.{}(id integer)').format(pg_sql.Identifier(name)))
         record(writer, f"{prefix}.schema_binding.outside_path", "SELECT to_regclass('\"a.b\"') IS NULL")
         record(writer, f"{prefix}.schema_binding.implicit_catalog", "SELECT 'pg_class'::regclass::oid=1259")
         record(writer, f"{prefix}.schema_binding.current_database", "SELECT to_regclass(quote_ident(current_database())||'.sr_hidden_relations_diff.\"a.b\"')='sr_hidden_relations_diff.\"a.b\"'::regclass")
@@ -321,11 +323,28 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         record(writer, f"{prefix}.schema_binding.on_path", "SELECT '\"a.b\"'::regclass='sr_hidden_relations_diff.\"a.b\"'::regclass,pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
         writer.execute('SET search_path TO public,pg_catalog')
         record(writer, f"{prefix}.schema_binding.explicit_catalog", "SELECT 'pg_class'::regclass='public.pg_class'::regclass,NOT pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
-        record_outcome(writer, f"{prefix}.schema_binding.invalid_regclass", "SELECT to_regclass('broken..name')", ())
+        writer.execute('BEGIN')
+        for label, query in (
+            ('invalid_inquiry', "SELECT to_regclass('broken..name') IS NULL"),
+            ('overflow_inquiry', "SELECT to_regclass('4294967296') IS NULL"),
+            ('empty_inquiry', "SELECT to_regclass('\"\"') IS NULL"),
+            ('zero_identifier', "SELECT '-'::regclass::oid=0,'-'::regclass::text='-'"),
+            ('punctuation', "SELECT 'ticket-1'::regclass='\"ticket-1\"'::regclass"),
+            ('numeric_name', "SELECT ' 123 '::regclass='\"123\"'::regclass,'123 '::text::regclass='\"123\"'::regclass"),
+            ('numeric_identifier', "SELECT '123'::regclass::oid=123"),
+            ('quoted_dash', "SELECT '\"-\"'::regclass='public.\"-\"'::regclass"),
+            ('invalid_cast', "SELECT 'broken..name'::regclass"),
+            ('overflow_cast', "SELECT '4294967296'::regclass"),
+            ('too_many_parts', "SELECT to_regclass('a.b.c.d')"),
+            ('strict_identifier', "SELECT parse_ident('ticket-1')"),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.regclass.{label}", query, ())
     finally:
         writer.execute('ROLLBACK')
         writer.execute('RESET search_path')
         writer.execute('DROP TABLE IF EXISTS public.pg_class')
+        for name in ('ticket-1', '123', '-'):
+            writer.execute(pg_sql.SQL('DROP TABLE IF EXISTS public.{}').format(pg_sql.Identifier(name)))
         writer.execute('DROP SCHEMA IF EXISTS sr_hidden_relations_diff CASCADE')
 
 
@@ -344,6 +363,7 @@ def schema_sequence_argument_reports(writer, prefix, record, record_outcome):
             ('null', 'SELECT currval(NULL::oid) IS NULL'),
         ):
             record(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query)
+        writer.execute('BEGIN')
         for label, query in (
             ('empty_next', 'SELECT nextval()'),
             ('empty_current', 'SELECT currval()'),

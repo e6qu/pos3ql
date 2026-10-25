@@ -786,7 +786,12 @@ pub trait SequenceAccess {
     fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
     fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
-    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError>;
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError>;
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -4627,10 +4632,15 @@ fn call<'a>(
         "nextval" | "currval" | "setval" => {
             if name == "setval" {
                 if args.len() != 2 && args.len() != 3 || star {
-                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION,
-                        "function setval(...) with {} arguments does not exist", args.len()));
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function setval(...) with {} arguments does not exist",
+                        args.len()
+                    ));
                 }
-            } else { arity(1)?; }
+            } else {
+                arity(1)?;
+            }
             let engine = hooks.sequences.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4644,20 +4654,26 @@ fn call<'a>(
                 Datum::Oid(value) => SequenceReference::Oid(value),
                 Datum::Int2(value) => SequenceReference::Oid(i32::from(value) as u32),
                 Datum::Int4(value) => SequenceReference::Oid(value as u32),
-                Datum::Int8(value) => SequenceReference::Oid(u32::try_from(value)
-                    .map_err(|_| overflow("oid"))?),
-                Datum::RegObject { type_oid: super::types::oid::REGCLASS, referenced_oid, .. } =>
-                    SequenceReference::Oid(referenced_oid as u32),
-                other => return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION,
-                    "function {}({}) does not exist", name, type_name_of(&other))),
+                Datum::Int8(value) => {
+                    SequenceReference::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?)
+                }
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGCLASS,
+                    referenced_oid,
+                    ..
+                } => SequenceReference::Oid(referenced_oid as u32),
+                other => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}({}) does not exist",
+                        name,
+                        type_name_of(&other)
+                    ));
+                }
             };
             let result = match name {
-                "nextval" => {
-                    engine.nextval(seq_name)?
-                }
-                "currval" => {
-                    engine.currval(seq_name)?
-                }
+                "nextval" => engine.nextval(seq_name)?,
+                "currval" => engine.currval(seq_name)?,
                 _ => {
                     let value = match args::int_arg(name, args, 1, arena, params, row, hooks)? {
                         Some(v) => v,
@@ -7240,6 +7256,10 @@ pub(crate) fn regobject_cast<'a>(
     if value.is_null() {
         return Ok(Datum::Null);
     }
+    let value = match value {
+        Datum::Bpchar(name) => Datum::Text(name.trim_end_matches(' ')),
+        other => other,
+    };
     let object_oid = match value {
         Datum::RegObject {
             type_oid,
@@ -7261,10 +7281,11 @@ pub(crate) fn regobject_cast<'a>(
         Datum::Int4(value) => value,
         Datum::Oid(value) => value as i32,
         Datum::Int8(value) => u32::try_from(value).map_err(|_| overflow(target.name()))? as i32,
-        Datum::Text(name) | Datum::Bpchar(name) => {
-            let name = name.trim_end_matches(' ');
-            if let Ok(value) = name.parse::<u32>() {
-                value as i32
+        Datum::Text(name) => {
+            if name == "-" {
+                0
+            } else if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+                name.parse::<u32>().map_err(|_| overflow(target.name()))? as i32
             } else {
                 let signature_required =
                     matches!(target, ColType::Regprocedure | ColType::Regoperator);

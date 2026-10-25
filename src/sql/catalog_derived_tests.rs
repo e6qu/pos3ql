@@ -216,7 +216,8 @@ fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_re
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut cold = Engine::new(&config, &mut cold_budget)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             if decision != "COMMIT" {
                 assert_eq!(read(&mut session, &mut cold), old);
@@ -338,35 +339,72 @@ fn catalog_snapshot_derived_permissions_keep_oid_identity_outside_the_search_pat
 fn catalog_snapshot_derived_arena_exhaustion_leaves_reports_usable() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(&mut engine, &mut budget, SETUP);
-    assert!(error_sqlstates(&setup).is_empty(), "{}", String::from_utf8_lossy(&setup));
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
     let mut small = Arena::new(&mut budget, "small derived catalog arena", 16 << 10).unwrap();
     for (namespace, name) in [
-        ("pg_catalog", "pg_views"), ("pg_catalog", "pg_matviews"),
-        ("pg_catalog", "pg_rules"), ("pg_catalog", "pg_sequences"),
-        ("information_schema", "views"), ("information_schema", "sequences"),
-        ("information_schema", "view_table_usage"), ("information_schema", "view_column_usage"),
+        ("pg_catalog", "pg_views"),
+        ("pg_catalog", "pg_matviews"),
+        ("pg_catalog", "pg_rules"),
+        ("pg_catalog", "pg_sequences"),
+        ("information_schema", "views"),
+        ("information_schema", "sequences"),
+        ("information_schema", "view_table_usage"),
+        ("information_schema", "view_column_usage"),
     ] {
         small.reset();
-        let result = crate::mem::guard::forbid_alloc(|| super::super::catalog::synthesize(
-            &engine.storage, Some(namespace), name, 0,
-            crate::sql::catalog_snapshot::CatalogScan::Sequential, &small,
-        ));
-        let error = match result { Err(error) => error, Ok(_) => panic!("{namespace}.{name} exceeded its arena") };
-        assert_eq!(error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
-        assert!(error.message.as_str().contains("arena"), "{}", error.message);
+        let result = crate::mem::guard::forbid_alloc(|| {
+            super::super::catalog::synthesize(
+                &engine.storage,
+                Some(namespace),
+                name,
+                0,
+                crate::sql::catalog_snapshot::CatalogScan::Sequential,
+                &small,
+            )
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("{namespace}.{name} exceeded its arena"),
+        };
+        assert_eq!(
+            error.sqlstate,
+            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert!(
+            error.message.as_str().contains("arena"),
+            "{}",
+            error.message
+        );
     }
-    assert_eq!(data_rows(&run_with_fixed_memory(&mut engine, &budget, REPORT, 4 << 20)), OLD);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            REPORT,
+            4 << 20
+        )),
+        OLD
+    );
 }
 
 #[test]
 fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_current() {
-    for (isolation, replaced) in [("READ COMMITTED", "t|t|t|t"), ("REPEATABLE READ", "f|f|f|f")] {
+    for (isolation, replaced) in [
+        ("READ COMMITTED", "t|t|t|t"),
+        ("REPEATABLE READ", "f|f|f|f"),
+    ] {
         let config = test_config("catalog-definition-rows");
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         writer.success(&mut engine,
             "CREATE VIEW definition_view AS SELECT 1 AS value;
              CREATE TABLE definition_target(id integer);
@@ -377,57 +415,137 @@ fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_cu
             position('2' IN pg_get_viewdef('definition_view'::regclass))>0,
             (SELECT position('2' IN definition)>0 FROM pg_rules WHERE rulename='definition_rule'),
             (SELECT position('2' IN pg_get_ruledef(oid))>0 FROM pg_rewrite WHERE rulename='definition_rule')";
-        assert_eq!(data_rows(&writer.success(&mut engine, query, true)), ["f|f|f|f"]);
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, query, true)),
+            ["f|f|f|f"]
+        );
         assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM pg_rewrite WHERE rulename='definition_rule'"), true)), ["1"]);
         writer.success(&mut engine,
             "CREATE OR REPLACE VIEW definition_view AS SELECT 2 AS value;
              CREATE OR REPLACE RULE definition_rule AS ON INSERT TO definition_target DO ALSO INSERT INTO definition_audit VALUES(2)", true);
-        assert_eq!(data_rows(&reader.success(&mut engine, query, true)), [replaced]);
-        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT * FROM definition_view; COMMIT", true)), ["2"]);
-        assert_eq!(data_rows(&reader.success(&mut engine, query, true)), ["t|t|t|t"]);
-        for sql in ["SELECT _pos3ql_view_definition FROM pg_rewrite", "SELECT _pos3ql_rule_body FROM pg_rewrite"] {
-            assert_eq!(error_sqlstates(&reader.execute(&mut engine, sql, true)), ["42703"]);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            [replaced]
+        );
+        reader.success(&mut engine, "CREATE OR REPLACE VIEW definition_view AS SELECT 3 AS value", true);
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "SELECT position('3' IN definition)>0 FROM pg_views WHERE viewname='definition_view';
+             SELECT position('3' IN pg_get_viewdef('definition_view'::regclass))>0", true)),
+            if isolation == "REPEATABLE READ" { ["f", "f"] } else { ["t", "t"] });
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, "SELECT * FROM definition_view; ROLLBACK", true)),
+            ["3"]
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, query, true)),
+            ["t|t|t|t"]
+        );
+        for sql in [
+            "SELECT _pos3ql_view_definition FROM pg_rewrite",
+            "SELECT _pos3ql_rule_body FROM pg_rewrite",
+        ] {
+            assert_eq!(
+                error_sqlstates(&reader.execute(&mut engine, sql, true)),
+                ["42703"]
+            );
         }
+        let oid = data_rows(&writer.success(&mut engine,
+            "SELECT oid FROM pg_class WHERE relname='definition_view'", true)).pop().unwrap();
+        reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; SELECT oid FROM pg_class WHERE relname='definition_view'"), true);
+        writer.success(&mut engine, "DROP VIEW definition_view", true);
+        for sql in [format!("SELECT pg_get_viewdef({oid}::oid) IS NOT NULL"),
+            "SELECT definition IS NOT NULL FROM pg_views WHERE viewname='definition_view'".to_owned()] {
+            reader.success(&mut engine, "SAVEPOINT dropped_definition", true);
+            let output = reader.execute(&mut engine, &sql, true);
+            if isolation == "REPEATABLE READ" {
+                assert_eq!(error_sqlstates(&output), ["XX000"]);
+                reader.success(&mut engine, "ROLLBACK TO dropped_definition", true);
+            } else {
+                assert!(error_sqlstates(&output).is_empty());
+                assert_eq!(data_rows(&output), if sql.starts_with("SELECT pg_get_viewdef") { vec!["f"] } else { vec![] });
+            }
+            reader.success(&mut engine, "RELEASE dropped_definition", true);
+        }
+        reader.success(&mut engine, "ROLLBACK", true);
     }
 }
 
 #[test]
 fn catalog_snapshot_builtin_metadata_keeps_objects_with_unsupported_row_reads() {
     let (mut engine, budget) = test_engine();
-    assert_eq!(data_rows(&run_with_fixed_memory(&mut engine, &budget,
-        "SELECT to_regclass('pg_statistic') IS NOT NULL,
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT to_regclass('pg_statistic') IS NOT NULL,
                 EXISTS(SELECT 1 FROM pg_class WHERE oid='pg_statistic'::regclass);
-         SELECT attname FROM pg_attribute WHERE attrelid='pg_statistic'::regclass AND attnum=1", 4 << 20)),
-        ["t|t", "starelid"]);
-    assert_eq!(error_sqlstates(&run_with_fixed_memory(&mut engine, &budget,
-        "SELECT * FROM pg_statistic", 4 << 20)), ["0A000"]);
+         SELECT attname FROM pg_attribute WHERE attrelid='pg_statistic'::regclass AND attnum=1",
+            4 << 20
+        )),
+        ["t|t", "starelid"]
+    );
+    assert_eq!(
+        error_sqlstates(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT * FROM pg_statistic",
+            4 << 20
+        )),
+        ["0A000"]
+    );
 }
 
 #[test]
 fn catalog_snapshot_index_hints_follow_existing_or_private_catalog_tuples() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
-      for forked in [false, true] {
-        let mut config = test_config("catalog-private-index-hints");
-        config.transaction_mode = mode;
-        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        engine.commit_progress = CommitProgressMode::Reactor;
-        let mut owner = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut observer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        owner.success(&mut engine, "CREATE TABLE private_hint(id integer); BEGIN; SAVEPOINT hint_start", true);
-        let query = "SELECT relhasindex FROM pg_class WHERE relname='private_hint'";
-        for rolled_back in [true, false] {
-            if forked {
-                owner.success(&mut engine, "ALTER TABLE private_hint RENAME TO private_hint_away; ALTER TABLE private_hint_away RENAME TO private_hint", true);
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for forked in [false, true] {
+            let mut config = test_config("catalog-private-index-hints");
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            engine.commit_progress = CommitProgressMode::Reactor;
+            let mut owner =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+            let mut observer =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            owner.success(
+                &mut engine,
+                "CREATE TABLE private_hint(id integer); BEGIN; SAVEPOINT hint_start",
+                true,
+            );
+            let query = "SELECT relhasindex FROM pg_class WHERE relname='private_hint'";
+            for rolled_back in [true, false] {
+                if forked {
+                    owner.success(&mut engine, "ALTER TABLE private_hint RENAME TO private_hint_away; ALTER TABLE private_hint_away RENAME TO private_hint", true);
+                }
+                owner.success(&mut engine, "CREATE INDEX private_hint_index ON private_hint(id); DROP INDEX private_hint_index", true);
+                assert_eq!(data_rows(&owner.success(&mut engine, query, true)), ["t"]);
+                assert_eq!(
+                    data_rows(&observer.success(&mut engine, query, true)),
+                    [if forked { "f" } else { "t" }]
+                );
+                owner.success(
+                    &mut engine,
+                    if rolled_back {
+                        "ROLLBACK TO hint_start"
+                    } else {
+                        "COMMIT"
+                    },
+                    true,
+                );
+                assert_eq!(
+                    data_rows(&observer.success(&mut engine, query, true)),
+                    [if forked && rolled_back { "f" } else { "t" }]
+                );
             }
-            owner.success(&mut engine, "CREATE INDEX private_hint_index ON private_hint(id); DROP INDEX private_hint_index", true);
-            assert_eq!(data_rows(&owner.success(&mut engine, query, true)), ["t"]);
-            assert_eq!(data_rows(&observer.success(&mut engine, query, true)), [if forked { "f" } else { "t" }]);
-            owner.success(&mut engine, if rolled_back { "ROLLBACK TO hint_start" } else { "COMMIT" }, true);
-            assert_eq!(data_rows(&observer.success(&mut engine, query, true)), [if forked && rolled_back { "f" } else { "t" }]);
+            owner.success(&mut engine, "VACUUM private_hint", true);
+            assert_eq!(
+                data_rows(&observer.success(&mut engine, query, true)),
+                ["f"]
+            );
         }
-        owner.success(&mut engine, "VACUUM private_hint", true);
-        assert_eq!(data_rows(&observer.success(&mut engine, query, true)), ["f"]);
-      }
     }
 }

@@ -1257,6 +1257,11 @@ estimates unless `ANALYZE` was requested. A table's `relhasindex` flag can remai
 true after an index is dropped or its creation is rolled back. `pg_index` lists
 the actual visible indexes; `VACUUM` clears the flag when none remain. The flag
 belongs to the table's lifetime and cannot leak to a replacement table.
+An earlier table rename gives the transaction a private catalog row. Creating
+an index then changes only that private row; rolling back restores the old flag.
+This remains true if the transaction renames the table back before creating
+the index. Without that prior edit, PostgreSQL updates the existing flag in
+place, so other connections can see it before commit and after rollback.
 
 **User example:** after `DROP INDEX orders_lookup`, a catalog query can still
 show `relhasindex = true` for `orders`. Running `VACUUM orders` clears it when
@@ -1265,8 +1270,8 @@ with empty caches preserves the saved flag and estimate. An unresolved prepared
 `ANALYZE` restores its relation counts while its column estimates remain private.
 
 Journal capture copies the visible estimates and records the exact relation-count
-revision from the same cell. Acknowledgement clears that captured revision's
-pending marker; a newer revision remains pending. Reused table slots preserve
+revision and index flag from the same cell. Acknowledgement clears the pending
+marker only when both still match; a newer count or flag remains pending. Reused table slots preserve
 revision identities, and an owned receipt cannot redirect to another Storage
 instance. Each query workspace reserves receipts for every physical table at
 startup. Full or already retained workspaces return `54000`; cancellation and

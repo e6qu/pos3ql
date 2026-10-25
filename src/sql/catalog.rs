@@ -25,12 +25,12 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_rewrite.rs"]
+mod rewrite;
 #[path = "catalog_view_definitions.rs"]
 mod view_definitions;
 #[path = "catalog_view_rows.rs"]
 mod view_rows;
-#[path = "catalog_rewrite.rs"]
-mod rewrite;
 #[path = "catalog_views.rs"]
 mod views;
 
@@ -8647,10 +8647,14 @@ pub(super) const CATALOG_RELATIONS: &[&str] = &[
 ];
 
 fn catalog_relation(name: &str) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
-    let relation = crate::sql::catalog_metadata::RELATIONS.iter().copied()
+    let relation = crate::sql::catalog_metadata::RELATIONS
+        .iter()
+        .copied()
         .find(|relation| relation.name == name)?;
-    if let Some((oid, row_type_oid, _, columns)) = MONITORING_RELATIONS.iter()
-        .find(|(_, _, candidate, _)| *candidate == name) {
+    if let Some((oid, row_type_oid, _, columns)) = MONITORING_RELATIONS
+        .iter()
+        .find(|(_, _, candidate, _)| *candidate == name)
+    {
         debug_assert_eq!(relation.oid, *oid);
         debug_assert_eq!(relation.row_type_oid, *row_type_oid);
         debug_assert_eq!(relation.attributes as usize, columns.len());
@@ -8663,7 +8667,8 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
 }
 
 pub(super) fn catalog_relation_name(oid: i32) -> Option<&'static str> {
-    crate::sql::catalog_metadata::RELATIONS.iter()
+    crate::sql::catalog_metadata::RELATIONS
+        .iter()
         .find_map(|relation| (relation.oid == oid).then_some(relation.name))
 }
 
@@ -8832,7 +8837,11 @@ pub(crate) fn synthesize_definition<'a>(
     let information_schema = qualifier == Some("information_schema");
     let specification = schema::definition(name, information_schema).ok_or_else(|| {
         if !information_schema && catalog_relation(name).is_some() {
-            return sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "reading catalog relation \"{}\" is not implemented", name);
+            return sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "reading catalog relation \"{}\" is not implemented",
+                name
+            );
         }
         sql_err!(
             sqlstate::UNDEFINED_TABLE,
@@ -9345,7 +9354,8 @@ pub(crate) fn synthesize_current<'a>(
         (true, "user_mappings") => info_user_mappings(storage, txid, arena),
         _ if !info && catalog_relation(name).is_some() => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "reading catalog relation \"{}\" is not implemented", name
+            "reading catalog relation \"{}\" is not implemented",
+            name
         )),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
@@ -18983,10 +18993,10 @@ fn pg_class<'a>(
             return Err(catalog_capacity_exceeded("pg_class"));
         }
         let toid = table_oid(storage, slot);
-        let has_index = storage.relation_has_index(crate::storage::CatalogPosition::new(
-            slot,
-            table_def.identity().created_at,
-        )?, txid) || indexes.iter().any(|i| i.table_oid == toid);
+        let has_index = storage.relation_has_index(
+            crate::storage::CatalogPosition::new(slot, table_def.identity().created_at)?,
+            txid,
+        ) || indexes.iter().any(|i| i.table_oid == toid);
         let has_triggers = storage.triggers_for_table(slot, txid).next().is_some()
             || !table_def.fkeys().is_empty()
             || foreign_keys
@@ -20351,7 +20361,6 @@ fn pg_constraint<'a>(
         arena,
     )
 }
-
 
 fn available_extension_requires<'a>(
     package: &crate::storage::ExtensionPackage,

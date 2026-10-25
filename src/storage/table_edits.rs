@@ -224,13 +224,19 @@ impl<'storage> TableDefinitionEdit<'storage> {
         definition.has_rules |= current.has_rules;
         // Column-only edits replace pg_attribute rows. Keep track of edits
         // that also fork pg_class, including a rename followed by renaming back.
-        let class_tuple_private = prior.as_ref().is_some_and(|version| version.class_tuple_private)
-            || current.schema != definition.schema || current.name != definition.name
-            || current.kind != definition.kind || current.persistence != definition.persistence
+        let class_tuple_private = prior
+            .as_ref()
+            .is_some_and(|version| version.class_tuple_private)
+            || current.schema != definition.schema
+            || current.name != definition.name
+            || current.kind != definition.kind
+            || current.persistence != definition.persistence
             || current.access_method != definition.access_method
             || current.storage_options != definition.storage_options
-            || current.tablespace != definition.tablespace || current.n_columns != definition.n_columns
-            || current.n_checks != definition.n_checks || current.has_toast != definition.has_toast
+            || current.tablespace != definition.tablespace
+            || current.n_columns != definition.n_columns
+            || current.n_checks != definition.n_checks
+            || current.has_toast != definition.has_toast
             || current.row_level_security.enabled != definition.row_level_security.enabled
             || current.row_level_security.forced != definition.row_level_security.forced
             || current.replica_identity != definition.replica_identity

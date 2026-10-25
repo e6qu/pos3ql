@@ -354,20 +354,49 @@ fn clear_pending(state: &mut StatisticsState, versions: &mut FixedVec<PendingTab
 
 impl Storage {
     pub(super) fn relation_catalog_tuple_is_private(&self, table: usize, transaction: u32) -> bool {
-        if transaction == 0 { return false; }
+        if transaction == 0 {
+            return false;
+        }
         {
             let definition = self.tables[table].definition.read();
             if matches!(definition.identity.existence, super::CatalogDdlState::PendingCreate { txid } | super::CatalogDdlState::PendingCreateDrop { txid } if txid == transaction)
-                || self.pending_table_defs.latest_locked(&definition).is_some_and(|pending| pending.txid == transaction && pending.class_tuple_private) {
+                || self
+                    .pending_table_defs
+                    .latest_locked(&definition)
+                    .is_some_and(|pending| {
+                        pending.txid == transaction && pending.class_tuple_private
+                    })
+            {
                 return true;
             }
         }
         let object = self.table_access_object(table, transaction);
-        if self.ownership(object).pending.is_some_and(|pending| pending.txid == transaction) { return true; }
+        if self
+            .ownership(object)
+            .pending
+            .is_some_and(|pending| pending.txid == transaction)
+        {
+            return true;
+        }
         if object.class == super::AccessClass::MaterializedView
-            && self.matview(usize::from(object.slot)).pending_population.is_some_and(|pending| pending.transaction == transaction) { return true; }
-        self.acl_catalog.lock().expect("ACL catalog lock poisoned").objects.iter()
-            .any(|entry| entry.object == object && entry.pending.is_some_and(|pending| pending.txid == transaction))
+            && self
+                .matview(usize::from(object.slot))
+                .pending_population
+                .is_some_and(|pending| pending.transaction == transaction)
+        {
+            return true;
+        }
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects
+            .iter()
+            .any(|entry| {
+                entry.object == object
+                    && entry
+                        .pending
+                        .is_some_and(|pending| pending.txid == transaction)
+            })
     }
 
     pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
@@ -622,12 +651,23 @@ impl Storage {
         if self.tables[position.slot()]
             .statistics
             .has_index(position.created_at())
-        { return true; }
-        if transaction == 0 { return false; }
-        let (definition, indexes) = super::row_ownership::acquire(|| Ok((
-            self.tables[position.slot()].definition.try_read_for_batch()?,
-            super::row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
-        )));
+        {
+            return true;
+        }
+        if transaction == 0 {
+            return false;
+        }
+        let (definition, indexes) = super::row_ownership::acquire(|| {
+            Ok((
+                self.tables[position.slot()]
+                    .definition
+                    .try_read_for_batch()?,
+                super::row_ownership::try_mutex(
+                    &self.index_catalog,
+                    "index catalog lock poisoned",
+                )?,
+            ))
+        });
         let identity = definition.identity;
         indexes.iter().any(|index| {
             index.database == identity.database
@@ -765,12 +805,15 @@ mod tests {
             receipt.acknowledge();
             assert!(!storage.relation_has_index(position, 0));
             assert!(storage.statistics_wal_dirty(table));
+            drop(receipt);
             let captured = storage.capture_statistics_for_wal(table, 7).unwrap();
             assert!(!captured.has_index);
             let receipt = receipts.retain().unwrap();
             receipt.retain_image(&captured).unwrap();
             let checkpoint = storage.capture_checkpoint_statistics(table);
-            storage.tables[table].statistics.mark_index_created(position.created_at());
+            storage.tables[table]
+                .statistics
+                .mark_index_created(position.created_at());
             receipt.acknowledge();
             checkpoint.acknowledge(&storage);
             assert!(storage.statistics_wal_dirty(table));

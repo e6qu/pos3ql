@@ -937,7 +937,12 @@ pub(crate) fn restore_rows<'a>(
             row.key,
             committed_rows.get(row.key).and_then(|row| row.image),
             row.image,
-            historical_rows.get(row.key).map(|row| HistoricalCatalogRow { key: row.key, before: row.image }),
+            historical_rows
+                .get(row.key)
+                .map(|row| HistoricalCatalogRow {
+                    key: row.key,
+                    before: row.image,
+                }),
             row_state(row.key)?,
             scan,
         )?;
@@ -950,7 +955,10 @@ pub(crate) fn restore_rows<'a>(
                 row.key,
                 committed_rows.get(row.key).and_then(|row| row.image),
                 None,
-                Some(HistoricalCatalogRow { key: row.key, before: row.image }),
+                Some(HistoricalCatalogRow {
+                    key: row.key,
+                    before: row.image,
+                }),
                 row_state(row.key)?,
                 scan,
             )?;

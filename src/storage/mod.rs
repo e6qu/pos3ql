@@ -35089,7 +35089,9 @@ impl Storage {
             key_preparation::EnforcerRows::ReusePrepared,
         )?;
         if !self.relation_catalog_tuple_is_private(table_index, txid) {
-            self.tables[table_index].statistics.mark_index_created(self.tables[table_index].identity().created_at);
+            self.tables[table_index]
+                .statistics
+                .mark_index_created(self.tables[table_index].identity().created_at);
         }
         Ok(())
     }
@@ -45777,7 +45779,9 @@ impl Storage {
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
     pub fn commit_index_create(&mut self, slot: usize) {
         if let Some(table) = self.index_table_slot(slot) {
-            self.tables[table].statistics.mark_index_created(self.tables[table].identity().created_at);
+            self.tables[table]
+                .statistics
+                .mark_index_created(self.tables[table].identity().created_at);
         }
         {
             let mut catalog = self.index_catalog();
@@ -55201,16 +55205,26 @@ mod tests {
             );
             assert!(storage.rule_dependencies(1, 0).entries().is_empty());
             assert!(storage.table_has_rules(table, 0));
-            let renamed = RuleDefinition { name: SqlName::parse("renamed_rule").unwrap(), ..definition };
-            storage.replay_rule(1, 42, renamed, StoredQueryDependencies::EMPTY).unwrap();
+            let renamed = RuleDefinition {
+                name: SqlName::parse("renamed_rule").unwrap(),
+                ..definition
+            };
+            storage
+                .replay_rule(1, 42, renamed, StoredQueryDependencies::EMPTY)
+                .unwrap();
             assert_eq!(storage.rule(1).definition.name.as_str(), "renamed_rule");
             let invalid_return = RuleDefinition {
                 name: SqlName::parse("renamed_return").unwrap(),
                 target: RuleTarget::View(0),
                 ..definition
             };
-            assert_eq!(storage.replay_rule(0, 8, invalid_return, StoredQueryDependencies::EMPTY).unwrap_err().sqlstate,
-                sqlstate::DATA_EXCEPTION);
+            assert_eq!(
+                storage
+                    .replay_rule(0, 8, invalid_return, StoredQueryDependencies::EMPTY)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             assert_eq!(storage.view_return_rule(0), 0);
             assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
         });

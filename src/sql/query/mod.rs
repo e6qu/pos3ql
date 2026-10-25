@@ -3384,7 +3384,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let object = match privilege_relation(self.storage, self.txid, relation) {
+        let object = match privilege_relation(self.storage, self.txid, relation)? {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 self.storage.table_access_object(slot, self.txid)
             }
@@ -3394,14 +3394,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             },
             Some(crate::storage::ResolvedRelation::Catalog) => {
                 let name = match relation {
-                    PrivilegeRelation::Name(name) => split_catalog_name(name).1,
-                    PrivilegeRelation::Oid(oid) => super::catalog::catalog_relation_name(oid)
-                        .expect("catalog identity was resolved"),
+                    PrivilegeRelation::Name(name) => super::identifiers::QualifiedObjectName::parse(name)?.name,
+                    PrivilegeRelation::Oid(oid) => crate::storage::SqlName::parse(
+                        super::catalog::catalog_relation_name(oid)
+                            .expect("catalog identity was resolved"))?,
                 };
                 // PostgreSQL 18.6 system_views.sql revokes PUBLIC access to
                 // these views; initdb also protects pg_authid/pg_largeobject.
                 let public_select = !matches!(
-                    name,
+                    name.as_str(),
                     "pg_authid"
                         | "pg_largeobject"
                         | "pg_shadow"
@@ -3467,7 +3468,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (object, column) = match privilege_relation(self.storage, self.txid, relation) {
+        let (object, column) = match privilege_relation(self.storage, self.txid, relation)? {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 let column = match column {
@@ -3540,7 +3541,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (object, columns) = match privilege_relation(self.storage, self.txid, relation) {
+        let (object, columns) = match privilege_relation(self.storage, self.txid, relation)? {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 (
@@ -3614,20 +3615,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let slot = match sequence {
-            PrivilegeRelation::Name(sequence) => {
-                let (schema, name) = split_catalog_name(sequence);
-                self.storage.sequence_on_path(schema, name, self.txid)
-            }
-            PrivilegeRelation::Oid(oid) => oid
-                .checked_sub(super::catalog::sequence_oid(0))
-                .and_then(|slot| usize::try_from(slot).ok())
-                .filter(|slot| {
-                    *slot < self.storage.sequence_count()
-                        && self.storage.sequence_slot_visible_to(*slot, self.txid)
-                }),
-        };
+        let oid = privilege_relation_oid(self.storage, self.txid, sequence)?;
+        let slot = oid
+            .checked_sub(super::catalog::sequence_oid(0))
+            .and_then(|slot| usize::try_from(slot).ok())
+            .filter(|slot| {
+                *slot < self.storage.sequence_count()
+                    && self.storage.sequence_slot_visible_to(*slot, self.txid)
+            });
         let Some(slot) = slot else {
+            if super::catalog::relation_oid_visibility(self.storage, self.txid, oid).is_some() {
+                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE,
+                    "object {} is not a sequence", oid));
+            }
             return Ok(None);
         };
         let object = crate::storage::AccessObject {
@@ -4463,38 +4463,63 @@ pub(super) fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
         .map_or((None, name), |(schema, object)| (Some(schema), object))
 }
 
+fn privilege_relation_oid(
+    storage: &Storage,
+    transaction: u32,
+    relation: PrivilegeRelation<'_>,
+) -> Result<i32, SqlError> {
+    let written = match relation {
+        PrivilegeRelation::Name(written) => written,
+        PrivilegeRelation::Oid(oid) => return Ok(oid),
+    };
+    let parsed = super::identifiers::QualifiedObjectName::parse(written)?;
+    if parsed.database.is_some_and(|database| database != storage.current_database_name(transaction)) {
+        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+            "cross-database relation references are not supported"));
+    }
+    if let Some(schema) = parsed.schema.as_ref() {
+        if super::catalog::schema_oid_by_name(storage, transaction, schema.as_str()).is_none() {
+            return Err(sql_err!(sqlstate::INVALID_SCHEMA_NAME,
+                r#"schema "{}" does not exist"#, schema.as_str()));
+        }
+        if storage.find_schema_visible(schema.as_str(), transaction).is_some() {
+            storage.require_schema_usage(schema.as_str(), transaction)?;
+        }
+    }
+    super::catalog::relation_oid_for_name(
+        storage,
+        transaction,
+        parsed.schema.as_ref().map(crate::storage::SqlName::as_str),
+        parsed.name.as_str(),
+    ).ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE,
+        r#"relation "{}" does not exist"#, written))
+}
+
 pub(super) fn privilege_relation(
     storage: &Storage,
     transaction: u32,
     relation: PrivilegeRelation<'_>,
-) -> Option<crate::storage::ResolvedRelation> {
-    match relation {
-        PrivilegeRelation::Name(name) => {
-            let (schema, name) = split_catalog_name(name);
-            storage.resolve_relation(schema, name, transaction)
-        }
-        PrivilegeRelation::Oid(oid) => {
-            if super::catalog::catalog_relation_oid_by_oid(oid) {
-                return Some(crate::storage::ResolvedRelation::Catalog);
-            }
-            if let Some(slot) = oid
-                .checked_sub(super::catalog::user_table_oid(0))
-                .and_then(|slot| usize::try_from(slot).ok())
-                .filter(|slot| {
-                    *slot < storage.table_count()
-                        && storage.table_slot_visible_to(*slot, transaction)
-                })
-            {
-                return Some(crate::storage::ResolvedRelation::Table(slot));
-            }
-            oid.checked_sub(super::catalog::view_oid(0))
-                .and_then(|slot| usize::try_from(slot).ok())
-                .filter(|slot| {
-                    *slot < storage.view_count() && storage.view_slot_visible_to(*slot, transaction)
-                })
-                .map(crate::storage::ResolvedRelation::View)
-        }
+) -> Result<Option<crate::storage::ResolvedRelation>, SqlError> {
+    let oid = privilege_relation_oid(storage, transaction, relation)?;
+    if super::catalog::catalog_relation_oid_by_oid(oid) {
+        return Ok(Some(crate::storage::ResolvedRelation::Catalog));
     }
+    if let Some(slot) = oid
+        .checked_sub(super::catalog::user_table_oid(0))
+        .and_then(|slot| usize::try_from(slot).ok())
+        .filter(|slot| *slot < storage.table_count() && storage.table_slot_visible_to(*slot, transaction))
+    {
+        return Ok(Some(crate::storage::ResolvedRelation::Table(slot)));
+    }
+    let resolved = oid.checked_sub(super::catalog::view_oid(0))
+        .and_then(|slot| usize::try_from(slot).ok())
+        .filter(|slot| *slot < storage.view_count() && storage.view_slot_visible_to(*slot, transaction))
+        .map(crate::storage::ResolvedRelation::View);
+    if resolved.is_none() && matches!(relation, PrivilegeRelation::Name(_)) {
+        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+            "privilege lookup for this relation kind is not implemented"));
+    }
+    Ok(resolved)
 }
 
 fn privilege_role(storage: &Storage, role: Option<&str>, txid: u32) -> Option<usize> {

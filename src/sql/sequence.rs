@@ -313,18 +313,15 @@ impl<'a> SeqEval<'a> {
                     self.storage.sequence_slot_visible_to(*slot, self.txid)
                         && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
                 });
-                if slot.is_none()
-                    && i32::try_from(oid).ok().is_some_and(|oid| {
-                        crate::sql::catalog::relation_oid_is_visible(self.storage, self.txid, oid)
-                    })
-                {
-                    return Err(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "object {} is not a sequence",
-                        oid
-                    ));
+                if let Some(slot) = slot {
+                    return Ok(slot);
                 }
-                slot
+                if crate::sql::catalog::relation_oid_visibility(self.storage, self.txid, oid as i32).is_some() {
+                    return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE,
+                        "object {} is not a sequence", oid));
+                }
+                return Err(sql_err!(sqlstate::INTERNAL_ERROR,
+                    "could not open relation with OID {}", oid));
             }
             crate::sql::identifiers::ObjectReference::Name(parsed) => {
                 if parsed.database.is_some_and(|database| {
@@ -336,6 +333,11 @@ impl<'a> SeqEval<'a> {
                     ));
                 }
                 let qualifier = parsed.schema.as_ref().map(crate::storage::SqlName::as_str);
+                if let Some(schema) = qualifier
+                    && self.storage.find_schema_visible(schema, self.txid).is_some()
+                {
+                    self.storage.require_schema_usage(schema, self.txid)?;
+                }
                 let base = parsed.name.as_str();
                 let slot = self.storage.sequence_on_path(qualifier, base, self.txid);
                 if slot.is_none()

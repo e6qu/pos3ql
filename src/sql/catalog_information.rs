@@ -167,7 +167,7 @@ fn relation_is_updatable(
     relation: PrivilegeRelation<'_>,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    match crate::sql::query::privilege_relation(storage, transaction, relation) {
+    match crate::sql::query::privilege_relation(storage, transaction, relation)? {
         Some(crate::storage::ResolvedRelation::View(slot)) => {
             let view = storage.view(slot);
             crate::sql::query::view_is_auto_updatable(

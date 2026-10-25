@@ -11786,7 +11786,7 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
     }
 }
 
-fn relation_oid_for_name(
+pub(super) fn relation_oid_for_name(
     storage: &Storage,
     txid: u32,
     schema: Option<&str>,

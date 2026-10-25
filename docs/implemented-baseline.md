@@ -876,9 +876,18 @@ Looking up `private_schema.orders` requires `USAGE` on that schema.
 A missing relation returns `NULL` from `to_regclass`; a permission error remains
 an error. Schema lookup does not itself require permission to read the table.
 Schemas without `USAGE` are skipped in `search_path`, as in PostgreSQL;
-`SET search_path TO private_schema` does not grant access.
+`SET search_path TO private_schema` does not grant access. Privilege checks accept
+quoted names too: `has_table_privilege('orders."line.items"','SELECT')` checks
+that table, rather than splitting its quoted name at the dot.
 Sequence calls also accept `regclass`, `oid` and integer identifiers, following
 [PostgreSQL 18.6's input casts](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_cast.dat#L95-L102).
+A numeric sequence identifier bypasses a schema-name lookup; it still requires
+permission to use the sequence. An administrator can look up
+`SELECT 'orders.ticket'::regclass::oid`, then give that number and sequence
+`USAGE` to a role. The role can pass the number to `nextval` without schema
+`USAGE`.
+Missing sequence names return `42P01`; a nonexistent numeric identifier returns
+`XX000`, matching PostgreSQL's failure to open that relation.
 
 A schema keeps its object identifier through renames and recovery. Renaming
 `public` to `archive`, then creating another `public`, gives the replacement a

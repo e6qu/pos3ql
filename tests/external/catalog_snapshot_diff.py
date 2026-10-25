@@ -354,6 +354,17 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         writer.execute('GRANT USAGE ON SCHEMA sr_hidden_relations_diff TO sr_lookup_reader_diff')
         writer.execute('SET ROLE sr_lookup_reader_diff')
         record(writer, f"{prefix}.schema_binding.regclass.usage_without_select", "SELECT to_regclass('\"a.b\"') IS NOT NULL,has_table_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.quoted_privileges", "SELECT has_table_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT'),has_column_privilege('sr_hidden_relations_diff.\"a.b\"','id','SELECT'),has_any_column_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.quoted_catalog_privileges", "SELECT has_table_privilege('\"pg_authid\"','SELECT'),has_table_privilege('\"pg_class\"','SELECT')")
+        writer.execute('SET search_path TO public,pg_catalog')
+        record(writer, f"{prefix}.schema_binding.regclass.privilege_path", "SELECT has_table_privilege('pg_class','SELECT'),has_table_privilege('pg_catalog.pg_class','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.privilege_numeric_name", "SELECT has_table_privilege('123','SELECT'),has_table_privilege(123::oid,'SELECT') IS NULL")
+        for label, query in (
+            ('missing_privilege_relation', "SELECT has_table_privilege('sr_hidden_relations_diff.missing','SELECT')"),
+            ('missing_privilege_schema', "SELECT has_table_privilege('sr_absent_lookup_diff.orders','SELECT')"),
+            ('malformed_privilege_relation', "SELECT has_table_privilege('broken..name','SELECT')"),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.regclass.{label}", query, ())
         writer.execute('RESET ROLE')
     finally:
         writer.execute('ROLLBACK')
@@ -425,12 +436,43 @@ def schema_sequence_argument_reports(writer, prefix, record, record_outcome):
             ('character', "SELECT nextval('sr_argument_ticket_diff'::character(30))"),
             ('negative_bigint', 'SELECT nextval(-1::bigint)'),
             ('missing_smallint', 'SELECT nextval(0::smallint)'),
+            ('missing_current_oid', 'SELECT currval(0::oid)'),
+            ('missing_set_oid', 'SELECT setval(0::oid,1)'),
+            ('negative_integer', 'SELECT nextval(-1::integer)'),
         ):
             record_outcome(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query, ())
         record(writer, f"{prefix}.schema_binding.sequence_arguments.after_errors", "SELECT currval('sr_argument_ticket_diff')")
     finally:
         writer.execute('ROLLBACK')
         writer.execute('DROP SEQUENCE IF EXISTS sr_argument_ticket_diff')
+
+
+def schema_sequence_oid_permission_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE ROLE sr_oid_sequence_reader_diff')
+        writer.execute('CREATE SCHEMA sr_oid_sequence_private_diff')
+        writer.execute('CREATE SEQUENCE sr_oid_sequence_private_diff."tick.et" START WITH 700')
+        writer.execute('CREATE TABLE sr_oid_sequence_private_diff.not_sequence(id integer)')
+        writer.execute('GRANT USAGE ON SEQUENCE sr_oid_sequence_private_diff."tick.et" TO sr_oid_sequence_reader_diff')
+        sequence = writer.execute("SELECT 'sr_oid_sequence_private_diff.\"tick.et\"'::regclass::oid").fetchone()[0]
+        table = writer.execute("SELECT 'sr_oid_sequence_private_diff.not_sequence'::regclass::oid").fetchone()[0]
+        writer.execute('BEGIN')
+        writer.execute('SET ROLE sr_oid_sequence_reader_diff')
+        record(writer, f"{prefix}.schema_binding.sequence_oid.without_namespace", "SELECT nextval(%s::oid),has_sequence_privilege(%s::oid,'USAGE')", (sequence, sequence))
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.denied_name", "SELECT nextval('sr_oid_sequence_private_diff.\"tick.et\"')", ())
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.wrong_kind", 'SELECT nextval(%s::oid)', (table,))
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.wrong_privilege_kind", "SELECT has_sequence_privilege(%s::oid,'USAGE')", (table,))
+        writer.execute('RESET ROLE')
+        writer.execute('GRANT USAGE ON SCHEMA sr_oid_sequence_private_diff TO sr_oid_sequence_reader_diff')
+        writer.execute('SET ROLE sr_oid_sequence_reader_diff')
+        record(writer, f"{prefix}.schema_binding.sequence_oid.quoted_name", "SELECT nextval('sr_oid_sequence_private_diff.\"tick.et\"'),has_sequence_privilege('sr_oid_sequence_private_diff.\"tick.et\"','USAGE')")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET ROLE')
+        writer.execute('DROP TABLE IF EXISTS sr_oid_sequence_private_diff.not_sequence')
+        writer.execute('DROP SEQUENCE IF EXISTS sr_oid_sequence_private_diff."tick.et"')
+        writer.execute('DROP SCHEMA IF EXISTS sr_oid_sequence_private_diff')
+        writer.execute('DROP ROLE IF EXISTS sr_oid_sequence_reader_diff')
 
 
 def schema_reference_literal_reports(writer, prefix, record):
@@ -632,6 +674,7 @@ def transcript(reader, writer, host, port, user, report_database):
         schema_regclass_lookup_reports(writer, prefix, record, record_outcome)
         schema_sequence_argument_reports(writer, prefix, record, record_outcome)
         schema_composite_lookup_reports(reader, writer, prefix, record)
+        schema_sequence_oid_permission_reports(writer, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

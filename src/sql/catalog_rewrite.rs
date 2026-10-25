@@ -293,7 +293,7 @@ pub(super) fn rule_definition<'a>(
         storage,
         transaction,
         PrivilegeRelation::Oid(relation_oid),
-    ) {
+    )? {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
             let definition = storage.table_def(slot, transaction);
             (definition.schema, definition.name)

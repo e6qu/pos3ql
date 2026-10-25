@@ -45,7 +45,10 @@ fn schema_name_sequence_arguments_accept_object_identifiers_and_reject_wrong_ari
             "42883",
         ),
         ("SELECT nextval(-1::bigint)", "22003"),
-        ("SELECT nextval(0::smallint)", "42P01"),
+        ("SELECT nextval(0::smallint)", "XX000"),
+        ("SELECT currval(0::oid)", "XX000"),
+        ("SELECT setval(0::oid,1)", "XX000"),
+        ("SELECT nextval(-1::integer)", "XX000"),
     ] {
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, query, true)),
@@ -187,6 +190,8 @@ fn schema_name_regclass_inquiry_preserves_permission_errors() {
         &mut engine,
         "CREATE ROLE lookup_reader;
         CREATE SCHEMA private_lookup; CREATE TABLE private_lookup.orders(id integer);
+        CREATE TABLE private_lookup.\"a.b\"(id integer);
+        CREATE TABLE public.pg_class(id integer); CREATE TABLE public.\"123\"(id integer);
         SET search_path TO private_lookup; SET ROLE lookup_reader",
         true,
     );
@@ -201,6 +206,7 @@ fn schema_name_regclass_inquiry_preserves_permission_errors() {
     for query in [
         "SELECT to_regclass('private_lookup.orders')",
         "SELECT 'private_lookup.orders'::regclass",
+        "SELECT has_table_privilege('private_lookup.orders','SELECT')",
     ] {
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, query, true)),
@@ -221,6 +227,50 @@ fn schema_name_regclass_inquiry_preserves_permission_errors() {
         true,
     );
     assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('orders') IS NOT NULL, has_table_privilege('private_lookup.orders','SELECT')", true)), ["t|f"]);
+    assert_eq!(data_rows(&session.success(&mut engine, r#"SELECT
+        has_table_privilege('private_lookup."a.b"','SELECT'),
+        has_column_privilege('private_lookup."a.b"','id','SELECT'),
+        has_any_column_privilege('private_lookup."a.b"','SELECT');
+        SELECT has_table_privilege('"pg_authid"','SELECT'),has_table_privilege('"pg_class"','SELECT');
+        SET search_path TO public,pg_catalog;
+        SELECT has_table_privilege('pg_class','SELECT'),has_table_privilege('pg_catalog.pg_class','SELECT');
+        SELECT has_table_privilege('123','SELECT'),has_table_privilege(123::oid,'SELECT') IS NULL;
+    "#, true)), ["f|f|f", "f|t", "f|t", "f|t"]);
+    for (query, state) in [
+        ("SELECT has_table_privilege('private_lookup.missing','SELECT')", "42P01"),
+        ("SELECT has_table_privilege('absent_lookup.orders','SELECT')", "3F000"),
+        ("SELECT has_table_privilege('broken..name','SELECT')", "42602"),
+    ] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), [state]);
+    }
+    session.success(&mut engine, "RESET ROLE", true);
+}
+
+#[test]
+fn schema_name_sequence_oid_requires_sequence_privilege_without_namespace_lookup() {
+    let config = test_config("schema-sequence-oid-permissions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"CREATE ROLE oid_sequence_reader;
+        CREATE SCHEMA oid_sequence_private;
+        CREATE SEQUENCE oid_sequence_private."tick.et" START WITH 700;
+        CREATE TABLE oid_sequence_private.not_sequence(id integer);
+        GRANT USAGE ON SEQUENCE oid_sequence_private."tick.et" TO oid_sequence_reader"#, true);
+    let sequence = data_rows(&session.success(&mut engine, r#"SELECT 'oid_sequence_private."tick.et"'::regclass::oid"#, true))[0].parse::<u32>().unwrap();
+    let table = data_rows(&session.success(&mut engine, "SELECT 'oid_sequence_private.not_sequence'::regclass::oid", true))[0].parse::<u32>().unwrap();
+    session.success(&mut engine, "SET ROLE oid_sequence_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT nextval({sequence}::oid),has_sequence_privilege({sequence}::oid,'USAGE')"), true)), ["700|t"]);
+    for (query, state) in [
+        (r#"SELECT nextval('oid_sequence_private."tick.et"')"#.to_string(), "42501"),
+        (format!("SELECT nextval({table}::oid)"), "42809"),
+        (format!("SELECT has_sequence_privilege({table}::oid,'USAGE')"), "42809"),
+    ] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, &query, true)), [state]);
+    }
+    session.success(&mut engine, "RESET ROLE; GRANT USAGE ON SCHEMA oid_sequence_private TO oid_sequence_reader; SET ROLE oid_sequence_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, r#"SELECT nextval('oid_sequence_private."tick.et"'),has_sequence_privilege('oid_sequence_private."tick.et"','USAGE')"#, true)), ["701|t"]);
     session.success(&mut engine, "RESET ROLE", true);
 }
 

@@ -10000,7 +10000,7 @@ fn catalog_owner(
     txid: u32,
 ) -> CatalogOwner {
     if matches!(object.class, crate::storage::AccessClass::Schema)
-        && storage.schema_def(usize::from(object.slot)).name.as_str() == "public"
+        && storage.schema_def_for(usize::from(object.slot), txid).name.as_str() == "public"
     {
         CatalogOwner::DatabaseOwner
     } else {
@@ -10597,7 +10597,7 @@ fn pg_default_acl<'a>(
         } else {
             namespace_oid(
                 storage,
-                storage.schema_def(entry.schema as usize).name.as_str(), txid)
+                storage.schema_def_for(entry.schema as usize, txid).name.as_str(), txid)
         };
         let object_type = match entry.class {
             DefaultPrivilegeClass::Table => "r",
@@ -11835,7 +11835,7 @@ fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Op
     };
     if let Some(written_schema) = written_schema {
         let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def(slot);
+            let definition = storage.schema_def_for(slot, txid);
             (definition.visible_to(txid)
                 && identifier_spelling_matches(written_schema, definition.name.as_str()))
             .then_some(definition.name)
@@ -11849,7 +11849,7 @@ fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Op
     }
     for entry in storage.path().entries() {
         if let crate::storage::PathEntry::Schema(schema) = entry
-            && let Some(slot) = in_schema(storage.schema_def(*schema as usize).name.as_str())
+            && let Some(slot) = in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
         {
             return Some(slot);
         }
@@ -12704,7 +12704,7 @@ fn routine_declared_signature<'a>(
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     let schema = routine.schema_for(txid);
-    if !storage.schema_is_on_path(schema) {
+    if !storage.schema_is_on_path(schema, txid) {
         write_identifier(&mut text, schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -12718,7 +12718,7 @@ fn routine_declared_signature<'a>(
         }
         let qualified = argument
             .user_type
-            .is_some_and(|identity| !storage.schema_is_on_path(identity.schema));
+            .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
         write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
             .map_err(|_| super::eval::arena_full())?;
     }
@@ -12863,7 +12863,7 @@ pub(crate) fn routine_name_by_oid<'a>(
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
-        if !storage.schema_is_on_path(routine.schema_for(txid)) {
+        if !storage.schema_is_on_path(routine.schema_for(txid), txid) {
             let mut qualified = StackStr::<256>::new();
             write_identifier(&mut qualified, routine.schema_for(txid).as_str());
             use core::fmt::Write;
@@ -13029,7 +13029,7 @@ pub(crate) fn operator_oid_by_name(
             builtin()
         } else {
             let schema = (0..storage.schema_count()).find_map(|slot| {
-                let definition = storage.schema_def(slot);
+                let definition = storage.schema_def_for(slot, txid);
                 (definition.visible_to(txid)
                     && identifier_spelling_matches(schema, definition.name.as_str()))
                 .then_some(definition.name)
@@ -13044,7 +13044,7 @@ pub(crate) fn operator_oid_by_name(
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin()?,
             crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def(usize::from(*slot)).name.as_str())?
+                user(storage.schema_def_for(usize::from(*slot), txid).name.as_str())?
             }
         };
         if found.is_some() {
@@ -13137,7 +13137,7 @@ pub(crate) fn operator_name_by_oid<'a>(
     let operator = storage.operator_for(slot, txid);
     let mut text = StackStr::<256>::new();
     use core::fmt::Write;
-    if !storage.schema_is_on_path(operator.schema) {
+    if !storage.schema_is_on_path(operator.schema, txid) {
         write_identifier(&mut text, operator.schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -13158,7 +13158,7 @@ pub(crate) fn operator_name_by_oid<'a>(
             if let Some(argument) = argument {
                 let qualified = argument
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema));
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
                 write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
                     .map_err(|_| super::eval::arena_full())?;
             } else {
@@ -13701,7 +13701,7 @@ pub fn function_arguments_text<'a>(
             parameter.user_type,
             parameter
                 .user_type
-                .is_some_and(|type_identity| !storage.schema_is_on_path(type_identity.schema)),
+                .is_some_and(|type_identity| !storage.schema_is_on_path(type_identity.schema, txid)),
         )
         .map_err(|_| super::eval::arena_full())?;
         if !identity && let Some(default) = parameter.mode.default() {
@@ -13743,7 +13743,7 @@ pub fn function_result_text<'a>(
                 result.user_type,
                 result
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13755,7 +13755,7 @@ pub fn function_result_text<'a>(
                 result.user_type,
                 result
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13778,7 +13778,7 @@ pub fn function_result_text<'a>(
                     column.user_type,
                     column
                         .user_type
-                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
                 )
                 .map_err(|_| super::eval::arena_full())?;
             }
@@ -13807,7 +13807,7 @@ pub fn function_result_text<'a>(
                 aggregate
                     .result_type
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13882,7 +13882,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
             return builtin();
         }
         let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def(slot);
+            let definition = storage.schema_def_for(slot, txid);
             (definition.visible_to(txid)
                 && identifier_spelling_matches(schema, definition.name.as_str()))
             .then_some(definition.name)
@@ -13893,7 +13893,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
             crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def(usize::from(*slot)).name.as_str())
+                user(storage.schema_def_for(usize::from(*slot), txid).name.as_str())
             }
         };
         if found.is_some() {
@@ -16056,7 +16056,7 @@ fn write_index_key_metadata(
             .operator_class_slot_by_oid(oid, txid)
             .expect("index operator class dependency is visible");
         let definition = storage.operator_class_for(slot, txid);
-        if !storage.schema_is_on_path(definition.schema) {
+        if !storage.schema_is_on_path(definition.schema, txid) {
             write_identifier(out, definition.schema.as_str());
             let _ = out.write_char('.');
         }
@@ -21118,7 +21118,7 @@ fn pg_extension<'a>(
                 )),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.schema_def(namespace as usize).name.as_str(), txid)),
+                    storage.schema_def_for(namespace as usize, txid).name.as_str(), txid)),
                 Datum::Bool(relocatable),
                 text(version.as_str(), arena)?,
                 extconfig,
@@ -21164,7 +21164,7 @@ fn extension_dependency_catalog_identity(
         }
         AccessClass::Schema => (
             PG_NAMESPACE_OID,
-            namespace_oid(storage, storage.schema_def(slot).name.as_str(), txid),
+            namespace_oid(storage, storage.schema_def_for(slot, txid).name.as_str(), txid),
         ),
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
@@ -21245,7 +21245,7 @@ fn pg_depend<'a>(
         .sum::<usize>();
     let matview_dependencies = storage
         .matviews_visible_to(txid)
-        .map(|(slot, _)| storage.matview_dependencies(slot).entries().len())
+        .map(|(slot, _)| storage.matview_dependencies(slot, txid).entries().len())
         .sum::<usize>();
     let trigger_dependencies = storage
         .triggers_with_slots_visible_to(txid)
@@ -21786,7 +21786,7 @@ fn pg_depend<'a>(
     for (materialized_slot, _) in storage.matviews_visible_to(txid) {
         let table_slot = storage.matview_table(materialized_slot);
         for dependency in storage
-            .snapshot_matview_dependencies(materialized_slot, arena)?
+            .snapshot_matview_dependencies(materialized_slot, txid, arena)?
             .entries()
         {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {

@@ -2821,7 +2821,7 @@ impl Engine {
                         let _ = write!(
                             published.names[published.n],
                             "{}",
-                            self.storage.schema_def(*slot as usize).name.as_str()
+                            self.storage.schema_def_for(*slot as usize, txn.txid).name.as_str()
                         );
                         published.n += 1;
                     }
@@ -5857,7 +5857,7 @@ impl Engine {
                 )
             } else {
                 let (namespace, relocatable, version) = extension.definition_to(txn.txid);
-                let schema = self.storage.schema_def(namespace as usize).name;
+                let schema = self.storage.schema_def_for(namespace as usize, txn.txid).name;
                 let object = crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Extension,
                     slot: slot as u16,
@@ -6295,7 +6295,7 @@ impl Engine {
             let schema = if entry.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
                 crate::storage::SqlName::EMPTY
             } else {
-                self.storage.schema_def(entry.schema as usize).name
+                self.storage.schema_def_for(entry.schema as usize, txn.txid).name
             };
             let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
@@ -7252,6 +7252,9 @@ impl Engine {
                     self.storage.commit_schema_create(*slot as usize);
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
+                DdlUndo::MatviewQueryChanged(undo) => self.storage.finish_matview_query(
+                    *undo, crate::storage::CatalogDdlDecision::Commit,
+                ),
                 DdlUndo::SchemaRenamed(undo) => self.storage.finish_schema_name(
                     *undo, crate::storage::CatalogDdlDecision::Commit,
                 ).expect("schema publication retains its selected source"),
@@ -7302,7 +7305,7 @@ impl Engine {
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
-                DdlUndo::ConstraintCommentRenamed { .. } => {}
+                DdlUndo::CommentIdentityChanged { .. } => {}
             }
         }
         for &advance in txn.subscription_advances() {
@@ -17971,7 +17974,7 @@ impl Engine {
                 .definition_to(txn.txid)
                 .0 as usize;
             required_names[index] = *required;
-            required_schema_names[index] = self.storage.schema_def(namespace).name;
+            required_schema_names[index] = self.storage.schema_def_for(namespace, txn.txid).name;
         }
         let required_count = package_definition.requires().len();
         for (schema, name) in required_schemas[..required_count]
@@ -17981,7 +17984,7 @@ impl Engine {
             *schema = name.as_str();
         }
         let namespace = self.storage.extension(extension).definition_to(txn.txid).0 as usize;
-        let schema_name = self.storage.schema_def(namespace).name;
+        let schema_name = self.storage.schema_def_for(namespace, txn.txid).name;
         let schema = schema_name.as_str();
         debug_assert_eq!(script.package as usize, package);
         let source = self.storage.extension_script_source(script);
@@ -18240,7 +18243,7 @@ impl Engine {
             )));
         };
         let old_namespace = self.storage.extension(extension).definition_to(txn.txid).0 as usize;
-        let old_schema = self.storage.schema_def(old_namespace).name;
+        let old_schema = self.storage.schema_def_for(old_namespace, txn.txid).name;
         let mut objects = [crate::storage::AccessObject {
             class: crate::storage::AccessClass::Table,
             slot: 0,
@@ -19047,7 +19050,7 @@ impl Engine {
                     .extension(plan.extension)
                     .definition_to(txn.txid)
                     .0 as usize;
-                let cascade_schema = self.storage.schema_def(namespace).name;
+                let cascade_schema = self.storage.schema_def_for(namespace, txn.txid).name;
                 let required_package = match self
                     .storage
                     .extension_package_for_version(required.as_str(), None)
@@ -20209,6 +20212,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         }
         DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
         DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
+        DdlUndo::MatviewQueryChanged(undo) => storage.finish_matview_query(
+            undo, crate::storage::CatalogDdlDecision::Rollback,
+        ),
         DdlUndo::SchemaRenamed(undo) => storage.finish_schema_name(
             undo, crate::storage::CatalogDdlDecision::Rollback,
         ).expect("schema rollback retains its selected source"),
@@ -20257,7 +20263,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::CommentSet { slot, prior } => {
             storage.restore_comment_pending(slot as usize, prior);
         }
-        DdlUndo::ConstraintCommentRenamed { slot, prior } => {
+        DdlUndo::CommentIdentityChanged { slot, prior } => {
             storage.restore_comment_identity_pending(slot as usize, prior);
         }
     }

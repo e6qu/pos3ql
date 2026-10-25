@@ -324,6 +324,7 @@ impl Storage {
         state: &table_definitions::DefinitionState,
         transaction: u32,
     ) -> Option<IndexDef> {
+        index = index.definition_for(transaction);
         if index.ddl_state.pending_drop_txid() == Some(transaction) {
             return Some(index);
         }

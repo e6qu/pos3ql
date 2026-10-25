@@ -1798,7 +1798,7 @@ fn record_operator_call(
     let has_catalog_candidate = storage.operators_visible_to(txid).any(|(_, operator)| {
         operator.name.as_str() == name
             && schema.map_or_else(
-                || storage.schema_is_on_path(operator.schema),
+                || storage.schema_is_on_path(operator.schema, txid),
                 |schema| operator.schema.as_str() == schema,
             )
     });

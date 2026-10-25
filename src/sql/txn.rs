@@ -359,6 +359,7 @@ pub(crate) enum DdlUndo {
     ViewChanged(crate::storage::ViewPublication),
     ViewDropped(crate::storage::CatalogDdlUndo),
     MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
+    MatviewQueryChanged(crate::storage::MatviewQueryUndo),
     RuleChanged {
         publication: crate::storage::RulePublication,
         prior_table_rule_txid: Option<u32>,
@@ -646,7 +647,7 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingComment>,
     },
     /// A table-constraint rename changed a comment's transaction-local name.
-    ConstraintCommentRenamed {
+    CommentIdentityChanged {
         slot: u32,
         prior: Option<crate::storage::PendingCommentIdentity>,
     },

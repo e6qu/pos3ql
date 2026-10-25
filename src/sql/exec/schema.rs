@@ -91,6 +91,11 @@ pub(super) fn rename(
             txn.write_table_definition(storage, target, definition, &mapping, false)?;
         }
     }
+    for slot in 0..storage.index_count() {
+        if let Some(prior) = storage.stage_index_schema_references(slot, old, name, txn.txid)? {
+            txn.record_catalog_change(storage, DdlUndo::IndexAltered { slot: slot as u32, prior })?;
+        }
+    }
     for slot in 0..storage.sequence_count() {
         let sequence = storage.sequence_for(slot, txn.txid);
         if sequence.database != storage.current_database_oid() || !sequence.visible_to(txn.txid) { continue; }
@@ -156,9 +161,87 @@ pub(super) fn rename(
             crate::storage::RuleMetadataChange::Schema { old, new: name }, txn.txid)?;
         txn.record_catalog_change(storage, DdlUndo::RuleAltered(change))?;
     }
+    for slot in 0..storage.matview_count() {
+        let view = storage.matview_for(slot, txn.txid);
+        if view.database != storage.current_database_oid() || !view.visible_to(txn.txid) { continue; }
+        let mut sql = view.sql;
+        let mut path = view.creation_path;
+        crate::storage::rename_schema_path(&mut path, old, name)?;
+        let changed = rename_schema_qualified_sql(&mut sql, &mut [], old, name)?;
+        let dependencies = storage.snapshot_matview_dependencies(slot, txn.txid, arena)?;
+        if changed || path != view.creation_path
+            || dependencies.entries().iter().any(|dependency| dependency.schema == old || dependency.referenced_schema == old) {
+            let change = storage.stage_matview_query_schema(storage.prepare_matview_edit(slot, txn.txid)?, old, name, txn.txid)?;
+            txn.record_catalog_change(storage, DdlUndo::MatviewQueryChanged(change))?;
+        }
+    }
+    // Capture each family before changing it: catalog iterators borrow storage,
+    // while journal exhaustion must be able to undo the just-staged edit.
+    let mut collations = ArenaList::new(arena);
+    for entry in storage.collations_visible_to(txn.txid).filter(|(_, definition)| definition.schema == old) {
+        collations.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in collations.as_slice() {
+        definition.schema = name;
+        let prior = storage.alter_collation(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::CollationAltered { slot: slot as u32, prior })?;
+    }
+    let mut conversions = ArenaList::new(arena);
+    for entry in storage.conversions_visible_to(txn.txid).filter(|(_, definition)| definition.schema == old) {
+        conversions.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in conversions.as_slice() {
+        definition.schema = name;
+        let prior = storage.alter_conversion(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::ConversionAltered { slot: slot as u32, prior })?;
+    }
+    let mut text_search = ArenaList::new(arena);
+    for entry in storage.text_search_objects_visible_to(txn.txid).filter(|(_, definition)| definition.schema() == old) {
+        text_search.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in text_search.as_slice() {
+        definition.rename(Some(name), None);
+        let prior = storage.alter_text_search_object(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::TextSearchAltered { slot: slot as u32, prior })?;
+    }
+    let mut operators = ArenaList::new(arena);
+    for entry in storage.operators_visible_to(txn.txid).filter(|(_, definition)| definition.schema == old) {
+        operators.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in operators.as_slice() {
+        definition.schema = name;
+        let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::OperatorAltered { slot: slot as u32, prior })?;
+    }
+    let mut families = ArenaList::new(arena);
+    for entry in storage.operator_families_visible_to(txn.txid).filter(|(_, definition)| definition.schema == old) {
+        families.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in families.as_slice() {
+        definition.schema = name;
+        let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::OperatorFamilyAltered { slot: slot as u32, prior })?;
+    }
+    let mut classes = ArenaList::new(arena);
+    for entry in storage.operator_classes_visible_to(txn.txid).filter(|(_, definition)| definition.schema == old) {
+        classes.push(entry).map_err(|_| arena_full())?;
+    }
+    for &(slot, mut definition) in classes.as_slice() {
+        definition.schema = name;
+        let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::OperatorClassAltered { slot: slot as u32, prior })?;
+    }
+    for slot in 0..storage.extended_statistics_count() {
+        let statistics = storage.extended_statistics(slot);
+        if statistics.database != storage.current_database_oid() || !statistics.visible_to(txn.txid) { continue; }
+        let mut definition = statistics.definition_for(txn.txid);
+        if !rename_schema_name(&mut definition.schema, old, name) { continue; }
+        let prior = storage.alter_extended_statistics(slot, definition, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::StatisticsAltered { slot: slot as u32, prior })?;
+    }
     for slot in 0..storage.comment_capacity() {
         if let Some(prior) = storage.stage_schema_comment_name(slot, old, name, txn.txid)? {
-            txn.record_catalog_change(storage, DdlUndo::ConstraintCommentRenamed { slot: slot as u32, prior })?;
+            txn.record_catalog_change(storage, DdlUndo::CommentIdentityChanged { slot: slot as u32, prior })?;
         }
     }
     Ok(())

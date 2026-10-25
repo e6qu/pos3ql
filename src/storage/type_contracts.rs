@@ -211,6 +211,7 @@ pub(super) enum CatalogPublicationInput<'input> {
     QueryDefinition(super::StoredQueryDependencyView<'input>),
     QueryCreation(super::StoredQueryDependencyView<'input>),
     RuleMetadataEdit,
+    StoredQueryEdit,
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +285,7 @@ impl CatalogPublicationInput<'_> {
     fn requirements(&self) -> CatalogOwnerRequirements {
         let (types, permissions, comments, extensions) = match self {
             Self::RoutineContract => (true, false, true, false),
+            Self::StoredQueryEdit => (true, false, false, false),
             Self::TypedCatalogCreation => (true, true, true, false),
             Self::ViewDefinition => (true, true, false, false),
             Self::ViewMetadataEdit | Self::RuleMetadataEdit => (true, false, true, false),

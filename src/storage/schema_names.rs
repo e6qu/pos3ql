@@ -75,6 +75,32 @@ impl SchemaNameTarget {
 }
 
 impl Storage {
+    pub(crate) fn stage_index_schema_references(
+        &self, slot: usize, old: SqlName, new: SqlName, transaction: u32,
+    ) -> Result<Option<Option<super::PendingIndexDefinition>>, SqlError> {
+        let mut indexes = self.index_catalog();
+        let index = indexes[slot];
+        if index.database != current_database() || !index.visible_to(transaction) { return Ok(None); }
+        let mut definition = index.definition_for(transaction);
+        let mut changed = false;
+        for expression in definition.expressions.iter_mut().flatten() {
+            changed |= super::rename_schema_qualified_sql(expression, &mut [], old, new)?;
+        }
+        if let Some(predicate) = &mut definition.predicate {
+            changed |= super::rename_schema_qualified_sql(predicate, &mut [], old, new)?;
+        }
+        if !changed { return Ok(None); }
+        if let Some(owner) = index.pending_owner_other_than(transaction) {
+            drop(indexes);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, index.name.as_str()));
+        }
+        indexes[slot].pending_definition = Some(super::PendingIndexDefinition {
+            txid: transaction, definition: definition.mutable_for(transaction),
+            expressions: definition.expressions, predicate: definition.predicate,
+        });
+        Ok(Some(index.pending_definition))
+    }
+
     pub(crate) fn stage_schema_comment_name(
         &self, slot: usize, old: SqlName, new: SqlName, transaction: u32,
     ) -> Result<Option<Option<super::PendingCommentIdentity>>, SqlError> {

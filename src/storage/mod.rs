@@ -26,6 +26,7 @@ mod query_lifecycles;
 mod routine_lifecycles;
 mod schema_names;
 pub(crate) use schema_names::{SchemaNameTarget, SchemaNameUndo};
+pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
 mod table_lifecycles;
@@ -3956,6 +3957,7 @@ fn pending_stored_query_dependency_capacity(config: &Config) -> usize {
         .max_rules
         .saturating_add(config.max_policies)
         .saturating_add(config.max_routines)
+        .saturating_add(config.max_materialized_views)
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
 }
@@ -4467,6 +4469,7 @@ enum StoredQueryDependencyOwner {
     Rule(u16),
     Policy(u16),
     Routine(u16),
+    MaterializedView(u16),
 }
 
 impl PendingStoredQueryDependencies {
@@ -6431,6 +6434,8 @@ pub struct MatviewDef {
     pub populated: bool,
     population_version: u64,
     pending_population: Option<query_lifecycles::PendingMatviewPopulation>,
+    query_version: u64,
+    pending_query: Option<matview_lifecycles::PendingMatviewQuery>,
     pub ddl_state: CatalogDdlState,
 }
 
@@ -6447,6 +6452,8 @@ impl MatviewDef {
         populated: false,
         population_version: 0,
         pending_population: None,
+        query_version: 0,
+        pending_query: None,
         ddl_state: CatalogDdlState::Absent,
     };
 
@@ -6458,6 +6465,11 @@ impl MatviewDef {
         self.pending_population
             .filter(|pending| pending.transaction == transaction)
             .map_or(self.populated, |pending| pending.populated)
+    }
+
+    pub(crate) fn definition_for(self, transaction: u32) -> Self {
+        self.pending_query.filter(|pending| pending.transaction == transaction)
+            .map_or(self, |pending| Self { sql: pending.sql, creation_path: pending.creation_path, ..self })
     }
 }
 
@@ -10975,6 +10987,8 @@ impl IndexMutableDefinition {
 pub(crate) struct PendingIndexDefinition {
     pub txid: u32,
     pub definition: IndexMutableDefinition,
+    pub expressions: [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
+    pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
 }
 
 /// A named executable index over a table's columns.
@@ -11066,6 +11080,15 @@ impl IndexDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(self.mutable, |pending| pending.definition)
+    }
+
+    pub(crate) fn definition_for(mut self, transaction: u32) -> Self {
+        if let Some(pending) = self.pending_definition.filter(|pending| pending.txid == transaction) {
+            self.mutable = pending.definition;
+            self.expressions = pending.expressions;
+            self.predicate = pending.predicate;
+        }
+        self
     }
 }
 
@@ -17853,6 +17876,7 @@ impl Storage {
             StoredQueryDependencyOwner::Routine(slot) => {
                 self.rule_count() + self.policy_count() + usize::from(slot)
             }
+            StoredQueryDependencyOwner::MaterializedView(slot) => self.matview_dependency_image(usize::from(slot)),
         }
     }
 
@@ -17964,9 +17988,14 @@ impl Storage {
     pub(crate) fn snapshot_matview_dependencies(
         &self,
         slot: usize,
+        txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        self.snapshot_dependency_image(self.matview_dependency_image(slot), arena)
+        let image = self.matview(slot).pending_query
+            .filter(|pending| pending.transaction == txid)
+            .map_or_else(|| self.matview_dependency_image(slot), |pending|
+                self.stored_query_dependency_pending_base + pending.dependency_slot as usize);
+        self.snapshot_dependency_image(image, arena)
     }
 
     fn copy_committed_dependencies(
@@ -23623,7 +23652,7 @@ impl Storage {
                 let definition = self.sequence_for(slot, txid);
                 (definition.schema, definition.name)
             }
-            AccessClass::Schema => (SqlName::EMPTY, self.schema_def(slot).name),
+            AccessClass::Schema => (SqlName::EMPTY, self.schema_def_for(slot, txid).name),
             AccessClass::Domain => {
                 let definition = self.domain_for(slot, txid);
                 (definition.schema, definition.name)
@@ -29925,7 +29954,7 @@ impl Storage {
                     }
                 }
                 PathEntry::Schema(slot) => {
-                    let schema_name = self.schema_def(*slot as usize).name;
+                    let schema_name = self.schema_def_for(*slot as usize, txid).name;
                     if let Some(found) = self.relation_in(schema_name.as_str(), name, txid) {
                         return Some(found);
                     }
@@ -29935,9 +29964,9 @@ impl Storage {
         None
     }
 
-    pub(crate) fn schema_is_on_path(&self, schema: SqlName) -> bool {
+    pub(crate) fn schema_is_on_path(&self, schema: SqlName, txid: u32) -> bool {
         self.path().entries().iter().any(|entry| {
-            matches!(entry, PathEntry::Schema(slot) if self.schema_def(*slot as usize).name == schema)
+            matches!(entry, PathEntry::Schema(slot) if self.schema_def_for(*slot as usize, txid).name == schema)
         })
     }
 
@@ -30031,7 +30060,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema_name = self.schema_def(*slot as usize).name;
+                let schema_name = self.schema_def_for(*slot as usize, txid).name;
                 if let Some(k) = self.relation_kind_in(schema_name.as_str(), name, txid) {
                     return Some((schema_name, k));
                 }
@@ -30093,7 +30122,7 @@ impl Storage {
                 "no schema has been selected to create in"
             ));
         };
-        Ok(self.schema_def(slot as usize).name)
+        Ok(self.schema_def_for(slot as usize, txid).name)
     }
 
     /// Live SQL tables with their slot indices, excluding internal storage.
@@ -38724,19 +38753,27 @@ impl Storage {
             txid,
             checkpoint: false,
         }
+        .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
     }
 
     pub(crate) fn matview(&self, slot: usize) -> MatviewDef {
         self.matview_catalog()[slot]
     }
 
-    pub(crate) fn matview_dependencies(&self, slot: usize) -> StoredQueryDependencyImage<'_> {
-        let image = self.matview_dependency_image(slot);
+    pub(crate) fn matview_for(&self, slot: usize, transaction: u32) -> MatviewDef {
+        self.matview(slot).definition_for(transaction)
+    }
+
+    pub(crate) fn matview_dependencies(&self, slot: usize, txid: u32) -> StoredQueryDependencyImage<'_> {
+        let image = self.matview(slot).pending_query
+            .filter(|pending| pending.transaction == txid)
+            .map_or_else(|| self.matview_dependency_image(slot), |pending|
+                self.stored_query_dependency_pending_base + pending.dependency_slot as usize);
         let catalog = self
             .stored_query_dependencies
             .lock()
             .expect("stored-query dependency catalog lock poisoned");
-        let count = catalog.counts[image];
+        let count = catalog.image_count(image);
         StoredQueryDependencyImage {
             catalog,
             image,
@@ -38953,7 +38990,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema_name = self.schema_def(*slot as usize).name;
+                let schema_name = self.schema_def_for(*slot as usize, txid).name;
                 if let Some(found) = self.sequence_slot(schema_name.as_str(), name, txid) {
                     return Some(found);
                 }
@@ -39175,7 +39212,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema = self.schema_def(*slot as usize).name;
+                let schema = self.schema_def_for(*slot as usize, txid).name;
                 if let Some(i) = (DomainIter {
                     catalog: &self.type_catalog,
                     next_slot: 0,
@@ -40084,7 +40121,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema = self.schema_def(*slot as usize).name;
+                let schema = self.schema_def_for(*slot as usize, txid).name;
                 if let Some(i) = (EnumIter {
                     catalog: &self.type_catalog,
                     next_slot: 0,
@@ -40733,7 +40770,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schema_def(*schema_slot as usize).name;
+            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
             if let Some(slot) = self.composite_slot(schema.as_str(), name, txid) {
                 return Some(slot);
             }
@@ -40800,7 +40837,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schema_def(*schema_slot as usize).name;
+            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
             if let Some(target) = self.alter_type_target_in_schema(schema.as_str(), name, txid) {
                 return Some(target);
             }
@@ -41591,7 +41628,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schema_def(*slot as usize).name.as_str(), name)
+            resolve(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -41624,7 +41661,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schema_def(*slot as usize).name.as_str(), name)
+            resolve(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -41657,7 +41694,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schema_def(*slot as usize).name.as_str(), name)
+            resolve(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -41873,7 +41910,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schema_def(*schema_slot as usize).name;
+            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
             if let Some(expected) = resolve(schema.as_str(), name) {
                 return Some(expected);
             }
@@ -42033,7 +42070,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return false;
             };
-            matches(self.schema_def(*slot as usize).name.as_str(), name)
+            matches(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -42130,7 +42167,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schema_def(*slot as usize).name.as_str(), name)
+            resolve(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -42167,7 +42204,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schema_def(*slot as usize).name.as_str(), name)
+            resolve(self.schema_def_for(*slot as usize, txid).name.as_str(), name)
         })
     }
 
@@ -42296,7 +42333,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schema_def(*schema_slot as usize).name;
+            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
             if let Some(expected) = resolve(schema.as_str(), name) {
                 return Some(expected);
             }
@@ -42327,7 +42364,7 @@ impl Storage {
                 return None;
             };
             self.routine_slot_in(
-                self.schema_def(*slot as usize).name.as_str(),
+                self.schema_def_for(*slot as usize, txid).name.as_str(),
                 name,
                 argument_types,
                 txid,
@@ -42351,7 +42388,7 @@ impl Storage {
                 return None;
             };
             self.routine_slot_in_oids(
-                self.schema_def(*slot as usize).name.as_str(),
+                self.schema_def_for(*slot as usize, txid).name.as_str(),
                 name,
                 argument_type_oids,
                 txid,
@@ -44459,7 +44496,7 @@ impl Storage {
         }
         self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => self.extended_statistics_slot(
-                self.schema_def(*slot as usize).name.as_str(),
+                self.schema_def_for(*slot as usize, txid).name.as_str(),
                 name,
                 txid,
             ),
@@ -45122,7 +45159,7 @@ impl Storage {
         }
         self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => {
-                self.index_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
+                self.index_slot(self.schema_def_for(*slot as usize, txid).name.as_str(), name, txid)
             }
             PathEntry::Catalog => None,
         })
@@ -45797,7 +45834,10 @@ impl Storage {
         }
         let index = &mut catalog[slot];
         let prior = index.pending_definition;
-        index.pending_definition = Some(PendingIndexDefinition { txid, definition });
+        let current = index.definition_for(txid);
+        index.pending_definition = Some(PendingIndexDefinition {
+            txid, definition, expressions: current.expressions, predicate: current.predicate,
+        });
         Ok(prior)
     }
 
@@ -45808,6 +45848,8 @@ impl Storage {
             && pending.txid == txid
         {
             index.mutable = pending.definition;
+            index.expressions = pending.expressions;
+            index.predicate = pending.predicate;
             index.pending_definition = None;
         }
     }
@@ -48699,7 +48741,7 @@ impl Storage {
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => self.text_search_slot(
                     kind,
-                    self.schema_def(*slot as usize).name.as_str(),
+                    self.schema_def_for(*slot as usize, txid).name.as_str(),
                     name,
                     txid,
                 ),
@@ -48752,7 +48794,7 @@ impl Storage {
             Some(schema) => self.collation_slot(schema, name, txid),
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
-                    self.collation_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
+                    self.collation_slot(self.schema_def_for(*slot as usize, txid).name.as_str(), name, txid)
                 }
                 PathEntry::Catalog => None,
             }),
@@ -48796,7 +48838,7 @@ impl Storage {
             Some(schema) => self.conversion_slot(schema, name, txid),
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
-                    self.conversion_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
+                    self.conversion_slot(self.schema_def_for(*slot as usize, txid).name.as_str(), name, txid)
                 }
                 PathEntry::Catalog => None,
             }),
@@ -48813,7 +48855,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 return None;
             };
-            let schema = self.schema_def(*schema_slot as usize).name;
+            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
             self.conversions_visible_to(txid)
                 .find_map(|(_, definition)| {
                     (definition.schema == schema
@@ -50785,9 +50827,9 @@ impl Storage {
             })
     }
 
-    fn operator_schema_matches_path(&self, schema: SqlName) -> bool {
+    fn operator_schema_matches_path(&self, schema: SqlName, txid: u32) -> bool {
         self.path().entries().iter().any(|entry| match entry {
-            PathEntry::Schema(slot) => self.schema_def(*slot as usize).name == schema,
+            PathEntry::Schema(slot) => self.schema_def_for(*slot as usize, txid).name == schema,
             PathEntry::Catalog => false,
         })
     }
@@ -50807,7 +50849,7 @@ impl Storage {
             for (slot, definition) in self.operators_visible_to(txid) {
                 if definition.name.as_str() != name
                     || schema.is_some_and(|schema| definition.schema.as_str() != schema)
-                    || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
+                    || (schema.is_none() && !self.operator_schema_matches_path(definition.schema, txid))
                     || definition.signature.arity()
                         != left_oid.is_some() as usize + right_oid.is_some() as usize
                 {
@@ -50893,7 +50935,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            if let Some(expected) = resolve(self.schema_def(*schema_slot as usize).name.as_str()) {
+            if let Some(expected) = resolve(self.schema_def_for(*schema_slot as usize, txid).name.as_str()) {
                 return Some(expected);
             }
         }
@@ -50935,7 +50977,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            if let Some(expected) = resolve(self.schema_def(*schema_slot as usize).name.as_str()) {
+            if let Some(expected) = resolve(self.schema_def_for(*schema_slot as usize, txid).name.as_str()) {
                 return Some(expected);
             }
         }
@@ -51355,7 +51397,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
-                let schema = self.schema_def(*schema_slot as usize).name;
+                let schema = self.schema_def_for(*schema_slot as usize, txid).name;
                 if let Some(slot) = self.operator_family_slot_exact(schema.as_str(), name, txid) {
                     return Some(slot);
                 }
@@ -51754,7 +51796,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
-                let schema = self.schema_def(*schema_slot as usize).name;
+                let schema = self.schema_def_for(*schema_slot as usize, txid).name;
                 if let Some(slot) = self.operator_class_slot_exact(schema.as_str(), name, txid) {
                     return Some(slot);
                 }
@@ -56016,6 +56058,8 @@ mod tests {
                 populated: _,
                 population_version: _,
                 pending_population: _,
+                query_version: _,
+                pending_query: _,
                 ddl_state: _,
             } = view;
         };
@@ -60763,6 +60807,8 @@ mod tests {
                         populated: false,
                         population_version: created_at,
                         pending_population: None,
+                        query_version: created_at,
+                        pending_query: None,
                         ddl_state: CatalogDdlState::Present,
                     };
                 });

@@ -11044,7 +11044,7 @@ impl Checkpointer {
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(mv.populated),
-                    ManifestDependencies(storage.matview_dependencies(matview_slot).view())
+                    ManifestDependencies(storage.matview_dependencies(matview_slot, 0).view())
                 ),
             )?;
         }

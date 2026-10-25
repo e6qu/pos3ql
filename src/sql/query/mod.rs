@@ -2302,7 +2302,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .definition_for(self.txid);
         let mut output = crate::util::StackStr::new();
         if definition.schema().as_str() != "pg_catalog"
-            && !self.storage.schema_is_on_path(definition.schema())
+            && !self.storage.schema_is_on_path(definition.schema(), self.txid)
         {
             use core::fmt::Write as _;
             write!(output, "{}.", definition.schema().as_str()).ok()?;
@@ -2339,7 +2339,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .definition_for(self.txid);
         let mut output = crate::util::StackStr::new();
         if definition.schema().as_str() != "pg_catalog"
-            && !self.storage.schema_is_on_path(definition.schema())
+            && !self.storage.schema_is_on_path(definition.schema(), self.txid)
         {
             use core::fmt::Write as _;
             write!(output, "{}.", definition.schema().as_str()).ok()?;
@@ -2511,7 +2511,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage
             .operators_visible_to(self.txid)
             .any(|(_, operator)| {
-                operator.name.as_str() == name && self.storage.schema_is_on_path(operator.schema)
+                operator.name.as_str() == name && self.storage.schema_is_on_path(operator.schema, self.txid)
             })
     }
 

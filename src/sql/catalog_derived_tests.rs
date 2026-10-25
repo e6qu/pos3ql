@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn schema_rename_rewrites_private_materialized_queries_and_index_expressions() {
+    let config = test_config("private-schema-query-text");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "
+        CREATE SCHEMA query_schema_before;
+        CREATE FUNCTION query_schema_before.score(value integer) RETURNS integer
+          LANGUAGE SQL IMMUTABLE AS 'SELECT value+1';
+        CREATE TABLE query_schema_before.items(id integer);
+        INSERT INTO query_schema_before.items VALUES (4);
+        CREATE INDEX scored_items ON query_schema_before.items
+          ((query_schema_before.score(id))) WHERE query_schema_before.score(id)>0;
+        CREATE MATERIALIZED VIEW cached_schema_items AS
+          SELECT query_schema_before.score(id) AS score FROM query_schema_before.items;
+    ", true);
+    writer.success(&mut engine, "BEGIN; SAVEPOINT before_move;
+        ALTER SCHEMA query_schema_before RENAME TO query_schema_after;
+        REFRESH MATERIALIZED VIEW cached_schema_items", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "
+        SELECT query_schema_after.score(id) FROM query_schema_after.items;
+        SELECT score FROM cached_schema_items;
+        SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_after%';
+    ", true)), ["5", "5", "t"]);
+    assert_eq!(data_rows(&reader.success(&mut engine, "
+        SELECT query_schema_before.score(id) FROM query_schema_before.items;
+        SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_before%';
+    ", true)), ["5", "t"]);
+    writer.success(&mut engine, "ROLLBACK TO before_move", true);
+    assert_eq!(data_rows(&writer.success(&mut engine,
+        "SELECT query_schema_before.score(id) FROM query_schema_before.items", true)), ["5"]);
+    writer.success(&mut engine, "ALTER SCHEMA query_schema_before RENAME TO query_schema_after;
+        REFRESH MATERIALIZED VIEW cached_schema_items; COMMIT", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, "
+        REFRESH MATERIALIZED VIEW cached_schema_items;
+        SELECT score FROM cached_schema_items;
+        SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_after%';
+    ", true)), ["5", "t"]);
+}
+
+#[test]
 fn schema_rename_keeps_names_and_dependent_definitions_private_until_commit() {
     let setup = "
         CREATE SCHEMA private_schema_before;

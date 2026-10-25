@@ -16259,7 +16259,13 @@ fn finish_with_hidden<'a>(
         {
             // Tagged derived rows must carry the advertised representation,
             // notably oid rather than int4, before hashing or wire encoding.
-            let value = super::eval::cast_to(value, *column_type, arena)?;
+            // These private source rows bind node SQL to column identities
+            // in expressions::current before any catalog row is exposed.
+            let value = if *column_type == ColType::PgNodeTree && matches!(value, Datum::Text(_)) {
+                value
+            } else {
+                super::eval::cast_to(value, *column_type, arena)?
+            };
             if *name == "tableoid"
                 && let Some(relation) = specification.relation
                 && value != Datum::Oid(relation.get())

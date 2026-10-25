@@ -111,6 +111,14 @@ fn selected_rule<'a>(storage: &Storage, transaction: u32, oid: i32, arena: &'a A
 
 pub(super) fn view_definition<'a>(storage: &Storage, transaction: u32, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
     let Some(slot) = oid.checked_sub(super::view_oid(0)).and_then(|slot| usize::try_from(slot).ok()).filter(|slot| *slot < storage.view_count()) else { return Ok(None); };
+    if !storage.view_slot_visible_to(slot, transaction) {
+        let retained = super::select_catalog_rows(storage, Some("pg_catalog"), "pg_rewrite", transaction, CatalogScan::Index, arena,
+            |at| current(storage, at, Materialization::History, arena))?;
+        let mut matching = retained.rows.iter().copied().filter(|values| values[2] == Datum::Oid(oid as u32) && values[1] == Datum::Text("_RETURN"));
+        let Some(values) = matching.next() else { return Ok(None); };
+        if matching.next().is_some() { return Ok(None); }
+        return match values[VIEW_DEFINITION] { Datum::Null => Ok(None), value => string(value).map(Some) };
+    }
     let rule_slot = storage.view_return_rule(slot);
     if rule_slot >= storage.rule_count() { return Ok(None); }
     let Some(values) = selected_rule(storage, transaction, storage.rule(rule_slot).oid(), arena)? else { return Ok(None); };

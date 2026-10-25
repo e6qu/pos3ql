@@ -377,7 +377,8 @@ fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_cu
             position('2' IN pg_get_viewdef('definition_view'::regclass))>0,
             (SELECT position('2' IN definition)>0 FROM pg_rules WHERE rulename='definition_rule'),
             (SELECT position('2' IN pg_get_ruledef(oid))>0 FROM pg_rewrite WHERE rulename='definition_rule')";
-        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {query}"), true)), ["f|f|f|f"]);
+        assert_eq!(data_rows(&writer.success(&mut engine, query, true)), ["f|f|f|f"]);
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM pg_rewrite WHERE rulename='definition_rule'"), true)), ["1"]);
         writer.success(&mut engine,
             "CREATE OR REPLACE VIEW definition_view AS SELECT 2 AS value;
              CREATE OR REPLACE RULE definition_rule AS ON INSERT TO definition_target DO ALSO INSERT INTO definition_audit VALUES(2)", true);
@@ -400,4 +401,33 @@ fn catalog_snapshot_builtin_metadata_keeps_objects_with_unsupported_row_reads() 
         ["t|t", "starelid"]);
     assert_eq!(error_sqlstates(&run_with_fixed_memory(&mut engine, &budget,
         "SELECT * FROM pg_statistic", 4 << 20)), ["0A000"]);
+}
+
+#[test]
+fn catalog_snapshot_index_hints_follow_existing_or_private_catalog_tuples() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+      for forked in [false, true] {
+        let mut config = test_config("catalog-private-index-hints");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut owner = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut observer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        owner.success(&mut engine, "CREATE TABLE private_hint(id integer); BEGIN; SAVEPOINT hint_start", true);
+        let query = "SELECT relhasindex FROM pg_class WHERE relname='private_hint'";
+        for rolled_back in [true, false] {
+            if forked {
+                owner.success(&mut engine, "ALTER TABLE private_hint RENAME TO private_hint_away; ALTER TABLE private_hint_away RENAME TO private_hint", true);
+            }
+            owner.success(&mut engine, "CREATE INDEX private_hint_index ON private_hint(id); DROP INDEX private_hint_index", true);
+            assert_eq!(data_rows(&owner.success(&mut engine, query, true)), ["t"]);
+            assert_eq!(data_rows(&observer.success(&mut engine, query, true)), [if forked { "f" } else { "t" }]);
+            owner.success(&mut engine, if rolled_back { "ROLLBACK TO hint_start" } else { "COMMIT" }, true);
+            assert_eq!(data_rows(&observer.success(&mut engine, query, true)), [if forked && rolled_back { "f" } else { "t" }]);
+        }
+        owner.success(&mut engine, "VACUUM private_hint", true);
+        assert_eq!(data_rows(&observer.success(&mut engine, query, true)), ["f"]);
+      }
+    }
 }

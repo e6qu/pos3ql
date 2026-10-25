@@ -3989,6 +3989,7 @@ struct PendingTableDef {
     /// Every visible row was re-homed into the heap under this definition, so
     /// the committed spill list becomes obsolete when this version commits.
     pub rewrites_rows: bool,
+    pub class_tuple_private: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -20913,7 +20914,7 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.table_statistics(source_slot, 0);
                 let has_index =
-                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?);
+                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?, 0);
                 let serial_values = self.table_serial_values(source_slot);
                 let target_slot = table_creation::allocate(
                     self,
@@ -35086,7 +35087,11 @@ impl Storage {
             table_index,
             Some(txid),
             key_preparation::EnforcerRows::ReusePrepared,
-        )
+        )?;
+        if !self.relation_catalog_tuple_is_private(table_index, txid) {
+            self.tables[table_index].statistics.mark_index_created(self.tables[table_index].identity().created_at);
+        }
+        Ok(())
     }
 
     fn refresh_enforcers_visible(
@@ -45771,6 +45776,9 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
     pub fn commit_index_create(&mut self, slot: usize) {
+        if let Some(table) = self.index_table_slot(slot) {
+            self.tables[table].statistics.mark_index_created(self.tables[table].identity().created_at);
+        }
         {
             let mut catalog = self.index_catalog();
             catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
@@ -50220,7 +50228,9 @@ impl Storage {
                 || occupied.ddl_state != CatalogDdlState::Present
                 || occupied.pending.is_some()
                 || occupied.definition.target != definition.target
-                || occupied.definition.name != definition.name)
+                || (occupied.definition.name != definition.name
+                    && (occupied.definition.name.as_str() == "_RETURN"
+                        || definition.name.as_str() == "_RETURN")))
         {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
@@ -55191,6 +55201,18 @@ mod tests {
             );
             assert!(storage.rule_dependencies(1, 0).entries().is_empty());
             assert!(storage.table_has_rules(table, 0));
+            let renamed = RuleDefinition { name: SqlName::parse("renamed_rule").unwrap(), ..definition };
+            storage.replay_rule(1, 42, renamed, StoredQueryDependencies::EMPTY).unwrap();
+            assert_eq!(storage.rule(1).definition.name.as_str(), "renamed_rule");
+            let invalid_return = RuleDefinition {
+                name: SqlName::parse("renamed_return").unwrap(),
+                target: RuleTarget::View(0),
+                ..definition
+            };
+            assert_eq!(storage.replay_rule(0, 8, invalid_return, StoredQueryDependencies::EMPTY).unwrap_err().sqlstate,
+                sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.view_return_rule(0), 0);
+            assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
         });
     }
 

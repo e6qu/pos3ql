@@ -181,9 +181,15 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.derived.definition.own", "SELECT position('3' IN definition)>0 FROM pg_views WHERE viewname='derived_definition_diff'")
             record(reader, f"{prefix}.derived.definition.own_lookup", "SELECT position('3' IN pg_get_viewdef('derived_definition_diff'::regclass))>0")
             reader.execute("ROLLBACK")
+            reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            view_oid = reader.execute("SELECT oid FROM pg_class WHERE relname='derived_definition_diff'").fetchone()[0]
+            writer.execute("DROP VIEW derived_definition_diff")
+            record_outcome(reader, f"{prefix}.derived.definition.dropped_lookup", "SELECT pg_get_viewdef(%s::oid) IS NOT NULL", (view_oid,))
+            record_outcome(reader, f"{prefix}.derived.definition.dropped_listing", "SELECT definition IS NOT NULL FROM pg_views WHERE viewname='derived_definition_diff'", ())
+            reader.execute("ROLLBACK")
         finally:
             reader.execute("ROLLBACK")
-            writer.execute("DROP VIEW derived_definition_diff")
+            writer.execute("DROP VIEW IF EXISTS derived_definition_diff")
 
         writer.execute("CREATE TABLE derived_rule_target_diff(id integer)")
         writer.execute("CREATE TABLE derived_rule_audit_diff(id integer)")
@@ -191,7 +197,7 @@ def transcript(reader, writer):
         try:
             reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
             query = "SELECT position('2' IN definition)>0 FROM pg_rules WHERE rulename='derived_definition_rule_diff'"
-            record(reader, f"{prefix}.derived.rule_definition.before", query)
+            record(reader, f"{prefix}.derived.rule_definition.before", "SELECT rulename FROM pg_rules WHERE rulename='derived_definition_rule_diff'")
             writer.execute("CREATE OR REPLACE RULE derived_definition_rule_diff AS ON INSERT TO derived_rule_target_diff DO ALSO INSERT INTO derived_rule_audit_diff VALUES(2)")
             record(reader, f"{prefix}.derived.rule_definition.replaced", query)
             record(reader, f"{prefix}.derived.rule_definition.lookup", "SELECT position('2' IN pg_get_ruledef(oid))>0 FROM pg_rewrite WHERE rulename='derived_definition_rule_diff'")
@@ -278,6 +284,29 @@ def transcript(reader, writer):
             writer.execute("DROP TABLE IF EXISTS derived_renamed_source_diff CASCADE")
             writer.execute("DROP SEQUENCE IF EXISTS derived_sequence_diff")
             writer.execute("DROP SEQUENCE IF EXISTS derived_renamed_sequence_diff")
+
+        for forked in (False, True):
+            variant = "private" if forked else "existing"
+            writer.execute("CREATE TABLE derived_hint_diff(id integer)")
+            try:
+                writer.execute("BEGIN")
+                writer.execute("SAVEPOINT hint_start")
+                query = "SELECT relhasindex FROM pg_class WHERE relname='derived_hint_diff'"
+                for label, decision in (("rollback", "ROLLBACK TO hint_start"), ("commit", "COMMIT")):
+                    if forked:
+                        writer.execute("ALTER TABLE derived_hint_diff RENAME TO derived_hint_away_diff")
+                        writer.execute("ALTER TABLE derived_hint_away_diff RENAME TO derived_hint_diff")
+                    writer.execute("CREATE INDEX derived_hint_index_diff ON derived_hint_diff(id)")
+                    writer.execute("DROP INDEX derived_hint_index_diff")
+                    record(writer, f"{prefix}.derived.hint.{variant}.{label}.private", query)
+                    record(reader, f"{prefix}.derived.hint.{variant}.{label}.concurrent", query)
+                    writer.execute(decision)
+                    record(reader, f"{prefix}.derived.hint.{variant}.{label}.finished", query)
+                writer.execute("VACUUM derived_hint_diff")
+                record(reader, f"{prefix}.derived.hint.{variant}.vacuumed", query)
+            finally:
+                writer.execute("ROLLBACK")
+                writer.execute("DROP TABLE derived_hint_diff")
 
         writer.execute("CREATE ROLE derived_reader_diff")
         writer.execute("CREATE TABLE derived_private_diff(id integer,payload text)")

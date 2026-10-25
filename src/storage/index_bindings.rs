@@ -708,6 +708,7 @@ mod tests {
                                 transition: core::array::from_fn(|column| column as u16),
                                 column_mapping: mapping,
                                 rewrites_rows: false,
+                                class_tuple_private: false,
                             },
                             storage.max_catalog_versions_per_object,
                         )

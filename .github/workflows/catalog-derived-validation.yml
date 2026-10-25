@@ -31,7 +31,7 @@ jobs:
           name: derived-catalog-formatting-${{ github.sha }}
           path: ${{ runner.temp }}/formatting.patch
       - name: Snapshot and view regressions
-        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_snapshot_ view_catalog_metadata_ --nocapture --test-threads=1
+        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_snapshot_ view_catalog_metadata_ failed_rule_replay --nocapture --test-threads=1
       - name: Lint all targets
         run: cargo clippy --all-targets -- -D warnings
   postgresql:

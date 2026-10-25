@@ -14078,7 +14078,13 @@ fn pg_description<'a>(
                 )
             }
         };
-        let catalog_subid = if matches!(
+        let catalog_subid = if class == crate::storage::CommentClass::Relation && subid > 0
+            && let Some(slot) = storage.find_visible(schema, name, txid) {
+            let table = storage.table_def(slot, txid);
+            let column = subid as usize - 1;
+            if column >= table.n_columns { continue; }
+            i32::from(table.attribute_number(column))
+        } else if matches!(
             class,
             crate::storage::CommentClass::Trigger
                 | crate::storage::CommentClass::Rule
@@ -20890,7 +20896,7 @@ fn pg_depend<'a>(
             sequence_oid(sequence_slot),
             PG_CLASS_OID,
             table_oid(storage, table_slot),
-            column as i32 + 1,
+            i32::from(table.attribute_number(column)),
             if table.columns()[column].is_identity {
                 "i"
             } else {

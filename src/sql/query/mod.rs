@@ -3427,8 +3427,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let column = match column {
                     super::eval::PrivilegeColumn::Name(name) => definition.column_index(name),
                     super::eval::PrivilegeColumn::Number(number) if number > 0 => {
-                        let index = number as usize - 1;
-                        (index < definition.n_columns).then_some(index)
+                        definition.attribute_column(number as u16)
                     }
                     super::eval::PrivilegeColumn::Number(_) => None,
                 };

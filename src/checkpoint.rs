@@ -9980,7 +9980,7 @@ impl Checkpointer {
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
             if !definition.attributes.validate(definition.n_columns) {
-                return Err(CheckpointSetupError::Corrupt("invalid column attribute layout"));
+                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "invalid column attribute layout"));
             }
             write_manifest(&mut self.manifest_output, format_args!("attributes2 0 {}", definition.attributes.count))?;
             for (number, attribute) in definition.attributes.slots[..usize::from(definition.attributes.count)].iter().enumerate() {

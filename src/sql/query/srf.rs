@@ -490,7 +490,7 @@ fn publication_output_relation_for(
     }
 }
 
-fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn publication_int2vector<'a>(mask: ColumnSet, table: &crate::storage::TableDef, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let count = mask.count_ones() as usize;
     let raw = arena
         .alloc_slice_with(count * 2, |_| 0u8)
@@ -500,7 +500,7 @@ fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum
         if !mask.contains(column) {
             continue;
         }
-        let attribute_number = i16::try_from(column + 1).map_err(|_| {
+        let attribute_number = i16::try_from(table.attribute_number(column)).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "publication column number is too large"
@@ -658,7 +658,7 @@ fn publication_table_rows<'a>(
             &[
                 Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
                 Datum::Oid(crate::sql::catalog::user_table_oid(info.relation_slot) as u32),
-                publication_int2vector(column_mask, arena)?,
+                publication_int2vector(column_mask, &table, arena)?,
                 qual,
             ],
             arena,

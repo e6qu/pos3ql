@@ -11996,7 +11996,7 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             3 + *len as usize
         }
         Some(OwnedDatum::PgNodeTree { len, bytes }) => {
-            out[0] = 42;
+            out[0] = 43;
             out[1] = *len;
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
@@ -12221,7 +12221,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             *at += 8;
             Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
         }
-        42 => {
+        43 => {
             let len = *payload.get(*at)? as usize;
             *at += 1;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;

@@ -77,14 +77,15 @@ pub use cte::{
     rewrite_view_dml,
 };
 
-pub fn stored_query_dependencies(
+pub(crate) fn stored_query_dependencies(
     sql: &str,
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
+    bindings: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
-    dependencies::collect(sql, storage, txid, path, arena)
+    dependencies::collect(sql, storage, txid, path, bindings, arena)
 }
 
 pub(crate) fn stored_routine_dependencies(
@@ -3341,12 +3342,27 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 slot: slot as u16,
             },
             Some(crate::storage::ResolvedRelation::Catalog) => {
+                let name = match relation {
+                    PrivilegeRelation::Name(name) => split_catalog_name(name).1,
+                    PrivilegeRelation::Oid(oid) => super::catalog::catalog_relation_name(oid)
+                        .expect("catalog identity was resolved"),
+                };
+                // PostgreSQL 18.6 system_views.sql revokes PUBLIC access to
+                // these views; initdb also protects pg_authid/pg_largeobject.
+                let public_select = !matches!(name,
+                    "pg_authid" | "pg_largeobject" | "pg_shadow" | "pg_statistic" |
+                    "pg_statistic_ext_data" | "pg_file_settings" | "pg_hba_file_rules" |
+                    "pg_ident_file_mappings" | "pg_config" | "pg_shmem_allocations" |
+                    "pg_shmem_allocations_numa" | "pg_backend_memory_contexts" |
+                    "pg_user_mapping" | "pg_replication_origin_status" | "pg_subscription" | "pg_aios");
+                let owned = self.storage.role_slot_by_oid(10, self.txid)
+                    .is_some_and(|owner| self.storage.role_has_privileges_of(role, owner, self.txid));
                 return privilege_query(
                     privileges,
-                    crate::storage::PrivilegeSet::SELECT,
+                    if public_select { crate::storage::PrivilegeSet::SELECT } else { crate::storage::PrivilegeSet::NONE },
                     crate::storage::PrivilegeSet::TABLE_ALL,
-                    |_| false,
-                    |_| false,
+                    |_| owned,
+                    |_| owned,
                 )
                 .map(Some);
             }
@@ -4292,8 +4308,8 @@ fn privilege_query(
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
-        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
-            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        let (name, grant_option) = if item.get(item.len().saturating_sub(GRANT_OPTION.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
         {
             (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
         } else {
@@ -4384,8 +4400,8 @@ fn parameter_privilege_query(
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
-        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
-            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        let (name, grant_option) = if item.get(item.len().saturating_sub(GRANT_OPTION.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
         {
             (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
         } else {

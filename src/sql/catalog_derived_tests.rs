@@ -56,7 +56,10 @@ const CHANGE: &str = "
     CREATE INDEX derived_materialized_index ON derived_renamed_materialized(id);
     ALTER RULE derived_rule ON derived_source RENAME TO derived_renamed_rule;
     ALTER TABLE derived_source RENAME TO derived_renamed_source;
+    CREATE TABLE derived_source(id integer, payload text);
     ALTER TABLE derived_renamed_source RENAME payload TO renamed_payload;
+    INSERT INTO derived_renamed_source VALUES(42,'retained');
+    INSERT INTO derived_source VALUES(99,'replacement');
     ALTER SEQUENCE derived_sequence RENAME TO derived_renamed_sequence;
     ALTER SEQUENCE derived_renamed_sequence INCREMENT 5;
 ";
@@ -80,6 +83,7 @@ fn catalog_snapshot_derived_reports_preserve_rows_without_freezing_current_value
         );
         assert_eq!(data_rows(&initial), OLD);
         writer.success(&mut engine, CHANGE, true);
+        assert_eq!(data_rows(&writer.success(&mut engine, "SELECT * FROM derived_renamed_view", true)), ["42|retained"]);
         writer.success(
             &mut engine,
             "SELECT nextval('derived_renamed_sequence')",
@@ -243,14 +247,16 @@ fn catalog_snapshot_privilege_lists_accept_any_grant_and_validate_every_item() {
                 has_parameter_privilege('track_functions','SET, ALTER SYSTEM'),
                 has_table_privilege('list_table','SELECT WITH GRANT OPTION, INSERT');
          SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='list_sequence';
-         SELECT last_value IS NULL FROM pg_sequences WHERE sequencename='list_sequence'", true)),
-        ["t|t|t|t|t|f", "list_sequence", "t"]);
+         SELECT last_value IS NULL FROM pg_sequences WHERE sequencename='list_sequence';
+         SELECT has_table_privilege('pg_shadow','SELECT'),has_table_privilege('pg_views','SELECT'),has_table_privilege('pg_authid','SELECT')", true)),
+        ["t|t|t|t|t|f", "list_sequence", "t", "f|t|f"]);
     for sql in [
         "SELECT has_table_privilege('list_table','SELECT, USAGE')",
         "SELECT has_table_privilege('list_table','ALL')",
         "SELECT has_column_privilege('list_table','id','SELECT, DELETE')",
         "SELECT has_sequence_privilege('list_sequence','UPDATE, INSERT')",
         "SELECT has_parameter_privilege('track_functions','SET, ALL')",
+        "SELECT has_table_privilege('list_table','🦀🦀🦀🦀🦀')",
     ] {
         let output = session.execute(&mut engine, sql, true);
         assert_eq!(error_sqlstates(&output), ["22023"], "{sql}: {}", String::from_utf8_lossy(&output));

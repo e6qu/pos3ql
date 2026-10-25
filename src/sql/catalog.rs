@@ -8666,7 +8666,7 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
     catalog_relation(name).map(|relation| relation.oid)
 }
 
-fn catalog_relation_name(oid: i32) -> Option<&'static str> {
+pub(super) fn catalog_relation_name(oid: i32) -> Option<&'static str> {
     CATALOG_RELATIONS
         .iter()
         .copied()

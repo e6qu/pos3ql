@@ -26342,12 +26342,16 @@ impl Storage {
         let Some(current) = self.current_role_slot(txid) else {
             return false;
         };
-        if self.role(current).attributes_to(txid).superuser {
+        self.role_has_privileges_of(current, usize::from(role), txid)
+    }
+
+    pub(crate) fn role_has_privileges_of(&self, member: usize, target: usize, txid: u32) -> bool {
+        if self.role(member).attributes_to(txid).superuser {
             return true;
         }
         let mut roles = self.role_graph_scratch();
-        self.reachable_roles(current, txid, true, false, &mut roles);
-        roles.get(role as usize).copied().unwrap_or(false)
+        self.reachable_roles(member, txid, true, false, &mut roles);
+        roles.get(target).copied().unwrap_or(false)
     }
 
     pub(crate) fn has_object_privilege(

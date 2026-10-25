@@ -204,7 +204,10 @@ def transcript(reader, writer):
             "CREATE INDEX derived_materialized_index_diff ON derived_renamed_materialized_diff(id)",
             "ALTER RULE derived_rule_diff ON derived_source_diff RENAME TO derived_renamed_rule_diff",
             "ALTER TABLE derived_source_diff RENAME TO derived_renamed_source_diff",
+            "CREATE TABLE derived_source_diff(id integer,payload text)",
             "ALTER TABLE derived_renamed_source_diff RENAME payload TO renamed_payload",
+            "INSERT INTO derived_renamed_source_diff VALUES(42,'retained')",
+            "INSERT INTO derived_source_diff VALUES(99,'replacement')",
             "ALTER SEQUENCE derived_sequence_diff RENAME TO derived_renamed_sequence_diff",
             "ALTER SEQUENCE derived_renamed_sequence_diff INCREMENT 5",
         )
@@ -216,7 +219,7 @@ def transcript(reader, writer):
             ("information_views", "SELECT table_name,check_option FROM information_schema.views WHERE table_name IN ('derived_view_diff','derived_renamed_view_diff')"),
             ("materialized", "SELECT matviewname,hasindexes,ispopulated FROM pg_matviews WHERE matviewname IN ('derived_materialized_diff','derived_renamed_materialized_diff')"),
             ("rules", "SELECT tablename,rulename FROM pg_rules WHERE rulename IN ('derived_rule_diff','derived_renamed_rule_diff')"),
-            *reports[4:],
+            *reports[5:],
         )
         try:
             reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
@@ -229,6 +232,7 @@ def transcript(reader, writer):
                 writer.execute(sql)
             for label, sql in reports:
                 record(writer, f"{prefix}.derived.private.{label}", sql)
+            record(writer, f"{prefix}.derived.private.bound_rows", "SELECT * FROM derived_renamed_view_diff")
             for label, sql in listings:
                 record(reader, f"{prefix}.derived.concurrent.{label}", sql)
             writer.execute("ROLLBACK TO derived_change")
@@ -289,6 +293,7 @@ def transcript(reader, writer):
                 record(reader, f"{prefix}.derived.privilege.{role}.identity.sequences", "SELECT sequence_schema,sequence_name FROM information_schema.sequences WHERE sequence_name='derived_identity_sequence_diff' ORDER BY sequence_schema")
                 record(reader, f"{prefix}.derived.privilege.{role}.identity.values", "SELECT schemaname,last_value FROM pg_sequences WHERE sequencename='derived_identity_sequence_diff' ORDER BY schemaname")
                 record(reader, f"{prefix}.derived.privilege.{role}.identity.function", "SELECT has_function_privilege('derived_identity_function_diff()'::regprocedure::oid,'EXECUTE')")
+                record(reader, f"{prefix}.derived.privilege.{role}.builtin", "SELECT relname,has_table_privilege(oid,'SELECT'),has_table_privilege(oid,'INSERT'),has_table_privilege(oid,'SELECT WITH GRANT OPTION') FROM pg_class WHERE relnamespace='pg_catalog'::regnamespace AND relname IN ('pg_authid','pg_largeobject','pg_shadow','pg_statistic','pg_statistic_ext_data','pg_file_settings','pg_hba_file_rules','pg_ident_file_mappings','pg_config','pg_shmem_allocations','pg_shmem_allocations_numa','pg_backend_memory_contexts','pg_user_mapping','pg_replication_origin_status','pg_subscription','pg_aios','pg_views','pg_tables') ORDER BY relname")
                 reader.execute("BEGIN")
                 try:
                     for label, sql in (
@@ -296,6 +301,7 @@ def transcript(reader, writer):
                         ("invalid_table_all", "SELECT has_table_privilege('derived_repeated_diff','ALL')"),
                         ("invalid_parameter_all", "SELECT has_parameter_privilege('track_functions','SET, ALL')"),
                         ("invalid_sequence_list", "SELECT has_sequence_privilege('derived_hidden_sequence_diff','SELECT, INSERT')"),
+                        ("invalid_unicode", "SELECT has_table_privilege('derived_repeated_diff','🦀🦀🦀🦀🦀')"),
                     ):
                         record_outcome(reader, f"{prefix}.derived.privilege.{role}.{label}", sql, ())
                 finally:

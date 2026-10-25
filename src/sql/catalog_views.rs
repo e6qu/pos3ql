@@ -31,6 +31,8 @@ pub(super) enum Base {
     Constraint,
     Index,
     RoleMembers,
+    Procedure,
+    Language,
 }
 
 pub(super) fn indexes<'a>(
@@ -135,6 +137,8 @@ impl Read {
             Base::Constraint => "pg_constraint",
             Base::Index => "pg_index",
             Base::RoleMembers => "pg_auth_members",
+            Base::Procedure => "pg_proc",
+            Base::Language => "pg_language",
         };
         match self {
             Self::Statement => super::synthesize(

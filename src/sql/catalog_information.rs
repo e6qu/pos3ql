@@ -127,10 +127,9 @@ pub(super) fn schemata<'a>(
         let namespace = CatalogRow { definition: namespaces.def, values };
         let owner = namespace.integer("nspowner")?;
         let visible = owner_is_enabled(storage, transaction, owner)
-            || match catalog.schema_name(namespace.integer("oid")?, arena)? {
-                Some(name) => catalog.has_schema_privilege(None, name, "CREATE, USAGE")? == Some(true),
-                None => false,
-            };
+            || catalog.has_schema_privilege(None,
+                crate::sql::eval::PrivilegeObject::Oid(namespace.integer("oid")?),
+                "CREATE, USAGE")? == Some(true);
         if !visible {
             continue;
         }

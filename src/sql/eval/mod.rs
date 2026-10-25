@@ -1408,7 +1408,7 @@ pub trait CatalogAccess {
     fn has_schema_privilege(
         &self,
         _role: Option<&str>,
-        _schema: &str,
+        _schema: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1416,7 +1416,7 @@ pub trait CatalogAccess {
     fn has_type_privilege(
         &self,
         _role: Option<&str>,
-        _target: PrivilegeType<'_>,
+        _target: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1432,7 +1432,7 @@ pub trait CatalogAccess {
     fn has_function_privilege(
         &self,
         _role: Option<&str>,
-        _function: &str,
+        _function: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1667,7 +1667,7 @@ pub enum PrivilegeRelation<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub enum PrivilegeType<'a> {
+pub enum PrivilegeObject<'a> {
     Name(&'a str),
     Oid(i32),
 }

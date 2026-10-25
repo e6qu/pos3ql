@@ -56,6 +56,17 @@ jobs:
           SELECT nspname,has_schema_privilege(oid,'USAGE'),has_schema_privilege(oid,'CREATE')
             FROM pg_namespace ORDER BY nspname;
           SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;
+          RESET ROLE;
+          CREATE FUNCTION snapshot_routine_before(a integer,b integer DEFAULT 17)
+            RETURNS integer LANGUAGE SQL IMMUTABLE STRICT SECURITY DEFINER AS 'SELECT a+b';
+          SELECT routine_name,routine_type,data_type,routine_body,external_language,is_deterministic,is_null_call,security_type,routine_definition
+            FROM information_schema.routines WHERE routine_name='snapshot_routine_before';
+          SELECT ordinal_position,parameter_name,parameter_mode,data_type,udt_name,parameter_default
+            FROM information_schema.parameters WHERE specific_schema='public' AND specific_name LIKE 'snapshot_routine_before_%' ORDER BY ordinal_position;
+          SET ROLE namespace_reader;
+          SELECT has_function_privilege('abs(integer)','EXECUTE'),has_function_privilege('abs(integer)'::regprocedure,'EXECUTE'),has_function_privilege('abs(integer)'::regprocedure,'EXECUTE WITH GRANT OPTION');
+          SELECT has_function_privilege(0::oid,'EXECUTE'),has_schema_privilege(0::oid,'USAGE');
+          RESET ROLE;
           SQL
       - name: Native catalog and schema regressions
         run: |

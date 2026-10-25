@@ -1808,16 +1808,20 @@ pub(crate) fn dispatch<'a>(
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
-                if name == "has_type_privilege" {
+                if matches!(name, "has_type_privilege" | "has_schema_privilege" | "has_function_privilege") {
                     let target = match object {
-                        Datum::Text(name) => super::super::PrivilegeType::Name(name),
-                        value => super::super::PrivilegeType::Oid(
-                            CatalogOid::parse(value)?.expect("non-null type identity").0,
+                        Datum::Text(name) => super::super::PrivilegeObject::Name(name),
+                        value => super::super::PrivilegeObject::Oid(
+                            CatalogOid::parse(value)?.expect("non-null object identity").0,
                         ),
                     };
-                    return Ok(cat
-                        .has_type_privilege(role, target, privilege)?
-                        .map_or(Datum::Null, Datum::Bool));
+                    let answer = match name {
+                        "has_type_privilege" => cat.has_type_privilege(role, target, privilege)?,
+                        "has_schema_privilege" => cat.has_schema_privilege(role, target, privilege)?,
+                        "has_function_privilege" => cat.has_function_privilege(role, target, privilege)?,
+                        _ => unreachable!("typed object privilege function was classified"),
+                    };
+                    return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
                 let object = if name == "has_parameter_privilege" {
                     match object {
@@ -1836,12 +1840,8 @@ pub(crate) fn dispatch<'a>(
                     }
                 };
                 let answer = match name {
-                    "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
                     "has_language_privilege" => {
                         cat.has_language_privilege(role, object, privilege)?
-                    }
-                    "has_function_privilege" => {
-                        cat.has_function_privilege(role, object, privilege)?
                     }
                     "has_database_privilege" => {
                         cat.has_database_privilege(role, object, privilege)?

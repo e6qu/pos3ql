@@ -3648,14 +3648,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_schema_privilege(
         &self,
         role: Option<&str>,
-        schema: &str,
+        schema: super::eval::PrivilegeObject<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        use super::eval::PrivilegeObject;
+        use crate::storage::PrivilegeSet;
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let Some(slot) = self.storage.find_schema_visible(schema, self.txid) else {
+        let oid = match schema {
+            PrivilegeObject::Oid(oid) => oid,
+            PrivilegeObject::Name(name) => super::catalog::schema_oid_by_written(self.storage, self.txid, name)
+                .ok_or_else(|| sql_err!(sqlstate::INVALID_SCHEMA_NAME, "schema \"{}\" does not exist", name))?,
+        };
+        let Some(schema) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
+            return Ok(None);
+        };
+        if matches!(schema.as_str(), "pg_catalog" | "information_schema" | "pg_toast") {
+            let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+            let public = schema.as_str() != "pg_toast";
+            return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::SCHEMA_ALL,
+                |privilege| owner || (public && privilege == PrivilegeSet::USAGE),
+                |_| owner).map(Some);
+        }
+        let Some(slot) = self.storage.find_schema_visible(schema.as_str(), self.txid) else {
             return Ok(None);
         };
         let object = crate::storage::AccessObject {
@@ -3681,7 +3698,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_type_privilege(
         &self,
         role: Option<&str>,
-        target: super::eval::PrivilegeType<'_>,
+        target: super::eval::PrivilegeObject<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         use super::types::oid;
@@ -3691,8 +3708,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => return Ok(None),
         };
         let type_oid = match target {
-            super::eval::PrivilegeType::Oid(oid) => oid,
-            super::eval::PrivilegeType::Name(name) => {
+            super::eval::PrivilegeObject::Oid(oid) => oid,
+            super::eval::PrivilegeObject::Name(name) => {
                 let resolved = super::eval::regtype_cast(
                     Datum::Text(name),
                     Some(self),
@@ -3880,47 +3897,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_function_privilege(
         &self,
         role: Option<&str>,
-        function: &str,
+        function: super::eval::PrivilegeObject<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        use super::eval::PrivilegeObject;
+        use crate::storage::PrivilegeSet;
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let function = function.trim();
-        let (written_name, written_arguments) = match function.strip_suffix(')') {
-            Some(prefix) => prefix.rsplit_once('(').unwrap_or((function, "")),
-            None => (function, ""),
+        let oid = match function {
+            PrivilegeObject::Oid(oid) => oid,
+            PrivilegeObject::Name(name) => super::catalog::routine_oid_by_name(self.storage, self.txid, name, true)?
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_FUNCTION, "function \"{}\" does not exist", name))?,
         };
-        let (schema, name) = split_catalog_name(written_name.trim());
-        let written_arguments = written_arguments.trim();
-        let mut written_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let argument_count = if written_arguments.is_empty() {
-            0usize
-        } else {
-            let mut count = 0usize;
-            for type_name in written_arguments.split(',') {
-                if count == written_types.len() {
-                    return Ok(None);
-                }
-                written_types[count] = type_name.trim();
-                count += 1;
-            }
-            count
-        };
-        let Ok(arguments) = crate::sql::exec::resolve_routine_signature(
-            self.storage,
-            self.txid,
-            &written_types[..argument_count],
-        ) else {
-            return Ok(None);
-        };
-        let Some(slot) = self.storage.routine_slot_by_declared_signature(
-            schema.unwrap_or("public"),
-            name,
-            &arguments[..argument_count],
-            self.txid,
-        ) else {
+        if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
+            let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
+            return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::FUNCTION_ALL,
+                |_| owner || public, |_| owner).map(Some);
+        }
+        let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Ok(None);
         };
         let object = crate::storage::Storage::routine_access_object(slot);

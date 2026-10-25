@@ -88,6 +88,50 @@ fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions(
     ]);
 }
 
+#[test]
+fn catalog_snapshot_routine_reports_preserve_definitions_and_check_current_execution_access() {
+    let report = "
+        SELECT routine_name,routine_type,data_type,routine_body,external_language,
+               is_deterministic,is_null_call,security_type,routine_definition='SELECT a+b'
+          FROM information_schema.routines WHERE routine_name LIKE 'snapshot_routine_%';
+        SELECT ordinal_position,parameter_name,parameter_mode,data_type,udt_name,parameter_default
+          FROM information_schema.parameters WHERE specific_schema='public' AND specific_name LIKE 'snapshot_routine_%'
+          ORDER BY ordinal_position;
+    ";
+    let old = ["snapshot_routine_before|FUNCTION|integer|SQL|SQL|YES|YES|DEFINER|t", "1|a|IN|integer|int4|", "2|b|IN|integer|int4|17"];
+    let new = ["snapshot_routine_after|FUNCTION|integer|SQL|SQL|NO|NO|INVOKER|f", "1|a|IN|integer|int4|", "2|b|IN|integer|int4|23"];
+    for isolation in ["REPEATABLE READ", "READ COMMITTED"] {
+        let config = test_config("snapshot-routine-reports");
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "
+            CREATE ROLE snapshot_routine_reader;
+            CREATE FUNCTION snapshot_routine_before(a integer,b integer DEFAULT 17)
+              RETURNS integer LANGUAGE SQL IMMUTABLE STRICT SECURITY DEFINER AS 'SELECT a+b';
+        ", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)), old);
+        writer.success(&mut engine, "
+            CREATE OR REPLACE FUNCTION snapshot_routine_before(a integer,b integer DEFAULT 23)
+              RETURNS integer LANGUAGE SQL VOLATILE CALLED ON NULL INPUT SECURITY INVOKER AS 'SELECT a-b';
+            ALTER FUNCTION snapshot_routine_before(integer,integer) RENAME TO snapshot_routine_after;
+        ", true);
+        let selected = reader.success(&mut engine, report, true);
+        let expected = if isolation == "REPEATABLE READ" {
+            [old[0], old[1], new[2]]
+        } else { new };
+        assert_eq!(data_rows(&selected), expected, "{isolation}: {}", String::from_utf8_lossy(&selected));
+        reader.success(&mut engine, "COMMIT; SET ROLE snapshot_routine_reader", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_name='snapshot_routine_after'", true)), ["snapshot_routine_after|t"]);
+        writer.success(&mut engine, "REVOKE EXECUTE ON FUNCTION snapshot_routine_after(integer,integer) FROM PUBLIC", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT count(*) FROM information_schema.routines WHERE routine_name='snapshot_routine_after'; SELECT count(*) FROM information_schema.parameters WHERE specific_schema='public' AND specific_name LIKE 'snapshot_routine_%'", true)), ["0", "0"]);
+        writer.success(&mut engine, "GRANT EXECUTE ON FUNCTION snapshot_routine_after(integer,integer) TO snapshot_routine_reader", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_name='snapshot_routine_after'", true)), ["snapshot_routine_after|t"]);
+    }
+}
+
 const SETUP: &str = "
     CREATE TABLE derived_source(id integer, payload text);
     CREATE VIEW derived_view AS SELECT id, payload FROM derived_source WITH LOCAL CHECK OPTION;

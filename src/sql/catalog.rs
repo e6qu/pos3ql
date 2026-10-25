@@ -40,6 +40,8 @@ mod constraints;
 pub(crate) mod expressions;
 #[path = "catalog_information.rs"]
 mod information;
+#[path = "catalog_routines.rs"]
+mod routines;
 
 #[path = "catalog_type_io.rs"]
 mod type_io;
@@ -60,6 +62,8 @@ const FIRST_USER_OID: i32 = 16384;
 const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
+// Captured from the pinned PostgreSQL 18.6 initdb image.
+const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
@@ -8878,6 +8882,8 @@ pub(crate) fn synthesize<'a>(
     if qualifier == Some("information_schema") {
         match name {
             "schemata" => return information::schemata(storage, txid, views::Read::Statement, arena),
+            "routines" => return routines::routines(storage, txid, views::Read::Statement, arena),
+            "parameters" => return routines::parameters(storage, txid, views::Read::Statement, arena),
             "views" => return information::views(storage, txid, views::Read::Statement, arena),
             "sequences" => {
                 return information::sequences(storage, txid, views::Read::Statement, arena);
@@ -9377,8 +9383,8 @@ pub(crate) fn synthesize_current<'a>(
         (true, "column_privileges") => info_column_privileges(storage, txid, arena, true),
         (true, "role_column_grants") => info_column_privileges(storage, txid, arena, false),
         (true, "views") => information::views(storage, txid, views::Read::Current, arena),
-        (true, "routines") => info_routines(storage, txid, arena),
-        (true, "parameters") => info_parameters(storage, txid, arena),
+        (true, "routines") => routines::routines(storage, txid, views::Read::Current, arena),
+        (true, "parameters") => routines::parameters(storage, txid, views::Read::Current, arena),
         (true, "routine_privileges") => info_routine_privileges(storage, txid, arena, true),
         (true, "role_routine_grants") => info_routine_privileges(storage, txid, arena, false),
         (true, "view_table_usage") => information::view_usage(
@@ -10446,6 +10452,7 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         "pg_toast" => PG_TOAST_NS_OID,
+        "information_schema" => INFORMATION_SCHEMA_NS_OID,
         _ if schema.starts_with("pg_temp_") => schema[8..]
             .parse::<i32>()
             .ok()
@@ -10509,6 +10516,7 @@ pub(crate) fn schema_name_by_oid(
         PUBLIC_NS_OID => crate::storage::SqlName::parse("public").ok(),
         PG_CATALOG_NS_OID => crate::storage::SqlName::parse("pg_catalog").ok(),
         PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
+        INFORMATION_SCHEMA_NS_OID => crate::storage::SqlName::parse("information_schema").ok(),
         _ => (0..storage.table_count())
             .find_map(|slot| {
                 let table = storage.table_def(slot, txid);
@@ -10531,6 +10539,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "public" => Some(PUBLIC_NS_OID),
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
+        "information_schema" => Some(INFORMATION_SCHEMA_NS_OID),
         "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
             .then(|| current_temporary_namespace_oid(storage, txid)),
         _ if name.starts_with("pg_temp_") => {
@@ -10556,7 +10565,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 }
 
 pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    for name in ["public", "pg_catalog", "pg_toast", "pg_temp"] {
+    for name in ["public", "pg_catalog", "pg_toast", "information_schema", "pg_temp"] {
         if identifier_spelling_matches(written, name) {
             return schema_oid_by_name(storage, txid, name);
         }
@@ -11954,6 +11963,25 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
+    function_oid_is_visible(oid).then_some(!matches!(oid,
+        764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387))
+}
+
+fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
+    Some(match oid {
+        2096 => (1, "0"),
+        3577 | 3578 | 3960 | 3961 => (1, "false"),
+        3786 => (3, "false, false, false"),
+        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => (2, "'{}'::jsonb, false"),
+        6212 => (2, "0, 1"),
+        1268 => (1, "true"),
+        4350 | 4351 => (1, "'NFC'::text"),
+        3464 => (7, "0, 0, 0, 0, 0, 0, 0.0"),
+        _ => return None,
+    })
 }
 
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -26363,10 +26391,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
-                if matches!(
-                    routine.oid,
-                    764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
-                ) {
+                if intrinsic_routine_public_execute(routine.oid) == Some(false) {
                     builtin_acl(&["postgres=X/postgres"], arena)?
                 } else {
                     Datum::Null
@@ -26426,17 +26451,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         name: "-",
                     },
                 },
-                Datum::Int4(match routine.oid {
-                    2096 => 1,
-                    3577 | 3578 => 1,
-                    3786 => 3,
-                    6212 => 2,
-                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => 2,
-                    3960 | 3961 => 1,
-                    1268 | 4350 | 4351 => 1,
-                    3464 => 7,
-                    _ => 0,
-                }),
+                Datum::Int4(intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32)),
                 Datum::Int4(match routine.oid {
                     6119 => super::types::oid::TEXT,
                     3058 | 3059 | 3539 => 2276,
@@ -26507,20 +26522,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     (_, None) => Datum::Null,
                 },
-                match routine.oid {
-                    2096 => Datum::Text("0"),
-                    3577 | 3578 => Datum::Text("false"),
-                    3786 => Datum::Text("false, false, false"),
-                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
-                        Datum::Text("'{}'::jsonb, false")
-                    }
-                    3960 | 3961 => Datum::Text("false"),
-                    6212 => Datum::Text("0, 1"),
-                    1268 => Datum::Text("true"),
-                    4350 | 4351 => Datum::Text("'NFC'::text"),
-                    3464 => Datum::Text("0, 0, 0, 0, 0, 0, 0.0"),
-                    _ => Datum::Null,
-                },
+                intrinsic_routine_defaults(routine.oid).map_or(Datum::Null, |(_, source)| Datum::Text(source)),
                 Datum::Null,
             ],
             arena,
@@ -30067,7 +30069,7 @@ fn pg_namespace<'a>(
             Datum::Int4(PG_CATALOG_NS_OID),
             text("pg_catalog", arena)?,
             Datum::Int4(10),
-            Datum::Null,
+            builtin_acl(&["postgres=UC/postgres", "=U/postgres"], arena)?,
         ],
         arena,
     )?;
@@ -30081,7 +30083,17 @@ fn pg_namespace<'a>(
         ],
         arena,
     )?;
-    let mut n = 2;
+    out[2] = row(
+        &[
+            Datum::Int4(PG_NAMESPACE_OID),
+            Datum::Int4(INFORMATION_SCHEMA_NS_OID),
+            text("information_schema", arena)?,
+            Datum::Int4(10),
+            builtin_acl(&["postgres=UC/postgres", "=U/postgres"], arena)?,
+        ],
+        arena,
+    )?;
+    let mut n = 3;
     for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[
@@ -31158,75 +31170,13 @@ fn info_user_mapping_options<'a>(
 }
 
 fn routine_specific_name(
-    routine: &crate::storage::RoutineDef,
-    txid: u32,
-) -> crate::util::StackStr<96> {
-    use core::fmt::Write;
-    let mut name = crate::util::StackStr::new();
-    let _ = write!(
-        name,
-        "{}_{}",
-        routine.name_for(txid).as_str(),
-        crate::storage::routine_oid(routine)
-    );
-    name
-}
-
-fn info_routines<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("routines", true);
-    let count = (0..storage.routine_count())
-        .filter(|slot| {
-            storage.routine_slot_visible_to(*slot, txid)
-                && !matches!(
-                    storage.routine_for(*slot, txid).kind,
-                    crate::storage::RoutineKind::Aggregate(_)
-                )
-        })
-        .count();
-    let output = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut row_index = 0;
-    for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
-        if !storage.routine_slot_visible_to(slot, txid)
-            || matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
-        {
-            continue;
-        }
-        let specific_name = routine_specific_name(&routine, txid);
-        output[row_index] = row(
-            &[
-                text("postgres", arena)?,
-                text(routine.schema_for(txid).as_str(), arena)?,
-                text(specific_name.as_str(), arena)?,
-                text("postgres", arena)?,
-                text(routine.schema_for(txid).as_str(), arena)?,
-                text(routine.name_for(txid).as_str(), arena)?,
-                text(
-                    if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
-                        "PROCEDURE"
-                    } else {
-                        "FUNCTION"
-                    },
-                    arena,
-                )?,
-                match routine.kind.function_result() {
-                    Some(result) => text(result.name(), arena)?,
-                    None => Datum::Null,
-                },
-                text("SQL", arena)?,
-                text(routine.body.as_str(), arena)?,
-            ],
-            arena,
-        )?;
-        row_index += 1;
-    }
-    finish(definition, output, arena)
+    name: &str,
+    oid: u32,
+) -> crate::util::StackStr<63> {
+    let suffix = stack_format!(12, "_{}", oid);
+    let mut end = name.len().min(63 - suffix.len());
+    while !name.is_char_boundary(end) { end -= 1; }
+    stack_format!(63, "{}{}", &name[..end], suffix.as_str())
 }
 
 fn info_routine_privileges<'a>(
@@ -31262,7 +31212,7 @@ fn info_routine_privileges<'a>(
                 ));
             }
             let routine = storage.routine_for(slot, txid);
-            let specific_name = routine_specific_name(&routine, txid);
+            let specific_name = routine_specific_name(routine.name_for(txid).as_str(), crate::storage::routine_oid(&routine) as u32);
             let grantor_name = storage.role_name(grantor as usize, txid);
             let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
                 SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
@@ -31322,58 +31272,6 @@ fn info_routine_privileges<'a>(
         }
     }
     finish(definition, &output[..count], arena)
-}
-
-fn info_parameters<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("parameters", true);
-    let count = (0..storage.routine_count())
-        .filter(|slot| storage.routine_slot_visible_to(*slot, txid))
-        .map(|slot| storage.routine_for(slot, txid).parameter_count)
-        .sum();
-    let output = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut row_index = 0;
-    for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
-        if !storage.routine_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let specific_name = routine_specific_name(&routine, txid);
-        for (argument_index, argument) in routine.parameters().iter().enumerate() {
-            let mode = match argument.mode {
-                crate::storage::RoutineParameterMode::In { .. }
-                | crate::storage::RoutineParameterMode::Variadic { .. } => "IN",
-                crate::storage::RoutineParameterMode::Out => "OUT",
-                crate::storage::RoutineParameterMode::InOut { .. } => "INOUT",
-            };
-            output[row_index] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(routine.schema_for(txid).as_str(), arena)?,
-                    text(specific_name.as_str(), arena)?,
-                    Datum::Int4((argument_index + 1) as i32),
-                    text(mode, arena)?,
-                    if argument.name.as_str().is_empty() {
-                        Datum::Null
-                    } else {
-                        text(argument.name.as_str(), arena)?
-                    },
-                    text(argument.ctype.name(), arena)?,
-                    text("postgres", arena)?,
-                    text("pg_catalog", arena)?,
-                    text(argument.ctype.name(), arena)?,
-                ],
-                arena,
-            )?;
-            row_index += 1;
-        }
-    }
-    finish(definition, output, arena)
 }
 
 fn view_column_catalog_type(

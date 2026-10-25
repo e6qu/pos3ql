@@ -67908,6 +67908,7 @@ fn alter_table_relation(
     def.schema(&mut old_schema);
     let old_schema = &old_schema[..def.n_columns];
 
+    if let Err(error) = crate::storage::constraint_names::table(&mut new_def) { return sql_fail(error); }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);
     let new_schema = &new_schema[..new_def.n_columns];

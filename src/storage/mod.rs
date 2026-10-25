@@ -107,7 +107,7 @@ mod transaction_admission;
 use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 mod statistics;
-mod constraint_names;
+pub(crate) mod constraint_names;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};

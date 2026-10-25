@@ -1037,6 +1037,12 @@ def main():
                      WHERE n.nspname='pg_catalog'
                      ORDER BY t.oid
                 """).fetchall(),
+                "type_layouts": reader.execute("""
+                    SELECT t.oid,t.typname,t.typlen,t.typbyval,t.typalign,t.typstorage
+                      FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
+                     WHERE n.nspname='pg_catalog' AND t.oid<16384
+                     ORDER BY t.oid
+                """).fetchall(),
             }
             arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")
         observed = transcript(reader, writer)

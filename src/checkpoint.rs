@@ -4007,6 +4007,8 @@ impl Checkpointer {
                     };
                     let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
                     if (not_null & 3 != 0) != not_null_name.is_some() {
+                        #[cfg(test)]
+                        eprintln!("invalid column NOT NULL name: flags={not_null}, type={type_code}, name={not_null_text:?}");
                         return Err(CheckpointSetupError::Corrupt("invalid column NOT NULL name"));
                     }
                     let type_mod: i32 = parse_field(words.next(), "col typmod")?;

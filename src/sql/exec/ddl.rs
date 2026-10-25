@@ -998,7 +998,7 @@ pub(super) fn attach_constraints(
             }
         }
     }
-    Ok(())
+    crate::storage::constraint_names::table(def)
 }
 
 /// PostgreSQL's auto-generated constraint name: `<table>_pkey` for a primary

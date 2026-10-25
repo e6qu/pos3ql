@@ -34,7 +34,7 @@ fn choose(left: &str, right: Option<&str>, occupied: impl Fn(SqlName) -> bool) -
     Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "NOT NULL constraint names are exhausted"))
 }
 
-pub(super) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
+pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
         if !column.not_null.is_required() {

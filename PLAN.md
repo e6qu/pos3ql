@@ -43,23 +43,13 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Finish connecting the remaining derived reports, including index, schema,
-  constraint, routine, role and privilege views, to selected base rows. Preserve
-  PostgreSQL's column shapes, joins and current permission checks. The behavior
-  guide identifies the connected table, column, view, rule, sequence and
-  view-dependency reports and their current-lookup boundaries.
-  Check remaining constraint reports in another database and with SELECT-only
-  and column-writing roles. Preserve foreign-key column order, duplicate rows,
-  exact result types, and named memory-exhaustion errors.
-  Keep constraint names and column numbers stable through renames, column
-  removal, savepoints, prepared decisions and recovery. Retained expressions
-  must use those column identities when displaying current names.
-  Exercise stored expression copies and reject text and binary node input at
-  every client boundary. Compare column alignment, length, and passing rules
-  against the pinned PostgreSQL service, including domains and arrays.
-  Include dropped-column descriptions and identifiers used by defaults,
-  indexes, dependencies and permission inquiries; a removed column must never
-  shift a saved expression onto the following column.
+- Finish connecting remaining schema, routine, role and privilege reports to
+  selected base rows, with PostgreSQL's exact joins and current access checks.
+  The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
+  owns the connected table, column, index, constraint, view, rule, sequence and
+  dependency reports, including stable column numbers and expression inputs.
+  Finish qualification of constraint reports in another database, with
+  SELECT-only and column-writing roles, duplicate rows and bounded memory.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

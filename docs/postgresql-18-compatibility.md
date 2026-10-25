@@ -99,7 +99,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 
 | Kind | Boundary | Source or qualification |
 |---|---|---|
-| PostgreSQL relation shape | 1,600 columns: tables, views, named composites, record definitions, explicit USING lists | `src/storage/rowenc.rs`; wide relation and record differential fixtures |
+| PostgreSQL relation shape | 1,600 columns: tables (including retained dropped columns), views, named composites, record definitions, explicit USING lists | `src/storage/rowenc.rs`; wide relation and record differential fixtures |
 | PostgreSQL executable result | 1,664 columns: SELECT targets, routine/table-function results, Describe and Bind formats | Wide result and routine fixtures |
 | PostgreSQL statement shapes | 100 routine inputs; 32 index/partition attributes; 4,096 grouping sets; 12 CUBE elements; 31 GROUPING arguments | Parser/type boundaries and accepted/rejected differential cases |
 | PostgreSQL wire parameters | 65,535 Parse/Bind and SQL PREPARE/EXECUTE parameters | Fixed prepared/portal buffers plus statement memory; maximum-width wire fixture |

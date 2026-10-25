@@ -27,7 +27,11 @@ jobs:
       - name: Selected report and catalog regressions
         env:
           RUST_BACKTRACE: "1"
-        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_snapshot catalog_constraint_ view_catalog_metadata_ key_preparation_recovery failed_rule_replay wal::tests:: --nocapture --test-threads=1
+        run: >-
+          python3 tools/test_command.py cargo test --lib --locked --
+          catalog_snapshot catalog_constraint_ view_catalog_metadata_
+          key_preparation_recovery failed_rule_replay wal::tests::
+          --nocapture --test-threads=1
       - name: Lint all targets
         run: cargo clippy --all-targets -- -D warnings
   reference:

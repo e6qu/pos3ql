@@ -2,15 +2,9 @@
 
 No known defects are blocked by an external dependency or an intractable problem.
 
-Fix reproducible defects in the PR that finds them, including incidental
-failures, invalid catalog or column identities, incorrect report types,
-database names or permissions, timeouts, rollback and recovery errors.
-Malformed expression input must fail before it can become a stored catalog node.
-Column removal must preserve surviving column numbers through recovery.
-Record a defect here only when an external blocker or genuine intractability
-prevents its repair.
-Each entry needs a reproducer, affected behavior, observed result and exact
-blocker. Remove repaired entries and retain their evidence in the fixing PR.
+Fix reproducible defects in the PR that finds them. An entry here needs a
+reproducer, affected behavior, observed result and exact blocker. Remove repaired
+entries and retain their evidence in the fixing PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Unfinished features and acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)

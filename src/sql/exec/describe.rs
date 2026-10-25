@@ -4050,16 +4050,10 @@ pub fn infer_type_res(
             "pg_event_trigger_table_rewrite_reason" => of(ColType::Int4),
             "pg_extension_config_dump" => (oid::VOID, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
-            name if super::super::eval::funcs::system::is_privilege_predicate(name) => {
+            name if super::super::eval::funcs::system::catalog_predicate_kind(name).is_some() => {
                 of(ColType::Bool)
             }
-            "pg_table_is_visible"
-            | "pg_type_is_visible"
-            | "pg_function_is_visible"
-            | "pg_relation_is_publishable"
-            | "pg_input_is_valid"
-            | "booleq"
-            | "boolne" => of(ColType::Bool),
+            "pg_input_is_valid" | "booleq" | "boolne" => of(ColType::Bool),
             "pg_get_replica_identity_index" => of(ColType::Regclass),
             "pg_is_other_temp_schema" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {

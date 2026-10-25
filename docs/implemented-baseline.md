@@ -1181,9 +1181,9 @@ result header; sending that result back as binary input is rejected by
 ### What permission lookups see
 
 `pg_catalog.has_language_privilege('sql', 'USAGE')` has the Boolean result
-type, as do the other supported privilege checks. The type stays Boolean when
-an argument is NULL, so clients receive type identifier `16` in both simple-query
-and prepared-statement descriptions.
+type, as do the other supported privilege, visibility and publication checks.
+The type stays Boolean when an argument is NULL, so clients receive type
+identifier `16` in both simple-query and prepared-statement descriptions.
 
 Catalog permission rows retain role identifiers. Renaming a role changes the
 name printed in an older permission list without adding later grants to that

@@ -3851,6 +3851,8 @@ def test_catalog_aware_binary_bind_parameters():
         messages,
     )
     shaped_results = [
+        ("collation visibility Boolean", "SELECT pg_collation_is_visible(100::oid)", 16, b"\x01"),
+        ("qualified collation visibility Boolean", "SELECT pg_catalog.pg_collation_is_visible(100::oid)", 16, b"\x01"),
         ("language privilege Boolean", "SELECT has_language_privilege('sql','USAGE')", 16, b"\x01"),
         ("qualified language privilege Boolean", "SELECT pg_catalog.has_language_privilege('sql','USAGE')", 16, b"\x01"),
         ("empty int2vector", "SELECT ''::int2vector", 22,

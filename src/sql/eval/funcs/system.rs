@@ -786,26 +786,44 @@ fn describe_catalog_object(
         .map_err(|_| arena_full())
 }
 
-/// Execution and result descriptions share this accepted Boolean family.
-pub(crate) fn is_privilege_predicate(name: &str) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogPredicateKind {
+    Privilege,
+    Object,
+}
+
+/// Execution and result descriptions share these accepted Boolean families.
+pub(crate) fn catalog_predicate_kind(name: &str) -> Option<CatalogPredicateKind> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
-    matches!(
-        name,
+    match name {
         "has_table_privilege"
-            | "has_column_privilege"
-            | "has_any_column_privilege"
-            | "has_sequence_privilege"
-            | "has_schema_privilege"
-            | "has_type_privilege"
-            | "has_language_privilege"
-            | "has_function_privilege"
-            | "has_database_privilege"
-            | "has_tablespace_privilege"
-            | "has_foreign_data_wrapper_privilege"
-            | "has_server_privilege"
-            | "has_largeobject_privilege"
-            | "has_parameter_privilege"
-    )
+        | "has_column_privilege"
+        | "has_any_column_privilege"
+        | "has_sequence_privilege"
+        | "has_schema_privilege"
+        | "has_type_privilege"
+        | "has_language_privilege"
+        | "has_function_privilege"
+        | "has_database_privilege"
+        | "has_tablespace_privilege"
+        | "has_foreign_data_wrapper_privilege"
+        | "has_server_privilege"
+        | "has_largeobject_privilege"
+        | "has_parameter_privilege" => Some(CatalogPredicateKind::Privilege),
+        "pg_table_is_visible"
+        | "pg_type_is_visible"
+        | "pg_function_is_visible"
+        | "pg_collation_is_visible"
+        | "pg_operator_is_visible"
+        | "pg_opclass_is_visible"
+        | "pg_opfamily_is_visible"
+        | "pg_conversion_is_visible"
+        | "pg_statistics_obj_is_visible"
+        | "pg_ts_dict_is_visible"
+        | "pg_ts_config_is_visible"
+        | "pg_relation_is_publishable" => Some(CatalogPredicateKind::Object),
+        _ => None,
+    }
 }
 
 /// Handles the system/introspection family. Returns `None` if `name` is not one
@@ -820,8 +838,8 @@ pub(crate) fn dispatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Option<Result<Datum<'a>, SqlError>> {
-    let privilege = is_privilege_predicate(name);
-    if !privilege
+    let predicate = catalog_predicate_kind(name);
+    if predicate.is_none()
         && !matches!(
             name,
             "version"
@@ -860,23 +878,11 @@ pub(crate) fn dispatch<'a>(
                 | "pg_partition_ancestors"
                 | "pg_partition_root"
                 | "pg_partition_tree"
-                | "pg_table_is_visible"
-                | "pg_type_is_visible"
-                | "pg_function_is_visible"
-                | "pg_collation_is_visible"
-                | "pg_operator_is_visible"
-                | "pg_opclass_is_visible"
-                | "pg_opfamily_is_visible"
-                | "pg_conversion_is_visible"
-                | "pg_statistics_obj_is_visible"
-                | "pg_ts_dict_is_visible"
-                | "pg_ts_config_is_visible"
                 | "pg_identify_object"
                 | "pg_identify_object_as_address"
                 | "pg_get_object_address"
                 | "pg_describe_object"
                 | "pg_get_serial_sequence"
-                | "pg_relation_is_publishable"
                 | "pg_get_replica_identity_index"
                 | "pg_my_temp_schema"
                 | "pg_is_other_temp_schema"
@@ -1672,7 +1678,7 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)
             }
-            _ if privilege => {
+            _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -1789,18 +1795,8 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))
             }
-            "pg_table_is_visible"
-            | "pg_type_is_visible"
-            | "pg_function_is_visible"
-            | "pg_collation_is_visible"
-            | "pg_operator_is_visible"
-            | "pg_opclass_is_visible"
-            | "pg_opfamily_is_visible"
-            | "pg_conversion_is_visible"
-            | "pg_statistics_obj_is_visible"
-            | "pg_ts_dict_is_visible"
-            | "pg_ts_config_is_visible"
-            | "pg_relation_is_publishable" => {
+            _ if predicate == Some(CatalogPredicateKind::Object) => {
+                let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 arity(1)?;
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);

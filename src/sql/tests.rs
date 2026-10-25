@@ -21775,29 +21775,36 @@ fn catalog_snapshot_acl_addresses_match_postgresql_object_classes() {
 }
 
 #[test]
-fn catalog_privilege_predicates_describe_boolean_results_for_null_inputs() {
+fn catalog_predicate_type_descriptions_are_boolean_for_null_inputs() {
     let (mut engine, mut budget) = test_engine();
-    for name in [
-        "has_table_privilege",
-        "has_column_privilege",
-        "has_any_column_privilege",
-        "has_sequence_privilege",
-        "has_schema_privilege",
-        "has_type_privilege",
-        "has_language_privilege",
-        "has_function_privilege",
-        "has_database_privilege",
-        "has_tablespace_privilege",
-        "has_foreign_data_wrapper_privilege",
-        "has_server_privilege",
-        "has_largeobject_privilege",
-        "has_parameter_privilege",
+    for (name, arguments) in [
+        ("has_table_privilege", "NULL::oid,NULL::text"),
+        ("has_column_privilege", "NULL::oid,NULL::text,NULL::text"),
+        ("has_any_column_privilege", "NULL::oid,NULL::text"),
+        ("has_sequence_privilege", "NULL::oid,NULL::text"),
+        ("has_schema_privilege", "NULL::oid,NULL::text"),
+        ("has_type_privilege", "NULL::oid,NULL::text"),
+        ("has_language_privilege", "NULL::oid,NULL::text"),
+        ("has_function_privilege", "NULL::oid,NULL::text"),
+        ("has_database_privilege", "NULL::oid,NULL::text"),
+        ("has_tablespace_privilege", "NULL::oid,NULL::text"),
+        ("has_foreign_data_wrapper_privilege", "NULL::oid,NULL::text"),
+        ("has_server_privilege", "NULL::oid,NULL::text"),
+        ("has_largeobject_privilege", "NULL::oid,NULL::text"),
+        ("has_parameter_privilege", "NULL::text,NULL::text"),
+        ("pg_table_is_visible", "NULL::oid"),
+        ("pg_type_is_visible", "NULL::oid"),
+        ("pg_function_is_visible", "NULL::oid"),
+        ("pg_collation_is_visible", "NULL::oid"),
+        ("pg_operator_is_visible", "NULL::oid"),
+        ("pg_opclass_is_visible", "NULL::oid"),
+        ("pg_opfamily_is_visible", "NULL::oid"),
+        ("pg_conversion_is_visible", "NULL::oid"),
+        ("pg_statistics_obj_is_visible", "NULL::oid"),
+        ("pg_ts_dict_is_visible", "NULL::oid"),
+        ("pg_ts_config_is_visible", "NULL::oid"),
+        ("pg_relation_is_publishable", "NULL::oid"),
     ] {
-        let arguments = match name {
-            "has_column_privilege" => "NULL::oid,NULL::text,NULL::text",
-            "has_parameter_privilege" => "NULL::text,NULL::text",
-            _ => "NULL::oid,NULL::text",
-        };
         for qualifier in ["", "pg_catalog."] {
             let query = format!(
                 "SELECT {qualifier}{name}({arguments}), pg_typeof({qualifier}{name}({arguments}))::text"

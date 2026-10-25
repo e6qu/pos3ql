@@ -118,6 +118,25 @@ impl<'a> CatalogRow<'a> {
     pub(super) fn boolean(self, field: &str) -> Result<bool, SqlError> {
         boolean(self.get(field)?)
     }
+
+    pub(super) fn integers(self, field: &str, arena: &'a Arena) -> Result<&'a [i32], SqlError> {
+        match self.get(field)? {
+            Datum::Null => Ok(&[]),
+            Datum::Array { raw, element } => {
+                let mut count = 0;
+                for value in crate::sql::array::elements(raw, element) {
+                    integer(value)?;
+                    count += 1;
+                }
+                let mut values = crate::sql::array::elements(raw, element);
+                arena.alloc_slice_with(count, |_| {
+                    integer(values.next().expect("counted catalog array element"))
+                        .expect("validated catalog integer array")
+                }).map(|values| &*values).map_err(|_| arena_full())
+            }
+            _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "catalog field is not an integer array")),
+        }
+    }
 }
 
 pub(super) struct NamespaceJoin<'index, 'a> {
@@ -232,16 +251,8 @@ impl<'a> Output<'a> {
         information: bool,
         distinct_names: bool,
     ) -> Result<SynthTable<'a>, SqlError> {
-        let rows = self
-            .arena
-            .alloc_slice_with(self.count, |_| &[] as &[Datum])
-            .map_err(|_| arena_full())?;
-        let mut current = self.last;
-        for target in rows.iter_mut().rev() {
-            let node = current.expect("each counted output row has an arena node");
-            *target = node.values;
-            current = node.previous;
-        }
+        let arena = self.arena;
+        let rows = self.rows()?;
         let mut count = rows.len();
         if distinct_names {
             for values in rows.iter() {
@@ -266,11 +277,21 @@ impl<'a> Output<'a> {
                 }
             }
         }
-        finish(
-            schema::require(name, information),
-            &rows[..count],
-            self.arena,
-        )
+        finish(schema::require(name, information), &rows[..count], arena)
+    }
+
+    pub(super) fn rows(self) -> Result<&'a mut [&'a [Datum<'a>]], SqlError> {
+        let rows = self
+            .arena
+            .alloc_slice_with(self.count, |_| &[] as &[Datum])
+            .map_err(|_| arena_full())?;
+        let mut current = self.last;
+        for target in rows.iter_mut().rev() {
+            let node = current.expect("each counted output row has an arena node");
+            *target = node.values;
+            current = node.previous;
+        }
+        Ok(rows)
     }
 }
 

@@ -19,6 +19,42 @@ const REPORT: &str = "
 ";
 
 #[test]
+fn catalog_constraint_key_reports_preserve_order_duplicates_and_selected_columns() {
+    for (isolation, retained) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
+        let mut config = test_config("constraint-key-report-rows");
+        config.transaction_mode = crate::config::TransactionMode::Mvcc;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, SETUP, true);
+        writer.success(&mut engine,
+            "ALTER TABLE constraint_parent ADD CONSTRAINT parent_positive CHECK(b>0);
+             CREATE TABLE another_child(x integer,y integer,
+                 CONSTRAINT constraint_child_parent FOREIGN KEY(x,y) REFERENCES constraint_parent(b,a))", true);
+        let report = "
+            SELECT table_name,column_name,ordinal_position,position_in_unique_constraint
+              FROM information_schema.key_column_usage WHERE constraint_name='constraint_child_parent'
+              ORDER BY table_name,ordinal_position;
+            SELECT table_name,column_name,count(*) FROM information_schema.constraint_column_usage
+              WHERE constraint_name='constraint_child_parent' GROUP BY table_name,column_name ORDER BY column_name;
+            SELECT table_name,column_name FROM information_schema.constraint_column_usage WHERE constraint_name='parent_positive';
+            SELECT constraint_name,unique_constraint_name FROM information_schema.referential_constraints
+              WHERE constraint_name='constraint_child_parent' ORDER BY constraint_name;
+        ";
+        let old = data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true));
+        assert_eq!(old, ["another_child|x|1|2", "another_child|y|2|1", "constraint_child|x|1|2", "constraint_child|y|2|1",
+            "constraint_parent|a|2", "constraint_parent|b|2", "constraint_parent|b",
+            "constraint_child_parent|constraint_parent_key", "constraint_child_parent|constraint_parent_key"]);
+        writer.success(&mut engine, "ALTER TABLE constraint_parent RENAME COLUMN b TO new_b", true);
+        let expected = old.iter().map(|row| row.replacen("constraint_parent|b", "constraint_parent|new_b", 1)).collect::<Vec<_>>();
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), if retained { old } else { expected });
+        reader.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
 fn catalog_constraint_reports_keep_selected_names_and_private_edits() {
     for (isolation, retained) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
         let mut config = test_config("constraint-report-rows");

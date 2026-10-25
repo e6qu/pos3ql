@@ -22037,14 +22037,6 @@ impl Storage {
             allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
-        if result.is_ok() {
-            // Replay installs already journaled definitions through the same
-            // cache builders as DDL. Their index hints still need checkpointing,
-            // but must not turn the first client read into another WAL write.
-            for table in &self.tables {
-                table.statistics.clear_wal();
-            }
-        }
         result
     }
 
@@ -35090,6 +35082,14 @@ impl Storage {
             Ok(())
         })();
         crate::sql::set_execution_database_oid(prior_database);
+        if result.is_ok() {
+            // Replay installs already journaled definitions through the same
+            // cache builders as DDL. Their index hints still need checkpointing,
+            // but must not turn the first client read into another WAL write.
+            for table in self.tables.iter() {
+                table.statistics.clear_wal();
+            }
+        }
         result
     }
 

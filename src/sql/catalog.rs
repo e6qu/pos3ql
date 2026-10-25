@@ -43,6 +43,7 @@ mod information;
 mod type_io;
 
 /// A materialized catalog relation: its shape plus rows in the arena.
+#[derive(Clone, Copy)]
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
     pub rows: &'a [&'a [Datum<'a>]],
@@ -8902,6 +8903,15 @@ pub(crate) fn synthesize<'a>(
             "constraint_table_usage" => {
                 return constraints::table_usage(storage, txid, views::Read::Statement, arena);
             }
+            "key_column_usage" => {
+                return constraints::keys(storage, txid, views::Read::Statement, arena);
+            }
+            "constraint_column_usage" => {
+                return constraints::column_usage(storage, txid, views::Read::Statement, arena);
+            }
+            "referential_constraints" => {
+                return constraints::references(storage, txid, views::Read::Statement, arena);
+            }
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9322,9 +9332,9 @@ pub(crate) fn synthesize_current<'a>(
         (true, "constraint_table_usage") => {
             constraints::table_usage(storage, txid, views::Read::Current, arena)
         }
-        (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
-        (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
-        (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
+        (true, "key_column_usage") => constraints::keys(storage, txid, views::Read::Current, arena),
+        (true, "constraint_column_usage") => constraints::column_usage(storage, txid, views::Read::Current, arena),
+        (true, "referential_constraints") => constraints::references(storage, txid, views::Read::Current, arena),
         (true, "table_privileges") => info_table_privileges(storage, txid, arena),
         (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
         (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
@@ -20024,8 +20034,12 @@ fn pg_constraint<'a>(
             .iter()
             .find(|ix| {
                 ix.table_oid == info.confrelid
+                    && ix.is_unique
+                    && ix.predicate.is_none()
+                    && !ix.expression_keys[..ix.n_cols].iter().any(|expression| *expression)
                     && ix.n_cols == fk.n_parent_cols
-                    && ix.columns[..ix.n_cols] == fk.parent_cols[..fk.n_parent_cols]
+                    && fk.parent_cols[..fk.n_parent_cols].iter()
+                        .all(|column| ix.columns[..ix.n_cols].contains(column))
             })
             .map_or(0, |ix| ix.oid);
         out[n] = row(
@@ -20163,6 +20177,17 @@ fn pg_constraint<'a>(
             }
             let inheritance_count = check_inheritance_count(storage, txid, slot, check);
             let inherited = inheritance_count != 0;
+            let table = storage.table_def(slot, txid);
+            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+            let referenced = super::exec::check_referenced_columns(expression, &table)?;
+            let mut columns = [0; MAX_COLUMNS];
+            let mut count = 0;
+            for column in 0..table.n_columns {
+                if referenced.contains(column) {
+                    columns[count] = column as u16;
+                    count += 1;
+                }
+            }
             out[n] = row(
                 &[
                     Datum::Int4(check_constraint_oid(slot, check_index)),
@@ -20180,7 +20205,7 @@ fn pg_constraint<'a>(
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
-                    empty_int_array(arena)?,
+                    if count == 0 { Datum::Null } else { attnum_array(&columns[..count], arena)? },
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(
@@ -20624,6 +20649,7 @@ fn pg_depend<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_depend", false);
+    let constraint_dependencies = constraints::dependencies(storage, txid, arena)?;
     let dependency_capacity = |dependencies: &[crate::storage::StoredQueryDependency]| {
         dependencies
             .iter()
@@ -20708,6 +20734,7 @@ fn pg_depend<'a>(
     let out = catalog_rows(
         arena,
         sequence_dependencies
+            + constraint_dependencies.rows.len()
             + domain_dependencies
             + cast_dependencies
             + operator_dependencies
@@ -20755,6 +20782,14 @@ fn pg_depend<'a>(
     // Sequence ownership is how pg_dump distinguishes serial/identity
     // generators from independent sequences and orders them with the owning
     // column.
+    for values in constraint_dependencies.rows {
+        let value = view_rows::CatalogRow { definition: constraint_dependencies.def, values };
+        let kind = value.character("deptype")?;
+        let encoded = [kind];
+        let kind = core::str::from_utf8(&encoded).expect("dependency type is ASCII");
+        push(value.integer("classid")?, value.integer("objid")?, value.integer("refclassid")?,
+            value.integer("refobjid")?, value.integer("refobjsubid")?, kind)?;
+    }
     for sequence_slot in 0..storage.sequence_count() {
         let sequence = storage.sequence_for(sequence_slot, txid);
         if !storage.sequence_slot_visible_to(sequence_slot, txid) {
@@ -21387,13 +21422,11 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
 /// A `Datum::Array` of 1-based attribute numbers (column index + 1), the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
 fn attnum_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (i, &c) in columns.iter().enumerate() {
-        vals[i] = Datum::Int4(i32::from(c) + 1);
-    }
+    let vals = arena.alloc_slice_with(columns.len(), |index| Datum::Int4(i32::from(columns[index]) + 1))
+        .map_err(|_| arena_full())?;
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..columns.len()], arena)?,
+        raw: super::array::build(vals, arena)?,
     })
 }
 
@@ -31041,14 +31074,6 @@ fn view_column_catalog_type(
     })
 }
 
-fn inline_primary_constraint_name(table: &TableDef) -> StackStr<128> {
-    stack_format!(128, "{}_pkey", table.name.as_str())
-}
-
-fn inline_unique_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<128> {
-    stack_format!(128, "{}_{}_key", table.name.as_str(), column.name.as_str())
-}
-
 fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<128> {
     stack_format!(
         128,
@@ -31056,275 +31081,6 @@ fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<1
         table.name.as_str(),
         column.name.as_str()
     )
-}
-
-struct KeyConstraint {
-    name: StackStr<128>,
-    columns: [u16; crate::storage::MAX_INDEX_COLS],
-    count: usize,
-}
-
-impl KeyConstraint {
-    fn columns(&self) -> &[u16] {
-        &self.columns[..self.count]
-    }
-}
-
-fn matching_key_constraint(table: &TableDef, columns: &[u16]) -> Option<KeyConstraint> {
-    if columns.len() == 1 {
-        let column = &table.columns()[columns[0] as usize];
-        if column.primary || column.unique {
-            return Some(KeyConstraint {
-                name: if column.primary {
-                    inline_primary_constraint_name(table)
-                } else {
-                    inline_unique_constraint_name(table, column)
-                },
-                columns: [columns[0]; crate::storage::MAX_INDEX_COLS],
-                count: 1,
-            });
-        }
-    }
-    table.uniques().iter().find_map(|key| {
-        (key.n_cols == columns.len()
-            && columns.iter().all(|column| key.columns().contains(column))
-            && key.columns().iter().all(|column| columns.contains(column)))
-        .then(|| KeyConstraint {
-            name: stack_format!(128, "{}", key.name.as_str()),
-            columns: key.columns,
-            count: key.n_cols,
-        })
-    })
-}
-
-fn require_parent_key(
-    storage: &Storage,
-    txid: u32,
-    foreign_key: &crate::storage::ForeignKey,
-) -> Result<(TableDef, KeyConstraint), SqlError> {
-    let parent_slot = storage
-        .find_visible(
-            foreign_key.parent_schema.as_str(),
-            foreign_key.parent.as_str(),
-            txid,
-        )
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "foreign key \"{}\" has no visible referenced table",
-                foreign_key.name.as_str()
-            )
-        })?;
-    let parent = *storage.table_def(parent_slot, txid);
-    let key = matching_key_constraint(&parent, foreign_key.parent_cols()).ok_or_else(|| {
-        sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "foreign key \"{}\" has no referenced key",
-            foreign_key.name.as_str()
-        )
-    })?;
-    Ok((parent, key))
-}
-
-fn info_key_column_usage<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("key_column_usage", true);
-    let per_table = crate::storage::MAX_COLUMNS
-        + crate::storage::MAX_UNIQUES * crate::storage::MAX_INDEX_COLS
-        + crate::storage::MAX_FKEYS * crate::storage::MAX_INDEX_COLS;
-    let output = arena
-        .alloc_slice_with(storage.table_count().saturating_mul(per_table), |_| &[][..])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |table: &TableDef,
-                      name: &str,
-                      column: u16,
-                      position: usize,
-                      parent_position: Option<usize>|
-     -> Result<(), SqlError> {
-        if count == output.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "key_column_usage exceeds static capacity"
-            ));
-        }
-        output[count] = row(
-            &[
-                text("postgres", arena)?,
-                text(table.schema.as_str(), arena)?,
-                text(name, arena)?,
-                text("postgres", arena)?,
-                text(table.schema.as_str(), arena)?,
-                text(table.name.as_str(), arena)?,
-                text(table.columns()[column as usize].name.as_str(), arena)?,
-                Datum::Int4(position as i32),
-                parent_position.map_or(Datum::Null, |value| Datum::Int4(value as i32)),
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        for (column_index, column) in table.columns().iter().enumerate() {
-            if column.primary || column.unique {
-                let name = if column.primary {
-                    inline_primary_constraint_name(&table)
-                } else {
-                    inline_unique_constraint_name(&table, column)
-                };
-                append(&table, name.as_str(), column_index as u16, 1, None)?;
-            }
-        }
-        for key in table.uniques() {
-            for (position, &column) in key.columns().iter().enumerate() {
-                append(&table, key.name.as_str(), column, position + 1, None)?;
-            }
-        }
-        for foreign_key in table.fkeys() {
-            let (_, parent_key) = require_parent_key(storage, txid, foreign_key)?;
-            for (position, (&column, &parent_column)) in foreign_key
-                .columns()
-                .iter()
-                .zip(foreign_key.parent_cols())
-                .enumerate()
-            {
-                let parent_position = parent_key
-                    .columns()
-                    .iter()
-                    .position(|candidate| *candidate == parent_column)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "foreign key \"{}\" does not map to its referenced key",
-                            foreign_key.name.as_str()
-                        )
-                    })?;
-                append(
-                    &table,
-                    foreign_key.name.as_str(),
-                    column,
-                    position + 1,
-                    Some(parent_position + 1),
-                )?;
-            }
-        }
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_constraint_column_usage<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("constraint_column_usage", true);
-    let mut total = 0usize;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        total += table
-            .columns()
-            .iter()
-            .filter(|column| column.primary || column.unique)
-            .count();
-        total += table
-            .columns()
-            .iter()
-            .filter(|column| column.not_null.is_required())
-            .count();
-        total += table.uniques().iter().map(|key| key.n_cols).sum::<usize>();
-        total += table
-            .fkeys()
-            .iter()
-            .map(|key| key.n_parent_cols)
-            .sum::<usize>();
-        for check in table.checks() {
-            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            total += crate::sql::exec::check_referenced_columns(expression, &table)?.count_ones()
-                as usize;
-        }
-    }
-    let output = arena
-        .alloc_slice_with(total, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |referenced_table: &TableDef,
-                      constraint_table: &TableDef,
-                      referenced_column: u16,
-                      constraint_name: &str|
-     -> Result<(), SqlError> {
-        output[count] = row(
-            &[
-                text("postgres", arena)?,
-                text(referenced_table.schema.as_str(), arena)?,
-                text(referenced_table.name.as_str(), arena)?,
-                text(
-                    referenced_table.columns()[referenced_column as usize]
-                        .name
-                        .as_str(),
-                    arena,
-                )?,
-                text("postgres", arena)?,
-                text(constraint_table.schema.as_str(), arena)?,
-                text(constraint_name, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        for (column_index, column) in table.columns().iter().enumerate() {
-            if column.primary || column.unique {
-                let name = if column.primary {
-                    inline_primary_constraint_name(&table)
-                } else {
-                    inline_unique_constraint_name(&table, column)
-                };
-                append(&table, &table, column_index as u16, name.as_str())?;
-            }
-            if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                append(&table, &table, column_index as u16, name.as_str())?;
-            }
-        }
-        for key in table.uniques() {
-            for &column in key.columns() {
-                append(&table, &table, column, key.name.as_str())?;
-            }
-        }
-        for check in table.checks() {
-            let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            let columns = crate::sql::exec::check_referenced_columns(expression, &table)?;
-            for (index, _) in table.columns().iter().enumerate() {
-                if columns.contains(index) {
-                    append(&table, &table, index as u16, check.name.as_str())?;
-                }
-            }
-        }
-        for foreign_key in table.fkeys() {
-            let (parent, _) = require_parent_key(storage, txid, foreign_key)?;
-            for &column in foreign_key.parent_cols() {
-                append(&parent, &table, column, foreign_key.name.as_str())?;
-            }
-        }
-    }
-    debug_assert_eq!(count, output.len());
-    finish(definition, output, arena)
 }
 
 fn info_table_privileges<'a>(
@@ -31947,64 +31703,6 @@ fn info_column_privileges<'a>(
         )?;
     }
     debug_assert_eq!(count, output.len());
-    finish(definition, &output[..count], arena)
-}
-
-fn fk_action_name(action: crate::storage::FkAction) -> &'static str {
-    match action {
-        crate::storage::FkAction::NoAction => "NO ACTION",
-        crate::storage::FkAction::Restrict => "RESTRICT",
-        crate::storage::FkAction::Cascade => "CASCADE",
-        crate::storage::FkAction::SetNull => "SET NULL",
-        crate::storage::FkAction::SetDefault => "SET DEFAULT",
-    }
-}
-
-fn info_referential_constraints<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("referential_constraints", true);
-    let output = arena
-        .alloc_slice_with(
-            storage
-                .table_count()
-                .saturating_mul(crate::storage::MAX_FKEYS),
-            |_| &[][..],
-        )
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        for foreign_key in table.fkeys() {
-            if count == output.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "referential_constraints exceeds static capacity"
-                ));
-            }
-            let (parent, parent_key) = require_parent_key(storage, txid, foreign_key)?;
-            output[count] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(table.schema.as_str(), arena)?,
-                    text(foreign_key.name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(parent.schema.as_str(), arena)?,
-                    text(parent_key.name.as_str(), arena)?,
-                    text("NONE", arena)?,
-                    text(fk_action_name(foreign_key.on_update), arena)?,
-                    text(fk_action_name(foreign_key.on_delete), arena)?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
-    }
     finish(definition, &output[..count], arena)
 }
 

@@ -324,6 +324,10 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         record(writer, f"{prefix}.schema_binding.on_path", "SELECT '\"a.b\"'::regclass='sr_hidden_relations_diff.\"a.b\"'::regclass,pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
         writer.execute('SET search_path TO public,pg_catalog')
         record(writer, f"{prefix}.schema_binding.explicit_catalog", "SELECT 'pg_class'::regclass='public.pg_class'::regclass,NOT pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
+        writer.execute('CREATE TEMP TABLE sr_temporary_lookup_diff(id integer)')
+        writer.execute('CREATE INDEX pg_class ON sr_temporary_lookup_diff(id)')
+        record(writer, f"{prefix}.schema_binding.regclass.temporary_index", "SELECT 'pg_class'::regclass::oid<>1259,'pg_catalog.pg_class'::regclass::oid=1259")
+        writer.execute('DROP TABLE sr_temporary_lookup_diff')
         writer.execute('BEGIN')
         for label, query in (
             ('invalid_inquiry', "SELECT to_regclass('broken..name') IS NULL"),
@@ -355,6 +359,7 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         writer.execute('ROLLBACK')
         writer.execute('RESET ROLE')
         writer.execute('RESET search_path')
+        writer.execute('DROP TABLE IF EXISTS sr_temporary_lookup_diff')
         writer.execute('DROP TABLE IF EXISTS public.pg_class')
         for name in ('ticket-1', '123', '-'):
             writer.execute(pg_sql.SQL('DROP TABLE IF EXISTS public.{}').format(pg_sql.Identifier(name)))

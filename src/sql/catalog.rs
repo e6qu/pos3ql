@@ -11195,12 +11195,20 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
 /// UNIQUE (from column flags), a multi-column PK/UNIQUE (from `uniques`), and
 /// explicit `CREATE INDEX`es. OIDs are assigned by table slot + position so the
 /// same index resolves identically here and in `pg_get_indexdef`.
-fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
+fn visit_indexes(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    mut visit: impl FnMut(IdxInfo),
+) {
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
         let def = storage.table_def(slot, txid);
+        if schema.is_some_and(|schema| def.schema.as_str() != schema) {
+            continue;
+        }
         let table_name = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
@@ -11402,7 +11410,7 @@ pub(crate) fn value_index_identity(
 ) -> Option<(i32, StackStr<64>, crate::sql::ast::IndexAccessMethod)> {
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if found.is_none()
             && index.table_slot == table_slot
             && index.n_cols == columns.len()
@@ -11446,7 +11454,7 @@ pub(crate) fn ordered_value_index_identity(
     }
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot
             || index.method != crate::sql::ast::IndexAccessMethod::Btree
             || index.n_cols != columns.len()
@@ -11516,7 +11524,7 @@ pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid
         return;
     }
     let mut is_index = false;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         is_index |= index.oid == oid;
     });
     if is_index {
@@ -11534,7 +11542,7 @@ pub(crate) fn replica_identity_index_oid(
     })?;
     let mode = storage.table_def(table_slot, txid).replica_identity;
     let mut selected = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot || selected.is_some() {
             return;
         }
@@ -11612,12 +11620,12 @@ fn collect_indexes<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [IdxInfo], SqlError> {
     let mut count = 0usize;
-    visit_indexes(storage, txid, |_| count += 1);
+    visit_indexes(storage, txid, None, |_| count += 1);
     let indexes = arena
         .alloc_slice_with(count, |_| empty_index())
         .map_err(|_| arena_full())?;
     let mut next = 0usize;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         indexes[next] = index;
         next += 1;
     });
@@ -11632,7 +11640,7 @@ fn index_oid_by_name(
 ) -> Option<i32> {
     let current_temporary_schema = storage.temporary_schema().ok();
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, schema, |index| {
         let table = storage.table_def(index.table_slot, txid);
         let is_current_temporary = table.persistence
             == crate::storage::RelationPersistence::Temporary
@@ -11655,7 +11663,7 @@ fn index_oid_by_name(
 
 fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
     let mut found = false;
-    visit_indexes(storage, txid, |index| found |= index.oid == oid);
+    visit_indexes(storage, txid, None, |index| found |= index.oid == oid);
     found
 }
 
@@ -11668,7 +11676,7 @@ pub(crate) fn index_identity_by_oid(
     oid: i32,
 ) -> Option<(crate::storage::SqlName, StackStr<128>)> {
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.oid == oid {
             found = Some((
                 storage.table_def(index.table_slot, txid).schema,
@@ -15330,7 +15338,7 @@ pub(crate) fn table_constraint_oid(
         return None;
     }
     let mut index_constraint = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
             index_constraint = Some(index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET);
         }
@@ -15419,7 +15427,7 @@ pub(crate) fn table_constraint_identity_by_oid(
             }
         }
         let mut index_name = None;
-        visit_indexes(storage, txid, |index| {
+        visit_indexes(storage, txid, None, |index| {
             if index.table_slot == table_slot
                 && index.is_constraint
                 && index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET == oid

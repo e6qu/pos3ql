@@ -111,6 +111,9 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
         )),
         ["t", "t", "t", "t", "t", "t", "t", "t", "t", "t"]
     );
+    session.success(&mut engine, "CREATE TEMP TABLE temporary_lookup(id integer); CREATE INDEX pg_class ON temporary_lookup(id)", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT 'pg_class'::regclass::oid<>1259,'pg_catalog.pg_class'::regclass::oid=1259", true)), ["t|t"]);
+    session.success(&mut engine, "DROP TABLE temporary_lookup", true);
     for (query, state) in [
         ("SELECT 'broken..name'::regclass", "42602"),
         ("SELECT '4294967296'::regclass", "22003"),

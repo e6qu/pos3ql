@@ -367,6 +367,38 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         writer.execute('DROP ROLE IF EXISTS sr_lookup_reader_diff')
 
 
+def schema_composite_lookup_reports(reader, writer, prefix, record):
+    try:
+        writer.execute('CREATE SCHEMA sr_composite_before_diff')
+        writer.execute('CREATE TYPE sr_composite_before_diff.row_type AS (id integer,label text)')
+        writer.execute('CREATE TABLE sr_composite_holder_diff(item sr_composite_before_diff.row_type)')
+        writer.execute("INSERT INTO sr_composite_holder_diff VALUES(ROW(7,'original')::sr_composite_before_diff.row_type)")
+        writer.execute('BEGIN')
+        writer.execute('ALTER SCHEMA sr_composite_before_diff RENAME TO sr_composite_after_diff')
+        record(writer, f"{prefix}.schema_binding.composite.private_names", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_before_diff.row_type') IS NULL")
+        record(writer, f"{prefix}.schema_binding.composite.private_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        record(reader, f"{prefix}.schema_binding.composite.other_names", "SELECT to_regclass('sr_composite_before_diff.row_type') IS NOT NULL,to_regclass('sr_composite_after_diff.row_type') IS NULL")
+        record(reader, f"{prefix}.schema_binding.composite.other_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('SAVEPOINT before_type_name')
+        writer.execute('ALTER TYPE sr_composite_after_diff.row_type RENAME TO renamed_type')
+        record(writer, f"{prefix}.schema_binding.composite.private_type", "SELECT to_regclass('sr_composite_after_diff.renamed_type') IS NOT NULL,to_regclass('sr_composite_after_diff.row_type') IS NULL")
+        record(writer, f"{prefix}.schema_binding.composite.renamed_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('ROLLBACK TO before_type_name')
+        record(writer, f"{prefix}.schema_binding.composite.savepoint", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_after_diff.renamed_type') IS NULL")
+        writer.execute('ROLLBACK')
+        record(writer, f"{prefix}.schema_binding.composite.rollback", "SELECT to_regclass('sr_composite_before_diff.row_type') IS NOT NULL")
+        record(writer, f"{prefix}.schema_binding.composite.rollback_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('ALTER SCHEMA sr_composite_before_diff RENAME TO sr_composite_after_diff')
+        record(reader, f"{prefix}.schema_binding.composite.committed", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_before_diff.row_type') IS NULL")
+        record(reader, f"{prefix}.schema_binding.composite.committed_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+    finally:
+        reader.execute('ROLLBACK')
+        writer.execute('ROLLBACK')
+        writer.execute('DROP TABLE IF EXISTS sr_composite_holder_diff')
+        writer.execute('DROP SCHEMA IF EXISTS sr_composite_before_diff CASCADE')
+        writer.execute('DROP SCHEMA IF EXISTS sr_composite_after_diff CASCADE')
+
+
 def schema_sequence_argument_reports(writer, prefix, record, record_outcome):
     try:
         writer.execute('CREATE SEQUENCE sr_argument_ticket_diff START WITH 100')
@@ -599,6 +631,7 @@ def transcript(reader, writer, host, port, user, report_database):
         schema_reference_literal_reports(writer, prefix, record)
         schema_regclass_lookup_reports(writer, prefix, record, record_outcome)
         schema_sequence_argument_reports(writer, prefix, record, record_outcome)
+        schema_composite_lookup_reports(reader, writer, prefix, record)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

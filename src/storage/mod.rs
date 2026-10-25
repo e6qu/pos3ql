@@ -7929,20 +7929,27 @@ impl Iterator for EnumIter<'_> {
     }
 }
 
-struct CompositeIter<'a> {
+struct CompositeIter<'a, F> {
     catalog: &'a Mutex<TypeCatalog>,
     next_slot: usize,
+    accepts: F,
 }
 
-impl Iterator for CompositeIter<'_> {
+impl<F: FnMut(&CompositeDef) -> bool> Iterator for CompositeIter<'_, F> {
     type Item = (usize, CompositeDef);
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("type catalog lock poisoned");
-        let slot = self.next_slot;
-        let definition = catalog.composites.get(slot).copied()?;
-        self.next_slot += 1;
-        Some((slot, definition))
+        while let Some(definition) = catalog.composites.get(self.next_slot) {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            // A layout can contain 1,600 fields, including a private replacement.
+            // Reject unused and invisible slots before copying their layouts.
+            if (self.accepts)(definition) {
+                return Some((slot, *definition));
+            }
+        }
+        None
     }
 }
 
@@ -10034,6 +10041,13 @@ impl CompositeDef {
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn names_for(&self, txid: u32) -> (SqlName, SqlName) {
+        self.pending_definition
+            .as_ref()
+            .filter(|pending| pending.txid == txid)
+            .map_or((self.schema, self.name), |pending| (pending.schema, pending.name))
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
@@ -24243,14 +24257,10 @@ impl Storage {
                 })?
             }
             AccessClass::Composite => {
-                let created_at = self.composite(source_slot).created_at;
-                CompositeIter {
-                    catalog: &self.type_catalog,
-                    next_slot: 0,
-                }
-                .find_map(|(slot, candidate)| {
-                    (candidate.database == target_database && candidate.created_at == created_at)
-                        .then_some(slot)
+                let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+                let created_at = catalog.composites[source_slot].created_at;
+                catalog.composites.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
             AccessClass::Index => {
@@ -24383,8 +24393,8 @@ impl Storage {
         CompositeIter {
             catalog: &self.type_catalog,
             next_slot: 0,
+            accepts: |value: &CompositeDef| value.ddl_state.committed_exists(),
         }
-        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
@@ -30416,12 +30426,17 @@ impl Storage {
                 continue;
             }
             if let Some(slot) = self.find_schema_visible(name, txid)
-                && role.is_some_and(|role| self.has_object_privilege(
-                    AccessObject { class: AccessClass::Schema, slot: slot as u16 },
-                    role,
-                    PrivilegeSet::USAGE,
-                    txid,
-                ))
+                && role.is_some_and(|role| {
+                    self.has_object_privilege(
+                        AccessObject {
+                            class: AccessClass::Schema,
+                            slot: slot as u16,
+                        },
+                        role,
+                        PrivilegeSet::USAGE,
+                        txid,
+                    )
+                })
             {
                 let entry = PathEntry::Schema(slot as u16);
                 if !entries[..n].contains(&entry) {
@@ -41345,16 +41360,13 @@ impl Storage {
     }
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        CompositeIter {
-            catalog: &self.type_catalog,
-            next_slot: 0,
-        }
-        .find_map(|(slot, definition)| {
-            (definition.database == current_database()
-                && definition.visible_to(txid)
-                && definition.definition_for(txid).schema.as_str() == schema
-                && definition.definition_for(txid).name.as_str() == name)
-                .then_some(slot)
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        catalog.composites.iter().position(|definition| {
+            if definition.database != current_database() || !definition.visible_to(txid) {
+                return false;
+            }
+            let (visible_schema, visible_name) = definition.names_for(txid);
+            visible_schema.as_str() == schema && visible_name.as_str() == name
         })
     }
     /// Resolves a durable declaration while its owner transaction moves the
@@ -41365,24 +41377,23 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<usize> {
-        self.composite_slot(schema, name, txid).or_else(|| {
-            CompositeIter {
-                catalog: &self.type_catalog,
-                next_slot: 0,
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        catalog.composites.iter().position(|definition| {
+            if definition.database != current_database() || !definition.visible_to(txid) {
+                return false;
             }
-            .find_map(|(slot, definition)| {
-                (definition.database == current_database()
-                    && definition.visible_to(txid)
-                    && definition.schema.as_str() == schema
-                    && definition.name.as_str() == name
-                    && definition.pending_definition.is_some_and(|pending| {
-                        pending.txid == txid
-                            && (pending.schema != definition.schema
-                                || pending.name != definition.name)
-                    }))
-                .then_some(slot)
-            })
-        })
+            let (visible_schema, visible_name) = definition.names_for(txid);
+            visible_schema.as_str() == schema && visible_name.as_str() == name
+        }).or_else(|| catalog.composites.iter().position(|definition| {
+            definition.database == current_database()
+                && definition.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+                && definition.pending_definition.as_ref().is_some_and(|pending| {
+                    pending.txid == txid
+                        && (pending.schema != definition.schema || pending.name != definition.name)
+                })
+        }))
     }
 
     /// Resolve the closed PostgreSQL `ALTER TYPE ... OWNER` target set.
@@ -41445,11 +41456,11 @@ impl Storage {
         CompositeIter {
             catalog: &self.type_catalog,
             next_slot: 0,
+            accepts: |definition: &CompositeDef| {
+                definition.database == current_database()
+                    && definition.ddl_state == CatalogDdlState::Present
+            },
         }
-        .filter(|(_, definition)| {
-            definition.database == current_database()
-                && definition.ddl_state == CatalogDdlState::Present
-        })
     }
 
     pub(crate) fn composite_count(&self) -> usize {
@@ -41467,15 +41478,16 @@ impl Storage {
         CompositeIter {
             catalog: &self.type_catalog,
             next_slot: 0,
+            accepts: move |definition: &CompositeDef| {
+                definition.database == current_database() && definition.visible_to(txid)
+            },
         }
-        .filter(move |(_, definition)| {
-            definition.database == current_database() && definition.visible_to(txid)
-        })
         .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
     }
 
     pub(crate) fn composite_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        let composite = self.composite(slot);
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let composite = &catalog.composites[slot];
         composite.database == current_database() && composite.visible_to(txid)
     }
 

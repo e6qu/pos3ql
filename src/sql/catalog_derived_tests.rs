@@ -112,7 +112,14 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
         ["t", "t", "t", "t", "t", "t", "t", "t", "t", "t"]
     );
     session.success(&mut engine, "CREATE TEMP TABLE temporary_lookup(id integer); CREATE INDEX pg_class ON temporary_lookup(id)", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT 'pg_class'::regclass::oid<>1259,'pg_catalog.pg_class'::regclass::oid=1259", true)), ["t|t"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 'pg_class'::regclass::oid<>1259,'pg_catalog.pg_class'::regclass::oid=1259",
+            true
+        )),
+        ["t|t"]
+    );
     session.success(&mut engine, "DROP TABLE temporary_lookup", true);
     for (query, state) in [
         ("SELECT 'broken..name'::regclass", "42602"),
@@ -129,21 +136,74 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
 }
 
 #[test]
+fn schema_name_composite_lookup_preserves_private_names_and_layouts() {
+    let config = test_config("schema-composite-name-lookup");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(&mut engine, "CREATE SCHEMA composite_before;
+        CREATE TYPE composite_before.row_type AS (id integer,label text);
+        CREATE TABLE composite_holder(item composite_before.row_type);
+        INSERT INTO composite_holder VALUES(ROW(7,'original')::composite_before.row_type)", true);
+    writer.success(&mut engine, "BEGIN; ALTER SCHEMA composite_before RENAME TO composite_after", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_before.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
+    assert_eq!(data_rows(&reader.success(&mut engine, "SELECT to_regclass('composite_before.row_type') IS NOT NULL,to_regclass('composite_after.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
+    writer.success(&mut engine, "SAVEPOINT before_type_name; ALTER TYPE composite_after.row_type RENAME TO renamed_type", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.renamed_type') IS NOT NULL,to_regclass('composite_after.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
+    writer.success(&mut engine, "ROLLBACK TO before_type_name", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_after.renamed_type') IS NULL", true)), ["t|t"]);
+    writer.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "SELECT to_regclass('composite_before.row_type') IS NOT NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t", "7|original"]);
+    writer.success(&mut engine, "ALTER SCHEMA composite_before RENAME TO composite_after", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, "SELECT to_regclass('composite_after.row_type') IS NOT NULL,to_regclass('composite_before.row_type') IS NULL; SELECT (item).id,(item).label FROM composite_holder", true)), ["t|t", "7|original"]);
+}
+
+#[test]
 fn schema_name_regclass_inquiry_preserves_permission_errors() {
     let config = test_config("schema-regclass-lookup-permissions");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE ROLE lookup_reader;
+    session.success(
+        &mut engine,
+        "CREATE ROLE lookup_reader;
         CREATE SCHEMA private_lookup; CREATE TABLE private_lookup.orders(id integer);
-        SET search_path TO private_lookup; SET ROLE lookup_reader", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('orders') IS NULL, current_schema() IS NULL", true)), ["t|t"]);
-    for query in ["SELECT to_regclass('private_lookup.orders')", "SELECT 'private_lookup.orders'::regclass"] {
-        assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), ["42501"]);
+        SET search_path TO private_lookup; SET ROLE lookup_reader",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT to_regclass('orders') IS NULL, current_schema() IS NULL",
+            true
+        )),
+        ["t|t"]
+    );
+    for query in [
+        "SELECT to_regclass('private_lookup.orders')",
+        "SELECT 'private_lookup.orders'::regclass",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            ["42501"]
+        );
     }
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('absent_lookup.orders') IS NULL", true)), ["t"]);
-    session.success(&mut engine, "RESET ROLE; GRANT USAGE ON SCHEMA private_lookup TO lookup_reader; SET ROLE lookup_reader", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT to_regclass('absent_lookup.orders') IS NULL",
+            true
+        )),
+        ["t"]
+    );
+    session.success(
+        &mut engine,
+        "RESET ROLE; GRANT USAGE ON SCHEMA private_lookup TO lookup_reader; SET ROLE lookup_reader",
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('orders') IS NOT NULL, has_table_privilege('private_lookup.orders','SELECT')", true)), ["t|f"]);
     session.success(&mut engine, "RESET ROLE", true);
 }

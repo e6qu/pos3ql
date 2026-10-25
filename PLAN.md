@@ -43,15 +43,14 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Keep a schema rename private until commit, including names used by its own
-  transaction, rollback, dependent definitions and prepared recovery. Preserve
-  the schema's object identifier and distinguish schema names from query aliases.
-- Cover private edits after another connection replaced a catalog tuple across
-  all catalog families. Listings and direct lookups can expose different rows;
-  dependency rows also need exact duplicate counts.
-- Give replacement objects fresh SQL object identifiers, independently of reused
-  storage slots. A cached identifier for a dropped table must not name its
-  replacement. Check shared catalogs across databases as well.
+- Apply checked source identities and private publication to the remaining
+  catalog families. Cover edits after another connection replaced a catalog
+  tuple. Listings and direct lookups can expose different rows; dependency rows
+  also need exact duplicate counts.
+- Give replacement tables, indexes, sequences and other remaining objects fresh
+  SQL object identifiers, independently of reused storage slots. A cached
+  identifier for a dropped table must not name its replacement. Check shared
+  catalogs across databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.
 - Replace remaining synchronous metadata and maintenance reads with bounded

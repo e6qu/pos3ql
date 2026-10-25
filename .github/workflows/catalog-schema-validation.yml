@@ -195,40 +195,6 @@ jobs:
           done
           chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
           echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
-      - name: Install the query profiler
-        run: sudo apt-get update && sudo apt-get install --yes gdb
-      - name: Sample the slow dependency query on the runner
-        shell: bash
-        run: |
-          python3 - <<'PYPROFILE'
-          from pathlib import Path
-          path = Path('tests/external/catalog_snapshot_diff.py')
-          text = path.read_text().replace('import json\n', 'import json\nimport time\n', 1)
-          before = '        cursor = connection.execute(sql, parameters)\n        rows = cursor.fetchall()\n'
-          after = '        started = time.monotonic()\n        if label.endswith(".constraint.dependencies"):\n            print("PROFILE_START " + label, flush=True)\n        cursor = connection.execute(sql, parameters)\n        rows = cursor.fetchall()\n        if label.endswith(".constraint.dependencies"):\n            print(f"PROFILE_END {label} {time.monotonic()-started:.6f}s", flush=True)\n'
-          assert text.count(before) == 1
-          path.write_text(text.replace(before, after, 1))
-          path = Path('tests/external/ci_diff.sh')
-          text = path.read_text()
-          before = 'echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="\n'
-          after = before + """(
-            for attempt in $(seq 1 150); do
-              if [[ -f "$EVIDENCE/catalog-comparison.log" ]] && grep -q '^PROFILE_START read_committed.constraint.dependencies$' "$EVIDENCE/catalog-comparison.log"; then
-                sleep 1
-                date -u > "$EVIDENCE/dependency-query-profile.txt"
-                sudo gdb -q --batch -nx -p "$P3_PID" \
-                  -ex 'set pagination off' -ex 'set print frame-arguments none' \
-                  -ex 'thread apply all bt 32' -ex detach \
-                  >> "$EVIDENCE/dependency-query-profile.txt" 2>&1
-                break
-              fi
-              sleep 0.1
-            done
-          ) &
-          """
-          assert text.count(before) == 1
-          path.write_text(text.replace(before, after, 1))
-          PYPROFILE
       - name: Compare catalogs and types against actual PostgreSQL
         shell: bash
         env:

@@ -13,7 +13,7 @@ use core::{fmt::Write, num::NonZeroU32};
 const PUBLIC_COLUMNS: usize = 7;
 const VIEW_DEFINITION: usize = 7;
 const RULE_BODY: usize = 8;
-const PRIVATE_COLUMNS: &[(&str, crate::sql::types::ColType)] = &[
+pub(super) const PRIVATE_COLUMNS: &[(&str, crate::sql::types::ColType)] = &[
     ("_pos3ql_view_definition", crate::sql::types::ColType::Text),
     (
         "_pos3ql_rule_body",

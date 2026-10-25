@@ -95,6 +95,7 @@ pub(crate) fn validate(
     bytes: &[u8],
     columns: impl Iterator<Item = ColType>,
     table_oid: Option<u32>,
+    private: impl Iterator<Item = ColType>,
 ) -> Option<()> {
     let mut reader = Reader(bytes);
     let count = usize::from(u16::from_le_bytes(reader.take(2)?.try_into().ok()?));
@@ -107,6 +108,11 @@ pub(crate) fn validate(
     }
     if let Some(oid) = table_oid {
         if reader.byte()? != 35 || reader.word()? != oid { return None; }
+        seen += 1;
+    }
+    for ctype in private {
+        if seen >= count { return None; }
+        reader.field(ctype)?;
         seen += 1;
     }
     (seen == count && reader.0.is_empty()).then_some(())
@@ -129,17 +135,17 @@ mod tests {
         bytes[offset + 1..offset + 5].copy_from_slice(&2606u32.to_le_bytes());
         let length = offset + 5;
         crate::mem::guard::forbid_alloc(|| {
-            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606)).is_some());
+            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606), [].into_iter()).is_some());
             for end in 0..length {
-                assert!(validate(&bytes[..end], [ColType::PgNodeTree].into_iter(), Some(2606)).is_none());
+                assert!(validate(&bytes[..end], [ColType::PgNodeTree].into_iter(), Some(2606), [].into_iter()).is_none());
             }
-            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(1259)).is_none());
-            assert!(validate(&bytes[..length], [ColType::Text].into_iter(), Some(2606)).is_none());
+            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(1259), [].into_iter()).is_none());
+            assert!(validate(&bytes[..length], [ColType::Text].into_iter(), Some(2606), [].into_iter()).is_none());
             bytes[2] = 5;
-            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606)).is_none());
+            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606), [].into_iter()).is_none());
             bytes[2] = 50;
             bytes[7] = b'x';
-            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606)).is_none());
+            assert!(validate(&bytes[..length], [ColType::PgNodeTree].into_iter(), Some(2606), [].into_iter()).is_none());
         });
     }
 }

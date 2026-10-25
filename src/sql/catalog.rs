@@ -16151,12 +16151,13 @@ pub(crate) fn validate_restored_row(
         .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
         .map(|(_, ctype)| *ctype);
     let table_oid = specification.relation.map(core::num::NonZeroU32::get);
+    let private = if relation.name == "pg_rewrite" { rewrite::PRIVATE_COLUMNS } else { &[] };
     if let Some(image) = row.before {
-        super::catalog_image::validate(image.bytes, visible(), table_oid).ok_or_else(invalid)?;
+        super::catalog_image::validate(image.bytes, visible(), table_oid, private.iter().map(|(_, ctype)| *ctype)).ok_or_else(invalid)?;
     }
     match relation.key {
         super::catalog_snapshot::CatalogRowKey::Tuple => {
-            super::catalog_image::validate(row.key, visible(), table_oid).ok_or_else(invalid)?;
+            super::catalog_image::validate(row.key, visible(), table_oid, private.iter().map(|(_, ctype)| *ctype)).ok_or_else(invalid)?;
             if row.before.is_some_and(|image| image.bytes != row.key) { return Err(invalid()); }
         }
         super::catalog_snapshot::CatalogRowKey::Columns(names) => {
@@ -16166,7 +16167,7 @@ pub(crate) fn validate_restored_row(
                 *target = specification.columns.iter().find(|(candidate, _)| candidate == name)
                     .map(|(_, ctype)| *ctype).ok_or_else(invalid)?;
             }
-            super::catalog_image::validate(row.key, columns[..names.len()].iter().copied(), None).ok_or_else(invalid)?;
+            super::catalog_image::validate(row.key, columns[..names.len()].iter().copied(), None, [].into_iter()).ok_or_else(invalid)?;
         }
     }
     Ok(())

@@ -14404,6 +14404,8 @@ mod tests {
         exclusion.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
         def.exclusions[0] = exclusion;
         def.n_exclusions = 1;
+        def.attributes.initialize(def.n_columns).unwrap();
+        crate::storage::constraint_names::table(&mut def).unwrap();
         def
     }
 
@@ -14438,6 +14440,40 @@ mod tests {
             .into_iter()
             .filter(|record| !record.contains(":Commit {"))
             .collect()
+    }
+
+    #[test]
+    fn catalog_snapshot_table_payload_validates_unique_modes_and_attribute_layouts() {
+        use crate::storage::UniqueKeyKind;
+        let mut definition = sample_def();
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "typed table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for kind in [UniqueKeyKind::UniqueNullsDistinct, UniqueKeyKind::Primary, UniqueKeyKind::UniqueNullsNotDistinct] {
+                definition.uniques[0].kind = kind;
+                payload.clear();
+                assert!(append_payload(&mut payload, &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(), definition: &definition,
+                }));
+                let (_, restored) = decode_table_payload(payload.readable()).unwrap();
+                assert_eq!(restored.uniques[0].kind, kind);
+                assert_eq!(restored.attributes, definition.attributes);
+                assert_eq!(restored.columns[0].not_null_name, definition.columns[0].not_null_name);
+                let name = definition.uniques[0].name.as_str().as_bytes();
+                let kind_at = payload.readable().windows(name.len()).position(|bytes| bytes == name).unwrap() + name.len();
+                payload.filled_mut()[kind_at] = u8::MAX;
+                assert!(decode_table_payload(payload.readable()).is_none());
+                payload.filled_mut()[kind_at] = kind.code();
+                payload.filled_mut()[kind_at + 1] = 0;
+                assert!(decode_table_payload(payload.readable()).is_none());
+            }
+            definition.attributes.slots[1] = definition.attributes.slots[0];
+            payload.clear();
+            assert_eq!(append_record(&mut payload, 1, &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 1).unwrap(), definition: &definition,
+            }).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(payload.len(), 0);
+        });
     }
 
     #[test]

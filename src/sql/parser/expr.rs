@@ -239,10 +239,12 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("operator") {
                 self.advance()?;
                 self.expect_op("(")?;
+                let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;
                 if self.eat_op(".")? {
+                    self.record_namespace(source)?;
                     schema = Some(first);
                     operator = self.any_op_token()?;
                 }
@@ -715,10 +717,12 @@ impl<'a> Parser<'a> {
             Tok::Ident("operator") => {
                 self.advance()?;
                 self.expect_op("(")?;
+                let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;
                 if self.eat_op(".")? {
+                    self.record_namespace(source)?;
                     schema = Some(first);
                     operator = self.any_op_token()?;
                 }

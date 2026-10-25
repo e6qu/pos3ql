@@ -2772,8 +2772,10 @@ impl<'a> Parser<'a> {
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
+        let source = NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
+            self.record_namespace(source)?;
             (Some(first), self.col_ident("table name")?)
         } else {
             (None, first)

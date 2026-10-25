@@ -329,6 +329,39 @@ def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
         writer.execute('DROP SCHEMA IF EXISTS sr_hidden_relations_diff CASCADE')
 
 
+def schema_sequence_argument_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE SEQUENCE sr_argument_ticket_diff START WITH 100')
+        for label, query in (
+            ('regclass', "SELECT nextval('sr_argument_ticket_diff'::regclass)"),
+            ('current_oid', "SELECT currval('sr_argument_ticket_diff'::regclass::oid)"),
+            ('set_oid', "SELECT setval('sr_argument_ticket_diff'::regclass::oid,200,false)"),
+            ('next_oid', "SELECT nextval('sr_argument_ticket_diff'::regclass::oid)"),
+            ('integer', "SELECT nextval('sr_argument_ticket_diff'::regclass::integer)"),
+            ('bigint', "SELECT nextval('sr_argument_ticket_diff'::regclass::bigint)"),
+            ('set_regclass', "SELECT setval('sr_argument_ticket_diff'::regclass,500,true)"),
+            ('current_name', "SELECT currval('sr_argument_ticket_diff')"),
+            ('null', 'SELECT currval(NULL::oid) IS NULL'),
+        ):
+            record(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query)
+        for label, query in (
+            ('empty_next', 'SELECT nextval()'),
+            ('empty_current', 'SELECT currval()'),
+            ('empty_set', 'SELECT setval()'),
+            ('extra_set', "SELECT setval('sr_argument_ticket_diff',1,true,false)"),
+            ('boolean', 'SELECT nextval(true)'),
+            ('numeric', 'SELECT nextval(1.5::numeric)'),
+            ('character', "SELECT nextval('sr_argument_ticket_diff'::character(30))"),
+            ('negative_bigint', 'SELECT nextval(-1::bigint)'),
+            ('missing_smallint', 'SELECT nextval(0::smallint)'),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query, ())
+        record(writer, f"{prefix}.schema_binding.sequence_arguments.after_errors", "SELECT currval('sr_argument_ticket_diff')")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('DROP SEQUENCE IF EXISTS sr_argument_ticket_diff')
+
+
 def schema_reference_literal_reports(writer, prefix, record):
     try:
         writer.execute('CREATE SCHEMA sr_typed_before_diff')
@@ -526,6 +559,7 @@ def transcript(reader, writer, host, port, user, report_database):
         schema_name_binding_reports(writer, prefix, record)
         schema_reference_literal_reports(writer, prefix, record)
         schema_regclass_lookup_reports(writer, prefix, record, record_outcome)
+        schema_sequence_argument_reports(writer, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

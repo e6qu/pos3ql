@@ -1,16 +1,56 @@
 use super::*;
 
 #[test]
+fn schema_name_sequence_arguments_accept_object_identifiers_and_reject_wrong_arity() {
+    let config = test_config("schema-sequence-argument-types");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE SEQUENCE sequence_argument_ticket START WITH 100", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT nextval('sequence_argument_ticket'::regclass);
+        SELECT currval('sequence_argument_ticket'::regclass::oid);
+        SELECT setval('sequence_argument_ticket'::regclass::oid,200,false);
+        SELECT nextval('sequence_argument_ticket'::regclass::oid);
+        SELECT nextval('sequence_argument_ticket'::regclass::integer);
+        SELECT nextval('sequence_argument_ticket'::regclass::bigint);
+        SELECT setval('sequence_argument_ticket'::regclass,500,true);
+        SELECT currval('sequence_argument_ticket');
+        SELECT currval(NULL::oid) IS NULL;
+    ", true)), ["100", "100", "200", "200", "201", "202", "500", "500", "t"]);
+    for (query, state) in [
+        ("SELECT nextval()", "42883"),
+        ("SELECT currval()", "42883"),
+        ("SELECT setval()", "42883"),
+        ("SELECT setval('sequence_argument_ticket',1,true,false)", "42883"),
+        ("SELECT nextval(true)", "42883"),
+        ("SELECT nextval(1.5::numeric)", "42883"),
+        ("SELECT nextval('sequence_argument_ticket'::character(30))", "42883"),
+        ("SELECT nextval(-1::bigint)", "22003"),
+        ("SELECT nextval(0::smallint)", "42P01"),
+    ] {
+        assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), [state], "{query}");
+    }
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT currval('sequence_argument_ticket')", true)), ["500"]);
+}
+
+#[test]
 fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
     let config = test_config("schema-regclass-search-path");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, r#"CREATE SCHEMA hidden_relations;
+    session.success(
+        &mut engine,
+        r#"CREATE SCHEMA hidden_relations;
         CREATE TABLE hidden_relations."a.b"(id integer);
         CREATE TABLE public.pg_class(id integer);
-    "#, true);
+    "#,
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine, r#"
         SELECT to_regclass('"a.b"') IS NULL;
         SELECT 'pg_class'::regclass::oid=1259;
@@ -22,8 +62,10 @@ fn schema_name_regclass_lookup_preserves_quotes_and_respects_the_search_path() {
         SELECT 'pg_class'::regclass='public.pg_class'::regclass;
         SELECT NOT pg_table_is_visible('hidden_relations."a.b"'::regclass);
     "#, true)), ["t", "t", "t", "t", "t", "t", "t"]);
-    assert_eq!(error_sqlstates(&session.execute(&mut engine,
-        "SELECT to_regclass('broken..name')", true)), ["42602"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "SELECT to_regclass('broken..name')", true)),
+        ["42602"]
+    );
 }
 
 #[test]

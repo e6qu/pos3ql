@@ -764,14 +764,29 @@ pub struct ProjectSetValue<'a> {
     pub fixed_index: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub enum SequenceReference<'a> {
+    Name(&'a str),
+    Oid(u32),
+}
+
+impl core::fmt::Display for SequenceReference<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Name(name) => output.write_str(name),
+            Self::Oid(oid) => core::fmt::Display::fmt(oid, output),
+        }
+    }
+}
+
 /// The side-effecting sequence functions, abstracted so `eval` need not depend
 /// on `Storage`. The implementor advances/reads generators (through `Cell`
 /// interior mutability) and the session's `currval`/`lastval` state.
 pub trait SequenceAccess {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError>;
-    fn currval(&self, name: &str) -> Result<i64, SqlError>;
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
+    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError>;
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -4610,6 +4625,12 @@ fn call<'a>(
         // Sequence functions: side-effecting, so they run through the
         // `hooks.sequences` bridge (interior-mutable) rather than as pure eval.
         "nextval" | "currval" | "setval" => {
+            if name == "setval" {
+                if args.len() != 2 && args.len() != 3 || star {
+                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION,
+                        "function setval(...) with {} arguments does not exist", args.len()));
+                }
+            } else { arity(1)?; }
             let engine = hooks.sequences.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4617,27 +4638,27 @@ fn call<'a>(
                     name
                 )
             })?;
-            let seq_name = match args::text_arg(name, args, 0, arena, params, row, hooks)? {
-                Some(s) => s,
-                None => return Ok(Datum::Null),
+            let seq_name = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => return Ok(Datum::Null),
+                Datum::Text(value) => SequenceReference::Name(value),
+                Datum::Oid(value) => SequenceReference::Oid(value),
+                Datum::Int2(value) => SequenceReference::Oid(i32::from(value) as u32),
+                Datum::Int4(value) => SequenceReference::Oid(value as u32),
+                Datum::Int8(value) => SequenceReference::Oid(u32::try_from(value)
+                    .map_err(|_| overflow("oid"))?),
+                Datum::RegObject { type_oid: super::types::oid::REGCLASS, referenced_oid, .. } =>
+                    SequenceReference::Oid(referenced_oid as u32),
+                other => return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION,
+                    "function {}({}) does not exist", name, type_name_of(&other))),
             };
             let result = match name {
                 "nextval" => {
-                    arity(1)?;
                     engine.nextval(seq_name)?
                 }
                 "currval" => {
-                    arity(1)?;
                     engine.currval(seq_name)?
                 }
                 _ => {
-                    if args.len() != 2 && args.len() != 3 || star {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_FUNCTION,
-                            "function setval(...) with {} arguments does not exist",
-                            args.len()
-                        ));
-                    }
                     let value = match args::int_arg(name, args, 1, arena, params, row, hooks)? {
                         Some(v) => v,
                         None => return Ok(Datum::Null),

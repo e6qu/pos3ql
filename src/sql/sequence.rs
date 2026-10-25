@@ -10,7 +10,7 @@
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
 use crate::mem::arena::{Arena, ArenaHandle, ArenaList};
-use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
+use crate::sql::eval::{SequenceAccess, SequenceReference, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
 use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
@@ -302,8 +302,12 @@ impl<'a> SeqEval<'a> {
     /// Resolves a `nextval('name')` argument to a live sequence slot. The name
     /// may be schema-qualified (`schema.seq`); resolution otherwise walks the
     /// search path, exactly as relation resolution does.
-    fn resolve(&self, name: &str) -> Result<usize, SqlError> {
-        let slot = match crate::sql::identifiers::ObjectReference::parse(name)? {
+    fn resolve(&self, name: SequenceReference<'_>) -> Result<usize, SqlError> {
+        let reference = match name {
+            SequenceReference::Name(name) => crate::sql::identifiers::ObjectReference::parse(name)?,
+            SequenceReference::Oid(oid) => crate::sql::identifiers::ObjectReference::Oid(oid),
+        };
+        let slot = match reference {
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..self.storage.sequence_count()).find(|slot| {
                     self.storage.sequence_slot_visible_to(*slot, self.txid)
@@ -429,7 +433,7 @@ pub(crate) fn next_cached(
 }
 
 impl SequenceAccess for SeqEval<'_> {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;
         if self.dry {
@@ -438,7 +442,7 @@ impl SequenceAccess for SeqEval<'_> {
         next_cached(self.storage, self.session, slot, self.txid)
     }
 
-    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
         let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
@@ -485,7 +489,7 @@ impl SequenceAccess for SeqEval<'_> {
         )
     }
 
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
         let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
@@ -516,16 +520,16 @@ impl SequenceAccess for SeqEval<'_> {
 }
 
 impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.nextval(name))
     }
-    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.currval(name))
     }
     fn lastval(&self) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.lastval())
     }
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(&self, name: SequenceReference<'_>, value: i64, is_called: bool) -> Result<i64, SqlError> {
         self.state
             .invoke(|| self.base.setval(name, value, is_called))
     }

@@ -75,6 +75,17 @@ impl SchemaNameTarget {
 }
 
 impl Storage {
+    pub(crate) fn commit_comment_identity(&self, slot: usize, transaction: u32) {
+        let mut comments = self.comment_catalog();
+        let comment = &mut comments.entries[slot];
+        if comment.pending_drop.is_some_and(|pending| pending.txid == transaction) { return; }
+        if let Some(identity) = comment.pending_identity.filter(|identity| identity.txid == transaction) {
+            comment.schema = identity.schema;
+            comment.name = identity.name;
+            comment.pending_identity = None;
+        }
+    }
+
     pub(crate) fn stage_index_schema_references(
         &self, slot: usize, old: SqlName, new: SqlName, transaction: u32,
     ) -> Result<Option<Option<super::PendingIndexDefinition>>, SqlError> {

@@ -692,6 +692,7 @@ mod copy_transition;
 mod partition_insert;
 mod partition_update;
 mod schema;
+pub(super) use schema::rename as stage_schema_rename;
 pub(crate) use copy_transition::CopyTransitionRows;
 
 mod describe;
@@ -12084,10 +12085,11 @@ pub(crate) fn drop_schema(
         }
     }
     // Everything the drop sweeps up, across all listed schemas.
+    let schema_transaction = txn.txid;
     let in_listed = |storage: &Storage, schema: &str| {
         slots[..n_slots]
             .iter()
-            .any(|&slot| storage.schema_def_for(slot, txn.txid).name.as_str() == schema)
+            .any(|&slot| storage.schema_def_for(slot, schema_transaction).name.as_str() == schema)
     };
     let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
     {

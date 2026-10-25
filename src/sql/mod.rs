@@ -3757,7 +3757,8 @@ impl Engine {
             .map_err(EngineSetupError::Checkpoint)?;
         }
         validate_checkpoint_prepared_batches(&expected_prepared, &recovered)?;
-        replay_transaction_batches(&mut storage, &mut prepared_transactions, &recovered, floor)?;
+        let mut work = QueryWorkspaces::new(config, budget)?;
+        replay_transaction_batches(&mut storage, &mut prepared_transactions, &recovered, floor, &mut work)?;
         u32::try_from(storage.latest_transaction_identity()).map_err(|_| {
             EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
                 "recovered transaction identity exceeds the internal counter",
@@ -3880,7 +3881,6 @@ impl Engine {
                 .push(EMPTY_PENDING_TRUNCATE)
                 .expect("sized to max_ddl_per_transaction");
         }
-        let work = QueryWorkspaces::new(config, budget)?;
         budget.draw(
             size_of::<Option<LocalCleanup>>(),
             "post-publication cleanup controls",
@@ -7305,7 +7305,7 @@ impl Engine {
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
-                DdlUndo::CommentIdentityChanged { .. } => {}
+                DdlUndo::CommentIdentityChanged { slot, .. } => self.storage.commit_comment_identity(*slot as usize, txn.txid),
             }
         }
         for &advance in txn.subscription_advances() {
@@ -20481,6 +20481,7 @@ fn replay_transaction_batches(
     prepared: &mut two_phase::PreparedTransactions,
     recovered: &std::collections::BTreeMap<u64, Vec<u8>>,
     apply_floor: u64,
+    arena: &mut Arena,
 ) -> Result<(), SqlError> {
     let mut batch: Vec<(u64, &[u8])> = Vec::new();
     for (lsn, record) in recovered {
@@ -20562,6 +20563,26 @@ fn replay_transaction_batches(
                             "prepared transaction WAL is corrupt"
                         )
                     })? {
+                        WalOp::CreateSchema(name) => {
+                            let selected = storage.create_schema_in(crate::storage::SqlName::parse(name)?, transaction_id)?;
+                            prepared.slot_mut(slot).transaction.record_catalog_change(storage, DdlUndo::SchemaCreated(selected as u32))?;
+                        }
+                        WalOp::DropSchema(name) => {
+                            let selected = storage.find_schema_visible(name, transaction_id)
+                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                                    "prepared transaction drops an unknown schema"))?;
+                            storage.drop_schema_in(selected, transaction_id)?;
+                            prepared.slot_mut(slot).transaction.record_catalog_change(storage, DdlUndo::SchemaDropped(selected as u32))?;
+                        }
+                        WalOp::RenameSchema { name, new_name } => {
+                            let selected = storage.find_schema_visible(name, transaction_id)
+                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                                    "prepared transaction renames an unknown schema"))?;
+                            arena.reset();
+                            exec::stage_schema_rename(storage, &mut prepared.slot_mut(slot).transaction,
+                                selected, crate::storage::SqlName::parse(new_name)?, arena)?;
+                            arena.reset();
+                        }
                         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => {
                             apply_prepared_table_wal_payload(
                                 storage,

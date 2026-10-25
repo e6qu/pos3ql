@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss() {
+    for checkpoint in [false, true] {
+        for decision in ["COMMIT PREPARED", "ROLLBACK PREPARED"] {
+            let name = format!("schema-prepared-{checkpoint}-{decision}");
+            let mut config = test_config(&name);
+            config.max_prepared_transactions = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine, "
+                CREATE SCHEMA prepared_schema_before;
+                CREATE TYPE prepared_schema_before.mood AS ENUM ('ready');
+                CREATE TABLE prepared_schema_before.items(id integer,state prepared_schema_before.mood);
+                INSERT INTO prepared_schema_before.items VALUES (8,'ready');
+                CREATE VIEW prepared_schema_before.item_view AS SELECT id,state FROM prepared_schema_before.items;
+                CREATE MATERIALIZED VIEW prepared_schema_cache AS SELECT id FROM prepared_schema_before.items;
+                CREATE FUNCTION prepared_schema_before.bound() RETURNS integer LANGUAGE SQL
+                  BEGIN ATOMIC SELECT id FROM prepared_schema_before.items; END;
+                COMMENT ON SCHEMA prepared_schema_before IS 'prepared namespace';
+            ", false);
+            session.success(&mut engine, "BEGIN; ALTER SCHEMA prepared_schema_before RENAME TO prepared_schema_after", true);
+            assert_eq!(data_rows(&session.success(&mut engine,
+                "SELECT prepared_schema_after.bound(); SELECT id,state FROM prepared_schema_after.item_view", true)),
+                ["8", "8|ready"]);
+            session.success(&mut engine, "PREPARE TRANSACTION 'schema_move'", false);
+            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "
+                SELECT to_regnamespace('prepared_schema_before') IS NOT NULL,to_regnamespace('prepared_schema_after') IS NULL;
+                SELECT prepared_schema_before.bound();
+                SELECT pg_get_viewdef('prepared_schema_cache'::regclass) LIKE '%prepared_schema_before%';
+            ", true)), ["t|t", "8", "t"], "{name}");
+            session.success(&mut cold, &format!("{decision} 'schema_move'"), false);
+            let schema = if decision == "COMMIT PREPARED" { "prepared_schema_after" } else { "prepared_schema_before" };
+            assert_eq!(data_rows(&session.success(&mut cold, &format!("
+                SELECT {schema}.bound(); SELECT id,state FROM {schema}.item_view;
+                SELECT obj_description('{schema}'::regnamespace,'pg_namespace');
+                REFRESH MATERIALIZED VIEW prepared_schema_cache;
+                SELECT id FROM prepared_schema_cache;
+            "), true)), ["8", "8|ready", "prepared namespace", "8"], "{name}");
+            drop(session);
+            drop(cold);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn schema_rename_rewrites_private_materialized_queries_and_index_expressions() {
     let config = test_config("private-schema-query-text");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

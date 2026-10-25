@@ -25,7 +25,7 @@ mod matview_lifecycles;
 mod query_lifecycles;
 mod routine_lifecycles;
 mod schema_names;
-pub(crate) use schema_names::{SchemaNameTarget, SchemaNameUndo};
+pub(crate) use schema_names::SchemaNameUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
@@ -4580,6 +4580,16 @@ impl StoredQueryDependencies {
 
     pub fn entries(&self) -> &[StoredQueryDependency] {
         &self.entry_storage()[..self.len as usize]
+    }
+
+    pub(crate) fn rename_schema(&mut self, old: SqlName, new: SqlName) -> bool {
+        let len = usize::from(self.len);
+        let mut changed = false;
+        for entry in &mut self.entry_storage_mut()[..len] {
+            changed |= rename_schema_name(&mut entry.schema, old, new);
+            changed |= rename_schema_name(&mut entry.referenced_schema, old, new);
+        }
+        changed
     }
 
     fn entry_storage(&self) -> &[StoredQueryDependency] {
@@ -28692,17 +28702,17 @@ impl Storage {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
-            let mut path = definition.creation_path;
-            rename_schema_path(&mut path, prior, name)?;
-            let mut body = definition.body;
             if definition.body_kind != RoutineBodyKind::String {
+                let mut path = definition.creation_path;
+                rename_schema_path(&mut path, prior, name)?;
+                let mut body = definition.body;
                 rename_schema_qualified_sql(&mut body, &mut [], prior, name)?;
             }
             if let Some(pending) = definition.pending_definition {
-                let mut path = pending.definition.creation_path;
-                rename_schema_path(&mut path, prior, name)?;
-                let mut body = pending.definition.body;
                 if pending.definition.body_kind != RoutineBodyKind::String {
+                    let mut path = pending.definition.creation_path;
+                    rename_schema_path(&mut path, prior, name)?;
+                    let mut body = pending.definition.body;
                     rename_schema_qualified_sql(&mut body, &mut [], prior, name)?;
                 }
             }
@@ -28717,6 +28727,14 @@ impl Storage {
                 rename_schema_path(&mut path, prior, name)?;
                 let mut sql = definition.sql;
                 rename_schema_qualified_sql(&mut sql, &mut [], prior, name)?;
+            }
+        }
+        for (_, policy) in (PolicyIter { catalog: &self.policy_catalog, next_slot: 0 })
+            .filter(|(_, policy)| policy.database == current_database() && policy.ddl_state != CatalogDdlState::Absent) {
+            for mut definition in [Some(policy.definition), policy.pending_definition.map(|pending| pending.definition)].into_iter().flatten() {
+                for expression in [&mut definition.using, &mut definition.with_check].into_iter().flatten() {
+                    rename_schema_qualified_sql(expression, &mut [], prior, name)?;
+                }
             }
         }
         for table_slot in 0..self.tables.len() {
@@ -28931,8 +28949,8 @@ impl Storage {
                 name,
             );
             rename_routine_kind_schema(&mut definition.kind, prior, name);
-            rename_schema_path(&mut definition.creation_path, prior, name)?;
             if definition.body_kind != RoutineBodyKind::String {
+                rename_schema_path(&mut definition.creation_path, prior, name)?;
                 rename_schema_qualified_sql(&mut definition.body, &mut [], prior, name)?;
             }
             if let Some(pending) = &mut definition.pending_definition {
@@ -28955,8 +28973,8 @@ impl Storage {
                     name,
                 );
                 rename_routine_kind_schema(&mut pending.definition.kind, prior, name);
-                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
                 if pending.definition.body_kind != RoutineBodyKind::String {
+                    rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
                     rename_schema_qualified_sql(&mut pending.definition.body, &mut [], prior, name)?;
                 }
             }
@@ -29089,6 +29107,18 @@ impl Storage {
         }) {
             if policy.database == current_database() && policy.ddl_state != CatalogDdlState::Absent
             {
+                {
+                    let mut catalog = self.policy_catalog.lock().expect("policy catalog lock poisoned");
+                    let definition = &mut catalog.definitions[slot];
+                    for expression in [&mut definition.definition.using, &mut definition.definition.with_check].into_iter().flatten() {
+                        rename_schema_qualified_sql(expression, &mut [], prior, name)?;
+                    }
+                    if let Some(pending) = &mut definition.pending_definition {
+                        for expression in [&mut pending.definition.using, &mut pending.definition.with_check].into_iter().flatten() {
+                            rename_schema_qualified_sql(expression, &mut [], prior, name)?;
+                        }
+                    }
+                }
                 let image = self
                     .committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16));
                 self.with_dependency_image_mut(image, |dependencies| {

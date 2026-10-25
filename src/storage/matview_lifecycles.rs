@@ -352,6 +352,7 @@ impl Storage {
             },
             backing,
             usage: QueryTargetUse::JournalRetirement,
+            query_version: view.query_version,
         };
         let change = self.drop_matview(target, 0)?;
         self.finish_matview_change(change, CatalogDdlDecision::Commit);

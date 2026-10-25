@@ -4,7 +4,7 @@ use super::*;
 use crate::sql::txn::DdlUndo;
 use crate::storage::{rename_schema_name, rename_schema_qualified_sql, rename_user_type_schema};
 
-pub(super) fn rename(
+pub(crate) fn rename(
     storage: &mut Storage,
     txn: &mut TxnState,
     slot: usize,
@@ -160,6 +160,24 @@ pub(super) fn rename(
         let (change, _) = storage.alter_rule(storage.prepare_rule_edit(slot, txn.txid)?,
             crate::storage::RuleMetadataChange::Schema { old, new: name }, txn.txid)?;
         txn.record_catalog_change(storage, DdlUndo::RuleAltered(change))?;
+    }
+    for slot in 0..storage.policy_count() {
+        let policy = storage.policy(slot);
+        if policy.database != storage.current_database_oid() || !policy.visible_to(txn.txid) { continue; }
+        let mut definition = policy.definition_for(txn.txid);
+        let mut changed = false;
+        for expression in [&mut definition.using, &mut definition.with_check].into_iter().flatten() {
+            changed |= rename_schema_qualified_sql(expression, &mut [], old, name)?;
+        }
+        let mut dependencies = storage.snapshot_policy_dependencies(slot, txn.txid, arena)?;
+        changed |= dependencies.rename_schema(old, name);
+        if !changed { continue; }
+        let mut roles = ArenaList::new(arena);
+        for role in storage.policy_roles(slot, txn.txid).iter() {
+            roles.push(*role).map_err(|_| arena_full())?;
+        }
+        let prior = storage.alter_policy(slot, definition, roles.as_slice(), &dependencies, txn.txid)?;
+        txn.record_catalog_change(storage, DdlUndo::PolicyAltered { slot: slot as u32, prior })?;
     }
     for slot in 0..storage.matview_count() {
         let view = storage.matview_for(slot, txn.txid);

@@ -74,6 +74,41 @@ fn catalog_constraint_index_columns_are_strict_and_cover_expressions_and_include
         ["((x + 1))|y||||NULL|NULL"]);
     assert_eq!(error_sqlstates(&session.execute(&mut engine,
         "SELECT pg_get_indexdef('expression_columns_index'::regclass,1)", true)), ["42883"]);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT
+        pg_get_indexdef('expression_columns_index'::regclass,0,true),
+        pg_get_indexdef('expression_columns_index'::regclass,1,true)", true)),
+        ["CREATE INDEX expression_columns_index ON expression_columns USING btree ((x + 1)) INCLUDE (y)|(x + 1)"]);
+}
+
+#[test]
+fn catalog_constraint_check_nodes_use_current_columns_and_strict_arguments() {
+    let mut config = test_config("constraint-check-node-rows");
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "CREATE TABLE expression_checks(a integer PRIMARY KEY,b integer,
+        g integer GENERATED ALWAYS AS (b+1) STORED, CONSTRAINT expression_positive CHECK(b>0));
+        CREATE SEQUENCE expression_arguments", true);
+    let report = "SELECT constraint_name,check_clause FROM information_schema.check_constraints WHERE constraint_name='expression_positive'";
+    assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)),
+        ["expression_positive|(b > 0)"]);
+    writer.success(&mut engine, "ALTER TABLE expression_checks RENAME b TO renamed_b", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["expression_positive|(renamed_b > 0)"]);
+    assert_eq!(data_rows(&reader.success(&mut engine, "SELECT generation_expression FROM information_schema.columns
+        WHERE table_name='expression_checks' AND column_name='g'", true)), ["(renamed_b + 1)"]);
+    assert_eq!(data_rows(&reader.success(&mut engine, "SELECT
+        pg_get_expr(conbin,NULL::oid),pg_get_expr(conbin,conrelid,NULL::boolean),pg_get_expr(conbin,conrelid,true)
+        FROM pg_constraint WHERE conname='expression_positive'", true)), ["NULL|NULL|renamed_b > 0"]);
+    reader.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(data_rows(&writer.success(&mut engine, "SELECT pg_get_expr(NULL::pg_node_tree,nextval('expression_arguments')::oid,false) IS NULL;
+        SELECT is_called FROM expression_arguments;
+        SELECT pg_get_expr(conbin,nextval('expression_arguments')::oid,false) IS NULL FROM pg_constraint WHERE conname='expression_checks_pkey';
+        SELECT last_value,is_called FROM expression_arguments", true)), ["t", "f", "t", "1|t"]);
+    assert_eq!(error_sqlstates(&writer.execute(&mut engine, "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='expression_positive'", true)), ["22023"]);
+    assert_eq!(error_sqlstates(&writer.execute(&mut engine, "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)", true)), ["0A000"]);
 }
 
 #[test]
@@ -102,7 +137,7 @@ fn catalog_constraint_domains_keep_selected_names_and_current_type_permissions()
         assert_eq!(data_rows(&reader.success(&mut engine,
             "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),
                 has_type_privilege(23::oid,'USAGE WITH GRANT OPTION'),has_type_privilege(2147483647::oid,'USAGE');
-             SELECT has_type_privilege(oid,'USAGE') FROM pg_type WHERE typname='renamed_constraint_domain'", true)),
+             SELECT has_type_privilege(oid,'USAGE') FROM pg_type WHERE typname IN ('constraint_domain','renamed_constraint_domain')", true)),
             ["t|t|f|NULL", "t"]);
         reader.success(&mut engine, "ROLLBACK", true);
     }

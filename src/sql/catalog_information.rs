@@ -446,7 +446,11 @@ fn emit_column<'a>(
     let generated = attribute.character("attgenerated")? != 0;
     let identity = attribute.character("attidentity")?;
     let expression = match default {
-        Some(default) => default.get("adbin")?,
+        Some(default) => match default.get("adbin")? {
+            Datum::Null => Datum::Null,
+            node => super::expression_def_text(storage, transaction, string(node)?, class.integer("oid")?, false, arena)?
+                .map_or(Datum::Null, Datum::Text),
+        },
         None => Datum::Null,
     };
     let database = storage.current_database_name(transaction);

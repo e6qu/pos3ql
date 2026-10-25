@@ -3217,12 +3217,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         oid: i32,
         col: i32,
+        pretty: bool,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::index_def_text(self.storage, self.txid, oid, col, arena)
+        super::catalog::index_def_text(self.storage, self.txid, oid, col, pretty, arena)
     }
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
+    }
+    fn expression_def<'a>(&self, node: &str, relation: i32, pretty: bool, arena: &'a Arena)
+        -> Result<Option<&'a str>, SqlError> {
+        super::catalog::expression_def_text(self.storage, self.txid, node, relation, pretty, arena)
     }
     fn partition_key_def<'a>(
         &self,
@@ -3656,17 +3661,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
         };
         let named = [
-            (oid::FIRST_DOMAIN, self.storage.domain_count(), AccessClass::Domain, false),
-            (oid::FIRST_ENUM, self.storage.enum_count(), AccessClass::Enum, false),
-            (oid::FIRST_COMPOSITE, self.storage.composite_count(), AccessClass::Composite, false),
-            (oid::FIRST_DOMAIN_ARRAY, self.storage.domain_count(), AccessClass::Domain, true),
-            (oid::FIRST_ENUM_ARRAY, self.storage.enum_count(), AccessClass::Enum, true),
-            (oid::FIRST_COMPOSITE_ARRAY, self.storage.composite_count(), AccessClass::Composite, true),
-        ].into_iter().find_map(|(first, count, class, array)| {
+            (oid::FIRST_DOMAIN, self.storage.domain_count(), AccessClass::Domain),
+            (oid::FIRST_ENUM, self.storage.enum_count(), AccessClass::Enum),
+            (oid::FIRST_COMPOSITE, self.storage.composite_count(), AccessClass::Composite),
+            (oid::FIRST_DOMAIN_ARRAY, self.storage.domain_count(), AccessClass::Domain),
+            (oid::FIRST_ENUM_ARRAY, self.storage.enum_count(), AccessClass::Enum),
+            (oid::FIRST_COMPOSITE_ARRAY, self.storage.composite_count(), AccessClass::Composite),
+        ].into_iter().find_map(|(first, count, class)| {
             let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
-            (slot < count).then_some((AccessObject { class, slot: slot as u16 }, array))
+            (slot < count).then_some(AccessObject { class, slot: slot as u16 })
         });
-        let owner = if let Some((object, array)) = named {
+        if let Some(object) = named {
             let slot = usize::from(object.slot);
             let visible = match object.class {
                 AccessClass::Domain => self.storage.domain_slot_visible_to(slot, self.txid),
@@ -3675,13 +3680,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 _ => unreachable!("named type object was classified"),
             };
             if !visible { return Ok(None); }
-            if !array {
-                return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::TYPE_ALL,
-                    |privilege| self.storage.has_object_privilege(object, role, privilege, self.txid),
-                    |privilege| self.storage.has_object_grant_option(object, role, privilege, self.txid)).map(Some);
-            }
-            self.storage.object_owner(object, self.txid)
-        } else {
+            return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::TYPE_ALL,
+                |privilege| self.storage.has_object_privilege(object, role, privilege, self.txid),
+                |privilege| self.storage.has_object_grant_option(object, role, privilege, self.txid)).map(Some);
+        }
+        let owner = {
             let row_type = [
                 (super::catalog::FIRST_TABLE_COMPOSITE_TYPE_OID, self.storage.table_count(), AccessClass::Table),
                 (super::catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID, self.storage.table_count(), AccessClass::Table),

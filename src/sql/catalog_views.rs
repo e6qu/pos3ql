@@ -73,7 +73,7 @@ pub(super) fn indexes<'a>(
                     continue;
                 }
                 let definition = catalog
-                    .index_def(indexed.integer("oid")?, 0, arena)?
+                    .index_def(indexed.integer("oid")?, 0, false, arena)?
                     .map_or(Datum::Null, Datum::Text);
                 for namespace in
                     namespaces.left(Some((relation.integer("relnamespace")? as u32, 0)))

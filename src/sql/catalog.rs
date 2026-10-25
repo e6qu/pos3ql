@@ -36,6 +36,8 @@ mod views;
 
 #[path = "catalog_constraints.rs"]
 mod constraints;
+#[path = "catalog_expressions.rs"]
+mod expressions;
 #[path = "catalog_information.rs"]
 mod information;
 
@@ -8915,6 +8917,9 @@ pub(crate) fn synthesize<'a>(
             "domain_constraints" => {
                 return constraints::domains(storage, txid, views::Read::Statement, arena);
             }
+            "check_constraints" => {
+                return constraints::checks(storage, txid, views::Read::Statement, arena);
+            }
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9344,7 +9349,7 @@ pub(crate) fn synthesize_current<'a>(
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         (true, "domains") => info_domains(storage, txid, arena),
         (true, "domain_constraints") => constraints::domains(storage, txid, views::Read::Current, arena),
-        (true, "check_constraints") => info_check_constraints(storage, txid, arena),
+        (true, "check_constraints") => constraints::checks(storage, txid, views::Read::Current, arena),
         (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
         (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
         (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
@@ -9391,6 +9396,7 @@ pub(crate) fn synthesize_current<'a>(
             name
         )),
     }?;
+    let table = expressions::current(storage, txid, table, arena)?;
     super::catalog_snapshot::canonical_acl_values(
         table,
         &super::query::storage_catalog(storage, arena, txid),
@@ -9402,6 +9408,11 @@ pub(crate) fn synthesize_current<'a>(
 /// range (stable for a running process).
 fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     user_table_oid(slot)
+}
+
+pub(crate) fn expression_def_text<'a>(storage: &Storage, transaction: u32, node: &str, relation: i32, pretty: bool, arena: &'a Arena)
+    -> Result<Option<&'a str>, SqlError> {
+    expressions::deparse(storage, transaction, node, relation, pretty, arena)
 }
 
 pub(crate) fn user_table_oid(slot: usize) -> i32 {
@@ -15868,7 +15879,7 @@ fn write_index_key_metadata(
     }
 }
 
-fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo) {
+fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo, qualify: bool) {
     let _ = out.write_str(" ON ");
     if info
         .explicit_definition
@@ -15876,8 +15887,10 @@ fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &
     {
         let _ = out.write_str("ONLY ");
     }
-    write_identifier(out, table.schema.as_str());
-    let _ = out.write_char('.');
+    if qualify {
+        write_identifier(out, table.schema.as_str());
+        let _ = out.write_char('.');
+    }
     write_identifier(out, table.name.as_str());
 }
 
@@ -15952,6 +15965,7 @@ pub fn index_def_text<'a>(
     txid: u32,
     oid: i32,
     col: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let builtin = match oid {
@@ -15986,7 +16000,7 @@ pub fn index_def_text<'a>(
                 if info.expression_keys[position] {
                     let expression = index_expression_source(storage, info, position, txid)
                         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
-                    return Ok(Some(index_expression_display(expression.as_str(), arena)?));
+                    return Ok(Some(index_expression_display(expression.as_str(), pretty, arena)?));
                 }
                 write_identifier(&mut name, col_name(position));
             } else if position - info.n_cols < info.n_include_cols {
@@ -16005,7 +16019,9 @@ pub fn index_def_text<'a>(
             if info.is_unique { "UNIQUE " } else { "" }
         );
         write_identifier(&mut s, info.name.as_str());
-        write_index_target(&mut s, &def, info);
+        let visible = matches!(storage.resolve_relation(None, def.name.as_str(), txid),
+            Some(crate::storage::ResolvedRelation::Table(slot)) if slot == info.table_slot);
+        write_index_target(&mut s, &def, info, !pretty || !visible);
         let _ = write!(
             s,
             " USING {} (",
@@ -16022,7 +16038,7 @@ pub fn index_def_text<'a>(
             if info.expression_keys[k] {
                 let expression = index_expression_source(storage, info, k, txid)
                     .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
-                let _ = s.write_str(index_expression_display(expression.as_str(), arena)?);
+                let _ = s.write_str(index_expression_display(expression.as_str(), pretty, arena)?);
             } else {
                 write_identifier(&mut s, col_name(k));
             }
@@ -16070,11 +16086,11 @@ pub fn index_def_text<'a>(
     Ok(None)
 }
 
-fn index_expression_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+fn index_expression_display<'a>(source: &str, pretty: bool, arena: &'a Arena) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let expression = super::parser::parse_expr(source, arena)?;
     let display = super::enum_values::checks::canonical_display(source, arena)?;
-    if matches!(expression, super::ast::Expr::Call { .. }) {
+    if matches!(expression, super::ast::Expr::Call { .. }) || pretty {
         return Ok(display);
     }
     let mut output = crate::mem::arena::ArenaString::new(arena);
@@ -20254,7 +20270,7 @@ fn pg_constraint_values<'a>(
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
-                    Datum::Null,
+                    text(check.expression.as_str(), arena)?,
                 ],
                 arena,
             )?;
@@ -20272,6 +20288,8 @@ fn pg_constraint_values<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_constraint"));
         }
+        let rendered = detached_partition_constraint_def_text(&table, constraint, arena)?;
+        let expression = rendered.strip_prefix("CHECK (").and_then(|text| text.strip_suffix(")")).ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "detached CHECK expression framing is invalid"))?;
         out[n] = row(
             &[
                 Datum::Int4(FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32),
@@ -20302,7 +20320,7 @@ fn pg_constraint_values<'a>(
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
-                Datum::Null,
+                text(expression, arena)?,
             ],
             arena,
         )?;
@@ -20404,7 +20422,7 @@ fn pg_constraint_values<'a>(
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
-                    Datum::Null,
+                    text(super::enum_values::checks::resolve(check.expression.as_str(), domain.base, storage, txid, arena)?, arena)?,
                 ],
                 arena,
             )?;
@@ -31809,99 +31827,6 @@ fn info_domains<'a>(
             arena,
         )?;
         count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_check_constraints<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("check_constraints", true);
-    let table_capacity = (0..storage.table_count())
-        .filter(|&slot| storage.table_slot_visible_to(slot, txid))
-        .map(|slot| {
-            let table = storage.table_def(slot, txid);
-            table.checks().len()
-                + table
-                    .columns()
-                    .iter()
-                    .filter(|column| column.not_null.is_required())
-                    .count()
-        })
-        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
-        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
-    let domain_capacity = (0..storage.domain_count())
-        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
-        .map(|slot| {
-            let domain = storage.domain_for(slot, txid);
-            domain.checks().len() + usize::from(domain.not_null)
-        })
-        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
-        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
-    let capacity = table_capacity
-        .checked_add(domain_capacity)
-        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
-    let output = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |schema: &str, name: &str, clause: &str| -> Result<(), SqlError> {
-        if count == output.len() {
-            return Err(catalog_capacity_exceeded(
-                "information_schema.check_constraints",
-            ));
-        }
-        output[count] = row(
-            &[
-                text("postgres", arena)?,
-                text(schema, arena)?,
-                text(name, arena)?,
-                text(clause, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        for check in table.checks() {
-            let clause = stack_format!(1024, "({})", check.expression.as_str());
-            append(table.schema.as_str(), check.name.as_str(), clause.as_str())?;
-        }
-        for column in table.columns() {
-            if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                let clause = stack_format!(256, "{} IS NOT NULL", column.name.as_str());
-                append(table.schema.as_str(), name.as_str(), clause.as_str())?;
-            }
-        }
-    }
-    for slot in 0..storage.domain_count() {
-        let domain = storage.domain_for(slot, txid);
-        if !storage.domain_slot_visible_to(slot, txid) {
-            continue;
-        }
-        for check in domain.checks() {
-            let expression = super::enum_values::checks::resolve(
-                check.expression.as_str(),
-                domain.base,
-                storage,
-                txid,
-                arena,
-            )?;
-            let clause = stack_format!(1024, "({})", expression);
-            append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
-        }
-        if domain.not_null {
-            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
-            append(domain.schema.as_str(), name.as_str(), "VALUE IS NOT NULL")?;
-        }
     }
     finish(definition, &output[..count], arena)
 }

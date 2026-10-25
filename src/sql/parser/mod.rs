@@ -298,6 +298,7 @@ pub(crate) struct ColumnSource<'a> {
     pub name: &'a str,
     pub start: usize,
     pub end: usize,
+    pub qualifier_parts: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -456,6 +457,23 @@ pub fn parse_expr<'a>(
         return Err(to_sql("trailing tokens after expression"));
     }
     Ok(expression)
+}
+
+pub(crate) fn parse_expr_with_column_sources<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a Expr<'a>, &'a [ColumnSource<'a>]), super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.column_sources = Some(core::cell::RefCell::new(QuerySourceCollector {
+        columns: ArenaList::new(arena),
+        projections: ArenaList::new(arena),
+    }));
+    let expression = parser.expression(0).map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(sqlstate::SYNTAX_ERROR, "trailing tokens after stored expression"));
+    }
+    let collector = parser.column_sources.as_ref().expect("explicit column source capture").borrow();
+    Ok((expression, collector.columns.as_slice()))
 }
 
 /// Parses one complete PostgreSQL type spelling for a procedural local.
@@ -8087,7 +8105,11 @@ impl<'a> Parser<'a> {
             sources
                 .borrow_mut()
                 .columns
-                .push(ColumnSource { name, start, end })
+                .push(ColumnSource { name, start, end, qualifier_parts: match e {
+                    Expr::Column { qualifier: Some(_), .. } => 1,
+                    Expr::SchemaColumn { .. } => 2,
+                    _ => 0,
+                } })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
         }
         self.arena

@@ -792,6 +792,24 @@ pub(crate) enum CatalogPredicateKind {
     Object,
 }
 
+fn strict_catalog_arguments<'a>(args: &[&Expr<'a>], mut evaluate: impl FnMut(usize, &Expr<'a>) -> Result<Datum<'a>, SqlError>)
+    -> Result<Option<[Datum<'a>; 3]>, SqlError> {
+    assert!(args.len() <= 3, "catalog call arity was validated");
+    let mut values = [Datum::Null; 3];
+    let mut constant_null = false;
+    for (position, expression) in args.iter().enumerate() {
+        if expression.is_constant() {
+            values[position] = evaluate(position, expression)?;
+            constant_null |= values[position].is_null();
+        }
+    }
+    if constant_null { return Ok(None); }
+    for (position, expression) in args.iter().enumerate() {
+        if !expression.is_constant() { values[position] = evaluate(position, expression)?; }
+    }
+    Ok((!values[..args.len()].iter().any(Datum::is_null)).then_some(values))
+}
+
 /// Execution and result descriptions share these accepted Boolean families.
 pub(crate) fn catalog_predicate_kind(name: &str) -> Option<CatalogPredicateKind> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
@@ -2001,12 +2019,21 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                let Some(values) = strict_catalog_arguments(args, |position, expression| {
+                    let value = eval_full(expression, arena, params, row, hooks)?;
+                    match position {
+                        0 => Ok(CatalogOid::parse(value)?.map_or(Datum::Null, |oid| Datum::Int4(oid.0))),
+                        1 => super::super::cast_to(value, ColType::Int4, arena),
+                        2 => super::super::cast_to(value, ColType::Bool, arena),
+                        _ => unreachable!("index definition call arity was validated"),
+                    }
+                })? else { return Ok(Datum::Null); };
+                let oid = match CatalogOid::parse(values[0])? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
                 let col = if args.len() >= 2 {
-                    match eval_full(args[1], arena, params, row, hooks)? {
+                    match values[1] {
                         Datum::Null => return Ok(Datum::Null),
                         value => match super::super::cast_to(value, ColType::Int4, arena)? {
                             Datum::Int4(value) => value,
@@ -2016,14 +2043,16 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     0
                 };
-                if args.len() == 3 {
-                    let pretty = eval_full(args[2], arena, params, row, hooks)?;
-                    if super::super::cast_to(pretty, ColType::Bool, arena)?.is_null() {
-                        return Ok(Datum::Null);
+                let pretty = if args.len() == 3 {
+                    let pretty = values[2];
+                    match super::super::cast_to(pretty, ColType::Bool, arena)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => unreachable!("boolean argument was coerced"),
                     }
-                }
+                } else { false };
                 Ok(cat
-                    .index_def(oid, col, arena)?
+                    .index_def(oid, col, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2211,11 +2240,30 @@ pub(crate) fn dispatch<'a>(
                         "function pg_get_expr(...) does not exist"
                     ));
                 }
-                match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Text(expression) => Ok(Datum::Text(expression)),
-                    Datum::Null => Ok(Datum::Null),
-                    _ => Ok(Datum::Null),
+                if let Some(source_type) = super::super::static_type(args[0], row)
+                    && source_type != ColType::PgNodeTree {
+                    if matches!(args[0], Expr::Str(_)) {
+                        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cannot accept a value of type pg_node_tree"));
+                    }
+                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function pg_get_expr(...) does not exist"));
                 }
+                let Some(values) = strict_catalog_arguments(args, |position, expression| {
+                    let value = eval_full(expression, arena, params, row, hooks)?;
+                    match position {
+                        0 => Ok(value),
+                        1 => Ok(CatalogOid::parse(value)?.map_or(Datum::Null, |oid| Datum::Int4(oid.0))),
+                        2 => super::super::cast_to(value, ColType::Bool, arena),
+                        _ => unreachable!("expression call arity was validated"),
+                    }
+                })? else { return Ok(Datum::Null); };
+                let Datum::Text(node) = values[0] else {
+                    return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "pg_get_expr requires a pg_node_tree value"));
+                };
+                let Datum::Int4(relation) = values[1] else { unreachable!("relation argument was coerced"); };
+                let pretty = args.len() == 3 && values[2] == Datum::Bool(true);
+                let catalog = hooks.catalog.ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+                    "catalog expression deparsing requires catalog access"))?;
+                Ok(catalog.expression_def(node, relation, pretty, arena)?.map_or(Datum::Null, Datum::Text))
             }
             "pg_get_viewdef" => {
                 if !(1..=2).contains(&args.len()) {

@@ -462,6 +462,64 @@ pub(super) fn domains<'a>(
     output.finish("domain_constraints", true)
 }
 
+pub(super) fn checks<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let constraints = read.base(storage, Base::Constraint, transaction, arena)?;
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let types = Index::oid(read.base(storage, Base::Type, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let attributes = read.base(storage, Base::Attribute, transaction, arena)?;
+    let [relation, number] = columns(&attributes, ["attrelid", "attnum"]);
+    let attributes = Index::new(attributes, arena, |values| Ok(Some((integer(values[relation])? as u32, integer(values[number])?))))?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let database = storage.current_database_name(transaction);
+    let database = text(database.as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for values in constraints.rows {
+        let constraint = CatalogRow { definition: constraints.def, values };
+        let kind = constraint.character("contype")?;
+        if !matches!(kind, b'c' | b'n') { continue; }
+        let key = constraint.integers("conkey", arena)?;
+        for class in classes.left(Some((constraint.integer("conrelid")? as u32, 0))) {
+            let class = class.map(|values| CatalogRow { definition: classes.table.def, values });
+            for ty in types.left(Some((constraint.integer("contypid")? as u32, 0))) {
+                let ty = ty.map(|values| CatalogRow { definition: types.table.def, values });
+                let owner = class.map(|row| row.integer("relowner")).transpose()?
+                    .or(ty.map(|row| row.integer("typowner")).transpose()?);
+                if !owner.is_some_and(|owner| owner_is_enabled(storage, transaction, owner)) { continue; }
+                let expression = if kind == b'c' {
+                    match constraint.get("conbin")? {
+                        Datum::Null => Datum::Null,
+                        node => catalog.expression_def(super::view_rows::string(node)?,
+                            class.map(|row| row.integer("oid")).transpose()?.unwrap_or(0), false, arena)?
+                            .map_or(Datum::Null, Datum::Text),
+                    }
+                } else { Datum::Null };
+                for names in namespaces.left(Some((constraint.integer("connamespace")? as u32, 0))) {
+                    let names = names.map(|values| CatalogRow { definition: namespaces.table.def, values });
+                    let namespace = names.map(|row| row.get("nspname")).transpose()?.unwrap_or(Datum::Null);
+                    if kind == b'c' {
+                        output.push(&[database, namespace, constraint.get("conname")?, expression])?;
+                        continue;
+                    }
+                    let attribute_key = key.first().map(|&number| constraint.integer("conrelid").map(|relation| (relation as u32, number))).transpose()?;
+                    for attribute in attributes.left(attribute_key) {
+                        let attribute = attribute.map(|values| CatalogRow { definition: attributes.table.def, values });
+                        let name = attribute.map(|row| row.string("attname")).transpose()?.unwrap_or("VALUE");
+                        let clause = arena.alloc_str_display(format_args!("{name} IS NOT NULL")).map_err(|_| super::arena_full())?;
+                        output.push(&[database, namespace, constraint.get("conname")?, Datum::Text(clause)])?;
+                    }
+                }
+            }
+        }
+    }
+    output.finish("check_constraints", true)
+}
+
 fn action(code: u8) -> Datum<'static> {
     match code {
         b'c' => Datum::Text("CASCADE"), b'n' => Datum::Text("SET NULL"), b'd' => Datum::Text("SET DEFAULT"),

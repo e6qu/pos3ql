@@ -15648,6 +15648,9 @@ impl NamespaceRewriteScope<'_> {
         old: SqlName,
         new: SqlName,
     ) -> Result<Option<(usize, &str)>, SqlError> {
+        #[cfg(not(test))]
+        let Self::Parsed { sources, arena } = self;
+        #[cfg(test)]
         let Self::Parsed { sources, arena } = self else {
             return Ok(None);
         };
@@ -29108,20 +29111,20 @@ impl Storage {
                     arena,
                 )?;
             }
-            if let Some(pending) = definition.pending_definition {
-                if pending.definition.body_kind != RoutineBodyKind::String {
-                    let mut path = pending.definition.creation_path;
-                    rename_schema_path(&mut path, prior, name)?;
-                    let mut body = pending.definition.body;
-                    rename_schema_qualified_sql(
-                        &mut body,
-                        &mut [],
-                        prior,
-                        name,
-                        pending.definition.body_kind.bound_sql_kind()?,
-                        arena,
-                    )?;
-                }
+            if let Some(pending) = definition.pending_definition.as_ref()
+                && pending.definition.body_kind != RoutineBodyKind::String
+            {
+                let mut path = pending.definition.creation_path;
+                rename_schema_path(&mut path, prior, name)?;
+                let mut body = pending.definition.body;
+                rename_schema_qualified_sql(
+                    &mut body,
+                    &mut [],
+                    prior,
+                    name,
+                    pending.definition.body_kind.bound_sql_kind()?,
+                    arena,
+                )?;
             }
         }
         {

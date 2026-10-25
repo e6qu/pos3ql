@@ -2454,15 +2454,12 @@ fn collect_expression<'a>(
     if let Expr::Call { name, args, .. } = expression
         && matches!(*name, "nextval" | "currval" | "setval")
         && let Some(sequence_name) = args.first().and_then(|argument| match argument {
-            Expr::Str(value) => Some(*value),
-            Expr::Cast {
-                operand,
+            Expr::Str(value)
+            | Expr::Cast {
+                operand: Expr::Str(value),
                 type_name: "regclass",
                 ..
-            } => match operand {
-                Expr::Str(value) => Some(*value),
-                _ => None,
-            },
+            } => Some(*value),
             _ => None,
         })
     {

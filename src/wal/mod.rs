@@ -2901,6 +2901,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             definition: def, ..
         } => {
             let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
+            n += def.attributes.encoded_len();
             n += match def.access_method {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
@@ -4569,6 +4570,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             definition: def,
         } => {
             let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
+                && def.attributes.validate(def.n_columns)
                 && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
                 && buffer.append(&identity.encode())
                 && name_bytes(buffer, def.name.as_str());
@@ -4593,6 +4595,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
                 }
             };
+            ok &= def.attributes.append(buffer);
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -7627,10 +7630,13 @@ fn decode_op_inner<'a>(
                 }
                 _ => return None,
             };
+            let attributes = crate::storage::column_attributes::ColumnAttributes::decode(payload, &mut at)?;
+            if !attributes.validate(n_cols) { return None; }
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
+                attributes,
                 has_toast,
                 kind: table_kind,
                 persistence,

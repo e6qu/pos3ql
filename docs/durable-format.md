@@ -98,6 +98,15 @@ Column names are hexadecimal fields too, preserving spaces and avoiding
 position-dependent parsing of the rest of a line. Extra fields are rejected.
 Domain journal payloads use marker 253 and reject earlier payload layouts.
 
+Table definitions retain a separate attribute layout. Live entries map a
+PostgreSQL column number to its current row position. Dropped entries retain
+length, passing convention, alignment, storage and compression; new columns
+append entries rather than reusing old numbers. The journal stores an entry
+count and eight bytes per entry. Manifest `attributes2` records store that count
+and each numbered entry as sixteen hexadecimal digits. Restore rejects missing,
+duplicate, out-of-range or incomplete layouts. PostgreSQL's 1,600-column table
+limit counts retained dropped entries too.
+
 Retained catalog expressions use `pos3ql-catalog-expression-v1` nodes. They
 contain validated source spans and bound column numbers, so a retained CHECK
 can display a column's current name after a rename. Scalar expressions, lists,

@@ -105,7 +105,7 @@ pub(crate) fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena
             let number = table.column_index(column.name).ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist", column.name))?;
             *target = Site { start: reference_start(parsed_source, *column, arena)? - prefix,
-                end: column.end - prefix, column: number + 1 };
+                end: column.end - prefix, column: usize::from(table.attribute_number(number)) };
         }
     }
     sites.sort_unstable_by_key(|site| (site.start, site.end, site.column));
@@ -161,7 +161,8 @@ pub(super) fn deparse<'a>(storage: &Storage, transaction: u32, node: &str, relat
             || !source.is_char_boundary(site.end) || site.column == 0 { return Err(corrupt()); }
         let slot = slot.ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "catalog expression requires a table relation"))?;
         let table = storage.table_def(slot, transaction);
-        let column = table.columns().get(site.column - 1).ok_or_else(corrupt)?;
+        let position = table.attribute_column(u16::try_from(site.column).map_err(|_| corrupt())?).ok_or_else(corrupt)?;
+        let column = &table.columns()[position];
         output.write_str(&source[copied..site.start]).map_err(|_| arena_full())?;
         let mut name = crate::util::StackStr::<130>::new();
         super::write_identifier(&mut name, column.name.as_str());

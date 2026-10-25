@@ -67909,6 +67909,22 @@ fn alter_table_relation(
     def.schema(&mut old_schema);
     let old_schema = &old_schema[..def.n_columns];
 
+    let mut column_mapping = [None; MAX_COLUMNS];
+    let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
+    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
+        if let ColSource::Keep(old_column)
+        | ColSource::Cast {
+            orig: old_column, ..
+        } = *source
+        {
+            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
+            wal_column_mapping[old_column] = new_column as u16;
+        }
+    }
+    new_def.attributes = match crate::storage::column_attributes::ColumnAttributes::rewrite(&def, new_def.columns(), &column_mapping) {
+        Ok(attributes) => attributes,
+        Err(error) => return sql_fail(error),
+    };
     if let Err(error) = crate::storage::constraint_names::table(&mut new_def) { return sql_fail(error); }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);
@@ -68170,18 +68186,6 @@ fn alter_table_relation(
         }
     }
 
-    let mut column_mapping = [None; MAX_COLUMNS];
-    let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
-    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
-        if let ColSource::Keep(old_column)
-        | ColSource::Cast {
-            orig: old_column, ..
-        } = *source
-        {
-            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
-            wal_column_mapping[old_column] = new_column as u16;
-        }
-    }
     if dropped_any
         && let Err(error) = remap_table_column_acls(
             storage,

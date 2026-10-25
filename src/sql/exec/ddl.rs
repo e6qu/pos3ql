@@ -998,6 +998,7 @@ pub(super) fn attach_constraints(
             }
         }
     }
+    def.attributes.initialize(def.n_columns)?;
     crate::storage::constraint_names::table(def)
 }
 

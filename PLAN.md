@@ -57,6 +57,9 @@ Complete these remaining cases:
   Exercise stored expression copies and reject text and binary node input at
   every client boundary. Compare column alignment, length, and passing rules
   against the pinned PostgreSQL service, including domains and arrays.
+  Include dropped-column descriptions and identifiers used by defaults,
+  indexes, dependencies and permission inquiries; a removed column must never
+  shift a saved expression onto the following column.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

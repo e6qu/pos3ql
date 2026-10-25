@@ -14994,6 +14994,7 @@ struct FkInfo {
     conrelid: i32,
     confrelid: i32,
     child_slot: usize,
+    parent_slot: usize,
     fk_index: usize,
     name: StackStr<64>,
 }
@@ -15079,7 +15080,7 @@ pub(crate) fn table_constraint_oid(
             column.not_null.is_required()
                 && not_null_constraint_name(column).as_str() == name
         })
-        .map(|(index, _)| not_null_constraint_oid(table_slot, index))
+        .map(|(index, _)| not_null_constraint_oid(table_slot, usize::from(table.attribute_number(index) - 1)))
 }
 
 /// Resolve a table constraint OID back to its stable table/name identity.
@@ -15162,6 +15163,7 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
                 conrelid,
                 confrelid: table_oid(storage, pslot),
                 child_slot: slot,
+                parent_slot: pslot,
                 fk_index: i,
                 name: stack_str_64(fk.name.as_str()),
             });
@@ -15175,6 +15177,7 @@ fn empty_foreign_key() -> FkInfo {
         conrelid: 0,
         confrelid: 0,
         child_slot: 0,
+        parent_slot: 0,
         fk_index: 0,
         name: StackStr::new(),
     }
@@ -16628,7 +16631,7 @@ fn pg_statistic_ext<'a>(
                     slot,
                     txid,
                 )),
-                int2vector(&columns[..n_columns], arena)?,
+                int2vector(&columns[..n_columns], Some(&storage.table_def(usize::from(statistics.table), txid)), arena)?,
                 mutable
                     .target
                     .map_or(Datum::Null, |target| Datum::Int2(target as i16)),
@@ -16654,7 +16657,7 @@ fn extended_statistics_key_numbers(
         numbers[position] = match key {
             crate::storage::ExtendedStatisticsKey::Column(column) => table
                 .column_index(column.as_str())
-                .map(|column| column as i16 + 1)
+                .map(|column| table.attribute_number(column) as i16)
                 .expect("statistics column remains a table dependency"),
             crate::storage::ExtendedStatisticsKey::Expression(_) => {
                 expression -= 1;
@@ -17444,7 +17447,7 @@ fn pg_publication_rel<'a>(
                         attribute_count += 1;
                     }
                 }
-                int2vector(&attributes[..attribute_count], arena)?
+                int2vector(&attributes[..attribute_count], Some(&storage.table_def(usize::from(*member), txid)), arena)?
             };
             rows[count] = row(
                 &[
@@ -18973,7 +18976,7 @@ fn pg_partitioned_table<'a>(
                 Datum::Char(strategy_code),
                 Datum::Int2(i16::from(n_keys)),
                 Datum::Int4(default_partition),
-                int2vector(&keys[..key_count], arena)?,
+                int2vector(&keys[..key_count], Some(&table), arena)?,
                 oidvector(&operator_classes[..key_count], arena)?,
                 oidvector(&collations[..key_count], arena)?,
                 Datum::Null,
@@ -19145,7 +19148,7 @@ fn pg_class<'a>(
                 text(table_def.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, table_def.schema.as_str())),
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
-                Datum::Int4(table_def.n_columns as i32),
+                Datum::Int4(i32::from(table_def.attributes.count)),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
                 Datum::Int4(match table_def.access_method {
@@ -20052,7 +20055,7 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?,  // confupdtype (n/a for non-FK)
                 text(" ", arena)?,  // confdeltype
-                attnum_array(&info.columns[..info.n_cols], arena)?,
+                attnum_array(&info.columns[..info.n_cols], &storage.table_def(info.table_slot, txid), arena)?,
                 empty_int_array(arena)?,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
@@ -20125,8 +20128,8 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false),
                 text(fk_action_char(fk.on_update), arena)?,
                 text(fk_action_char(fk.on_delete), arena)?,
-                attnum_array(&fk.columns[..fk.n_cols], arena)?,
-                attnum_array(&fk.parent_cols[..fk.n_parent_cols], arena)?,
+                attnum_array(&fk.columns[..fk.n_cols], &storage.table_def(info.child_slot, txid), arena)?,
+                attnum_array(&fk.parent_cols[..fk.n_parent_cols], &storage.table_def(info.parent_slot, txid), arena)?,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
@@ -20271,7 +20274,7 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
-                    if count == 0 { Datum::Null } else { attnum_array(&columns[..count], arena)? },
+                    if count == 0 { Datum::Null } else { attnum_array(&columns[..count], &table, arena)? },
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(
@@ -20364,7 +20367,7 @@ fn pg_constraint_values<'a>(
             let constraint_name = not_null_constraint_name(column);
             out[n] = row(
                 &[
-                    Datum::Int4(not_null_constraint_oid(slot, column_index)),
+                    Datum::Int4(not_null_constraint_oid(slot, usize::from(table.attribute_number(column_index) - 1))),
                     text(constraint_name.as_str(), arena)?,
                     Datum::Int4(table_oid(storage, slot)),
                     Datum::Int4(0),
@@ -20379,7 +20382,7 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
-                    attnum_array(&[column_index as u16], arena)?,
+                    attnum_array(&[column_index as u16], &table, arena)?,
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(storage, table.schema.as_str())),
@@ -20473,7 +20476,11 @@ fn pg_constraint_values<'a>(
     for (target, source) in compatible.iter_mut().zip(&out[..n]) {
         let mut values = [Datum::Null; 29];
         for (column, ((_, ctype), original)) in def.columns.iter().zip(SOURCE_COLUMNS).enumerate() {
-            values[column] = super::eval::cast_to(source[original], *ctype, arena)?;
+            values[column] = if *ctype == ColType::PgNodeTree && matches!(source[original], Datum::Text(_)) {
+                source[original]
+            } else {
+                super::eval::cast_to(source[original], *ctype, arena)?
+            };
         }
         values[28] = super::eval::cast_to(source[17], ColType::Oid, arena)?;
         *target = row(&values, arena)?;
@@ -21490,10 +21497,10 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
     }
 }
 
-/// A `Datum::Array` of 1-based attribute numbers (column index + 1), the form
+/// A `Datum::Array` of stable attribute numbers, the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
-fn attnum_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let vals = arena.alloc_slice_with(columns.len(), |index| Datum::Int4(i32::from(columns[index]) + 1))
+fn attnum_array<'a>(columns: &[u16], table: &TableDef, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let vals = arena.alloc_slice_with(columns.len(), |index| Datum::Int4(i32::from(table.attribute_number(usize::from(columns[index])))))
         .map_err(|_| arena_full())?;
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
@@ -21578,7 +21585,7 @@ fn pg_index<'a>(
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),
-                int2vector(&attributes[..info.n_cols + info.n_include_cols], arena)?,
+                int2vector(&attributes[..info.n_cols + info.n_include_cols], Some(&storage.table_def(info.table_slot, txid)), arena)?,
                 index_options(info, arena)?,
                 match info.predicate {
                     Some(predicate) => text(predicate.as_str(), arena)?,
@@ -21603,7 +21610,7 @@ fn pg_index<'a>(
         if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
             continue;
         }
-        let keys = [1_u16, 2];
+        let keys = [0_u16, 1];
         let collations = [0_i32, 0];
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
@@ -21620,7 +21627,7 @@ fn pg_index<'a>(
                 Datum::Bool(false),
                 Datum::Int4(2),
                 Datum::Int4(2),
-                int2vector(&keys, arena)?,
+                int2vector(&keys, None, arena)?,
                 Datum::Int2Vector {
                     lower_bound: 0,
                     raw: &[0; 4],
@@ -21660,7 +21667,7 @@ fn pg_index<'a>(
                 Datum::Bool(false),
                 Datum::Int4(attributes.len() as i32),
                 Datum::Int4(attributes.len() as i32),
-                int2vector(attributes, arena)?,
+                int2vector(attributes, None, arena)?,
                 Datum::Int2Vector {
                     lower_bound: 0,
                     raw: &[0; 4][..attributes.len() * 2],
@@ -21789,7 +21796,7 @@ impl<'a> ColumnLookup<'a> for TableColumnTypes<'_> {
     }
 }
 
-fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn int2vector<'a>(columns: &[u16], table: Option<&TableDef>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let raw = arena
         .alloc_slice_with(columns.len() * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
@@ -21797,7 +21804,7 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
         let attribute_number = if *column == u16::MAX {
             0
         } else {
-            *column as i16 + 1
+            table.map_or(*column + 1, |table| table.attribute_number(usize::from(*column))) as i16
         };
         raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
@@ -21911,7 +21918,7 @@ fn pg_attribute<'a>(
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| {
             let table = storage.table_def(slot, txid);
-            table.columns().len() + if table.has_toast { 5 } else { 0 }
+            usize::from(table.attributes.count) + if table.has_toast { 5 } else { 0 }
         })
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
@@ -21993,7 +22000,7 @@ fn pg_attribute<'a>(
                     Datum::Int4(table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
                     Datum::Int4(catalog_column_type_oid(storage, c, txid)?),
-                    Datum::Int4(i as i32 + 1),
+                    Datum::Int4(i32::from(table_definition.attribute_number(i))),
                     Datum::Bool(c.not_null.is_required()),
                     Datum::Int4(i32::from(c.ctype.typlen())),
                     Datum::Int4(catalog_column_type_mod(c)),
@@ -22034,7 +22041,7 @@ fn pg_attribute<'a>(
                         Datum::Int4(i32::from(c.statistics_target))
                     },
                     Datum::Bool(false), // attisdropped
-                    Datum::Int4(i as i32 + 1),
+                    Datum::Int4(i32::from(table_definition.attribute_number(i))),
                     text("i", arena)?,
                     Datum::Bool(true),
                     column_statistics_options_datum(c.statistics_options, arena)?,
@@ -22436,6 +22443,26 @@ fn pg_attribute<'a>(
             arena,
         )?;
     }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) { continue; }
+        let table = storage.table_def(slot, txid);
+        for (attribute, state) in table.attributes.slots[..usize::from(table.attributes.count)].iter().enumerate() {
+            let crate::storage::column_attributes::AttributeSlot::Dropped { layout, compression } = *state else { continue; };
+            if n == out.len() { return Err(catalog_capacity_exceeded("pg_attribute")); }
+            let number = attribute as i16 + 1;
+            out[n] = row(&[
+                Datum::Oid(table_oid(storage, slot) as u32),
+                text(stack_format!(64, "........pg.dropped.{number}........").as_str(), arena)?,
+                Datum::Oid(0), Datum::Int2(layout.length), Datum::Int2(number),
+                Datum::Int4(-1), Datum::Int2(0), Datum::Bool(layout.by_value),
+                Datum::Char(layout.alignment), Datum::Char(layout.storage), Datum::Char(compression),
+                Datum::Bool(false), Datum::Bool(false), Datum::Bool(false), Datum::Char(0), Datum::Char(0),
+                Datum::Bool(true), Datum::Bool(true), Datum::Int2(0), Datum::Oid(0),
+                Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null,
+            ], arena)?;
+            n += 1;
+        }
+    }
     finish(def, &out[..n], arena)
 }
 
@@ -22496,9 +22523,9 @@ fn pg_attrdef<'a>(
             }
             out[n] = row(
                 &[
-                    Datum::Oid((relid * 100 + ci as i32 + 1) as u32), // synthetic adbin oid
+                    Datum::Oid((400_000_000 + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32 + i32::from(table.attribute_number(ci)) - 1) as u32),
                     Datum::Oid(relid as u32),
-                    Datum::Int2(ci as i16 + 1),
+                    Datum::Int2(table.attribute_number(ci) as i16),
                     Datum::Text(text_expr),
                     Datum::Oid(2604),
                 ],
@@ -22544,7 +22571,7 @@ fn pg_attrdef<'a>(
             let relid = view_oid(slot);
             out[n] = row(
                 &[
-                    Datum::Oid((relid * 100 + column as i32 + 1) as u32),
+                    Datum::Oid((600_000_000 + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32 + column as i32) as u32),
                     Datum::Oid(relid as u32),
                     Datum::Int2(column as i16 + 1),
                     Datum::Text(default),
@@ -25489,7 +25516,7 @@ fn pg_trigger<'a>(
                         Datum::Bool(foreign_key.timing.is_deferrable()),
                         Datum::Bool(foreign_key.timing.initially_deferred()),
                         Datum::Int2(0),
-                        int2vector(&[], arena)?,
+                        int2vector(&[], None, arena)?,
                         Datum::Bytea(&[]),
                         Datum::Null,
                         Datum::Null,
@@ -25623,7 +25650,10 @@ fn pg_trigger<'a>(
                 Datum::Bool(constraint_timing.is_deferrable()),
                 Datum::Bool(constraint_timing.initially_deferred()),
                 Datum::Int2(trigger.arguments.values().len() as i16),
-                int2vector(&update_columns[..update_count], arena)?,
+                match trigger.target {
+                    crate::storage::TriggerTarget::Table(slot) => int2vector(&update_columns[..update_count], Some(&storage.table_def(usize::from(slot), txid)), arena)?,
+                    crate::storage::TriggerTarget::View(_) => int2vector(&update_columns[..update_count], None, arena)?,
+                },
                 Datum::Bytea(encoded_arguments),
                 trigger
                     .when

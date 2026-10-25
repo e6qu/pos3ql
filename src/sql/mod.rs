@@ -59,7 +59,7 @@ pub mod to_char;
 pub(crate) mod two_phase;
 pub mod txn;
 pub mod types;
-mod type_layouts;
+pub(crate) mod type_layouts;
 pub mod tzif;
 pub(crate) mod unicode;
 mod unicode_data;

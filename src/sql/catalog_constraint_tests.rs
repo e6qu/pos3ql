@@ -62,6 +62,33 @@ NULL',0)",
          SELECT pg_get_expr(expression,relation,false) FROM saved_nodes", true)), ["(amount > 0)"]);
 }
 
+#[test]
+fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindings() {
+    let mut config = test_config("constraint-attribute-numbers");
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine,
+        "CREATE TABLE ordinal_columns(lost text,kept bigint NOT NULL,
+            g bigint GENERATED ALWAYS AS(kept+1) STORED,
+            CONSTRAINT ordinal_positive CHECK(kept>0), CONSTRAINT ordinal_key UNIQUE(kept))", true);
+    let report = "SELECT pg_get_expr(conbin,conrelid,false) FROM pg_constraint WHERE conname='ordinal_positive'";
+    assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)), ["(kept > 0)"]);
+    writer.success(&mut engine, "ALTER TABLE ordinal_columns DROP COLUMN lost, ADD COLUMN fresh smallint", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["(kept > 0)"]);
+    assert_eq!(data_rows(&writer.success(&mut engine,
+        "SELECT attname,attnum,atttypid,attlen,attbyval,attalign,attisdropped FROM pg_attribute
+           WHERE attrelid='ordinal_columns'::regclass AND attnum>0 ORDER BY attnum;
+         SELECT conname,conkey FROM pg_constraint WHERE conname IN ('ordinal_positive','ordinal_key') ORDER BY conname;
+         SELECT relnatts FROM pg_class WHERE oid='ordinal_columns'::regclass", true)),
+        ["........pg.dropped.1........|1|0|-1|f|i|t", "kept|2|20|8|t|d|f",
+         "g|3|20|8|t|d|f", "fresh|4|21|2|t|s|f", "ordinal_key|{2}", "ordinal_positive|{2}", "4"]);
+    reader.success(&mut engine, "ROLLBACK", true);
+}
+
 const REPORT: &str = "
     SELECT table_name,constraint_name,constraint_type,nulls_distinct
       FROM information_schema.table_constraints
@@ -431,12 +458,13 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             // Simulator uploads own growing fixture vectors. SQL reads and
             // failed writes below still use the production allocation guard.
             session.success(&mut engine,
-                "CREATE TABLE saved_nulls(a integer NOT NULL,b integer,\" spaced column\" integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
+                "CREATE TABLE saved_nulls(lost text,a integer NOT NULL,b integer,\" spaced column\" integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
                  CREATE DOMAIN saved_domain AS integer NOT NULL;
                  ALTER TABLE saved_nulls ADD CONSTRAINT saved_positive CHECK(a>0);
                  CREATE TABLE saved_nodes(expression pg_node_tree, relation oid);
                  INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='saved_positive';
-                 BEGIN; ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
+                 BEGIN; ALTER TABLE saved_nulls DROP COLUMN lost, ADD COLUMN fresh smallint;
+                 ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
                  ALTER DOMAIN saved_domain RENAME TO saved_renamed_domain;
                  INSERT INTO saved_renamed_nulls(a,b) VALUES(1,NULL);
                  PREPARE TRANSACTION 'saved-null-mode'", false);
@@ -483,6 +511,9 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             } else {
                 "saved_nulls"
             };
+            assert_eq!(data_rows(&session.success(&mut cold,
+                "SELECT pg_typeof(expression),pg_get_expr(expression,relation,false) FROM saved_nodes", true)),
+                ["pg_node_tree|(a > 0)"]);
             assert_eq!(
                 data_rows(&session.success(&mut cold, metadata, true)),
                 [format!("{table}|NO")]

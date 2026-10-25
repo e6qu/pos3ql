@@ -6,6 +6,7 @@ Fix reproducible defects in the PR that finds them, including incidental
 failures, invalid catalog or column identities, incorrect report types,
 database names or permissions, timeouts, rollback and recovery errors.
 Malformed expression input must fail before it can become a stored catalog node.
+Column removal must preserve surviving column numbers through recovery.
 Record a defect here only when an external blocker or genuine intractability
 prevents its repair.
 Each entry needs a reproducer, affected behavior, observed result and exact

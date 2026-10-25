@@ -108,6 +108,7 @@ use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 mod statistics;
 pub(crate) mod constraint_names;
+pub(crate) mod column_attributes;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
@@ -1913,6 +1914,7 @@ pub struct TableDef {
     pub tablespace: u16,
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
+    pub(crate) attributes: column_attributes::ColumnAttributes,
     pub uniques: [UniqueKey; MAX_UNIQUES],
     pub n_uniques: usize,
     pub checks: [CheckConstraint; MAX_CHECKS],
@@ -2306,6 +2308,14 @@ pub(crate) const MAX_PARTITION_KEYS: usize = 32;
 pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
 impl TableDef {
+    pub(crate) fn attribute_number(&self, column: usize) -> u16 {
+        self.attributes.number(column).expect("admitted table column has a stable attribute number")
+    }
+
+    pub(crate) fn attribute_column(&self, number: u16) -> Option<usize> {
+        self.attributes.column(number)
+    }
+
     /// A table with a name and no columns or constraints, for spread-init of
     /// the constraint arrays at construction sites.
     pub const fn empty() -> Self {
@@ -2320,6 +2330,7 @@ impl TableDef {
             tablespace: 0,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
+            attributes: column_attributes::ColumnAttributes::EMPTY,
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
             checks: [CheckConstraint::EMPTY; MAX_CHECKS],
@@ -18610,6 +18621,7 @@ impl Storage {
             }
             definition.n_columns = 4;
             definition.has_toast = true;
+            definition.attributes.initialize(definition.n_columns).expect("internal column attributes fit");
             constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
             let mut state = table.definition.write();
             let mut identity = state.identity;

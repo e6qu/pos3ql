@@ -3949,6 +3949,10 @@ impl Checkpointer {
                         name: sql_name(name)?,
                         columns: [empty_column(); MAX_COLUMNS],
                         n_columns: n_cols,
+                        attributes: crate::storage::column_attributes::ColumnAttributes {
+                            count: u16::MAX,
+                            ..crate::storage::column_attributes::ColumnAttributes::EMPTY
+                        },
                         has_toast,
                         has_rules,
                         kind,
@@ -3968,6 +3972,38 @@ impl Checkpointer {
                         0,
                         [0i64; crate::storage::MAX_COLUMNS],
                     ));
+                }
+                Some("attributes2") => {
+                    use crate::storage::column_attributes::{AttributeSlot, ColumnAttributes};
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("attributes outside table"));
+                    };
+                    let number: usize = parse_field(words.next(), "attribute number")?;
+                    if number == 0 {
+                        let count: u16 = parse_field(words.next(), "attribute count")?;
+                        if def.attributes.count != u16::MAX || usize::from(count) > crate::storage::MAX_RELATION_COLUMNS
+                            || words.next().is_some() {
+                            return Err(CheckpointSetupError::Corrupt("invalid column attribute count"));
+                        }
+                        def.attributes = ColumnAttributes { count, ..ColumnAttributes::EMPTY };
+                    } else {
+                        if def.attributes.count == u16::MAX || number > usize::from(def.attributes.count)
+                            || def.attributes.slots[number - 1] != AttributeSlot::Empty {
+                            return Err(CheckpointSetupError::Corrupt("invalid column attribute number"));
+                        }
+                        let encoded = words.next().ok_or(CheckpointSetupError::Corrupt("missing column attribute"))?;
+                        if encoded.len() != 16 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            || words.next().is_some() {
+                            return Err(CheckpointSetupError::Corrupt("invalid column attribute encoding"));
+                        }
+                        let mut bytes = [0u8; 8];
+                        for (position, byte) in bytes.iter_mut().enumerate() {
+                            *byte = u8::from_str_radix(&encoded[position * 2..position * 2 + 2], 16)
+                                .map_err(|_| CheckpointSetupError::Corrupt("invalid column attribute encoding"))?;
+                        }
+                        def.attributes.slots[number - 1] = AttributeSlot::decode(bytes)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid column attribute"))?;
+                    }
                 }
                 Some("persist") => {
                     let Some((_, _, def, _, _)) = pending_def.as_mut() else {
@@ -9943,6 +9979,16 @@ impl Checkpointer {
                 &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
+            if !definition.attributes.validate(definition.n_columns) {
+                return Err(CheckpointSetupError::Corrupt("invalid column attribute layout"));
+            }
+            write_manifest(&mut self.manifest_output, format_args!("attributes2 0 {}", definition.attributes.count))?;
+            for (number, attribute) in definition.attributes.slots[..usize::from(definition.attributes.count)].iter().enumerate() {
+                use core::fmt::Write;
+                let mut encoded = StackStr::<16>::new();
+                for byte in attribute.encode() { write!(encoded, "{byte:02x}").expect("fixed attribute encoding fits"); }
+                write_manifest(&mut self.manifest_output, format_args!("attributes2 {} {}", number + 1, encoded.as_str()))?;
+            }
             if definition.schema.as_str() != "public" {
                 use core::fmt::Write;
                 let mut hex = StackStr::<130>::new();

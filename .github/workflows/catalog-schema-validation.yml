@@ -114,6 +114,23 @@ jobs:
               if not re.search(r'^test \S*' + re.escape(name) + r'\S* \.\.\. ok$', log, re.MULTILINE):
                   raise SystemExit('Missing passing regression: ' + name)
           PY
+      - name: Symbolize allocation guard failures
+        if: failure()
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/catalog-tests.log" "$RUNNER_TEMP/allocation-backtrace.txt" <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          import sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          binary = re.search(r'Running unittests src/lib.rs \(([^)]+)\)', log)
+          addresses = list(dict.fromkeys(re.findall(r'\(\+(0x[0-9a-fA-F]+)\)', log)))
+          if binary and addresses:
+              trace = subprocess.check_output(['addr2line', '-f', '-C', '-e', binary[1], *addresses], text=True)
+              pathlib.Path(sys.argv[2]).write_text(trace)
+              print(trace)
+          PY
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -122,8 +139,10 @@ jobs:
             ${{ runner.temp }}/formatting.patch
             ${{ runner.temp }}/postgresql-report-schema.txt
             ${{ runner.temp }}/catalog-tests.log
+            ${{ runner.temp }}/allocation-backtrace.txt
 
   comparison:
+    needs: reports
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:

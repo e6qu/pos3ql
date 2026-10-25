@@ -427,13 +427,21 @@ fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_cu
             data_rows(&reader.success(&mut engine, query, true)),
             [replaced]
         );
-        reader.success(&mut engine, "CREATE OR REPLACE VIEW definition_view AS SELECT 3 AS value", true);
+        reader.success(
+            &mut engine,
+            "CREATE OR REPLACE VIEW definition_view AS SELECT 3 AS value",
+            true,
+        );
         assert_eq!(data_rows(&reader.success(&mut engine,
             "SELECT position('3' IN definition)>0 FROM pg_views WHERE viewname='definition_view';
              SELECT position('3' IN pg_get_viewdef('definition_view'::regclass))>0", true)),
             if isolation == "REPEATABLE READ" { ["f", "f"] } else { ["t", "t"] });
         assert_eq!(
-            data_rows(&reader.success(&mut engine, "SELECT * FROM definition_view; ROLLBACK", true)),
+            data_rows(&reader.success(
+                &mut engine,
+                "SELECT * FROM definition_view; ROLLBACK",
+                true
+            )),
             ["3"]
         );
         assert_eq!(
@@ -449,12 +457,20 @@ fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_cu
                 ["42703"]
             );
         }
-        let oid = data_rows(&writer.success(&mut engine,
-            "SELECT oid FROM pg_class WHERE relname='definition_view'", true)).pop().unwrap();
+        let oid = data_rows(&writer.success(
+            &mut engine,
+            "SELECT oid FROM pg_class WHERE relname='definition_view'",
+            true,
+        ))
+        .pop()
+        .unwrap();
         reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; SELECT oid FROM pg_class WHERE relname='definition_view'"), true);
         writer.success(&mut engine, "DROP VIEW definition_view", true);
-        for sql in [format!("SELECT pg_get_viewdef({oid}::oid) IS NOT NULL"),
-            "SELECT definition IS NOT NULL FROM pg_views WHERE viewname='definition_view'".to_owned()] {
+        for sql in [
+            format!("SELECT pg_get_viewdef({oid}::oid) IS NOT NULL"),
+            "SELECT definition IS NOT NULL FROM pg_views WHERE viewname='definition_view'"
+                .to_owned(),
+        ] {
             reader.success(&mut engine, "SAVEPOINT dropped_definition", true);
             let output = reader.execute(&mut engine, &sql, true);
             if isolation == "REPEATABLE READ" {
@@ -462,7 +478,14 @@ fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_cu
                 reader.success(&mut engine, "ROLLBACK TO dropped_definition", true);
             } else {
                 assert!(error_sqlstates(&output).is_empty());
-                assert_eq!(data_rows(&output), if sql.starts_with("SELECT pg_get_viewdef") { vec!["f"] } else { vec![] });
+                assert_eq!(
+                    data_rows(&output),
+                    if sql.starts_with("SELECT pg_get_viewdef") {
+                        vec!["f"]
+                    } else {
+                        vec![]
+                    }
+                );
             }
             reader.success(&mut engine, "RELEASE dropped_definition", true);
         }

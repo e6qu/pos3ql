@@ -16272,32 +16272,6 @@ pub(crate) fn overlay_view_column_names<'a>(
     Ok(count)
 }
 
-fn describe_stored_view<'a>(
-    storage: &'a Storage,
-    txid: u32,
-    slot: usize,
-    arena: &'a Arena,
-    out: &mut [super::types::ColDesc<'a>],
-) -> Result<usize, SqlError> {
-    let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(slot, txid, arena)?;
-    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
-    let dependencies = query.dependencies;
-    let source = arena
-        .alloc_str(query.sql.as_str())
-        .map_err(|_| arena_full())?;
-    let count = super::query::describe_stored_query(
-        source,
-        storage,
-        txid,
-        path,
-        dependencies.view(),
-        arena,
-        out,
-    )?;
-    overlay_view_column_names(&storage.view(slot), txid, out, count, arena)
-}
-
 fn pg_stats<'a>(
     storage: &Storage,
     txid: u32,

@@ -255,7 +255,11 @@ pub(super) fn view_definition<'a>(
         }
         return match values[VIEW_DEFINITION] {
             Datum::Null => Ok(None),
-            _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "cache lookup failed for relation {}", oid)),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cache lookup failed for relation {}",
+                oid
+            )),
         };
     }
     let rule_slot = storage.view_return_rule(slot);

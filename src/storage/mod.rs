@@ -243,13 +243,6 @@ impl ColumnSet {
             })
     }
 
-    pub(crate) fn fits(self, columns: usize) -> bool {
-        if columns >= MAX_COLUMNS {
-            return true;
-        }
-        (columns..MAX_COLUMNS).all(|column| !self.contains(column))
-    }
-
     pub(crate) fn union_with(&mut self, other: Self) {
         for (target, source) in self.words.iter_mut().zip(other.words) {
             *target |= source;
@@ -38870,35 +38863,6 @@ impl Storage {
             value.dirty,
             value.generation,
         )
-    }
-
-    pub(crate) fn sequence_catalog_image_for(
-        &self,
-        slot: usize,
-        txid: u32,
-    ) -> Option<(SequenceDef, i64, bool, i64, bool, u64)> {
-        let catalog = self.sequence_catalog();
-        let sequence = catalog.definitions[slot];
-        if sequence.database != current_database() || !sequence.visible_to(txid) {
-            return None;
-        }
-        let pending = sequence
-            .pending_definition
-            .is_some_and(|pending| pending.txid == txid);
-        let definition = sequence.definition_for(txid);
-        let value = if pending {
-            catalog.values[slot].pending
-        } else {
-            catalog.values[slot].committed
-        };
-        Some((
-            definition,
-            value.last_value,
-            value.is_called,
-            value.log_count,
-            value.dirty,
-            value.generation,
-        ))
     }
 
     pub(crate) fn sequence_value_for(&self, slot: usize, txid: u32) -> (i64, bool) {

@@ -502,10 +502,10 @@ pub(super) fn sequences<'a>(
                 arena,
             )?);
             for names in namespaces.left(Some((integer(class[namespace])? as u32, 0))) {
-                if let Some(names) = names {
-                    if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) {
-                        continue;
-                    }
+                if let Some(names) = names
+                    && catalog.is_other_temporary_namespace(integer(names[namespace_oid])?)
+                {
+                    continue;
                 }
                 output.push(&[
                     names.map_or(Datum::Null, |values| values[namespace_name]),

@@ -1164,6 +1164,10 @@ containing 1, while executing `SELECT * FROM the_view` returns 2. This follows
 [PostgreSQL's rule lookups](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
 Retained rule text uses the existing catalog-history reservation; its internal
 fields are unavailable as SQL columns.
+If another connection drops the view, that older report can instead fail with
+`XX000`: the selected rule still exists in its snapshot, but the relation needed
+to print it no longer exists. A fresh read-committed listing omits the view,
+and looking up its old identifier with `pg_get_viewdef` returns NULL.
 
 The same report can keep a view's old name and check option, a materialized
 view's selected index and population flags, and a sequence's earlier increment.

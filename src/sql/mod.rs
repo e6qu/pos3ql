@@ -20343,20 +20343,41 @@ fn apply_prepared_table_wal_payload(
             || !storage.table_slot_visible_to(position.slot(), transaction_id)
             || storage.table(position.slot()).created_at() != position.created_at()
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "prepared table rewrite source identity does not match"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared table rewrite source identity does not match"
+            ));
         }
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         for (old, &new) in rewrite.column_mapping.iter().enumerate() {
             if new != u16::MAX {
-                mapping[old] = Some(definition.columns().get(usize::from(new))
-                    .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                        "prepared table rewrite column exceeds its definition"))?.name);
+                mapping[old] = Some(
+                    definition
+                        .columns()
+                        .get(usize::from(new))
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared table rewrite column exceeds its definition"
+                            )
+                        })?
+                        .name,
+                );
             }
         }
-        let target = storage.select_table_definition(position.slot(), transaction_id).0;
-        prepared.slot_mut(prepared_slot).transaction.write_table_definition(
-            storage, target, definition, &mapping, !rewrite.preserve_rows)?;
+        let target = storage
+            .select_table_definition(position.slot(), transaction_id)
+            .0;
+        prepared
+            .slot_mut(prepared_slot)
+            .transaction
+            .write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                !rewrite.preserve_rows,
+            )?;
         return Ok(());
     }
     if let Some(existing) = storage.find_visible(
@@ -20541,17 +20562,29 @@ fn replay_transaction_batches(
                             )?
                         }
                         WalOp::BeginTableRewrite {
-                            previous_schema, previous_name, preserve_rows, column_mapping,
+                            previous_schema,
+                            previous_name,
+                            preserve_rows,
+                            column_mapping,
                         } => {
                             if table_rewrite.is_some() {
-                                return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction contains nested table rewrite markers"));
+                                return Err(sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "prepared transaction contains nested table rewrite markers"
+                                ));
                             }
-                            let table = storage.find_visible(previous_schema, previous_name, transaction_id)
-                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction rewrites an unknown table"))?;
+                            let table = storage
+                                .find_visible(previous_schema, previous_name, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "prepared transaction rewrites an unknown table"
+                                    )
+                                })?;
                             table_rewrite = Some(PreparedTableRewrite {
-                                position: storage.table_position(table), preserve_rows, column_mapping,
+                                position: storage.table_position(table),
+                                preserve_rows,
+                                column_mapping,
                             });
                         }
                         WalOp::CreateSequence {
@@ -21129,8 +21162,10 @@ fn replay_transaction_batches(
                     }
                 }
                 if table_rewrite.is_some() {
-                    return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                        "prepared transaction ends during a table rewrite"));
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared transaction ends during a table rewrite"
+                    ));
                 }
                 prepared.slot_mut(slot).recovered = true;
                 storage.set_lsn(*lsn);

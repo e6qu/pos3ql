@@ -96,8 +96,8 @@ fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
         });
         if decision == "COMMIT" {
             assert_eq!(data_rows(&session.success(&mut cold, "
-                SELECT nspowner::regrole::text FROM pg_namespace
-                WHERE nspname IN ('existing_schema_owner','created_schema_owner') ORDER BY nspname
+                SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='created_schema_owner';
+                SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='existing_schema_owner';
             ", true)), ["retained_schema_owner", "retained_schema_owner"]);
             session.success(&mut cold, "DROP SCHEMA created_schema_owner; DROP SCHEMA existing_schema_owner", false);
         }
@@ -245,19 +245,23 @@ fn schema_rename_preserves_quoted_search_paths_and_unqualified_bound_queries() {
         CREATE TABLE items(id integer);
         INSERT INTO items VALUES (12);
         CREATE VIEW item_view AS SELECT id FROM items;
+        CREATE VIEW qualified_view AS SELECT id FROM "schema,""quoted""".items;
         CREATE FUNCTION bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM items; END;
+        CREATE FUNCTION qualified_bound() RETURNS integer LANGUAGE SQL
+          BEGIN ATOMIC SELECT id FROM "schema,""quoted""".items; END;
         BEGIN;
         ALTER SCHEMA "schema,""quoted""" RENAME TO "Next,""quoted""";
         SET LOCAL search_path TO "Next,""quoted""";
     "#, true);
     assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT current_schema(); SELECT id FROM item_view; SELECT bound()", true)),
-        ["Next,\"quoted\"", "12", "12"]);
+        "SELECT current_schema(); SELECT id FROM item_view; SELECT bound(); SELECT id FROM qualified_view; SELECT qualified_bound()", true)),
+        ["Next,\"quoted\"", "12", "12", "12", "12"]);
     session.success(&mut engine, "COMMIT", true);
     assert_eq!(data_rows(&session.success(&mut engine, r#"
         SET search_path TO "Next,""quoted""";
         SELECT current_schema(); SELECT id FROM item_view; SELECT bound();
-    "#, true)), ["Next,\"quoted\"", "12", "12"]);
+        SELECT id FROM qualified_view; SELECT qualified_bound();
+    "#, true)), ["Next,\"quoted\"", "12", "12", "12", "12"]);
 }
 
 #[test]

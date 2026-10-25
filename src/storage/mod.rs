@@ -15589,13 +15589,18 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     kind: crate::sql::parser::StoredSqlKind,
     arena: &crate::mem::arena::Arena,
 ) -> Result<bool, SqlError> {
-    let needle = old.as_str().as_bytes();
-    if needle.is_empty() {
+    if old.as_str().is_empty() {
         return Err(sql_err!(
             sqlstate::INVALID_SCHEMA_NAME,
             "schema name is empty"
         ));
     }
+    let mut identifier = StackStr::<130>::from_str(old.as_str());
+    if old.as_str().contains('"') {
+        identifier.clear();
+        write_schema_identifier(&mut identifier, old);
+    }
+    let needle = identifier.as_str().as_bytes();
     if !source
         .as_str()
         .as_bytes()

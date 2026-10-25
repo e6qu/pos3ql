@@ -6,7 +6,7 @@ on:
 
 concurrency:
   group: catalog-schema-validation-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   all-native:

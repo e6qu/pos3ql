@@ -71,7 +71,7 @@ jobs:
       - name: Native catalog and schema regressions
         shell: bash
         run: |
-          cargo test --lib --locked -- catalog_snapshot_ schema_rename_ --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/catalog-tests.log"
+          cargo test --lib --locked -- catalog_snapshot_ schema_rename_ schema_sql_rewrite_ --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/catalog-tests.log"
           python3 - "$RUNNER_TEMP/catalog-tests.log" <<'PY'
           import pathlib
           import re

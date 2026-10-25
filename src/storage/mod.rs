@@ -4933,6 +4933,18 @@ pub(crate) struct RuleDefinition {
 }
 
 impl RuleDefinition {
+    fn rename_schema(&mut self, old: SqlName, new: SqlName) -> Result<(), SqlError> {
+        let mut spans = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS + 1];
+        if let Some(condition) = self.condition { spans[0] = condition; }
+        spans[1..1 + usize::from(self.action_count)]
+            .copy_from_slice(&self.actions[..usize::from(self.action_count)]);
+        rename_schema_qualified_sql(&mut self.source, &mut spans[..1 + usize::from(self.action_count)], old, new)?;
+        if self.condition.is_some() { self.condition = Some(spans[0]); }
+        self.actions[..usize::from(self.action_count)]
+            .copy_from_slice(&spans[1..1 + usize::from(self.action_count)]);
+        Ok(())
+    }
+
     fn view_return(slot: usize, query: &StoredQueryDefinition) -> Self {
         Self {
             name: SqlName::parse("_RETURN").expect("fixed name fits"),
@@ -15398,19 +15410,22 @@ fn rename_schema_path(
 /// namespace identity.
 fn rename_schema_qualified_sql<const N: usize>(
     source: &mut StackStr<N>,
+    spans: &mut [RuleTextSpan],
     old: SqlName,
     new: SqlName,
 ) -> Result<(), SqlError> {
     use core::fmt::Write as _;
 
     fn is_identifier(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
     }
 
-    fn quoted_end(bytes: &[u8], mut at: usize, quote: u8) -> usize {
+    fn quoted_end(bytes: &[u8], mut at: usize, quote: u8, escapes: bool) -> usize {
         at += 1;
         while at < bytes.len() {
-            if bytes[at] == quote {
+            if escapes && bytes[at] == b'\\' {
+                at = (at + 2).min(bytes.len());
+            } else if bytes[at] == quote {
                 if bytes.get(at + 1) == Some(&quote) {
                     at += 2;
                 } else {
@@ -15421,6 +15436,16 @@ fn rename_schema_qualified_sql<const N: usize>(
             }
         }
         bytes.len()
+    }
+
+    fn quoted_identifier_matches(source: &str, name: &str) -> bool {
+        let mut source = source.chars().peekable();
+        let mut name = name.chars();
+        while let Some(character) = source.next() {
+            if character == '"' && source.peek() == Some(&'"') { source.next(); }
+            if name.next() != Some(character) { return false; }
+        }
+        name.next().is_none()
     }
 
     fn write_schema_identifier<const N: usize>(out: &mut StackStr<N>, name: SqlName) {
@@ -15447,23 +15472,51 @@ fn rename_schema_qualified_sql<const N: usize>(
     }
 
     let text = source.as_str();
+    if spans.len() > MAX_RULE_ACTIONS + 1 {
+        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "schema rename exceeds the saved SQL span limit"));
+    }
+    let mut boundaries = [[0_isize; 2]; MAX_RULE_ACTIONS + 1];
+    for (span, boundaries) in spans.iter().zip(&mut boundaries) {
+        let start = usize::from(span.start);
+        let end = start + usize::from(span.len);
+        if text.get(start..end).is_none() {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved SQL span is outside its definition"));
+        }
+        *boundaries = [start as isize, end as isize];
+    }
+    let mut remap = |start: usize, end: usize, replacement: usize| -> Result<(), SqlError> {
+        let shift = replacement as isize - (end - start) as isize;
+        for (span, boundaries) in spans.iter().zip(&mut boundaries) {
+            let original = [usize::from(span.start), usize::from(span.start) + usize::from(span.len)];
+            for (original, boundary) in original.into_iter().zip(boundaries) {
+                if original > start && original < end {
+                    return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved SQL span splits a namespace identifier"));
+                }
+                if original >= end { *boundary += shift; }
+            }
+        }
+        Ok(())
+    };
     let bytes = text.as_bytes();
     let mut rewritten = StackStr::<N>::new();
     let mut copied = 0usize;
     let mut at = 0usize;
     while at < bytes.len() {
         match bytes[at] {
-            b'\'' => at = quoted_end(bytes, at, b'\''),
+            b'E' | b'e' if bytes.get(at + 1) == Some(&b'\'') => at = quoted_end(bytes, at + 1, b'\'', true),
+            b'\'' => at = quoted_end(bytes, at, b'\'', false),
             b'"' => {
-                let end = quoted_end(bytes, at, b'"');
+                let end = quoted_end(bytes, at, b'"', false);
                 let identifier = &text[at + 1..end.saturating_sub(1)];
                 let mut next = end;
                 while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
                     next += 1;
                 }
-                if identifier == old.as_str() && bytes.get(next) == Some(&b'.') {
+                if quoted_identifier_matches(identifier, old.as_str()) && bytes.get(next) == Some(&b'.') {
                     let _ = rewritten.write_str(&text[copied..at]);
+                    let replacement = rewritten.len();
                     write_schema_identifier(&mut rewritten, new);
+                    remap(at, end, rewritten.len() - replacement)?;
                     copied = end;
                 }
                 at = end;
@@ -15494,7 +15547,7 @@ fn rename_schema_qualified_sql<const N: usize>(
             b'$' => {
                 let start = at;
                 at += 1;
-                while bytes.get(at).is_some_and(|byte| is_identifier(*byte)) {
+                while bytes.get(at).is_some_and(|byte| is_identifier(*byte) && *byte != b'$') {
                     at += 1;
                 }
                 if bytes.get(at) != Some(&b'$') {
@@ -15508,7 +15561,7 @@ fn rename_schema_qualified_sql<const N: usize>(
                         delimiter_end + offset + delimiter.len()
                     });
             }
-            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+            byte if byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80 => {
                 let start = at;
                 at += 1;
                 while bytes.get(at).is_some_and(|byte| is_identifier(*byte)) {
@@ -15522,7 +15575,9 @@ fn rename_schema_qualified_sql<const N: usize>(
                     && bytes.get(next) == Some(&b'.')
                 {
                     let _ = rewritten.write_str(&text[copied..start]);
+                    let replacement = rewritten.len();
                     write_schema_identifier(&mut rewritten, new);
+                    remap(start, at, rewritten.len() - replacement)?;
                     copied = at;
                 }
             }
@@ -15539,6 +15594,16 @@ fn rename_schema_qualified_sql<const N: usize>(
             "schema rename exceeds a stored SQL definition limit"
         ));
     }
+    let mut adjusted = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS + 1];
+    for (boundaries, adjusted) in boundaries.iter().zip(&mut adjusted).take(spans.len()) {
+        let start = u16::try_from(boundaries[0]).map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "schema rename exceeds the saved SQL span limit"))?;
+        let len = u16::try_from(boundaries[1] - boundaries[0]).map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "schema rename exceeds the saved SQL span limit"))?;
+        if rewritten.as_str().get(usize::from(start)..usize::from(start) + usize::from(len)).is_none() {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "renamed SQL span is outside its definition"));
+        }
+        *adjusted = RuleTextSpan { start, len };
+    }
+    spans.copy_from_slice(&adjusted[..spans.len()]);
     *source = rewritten;
     Ok(())
 }
@@ -15553,7 +15618,7 @@ fn rename_column_default_schema(
         ColumnDefault::Constant { expression, .. }
         | ColumnDefault::Expression(expression)
         | ColumnDefault::Generated(expression) => {
-            rename_schema_qualified_sql(expression, old, new)?;
+            rename_schema_qualified_sql(expression, &mut [], old, new)?;
         }
     }
     Ok(())
@@ -15568,7 +15633,7 @@ fn rename_table_sql_identity(
         rename_column_default_schema(&mut column.default, old, new)?;
     }
     for constraint in definition.checks.iter_mut().take(definition.n_checks) {
-        rename_schema_qualified_sql(&mut constraint.expression, old, new)?;
+        rename_schema_qualified_sql(&mut constraint.expression, &mut [], old, new)?;
     }
     for exclusion in definition
         .exclusions
@@ -15576,7 +15641,7 @@ fn rename_table_sql_identity(
         .take(definition.n_exclusions)
     {
         if let Some(predicate) = &mut exclusion.predicate {
-            rename_schema_qualified_sql(predicate, old, new)?;
+            rename_schema_qualified_sql(predicate, &mut [], old, new)?;
         }
     }
     Ok(())
@@ -28548,15 +28613,13 @@ impl Storage {
         for rule in self.rule_entries().map(|(_, entry)| entry).filter(|rule| {
             rule.database == current_database() && rule.ddl_state != CatalogDdlState::Absent
         }) {
-            let mut path = rule.definition.creation_path;
-            rename_schema_path(&mut path, prior, name)?;
-            let mut source = rule.definition.source;
-            rename_schema_qualified_sql(&mut source, prior, name)?;
+            let mut definition = rule.definition;
+            rename_schema_path(&mut definition.creation_path, prior, name)?;
+            definition.rename_schema(prior, name)?;
             if let Some(pending) = rule.pending {
-                let mut path = pending.definition.creation_path;
-                rename_schema_path(&mut path, prior, name)?;
-                let mut source = pending.definition.source;
-                rename_schema_qualified_sql(&mut source, prior, name)?;
+                let mut definition = pending.definition;
+                rename_schema_path(&mut definition.creation_path, prior, name)?;
+                definition.rename_schema(prior, name)?;
             }
         }
         for (_, definition) in (RoutineIter {
@@ -28571,12 +28634,16 @@ impl Storage {
             let mut path = definition.creation_path;
             rename_schema_path(&mut path, prior, name)?;
             let mut body = definition.body;
-            rename_schema_qualified_sql(&mut body, prior, name)?;
+            if definition.body_kind != RoutineBodyKind::String {
+                rename_schema_qualified_sql(&mut body, &mut [], prior, name)?;
+            }
             if let Some(pending) = definition.pending_definition {
                 let mut path = pending.definition.creation_path;
                 rename_schema_path(&mut path, prior, name)?;
                 let mut body = pending.definition.body;
-                rename_schema_qualified_sql(&mut body, prior, name)?;
+                if pending.definition.body_kind != RoutineBodyKind::String {
+                    rename_schema_qualified_sql(&mut body, &mut [], prior, name)?;
+                }
             }
         }
         {
@@ -28588,7 +28655,7 @@ impl Storage {
                 let mut path = definition.creation_path;
                 rename_schema_path(&mut path, prior, name)?;
                 let mut sql = definition.sql;
-                rename_schema_qualified_sql(&mut sql, prior, name)?;
+                rename_schema_qualified_sql(&mut sql, &mut [], prior, name)?;
             }
         }
         for table_slot in 0..self.tables.len() {
@@ -28613,11 +28680,11 @@ impl Storage {
         }) {
             if let Some(default) = definition.default_expr {
                 let mut default = default;
-                rename_schema_qualified_sql(&mut default, prior, name)?;
+                rename_schema_qualified_sql(&mut default, &mut [], prior, name)?;
             }
             for check in definition.checks.iter().take(definition.n_checks) {
                 let mut expression = check.expression;
-                rename_schema_qualified_sql(&mut expression, prior, name)?;
+                rename_schema_qualified_sql(&mut expression, &mut [], prior, name)?;
             }
         }
         for definition in self
@@ -28629,11 +28696,11 @@ impl Storage {
         {
             for expression in definition.expressions.iter().flatten() {
                 let mut expression = *expression;
-                rename_schema_qualified_sql(&mut expression, prior, name)?;
+                rename_schema_qualified_sql(&mut expression, &mut [], prior, name)?;
             }
             if let Some(predicate) = definition.predicate {
                 let mut predicate = predicate;
-                rename_schema_qualified_sql(&mut predicate, prior, name)?;
+                rename_schema_qualified_sql(&mut predicate, &mut [], prior, name)?;
             }
         }
 
@@ -28681,10 +28748,10 @@ impl Storage {
                     && definition.ddl_state != CatalogDdlState::Absent
             }) {
                 rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
+                definition.definition.rename_schema(prior, name)?;
                 if let Some(pending) = &mut definition.pending {
                     rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
-                    rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
+                    pending.definition.rename_schema(prior, name)?;
                 }
             }
         }
@@ -28721,10 +28788,10 @@ impl Storage {
                 rename_schema_name(&mut pending.schema, prior, name);
             }
             for expression in definition.expressions.iter_mut().flatten() {
-                rename_schema_qualified_sql(expression, prior, name)?;
+                rename_schema_qualified_sql(expression, &mut [], prior, name)?;
             }
             if let Some(predicate) = &mut definition.predicate {
-                rename_schema_qualified_sql(predicate, prior, name)?;
+                rename_schema_qualified_sql(predicate, &mut [], prior, name)?;
             }
         }
         let mut type_catalog = self
@@ -28739,10 +28806,10 @@ impl Storage {
             rename_user_type_schema(&mut definition.base_domain, prior, name);
             rename_user_type_schema(&mut definition.base_user_type, prior, name);
             if let Some(default) = &mut definition.default_expr {
-                rename_schema_qualified_sql(default, prior, name)?;
+                rename_schema_qualified_sql(default, &mut [], prior, name)?;
             }
             for check in definition.checks.iter_mut().take(definition.n_checks) {
-                rename_schema_qualified_sql(&mut check.expression, prior, name)?;
+                rename_schema_qualified_sql(&mut check.expression, &mut [], prior, name)?;
             }
             if let Some(pending) = &mut definition.pending_definition
                 && let Some(identity) = &mut pending.identity
@@ -28804,7 +28871,9 @@ impl Storage {
             );
             rename_routine_kind_schema(&mut definition.kind, prior, name);
             rename_schema_path(&mut definition.creation_path, prior, name)?;
-            rename_schema_qualified_sql(&mut definition.body, prior, name)?;
+            if definition.body_kind != RoutineBodyKind::String {
+                rename_schema_qualified_sql(&mut definition.body, &mut [], prior, name)?;
+            }
             if let Some(pending) = &mut definition.pending_definition {
                 rename_routine_arguments_schema(
                     &mut pending.definition.arguments,
@@ -28826,7 +28895,9 @@ impl Storage {
                 );
                 rename_routine_kind_schema(&mut pending.definition.kind, prior, name);
                 rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut pending.definition.body, prior, name)?;
+                if pending.definition.body_kind != RoutineBodyKind::String {
+                    rename_schema_qualified_sql(&mut pending.definition.body, &mut [], prior, name)?;
+                }
             }
         }
         drop(routines);
@@ -28925,7 +28996,7 @@ impl Storage {
                     && definition.ddl_state != CatalogDdlState::Absent
                 {
                     rename_schema_path(&mut definition.creation_path, prior, name)?;
-                    rename_schema_qualified_sql(&mut definition.sql, prior, name)?;
+                    rename_schema_qualified_sql(&mut definition.sql, &mut [], prior, name)?;
                 }
             }
         }
@@ -52604,11 +52675,85 @@ mod tests {
         let mut source = StackStr::<256>::from_str(
             "SELECT old_schema.item, 'old_schema.item', $$old_schema.item$$ /* old_schema.item /* nested */ */ FROM old_schema.items",
         );
-        rename_schema_qualified_sql(&mut source, old, new).unwrap();
+        rename_schema_qualified_sql(&mut source, &mut [], old, new).unwrap();
         assert_eq!(
             source.as_str(),
             "SELECT new_schema.item, 'old_schema.item', $$old_schema.item$$ /* old_schema.item /* nested */ */ FROM new_schema.items"
         );
+    }
+
+    #[test]
+    fn schema_sql_rewrite_preserves_escape_and_dollar_strings_and_identifier_spelling() {
+        crate::mem::guard::forbid_alloc(|| {
+            let old = SqlName::parse("old_schema").unwrap();
+            let new = SqlName::parse("new_schema").unwrap();
+            let mut source = StackStr::<256>::from_str(r"SELECT E'it\'s old_schema.item', $$ old_schema.item $$, $tag$ old_schema.item $tag$ FROM old_schema.items");
+            rename_schema_qualified_sql(&mut source, &mut [], old, new).unwrap();
+            assert_eq!(source.as_str(), r"SELECT E'it\'s old_schema.item', $$ old_schema.item $$, $tag$ old_schema.item $tag$ FROM new_schema.items");
+            let mut quoted = StackStr::<128>::from_str(r#"SELECT "old""schema".item FROM "old""schema".items"#);
+            rename_schema_qualified_sql(&mut quoted, &mut [], SqlName::parse("old\"schema").unwrap(), SqlName::parse("new space").unwrap()).unwrap();
+            assert_eq!(quoted.as_str(), r#"SELECT "new space".item FROM "new space".items"#);
+            let mut unicode = StackStr::<128>::from_str("SELECT café.item FROM café.items");
+            rename_schema_qualified_sql(&mut unicode, &mut [], SqlName::parse("café").unwrap(), new).unwrap();
+            assert_eq!(unicode.as_str(), "SELECT new_schema.item FROM new_schema.items");
+        });
+    }
+
+    #[test]
+    fn schema_sql_rewrite_remaps_view_and_rule_spans_for_shorter_and_longer_names() {
+        crate::mem::guard::forbid_alloc(|| {
+            let old = SqlName::parse("old_schema").unwrap();
+            for name in ["x", "a_longer_schema_name", "new space", "schéma"] {
+                let mut rule = RuleDefinition::EMPTY;
+                rule.source = StackStr::from_str("SELECT id FROM old_schema.orders");
+                rule.action_count = 1;
+                rule.actions[0] = RuleTextSpan { start: 0, len: rule.source.len() as u16 };
+                rule.rename_schema(old, SqlName::parse(name).unwrap()).unwrap();
+                assert_eq!(rule.action_sql().next(), Some(rule.source.as_str()));
+                assert_eq!(usize::from(rule.actions[0].len), rule.source.len());
+            }
+            let mut rule = RuleDefinition::EMPTY;
+            rule.source = StackStr::from_str("CREATE RULE r AS ON INSERT TO old_schema.orders WHERE old_schema.ok() DO ALSO (SELECT old_schema.first(); SELECT old_schema.second())");
+            let span = |source: &str| RuleTextSpan {
+                start: rule.source.as_str().find(source).unwrap() as u16,
+                len: source.len() as u16,
+            };
+            rule.condition = Some(span("old_schema.ok()"));
+            rule.actions[0] = span("SELECT old_schema.first()");
+            rule.actions[1] = span("SELECT old_schema.second()");
+            rule.action_count = 2;
+            rule.rename_schema(old, SqlName::parse("x").unwrap()).unwrap();
+            assert_eq!(rule.condition_sql(), Some("x.ok()"));
+            let mut actions = rule.action_sql();
+            assert_eq!(actions.next(), Some("SELECT x.first()"));
+            assert_eq!(actions.next(), Some("SELECT x.second()"));
+            assert_eq!(actions.next(), None);
+        });
+    }
+
+    #[test]
+    fn schema_sql_rewrite_rejects_invalid_spans_and_exhaustion_without_partial_edits() {
+        crate::mem::guard::forbid_alloc(|| {
+            let old = SqlName::parse("old_schema").unwrap();
+            let new = SqlName::parse("new_schema").unwrap();
+            let initial = StackStr::<64>::from_str("SELECT old_schema.orders");
+            for span in [RuleTextSpan { start: 8, len: 3 }, RuleTextSpan { start: 63, len: 2 }] {
+                let mut source = initial;
+                let mut spans = [span];
+                let error = rename_schema_qualified_sql(&mut source, &mut spans, old, new).unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+                assert_eq!(source, initial);
+                assert_eq!(spans, [span]);
+            }
+            let mut source = StackStr::<24>::from_str("SELECT old_schema.orders");
+            let initial = source;
+            let span = RuleTextSpan { start: 0, len: source.len() as u16 };
+            let mut spans = [span];
+            let error = rename_schema_qualified_sql(&mut source, &mut spans, old, SqlName::parse("a_schema_name_that_cannot_fit").unwrap()).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(source, initial);
+            assert_eq!(spans, [span]);
+        });
     }
 
     #[test]

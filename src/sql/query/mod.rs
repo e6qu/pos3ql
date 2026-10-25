@@ -22,7 +22,7 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, eval_full,
+    ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError, SubqueryValues, eval_full,
     resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
@@ -3325,15 +3325,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_table_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let object = match self.storage.resolve_relation(schema, name, self.txid) {
+        let object = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 self.storage.table_access_object(slot, self.txid)
             }
@@ -3372,7 +3371,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_column_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         column: super::eval::PrivilegeColumn<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
@@ -3380,8 +3379,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let (object, column) = match self.storage.resolve_relation(schema, name, self.txid) {
+        let (object, column) = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 let column = match column {
@@ -3448,15 +3446,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_any_column_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let (object, columns) = match self.storage.resolve_relation(schema, name, self.txid) {
+        let (object, columns) = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 (
@@ -3523,15 +3520,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_sequence_privilege(
         &self,
         role: Option<&str>,
-        sequence: &str,
+        sequence: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(sequence);
-        let Some(slot) = self.storage.sequence_on_path(schema, name, self.txid) else {
+        let slot = match sequence {
+            PrivilegeRelation::Name(sequence) => {
+                let (schema, name) = split_catalog_name(sequence);
+                self.storage.sequence_on_path(schema, name, self.txid)
+            }
+            PrivilegeRelation::Oid(oid) => oid.checked_sub(super::catalog::sequence_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| *slot < self.storage.sequence_count() && self.storage.sequence_slot_visible_to(*slot, self.txid)),
+        };
+        let Some(slot) = slot else {
             return Ok(None);
         };
         let object = crate::storage::AccessObject {
@@ -4242,6 +4247,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 pub(super) fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
     name.rsplit_once('.')
         .map_or((None, name), |(schema, object)| (Some(schema), object))
+}
+
+pub(super) fn privilege_relation(
+    storage: &Storage,
+    transaction: u32,
+    relation: PrivilegeRelation<'_>,
+) -> Option<crate::storage::ResolvedRelation> {
+    match relation {
+        PrivilegeRelation::Name(name) => {
+            let (schema, name) = split_catalog_name(name);
+            storage.resolve_relation(schema, name, transaction)
+        }
+        PrivilegeRelation::Oid(oid) => {
+            if super::catalog::catalog_relation_oid_by_oid(oid) { return Some(crate::storage::ResolvedRelation::Catalog); }
+            if let Some(slot) = oid.checked_sub(super::catalog::user_table_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| *slot < storage.table_count() && storage.table_slot_visible_to(*slot, transaction)) {
+                return Some(crate::storage::ResolvedRelation::Table(slot));
+            }
+            oid.checked_sub(super::catalog::view_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| *slot < storage.view_count() && storage.view_slot_visible_to(*slot, transaction))
+                .map(crate::storage::ResolvedRelation::View)
+        }
+    }
 }
 
 fn privilege_role(storage: &Storage, role: Option<&str>, txid: u32) -> Option<usize> {

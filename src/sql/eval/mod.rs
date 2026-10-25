@@ -1362,7 +1362,7 @@ pub trait CatalogAccess {
     fn has_table_privilege(
         &self,
         _role: Option<&str>,
-        _relation: &str,
+        _relation: PrivilegeRelation<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1370,7 +1370,7 @@ pub trait CatalogAccess {
     fn has_column_privilege(
         &self,
         _role: Option<&str>,
-        _relation: &str,
+        _relation: PrivilegeRelation<'_>,
         _column: PrivilegeColumn<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
@@ -1379,7 +1379,7 @@ pub trait CatalogAccess {
     fn has_any_column_privilege(
         &self,
         _role: Option<&str>,
-        _relation: &str,
+        _relation: PrivilegeRelation<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1387,7 +1387,7 @@ pub trait CatalogAccess {
     fn has_sequence_privilege(
         &self,
         _role: Option<&str>,
-        _sequence: &str,
+        _sequence: PrivilegeRelation<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1645,6 +1645,12 @@ pub enum DefinedCastContext {
 pub enum PrivilegeColumn<'a> {
     Name(&'a str),
     Number(i16),
+}
+
+#[derive(Clone, Copy)]
+pub enum PrivilegeRelation<'a> {
+    Name(&'a str),
+    Oid(i32),
 }
 
 /// A bounded membership source for an `IN (subquery)` result.

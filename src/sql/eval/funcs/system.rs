@@ -238,6 +238,8 @@ fn privilege_object_name<'a>(
                 .0;
             if function == "has_type_privilege" {
                 catalog.type_name(oid, arena)
+            } else if function == "has_function_privilege" {
+                catalog.routine_name(oid, true, arena)
             } else if function == "has_language_privilege" {
                 catalog.language_name(oid, arena)
             } else if function == "has_schema_privilege" {
@@ -1708,23 +1710,7 @@ pub(crate) fn dispatch<'a>(
                 };
                 let object = eval_full(args[at], arena, params, row, hooks)?;
                 at += 1;
-                let object = if name == "has_parameter_privilege" {
-                    match object {
-                        Datum::Text(parameter) => parameter,
-                        Datum::Null => return Ok(Datum::Null),
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "has_parameter_privilege() requires a text parameter name"
-                            ));
-                        }
-                    }
-                } else {
-                    match privilege_object_name(object, name, cat, arena)? {
-                        Some(object) => object,
-                        None => return Ok(Datum::Null),
-                    }
-                };
+                if matches!(object, Datum::Null) { return Ok(Datum::Null); }
                 let privilege_column = if column {
                     let column = eval_full(args[at], arena, params, row, hooks)?;
                     at += 1;
@@ -1753,20 +1739,35 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
+                if matches!(name, "has_table_privilege" | "has_column_privilege" | "has_any_column_privilege" | "has_sequence_privilege") {
+                    let relation = match object {
+                        Datum::Text(name) => super::super::PrivilegeRelation::Name(name),
+                        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. } | Datum::Regtype { .. }) => {
+                            super::super::PrivilegeRelation::Oid(CatalogOid::parse(value)?.expect("non-null relation identity").0)
+                        }
+                        _ => return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "object must be specified by name or oid")),
+                    };
+                    let answer = match name {
+                        "has_table_privilege" => cat.has_table_privilege(role, relation, privilege)?,
+                        "has_column_privilege" => cat.has_column_privilege(role, relation, privilege_column.expect("column function parsed a column"), privilege)?,
+                        "has_any_column_privilege" => cat.has_any_column_privilege(role, relation, privilege)?,
+                        "has_sequence_privilege" => cat.has_sequence_privilege(role, relation, privilege)?,
+                        _ => unreachable!("relation privilege function was classified"),
+                    };
+                    return Ok(answer.map_or(Datum::Null, Datum::Bool));
+                }
+                let object = if name == "has_parameter_privilege" {
+                    match object {
+                        Datum::Text(parameter) => parameter,
+                        _ => return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "has_parameter_privilege() requires a text parameter name")),
+                    }
+                } else {
+                    match privilege_object_name(object, name, cat, arena)? {
+                        Some(object) => object,
+                        None => return Ok(Datum::Null),
+                    }
+                };
                 let answer = match name {
-                    "has_table_privilege" => cat.has_table_privilege(role, object, privilege)?,
-                    "has_column_privilege" => cat.has_column_privilege(
-                        role,
-                        object,
-                        privilege_column.expect("column function parsed a column"),
-                        privilege,
-                    )?,
-                    "has_any_column_privilege" => {
-                        cat.has_any_column_privilege(role, object, privilege)?
-                    }
-                    "has_sequence_privilege" => {
-                        cat.has_sequence_privilege(role, object, privilege)?
-                    }
                     "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
                     "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
                     "has_language_privilege" => {

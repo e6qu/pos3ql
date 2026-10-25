@@ -6,7 +6,7 @@ use super::view_rows::{
 };
 use super::views::{Base, Read, columns};
 use super::{Arena, Datum, SqlError, Storage, SynthTable, arena_full, text};
-use crate::sql::eval::{CatalogAccess, sqlstate};
+use crate::sql::eval::{CatalogAccess, PrivilegeRelation, sqlstate};
 use crate::{sql_err, stack_format};
 
 pub(super) struct ScalarMetadata {
@@ -114,11 +114,10 @@ fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) -> bool {
 fn relation_is_updatable(
     storage: &Storage,
     transaction: u32,
-    name: &str,
+    relation: PrivilegeRelation<'_>,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let (qualifier, name) = crate::sql::query::split_catalog_name(name);
-    match storage.resolve_relation(qualifier, name, transaction) {
+    match crate::sql::query::privilege_relation(storage, transaction, relation) {
         Some(crate::storage::ResolvedRelation::View(slot)) => {
             let view = storage.view(slot);
             crate::sql::query::view_is_auto_updatable(
@@ -189,31 +188,24 @@ pub(super) fn tables<'a>(
             continue;
         }
         let relation_oid = integer(class[oid])?;
-        let current_name = catalog.relname(relation_oid, arena)?;
+        let relation = PrivilegeRelation::Oid(relation_oid);
         let visible = owner_is_enabled(storage, transaction, integer(class[owner])?)
-            || if let Some(name) = current_name {
-                catalog.has_table_privilege(
+            || catalog.has_table_privilege(
                     None,
-                    name,
+                    relation,
                     "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
                 )? == Some(true)
                     || catalog.has_any_column_privilege(
                         None,
-                        name,
+                        relation,
                         "SELECT, INSERT, UPDATE, REFERENCES",
                     )? == Some(true)
-            } else {
-                false
-            };
+            ;
         if !visible {
             continue;
         }
         let insertable = matches!(kind, b'r' | b'p')
-            || if let Some(name) = current_name {
-                relation_is_updatable(storage, transaction, name, arena)?
-            } else {
-                false
-            };
+            || relation_is_updatable(storage, transaction, relation, arena)?;
         for namespace in namespaces.matching((integer(class[namespace])? as u32, 0)) {
             let namespace_oid = integer(namespace[namespace_oid])?;
             if catalog.is_other_temporary_namespace(namespace_oid) {
@@ -612,27 +604,20 @@ pub(super) fn columns_view<'a>(
             if !matches!(kind, b'r' | b'p' | b'v' | b'f') {
                 continue;
             }
-            let current_name = catalog.relname(relation, arena)?;
+            let relation_identity = PrivilegeRelation::Oid(relation);
             let visible = owner_is_enabled(storage, transaction, class.integer("relowner")?)
-                || if let Some(name) = current_name {
-                    catalog.has_column_privilege(
+                || catalog.has_column_privilege(
                         None,
-                        name,
+                        relation_identity,
                         crate::sql::eval::PrivilegeColumn::Number(number),
                         "SELECT, INSERT, UPDATE, REFERENCES",
                     )? == Some(true)
-                } else {
-                    false
-                };
+                ;
             if !visible {
                 continue;
             }
             let updatable = matches!(kind, b'r' | b'p')
-                || if let Some(name) = current_name {
-                    relation_is_updatable(storage, transaction, name, arena)?
-                } else {
-                    false
-                };
+                || relation_is_updatable(storage, transaction, relation_identity, arena)?;
             for values in sources
                 .namespaces
                 .matching((class.integer("relnamespace")? as u32, 0))
@@ -733,22 +718,19 @@ pub(super) fn views<'a>(
         }
         let oid = integer(class[oid])?;
         let owned = owner_is_enabled(storage, transaction, integer(class[owner])?);
-        let current_name = catalog.relname(oid, arena)?;
+        let relation = PrivilegeRelation::Oid(oid);
         if !(owned
-            || if let Some(name) = current_name {
-                catalog.has_table_privilege(
+            || catalog.has_table_privilege(
                     None,
-                    name,
+                    relation,
                     "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
                 )? == Some(true)
                     || catalog.has_any_column_privilege(
                         None,
-                        name,
+                        relation,
                         "SELECT, INSERT, UPDATE, REFERENCES",
                     )? == Some(true)
-            } else {
-                false
-            })
+            )
         {
             continue;
         }
@@ -781,11 +763,7 @@ pub(super) fn views<'a>(
                 ));
             }
         };
-        let updatable = if let Some(name) = current_name {
-            relation_is_updatable(storage, transaction, name, arena)?
-        } else {
-            false
-        };
+        let updatable = relation_is_updatable(storage, transaction, relation, arena)?;
         let mut triggered = [false; 3];
         for trigger in triggers.matching((oid as u32, 0)) {
             let bits = integer(trigger[trigger_type])?;
@@ -894,13 +872,7 @@ pub(super) fn sequences<'a>(
                 continue;
             }
             if !(owner_is_enabled(storage, transaction, integer(class[owner])?)
-                || match catalog.relname(oid, arena)? {
-                    Some(name) => {
-                        catalog.has_sequence_privilege(None, name, "SELECT, UPDATE, USAGE")?
-                            == Some(true)
-                    }
-                    None => false,
-                })
+                || catalog.has_sequence_privilege(None, PrivilegeRelation::Oid(oid), "SELECT, UPDATE, USAGE")? == Some(true))
             {
                 continue;
             }

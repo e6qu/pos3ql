@@ -263,6 +263,17 @@ def transcript(reader, writer):
         writer.execute("SELECT nextval('derived_hidden_sequence_diff')")
         writer.execute("GRANT SELECT ON derived_repeated_diff TO derived_reader_diff")
         writer.execute("GRANT SET ON PARAMETER track_functions TO derived_reader_diff")
+        writer.execute("CREATE SCHEMA derived_identity_other_diff")
+        writer.execute("CREATE VIEW public.derived_identity_view_diff AS SELECT 1 AS value")
+        writer.execute("CREATE VIEW derived_identity_other_diff.derived_identity_view_diff AS SELECT 2 AS value")
+        writer.execute("CREATE SEQUENCE public.derived_identity_sequence_diff START 4")
+        writer.execute("CREATE SEQUENCE derived_identity_other_diff.derived_identity_sequence_diff START 9")
+        writer.execute("SELECT nextval('public.derived_identity_sequence_diff'),nextval('derived_identity_other_diff.derived_identity_sequence_diff')")
+        writer.execute("GRANT SELECT ON derived_identity_other_diff.derived_identity_view_diff TO derived_reader_diff")
+        writer.execute("GRANT USAGE ON SEQUENCE derived_identity_other_diff.derived_identity_sequence_diff TO derived_reader_diff")
+        writer.execute("CREATE FUNCTION derived_identity_function_diff() RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+        writer.execute("REVOKE ALL ON FUNCTION derived_identity_function_diff() FROM PUBLIC")
+        writer.execute("GRANT EXECUTE ON FUNCTION derived_identity_function_diff() TO derived_reader_diff")
         try:
             for role in ("postgres", "derived_reader_diff"):
                 reader.execute(f"SET ROLE {role}")
@@ -272,6 +283,12 @@ def transcript(reader, writer):
                 record(reader, f"{prefix}.derived.privilege.{role}.sequence", "SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='derived_hidden_sequence_diff'")
                 record(reader, f"{prefix}.derived.privilege.{role}.last", "SELECT last_value FROM pg_sequences WHERE sequencename='derived_hidden_sequence_diff'")
                 record(reader, f"{prefix}.derived.privilege.{role}.any", "SELECT has_table_privilege('derived_repeated_diff','SELECT, INSERT'),has_any_column_privilege('derived_repeated_diff','SELECT, UPDATE'),has_parameter_privilege('track_functions','SET, ALTER SYSTEM')")
+                record(reader, f"{prefix}.derived.privilege.{role}.identity", "SELECT n.nspname,has_table_privilege(c.oid,'SELECT, INSERT'),has_any_column_privilege(c.oid,'SELECT, UPDATE'),has_column_privilege(c.oid,1::smallint,'SELECT') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='derived_identity_view_diff' ORDER BY n.nspname")
+                for relation, name_field in (("views", "table_name"), ("tables", "table_name"), ("columns", "column_name")):
+                    record(reader, f"{prefix}.derived.privilege.{role}.identity.{relation}", f"SELECT table_schema,{name_field} FROM information_schema.{relation} WHERE table_name='derived_identity_view_diff' ORDER BY table_schema")
+                record(reader, f"{prefix}.derived.privilege.{role}.identity.sequences", "SELECT sequence_schema,sequence_name FROM information_schema.sequences WHERE sequence_name='derived_identity_sequence_diff' ORDER BY sequence_schema")
+                record(reader, f"{prefix}.derived.privilege.{role}.identity.values", "SELECT schemaname,last_value FROM pg_sequences WHERE sequencename='derived_identity_sequence_diff' ORDER BY schemaname")
+                record(reader, f"{prefix}.derived.privilege.{role}.identity.function", "SELECT has_function_privilege('derived_identity_function_diff()'::regprocedure::oid,'EXECUTE')")
                 reader.execute("BEGIN")
                 try:
                     for label, sql in (
@@ -288,6 +305,10 @@ def transcript(reader, writer):
             writer.execute("DROP VIEW derived_repeated_diff")
             writer.execute("DROP TABLE derived_private_diff")
             writer.execute("DROP SEQUENCE derived_hidden_sequence_diff")
+            writer.execute("DROP SCHEMA derived_identity_other_diff CASCADE")
+            writer.execute("DROP VIEW public.derived_identity_view_diff")
+            writer.execute("DROP SEQUENCE public.derived_identity_sequence_diff")
+            writer.execute("DROP FUNCTION derived_identity_function_diff()")
             writer.execute("REVOKE SET ON PARAMETER track_functions FROM derived_reader_diff")
             writer.execute("DROP ROLE derived_reader_diff")
 

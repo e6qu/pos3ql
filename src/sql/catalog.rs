@@ -11827,7 +11827,7 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
     None
 }
 
-fn catalog_relation_oid_by_oid(oid: i32) -> bool {
+pub(super) fn catalog_relation_oid_by_oid(oid: i32) -> bool {
     catalog_relation_name(oid).is_some()
 }
 

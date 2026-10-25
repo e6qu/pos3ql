@@ -256,3 +256,36 @@ fn catalog_snapshot_privilege_lists_accept_any_grant_and_validate_every_item() {
         assert_eq!(error_sqlstates(&output), ["22023"], "{sql}: {}", String::from_utf8_lossy(&output));
     }
 }
+
+#[test]
+fn catalog_snapshot_derived_permissions_keep_oid_identity_outside_the_search_path() {
+    let config = test_config("catalog-permission-identities");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE ROLE identity_reader;
+         CREATE SCHEMA identity_other;
+         CREATE VIEW public.identity_collision AS SELECT 1 AS value;
+         CREATE VIEW identity_other.identity_collision AS SELECT 2 AS value;
+         CREATE SEQUENCE public.identity_sequence START 4;
+         CREATE SEQUENCE identity_other.identity_sequence START 9;
+         SELECT nextval('public.identity_sequence'),nextval('identity_other.identity_sequence');
+         GRANT SELECT ON identity_other.identity_collision TO identity_reader;
+         GRANT USAGE ON SEQUENCE identity_other.identity_sequence TO identity_reader;
+         SET ROLE identity_reader;", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT n.nspname,has_table_privilege(c.oid,'SELECT, INSERT'),
+                has_any_column_privilege(c.oid,'SELECT, UPDATE'),
+                has_column_privilege(c.oid,1::smallint,'SELECT')
+           FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE c.relname='identity_collision' ORDER BY n.nspname;
+         SELECT table_schema,table_name FROM information_schema.views WHERE table_name='identity_collision';
+         SELECT table_schema,table_name FROM information_schema.tables WHERE table_name='identity_collision';
+         SELECT table_schema,column_name FROM information_schema.columns WHERE table_name='identity_collision';
+         SELECT sequence_schema,sequence_name FROM information_schema.sequences WHERE sequence_name='identity_sequence';
+         SELECT schemaname,last_value FROM pg_sequences WHERE sequencename='identity_sequence' ORDER BY schemaname;", true)),
+        ["identity_other|t|t|t", "public|f|f|f", "identity_other|identity_collision", "identity_other|identity_collision",
+         "identity_other|value", "identity_other|identity_sequence", "identity_other|9", "public|NULL"]);
+}

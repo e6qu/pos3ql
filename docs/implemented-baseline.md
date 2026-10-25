@@ -1164,6 +1164,8 @@ someone else's view can list it, but its definition is NULL unless its owner
 role is enabled. View dependencies list referenced tables and columns only
 when their owner role is enabled, and repeated references produce one output
 row. Identity sequences are excluded from `information_schema.sequences`.
+Permission checks keep numeric relation identifiers through lookup, including
+objects outside the search path that share a name with another schema's object.
 These joins and permission rules follow the pinned
 [PostgreSQL definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
 

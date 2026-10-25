@@ -24,6 +24,8 @@ pub(crate) use database_clone_positions::{
 mod matview_lifecycles;
 mod query_lifecycles;
 mod routine_lifecycles;
+mod schema_names;
+pub(crate) use schema_names::{SchemaNameTarget, SchemaNameUndo};
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
 mod table_lifecycles;
@@ -11755,6 +11757,9 @@ pub struct SchemaDef {
     pub name: SqlName,
     pub ownership: Ownership,
     ddl_state: CatalogDdlState,
+    created_at: u64,
+    version: u64,
+    pending_name: Option<schema_names::PendingSchemaName>,
 }
 
 impl SchemaDef {
@@ -11763,6 +11768,9 @@ impl SchemaDef {
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
+        created_at: 0,
+        version: 0,
+        pending_name: None,
     };
 
     /// Whether `txid` sees this schema exist.
@@ -11770,10 +11778,16 @@ impl SchemaDef {
         self.ddl_state.visible_to(txid)
     }
 
+    pub(crate) fn name_for(self, transaction: u32) -> SqlName {
+        self.pending_name.filter(|pending| pending.transaction == transaction)
+            .map_or(self.name, |pending| pending.name)
+    }
+
     fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
         [
             self.ddl_state.pending_txid(),
             self.ownership.pending.map(|pending| pending.txid),
+            self.pending_name.map(|pending| pending.transaction),
         ]
         .into_iter()
         .flatten()
@@ -15450,14 +15464,7 @@ fn rename_schema_qualified_sql<const N: usize>(
 
     fn write_schema_identifier<const N: usize>(out: &mut StackStr<N>, name: SqlName) {
         let text = name.as_str();
-        let plain = text
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || *byte == b'_')
-            && text.as_bytes().iter().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'$')
-            });
-        if plain {
+        if !crate::sql::eval::ident_needs_quotes(text) {
             let _ = out.write_str(text);
             return;
         }
@@ -19054,6 +19061,9 @@ impl Storage {
                     } else {
                         CatalogDdlState::Absent
                     },
+                    version: 0,
+                    created_at: 0,
+                    pending_name: None,
                 })
                 .expect("sized to max_schemas");
         }
@@ -20447,12 +20457,18 @@ impl Storage {
             .position(|schema| {
                 schema.database == current_database()
                     && schema.visible_to(txid)
-                    && schema.name.as_str() == name
+                    && schema.name_for(txid).as_str() == name
             })
     }
 
     pub fn schema_def(&self, slot: usize) -> SchemaDef {
         self.schemas.lock().expect("schema catalog lock poisoned")[slot]
+    }
+
+    pub(crate) fn schema_def_for(&self, slot: usize, transaction: u32) -> SchemaDef {
+        let mut schema = self.schema_def(slot);
+        schema.name = schema.name_for(transaction);
+        schema
     }
 
     pub(crate) fn schema_count(&self) -> usize {
@@ -27858,6 +27874,10 @@ impl Storage {
             next_slot: 0,
         }
         .filter(move |(_, schema)| schema.database == current_database() && schema.visible_to(txid))
+        .map(move |(slot, mut schema)| {
+            schema.name = schema.name_for(txid);
+            (slot, schema)
+        })
     }
 
     // --- Object comments (`COMMENT ON ...`) ---
@@ -28478,7 +28498,7 @@ impl Storage {
         let txid = ddl_state.pending_txid().unwrap_or(0);
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         if let Some(blocker) = schemas.iter().find_map(|schema| {
-            (schema.database == current_database() && schema.name == name)
+            (schema.database == current_database() && (schema.name == name || schema.pending_name.is_some_and(|pending| pending.name == name)))
                 .then(|| schema.pending_owner_other_than(txid))
                 .flatten()
         }) {
@@ -28486,7 +28506,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if schemas.iter().any(|schema| {
-            schema.database == current_database() && schema.visible_to(txid) && schema.name == name
+            schema.database == current_database() && schema.visible_to(txid) && schema.name_for(txid) == name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_SCHEMA,
@@ -28504,6 +28524,7 @@ impl Storage {
                 schemas.len()
             ));
         };
+        let version = self.catalog_sequence.next()?;
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Schema,
             slot: slot as u16,
@@ -28513,6 +28534,9 @@ impl Storage {
             name,
             ownership,
             ddl_state,
+            created_at: version,
+            version,
+            pending_name: None,
         };
         Ok(slot)
     }
@@ -52703,7 +52727,7 @@ mod tests {
     fn schema_sql_rewrite_remaps_view_and_rule_spans_for_shorter_and_longer_names() {
         crate::mem::guard::forbid_alloc(|| {
             let old = SqlName::parse("old_schema").unwrap();
-            for name in ["x", "a_longer_schema_name", "new space", "schéma"] {
+            for name in ["x", "a_longer_schema_name", "new space", "schéma", "select", "a\"quoted"] {
                 let mut rule = RuleDefinition::EMPTY;
                 rule.source = StackStr::from_str("SELECT id FROM old_schema.orders");
                 rule.action_count = 1;

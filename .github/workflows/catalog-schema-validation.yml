@@ -9,6 +9,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  all-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-catalog-schema-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Complete library regressions
+        shell: bash
+        run: |
+          cargo test --lib --locked -- --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/all-native.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/all-native.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: catalog-schema-all-native-${{ github.sha }}
+          path: ${{ runner.temp }}/all-native.log
+
   reports:
     runs-on: ubuntu-latest
     timeout-minutes: 15

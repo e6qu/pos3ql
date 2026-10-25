@@ -10597,8 +10597,7 @@ fn pg_default_acl<'a>(
         } else {
             namespace_oid(
                 storage,
-                storage.schema_def(entry.schema as usize).name.as_str(),
-            )
+                storage.schema_def(entry.schema as usize).name.as_str(), txid)
         };
         let object_type = match entry.class {
             DefaultPrivilegeClass::Table => "r",
@@ -10634,7 +10633,7 @@ pub(crate) const fn namespace_oid_for_slot(slot: usize) -> i32 {
     FIRST_SCHEMA_OID + slot as i32
 }
 
-fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
+fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
     match schema {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
@@ -10646,11 +10645,7 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
             .and_then(|connection| connection.checked_add(FIRST_TEMP_NAMESPACE_OID))
             .unwrap_or(0),
         _ => storage
-            .find_schema(schema)
-            .or_else(|| {
-                (0..storage.schema_count())
-                    .find(|slot| storage.schema_def(*slot).name.as_str() == schema)
-            })
+            .find_schema_visible(schema, txid)
             .map(namespace_oid_for_slot)
             .unwrap_or(0),
     }
@@ -10672,7 +10667,7 @@ pub(crate) fn current_temporary_namespace_oid(storage: &Storage, txid: u32) -> i
                 == crate::storage::RelationPersistence::Temporary
     });
     if exists {
-        namespace_oid(storage, schema.as_str())
+        namespace_oid(storage, schema.as_str(), txid)
     } else {
         0
     }
@@ -10685,12 +10680,12 @@ pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i3
             storage.table_slot_visible_to(slot, txid)
                 && storage.table_def(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str()) == oid
+                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str(), txid) == oid
         }) || (0..storage.sequence_count()).any(|slot| {
             storage.sequence_slot_visible_to(slot, txid)
                 && storage.sequence_for(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.sequence_for(slot, txid).schema.as_str()) == oid
+                && namespace_oid(storage, storage.sequence_for(slot, txid).schema.as_str(), txid) == oid
         }))
 }
 
@@ -10709,7 +10704,7 @@ pub(crate) fn schema_name_by_oid(
                 let table = storage.table_def(slot, txid);
                 (storage.table_slot_visible_to(slot, txid)
                     && table.persistence == crate::storage::RelationPersistence::Temporary
-                    && namespace_oid(storage, table.schema.as_str()) == oid)
+                    && namespace_oid(storage, table.schema.as_str(), txid) == oid)
                     .then_some(table.schema)
             })
             .or_else(|| {
@@ -10730,7 +10725,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
             .then(|| current_temporary_namespace_oid(storage, txid)),
         _ if name.starts_with("pg_temp_") => {
-            let oid = namespace_oid(storage, name);
+            let oid = namespace_oid(storage, name, txid);
             (oid != 0
                 && ((0..storage.table_count()).any(|slot| {
                     storage.table_slot_visible_to(slot, txid)
@@ -14079,7 +14074,7 @@ fn pg_description<'a>(
                 }
             }
             crate::storage::CommentClass::Schema => {
-                (namespace_oid(storage, name), PG_NAMESPACE_OID)
+                (namespace_oid(storage, name, txid), PG_NAMESPACE_OID)
             }
             crate::storage::CommentClass::Type => match type_oid_of(storage, schema, name, txid) {
                 Some(oid) => (oid, PG_TYPE_OID),
@@ -14935,7 +14930,7 @@ fn visit_comments_for_object(
             "pg_namespace" => {
                 class == crate::storage::CommentClass::Schema
                     && subid == 0
-                    && Some(namespace_oid(storage, name)) == signed_oid
+                    && Some(namespace_oid(storage, name, txid)) == signed_oid
             }
             "pg_type" => {
                 class == crate::storage::CommentClass::Type
@@ -17014,7 +17009,7 @@ fn pg_statistic_ext<'a>(
                 Datum::Int4(extended_statistics_oid(slot)),
                 Datum::Int4(table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, mutable.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Statistics,
@@ -17777,7 +17772,7 @@ fn pg_publication_namespace<'a>(
                     ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
-                    Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                    Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 ],
                 arena,
             )?;
@@ -19544,7 +19539,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(toid),
                 text(table_def.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, table_def.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table_def.schema.as_str(), txid)),
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
                 Datum::Int4(i32::from(table_def.attributes.count)),
                 Datum::Float8(reltuples),
@@ -19723,7 +19718,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(named_composite_relation_oid(slot)),
                 text(composite.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("c", arena)?,
                 Datum::Int4(composite.active_field_count() as i32),
                 Datum::Float8(-1.0),
@@ -19769,8 +19764,7 @@ fn pg_class<'a>(
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.table_slot, txid).schema.as_str(),
-                )),
+                    storage.table_def(info.table_slot, txid).schema.as_str(), txid)),
                 text(
                     if info
                         .explicit_definition
@@ -19853,7 +19847,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(sequence_oid(slot)),
                 text(seq.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, seq.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, seq.schema.as_str(), txid)),
                 text("S", arena)?, // relkind: sequence
                 Datum::Int4(1),    // a sequence has one row of state
                 Datum::Float8(1.0),
@@ -19953,7 +19947,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(view_oid(slot)),
                 text(view.name_for(txid).as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("v", arena)?,
                 Datum::Int4(n_columns as i32),
                 Datum::Float8(0.0),
@@ -20465,8 +20459,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.table_slot, txid).schema.as_str(),
-                )),
+                    storage.table_def(info.table_slot, txid).schema.as_str(), txid)),
                 text(" ", arena)?,
                 Datum::Bool(info.constraint_parent_oid == 0),
                 Datum::Int4(i32::from(info.constraint_parent_oid != 0)),
@@ -20549,8 +20542,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(info.child_slot, txid).schema.as_str(),
-                )),
+                    storage.table_def(info.child_slot, txid).schema.as_str(), txid)),
                 text("s", arena)?,
                 Datum::Bool(constraint_parent_oid == 0),
                 Datum::Int4(i32::from(constraint_parent_oid != 0)),
@@ -20605,8 +20597,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.table_def(table, txid).schema.as_str(),
-                )),
+                    storage.table_def(table, txid).schema.as_str(), txid)),
                 text(" ", arena)?,
                 Datum::Bool(true),
                 Datum::Int4(0),
@@ -20642,8 +20633,7 @@ fn pg_constraint_values<'a>(
             clone[2] = Datum::Int4(table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
-                storage.table_def(child, txid).schema.as_str(),
-            ));
+                storage.table_def(child, txid).schema.as_str(), txid));
             out[n] = row(&clone, arena)?;
             n += 1;
         }
@@ -20699,8 +20689,7 @@ fn pg_constraint_values<'a>(
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(
                         storage,
-                        storage.table_def(slot, txid).schema.as_str(),
-                    )),
+                        storage.table_def(slot, txid).schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
                     Datum::Int4(inheritance_count as i32),
@@ -20758,7 +20747,7 @@ fn pg_constraint_values<'a>(
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 Datum::Int4(2606),
-                Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table.schema.as_str(), txid)),
                 text(" ", arena)?,
                 Datum::Bool(true),
                 Datum::Int4(0),
@@ -20816,7 +20805,7 @@ fn pg_constraint_values<'a>(
                     attnum_array(&[column_index as u16], &table, arena)?,
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
-                    Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, table.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(column.not_null.is_local()),
                     Datum::Int4(i32::from(column.not_null.is_inherited())),
@@ -20863,7 +20852,7 @@ fn pg_constraint_values<'a>(
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
-                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(true),
                     Datum::Int4(0),
@@ -20915,7 +20904,7 @@ fn pg_constraint_values<'a>(
                     Datum::Null,
                     Datum::Null,
                     Datum::Int4(PG_CONSTRAINT_OID),
-                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(true),
                     Datum::Int4(0),
@@ -21129,8 +21118,7 @@ fn pg_extension<'a>(
                 )),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.schema_def(namespace as usize).name.as_str(),
-                )),
+                    storage.schema_def(namespace as usize).name.as_str(), txid)),
                 Datum::Bool(relocatable),
                 text(version.as_str(), arena)?,
                 extconfig,
@@ -21176,7 +21164,7 @@ fn extension_dependency_catalog_identity(
         }
         AccessClass::Schema => (
             PG_NAMESPACE_OID,
-            namespace_oid(storage, storage.schema_def(slot).name.as_str()),
+            namespace_oid(storage, storage.schema_def(slot).name.as_str(), txid),
         ),
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
@@ -21433,7 +21421,7 @@ fn pg_depend<'a>(
             PG_OPERATOR_OID,
             oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, operator.schema.as_str()),
+            namespace_oid(storage, operator.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21456,7 +21444,7 @@ fn pg_depend<'a>(
             PG_COLLATION_OID,
             storage.collation(slot).oid(slot),
             PG_NAMESPACE_OID,
-            namespace_oid(storage, collation.schema.as_str()),
+            namespace_oid(storage, collation.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21467,7 +21455,7 @@ fn pg_depend<'a>(
             PG_CONVERSION_OID,
             oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, conversion.schema.as_str()),
+            namespace_oid(storage, conversion.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21486,7 +21474,7 @@ fn pg_depend<'a>(
             PG_OPFAMILY_OID,
             storage.operator_family(slot).oid(),
             PG_NAMESPACE_OID,
-            namespace_oid(storage, family.schema.as_str()),
+            namespace_oid(storage, family.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21498,7 +21486,7 @@ fn pg_depend<'a>(
             PG_OPCLASS_OID,
             class_oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, class.schema.as_str()),
+            namespace_oid(storage, class.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -23705,7 +23693,7 @@ fn pg_operator<'a>(
                 Datum::Int4(2617),
                 Datum::Int4(storage.operator(slot).oid()),
                 text(operator.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, operator.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, operator.schema.as_str(), txid)),
                 Datum::Int4(operator.owner),
                 Datum::Bpchar(match (operator.signature.left, operator.signature.right) {
                     (None, Some(_)) => "l",
@@ -24050,7 +24038,7 @@ fn pg_opfamily<'a>(
                 Datum::Int4(storage.operator_family(slot).oid()),
                 Datum::Int4(403),
                 text(family.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, family.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, family.schema.as_str(), txid)),
                 Datum::Int4(family.owner),
             ],
             arena,
@@ -24551,7 +24539,7 @@ fn pg_opclass<'a>(
                 Datum::Int4(storage.operator_class(slot).oid()),
                 Datum::Int4(403),
                 text(class.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, class.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, class.schema.as_str(), txid)),
                 Datum::Int4(class.owner),
                 Datum::Int4(class.family),
                 Datum::Int4(catalog_routine_result_oid(storage, txid, class.input)?),
@@ -26849,7 +26837,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(1255),
                 Datum::Int4(crate::storage::routine_oid(&routine)),
                 text(routine.name_for(txid).as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str(), txid)),
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Function { .. }
@@ -27579,7 +27567,7 @@ fn pg_ts_parser<'a>(
                 Datum::Oid(PG_TS_PARSER_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 text_search_regproc(start, arena)?,
                 text_search_regproc(gettoken, arena)?,
                 text_search_regproc(end, arena)?,
@@ -27620,7 +27608,7 @@ fn pg_ts_template<'a>(
                 Datum::Oid(PG_TS_TEMPLATE_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 text_search_regproc(init, arena)?,
                 text_search_regproc(lexize, arena)?,
             ],
@@ -27659,7 +27647,7 @@ fn pg_ts_dict<'a>(
                 Datum::Oid(PG_TS_DICT_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 Datum::Oid(owner as u32),
                 Datum::Oid(template as u32),
                 if options.is_empty() {
@@ -27702,7 +27690,7 @@ fn pg_ts_config<'a>(
                 Datum::Oid(PG_TS_CONFIG_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 Datum::Oid(owner as u32),
                 Datum::Oid(parser as u32),
             ],
@@ -27817,7 +27805,7 @@ fn pg_collation<'a>(
                 Datum::Int4(PG_COLLATION_OID),
                 Datum::Int4(stored.oid(slot)),
                 text(collation.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, collation.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, collation.schema.as_str(), txid)),
                 Datum::Int4(collation.owner),
                 Datum::Bpchar(collation.provider.code()),
                 Datum::Bool(collation.deterministic),
@@ -27851,7 +27839,7 @@ fn pg_conversion<'a>(
                 Datum::Int4(PG_CONVERSION_OID),
                 Datum::Int4(storage.conversion(slot).oid(slot)),
                 text(conversion.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, conversion.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, conversion.schema.as_str(), txid)),
                 Datum::Int4(conversion.owner),
                 Datum::Int4(conversion.source.code()),
                 Datum::Int4(conversion.destination.code()),
@@ -29770,7 +29758,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(i32::from(d.base.typlen())),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("d", arena)?,
                 text(category(&d.base), arena)?,
                 Datum::Int4(base_oid),
@@ -29835,7 +29823,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29880,7 +29868,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(4), // typlen: enums are a 4-byte oid on the wire
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str(), txid)),
                 text("e", arena)?,
                 text("E", arena)?,
                 Datum::Int4(0), // typbasetype
@@ -29927,7 +29915,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29972,7 +29960,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -30019,7 +30007,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -30065,7 +30053,7 @@ fn pg_type<'a>(
                 text(name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -30120,7 +30108,7 @@ fn pg_type<'a>(
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -30158,7 +30146,7 @@ fn pg_type<'a>(
                 text(view.name_for(txid).as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -30197,7 +30185,7 @@ fn pg_type<'a>(
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -30298,7 +30286,7 @@ fn pg_namespace<'a>(
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
-                Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 text(
                     arena
                         .alloc_str(schema.name.as_str())
@@ -30369,7 +30357,7 @@ fn pg_namespace<'a>(
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text(schema.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(usize::from(owner))),
                 Datum::Null,

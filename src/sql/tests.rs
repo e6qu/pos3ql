@@ -24742,7 +24742,7 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
                 assert_eq!(shape.def.name.as_str(), catalog);
                 assert_eq!(
                     arena.used() - before,
-                    core::mem::size_of::<crate::storage::TableDef>()
+                    core::mem::size_of::<(crate::storage::TableDef, usize)>()
                 );
                 let materialized = crate::sql::catalog::synthesize(
                     &engine.storage,

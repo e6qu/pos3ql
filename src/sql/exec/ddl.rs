@@ -328,14 +328,9 @@ pub(super) fn build_column(
     })
 }
 
-/// PostgreSQL exposes `p` for fixed-width and tsquery values; the remaining
-/// modeled varlena types start at the ordinary EXTENDED policy.
 pub(super) fn default_column_storage(ctype: ColType) -> crate::sql::ast::ColumnStorage {
-    if ctype.typlen() >= 0 || matches!(ctype, ColType::TsQuery) {
-        crate::sql::ast::ColumnStorage::Plain
-    } else {
-        crate::sql::ast::ColumnStorage::Extended
-    }
+    crate::sql::ast::ColumnStorage::from_code(ctype.physical_layout().storage)
+        .expect("captured PostgreSQL type storage policy is valid")
 }
 
 /// Storage and compression are catalog-visible schema properties. They are

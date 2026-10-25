@@ -55,8 +55,8 @@ impl ColumnAttributes {
     pub(crate) fn encoded_len(&self) -> usize { 2 + usize::from(self.count) * 8 }
 
     pub(crate) fn append(&self, output: &mut crate::mem::buffer::FixedBuf) -> bool {
-        output.append(&self.count.to_le_bytes())
-            && self.slots[..usize::from(self.count)].iter().all(|slot| output.append(&slot.encode()))
+        self.slots.get(..usize::from(self.count)).is_some_and(|slots|
+            output.append(&self.count.to_le_bytes()) && slots.iter().all(|slot| output.append(&slot.encode())))
     }
 
     pub(crate) fn decode(bytes: &[u8], at: &mut usize) -> Option<Self> {
@@ -157,6 +157,23 @@ fn exhausted() -> SqlError {
 mod tests {
     use super::*;
     use crate::sql::types::ColType;
+
+    #[test]
+    fn catalog_snapshot_dropped_attributes_still_count_toward_the_table_limit() {
+        let mut table = TableDef::empty();
+        table.n_columns = MAX_RELATION_COLUMNS;
+        table.attributes.initialize(MAX_RELATION_COLUMNS).unwrap();
+        let column = SqlName::parse("retained").unwrap();
+        table.columns[MAX_RELATION_COLUMNS - 1].name = column;
+        let mut mapping = [None; MAX_COLUMNS];
+        mapping[MAX_RELATION_COLUMNS - 1] = Some(column);
+        crate::mem::guard::forbid_alloc(|| {
+            let columns = [table.columns[MAX_RELATION_COLUMNS - 1], ColumnMeta::EMPTY];
+            assert_eq!(ColumnAttributes::rewrite(&table, &columns, &mapping).unwrap_err().sqlstate, sqlstate::TOO_MANY_COLUMNS);
+            assert!(table.attributes.validate(MAX_RELATION_COLUMNS));
+            assert_eq!(table.attribute_number(MAX_RELATION_COLUMNS - 1), MAX_RELATION_COLUMNS as u16);
+        });
+    }
 
     #[test]
     fn catalog_snapshot_column_numbers_survive_drop_rename_and_same_name_addition() {

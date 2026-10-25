@@ -137,6 +137,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
             record(writer, f"{prefix}.constraint.fresh.{name}", query)
 
         writer.execute("CREATE TABLE report_ordinal_diff(lost text,kept bigint NOT NULL,g bigint GENERATED ALWAYS AS (kept+1) STORED,CONSTRAINT ordinal_positive_diff CHECK(kept>0),CONSTRAINT ordinal_key_diff UNIQUE(kept))")
+        writer.execute("COMMENT ON COLUMN report_ordinal_diff.kept IS 'retained column'")
         reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         record(reader, f"{prefix}.constraint.ordinal.before", "SELECT pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE conname='ordinal_positive_diff'")
         writer.execute("ALTER TABLE report_ordinal_diff DROP COLUMN lost")
@@ -146,6 +147,9 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         record(writer, f"{prefix}.constraint.ordinal.attributes", "SELECT attname,attnum,atttypid,attlen,attbyval,attalign,attstorage,attcompression,atttypmod,attnotnull,attisdropped,attstattarget FROM pg_attribute WHERE attrelid='report_ordinal_diff'::regclass AND attnum>0 ORDER BY attnum")
         record(writer, f"{prefix}.constraint.ordinal.keys", "SELECT conname,conkey FROM pg_constraint WHERE conname IN ('ordinal_positive_diff','ordinal_key_diff') ORDER BY conname")
         record(writer, f"{prefix}.constraint.ordinal.width", "SELECT relnatts FROM pg_class WHERE oid='report_ordinal_diff'::regclass")
+        record(writer, f"{prefix}.constraint.ordinal.comments", "SELECT objsubid,description FROM pg_description WHERE objoid='report_ordinal_diff'::regclass")
+        record_outcome(writer, f"{prefix}.constraint.ordinal.comment_lookup", "SELECT col_description('report_ordinal_diff'::regclass,2)", ())
+        record_outcome(writer, f"{prefix}.constraint.ordinal.address", "SELECT (pg_identify_object('pg_class'::regclass,'report_ordinal_diff'::regclass,2)).identity", ())
         writer.execute("DROP TABLE report_ordinal_diff")
 
         writer.execute("BEGIN")

@@ -11530,11 +11530,6 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
     let (requested_schema, relation) = name
         .split_once('.')
         .map_or((None, name), |(schema, relation)| (Some(schema), relation));
-    if requested_schema.is_none_or(|schema| schema == "pg_catalog")
-        && let Some(oid) = catalog_relation_oid(relation)
-    {
-        return Some(oid);
-    }
     let current_temporary_schema = storage.temporary_schema().ok();
     let classified_schema = storage
         .classify_relation(requested_schema, relation, txid)
@@ -11553,6 +11548,10 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         }
         (None, schema) => schema,
     };
+    if schema.is_none_or(|schema| schema == "pg_catalog")
+        && let Some(oid) = catalog_relation_oid(relation) {
+        return Some(oid);
+    }
     match storage.resolve_relation(schema, relation, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
             return Some(table_oid(storage, slot));
@@ -11708,8 +11707,8 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 }
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
-    if catalog_relation_oid_by_oid(oid) {
-        return Some(true);
+    if let Some(name) = catalog_relation_name(oid) {
+        return Some(reloid_of_name(storage, txid, name) == Some(oid));
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid {
@@ -15982,16 +15981,21 @@ pub fn index_def_text<'a>(
         2683 => Some((
             "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)",
             &["loid", "pageno"][..],
+            (2613, "pg_largeobject"),
         )),
         2996 => Some((
             "CREATE UNIQUE INDEX pg_largeobject_metadata_oid_index ON pg_catalog.pg_largeobject_metadata USING btree (oid)",
             &["oid"][..],
+            (PG_LARGEOBJECT_METADATA_OID, "pg_largeobject_metadata"),
         )),
         _ => None,
     };
-    if let Some((definition, columns)) = builtin {
+    if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
-            Some(definition)
+            Some(if pretty && reloid_of_name(storage, txid, name) == Some(relation) {
+                let (before, after) = definition.split_once("pg_catalog.").expect("builtin definition names its schema");
+                arena.alloc_str_display(format_args!("{before}{after}")).map_err(|_| arena_full())?
+            } else { definition })
         } else {
             Some(col.checked_sub(1).and_then(|number| usize::try_from(number).ok()).and_then(|position| columns.get(position).copied()).unwrap_or(""))
         });
@@ -21244,6 +21248,13 @@ fn pg_depend<'a>(
                 .oid(),
         )),
     };
+    let referenced_column = |dependency: &crate::storage::StoredQueryDependency, column: usize| {
+        match dependency.class {
+            crate::storage::DependencyClass::Table => i32::from(storage.table_def(usize::from(dependency.slot), txid).attribute_number(column)),
+            crate::storage::DependencyClass::View => column as i32 + 1,
+            _ => unreachable!("only relation dependencies contain column positions"),
+        }
+    };
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
         push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
@@ -21271,7 +21282,7 @@ fn pg_depend<'a>(
                             rewrite_oid,
                             referenced_class,
                             referenced_object,
-                            column as i32 + 1,
+                            referenced_column(dependency, column),
                             "n",
                         )?;
                     }
@@ -21313,7 +21324,7 @@ fn pg_depend<'a>(
                             rule.oid(),
                             referenced_class,
                             referenced_object,
-                            column as i32 + 1,
+                            referenced_column(dependency, column),
                             "n",
                         )?;
                     }
@@ -21385,7 +21396,10 @@ fn pg_depend<'a>(
                     trigger_oid,
                     PG_CLASS_OID,
                     relation_oid,
-                    column as i32 + 1,
+                    match trigger.target {
+                        crate::storage::TriggerTarget::Table(slot) => i32::from(storage.table_def(usize::from(slot), txid).attribute_number(column)),
+                        crate::storage::TriggerTarget::View(_) => column as i32 + 1,
+                    },
                     "n",
                 )?;
             }
@@ -21447,7 +21461,13 @@ fn pg_depend<'a>(
                         clone_oid,
                         PG_CLASS_OID,
                         child_relation_oid,
-                        column as i32 + 1,
+                        {
+                            let parent = storage.table_def(parent_table, txid);
+                            let child = storage.table_def(child, txid);
+                            let column = child.column_index(parent.columns()[column].name.as_str())
+                                .expect("partition trigger column remains present in its child");
+                            i32::from(child.attribute_number(column))
+                        },
                         "n",
                     )?;
                 }
@@ -25702,6 +25722,14 @@ fn pg_trigger<'a>(
             let clone_oid = partition_trigger_oid(&trigger, child)?;
             let mut clone = [Datum::Null; 20];
             clone.copy_from_slice(rows[root_row]);
+            let parent_definition = storage.table_def(parent_table, txid);
+            let child_definition = storage.table_def(child, txid);
+            let mut columns = [0u16; MAX_COLUMNS];
+            for (target, parent_column) in columns[..update_count].iter_mut().zip(&update_columns[..update_count]) {
+                *target = child_definition.column_index(parent_definition.columns()[usize::from(*parent_column)].name.as_str())
+                    .expect("partition trigger column remains present in its child") as u16;
+            }
+            clone[15] = int2vector(&columns[..update_count], Some(&child_definition), arena)?;
             clone[1] = Datum::Int4(clone_oid);
             clone[2] = Datum::Int4(table_oid(storage, child));
             clone[3] = Datum::Int4(parent_oid);

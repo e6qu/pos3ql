@@ -1867,6 +1867,12 @@ impl From<BudgetError> for WalSetupError {
 }
 
 fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+    if let WalOp::CreateTable { definition, .. } = operation {
+        crate::storage::Storage::validate_not_null_names(definition)?;
+        if !definition.attributes.validate(definition.n_columns) {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "invalid column attribute layout before journaling"));
+        }
+    }
     let payload_len = encoded_payload_len(operation);
     let total = HEADER_LEN + payload_len;
     if buffer.capacity() - buffer.len() < total {

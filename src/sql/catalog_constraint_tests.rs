@@ -10,7 +10,7 @@ fn catalog_constraint_attributes_use_postgresql_physical_type_properties() {
          CREATE TABLE layout_columns (
            a boolean, b smallint, c bigint, d text, e bigint[], f smallint[],
            g layout_domain, h layout_domain[], i layout_enum,
-           j layout_enum[], k layout_record, l layout_record[])");
+           j layout_enum[], k layout_record, l layout_record[], m inet, n cidr, o point)");
     let result = run_with(&mut engine, &mut budget,
         "SELECT attname,attlen,attbyval,attalign,attstorage FROM pg_attribute
            WHERE attrelid='layout_columns'::regclass AND attnum>0 ORDER BY attnum");
@@ -19,6 +19,7 @@ fn catalog_constraint_attributes_use_postgresql_physical_type_properties() {
         "a|1|t|c|p", "b|2|t|s|p", "c|8|t|d|p", "d|-1|f|i|x",
         "e|-1|f|d|x", "f|-1|f|i|x", "g|8|t|d|p", "h|-1|f|d|x",
         "i|4|t|i|p", "j|-1|f|i|x", "k|-1|f|d|x", "l|-1|f|d|x",
+        "m|-1|f|i|m", "n|-1|f|i|m", "o|16|f|d|p",
     ]);
 }
 
@@ -63,6 +64,20 @@ NULL',0)",
 }
 
 #[test]
+fn catalog_constraint_default_identifiers_do_not_overlap_on_wide_tables() {
+    let config = test_config("constraint-default-identifiers");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let columns = (0..101).map(|column| format!("c{column} integer DEFAULT 1")).collect::<Vec<_>>().join(",");
+    session.success(&mut engine, &format!("CREATE TABLE wide_defaults({columns}); CREATE TABLE following_defaults(a integer DEFAULT 1)"), true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT count(*),count(DISTINCT oid) FROM pg_attrdef
+          WHERE adrelid IN ('wide_defaults'::regclass,'following_defaults'::regclass)", true)), ["102|102"]);
+}
+
+#[test]
 fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindings() {
     let mut config = test_config("constraint-attribute-numbers");
     config.transaction_mode = crate::config::TransactionMode::Mvcc;
@@ -74,7 +89,9 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
     writer.success(&mut engine,
         "CREATE TABLE ordinal_columns(lost text,kept bigint NOT NULL,
             g bigint GENERATED ALWAYS AS(kept+1) STORED,
-            CONSTRAINT ordinal_positive CHECK(kept>0), CONSTRAINT ordinal_key UNIQUE(kept))", true);
+            CONSTRAINT ordinal_positive CHECK(kept>0), CONSTRAINT ordinal_key UNIQUE(kept));
+         COMMENT ON COLUMN ordinal_columns.kept IS 'retained comment';
+         CREATE ROLE ordinal_reader; GRANT SELECT(kept) ON ordinal_columns TO ordinal_reader", true);
     let report = "SELECT pg_get_expr(conbin,conrelid,false) FROM pg_constraint WHERE conname='ordinal_positive'";
     assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)), ["(kept > 0)"]);
     writer.success(&mut engine, "ALTER TABLE ordinal_columns DROP COLUMN lost, ADD COLUMN fresh smallint", true);
@@ -86,6 +103,13 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
          SELECT relnatts FROM pg_class WHERE oid='ordinal_columns'::regclass", true)),
         ["........pg.dropped.1........|1|0|-1|f|i|t", "kept|2|20|8|t|d|f",
          "g|3|20|8|t|d|f", "fresh|4|21|2|t|s|f", "ordinal_key|{2}", "ordinal_positive|{2}", "4"]);
+    assert_eq!(data_rows(&writer.success(&mut engine,
+        "SELECT has_column_privilege('ordinal_reader','ordinal_columns',2::smallint,'SELECT'),
+                has_column_privilege('ordinal_reader','ordinal_columns',3::smallint,'SELECT'),
+                col_description('ordinal_columns'::regclass,2);
+         SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass;
+         SELECT (pg_identify_object('pg_class'::regclass,'ordinal_columns'::regclass,2)).identity", true)),
+        ["t|f|retained comment", "2|retained comment", "public.ordinal_columns.kept"]);
     reader.success(&mut engine, "ROLLBACK", true);
 }
 
@@ -159,6 +183,14 @@ fn catalog_constraint_index_columns_are_strict_and_cover_expressions_and_include
         pg_get_indexdef('expression_columns_index'::regclass,0,true),
         pg_get_indexdef('expression_columns_index'::regclass,1,true)", true)),
         ["CREATE INDEX expression_columns_index ON expression_columns USING btree ((x + 1)) INCLUDE (y)|(x + 1)"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT pg_get_indexdef(2683,0,true);
+         CREATE TABLE public.pg_largeobject(loid oid,pageno integer);
+         SET search_path=public,pg_catalog;
+         SELECT pg_get_indexdef(2683,0,true),pg_table_is_visible(2613);
+         RESET search_path", true)),
+        ["CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_largeobject USING btree (loid, pageno)",
+         "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)|f"]);
 }
 
 #[test]

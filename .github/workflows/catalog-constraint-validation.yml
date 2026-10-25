@@ -25,6 +25,8 @@ jobs:
       - name: Format on the runner
         run: cargo fmt --all
       - name: Selected report and catalog regressions
+        env:
+          RUST_BACKTRACE: "1"
         run: python3 tools/test_command.py cargo test --lib --locked -- catalog_snapshot catalog_constraint_ view_catalog_metadata_ key_preparation_recovery failed_rule_replay unsupported_record_versions compact_catalog_defaults typed_default_decoder --nocapture --test-threads=1
       - name: Lint all targets
         run: cargo clippy --all-targets -- -D warnings

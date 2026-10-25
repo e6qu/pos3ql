@@ -604,7 +604,7 @@ pub(super) fn dependencies<'a>(
         }
         for column in 0..table.n_columns {
             if referenced.contains(column) {
-                push(super::PG_CLASS_OID, index.oid, super::PG_CLASS_OID, index.table_oid, column as i32 + 1, b'a')?;
+                push(super::PG_CLASS_OID, index.oid, super::PG_CLASS_OID, index.table_oid, i32::from(table.attribute_number(column)), b'a')?;
             }
         }
     }

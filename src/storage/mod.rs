@@ -4291,8 +4291,9 @@ pub struct StoredQueryDependency {
     pub class: DependencyClass,
     pub slot: u16,
     pub identity: StoredDependencyIdentity,
-    /// One bit per referenced attribute (PostgreSQL attribute numbers start
-    /// at one, so bit zero represents attnum 1). Relation-only dependencies
+    /// One bit per referenced live column in the selected row schema.
+    /// Catalog output maps these positions to retained attribute numbers.
+    /// Relation-only dependencies
     /// retain zero; this avoids treating an unknown column set as every
     /// column when reconstructing catalog dependencies.
     pub referenced_columns: ColumnSet,

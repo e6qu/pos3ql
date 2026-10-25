@@ -147,9 +147,9 @@ pub(super) fn deparse<'a>(storage: &Storage, transaction: u32, node: &str, relat
         rest = next;
     }
     let source = rest.strip_prefix('\n').ok_or_else(corrupt)?;
-    if kind == "query" { return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "SQL routine body is not a scalar expression")); }
+    if kind == "query" { return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "input is a query, not an expression")); }
     if count != 0 && relation == 0 {
-        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "expression contains variables of more than one relation"));
+        return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "expression contains variables"));
     }
     if relation != 0 && !super::relation_oid_is_visible(storage, transaction, relation) { return Ok(None); }
     let slot = (0..storage.table_count()).find(|&slot| storage.table_slot_visible_to(slot, transaction)

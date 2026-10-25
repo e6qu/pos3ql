@@ -39375,7 +39375,7 @@ pub fn create_table_as(
             } else {
                 crate::sql::ast::Collation::None
             },
-            storage: crate::sql::ast::ColumnStorage::Plain,
+            storage: ddl::default_column_storage(ctype),
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
@@ -39392,6 +39392,7 @@ pub fn create_table_as(
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
     }
+    if let Err(error) = def.attributes.initialize(def.n_columns) { return sql_fail(error); }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
@@ -70122,7 +70123,7 @@ pub(crate) fn coerce<'a>(
         // Data errors (out of range, bad input syntax — class 22) keep their
         // specific message; only a genuine type mismatch is rewritten with the
         // column context.
-        if e.sqlstate.starts_with("22") {
+        if e.sqlstate.starts_with("22") || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED {
             e
         } else {
             sql_err!(

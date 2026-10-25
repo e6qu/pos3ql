@@ -22,6 +22,7 @@ pub(super) fn allocate(
     allocation: super::CatalogAllocation,
     creation: TableCreation,
 ) -> Result<usize, SqlError> {
+    super::constraint_names::table(&mut def)?;
     let transaction = match creation {
         TableCreation::Committed => 0,
         TableCreation::Pending(transaction) => transaction,

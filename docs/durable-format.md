@@ -89,6 +89,21 @@ array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
 Existing startup buffers remain fixed; exhaustion fails explicitly.
 
+Table columns and domains store their NOT NULL constraint names. Renaming
+`orders` to `sales` preserves `orders_id_not_null`; recovery keeps that same
+name. Manifest `col4` and `dom5` records include its hexadecimal name, and the
+journal stores its length and bytes. Nullable columns and domains store an
+empty name. A missing required name or an unexpected name is corrupt data.
+Domain journal payloads use marker 253 and reject earlier payload layouts.
+
+Retained catalog expressions use `pos3ql-catalog-expression-v1` nodes. They
+contain validated source spans and bound column numbers, so a retained CHECK
+can display a column's current name after a rename. Scalar expressions, lists,
+partition bounds and SQL routine bodies have separate node kinds. PostgreSQL's
+`pg_get_expr` interface renders expression nodes; SQL cannot supply raw
+`pg_node_tree` input. Node text is an internal format, not PostgreSQL's tree
+serialization.
+
 ## Format details for implementers
 
 The manifest header versions the catalog and root record grammar. Each `dsst`
@@ -331,7 +346,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 8.
+contracts share this encoding. Table definition payloads use version 9.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.

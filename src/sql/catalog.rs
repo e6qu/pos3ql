@@ -15003,6 +15003,7 @@ pub(crate) const FIRST_CHECK_OID: i32 = 20_000_000;
 pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 30_000_000;
 pub(crate) const FIRST_NOT_NULL_OID: i32 = 40_000_000;
 pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 110_000_000;
+pub(crate) const FIRST_DOMAIN_NOT_NULL_OID: i32 = 130_000_000;
 
 /// Constraint positions are durable catalog identities. Keep their OID
 /// arithmetic here so catalog rows, event triggers, and comments cannot drift
@@ -15076,7 +15077,7 @@ pub(crate) fn table_constraint_oid(
         .enumerate()
         .find(|(_, column)| {
             column.not_null.is_required()
-                && not_null_constraint_name(&table, column).as_str() == name
+                && not_null_constraint_name(column).as_str() == name
         })
         .map(|(index, _)| not_null_constraint_oid(table_slot, index))
 }
@@ -15118,7 +15119,7 @@ pub(crate) fn table_constraint_identity_by_oid(
         }
         for column in table.columns() {
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
+                let name = not_null_constraint_name(column);
                 if let Some(found) = candidate(name.as_str()) {
                     return Some(found);
                 }
@@ -19989,7 +19990,7 @@ fn pg_constraint_values<'a>(
         .sum::<usize>();
     let domain_constraints = (0..storage.domain_count())
         .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
-        .map(|slot| storage.domain_for(slot, txid).checks().len())
+        .map(|slot| { let domain = storage.domain_for(slot, txid); domain.checks().len() + usize::from(domain.not_null) })
         .sum::<usize>();
     let out = catalog_rows(
         arena,
@@ -20344,7 +20345,7 @@ fn pg_constraint_values<'a>(
                     "pg_constraint result exceeds static capacity"
                 ));
             }
-            let constraint_name = not_null_constraint_name(&table, column);
+            let constraint_name = not_null_constraint_name(column);
             out[n] = row(
                 &[
                     Datum::Int4(not_null_constraint_oid(slot, column_index)),
@@ -20426,6 +20427,21 @@ fn pg_constraint_values<'a>(
                 ],
                 arena,
             )?;
+            n += 1;
+        }
+        if domain.not_null {
+            if n == out.len() { return Err(catalog_capacity_exceeded("pg_constraint")); }
+            let name = domain.not_null_name.expect("stored domain NOT NULL constraint has a name");
+            out[n] = row(&[
+                Datum::Int4(FIRST_DOMAIN_NOT_NULL_OID + slot as i32), text(name.as_str(), arena)?,
+                Datum::Int4(0), Datum::Int4(domain_oid(slot)), text("n", arena)?,
+                Datum::Int4(0), Datum::Int4(0), Datum::Int4(0),
+                Datum::Bool(false), Datum::Bool(false), Datum::Bool(true), Datum::Bool(true), Datum::Bool(false),
+                text(" ", arena)?, text(" ", arena)?, Datum::Null, Datum::Null,
+                Datum::Int4(PG_CONSTRAINT_OID), Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                text(" ", arena)?, Datum::Bool(true), Datum::Int4(0), Datum::Bool(false),
+                Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null,
+            ], arena)?;
             n += 1;
         }
     }
@@ -22085,6 +22101,7 @@ fn pg_attribute<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -26085,9 +26102,9 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 match routine.oid {
                     2096 => Datum::Text("0"),
                     3577 | 3578 => Datum::Text("false"),
-                    3786 => Datum::Text("false false false"),
+                    3786 => Datum::Text("false, false, false"),
                     1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
-                        Datum::Text("'{}'::jsonb false")
+                        Datum::Text("'{}'::jsonb, false")
                     }
                     3960 | 3961 => Datum::Text("false"),
                     6212 => Datum::Text("0, 1"),
@@ -31113,13 +31130,8 @@ fn view_column_catalog_type(
     })
 }
 
-fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> StackStr<128> {
-    stack_format!(
-        128,
-        "{}_{}_not_null",
-        table.name.as_str(),
-        column.name.as_str()
-    )
+fn not_null_constraint_name(column: &ColumnMeta) -> SqlName {
+    column.not_null_name.expect("stored NOT NULL constraint has a durable name")
 }
 
 fn info_table_privileges<'a>(
@@ -31661,6 +31673,7 @@ fn info_column_privileges<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -31944,6 +31957,7 @@ fn info_column_type_usage<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,

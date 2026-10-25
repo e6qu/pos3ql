@@ -2478,6 +2478,7 @@ impl ColType {
             "anyarray" => Self::AnyArray,
             "int2vector" => Self::Int2Vector,
             "oidvector" => Self::OidVector,
+            "pg_node_tree" => Self::PgNodeTree,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,

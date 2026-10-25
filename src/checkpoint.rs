@@ -4000,6 +4000,11 @@ impl Checkpointer {
                             "invalid NOT NULL inheritance",
                         ));
                     }
+                    let not_null_text = hexstr(words.next(), "col NOT NULL name missing")?;
+                    let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
+                    if (not_null & 3 != 0) != not_null_name.is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid column NOT NULL name"));
+                    }
                     let type_mod: i32 = parse_field(words.next(), "col typmod")?;
                     let default_hex = words
                         .next()
@@ -4105,6 +4110,7 @@ impl Checkpointer {
                         not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
                             .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
                         not_null_inheritable: not_null_inheritable != 0,
+                        not_null_name,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
                         auto_increment: not_null & 16 != 0,
@@ -7289,9 +7295,6 @@ impl Checkpointer {
                             "invalid domain source lifetime",
                         ));
                     }
-                    let has_parent = true;
-                    let has_base_identity = true;
-                    let has_validation = true;
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -7306,28 +7309,22 @@ impl Checkpointer {
                     let base_code: u8 = parse_field(words.next(), "dom base")?;
                     let base_type_mod: i32 = parse_field(words.next(), "dom typmod")?;
                     let not_null: u8 = parse_field(words.next(), "dom notnull")?;
+                    if not_null > 1 { return Err(CheckpointSetupError::Corrupt("invalid domain NOT NULL flag")); }
                     let n_checks: usize = parse_field(words.next(), "dom nchecks")?;
                     if n_checks > crate::storage::MAX_DOMAIN_CHECKS {
                         return Err(CheckpointSetupError::Corrupt("too many domain checks"));
                     }
                     let schema = hexstr(words.next(), "dom schema missing")?;
                     let name = hexstr(words.next(), "dom name missing")?;
-                    let (base_domain, base_domain_schema) = if has_parent {
-                        (
-                            hexstr(words.next(), "dom base domain missing")?,
-                            hexstr(words.next(), "dom base domain schema missing")?,
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    };
-                    let (base_user_type, base_user_type_schema) = if has_base_identity {
-                        (
-                            hexstr(words.next(), "dom base type missing")?,
-                            hexstr(words.next(), "dom base type schema missing")?,
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    };
+                    let base_domain = hexstr(words.next(), "dom base domain missing")?;
+                    let base_domain_schema = hexstr(words.next(), "dom base domain schema missing")?;
+                    let base_user_type = hexstr(words.next(), "dom base type missing")?;
+                    let base_user_type_schema = hexstr(words.next(), "dom base type schema missing")?;
+                    let not_null_text = hexstr(words.next(), "dom NOT NULL name missing")?;
+                    let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
+                    if (not_null != 0) != not_null_name.is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid domain NOT NULL name"));
+                    }
                     let default_text = hexstr(words.next(), "dom default missing")?;
                     let base = crate::sql::types::ColType::from_code(base_code)
                         .ok_or(CheckpointSetupError::Corrupt("bad domain base type"))?;
@@ -7336,14 +7333,9 @@ impl Checkpointer {
                     for check in checks.iter_mut().take(n_checks) {
                         let cname = hexstr(words.next(), "dom check name missing")?;
                         let cexpr = hexstr(words.next(), "dom check expr missing")?;
-                        let validation = if has_validation {
-                            let code: u8 = parse_field(words.next(), "dom check validation")?;
-                            crate::storage::ConstraintValidation::from_code(code).ok_or(
-                                CheckpointSetupError::Corrupt("bad domain check validation"),
-                            )?
-                        } else {
-                            crate::storage::ConstraintValidation::EnforcedValidated
-                        };
+                        let code: u8 = parse_field(words.next(), "dom check validation")?;
+                        let validation = crate::storage::ConstraintValidation::from_code(code).ok_or(
+                            CheckpointSetupError::Corrupt("bad domain check validation"))?;
                         *check = crate::storage::CheckConstraint {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
@@ -7386,12 +7378,14 @@ impl Checkpointer {
                                 ));
                             }
                         };
+                    if words.next().is_some() { return Err(CheckpointSetupError::Corrupt("unexpected domain fields")); }
                     let spec = crate::storage::DomainSpec {
                         base_domain,
                         base_user_type,
                         base,
                         base_type_mod,
                         not_null: not_null != 0,
+                        not_null_name,
                         default_expr: (!default_text.is_empty())
                             .then(|| crate::util::StackStr::from_str(&default_text)),
                         checks,
@@ -9712,6 +9706,8 @@ impl Checkpointer {
                     .unwrap_or(""),
             );
             let _ = write!(line, " ");
+            hex(&mut line, d.not_null_name.as_ref().map_or("", |name| name.as_str()));
+            let _ = write!(line, " ");
             hex(
                 &mut line,
                 d.default_expr.as_ref().map(|e| e.as_str()).unwrap_or(""),
@@ -10010,13 +10006,18 @@ impl Checkpointer {
                         let _ = write!(domain_hex, "0");
                     }
                 }
+                let mut not_null_name_hex = StackStr::<128>::new();
+                if let Some(name) = c.not_null_name {
+                    for byte in name.as_str().as_bytes() { let _ = write!(not_null_name_hex, "{byte:02x}"); }
+                } else { let _ = write!(not_null_name_hex, "0"); }
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         u8::from(c.not_null_inheritable),
+                        not_null_name_hex.as_str(),
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
@@ -18651,6 +18652,7 @@ fn empty_column() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,

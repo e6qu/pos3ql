@@ -247,6 +247,7 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         && image.base == base
         && image.base_type_mod == type_mod
         && image.not_null == not_null
+        && image.not_null_name == pending.map_or(source.not_null_name, |pending| pending.spec.not_null_name)
         && image.default_expr == default
         && image.checks().len() == checks.len()
         && image.checks().iter().zip(checks).all(|(left, right)| {
@@ -756,6 +757,7 @@ mod tests {
                         base: ColType::Int4,
                         base_type_mod: -1,
                         not_null: true,
+                        not_null_name: None,
                         default_expr: None,
                         checks,
                         n_checks: 1,
@@ -1257,6 +1259,7 @@ mod tests {
                     base: ColType::Enum(0),
                     base_type_mod: -1,
                     not_null: false,
+                    not_null_name: None,
                     default_expr: None,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
@@ -1399,6 +1402,7 @@ mod tests {
                                     base: ColType::Int8,
                                     base_type_mod: -1,
                                     not_null: false,
+                                    not_null_name: None,
                                     default_expr: None,
                                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                                     n_checks: 0,
@@ -1593,6 +1597,7 @@ mod tests {
                         base: ColType::Int4,
                         base_type_mod: -1,
                         not_null: false,
+                        not_null_name: None,
                         default_expr: Some(crate::util::StackStr::from_str(marker)),
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,

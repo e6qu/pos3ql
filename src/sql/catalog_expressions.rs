@@ -13,7 +13,7 @@ const HEADER: &str = "pos3ql-catalog-expression-v1\n";
 struct Site { start: usize, end: usize, column: usize }
 
 #[derive(Clone, Copy)]
-enum Kind { Expression, List, Partition }
+enum Kind { Expression, List, Partition, Query }
 
 pub(super) fn current<'a>(storage: &Storage, transaction: u32, table: SynthTable<'a>, arena: &'a Arena)
     -> Result<SynthTable<'a>, SqlError> {
@@ -42,6 +42,7 @@ pub(super) fn current<'a>(storage: &Storage, transaction: u32, table: SynthTable
                 ("pg_class", "relpartbound") => (None, Kind::Partition),
                 ("pg_type", "typdefaultbin") => (None, Kind::Expression),
                 ("pg_proc", "proargdefaults") => (None, Kind::List),
+                ("pg_proc", "prosqlbody") => (None, Kind::Query),
                 _ => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "catalog expression {}.{} is not supported",
                     table.def.name.as_str(), column.name.as_str())),
             };
@@ -80,8 +81,8 @@ fn reference_start(source: &str, site: parser::ColumnSource<'_>, arena: &Arena) 
 fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     let mut output = ArenaString::new(arena);
     output.write_str(HEADER).map_err(|_| arena_full())?;
-    if matches!(kind, Kind::Partition) {
-        write!(output, "partition\n0\n\n{source}").map_err(|_| arena_full())?;
+    if matches!(kind, Kind::Partition | Kind::Query) {
+        write!(output, "{}\n0\n\n{source}", if matches!(kind, Kind::Partition) { "partition" } else { "query" }).map_err(|_| arena_full())?;
         return Ok(output.as_str());
     }
     let source = arena.alloc_str(source).map_err(|_| arena_full())?;
@@ -95,7 +96,7 @@ fn bind<'a>(source: &str, kind: Kind, table: Option<&TableDef>, arena: &'a Arena
             let (_, columns) = parser::parse_query_with_column_sources(query, arena)?;
             (query, columns.columns, 7)
         }
-        Kind::Partition => unreachable!("partition nodes have no column references"),
+        Kind::Partition | Kind::Query => unreachable!("non-expression nodes have no scalar column references"),
     };
     let sites = arena.alloc_slice_with(if table.is_some() { columns.len() } else { 0 }, |_| Site { start: 0, end: 0, column: 0 })
         .map_err(|_| arena_full())?;
@@ -128,10 +129,11 @@ pub(super) fn deparse<'a>(storage: &Storage, transaction: u32, node: &str, relat
     let body = node.strip_prefix(HEADER).ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
         "cannot accept a value of type pg_node_tree"))?;
     let (kind, rest) = body.split_once('\n').ok_or_else(corrupt)?;
-    if !matches!(kind, "expression" | "list" | "partition") { return Err(corrupt()); }
+    if !matches!(kind, "expression" | "list" | "partition" | "query") { return Err(corrupt()); }
     let (count, mut rest) = rest.split_once('\n').ok_or_else(corrupt)?;
     let count = count.parse::<usize>().map_err(|_| corrupt())?;
     if count > rest.len() { return Err(corrupt()); }
+    if matches!(kind, "partition" | "query") && count != 0 { return Err(corrupt()); }
     let sites = arena.alloc_slice_with(count, |_| Site { start: 0, end: 0, column: 0 }).map_err(|_| arena_full())?;
     for site in sites.iter_mut() {
         let (line, next) = rest.split_once('\n').ok_or_else(corrupt)?;
@@ -143,6 +145,7 @@ pub(super) fn deparse<'a>(storage: &Storage, transaction: u32, node: &str, relat
         rest = next;
     }
     let source = rest.strip_prefix('\n').ok_or_else(corrupt)?;
+    if kind == "query" { return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "SQL routine body is not a scalar expression")); }
     if count != 0 && relation == 0 {
         return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "expression contains variables of more than one relation"));
     }

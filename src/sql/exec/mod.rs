@@ -2849,6 +2849,7 @@ fn build_partitioned_table_def(
             def.schema =
                 storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
             for column in def.columns.iter_mut().take(def.n_columns) {
+                column.not_null_name = None;
                 column.not_null = if column.not_null.is_required() {
                     crate::storage::NotNullOrigin::Inherited
                 } else {
@@ -3744,6 +3745,7 @@ fn build_def_with_likes(
             let source = like_source(storage, like, txid)?;
             for column in source.columns() {
                 let mut copied = *column;
+                copied.not_null_name = None;
                 if !like.defaults && !copied.default.is_generated() {
                     copied.default = crate::storage::ColumnDefault::NONE;
                 }
@@ -39377,6 +39379,7 @@ pub fn create_table_as(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -41113,6 +41116,7 @@ fn build_domain_spec(
         base,
         base_type_mod,
         not_null,
+        not_null_name: None,
         default_expr,
         checks,
         n_checks: n,
@@ -42040,6 +42044,7 @@ pub fn alter_domain(
         base: current.base,
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
+        not_null_name: current.not_null_name,
         default_expr: current.default_expr,
         checks: current.checks,
         n_checks: current.n_checks,
@@ -46569,6 +46574,7 @@ fn rewrite_composite_dependent_domains(
             base: current.base,
             base_type_mod: current.base_type_mod,
             not_null: current.not_null,
+            not_null_name: current.not_null_name,
             default_expr: current.default_expr,
             checks: current.checks,
             n_checks: current.n_checks,
@@ -59135,6 +59141,7 @@ pub(crate) fn view_trigger_definition(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -70531,6 +70538,7 @@ fn coerce_composite_value_inner<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
             not_null_inheritable: true,
+            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,

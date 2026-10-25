@@ -2119,6 +2119,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,

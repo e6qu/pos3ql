@@ -107,6 +107,7 @@ mod transaction_admission;
 use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 mod statistics;
+mod constraint_names;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
@@ -1355,6 +1356,7 @@ pub struct ColumnMeta {
     /// catalog). It is retained separately from the object block codec.
     pub compression: crate::sql::ast::ColumnCompression,
     pub not_null: NotNullOrigin,
+    pub not_null_name: Option<SqlName>,
     /// Whether this column's local NOT NULL constraint participates in
     /// ordinary table inheritance. It is irrelevant for a nullable column.
     pub not_null_inheritable: bool,
@@ -1571,6 +1573,7 @@ impl ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -9524,6 +9527,7 @@ pub struct DomainDef {
     /// before the domain's own constraints.
     pub base_type_mod: i32,
     pub not_null: bool,
+    pub not_null_name: Option<SqlName>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -9557,6 +9561,7 @@ impl DomainDef {
         base: ColType::Bool,
         base_type_mod: -1,
         not_null: false,
+        not_null_name: None,
         default_expr: None,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
@@ -9585,6 +9590,7 @@ impl DomainDef {
                 base: pending.spec.base,
                 base_type_mod: pending.spec.base_type_mod,
                 not_null: pending.spec.not_null,
+                not_null_name: pending.spec.not_null_name,
                 default_expr: pending.spec.default_expr,
                 checks: pending.spec.checks,
                 n_checks: pending.spec.n_checks,
@@ -9603,6 +9609,7 @@ pub(crate) struct DomainSpec {
     pub base: ColType,
     pub base_type_mod: i32,
     pub not_null: bool,
+    pub not_null_name: Option<SqlName>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -39403,6 +39410,7 @@ impl Storage {
         txid: u32,
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
+        constraint_names::domain(name, &mut spec)?;
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
@@ -39444,6 +39452,7 @@ impl Storage {
             base: spec.base,
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
+            not_null_name: spec.not_null_name,
             default_expr: spec.default_expr,
             checks: spec.checks,
             n_checks: spec.n_checks,
@@ -39761,6 +39770,7 @@ impl Storage {
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
         let prior = domain.pending_definition;
+        constraint_names::domain(domain.definition_for(txid).name, &mut spec)?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -39824,6 +39834,7 @@ impl Storage {
                 base: domain.base,
                 base_type_mod: domain.base_type_mod,
                 not_null: domain.not_null,
+                not_null_name: domain.not_null_name,
                 default_expr: domain.default_expr,
                 checks: domain.checks,
                 n_checks: domain.n_checks,
@@ -55734,6 +55745,7 @@ mod tests {
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 not_null_inheritable: true,
+                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -57169,6 +57181,7 @@ mod tests {
                         base: ColType::Int4,
                         base_type_mod: -1,
                         not_null: false,
+                        not_null_name: None,
                         default_expr: None,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,

@@ -377,8 +377,10 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             // Simulator uploads own growing fixture vectors. SQL reads and
             // failed writes below still use the production allocation guard.
             session.success(&mut engine,
-                "CREATE TABLE saved_nulls(a integer,b integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
+                "CREATE TABLE saved_nulls(a integer NOT NULL,b integer,CONSTRAINT saved_nulls_key UNIQUE NULLS NOT DISTINCT(a,b));
+                 CREATE DOMAIN saved_domain AS integer NOT NULL;
                  BEGIN; ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
+                 ALTER DOMAIN saved_domain RENAME TO saved_renamed_domain;
                  INSERT INTO saved_renamed_nulls VALUES(1,NULL);
                  PREPARE TRANSACTION 'saved-null-mode'", false);
             if checkpoint {
@@ -401,6 +403,10 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                 ["saved_nulls|NO"]
             );
             assert_eq!(cold.journal_lsn(), recovered_journal);
+            assert_eq!(data_rows(&session.success(&mut cold,
+                "SELECT domain_name,constraint_name FROM information_schema.domain_constraints WHERE constraint_name='saved_domain_not_null';
+                 SELECT check_clause FROM information_schema.check_constraints WHERE constraint_name='saved_nulls_a_not_null'", true)),
+                ["saved_domain|saved_domain_not_null", "a IS NOT NULL"]);
             session.success(
                 &mut cold,
                 if commit {
@@ -419,6 +425,10 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                 data_rows(&session.success(&mut cold, metadata, true)),
                 [format!("{table}|NO")]
             );
+            assert_eq!(data_rows(&session.success(&mut cold,
+                "SELECT domain_name,constraint_name FROM information_schema.domain_constraints WHERE constraint_name='saved_domain_not_null';
+                 SELECT check_clause FROM information_schema.check_constraints WHERE constraint_name='saved_nulls_a_not_null'", true)),
+                [if commit { "saved_renamed_domain|saved_domain_not_null" } else { "saved_domain|saved_domain_not_null" }, "a IS NOT NULL"]);
             if !commit {
                 session.success(&mut cold, "INSERT INTO saved_nulls VALUES(1,NULL)", false);
             }

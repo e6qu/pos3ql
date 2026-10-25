@@ -253,8 +253,7 @@ wal_record_kinds! {
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
 const TABLE_DEF_PAYLOAD_VERSION: u8 = 9;
-const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
-const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
+const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 2;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -2909,6 +2908,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
+                n += 1 + c.not_null_name.map_or(0, |name| name.as_str().len());
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -3520,7 +3520,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 .base_user_type
                 .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
-            let mut n = 2
+            let mut n = 1 + def.not_null_name.map_or(0, |name| name.as_str().len()) + 2
                 + 8
                 + 1
                 + def.name.as_str().len()
@@ -4568,7 +4568,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             identity,
             definition: def,
         } => {
-            let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
+            let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
+                && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
                 && buffer.append(&identity.encode())
                 && name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -4607,6 +4608,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&[c.not_null.code()]);
                 ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+                ok &= name_bytes(buffer, c.not_null_name.as_ref().map_or("", |name| name.as_str()));
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
                 ok &= append_default(buffer, &default_value);
@@ -5642,11 +5644,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let base_name = def
                 .base_user_type
                 .map(crate::storage::UserTypeName::storage_name);
-            let mut ok = buffer.append(&slot.to_le_bytes())
+            let mut ok = def.not_null == def.not_null_name.is_some()
+                && buffer.append(&slot.to_le_bytes())
                 && buffer.append(&def.created_at.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION])
+                && buffer.append(&[DOMAIN_PAYLOAD_VERSION])
                 && name_bytes(
                     buffer,
                     parent_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
@@ -5673,6 +5676,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&domain_base_slot(def).to_le_bytes())
                 && buffer.append(&def.base_type_mod.to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
+                && name_bytes(buffer, def.not_null_name.as_ref().map_or("", |name| name.as_str()))
                 && buffer.append(&(de.len() as u16).to_le_bytes())
                 && buffer.append(de.as_bytes())
                 && buffer.append(&[def.n_checks as u8]);
@@ -7646,6 +7650,9 @@ fn decode_op_inner<'a>(
                     _ => return None,
                 };
                 at += 1;
+                let name = take_name(&mut at)?;
+                let not_null_name = if name.is_empty() { None } else { Some(SqlName::parse(name).ok()?) };
+                if not_null.is_required() != not_null_name.is_some() { return None; }
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
                 at += 4;
                 let default_value = decode_default(payload, &mut at)?;
@@ -7708,6 +7715,7 @@ fn decode_op_inner<'a>(
                     compression,
                     not_null,
                     not_null_inheritable,
+                    not_null_name,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -9719,10 +9727,7 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
-            if !matches!(
-                payload_version,
-                DOMAIN_PAYLOAD_WITH_BASE_SLOT | DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION
-            ) {
+            if payload_version != DOMAIN_PAYLOAD_VERSION {
                 return None;
             }
             at += 1;
@@ -9800,6 +9805,9 @@ fn decode_op_inner<'a>(
             at += 4;
             let not_null = stored_boolean(*payload.get(at)?)?;
             at += 1;
+            let not_null_text = take_name(&mut at)?;
+            let not_null_name = if not_null_text.is_empty() { None } else { Some(SqlName::parse(not_null_text).ok()?) };
+            if not_null != not_null_name.is_some() { return None; }
             let de_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let de = core::str::from_utf8(payload.get(at..at + de_len)?).ok()?;
@@ -9823,14 +9831,8 @@ fn decode_op_inner<'a>(
                 at += 2;
                 let expr = core::str::from_utf8(payload.get(at..at + elen)?).ok()?;
                 at += elen;
-                let validation = if payload_version == DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION {
-                    let validation =
-                        crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
-                    at += 1;
-                    validation
-                } else {
-                    crate::storage::ConstraintValidation::EnforcedValidated
-                };
+                let validation = crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
+                at += 1;
                 *check = crate::storage::CheckConstraint {
                     name: SqlName::parse(cname).ok()?,
                     expression: bounded_wal_text(expr)?,
@@ -9851,6 +9853,7 @@ fn decode_op_inner<'a>(
                 base,
                 base_type_mod,
                 not_null,
+                not_null_name,
                 default_expr,
                 checks,
                 n_checks,
@@ -14281,6 +14284,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
             not_null_inheritable: true,
+            not_null_name: None,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -14301,6 +14305,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -15938,7 +15943,7 @@ mod tests {
                 bytes.push(name.len() as u8);
                 bytes.extend_from_slice(name.as_bytes());
             }
-            bytes.extend_from_slice(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION, 0, 0, 0, 0]);
+            bytes.extend_from_slice(&[DOMAIN_PAYLOAD_VERSION, 0, 0, 0, 0]);
             bytes.push(ColType::Int4.code());
             bytes.extend_from_slice(&NO_DOMAIN_BASE_SLOT.to_le_bytes());
             bytes.extend_from_slice(&(-1_i32).to_le_bytes());
@@ -16001,7 +16006,7 @@ mod tests {
         let mut payload = Vec::new();
         push_name(&mut payload, "child");
         push_name(&mut payload, "public");
-        payload.push(DOMAIN_PAYLOAD_WITH_BASE_SLOT);
+        payload.push(u8::MAX);
         push_name(&mut payload, "parent");
         push_name(&mut payload, "");
         payload.push(ColType::Int4.code());

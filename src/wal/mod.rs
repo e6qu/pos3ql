@@ -7743,7 +7743,9 @@ fn decode_op_inner<'a>(
                 for position in 0..n {
                     let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
-                    if usize::from(column) >= def.n_columns || uk.columns[..position].contains(&column) {
+                    if usize::from(column) >= def.n_columns
+                        || uk.columns[..position].contains(&column)
+                    {
                         return None;
                     }
                     uk.columns[position] = column;

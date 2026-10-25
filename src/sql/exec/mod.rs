@@ -2860,7 +2860,11 @@ fn build_partitioned_table_def(
                 def.uniques[index].name = auto_key_name(
                     &def,
                     constraint.columns(),
-                    if constraint.kind.is_primary() { "pkey" } else { "key" },
+                    if constraint.kind.is_primary() {
+                        "pkey"
+                    } else {
+                        "key"
+                    },
                     !constraint.kind.is_primary(),
                 )?;
             }
@@ -4473,7 +4477,9 @@ fn unique_arbiter_matches(
     for uk in def.uniques() {
         if !uk.timing.is_deferrable() && same(uk.columns()) {
             matched = true;
-            if uk.kind.nulls_not_distinct() { return Some(true); }
+            if uk.kind.nulls_not_distinct() {
+                return Some(true);
+            }
         }
     }
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
@@ -4836,7 +4842,9 @@ fn find_conflict<'a>(
                                 }
                             }
                             for uk in def.uniques() {
-                                if !uk.timing.is_deferrable() && key_hit(uk.columns(), uk.kind.nulls_not_distinct())? {
+                                if !uk.timing.is_deferrable()
+                                    && key_hit(uk.columns(), uk.kind.nulls_not_distinct())?
+                                {
                                     return Ok(true);
                                 }
                             }
@@ -63530,8 +63538,8 @@ fn attach_constraint_using_index(
         ));
     }
     if index.descending[..index.n_cols]
-            .iter()
-            .any(|descending| *descending)
+        .iter()
+        .any(|descending| *descending)
         || index.nulls_first[..index.n_cols]
             .iter()
             .any(|nulls_first| *nulls_first)
@@ -63562,7 +63570,10 @@ fn attach_constraint_using_index(
     }
     if primary {
         if new_definition.columns().iter().any(|column| column.primary)
-            || new_definition.uniques().iter().any(|key| key.kind.is_primary())
+            || new_definition
+                .uniques()
+                .iter()
+                .any(|key| key.kind.is_primary())
         {
             return Err(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
@@ -63581,9 +63592,13 @@ fn attach_constraint_using_index(
         if primary { "pkey" } else { "key" },
         &index.columns,
         index.n_cols,
-        if primary { crate::storage::UniqueKeyKind::Primary }
-        else if index.nulls_not_distinct { crate::storage::UniqueKeyKind::UniqueNullsNotDistinct }
-        else { crate::storage::UniqueKeyKind::UniqueNullsDistinct },
+        if primary {
+            crate::storage::UniqueKeyKind::Primary
+        } else if index.nulls_not_distinct {
+            crate::storage::UniqueKeyKind::UniqueNullsNotDistinct
+        } else {
+            crate::storage::UniqueKeyKind::UniqueNullsDistinct
+        },
         timing,
     )?;
     stage_index_rename(storage, wal, txn, slot, constraint_name)
@@ -63891,28 +63906,52 @@ fn drop_column_constraints(
 
 /// Rewritten rows use the same collations and NULL equality modes as ordinary
 /// writes. Comparison errors must stop the rewrite before it is journaled.
-fn rewritten_dup_name(storage: &Storage, transaction: u32, new_def: &TableDef, a: &[Datum], b: &[Datum]) -> Result<Option<SqlName>, SqlError> {
+fn rewritten_dup_name(
+    storage: &Storage,
+    transaction: u32,
+    new_def: &TableDef,
+    a: &[Datum],
+    b: &[Datum],
+) -> Result<Option<SqlName>, SqlError> {
     let matches_key = |columns: &[u16], nulls_not_distinct: bool| -> Result<bool, SqlError> {
         if columns.len() > crate::storage::MAX_INDEX_COLS {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "rewritten unique key exceeds its column capacity"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewritten unique key exceeds its column capacity"
+            ));
         }
         let mut left = [Datum::Null; crate::storage::MAX_INDEX_COLS];
         let mut right = [Datum::Null; crate::storage::MAX_INDEX_COLS];
         let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
         for (position, &column) in columns.iter().enumerate() {
             let column = usize::from(column);
-            let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "rewritten unique key column is unavailable");
+            let invalid = || {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "rewritten unique key column is unavailable"
+                )
+            };
             left[position] = *a.get(column).ok_or_else(invalid)?;
             right[position] = *b.get(column).ok_or_else(invalid)?;
             collations[position] = new_def.columns().get(column).ok_or_else(invalid)?.collation;
         }
-        constraints::key_values_equal(storage, transaction, &collations[..columns.len()],
-            &left[..columns.len()], &right[..columns.len()], nulls_not_distinct)
+        constraints::key_values_equal(
+            storage,
+            transaction,
+            &collations[..columns.len()],
+            &left[..columns.len()],
+            &right[..columns.len()],
+            nulls_not_distinct,
+        )
     };
     for (i, c) in new_def.columns().iter().enumerate() {
         if c.unique && matches_key(&[i as u16], false)? {
-            return Ok(Some(auto_key_name(new_def, &[i as u16],
-                if c.primary { "pkey" } else { "key" }, !c.primary)?));
+            return Ok(Some(auto_key_name(
+                new_def,
+                &[i as u16],
+                if c.primary { "pkey" } else { "key" },
+                !c.primary,
+            )?));
         }
     }
     for uk in new_def.uniques() {
@@ -64454,7 +64493,8 @@ fn inherit_partition_constraints(
         // copying the parent's name would collide because index names are
         // schema-wide and makes pg_dump emit self-referential INDEX ATTACHes.
         if child.uniques().iter().any(|existing| {
-            existing.kind == constraint.kind && existing.timing == constraint.timing
+            existing.kind == constraint.kind
+                && existing.timing == constraint.timing
                 && existing.columns() == &columns[..constraint.n_cols]
         }) {
             continue;
@@ -64470,7 +64510,11 @@ fn inherit_partition_constraints(
         inherited.name = auto_key_name(
             child,
             &columns[..constraint.n_cols],
-            if constraint.kind.is_primary() { "pkey" } else { "key" },
+            if constraint.kind.is_primary() {
+                "pkey"
+            } else {
+                "key"
+            },
             !constraint.kind.is_primary(),
         )?;
         child.uniques[child.n_uniques] = inherited;
@@ -64569,7 +64613,12 @@ fn inherit_partition_constraints(
     Ok(())
 }
 
-fn has_unique_identity(definition: &TableDef, columns: &[u16], kind: crate::storage::UniqueKeyKind, timing: crate::storage::ConstraintTiming) -> bool {
+fn has_unique_identity(
+    definition: &TableDef,
+    columns: &[u16],
+    kind: crate::storage::UniqueKeyKind,
+    timing: crate::storage::ConstraintTiming,
+) -> bool {
     definition
         .columns()
         .iter()
@@ -64579,7 +64628,9 @@ fn has_unique_identity(definition: &TableDef, columns: &[u16], kind: crate::stor
                 && timing == crate::storage::ConstraintTiming::NotDeferrable
                 && match kind {
                     crate::storage::UniqueKeyKind::Primary => metadata.primary,
-                    crate::storage::UniqueKeyKind::UniqueNullsDistinct => metadata.unique && !metadata.primary,
+                    crate::storage::UniqueKeyKind::UniqueNullsDistinct => {
+                        metadata.unique && !metadata.primary
+                    }
                     crate::storage::UniqueKeyKind::UniqueNullsNotDistinct => false,
                 }
         })
@@ -64589,7 +64640,12 @@ fn has_unique_identity(definition: &TableDef, columns: &[u16], kind: crate::stor
             .any(|key| key.kind == kind && key.timing == timing && key.columns() == columns)
 }
 
-fn drop_unique_identity(definition: &mut TableDef, columns: &[u16], kind: crate::storage::UniqueKeyKind, timing: crate::storage::ConstraintTiming) -> bool {
+fn drop_unique_identity(
+    definition: &mut TableDef,
+    columns: &[u16],
+    kind: crate::storage::UniqueKeyKind,
+    timing: crate::storage::ConstraintTiming,
+) -> bool {
     if columns.len() == 1 && timing == crate::storage::ConstraintTiming::NotDeferrable {
         let metadata = &mut definition.columns[usize::from(columns[0])];
         if kind.is_primary() && metadata.primary {
@@ -64597,7 +64653,10 @@ fn drop_unique_identity(definition: &mut TableDef, columns: &[u16], kind: crate:
             metadata.unique = false;
             return true;
         }
-        if kind == crate::storage::UniqueKeyKind::UniqueNullsDistinct && metadata.unique && !metadata.primary {
+        if kind == crate::storage::UniqueKeyKind::UniqueNullsDistinct
+            && metadata.unique
+            && !metadata.primary
+        {
             metadata.unique = false;
             return true;
         }
@@ -64653,13 +64712,35 @@ fn synchronize_inherited_constraint_changes(
                 "partition is missing an inherited column"
             )
         })? as u16;
-        if metadata.primary && !has_unique_identity(new_parent, &[column as u16], crate::storage::UniqueKeyKind::Primary, crate::storage::ConstraintTiming::NotDeferrable) {
-            changed |= drop_unique_identity(child, &[child_column], crate::storage::UniqueKeyKind::Primary, crate::storage::ConstraintTiming::NotDeferrable);
+        if metadata.primary
+            && !has_unique_identity(
+                new_parent,
+                &[column as u16],
+                crate::storage::UniqueKeyKind::Primary,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            )
+        {
+            changed |= drop_unique_identity(
+                child,
+                &[child_column],
+                crate::storage::UniqueKeyKind::Primary,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            );
         } else if metadata.unique
             && !metadata.primary
-            && !has_unique_identity(new_parent, &[column as u16], crate::storage::UniqueKeyKind::UniqueNullsDistinct, crate::storage::ConstraintTiming::NotDeferrable)
+            && !has_unique_identity(
+                new_parent,
+                &[column as u16],
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            )
         {
-            changed |= drop_unique_identity(child, &[child_column], crate::storage::UniqueKeyKind::UniqueNullsDistinct, crate::storage::ConstraintTiming::NotDeferrable);
+            changed |= drop_unique_identity(
+                child,
+                &[child_column],
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            );
         }
     }
     for key in old_parent.uniques() {
@@ -69058,8 +69139,11 @@ fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
             if metadata.primary { "pkey" } else { "key" },
             &indices,
             1,
-            if metadata.primary { crate::storage::UniqueKeyKind::Primary }
-            else { crate::storage::UniqueKeyKind::UniqueNullsDistinct },
+            if metadata.primary {
+                crate::storage::UniqueKeyKind::Primary
+            } else {
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct
+            },
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
         def.columns[column].primary = false;
@@ -69103,8 +69187,11 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
                 if was_primary { "pkey" } else { "key" },
                 &indices,
                 1,
-                if was_primary { crate::storage::UniqueKeyKind::Primary }
-                else { crate::storage::UniqueKeyKind::UniqueNullsDistinct },
+                if was_primary {
+                    crate::storage::UniqueKeyKind::Primary
+                } else {
+                    crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                },
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
             return Ok(true);

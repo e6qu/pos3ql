@@ -10874,12 +10874,7 @@ struct IdxInfo {
     explicit_definition: Option<crate::storage::IndexMutableDefinition>,
 }
 
-fn parent_constraint_oid(
-    storage: &Storage,
-    txid: u32,
-    child_slot: usize,
-    index: &IdxInfo,
-) -> i32 {
+fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index: &IdxInfo) -> i32 {
     let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
         return 0;
     };
@@ -10891,14 +10886,22 @@ fn parent_constraint_oid(
     let mut position = 0usize;
     for (column, metadata) in parent.columns().iter().enumerate() {
         if metadata.primary {
-            if !is_exclusion && is_primary && index.timing == crate::storage::ConstraintTiming::NotDeferrable && columns == [column as u16] {
+            if !is_exclusion
+                && is_primary
+                && index.timing == crate::storage::ConstraintTiming::NotDeferrable
+                && columns == [column as u16]
+            {
                 return index_oid(parent_slot, position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         } else if metadata.unique {
-            if !is_exclusion && !is_primary && !index.nulls_not_distinct
-                && index.timing == crate::storage::ConstraintTiming::NotDeferrable && columns == [column as u16] {
+            if !is_exclusion
+                && !is_primary
+                && !index.nulls_not_distinct
+                && index.timing == crate::storage::ConstraintTiming::NotDeferrable
+                && columns == [column as u16]
+            {
                 return index_oid(parent_slot, position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
@@ -10906,9 +10909,12 @@ fn parent_constraint_oid(
         }
     }
     for unique in parent.uniques() {
-        if !is_exclusion && unique.kind.is_primary() == is_primary
+        if !is_exclusion
+            && unique.kind.is_primary() == is_primary
             && (is_primary || unique.kind.nulls_not_distinct() == index.nulls_not_distinct)
-            && unique.timing == index.timing && unique.columns() == columns {
+            && unique.timing == index.timing
+            && unique.columns() == columns
+        {
             return index_oid(parent_slot, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;

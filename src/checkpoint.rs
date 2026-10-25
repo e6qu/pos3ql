@@ -5304,7 +5304,9 @@ impl Checkpointer {
                         *c = parse_field(words.next(), "ukey col")?;
                     }
                     for (position, column) in uk.columns[..n_cols].iter().enumerate() {
-                        if usize::from(*column) >= def.n_columns || uk.columns[..position].contains(column) {
+                        if usize::from(*column) >= def.n_columns
+                            || uk.columns[..position].contains(column)
+                        {
                             return Err(CheckpointSetupError::Corrupt("bad ukey column"));
                         }
                     }

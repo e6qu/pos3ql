@@ -732,7 +732,9 @@ pub(super) fn attach_constraints(
     // looking only at the columns would miss one a `LIKE ... INCLUDING INDEXES`
     // had already copied in and let the table end up with two.
     let mut has_primary = def.columns().iter().any(|c| c.primary)
-        || def.uniques[..def.n_uniques].iter().any(|k| k.kind.is_primary());
+        || def.uniques[..def.n_uniques]
+            .iter()
+            .any(|k| k.kind.is_primary());
     for con in constraints {
         match con {
             TableConstraint::PrimaryKey {
@@ -772,7 +774,15 @@ pub(super) fn attach_constraints(
                             def.name.as_str()
                         ));
                     }
-                    add_unique_key(def, *name, "pkey", &indices, n, crate::storage::UniqueKeyKind::Primary, *timing)?;
+                    add_unique_key(
+                        def,
+                        *name,
+                        "pkey",
+                        &indices,
+                        n,
+                        crate::storage::UniqueKeyKind::Primary,
+                        *timing,
+                    )?;
                 }
             }
             TableConstraint::Unique {
@@ -789,13 +799,19 @@ pub(super) fn attach_constraints(
                     && (def.columns[indices[0] as usize].unique
                         || def.columns[indices[0] as usize].primary);
                 let equivalent_key = def.uniques().iter().any(|key| {
-                    !key.kind.is_primary() && key.kind.nulls_not_distinct() == *nulls_not_distinct
-                        && key.timing == stored_timing && key.columns() == &indices[..n]
+                    !key.kind.is_primary()
+                        && key.kind.nulls_not_distinct() == *nulls_not_distinct
+                        && key.timing == stored_timing
+                        && key.columns() == &indices[..n]
                 });
                 if merge_equivalent && (equivalent_flag || equivalent_key) {
                     continue;
                 }
-                if n == 1 && name.is_none() && !stored_timing.is_deferrable() && !*nulls_not_distinct {
+                if n == 1
+                    && name.is_none()
+                    && !stored_timing.is_deferrable()
+                    && !*nulls_not_distinct
+                {
                     def.columns[indices[0] as usize].unique = true;
                 } else {
                     if !merge_equivalent
@@ -811,7 +827,9 @@ pub(super) fn attach_constraints(
                     }
                     let kind = if *nulls_not_distinct {
                         crate::storage::UniqueKeyKind::UniqueNullsNotDistinct
-                    } else { crate::storage::UniqueKeyKind::UniqueNullsDistinct };
+                    } else {
+                        crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                    };
                     add_unique_key(def, *name, "key", &indices, n, kind, *timing)?;
                 }
             }

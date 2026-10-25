@@ -1719,9 +1719,15 @@ pub enum UniqueKeyKind {
 }
 
 impl UniqueKeyKind {
-    pub const fn is_primary(self) -> bool { matches!(self, Self::Primary) }
-    pub const fn nulls_not_distinct(self) -> bool { matches!(self, Self::UniqueNullsNotDistinct) }
-    pub const fn code(self) -> u8 { self as u8 }
+    pub const fn is_primary(self) -> bool {
+        matches!(self, Self::Primary)
+    }
+    pub const fn nulls_not_distinct(self) -> bool {
+        matches!(self, Self::UniqueNullsNotDistinct)
+    }
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::UniqueNullsDistinct),
@@ -22031,6 +22037,14 @@ impl Storage {
             allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
+        if result.is_ok() {
+            // Replay installs already journaled definitions through the same
+            // cache builders as DDL. Their index hints still need checkpointing,
+            // but must not turn the first client read into another WAL write.
+            for table in &self.tables {
+                table.statistics.clear_wal();
+            }
+        }
         result
     }
 
@@ -46166,16 +46180,6 @@ impl Storage {
             .get(slot)
             .copied()
             .filter(|tablespace| tablespace.visible_to(txid))
-    }
-
-    pub(crate) fn tablespace_name(&self, id: u16, txid: u32) -> Option<SqlName> {
-        match id {
-            0 => SqlName::parse("pg_default").ok(),
-            1 => SqlName::parse("pg_global").ok(),
-            _ => self
-                .tablespace_by_id(id, txid)
-                .map(|tablespace| tablespace.name_for(txid)),
-        }
     }
 
     pub(crate) fn tablespace_id(&self, name: &str, txid: u32) -> Option<u16> {

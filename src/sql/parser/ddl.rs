@@ -8279,7 +8279,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn unique_nulls_not_distinct(&mut self) -> Result<bool, ParseError> {
-        if !self.eat_ident("nulls")? { return Ok(false); }
+        if !self.eat_ident("nulls")? {
+            return Ok(false);
+        }
         let not_distinct = self.eat_ident("not")?;
         self.expect_ident("distinct")?;
         Ok(not_distinct)

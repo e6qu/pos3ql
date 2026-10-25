@@ -114,10 +114,15 @@ fn catalog_constraint_reports_use_postgresql_visibility_and_declared_types() {
 
 #[test]
 fn catalog_constraint_null_modes_cover_writes_conflicts_like_and_rewrites() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config("constraint-null-modes");
         config.transaction_mode = mode;
-        if matches!(mode, crate::config::TransactionMode::Locking) { config.catalog_history_bytes = 0; }
+        if matches!(mode, crate::config::TransactionMode::Locking) {
+            config.catalog_history_bytes = 0;
+        }
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
@@ -127,8 +132,14 @@ fn catalog_constraint_null_modes_cover_writes_conflicts_like_and_rewrites() {
              INSERT INTO null_distinct VALUES(NULL),(NULL);
              CREATE TABLE null_equal(a integer,b integer,CONSTRAINT null_equal_key UNIQUE NULLS NOT DISTINCT(a,b));
              INSERT INTO null_equal VALUES(1,NULL)", true);
-        assert_eq!(error_sqlstates(&session.execute(&mut engine,
-            "INSERT INTO null_equal VALUES(1,NULL)", true)), ["23505"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "INSERT INTO null_equal VALUES(1,NULL)",
+                true
+            )),
+            ["23505"]
+        );
         assert_eq!(data_rows(&session.success(&mut engine,
             "INSERT INTO null_equal VALUES(1,NULL) ON CONFLICT ON CONSTRAINT null_equal_key DO UPDATE SET b=excluded.b RETURNING a;
              SELECT count(*) FROM null_equal", true)), ["1", "1"]);
@@ -138,18 +149,42 @@ fn catalog_constraint_null_modes_cover_writes_conflicts_like_and_rewrites() {
              INSERT INTO null_overlap VALUES(NULL) ON CONFLICT(a) DO UPDATE SET a=excluded.a;
              CREATE TABLE null_clone(LIKE null_equal INCLUDING INDEXES);
              INSERT INTO null_clone VALUES(1,NULL)", true);
-        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_overlap", true)), ["1"]);
-        assert_eq!(error_sqlstates(&session.execute(&mut engine,
-            "INSERT INTO null_clone VALUES(1,NULL)", true)), ["23505"]);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "SELECT nulls_distinct FROM information_schema.table_constraints
-             WHERE table_name='null_clone' AND constraint_type='UNIQUE'", true)), ["NO"]);
-        session.success(&mut engine,
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_overlap", true)),
+            ["1"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "INSERT INTO null_clone VALUES(1,NULL)",
+                true
+            )),
+            ["23505"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nulls_distinct FROM information_schema.table_constraints
+             WHERE table_name='null_clone' AND constraint_type='UNIQUE'",
+                true
+            )),
+            ["NO"]
+        );
+        session.success(
+            &mut engine,
             "CREATE TABLE null_rewrite(a integer,b integer);
-             INSERT INTO null_rewrite VALUES(1,NULL),(2,NULL)", true);
-        assert_eq!(error_sqlstates(&session.execute(&mut engine,
-            "ALTER TABLE null_rewrite ALTER COLUMN a TYPE bigint USING 0,
-             ADD CONSTRAINT null_rewrite_key UNIQUE NULLS NOT DISTINCT(a,b)", true)), ["23505"]);
+             INSERT INTO null_rewrite VALUES(1,NULL),(2,NULL)",
+            true,
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "ALTER TABLE null_rewrite ALTER COLUMN a TYPE bigint USING 0,
+             ADD CONSTRAINT null_rewrite_key UNIQUE NULLS NOT DISTINCT(a,b)",
+                true
+            )),
+            ["23505"]
+        );
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT a FROM null_rewrite ORDER BY a;
              SELECT count(*) FROM information_schema.table_constraints WHERE constraint_name='null_rewrite_key'", true)),
@@ -159,10 +194,15 @@ fn catalog_constraint_null_modes_cover_writes_conflicts_like_and_rewrites() {
 
 #[test]
 fn catalog_constraint_null_modes_keep_deferred_savepoint_semantics() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config("constraint-null-deferred");
         config.transaction_mode = mode;
-        if matches!(mode, crate::config::TransactionMode::Locking) { config.catalog_history_bytes = 0; }
+        if matches!(mode, crate::config::TransactionMode::Locking) {
+            config.catalog_history_bytes = 0;
+        }
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
@@ -170,13 +210,25 @@ fn catalog_constraint_null_modes_keep_deferred_savepoint_semantics() {
         session.success(&mut engine,
             "CREATE TABLE null_deferred(a integer CONSTRAINT null_deferred_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED);
              BEGIN; INSERT INTO null_deferred VALUES(NULL),(NULL)", true);
-        assert_eq!(error_sqlstates(&session.execute(&mut engine, "COMMIT", true)), ["23505"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
+            ["23505"]
+        );
         session.success(&mut engine, "ROLLBACK", true);
-        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_deferred", true)), ["0"]);
-        session.success(&mut engine,
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_deferred", true)),
+            ["0"]
+        );
+        session.success(
+            &mut engine,
             "BEGIN; INSERT INTO null_deferred VALUES(NULL); SAVEPOINT before_duplicate;
-             INSERT INTO null_deferred VALUES(NULL); ROLLBACK TO before_duplicate; COMMIT", true);
-        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_deferred", true)), ["1"]);
+             INSERT INTO null_deferred VALUES(NULL); ROLLBACK TO before_duplicate; COMMIT",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM null_deferred", true)),
+            ["1"]
+        );
     }
 }
 
@@ -204,27 +256,63 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                  BEGIN; ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
                  INSERT INTO saved_renamed_nulls VALUES(1,NULL);
                  PREPARE TRANSACTION 'saved-null-mode'", false);
-            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
             drop(session);
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
             let mut cold = Engine::new(&config, &mut cold_budget)
                 .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            for slot in 0..cold.storage.table_count() {
+                assert!(!cold.storage.statistics_wal_dirty(slot), "{name}: table {slot}");
+            }
+            let recovered_journal = cold.journal_lsn();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             let metadata = "SELECT table_name,nulls_distinct FROM information_schema.table_constraints WHERE constraint_name='saved_nulls_key'";
-            assert_eq!(data_rows(&session.success(&mut cold, metadata, true)), ["saved_nulls|NO"]);
-            session.success(&mut cold, if commit { "COMMIT PREPARED 'saved-null-mode'" }
-                else { "ROLLBACK PREPARED 'saved-null-mode'" }, false);
-            let table = if commit { "saved_renamed_nulls" } else { "saved_nulls" };
-            assert_eq!(data_rows(&session.success(&mut cold, metadata, true)), [format!("{table}|NO")]);
+            assert_eq!(
+                data_rows(&session.success(&mut cold, metadata, true)),
+                ["saved_nulls|NO"]
+            );
+            assert_eq!(cold.journal_lsn(), recovered_journal);
+            session.success(
+                &mut cold,
+                if commit {
+                    "COMMIT PREPARED 'saved-null-mode'"
+                } else {
+                    "ROLLBACK PREPARED 'saved-null-mode'"
+                },
+                false,
+            );
+            let table = if commit {
+                "saved_renamed_nulls"
+            } else {
+                "saved_nulls"
+            };
+            assert_eq!(
+                data_rows(&session.success(&mut cold, metadata, true)),
+                [format!("{table}|NO")]
+            );
             if !commit {
                 session.success(&mut cold, "INSERT INTO saved_nulls VALUES(1,NULL)", false);
             }
-            assert_eq!(error_sqlstates(&session.execute(&mut cold,
-                &format!("INSERT INTO {table} VALUES(1,NULL)"), true)), ["23505"]);
-            assert_eq!(data_rows(&session.success(&mut cold,
-                &format!("SELECT count(*) FROM {table}"), true)), ["1"]);
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    &format!("INSERT INTO {table} VALUES(1,NULL)"),
+                    true
+                )),
+                ["23505"]
+            );
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    &format!("SELECT count(*) FROM {table}"),
+                    true
+                )),
+                ["1"]
+            );
             drop(session);
             drop(cold);
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

@@ -81,6 +81,9 @@ impl Storage {
             || schema.pending_name.map_or(schema.version, |pending| pending.version) != target.version {
             return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "schema name changed after edit preparation"));
         }
+        if name == schema.name_for(target.transaction) {
+            return Err(sql_err!(sqlstate::DUPLICATE_SCHEMA, "schema \"{}\" already exists", name.as_str()));
+        }
         for (slot, other) in schemas.iter().enumerate() {
             if slot == target.slot || other.database != target.database { continue; }
             let reserves_name = other.name == name || other.pending_name.is_some_and(|pending| pending.name == name);

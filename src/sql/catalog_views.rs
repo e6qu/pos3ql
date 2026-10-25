@@ -33,6 +33,9 @@ pub(super) enum Base {
     RoleMembers,
     Procedure,
     Language,
+    Database,
+    ForeignDataWrapper,
+    ForeignServer,
 }
 
 pub(super) fn indexes<'a>(
@@ -139,6 +142,9 @@ impl Read {
             Base::RoleMembers => "pg_auth_members",
             Base::Procedure => "pg_proc",
             Base::Language => "pg_language",
+            Base::Database => "pg_database",
+            Base::ForeignDataWrapper => "pg_foreign_data_wrapper",
+            Base::ForeignServer => "pg_foreign_server",
         };
         match self {
             Self::Statement => super::synthesize(

@@ -1492,7 +1492,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("increment", ColType::Varchar),
             ("cycle_option", ColType::Varchar),
         ],
-        (true, "usage_privileges") => &[
+        (true, "usage_privileges" | "role_usage_grants") => &[
             ("grantor", ColType::Name),
             ("grantee", ColType::Name),
             ("object_catalog", ColType::Name),
@@ -1746,6 +1746,7 @@ mod tests {
             "constraint_table_usage",
             "sequences",
             "usage_privileges",
+            "role_usage_grants",
             "table_privileges",
             "role_table_grants",
             "column_privileges",

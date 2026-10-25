@@ -48,6 +48,50 @@ fn catalog_snapshot_default_acls_keep_missing_owner_identifiers() {
 }
 
 #[test]
+fn catalog_snapshot_column_grants_union_before_calculating_owner_grant_options() {
+    let config = test_config("snapshot-column-grants");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE ROLE snapshot_column_reader;
+        CREATE TABLE snapshot_column_grants(id integer,payload text);
+        GRANT SELECT ON snapshot_column_grants TO snapshot_column_reader;
+        GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader", true);
+    let report = "SELECT column_name,is_grantable FROM information_schema.column_privileges
+        WHERE table_name='snapshot_column_grants' AND grantee='snapshot_column_reader' ORDER BY column_name,is_grantable";
+    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|NO", "payload|NO"]);
+    session.success(&mut engine, "GRANT SELECT(id) ON snapshot_column_grants TO snapshot_column_reader WITH GRANT OPTION", true);
+    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|NO", "id|YES", "payload|NO"]);
+    session.success(&mut engine, "GRANT postgres TO snapshot_column_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, report, true)), ["id|YES", "id|YES", "payload|YES"]);
+}
+
+#[test]
+fn catalog_snapshot_usage_reports_include_domains_collations_and_sequence_acl_rows() {
+    let config = test_config("snapshot-usage-grants");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE ROLE snapshot_usage_reader;
+        CREATE DOMAIN snapshot_usage_domain AS integer;
+        CREATE COLLATION snapshot_usage_collation FROM \"C\";
+        CREATE SEQUENCE snapshot_usage_sequence", true);
+    let report = "SELECT object_name,object_type,grantee,is_grantable FROM information_schema.usage_privileges
+        WHERE object_name LIKE 'snapshot_usage_%' ORDER BY object_name,grantee";
+    assert_eq!(data_rows(&session.success(&mut engine, report, true)), [
+        "snapshot_usage_collation|COLLATION|PUBLIC|NO",
+        "snapshot_usage_domain|DOMAIN|PUBLIC|NO",
+        "snapshot_usage_domain|DOMAIN|postgres|YES",
+    ]);
+    session.success(&mut engine, "GRANT USAGE ON SEQUENCE snapshot_usage_sequence TO snapshot_usage_reader", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT object_name,grantee,is_grantable FROM information_schema.role_usage_grants WHERE object_name='snapshot_usage_sequence' ORDER BY grantee", true)), [
+        "snapshot_usage_sequence|postgres|YES", "snapshot_usage_sequence|snapshot_usage_reader|NO",
+    ]);
+}
+
+#[test]
 fn catalog_snapshot_account_reports_join_selected_roles_memberships_and_settings() {
     let report = "
         SELECT usename,usecreatedb,useconfig,passwd FROM pg_user
@@ -221,12 +265,12 @@ fn catalog_snapshot_routine_reports_preserve_definitions_and_check_current_execu
     ";
     let old = [
         "snapshot_routine_before|FUNCTION|integer|SQL|SQL|YES|YES|DEFINER|t",
-        "1|a|IN|integer|int4|",
+        "1|a|IN|integer|int4|NULL",
         "2|b|IN|integer|int4|17",
     ];
     let new = [
         "snapshot_routine_after|FUNCTION|integer|SQL|SQL|NO|NO|INVOKER|f",
-        "1|a|IN|integer|int4|",
+        "1|a|IN|integer|int4|NULL",
         "2|b|IN|integer|int4|23",
     ];
     for isolation in ["REPEATABLE READ", "READ COMMITTED"] {

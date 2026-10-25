@@ -197,6 +197,116 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         writer.execute("DROP ROLE IF EXISTS report_reader_diff")
 
 
+def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
+    roles = ("sr_owner_diff", "sr_owner_after_diff", "sr_reader_diff", "sr_account_diff", "sr_account_after_diff", "sr_group_diff")
+    reports = (
+        ("schemata", "schema_name LIKE 'sr_%%'", "schema_name"),
+        ("routines", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name"),
+        ("parameters", "specific_schema IN ('sr_visible_diff','sr_hidden_diff')", "specific_schema,specific_name,ordinal_position"),
+        ("routine_privileges", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name,grantor,grantee"),
+        ("role_routine_grants", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name,grantor,grantee"),
+        ("table_privileges", "table_schema='sr_visible_diff'", "table_name,grantor,grantee,privilege_type"),
+        ("role_table_grants", "table_schema='sr_visible_diff'", "table_name,grantor,grantee,privilege_type"),
+        ("column_privileges", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
+        ("role_column_grants", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
+        ("usage_privileges", "object_name LIKE 'sr_%%'", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("role_usage_grants", "object_name LIKE 'sr_%%'", "object_type,object_name,grantor,grantee,is_grantable"),
+    )
+    projections = {}
+    try:
+        for role in ("sr_owner_diff", "sr_reader_diff", "sr_group_diff"):
+            writer.execute(pg_sql.SQL("CREATE ROLE {}").format(pg_sql.Identifier(role)))
+        writer.execute("CREATE ROLE sr_account_diff LOGIN")
+        writer.execute("GRANT sr_group_diff TO sr_account_diff")
+        writer.execute("ALTER ROLE sr_account_diff SET search_path=public")
+        writer.execute("CREATE SCHEMA sr_visible_diff AUTHORIZATION sr_owner_diff")
+        writer.execute("CREATE SCHEMA sr_hidden_diff")
+        writer.execute("GRANT USAGE ON SCHEMA sr_visible_diff TO sr_reader_diff")
+        writer.execute("CREATE TABLE sr_visible_diff.orders(id integer,payload text)")
+        writer.execute("CREATE TABLE sr_permission_refresh_diff(id integer)")
+        writer.execute("GRANT SELECT ON sr_permission_refresh_diff TO sr_reader_diff")
+        writer.execute("GRANT SELECT ON sr_visible_diff.orders TO PUBLIC")
+        writer.execute("GRANT SELECT ON sr_visible_diff.orders TO sr_reader_diff")
+        writer.execute("GRANT SELECT(id) ON sr_visible_diff.orders TO sr_reader_diff")
+        writer.execute("CREATE DOMAIN sr_visible_diff.sr_domain_diff AS integer")
+        writer.execute("CREATE COLLATION sr_visible_diff.sr_collation_diff FROM \"C\"")
+        writer.execute("CREATE SEQUENCE sr_visible_diff.sr_sequence_diff")
+        writer.execute("CREATE FOREIGN DATA WRAPPER sr_wrapper_diff")
+        writer.execute("CREATE SERVER sr_server_diff FOREIGN DATA WRAPPER sr_wrapper_diff")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_function_diff(a integer,b integer DEFAULT 17) RETURNS integer LANGUAGE SQL IMMUTABLE STRICT SECURITY DEFINER AS 'SELECT a+b'")
+        writer.execute("CREATE PROCEDURE sr_visible_diff.sr_procedure_diff(INOUT value integer) LANGUAGE SQL AS 'SELECT value'")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_output_diff(a integer) RETURNS TABLE(id integer,label text) LANGUAGE SQL AS 'SELECT a, a::text'")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_array_diff(items integer[]) RETURNS integer[] LANGUAGE SQL AS 'SELECT items'")
+        for name, _, _ in reports:
+            query = f"SELECT * FROM information_schema.{name} LIMIT 0"
+            record(writer, f"{prefix}.schema_routine.types.{name}", query)
+            fields = writer.execute(query).description
+            projections[name] = pg_sql.SQL(",").join(
+                pg_sql.SQL("regexp_replace(specific_name::text,'_[0-9]+$','_OID')::name AS specific_name")
+                if field.name == "specific_name" else pg_sql.Identifier(field.name)
+                for field in fields
+            )
+
+        def capture(connection, label):
+            for name, condition, order in reports:
+                query = pg_sql.SQL("SELECT {} FROM information_schema.{} WHERE {} ORDER BY {}").format(
+                    projections[name], pg_sql.Identifier(name), pg_sql.SQL(condition), pg_sql.SQL(order)
+                )
+                record(connection, f"{prefix}.schema_routine.{label}.{name}", query)
+            record(connection, f"{prefix}.schema_routine.{label}.users", "SELECT usename,usecreatedb,passwd,useconfig FROM pg_user WHERE usename LIKE 'sr_account_%%' ORDER BY usename")
+            record(connection, f"{prefix}.schema_routine.{label}.shadow", "SELECT usename,usecreatedb,passwd,useconfig FROM pg_shadow WHERE usename LIKE 'sr_account_%%' ORDER BY usename")
+            record(connection, f"{prefix}.schema_routine.{label}.groups", "SELECT groname,array_length(grolist,1) FROM pg_group WHERE groname='sr_group_diff'")
+
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        capture(reader, "before")
+        writer.execute("ALTER ROLE sr_account_diff RENAME TO sr_account_after_diff")
+        writer.execute("ALTER ROLE sr_account_after_diff CREATEDB")
+        writer.execute("ALTER ROLE sr_account_after_diff SET search_path=pg_catalog")
+        writer.execute("GRANT sr_group_diff TO sr_reader_diff")
+        writer.execute("ALTER ROLE sr_owner_diff RENAME TO sr_owner_after_diff")
+        writer.execute("CREATE OR REPLACE FUNCTION sr_visible_diff.sr_function_diff(a integer,b integer DEFAULT 23) RETURNS integer LANGUAGE SQL VOLATILE CALLED ON NULL INPUT SECURITY INVOKER AS 'SELECT a-b'")
+        writer.execute("ALTER FUNCTION sr_visible_diff.sr_function_diff(integer,integer) RENAME TO sr_function_after_diff")
+        writer.execute("REVOKE SELECT ON sr_visible_diff.orders FROM PUBLIC")
+        writer.execute("GRANT UPDATE ON sr_visible_diff.orders TO sr_reader_diff WITH GRANT OPTION")
+        writer.execute("GRANT SELECT(id) ON sr_visible_diff.orders TO sr_reader_diff WITH GRANT OPTION")
+        writer.execute("GRANT USAGE ON SEQUENCE sr_visible_diff.sr_sequence_diff TO sr_reader_diff")
+        writer.execute("GRANT USAGE ON FOREIGN DATA WRAPPER sr_wrapper_diff TO sr_reader_diff")
+        writer.execute("GRANT USAGE ON FOREIGN SERVER sr_server_diff TO sr_reader_diff")
+        writer.execute("ALTER TABLE sr_visible_diff.orders RENAME TO sales")
+        capture(reader, "selected")
+        reader.execute("COMMIT")
+        capture(reader, "committed")
+
+        reader.execute("SET ROLE sr_reader_diff")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        record(reader, f"{prefix}.schema_routine.access.before", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record(reader, f"{prefix}.schema_routine.access.schemas_before", "SELECT schema_name,schema_owner FROM information_schema.schemata WHERE schema_name LIKE 'sr_%%' ORDER BY schema_name")
+        writer.execute("REVOKE EXECUTE ON FUNCTION sr_visible_diff.sr_function_after_diff(integer,integer) FROM PUBLIC")
+        writer.execute("GRANT CREATE ON SCHEMA sr_hidden_diff TO sr_reader_diff")
+        reader.execute("LOCK TABLE sr_permission_refresh_diff IN ACCESS SHARE MODE")
+        record(reader, f"{prefix}.schema_routine.access.revoked", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record(reader, f"{prefix}.schema_routine.access.schemas_current", "SELECT schema_name,schema_owner FROM information_schema.schemata WHERE schema_name LIKE 'sr_%%' ORDER BY schema_name")
+        writer.execute("GRANT EXECUTE ON FUNCTION sr_visible_diff.sr_function_after_diff(integer,integer) TO sr_reader_diff")
+        reader.execute("LOCK TABLE sr_permission_refresh_diff IN ACCESS SHARE MODE")
+        record(reader, f"{prefix}.schema_routine.access.granted", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record_outcome(reader, f"{prefix}.schema_routine.access.shadow", "SELECT * FROM pg_shadow", ())
+        reader.execute("COMMIT")
+        reader.execute("RESET ROLE")
+        record(writer, f"{prefix}.schema_routine.builtin", "SELECT routine_name,data_type,routine_body,external_language,is_deterministic,is_null_call,security_type FROM information_schema.routines WHERE specific_schema='pg_catalog' AND routine_name='abs' ORDER BY data_type")
+        record(writer, f"{prefix}.schema_routine.builtin_namespaces", "SELECT nspname,has_schema_privilege('sr_reader_diff',oid,'USAGE'),has_schema_privilege('sr_reader_diff',oid,'CREATE') FROM pg_namespace WHERE nspname IN ('pg_catalog','pg_toast','information_schema') ORDER BY nspname")
+        record(writer, f"{prefix}.schema_routine.default_acl", "SELECT acldefault('f',12345::oid)::text,acldefault('c',12345::oid)::text,acldefault('r',12345::oid) IS NOT NULL")
+    finally:
+        reader.execute("ROLLBACK")
+        reader.execute("RESET ROLE")
+        writer.execute("DROP SCHEMA IF EXISTS sr_visible_diff CASCADE")
+        writer.execute("DROP SCHEMA IF EXISTS sr_hidden_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS sr_permission_refresh_diff")
+        writer.execute("DROP SERVER IF EXISTS sr_server_diff")
+        writer.execute("DROP FOREIGN DATA WRAPPER IF EXISTS sr_wrapper_diff")
+        for role in roles:
+            writer.execute(pg_sql.SQL("DROP ROLE IF EXISTS {}").format(pg_sql.Identifier(role)))
+
+
 def transcript(reader, writer, host, port, user, report_database):
     observed = []
 
@@ -230,6 +340,7 @@ def transcript(reader, writer, host, port, user, report_database):
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
         constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

@@ -171,6 +171,18 @@ fn catalog_snapshot_derived_usage_is_distinct_and_checks_referenced_ownership() 
 
 #[test]
 fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_recovery() {
+    // SQL ORDER BY writes simulator fixture objects. Sort the client results
+    // outside the guard so the complete metadata reads still forbid allocation.
+    let report = REPORT.replace(" ORDER BY column_name", "");
+    let read = |session: &mut ConfiguredTransactionSession, engine: &mut Engine| {
+        let mut rows = data_rows(&session.success(engine, &report, true));
+        rows.sort_unstable();
+        rows
+    };
+    let mut old = OLD.map(str::to_owned);
+    old.sort_unstable();
+    let mut new = NEW.map(str::to_owned);
+    new.sort_unstable();
     for checkpoint in [false, true] {
         for decision in ["COMMIT", "COMMIT PREPARED", "ROLLBACK PREPARED"] {
             let name = format!("derived-recovery-{checkpoint}-{decision}");
@@ -190,12 +202,12 @@ fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_re
             session.success(&mut engine, SETUP, false);
             session.success(&mut engine, "BEGIN", true);
             session.success(&mut engine, CHANGE, true);
-            assert_eq!(data_rows(&session.success(&mut engine, REPORT, true)), NEW);
+            assert_eq!(read(&mut session, &mut engine), new);
             if decision == "COMMIT" {
                 session.success(&mut engine, "COMMIT", false);
             } else {
                 session.success(&mut engine, "PREPARE TRANSACTION 'derived-reports'", false);
-                assert_eq!(data_rows(&session.success(&mut engine, REPORT, true)), OLD);
+                assert_eq!(read(&mut session, &mut engine), old);
             }
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
@@ -207,15 +219,15 @@ fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_re
             let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             if decision != "COMMIT" {
-                assert_eq!(data_rows(&session.success(&mut cold, REPORT, true)), OLD);
+                assert_eq!(read(&mut session, &mut cold), old);
                 session.success(&mut cold, &format!("{decision} 'derived-reports'"), false);
             }
             assert_eq!(
-                data_rows(&session.success(&mut cold, REPORT, true)),
+                read(&mut session, &mut cold).as_slice(),
                 if decision == "ROLLBACK PREPARED" {
-                    OLD
+                    old.as_slice()
                 } else {
-                    NEW
+                    new.as_slice()
                 },
                 "{name}"
             );
@@ -320,4 +332,72 @@ fn catalog_snapshot_derived_permissions_keep_oid_identity_outside_the_search_pat
          SELECT schemaname,last_value FROM pg_sequences WHERE sequencename='identity_sequence' ORDER BY schemaname;", true)),
         ["identity_other|t|t|t", "public|f|f|f", "identity_other|identity_collision", "identity_other|identity_collision",
          "identity_other|value", "identity_other|identity_sequence", "identity_other|9", "public|NULL"]);
+}
+
+#[test]
+fn catalog_snapshot_derived_arena_exhaustion_leaves_reports_usable() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(&mut engine, &mut budget, SETUP);
+    assert!(error_sqlstates(&setup).is_empty(), "{}", String::from_utf8_lossy(&setup));
+    let mut small = Arena::new(&mut budget, "small derived catalog arena", 16 << 10).unwrap();
+    for (namespace, name) in [
+        ("pg_catalog", "pg_views"), ("pg_catalog", "pg_matviews"),
+        ("pg_catalog", "pg_rules"), ("pg_catalog", "pg_sequences"),
+        ("information_schema", "views"), ("information_schema", "sequences"),
+        ("information_schema", "view_table_usage"), ("information_schema", "view_column_usage"),
+    ] {
+        small.reset();
+        let result = crate::mem::guard::forbid_alloc(|| super::super::catalog::synthesize(
+            &engine.storage, Some(namespace), name, 0,
+            crate::sql::catalog_snapshot::CatalogScan::Sequential, &small,
+        ));
+        let error = match result { Err(error) => error, Ok(_) => panic!("{namespace}.{name} exceeded its arena") };
+        assert_eq!(error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("arena"), "{}", error.message);
+    }
+    assert_eq!(data_rows(&run_with_fixed_memory(&mut engine, &budget, REPORT, 4 << 20)), OLD);
+}
+
+#[test]
+fn catalog_snapshot_definition_text_retains_rule_rows_while_view_execution_is_current() {
+    for (isolation, replaced) in [("READ COMMITTED", "t|t|t|t"), ("REPEATABLE READ", "f|f|f|f")] {
+        let config = test_config("catalog-definition-rows");
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine,
+            "CREATE VIEW definition_view AS SELECT 1 AS value;
+             CREATE TABLE definition_target(id integer);
+             CREATE TABLE definition_audit(id integer);
+             CREATE RULE definition_rule AS ON INSERT TO definition_target DO ALSO INSERT INTO definition_audit VALUES(1)", true);
+        let query = "SELECT
+            (SELECT position('2' IN definition)>0 FROM pg_views WHERE viewname='definition_view'),
+            position('2' IN pg_get_viewdef('definition_view'::regclass))>0,
+            (SELECT position('2' IN definition)>0 FROM pg_rules WHERE rulename='definition_rule'),
+            (SELECT position('2' IN pg_get_ruledef(oid))>0 FROM pg_rewrite WHERE rulename='definition_rule')";
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {query}"), true)), ["f|f|f|f"]);
+        writer.success(&mut engine,
+            "CREATE OR REPLACE VIEW definition_view AS SELECT 2 AS value;
+             CREATE OR REPLACE RULE definition_rule AS ON INSERT TO definition_target DO ALSO INSERT INTO definition_audit VALUES(2)", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, query, true)), [replaced]);
+        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT * FROM definition_view; COMMIT", true)), ["2"]);
+        assert_eq!(data_rows(&reader.success(&mut engine, query, true)), ["t|t|t|t"]);
+        for sql in ["SELECT _pos3ql_view_definition FROM pg_rewrite", "SELECT _pos3ql_rule_body FROM pg_rewrite"] {
+            assert_eq!(error_sqlstates(&reader.execute(&mut engine, sql, true)), ["42703"]);
+        }
+    }
+}
+
+#[test]
+fn catalog_snapshot_builtin_metadata_keeps_objects_with_unsupported_row_reads() {
+    let (mut engine, budget) = test_engine();
+    assert_eq!(data_rows(&run_with_fixed_memory(&mut engine, &budget,
+        "SELECT to_regclass('pg_statistic') IS NOT NULL,
+                EXISTS(SELECT 1 FROM pg_class WHERE oid='pg_statistic'::regclass);
+         SELECT attname FROM pg_attribute WHERE attrelid='pg_statistic'::regclass AND attnum=1", 4 << 20)),
+        ["t|t", "starelid"]);
+    assert_eq!(error_sqlstates(&run_with_fixed_memory(&mut engine, &budget,
+        "SELECT * FROM pg_statistic", 4 << 20)), ["0A000"]);
 }

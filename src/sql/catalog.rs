@@ -29,6 +29,8 @@ mod schema;
 mod view_definitions;
 #[path = "catalog_view_rows.rs"]
 mod view_rows;
+#[path = "catalog_rewrite.rs"]
+mod rewrite;
 #[path = "catalog_views.rs"]
 mod views;
 
@@ -8497,6 +8499,7 @@ const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
+#[cfg(test)]
 pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_aggregate",
     "pg_aios",
@@ -8644,22 +8647,15 @@ pub(super) const CATALOG_RELATIONS: &[&str] = &[
 ];
 
 fn catalog_relation(name: &str) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
-    CATALOG_RELATIONS.contains(&name).then(|| {
-        let relation = crate::sql::catalog_metadata::RELATIONS
-            .iter()
-            .copied()
-            .find(|relation| relation.name == name)
-            .expect("supported catalog relation has PostgreSQL 18 metadata");
-        if let Some((oid, row_type_oid, _, columns)) = MONITORING_RELATIONS
-            .iter()
-            .find(|(_, _, candidate, _)| *candidate == name)
-        {
-            debug_assert_eq!(relation.oid, *oid);
-            debug_assert_eq!(relation.row_type_oid, *row_type_oid);
-            debug_assert_eq!(relation.attributes as usize, columns.len());
-        }
-        relation
-    })
+    let relation = crate::sql::catalog_metadata::RELATIONS.iter().copied()
+        .find(|relation| relation.name == name)?;
+    if let Some((oid, row_type_oid, _, columns)) = MONITORING_RELATIONS.iter()
+        .find(|(_, _, candidate, _)| *candidate == name) {
+        debug_assert_eq!(relation.oid, *oid);
+        debug_assert_eq!(relation.row_type_oid, *row_type_oid);
+        debug_assert_eq!(relation.attributes as usize, columns.len());
+    }
+    Some(relation)
 }
 
 fn catalog_relation_oid(name: &str) -> Option<i32> {
@@ -8667,10 +8663,8 @@ fn catalog_relation_oid(name: &str) -> Option<i32> {
 }
 
 pub(super) fn catalog_relation_name(oid: i32) -> Option<&'static str> {
-    CATALOG_RELATIONS
-        .iter()
-        .copied()
-        .find(|name| catalog_relation(name).is_some_and(|relation| relation.oid == oid))
+    crate::sql::catalog_metadata::RELATIONS.iter()
+        .find_map(|relation| (relation.oid == oid).then_some(relation.name))
 }
 
 pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
@@ -8720,152 +8714,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "user_mappings"
         ),
         Some(_) => false,
-        None => matches!(
-            name,
-            "pg_class"
-                | "pg_attribute"
-                | "pg_type"
-                | "pg_namespace"
-                | "pg_tables"
-                | "pg_indexes"
-                | "pg_views"
-                | "pg_rules"
-                | "pg_matviews"
-                | "pg_sequences"
-                | "pg_sequence"
-                | "pg_roles"
-                | "pg_authid"
-                | "pg_database"
-                | "pg_am"
-                | "pg_index"
-                | "pg_constraint"
-                | "pg_attrdef"
-                | "pg_collation"
-                | "pg_conversion"
-                | "pg_policy"
-                | "pg_policies"
-                | "pg_rewrite"
-                | "pg_trigger"
-                | "pg_event_trigger"
-                | "pg_inherits"
-                | "pg_stats"
-                | "pg_stats_ext"
-                | "pg_stats_ext_exprs"
-                | "pg_statistic_ext"
-                | "pg_statistic_ext_data"
-                | "pg_publication"
-                | "pg_publication_rel"
-                | "pg_publication_tables"
-                | "pg_publication_namespace"
-                | "pg_replication_slots"
-                | "pg_replication_origin"
-                | "pg_replication_origin_status"
-                | "pg_stat_replication"
-                | "pg_stat_replication_slots"
-                | "pg_subscription"
-                | "pg_subscription_rel"
-                | "pg_stat_subscription"
-                | "pg_stat_subscription_stats"
-                | "pg_foreign_table"
-                | "pg_foreign_server"
-                | "pg_user_mapping"
-                | "pg_user_mappings"
-                | "pg_partitioned_table"
-                | "pg_description"
-                | "pg_shdescription"
-                | "pg_seclabels"
-                | "pg_shseclabel"
-                | "pg_largeobject_metadata"
-                | "pg_largeobject"
-                | "pg_enum"
-                | "pg_range"
-                | "pg_settings"
-                | "pg_aios"
-                | "pg_backend_memory_contexts"
-                | "pg_config"
-                | "pg_file_settings"
-                | "pg_group"
-                | "pg_hba_file_rules"
-                | "pg_ident_file_mappings"
-                | "pg_prepared_statements"
-                | "pg_seclabel"
-                | "pg_shadow"
-                | "pg_shdepend"
-                | "pg_shmem_allocations"
-                | "pg_shmem_allocations_numa"
-                | "pg_timezone_abbrevs"
-                | "pg_timezone_names"
-                | "pg_user"
-                | "pg_wait_events"
-                | "pg_prepared_xacts"
-                | "pg_proc"
-                | "pg_aggregate"
-                | "pg_operator"
-                | "pg_opclass"
-                | "pg_opfamily"
-                | "pg_amop"
-                | "pg_amproc"
-                | "pg_ts_parser"
-                | "pg_ts_template"
-                | "pg_ts_dict"
-                | "pg_ts_config"
-                | "pg_ts_config_map"
-                | "pg_language"
-                | "pg_auth_members"
-                | "pg_db_role_setting"
-                | "pg_parameter_acl"
-                | "pg_default_acl"
-                | "pg_extension"
-                | "pg_available_extensions"
-                | "pg_available_extension_versions"
-                | "pg_depend"
-                | "pg_init_privs"
-                | "pg_cast"
-                | "pg_transform"
-                | "pg_tablespace"
-                | "pg_foreign_data_wrapper"
-                | "pg_locks"
-                | "pg_cursors"
-                | "pg_stat_activity"
-                | "pg_stat_ssl"
-                | "pg_stat_all_tables"
-                | "pg_stat_xact_all_tables"
-                | "pg_stat_sys_tables"
-                | "pg_stat_xact_sys_tables"
-                | "pg_stat_user_tables"
-                | "pg_stat_xact_user_tables"
-                | "pg_statio_all_tables"
-                | "pg_statio_sys_tables"
-                | "pg_statio_user_tables"
-                | "pg_stat_all_indexes"
-                | "pg_stat_sys_indexes"
-                | "pg_stat_user_indexes"
-                | "pg_statio_all_indexes"
-                | "pg_statio_sys_indexes"
-                | "pg_statio_user_indexes"
-                | "pg_statio_all_sequences"
-                | "pg_statio_sys_sequences"
-                | "pg_statio_user_sequences"
-                | "pg_stat_slru"
-                | "pg_stat_wal_receiver"
-                | "pg_stat_recovery_prefetch"
-                | "pg_stat_gssapi"
-                | "pg_stat_database"
-                | "pg_stat_database_conflicts"
-                | "pg_stat_user_functions"
-                | "pg_stat_xact_user_functions"
-                | "pg_stat_archiver"
-                | "pg_stat_bgwriter"
-                | "pg_stat_checkpointer"
-                | "pg_stat_io"
-                | "pg_stat_wal"
-                | "pg_stat_progress_analyze"
-                | "pg_stat_progress_vacuum"
-                | "pg_stat_progress_cluster"
-                | "pg_stat_progress_create_index"
-                | "pg_stat_progress_basebackup"
-                | "pg_stat_progress_copy"
-        ),
+        None => catalog_relation(name).is_some(),
     }
 }
 
@@ -8982,6 +8831,9 @@ pub(crate) fn synthesize_definition<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let information_schema = qualifier == Some("information_schema");
     let specification = schema::definition(name, information_schema).ok_or_else(|| {
+        if !information_schema && catalog_relation(name).is_some() {
+            return sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "reading catalog relation \"{}\" is not implemented", name);
+        }
         sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "relation \"{}\" does not exist",
@@ -9041,6 +8893,7 @@ pub(crate) fn synthesize<'a>(
     }
     if qualifier != Some("information_schema") {
         match name {
+            "pg_rewrite" => return rewrite::selected(storage, txid, scan, arena),
             "pg_views" => {
                 return views::relations(
                     storage,
@@ -9354,7 +9207,7 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_stat_subscription") => pg_stat_subscription(storage, txid, arena),
         (false, "pg_stat_subscription_stats") => pg_stat_subscription_stats(storage, txid, arena),
         (false, "pg_inherits") => pg_inherits(storage, txid, arena),
-        (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
+        (false, "pg_rewrite") => rewrite::current(storage, txid, purpose, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
         (false, "pg_event_trigger") => pg_event_trigger(storage, txid, arena),
         (false, "pg_foreign_table") => pg_foreign_table(storage, txid, arena),
@@ -9490,6 +9343,10 @@ pub(crate) fn synthesize_current<'a>(
         ),
         (true, "user_mapping_options") => info_user_mapping_options(storage, txid, arena),
         (true, "user_mappings") => info_user_mappings(storage, txid, arena),
+        _ if !info && catalog_relation(name).is_some() => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "reading catalog relation \"{}\" is not implemented", name
+        )),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -13821,18 +13678,7 @@ pub fn view_def_text<'a>(
             .map(Some)
             .map_err(|_| arena_full());
     }
-    for (slot, _) in storage.views_visible_to(txid) {
-        if view_oid(slot) == oid {
-            return arena
-                .alloc_str_display(format_args!(
-                    "{};",
-                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str()
-                ))
-                .map(Some)
-                .map_err(|_| arena_full());
-        }
-    }
-    Ok(None)
+    rewrite::view_definition(storage, txid, oid, arena)
 }
 
 pub fn rule_def_text<'a>(
@@ -13841,69 +13687,7 @@ pub fn rule_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    use core::fmt::Write as _;
-    let Some((_, rule)) = storage
-        .rules_visible_to(txid)
-        .find(|(_, rule)| rule.oid() == oid)
-    else {
-        return Ok(None);
-    };
-    let definition = rule.definition_for(txid);
-    let (schema, relation) = storage.rule_target_names(definition.target, txid);
-    let rule_name = super::eval::quote_ident_str(definition.name.as_str(), arena)?;
-    let schema = super::eval::quote_ident_str(schema.as_str(), arena)?;
-    let relation = super::eval::quote_ident_str(relation.as_str(), arena)?;
-    let mut out = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
-    let _ = write!(
-        out,
-        "CREATE RULE {} AS ON {} TO {}.{}",
-        rule_name,
-        match definition.event {
-            crate::storage::RewriteEvent::Select => "SELECT",
-            crate::storage::RewriteEvent::Insert => "INSERT",
-            crate::storage::RewriteEvent::Update => "UPDATE",
-            crate::storage::RewriteEvent::Delete => "DELETE",
-        },
-        schema,
-        relation,
-    );
-    if let Some(condition) = definition.condition_sql() {
-        let _ = write!(out, " WHERE ({condition})");
-    }
-    let _ = write!(
-        out,
-        " DO {}",
-        if matches!(definition.mode, crate::storage::RewriteMode::Instead) {
-            "INSTEAD "
-        } else {
-            "ALSO "
-        }
-    );
-    if definition.action_count == 0 {
-        let _ = out.write_str("NOTHING;");
-    } else if definition.action_count == 1 {
-        let _ = write!(
-            out,
-            "{};",
-            definition.action_sql().next().expect("one action")
-        );
-    } else {
-        let _ = out.write_char('(');
-        for action in definition.action_sql() {
-            let _ = write!(out, "{action};");
-        }
-        let _ = out.write_str(");");
-    }
-    if out.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "formatted rewrite rule exceeds static output capacity"
-        ));
-    }
-    arena
-        .alloc_str(out.as_str())
-        .map(Some)
-        .map_err(|_| arena_full())
+    rewrite::rule_definition(storage, txid, oid, arena)
 }
 
 /// The bytes occupied by a relation's visible encoded row images. Plain views
@@ -19127,8 +18911,8 @@ fn pg_class<'a>(
         })
         .count()
         * 2;
-    let catalogs: &[&str] = match purpose {
-        Materialization::Query => CATALOG_RELATIONS,
+    let catalogs: &[crate::sql::catalog_metadata::CatalogRelation] = match purpose {
+        Materialization::Query => crate::sql::catalog_metadata::RELATIONS,
         Materialization::History => &[],
     };
     let out_capacity = catalogs.len()
@@ -19145,8 +18929,7 @@ fn pg_class<'a>(
         .alloc_slice_with(out_capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
-    for name in catalogs {
-        let relation = catalog_relation(name).expect("catalog metadata exists");
+    for relation in catalogs {
         out[n] = row(
             &[
                 Datum::Int4(relation.oid),
@@ -20569,46 +20352,6 @@ fn pg_constraint<'a>(
     )
 }
 
-fn pg_rewrite<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_rewrite", false);
-    let count = storage.rules_visible_to(txid).count();
-    let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    for (index, (_, rule)) in storage.rules_visible_to(txid).enumerate() {
-        let definition = rule.definition_for(txid);
-        let relation_oid = match definition.target {
-            crate::storage::RuleTarget::Table(slot) => table_oid(storage, usize::from(slot)),
-            crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
-        };
-        let event = [definition.event.catalog_code()];
-        let event = core::str::from_utf8(&event).expect("catalog event code is ASCII");
-        out[index] = row(
-            &[
-                Datum::Int4(2618),
-                Datum::Int4(rule.oid()),
-                text(definition.name.as_str(), arena)?,
-                Datum::Int4(relation_oid),
-                text(event, arena)?,
-                text(
-                    core::str::from_utf8(&[definition.enabled.code()])
-                        .expect("rule enabled code is ASCII"),
-                    arena,
-                )?,
-                Datum::Bool(matches!(
-                    definition.mode,
-                    crate::storage::RewriteMode::Instead
-                )),
-            ],
-            arena,
-        )?;
-    }
-    finish(def, out, arena)
-}
 
 fn available_extension_requires<'a>(
     package: &crate::storage::ExtensionPackage,

@@ -1146,11 +1146,24 @@ build their results by joining the selected base rows:
 
 Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
 
+Object listings use the PostgreSQL metadata inventory independently of which
+catalog row queries are implemented. For example, `pg_statistic` appears in
+`pg_class` and resolves through `to_regclass`, while reading its raw rows fails
+explicitly with `0A000` (unsupported feature).
+
 **User example:** start a repeatable-read report listing `orders`. Another
 connection renames it to `sales` and commits. The report can still list
 `orders`, while `to_regclass('sales')` resolves the current name. An owner's
 displayed account name can also change after that account is renamed. Listing
 an old definition and resolving an object for use are different operations.
+
+`pg_get_viewdef` and `pg_get_ruledef` read the selected rule text. For example,
+replace a view's `SELECT 1 AS value` with `SELECT 2 AS value` in another
+connection. An older repeatable-read report can still show the definition
+containing 1, while executing `SELECT * FROM the_view` returns 2. This follows
+[PostgreSQL's rule lookups](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
+Retained rule text uses the existing catalog-history reservation; its internal
+fields are unavailable as SQL columns.
 
 The same report can keep a view's old name and check option, a materialized
 view's selected index and population flags, and a sequence's earlier increment.

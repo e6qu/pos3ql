@@ -851,20 +851,20 @@ pub(crate) fn capture_rows(
     Ok(())
 }
 
-fn selected_image<'a>(
+pub(crate) fn selected_image<'a>(
     key: CatalogRowKey<'_>,
     encoded_key: &'a [u8],
     current: Option<CatalogRowImage<'a>>,
     private: Option<CatalogRowImage<'a>>,
-    historical: Option<KeyedRow<'a>>,
+    historical: Option<HistoricalCatalogRow<'a>>,
     state: CatalogRowState,
     scan: CatalogScan,
 ) -> Result<[Option<CatalogRowImage<'a>>; 2], SqlError> {
-    let snapshot = historical.map_or(current, |row| row.image);
+    let snapshot = historical.map_or(current, |row| row.before);
     match key {
         CatalogRowKey::Columns(_) => Ok(match historical {
-            Some(KeyedRow {
-                image: Some(before),
+            Some(HistoricalCatalogRow {
+                before: Some(before),
                 ..
             }) => {
                 let own = (state.private || current != private)
@@ -937,7 +937,7 @@ pub(crate) fn restore_rows<'a>(
             row.key,
             committed_rows.get(row.key).and_then(|row| row.image),
             row.image,
-            historical_rows.get(row.key),
+            historical_rows.get(row.key).map(|row| HistoricalCatalogRow { key: row.key, before: row.image }),
             row_state(row.key)?,
             scan,
         )?;
@@ -950,7 +950,7 @@ pub(crate) fn restore_rows<'a>(
                 row.key,
                 committed_rows.get(row.key).and_then(|row| row.image),
                 None,
-                Some(row),
+                Some(HistoricalCatalogRow { key: row.key, before: row.image }),
                 row_state(row.key)?,
                 scan,
             )?;

@@ -177,10 +177,29 @@ def transcript(reader, writer):
             record(reader, f"{prefix}.derived.definition.replaced", query)
             record(reader, f"{prefix}.derived.definition.lookup", "SELECT position('2' IN pg_get_viewdef('derived_definition_diff'::regclass))>0")
             record(reader, f"{prefix}.derived.definition.execution", "SELECT * FROM derived_definition_diff")
-            reader.execute("COMMIT")
+            reader.execute("CREATE OR REPLACE VIEW derived_definition_diff AS SELECT 3 AS value")
+            record(reader, f"{prefix}.derived.definition.own", "SELECT position('3' IN definition)>0 FROM pg_views WHERE viewname='derived_definition_diff'")
+            record(reader, f"{prefix}.derived.definition.own_lookup", "SELECT position('3' IN pg_get_viewdef('derived_definition_diff'::regclass))>0")
+            reader.execute("ROLLBACK")
         finally:
             reader.execute("ROLLBACK")
             writer.execute("DROP VIEW derived_definition_diff")
+
+        writer.execute("CREATE TABLE derived_rule_target_diff(id integer)")
+        writer.execute("CREATE TABLE derived_rule_audit_diff(id integer)")
+        writer.execute("CREATE RULE derived_definition_rule_diff AS ON INSERT TO derived_rule_target_diff DO ALSO INSERT INTO derived_rule_audit_diff VALUES(1)")
+        try:
+            reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            query = "SELECT position('2' IN definition)>0 FROM pg_rules WHERE rulename='derived_definition_rule_diff'"
+            record(reader, f"{prefix}.derived.rule_definition.before", query)
+            writer.execute("CREATE OR REPLACE RULE derived_definition_rule_diff AS ON INSERT TO derived_rule_target_diff DO ALSO INSERT INTO derived_rule_audit_diff VALUES(2)")
+            record(reader, f"{prefix}.derived.rule_definition.replaced", query)
+            record(reader, f"{prefix}.derived.rule_definition.lookup", "SELECT position('2' IN pg_get_ruledef(oid))>0 FROM pg_rewrite WHERE rulename='derived_definition_rule_diff'")
+            reader.execute("COMMIT")
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("DROP TABLE derived_rule_target_diff CASCADE")
+            writer.execute("DROP TABLE derived_rule_audit_diff")
 
         writer.execute("CREATE TABLE derived_source_diff(id integer, payload text)")
         writer.execute("CREATE VIEW derived_view_diff AS SELECT id,payload FROM derived_source_diff WITH LOCAL CHECK OPTION")

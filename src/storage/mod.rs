@@ -35459,11 +35459,13 @@ impl Storage {
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
-                self.tables[table_index].statistics.set_index_hint(
-                    definition.identity.created_at,
-                    true,
-                    true,
-                )?;
+                if txid.is_none() {
+                    self.tables[table_index].statistics.set_index_hint(
+                        definition.identity.created_at,
+                        true,
+                        true,
+                    )?;
+                }
                 publication.enforcers = candidate;
                 publication.n_enforcers = n_want;
                 return Ok(());
@@ -35533,11 +35535,13 @@ impl Storage {
                 "table changed while its value caches were being built"
             ));
         }
-        self.tables[table_index].statistics.set_index_hint(
-            definition.identity.created_at,
-            true,
-            true,
-        )?;
+        if txid.is_none() {
+            self.tables[table_index].statistics.set_index_hint(
+                definition.identity.created_at,
+                true,
+                true,
+            )?;
+        }
         publication.enforcers = candidate;
         publication.n_enforcers = n_want;
         Ok(())
@@ -49695,6 +49699,12 @@ impl Storage {
 
     pub(crate) fn rule(&self, slot: usize) -> RuleDef {
         self.view_rule_catalog().rules[slot]
+    }
+
+    pub(crate) fn rule_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.view_rule_catalog().rules.iter().position(|rule| {
+            rule.database == current_database() && rule.visible_to(txid) && rule.oid() == oid
+        })
     }
 
     pub(crate) fn rule_dependencies(

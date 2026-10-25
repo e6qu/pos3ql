@@ -6459,6 +6459,7 @@ impl<'a> Parser<'a> {
                 timing,
             });
         }
+        let nulls_not_distinct = if primary { false } else { self.unique_nulls_not_distinct()? };
         let columns = self.column_name_list()?;
         let timing = self.constraint_timing(false)?;
         Ok(AlterAction::AddConstraint(if primary {
@@ -6472,6 +6473,7 @@ impl<'a> Parser<'a> {
                 name,
                 columns,
                 timing,
+                nulls_not_distinct,
             }
         }))
     }

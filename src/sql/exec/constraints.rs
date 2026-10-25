@@ -1859,7 +1859,7 @@ fn check_or_defer_unique_keys(
             self_rowid,
             txid,
             key.columns(),
-            false,
+            key.kind.nulls_not_distinct(),
             &ConstraintName::Named(key.name.as_str()),
         )?;
     }
@@ -2166,7 +2166,7 @@ pub(crate) fn validate_constraint_obligation(
                     Some(rowid),
                     txid,
                     key.columns(),
-                    false,
+                    key.kind.nulls_not_distinct(),
                     &ConstraintName::Named(key.name.as_str()),
                 )?;
             } else if let Some(foreign_key) = foreign_key {

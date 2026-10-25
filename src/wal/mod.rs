@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 13;
+pub(crate) const RECORD_VERSION: u8 = 14;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 8;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 9;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -4631,7 +4631,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[def.n_uniques as u8]);
             for uk in def.uniques() {
                 ok &= name_bytes(buffer, uk.name.as_str());
-                ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8, uk.timing.code()]);
+                ok &= buffer.append(&[uk.kind.code(), uk.n_cols as u8, uk.timing.code()]);
                 for &c in uk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
@@ -7732,17 +7732,21 @@ fn decode_op_inner<'a>(
                 let meta = payload.get(at..at + 3)?;
                 at += 3;
                 let n = meta[1] as usize;
-                if n > MAX_INDEX_COLS {
+                if n == 0 || n > MAX_INDEX_COLS {
                     return None;
                 }
                 let mut uk = UniqueKey::EMPTY;
                 uk.name = SqlName::parse(uname).ok()?;
-                uk.is_primary = stored_boolean(meta[0])?;
+                uk.kind = crate::storage::UniqueKeyKind::from_code(meta[0])?;
                 uk.timing = crate::storage::ConstraintTiming::from_code(meta[2])?;
                 uk.n_cols = n;
-                for c in uk.columns.iter_mut().take(n) {
-                    *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+                for position in 0..n {
+                    let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
+                    if usize::from(column) >= def.n_columns || uk.columns[..position].contains(&column) {
+                        return None;
+                    }
+                    uk.columns[position] = column;
                 }
                 def.uniques[u] = uk;
             }

@@ -34,10 +34,10 @@ mod view_rows;
 #[path = "catalog_views.rs"]
 mod views;
 
-#[path = "catalog_information.rs"]
-mod information;
 #[path = "catalog_constraints.rs"]
 mod constraints;
+#[path = "catalog_information.rs"]
+mod information;
 
 #[path = "catalog_type_io.rs"]
 mod type_io;
@@ -8896,8 +8896,12 @@ pub(crate) fn synthesize<'a>(
                     arena,
                 );
             }
-            "table_constraints" => return constraints::tables(storage, txid, views::Read::Statement, arena),
-            "constraint_table_usage" => return constraints::table_usage(storage, txid, views::Read::Statement, arena),
+            "table_constraints" => {
+                return constraints::tables(storage, txid, views::Read::Statement, arena);
+            }
+            "constraint_table_usage" => {
+                return constraints::table_usage(storage, txid, views::Read::Statement, arena);
+            }
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9312,8 +9316,12 @@ pub(crate) fn synthesize_current<'a>(
         (true, "foreign_table_options") => info_foreign_table_options(storage, txid, arena),
         (true, "foreign_tables") => info_foreign_tables(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, txid, arena),
-        (true, "table_constraints") => constraints::tables(storage, txid, views::Read::Current, arena),
-        (true, "constraint_table_usage") => constraints::table_usage(storage, txid, views::Read::Current, arena),
+        (true, "table_constraints") => {
+            constraints::tables(storage, txid, views::Read::Current, arena)
+        }
+        (true, "constraint_table_usage") => {
+            constraints::table_usage(storage, txid, views::Read::Current, arena)
+        }
         (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
         (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
         (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
@@ -10870,25 +10878,27 @@ fn parent_constraint_oid(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
-    columns: &[u16],
-    is_primary: bool,
-    is_exclusion: bool,
+    index: &IdxInfo,
 ) -> i32 {
     let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
         return 0;
     };
     let parent_slot = usize::from(attachment.parent);
     let parent = storage.table_def(parent_slot, txid);
+    let columns = &index.columns[..index.n_cols];
+    let is_primary = index.is_primary;
+    let is_exclusion = index.is_exclusion;
     let mut position = 0usize;
     for (column, metadata) in parent.columns().iter().enumerate() {
         if metadata.primary {
-            if !is_exclusion && is_primary && columns == [column as u16] {
+            if !is_exclusion && is_primary && index.timing == crate::storage::ConstraintTiming::NotDeferrable && columns == [column as u16] {
                 return index_oid(parent_slot, position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         } else if metadata.unique {
-            if !is_exclusion && !is_primary && columns == [column as u16] {
+            if !is_exclusion && !is_primary && !index.nulls_not_distinct
+                && index.timing == crate::storage::ConstraintTiming::NotDeferrable && columns == [column as u16] {
                 return index_oid(parent_slot, position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
@@ -10896,7 +10906,9 @@ fn parent_constraint_oid(
         }
     }
     for unique in parent.uniques() {
-        if !is_exclusion && unique.is_primary == is_primary && unique.columns() == columns {
+        if !is_exclusion && unique.kind.is_primary() == is_primary
+            && (is_primary || unique.kind.nulls_not_distinct() == index.nulls_not_distinct)
+            && unique.timing == index.timing && unique.columns() == columns {
             return index_oid(parent_slot, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;
@@ -10955,7 +10967,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
-            let info = IdxInfo {
+            let mut info = IdxInfo {
                 oid: index_oid(slot, pos),
                 table_oid: toid,
                 table_slot: slot,
@@ -10981,13 +10993,12 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 is_constraint,
                 is_exclusion,
                 timing,
-                constraint_parent_oid: if is_constraint {
-                    parent_constraint_oid(storage, txid, slot, columns, is_primary, is_exclusion)
-                } else {
-                    0
-                },
+                constraint_parent_oid: 0,
                 explicit_definition: None,
             };
+            if is_constraint {
+                info.constraint_parent_oid = parent_constraint_oid(storage, txid, slot, &info);
+            }
             pos += 1;
             info
         };
@@ -11057,8 +11068,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
                 None,
-                false,
-                uk.is_primary,
+                uk.kind.nulls_not_distinct(),
+                uk.kind.is_primary(),
                 true,
                 true,
                 false,
@@ -11103,7 +11114,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.nulls_first,
                 index.predicate,
                 index.nulls_not_distinct,
-                attached.is_some_and(|key| key.is_primary),
+                attached.is_some_and(|key| key.kind.is_primary()),
                 index.unique,
                 attached.is_some(),
                 false,
@@ -15936,7 +15947,11 @@ pub fn index_def_text<'a>(
         _ => None,
     };
     if let Some((definition, columns)) = builtin {
-        return Ok(if col == 0 { Some(definition) } else { columns.get(col - 1).copied() });
+        return Ok(if col == 0 {
+            Some(definition)
+        } else {
+            columns.get(col - 1).copied()
+        });
     }
     let indices = collect_indexes(storage, txid, arena)?;
     for info in indices {

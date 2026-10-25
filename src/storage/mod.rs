@@ -1710,15 +1710,35 @@ impl ConstraintValidation {
     }
 }
 
-/// A multi-column UNIQUE or PRIMARY KEY constraint. Single-column PK/UNIQUE
-/// declared inline on a column stays on that column's flags; this covers the
-/// multi-column table-level form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UniqueKeyKind {
+    UniqueNullsDistinct = 0,
+    Primary = 1,
+    UniqueNullsNotDistinct = 2,
+}
+
+impl UniqueKeyKind {
+    pub const fn is_primary(self) -> bool { matches!(self, Self::Primary) }
+    pub const fn nulls_not_distinct(self) -> bool { matches!(self, Self::UniqueNullsNotDistinct) }
+    pub const fn code(self) -> u8 { self as u8 }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::UniqueNullsDistinct),
+            1 => Some(Self::Primary),
+            2 => Some(Self::UniqueNullsNotDistinct),
+            _ => None,
+        }
+    }
+}
+
+/// Named, multi-column, deferred or NULLS NOT DISTINCT key constraint.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
-    pub is_primary: bool,
+    pub kind: UniqueKeyKind,
     pub timing: ConstraintTiming,
 }
 
@@ -1727,7 +1747,7 @@ impl UniqueKey {
         name: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
-        is_primary: false,
+        kind: UniqueKeyKind::UniqueNullsDistinct,
         timing: ConstraintTiming::NotDeferrable,
     };
 

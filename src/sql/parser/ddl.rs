@@ -5370,13 +5370,7 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
-        let nulls_not_distinct = if self.eat_ident("nulls")? {
-            let not = self.eat_ident("not")?;
-            self.expect_ident("distinct")?;
-            not
-        } else {
-            false
-        };
+        let nulls_not_distinct = self.unique_nulls_not_distinct()?;
         let options = if self.eat_ident("with")? {
             self.expect_op("(")?;
             let options = self.index_storage_options()?;
@@ -7915,11 +7909,12 @@ impl<'a> Parser<'a> {
                     default = Some(self.column_default_expression()?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
+                    let nulls_not_distinct = self.unique_nulls_not_distinct()?;
                     let timing = self.constraint_timing(false)?;
                     // A named or deferrable single-column constraint needs a
                     // durable key object; only the default unnamed form can use
                     // the compact column flag.
-                    if col_cons_name.is_some() || timing.is_deferrable() {
+                    if col_cons_name.is_some() || timing.is_deferrable() || nulls_not_distinct {
                         let key_columns = self.arena_slice(&[col_name])?;
                         self.push(
                             &mut cons,
@@ -7927,6 +7922,7 @@ impl<'a> Parser<'a> {
                                 name: col_cons_name,
                                 columns: key_columns,
                                 timing,
+                                nulls_not_distinct,
                             },
                         )?;
                         continue;
@@ -8260,12 +8256,14 @@ impl<'a> Parser<'a> {
                 timing,
             })
         } else if self.eat_ident("unique")? {
+            let nulls_not_distinct = self.unique_nulls_not_distinct()?;
             let columns = self.column_name_list()?;
             let timing = self.constraint_timing(false)?;
             Ok(TableConstraint::Unique {
                 name,
                 columns,
                 timing,
+                nulls_not_distinct,
             })
         } else if self.eat_ident("check")? {
             self.check_constraint(name, allow_not_valid)
@@ -8278,6 +8276,13 @@ impl<'a> Parser<'a> {
             self.expect_ident("references")?;
             self.references_tail(name, columns, allow_not_valid)
         }
+    }
+
+    pub(super) fn unique_nulls_not_distinct(&mut self) -> Result<bool, ParseError> {
+        if !self.eat_ident("nulls")? { return Ok(false); }
+        let not_distinct = self.eat_ident("not")?;
+        self.expect_ident("distinct")?;
+        Ok(not_distinct)
     }
 
     fn exclusion_constraint(

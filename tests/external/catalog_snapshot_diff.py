@@ -76,14 +76,28 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
     reports = (
         ("table_constraints", "SELECT * FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name"),
         ("key_column_usage", "SELECT * FROM information_schema.key_column_usage WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name,ordinal_position"),
-        ("constraint_column_usage", "SELECT * FROM information_schema.constraint_column_usage WHERE constraint_name LIKE 'report_%' ORDER BY table_name,column_name,constraint_name"),
-        ("constraint_table_usage", "SELECT * FROM information_schema.constraint_table_usage WHERE constraint_name LIKE 'report_%' ORDER BY table_name,constraint_name"),
+        ("constraint_column_usage", "SELECT * FROM information_schema.constraint_column_usage WHERE constraint_name LIKE 'report_%%' ORDER BY table_name,column_name,constraint_name"),
+        ("constraint_table_usage", "SELECT * FROM information_schema.constraint_table_usage WHERE constraint_name LIKE 'report_%%' ORDER BY table_name,constraint_name"),
         ("referential_constraints", "SELECT * FROM information_schema.referential_constraints WHERE constraint_name='report_parent_fk_diff'"),
         ("domain_constraints", "SELECT * FROM information_schema.domain_constraints WHERE domain_name IN ('report_domain_diff','report_renamed_domain_diff') ORDER BY constraint_name"),
-        ("check_constraints", "SELECT * FROM information_schema.check_constraints WHERE constraint_name LIKE 'report_%' ORDER BY constraint_name"),
+        ("check_constraints", "SELECT * FROM information_schema.check_constraints WHERE constraint_name LIKE 'report_%%' ORDER BY constraint_name"),
         ("indexes", "SELECT * FROM pg_indexes WHERE tablename IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY indexname"),
     )
     try:
+        record(writer, f"{prefix}.constraint.dependencies", """
+            SELECT d.classid::regclass::text,coalesce(c.conname,i.relname),d.objsubid,
+                   d.refclassid::regclass::text,
+                   coalesce(rc.conname,ri.relname,rn.nspname,rt.typname),d.refobjsubid,d.deptype
+              FROM pg_depend d
+              LEFT JOIN pg_constraint c ON d.classid='pg_constraint'::regclass AND c.oid=d.objid
+              LEFT JOIN pg_class i ON d.classid='pg_class'::regclass AND i.oid=d.objid
+              LEFT JOIN pg_constraint rc ON d.refclassid='pg_constraint'::regclass AND rc.oid=d.refobjid
+              LEFT JOIN pg_class ri ON d.refclassid='pg_class'::regclass AND ri.oid=d.refobjid
+              LEFT JOIN pg_namespace rn ON d.refclassid='pg_namespace'::regclass AND rn.oid=d.refobjid
+              LEFT JOIN pg_type rt ON d.refclassid='pg_type'::regclass AND rt.oid=d.refobjid
+             WHERE c.conname LIKE 'report_%%' OR (i.relkind IN ('i','I') AND i.relname LIKE 'report_%%')
+             ORDER BY 1,2,3,4,5,6,7
+        """)
         for name, query in reports:
             record(writer, f"{prefix}.constraint.types.{name}", f"SELECT * FROM ({query}) report LIMIT 0")
         record(writer, f"{prefix}.constraint.index_columns", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,false),pg_get_indexdef('report_expression_diff'::regclass,2,false),pg_get_indexdef('report_expression_diff'::regclass,3,false)")

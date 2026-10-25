@@ -22013,10 +22013,10 @@ fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
     );
 }
 
-#[path = "catalog_derived_tests.rs"]
-mod catalog_derived_tests;
 #[path = "catalog_constraint_tests.rs"]
 mod catalog_constraint_tests;
+#[path = "catalog_derived_tests.rs"]
+mod catalog_derived_tests;
 
 #[test]
 fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
@@ -81146,7 +81146,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v25\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v26\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -81361,7 +81361,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v25\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v26\n"))
     );
     drop(recovered);
 

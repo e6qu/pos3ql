@@ -20111,8 +20111,9 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let schema_acl_tag = format!("acl {} ", crate::storage::AccessClass::Schema as u8);
                     let manifest = saved.lines()
-                        .filter(|line| !remove_namespaces || !line.starts_with("nsp "))
+                        .filter(|line| !remove_namespaces || (!line.starts_with("nsp ") && !line.starts_with(&schema_acl_tag)))
                         .map(|line| format!("{line}\n")).collect::<String>();
                     let restored = checkpointer.load_manifest_text(&mut storage, &manifest);
                     if remove_namespaces {

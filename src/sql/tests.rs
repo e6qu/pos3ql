@@ -3952,19 +3952,19 @@ fn schema_rename_database_selection_accepts_missing_public_and_rejects_unknown_d
     engine.select_database(template).unwrap();
     assert_eq!(engine.storage.current_database_oid(), template);
     assert_eq!(engine.work.database_oid(), template);
-    assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
-        "SELECT to_regnamespace('public') IS NULL; SELECT current_schema() IS NULL")), ["t", "t"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT to_regnamespace('public') IS NULL; SELECT current_schema() IS NULL"
+        )),
+        ["t", "t"]
+    );
     let unknown = crate::storage::DatabaseOid::parse(i32::MAX).unwrap();
     let error = engine.select_database(unknown).unwrap_err();
     assert_eq!(error.sqlstate, eval::sqlstate::INVALID_CATALOG_NAME);
-    assert_eq!(
-        engine.storage.current_database_oid(),
-        template
-    );
-    assert_eq!(
-        engine.work.database_oid(),
-        template
-    );
+    assert_eq!(engine.storage.current_database_oid(), template);
+    assert_eq!(engine.work.database_oid(), template);
 }
 
 #[test]

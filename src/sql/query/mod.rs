@@ -136,6 +136,11 @@ pub(crate) enum StoredQueryRenameTarget<'a> {
         column: usize,
         sources: &'a [super::parser::ColumnSource<'a>],
     },
+    CatalogColumns {
+        table: usize,
+        sources: &'a [super::parser::ColumnSource<'a>],
+        bindings: &'a [core::cell::Cell<Option<usize>>],
+    },
 }
 
 pub(crate) struct StoredQueryRename<'a> {
@@ -152,13 +157,11 @@ struct StoredQueryRenameScope<'scope, 'arena> {
 }
 
 impl StoredQueryRenameScope<'_, '_> {
-    fn references_column(
+    fn column_origin(
         &self,
         qualifier: Option<&str>,
         name: &str,
-        table: usize,
-        column: usize,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<Option<(usize, usize)>, SqlError> {
         match self.current.find_column(qualifier, name) {
             Ok(ResolvedColumn::Table(source, selected)) => {
                 let reference = if source == 0 {
@@ -166,23 +169,21 @@ impl StoredQueryRenameScope<'_, '_> {
                 } else {
                     &self.from.joins[source - 1].table
                 };
-                Ok(self.current.derived[source].is_none()
-                    && self.current.slots[source] == table
-                    && selected == column
+                Ok((self.current.derived[source].is_none()
                     && reference
                         .col_alias
                         .is_none_or(|aliases| selected >= aliases.len()))
+                .then_some((self.current.slots[source], selected)))
             }
-            Ok(ResolvedColumn::Merged(_)) => Ok(false),
+            Ok(ResolvedColumn::Merged(_)) => Ok(None),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                self.outer.map_or(Ok(false), |outer| {
-                    outer.references_column(qualifier, name, table, column)
-                })
+                self.outer
+                    .map_or(Ok(None), |outer| outer.column_origin(qualifier, name))
             }
             Err(error) => Err(error),
         }
@@ -234,11 +235,8 @@ impl<'a> StoredQueryRename<'a> {
                     expression, columns, slot, from, sites, count,
                 )
             }
-            StoredQueryRenameTarget::TableColumn {
-                table,
-                column,
-                sources,
-            } => {
+            StoredQueryRenameTarget::TableColumn { table, sources, .. }
+            | StoredQueryRenameTarget::CatalogColumns { table, sources, .. } => {
                 let (qualifier, name) = match expression {
                     Expr::Column { qualifier, name } => (*qualifier, *name),
                     Expr::SchemaColumn {
@@ -258,14 +256,23 @@ impl<'a> StoredQueryRename<'a> {
                     }
                     _ => return Ok(()),
                 };
-                if outer_scope.map_or(Ok(false), |scope| {
-                    scope.references_column(qualifier, name, table, column)
-                })? {
+                if let Some((origin, column)) =
+                    outer_scope.map_or(Ok(None), |scope| scope.column_origin(qualifier, name))?
+                    && origin == table
+                {
                     for (index, source) in sources.iter().enumerate() {
                         if core::ptr::eq(source.name.as_ptr(), name.as_ptr())
                             && source.name.len() == name.len()
                         {
-                            sites[index] = true;
+                            match self.target {
+                                StoredQueryRenameTarget::TableColumn { column: target, .. } => {
+                                    sites[index] |= column == target;
+                                }
+                                StoredQueryRenameTarget::CatalogColumns { bindings, .. } => {
+                                    bindings[index].set(Some(column));
+                                }
+                                StoredQueryRenameTarget::CompositeField { .. } => unreachable!(),
+                            }
                         }
                     }
                 }
@@ -273,6 +280,35 @@ impl<'a> StoredQueryRename<'a> {
             }
         }
     }
+}
+
+pub(crate) fn catalog_expression_bindings<'a>(
+    select: &'a Select<'a>,
+    sources: &'a [super::parser::ColumnSource<'a>],
+    storage: &'a Storage,
+    txid: u32,
+    table: usize,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a [core::cell::Cell<Option<usize>>], SqlError> {
+    let select =
+        cte::expand_stored_query(select, storage, txid, storage.path(), dependencies, arena)?;
+    let values = arena
+        .alloc_slice_with(sources.len(), |_| None::<usize>)
+        .map_err(|_| arena_full())?;
+    let bindings = core::cell::Cell::from_mut(values).as_slice_of_cells();
+    let selection = StoredQueryRename {
+        storage,
+        txid,
+        arena,
+        target: StoredQueryRenameTarget::CatalogColumns {
+            table,
+            sources,
+            bindings,
+        },
+    };
+    collect_stored_query_composite_field_rename_select(select, &selection, None, &mut [], &mut 0)?;
+    Ok(bindings)
 }
 
 fn collect_stored_query_composite_field_rename_set_tree<'a>(
@@ -575,8 +611,8 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 pub(crate) use srf::{
-    expression_has_project_set, is_srf_name as is_builtin_set_routine, synth_derived_def,
-    synth_derived_def_outer, table_func_rows_outer,
+    describe_derived_definition, expression_has_project_set, is_srf_name as is_builtin_set_routine,
+    synth_derived_def, synth_derived_def_outer, table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -3216,13 +3252,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn index_def<'a>(
         &self,
         oid: i32,
-        col: usize,
+        col: i32,
+        pretty: bool,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::index_def_text(self.storage, self.txid, oid, col, arena)
+        super::catalog::index_def_text(self.storage, self.txid, oid, col, pretty, arena)
     }
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
+    }
+    fn expression_def<'a>(
+        &self,
+        node: &str,
+        relation: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::expression_def_text(self.storage, self.txid, node, relation, pretty, arena)
     }
     fn partition_key_def<'a>(
         &self,
@@ -3422,8 +3468,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let column = match column {
                     super::eval::PrivilegeColumn::Name(name) => definition.column_index(name),
                     super::eval::PrivilegeColumn::Number(number) if number > 0 => {
-                        let index = number as usize - 1;
-                        (index < definition.n_columns).then_some(index)
+                        definition.attribute_column(number as u16)
                     }
                     super::eval::PrivilegeColumn::Number(_) => None,
                 };
@@ -3636,58 +3681,154 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_type_privilege(
         &self,
         role: Option<&str>,
-        type_name: &str,
+        target: super::eval::PrivilegeType<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        use super::types::oid;
+        use crate::storage::{AccessClass, AccessObject, PrivilegeSet};
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (written_schema, name) = split_catalog_name(type_name);
-        let domain = match written_schema {
-            Some(schema) => self.storage.domain_slot(schema, name, self.txid),
-            None => self.storage.resolve_domain_slot(name, self.txid),
+        let type_oid = match target {
+            super::eval::PrivilegeType::Oid(oid) => oid,
+            super::eval::PrivilegeType::Name(name) => {
+                let resolved = super::eval::regtype_cast(
+                    Datum::Text(name),
+                    Some(self),
+                    self.routine_workspace,
+                )?;
+                let Datum::Regtype { referenced_oid, .. } = resolved else {
+                    unreachable!("type name resolved to regtype")
+                };
+                referenced_oid
+            }
         };
-        let enumeration = match written_schema {
-            Some(schema) => self.storage.enum_slot(schema, name, self.txid),
-            None => self.storage.resolve_enum_slot(name, self.txid),
-        };
-        let composite = match written_schema {
-            Some(schema) => self.storage.composite_slot(schema, name, self.txid),
-            None => self.storage.resolve_composite_slot(name, self.txid),
-        };
-        let object = domain
-            .map(|slot| crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Domain,
+        let named = [
+            (
+                oid::FIRST_DOMAIN,
+                self.storage.domain_count(),
+                AccessClass::Domain,
+            ),
+            (
+                oid::FIRST_ENUM,
+                self.storage.enum_count(),
+                AccessClass::Enum,
+            ),
+            (
+                oid::FIRST_COMPOSITE,
+                self.storage.composite_count(),
+                AccessClass::Composite,
+            ),
+            (
+                oid::FIRST_DOMAIN_ARRAY,
+                self.storage.domain_count(),
+                AccessClass::Domain,
+            ),
+            (
+                oid::FIRST_ENUM_ARRAY,
+                self.storage.enum_count(),
+                AccessClass::Enum,
+            ),
+            (
+                oid::FIRST_COMPOSITE_ARRAY,
+                self.storage.composite_count(),
+                AccessClass::Composite,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(first, count, class)| {
+            let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
+            (slot < count).then_some(AccessObject {
+                class,
                 slot: slot as u16,
             })
-            .or_else(|| {
-                enumeration.map(|slot| crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Enum,
-                    slot: slot as u16,
-                })
-            })
-            .or_else(|| {
-                composite.map(|slot| crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Composite,
+        });
+        if let Some(object) = named {
+            let slot = usize::from(object.slot);
+            let visible = match object.class {
+                AccessClass::Domain => self.storage.domain_slot_visible_to(slot, self.txid),
+                AccessClass::Enum => self.storage.enum_slot_visible_to(slot, self.txid),
+                AccessClass::Composite => self.storage.composite_slot_visible_to(slot, self.txid),
+                _ => unreachable!("named type object was classified"),
+            };
+            if !visible {
+                return Ok(None);
+            }
+            return privilege_query(
+                privileges,
+                PrivilegeSet::NONE,
+                PrivilegeSet::TYPE_ALL,
+                |privilege| {
+                    self.storage
+                        .has_object_privilege(object, role, privilege, self.txid)
+                },
+                |privilege| {
+                    self.storage
+                        .has_object_grant_option(object, role, privilege, self.txid)
+                },
+            )
+            .map(Some);
+        }
+        let owner = {
+            let row_type = [
+                (
+                    super::catalog::FIRST_TABLE_COMPOSITE_TYPE_OID,
+                    self.storage.table_count(),
+                    AccessClass::Table,
+                ),
+                (
+                    super::catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID,
+                    self.storage.table_count(),
+                    AccessClass::Table,
+                ),
+                (
+                    super::catalog::FIRST_VIEW_COMPOSITE_TYPE_OID,
+                    self.storage.view_count(),
+                    AccessClass::View,
+                ),
+                (
+                    super::catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID,
+                    self.storage.view_count(),
+                    AccessClass::View,
+                ),
+            ]
+            .into_iter()
+            .find_map(|(first, count, class)| {
+                let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
+                (slot < count).then_some(AccessObject {
+                    class,
                     slot: slot as u16,
                 })
             });
-        let Some(object) = object else {
-            return Ok(None);
+            if let Some(object) = row_type {
+                let slot = usize::from(object.slot);
+                let visible = match object.class {
+                    AccessClass::Table => self.storage.table_slot_visible_to(slot, self.txid),
+                    AccessClass::View => self.storage.view_slot_visible_to(slot, self.txid),
+                    _ => unreachable!("row type was classified"),
+                };
+                if !visible {
+                    return Ok(None);
+                }
+                self.storage.object_owner(object, self.txid)
+            } else if type_oid < oid::FIRST_DOMAIN
+                && super::catalog::intrinsic_type_name(type_oid).is_some()
+            {
+                self.storage
+                    .role_slot_by_oid(10, self.txid)
+                    .expect("bootstrap type owner exists")
+            } else {
+                return Ok(None);
+            }
         };
+        let owned = self.storage.role_has_privileges_of(role, owner, self.txid);
         privilege_query(
             privileges,
-            crate::storage::PrivilegeSet::NONE,
-            crate::storage::PrivilegeSet::TYPE_ALL,
-            |privilege| {
-                self.storage
-                    .has_object_privilege(object, role, privilege, self.txid)
-            },
-            |privilege| {
-                self.storage
-                    .has_object_grant_option(object, role, privilege, self.txid)
-            },
+            PrivilegeSet::USAGE,
+            PrivilegeSet::TYPE_ALL,
+            |_| owned,
+            |_| owned,
         )
         .map(Some)
     }

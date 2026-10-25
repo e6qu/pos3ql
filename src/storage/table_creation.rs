@@ -22,6 +22,14 @@ pub(super) fn allocate(
     allocation: super::CatalogAllocation,
     creation: TableCreation,
 ) -> Result<usize, SqlError> {
+    def.attributes.initialize(def.n_columns)?;
+    if !def.attributes.validate(def.n_columns) {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid column attribute layout"
+        ));
+    }
+    super::constraint_names::table(&mut def)?;
     let transaction = match creation {
         TableCreation::Committed => 0,
         TableCreation::Pending(transaction) => transaction,

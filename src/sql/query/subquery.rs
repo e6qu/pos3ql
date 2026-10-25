@@ -2095,8 +2095,8 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Composite(slot) => Datum::Composite { slot, fields: &[] },
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
-        ColType::PgNodeTree
-        | ColType::PgNdistinct
+        ColType::PgNodeTree => Datum::PgNodeTree(crate::sql::catalog_node::CatalogNode::NULL),
+        ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
         | ColType::PgStatisticArray

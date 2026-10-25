@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import psycopg
+from psycopg import sql as pg_sql
 
 
 # Declared fields verified against the PostgreSQL reference metadata.
@@ -68,7 +69,135 @@ def connect(host, port, user, database):
     return connection
 
 
-def transcript(reader, writer):
+def constraint_reports(reader, writer, isolation, prefix, record, record_outcome):
+    writer.execute("CREATE TABLE report_parent_diff(a integer,b integer,CONSTRAINT report_parent_key_diff PRIMARY KEY(a,b),CONSTRAINT report_positive_diff CHECK(b>0))")
+    writer.execute("CREATE TABLE report_child_diff(x integer,y integer,CONSTRAINT report_child_unique_diff UNIQUE NULLS NOT DISTINCT(x,y),CONSTRAINT report_parent_fk_diff FOREIGN KEY(x,y) REFERENCES report_parent_diff(b,a) DEFERRABLE INITIALLY DEFERRED)")
+    writer.execute("CREATE DOMAIN report_domain_diff AS integer NOT NULL CONSTRAINT report_domain_check_diff CHECK(VALUE>0)")
+    writer.execute("CREATE INDEX report_expression_diff ON report_child_diff((x+1)) INCLUDE(y)")
+    reports = (
+        ("table_constraints", "SELECT * FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name"),
+        ("key_column_usage", "SELECT * FROM information_schema.key_column_usage WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name,ordinal_position"),
+        ("constraint_column_usage", "SELECT * FROM information_schema.constraint_column_usage WHERE constraint_name LIKE 'report_%%' ORDER BY table_name,column_name,constraint_name"),
+        ("constraint_table_usage", "SELECT * FROM information_schema.constraint_table_usage WHERE constraint_name LIKE 'report_%%' ORDER BY table_name,constraint_name"),
+        ("referential_constraints", "SELECT * FROM information_schema.referential_constraints WHERE constraint_name='report_parent_fk_diff'"),
+        ("domain_constraints", "SELECT * FROM information_schema.domain_constraints WHERE domain_name IN ('report_domain_diff','report_renamed_domain_diff') ORDER BY constraint_name"),
+        ("check_constraints", "SELECT * FROM information_schema.check_constraints WHERE constraint_name LIKE 'report_%%' ORDER BY constraint_name"),
+        ("indexes", "SELECT * FROM pg_indexes WHERE tablename IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY indexname"),
+    )
+    try:
+        record(writer, f"{prefix}.constraint.dependencies", """
+            SELECT d.classid::regclass::text,coalesce(c.conname,i.relname),d.objsubid,
+                   d.refclassid::regclass::text,
+                   coalesce(rc.conname,ri.relname,rn.nspname,rt.typname),d.refobjsubid,d.deptype
+              FROM pg_depend d
+              LEFT JOIN pg_constraint c ON d.classid='pg_constraint'::regclass AND c.oid=d.objid
+              LEFT JOIN pg_class i ON d.classid='pg_class'::regclass AND i.oid=d.objid
+              LEFT JOIN pg_constraint rc ON d.refclassid='pg_constraint'::regclass AND rc.oid=d.refobjid
+              LEFT JOIN pg_class ri ON d.refclassid='pg_class'::regclass AND ri.oid=d.refobjid
+              LEFT JOIN pg_namespace rn ON d.refclassid='pg_namespace'::regclass AND rn.oid=d.refobjid
+              LEFT JOIN pg_type rt ON d.refclassid='pg_type'::regclass AND rt.oid=d.refobjid
+             WHERE c.conname LIKE 'report_%%' OR (i.relkind IN ('i','I') AND i.relname LIKE 'report_%%')
+             ORDER BY 1,2,3,4,5,6,7
+        """)
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.types.{name}", f"SELECT * FROM ({query}) report LIMIT 0")
+        record(writer, f"{prefix}.constraint.index_columns", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,false),pg_get_indexdef('report_expression_diff'::regclass,2,false),pg_get_indexdef('report_expression_diff'::regclass,3,false)")
+        record(writer, f"{prefix}.constraint.index_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,0,true),pg_get_indexdef('report_expression_diff'::regclass,1,true),pg_get_indexdef('report_expression_diff'::regclass,2,true)")
+        writer.execute("CREATE SEQUENCE report_argument_diff")
+        writer.execute("CREATE FUNCTION report_node_query_diff() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END")
+        writer.execute("BEGIN")
+        try:
+            for name, query in (
+                ("expression_null_relation", "SELECT pg_get_expr(conbin,NULL::oid) IS NULL FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_null_pretty", "SELECT pg_get_expr(conbin,conrelid,NULL::boolean) IS NULL FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_null_first", "SELECT pg_get_expr(NULL::pg_node_tree,nextval('report_argument_diff')::oid,false) IS NULL"),
+                ("expression_null_row", "SELECT pg_get_expr(conbin,nextval('report_argument_diff')::oid,false) IS NULL FROM pg_constraint WHERE conname='report_parent_key_diff'"),
+                ("expression_arguments_called", "SELECT last_value,is_called FROM report_argument_diff"),
+                ("expression_missing_relation", "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_invalid_input", "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)"),
+                ("expression_query_body", "SELECT pg_get_expr(prosqlbody,0) FROM pg_proc WHERE proname='report_node_query_diff'"),
+                ("statistics_ndistinct_input", "SELECT 'invalid'::pg_ndistinct"),
+                ("statistics_dependencies_input", "SELECT 'invalid'::pg_dependencies"),
+                ("statistics_mcv_input", "SELECT 'invalid'::pg_mcv_list"),
+                ("index_negative_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,-1,false)"),
+                ("index_minimum_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,'-2147483648'::integer,false)"),
+                ("index_two_arguments", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1)"),
+                ("index_null_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,NULL::integer,false) IS NULL"),
+                ("index_null_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,NULL::boolean) IS NULL"),
+            ):
+                record_outcome(writer, f"{prefix}.constraint.deparse.{name}", query, ())
+        finally:
+            writer.execute("ROLLBACK")
+            writer.execute("DROP SEQUENCE report_argument_diff")
+            writer.execute("DROP FUNCTION report_node_query_diff()")
+
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        record(reader, f"{prefix}.constraint.listing.before", "SELECT table_name,constraint_name FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff') ORDER BY table_name,constraint_name")
+        writer.execute("ALTER TABLE report_parent_diff RENAME TO report_renamed_parent_diff")
+        writer.execute("ALTER TABLE report_renamed_parent_diff RENAME b TO renamed_b")
+        writer.execute("ALTER TABLE report_child_diff RENAME TO report_renamed_child_diff")
+        writer.execute("ALTER DOMAIN report_domain_diff RENAME TO report_renamed_domain_diff")
+        for name, query in reports:
+            record_outcome(reader, f"{prefix}.constraint.selected.{name}", query, ())
+        reader.execute("COMMIT")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.fresh.{name}", query)
+
+        writer.execute("CREATE TABLE report_ordinal_diff(lost text,kept bigint NOT NULL,g bigint GENERATED ALWAYS AS (kept+1) STORED,CONSTRAINT ordinal_positive_diff CHECK(kept>0),CONSTRAINT ordinal_key_diff UNIQUE(kept))")
+        writer.execute("COMMENT ON COLUMN report_ordinal_diff.kept IS 'retained column'")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        record(reader, f"{prefix}.constraint.ordinal.before", "SELECT pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE conname='ordinal_positive_diff'")
+        writer.execute("ALTER TABLE report_ordinal_diff DROP COLUMN lost")
+        writer.execute("ALTER TABLE report_ordinal_diff ADD COLUMN fresh smallint")
+        record_outcome(reader, f"{prefix}.constraint.ordinal.selected", "SELECT pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE conname='ordinal_positive_diff'", ())
+        reader.execute("ROLLBACK")
+        record(writer, f"{prefix}.constraint.ordinal.attributes", "SELECT attname,attnum,atttypid,attlen,attbyval,attalign,attstorage,attcompression,atttypmod,attnotnull,attisdropped,attstattarget FROM pg_attribute WHERE attrelid='report_ordinal_diff'::regclass AND attnum>0 ORDER BY attnum")
+        record(writer, f"{prefix}.constraint.ordinal.keys", "SELECT conname,conkey FROM pg_constraint WHERE conname IN ('ordinal_positive_diff','ordinal_key_diff') ORDER BY conname")
+        record(writer, f"{prefix}.constraint.ordinal.width", "SELECT relnatts FROM pg_class WHERE oid='report_ordinal_diff'::regclass")
+        record(writer, f"{prefix}.constraint.ordinal.comments", "SELECT objsubid,description FROM pg_description WHERE objoid='report_ordinal_diff'::regclass")
+        record(writer, f"{prefix}.constraint.ordinal.comment_lookup", "SELECT col_description('report_ordinal_diff'::regclass,2)")
+        record(writer, f"{prefix}.constraint.ordinal.address", "SELECT (pg_identify_object('pg_class'::regclass,'report_ordinal_diff'::regclass,2)).identity")
+        writer.execute("DROP TABLE report_ordinal_diff")
+
+        writer.execute("BEGIN")
+        writer.execute("SAVEPOINT report_before_edit")
+        writer.execute("ALTER TABLE report_renamed_child_diff RENAME TO report_child_diff")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.private.{name}", query)
+        writer.execute("ROLLBACK TO report_before_edit")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.savepoint.{name}", query)
+        writer.execute("ROLLBACK")
+
+        writer.execute("CREATE ROLE report_reader_diff")
+        writer.execute("GRANT SELECT ON report_renamed_child_diff TO report_reader_diff")
+        record(writer, f"{prefix}.constraint.type_owner", "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE WITH GRANT OPTION')")
+        reader.execute("SET ROLE report_reader_diff")
+        try:
+            for name, query in reports:
+                record(reader, f"{prefix}.constraint.select_only.{name}", query)
+            record(reader, f"{prefix}.constraint.type_public", "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE WITH GRANT OPTION')")
+            writer.execute("REVOKE USAGE ON DOMAIN report_renamed_domain_diff FROM PUBLIC")
+            record(reader, f"{prefix}.constraint.type_revoked", "SELECT has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE')")
+            writer.execute("GRANT USAGE ON DOMAIN report_renamed_domain_diff TO PUBLIC")
+            writer.execute("GRANT UPDATE(y) ON report_renamed_child_diff TO report_reader_diff")
+            for name, query in reports:
+                record(reader, f"{prefix}.constraint.column_writer.{name}", query)
+        finally:
+            reader.execute("RESET ROLE")
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE IF EXISTS report_child_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_renamed_child_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_parent_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_renamed_parent_diff CASCADE")
+        writer.execute("DROP DOMAIN IF EXISTS report_domain_diff CASCADE")
+        writer.execute("DROP DOMAIN IF EXISTS report_renamed_domain_diff CASCADE")
+        writer.execute("DROP ROLE IF EXISTS report_reader_diff")
+
+
+def transcript(reader, writer, host, port, user, report_database):
     observed = []
 
     def record(connection, label, sql, parameters=()):
@@ -100,6 +229,7 @@ def transcript(reader, writer):
 
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
+        constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")
@@ -369,6 +499,18 @@ def transcript(reader, writer):
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
         try:
             writer.execute('CREATE INDEX catalog_index_vectors_diff_idx ON catalog_index_vectors_diff (id DESC NULLS LAST, note COLLATE "C" ASC NULLS FIRST) INCLUDE (extra)')
+            record(writer, f"{prefix}.catalog_collated_columns", """
+                SELECT indkey::text,pg_get_indexdef(indexrelid,0,false),
+                       pg_get_indexdef(indexrelid,0,true),pg_get_indexdef(indexrelid,2,false)
+                  FROM pg_index WHERE indexrelid='catalog_index_vectors_diff_idx'::regclass
+            """)
+            writer.execute('CREATE INDEX catalog_index_collate_expr_diff ON catalog_index_vectors_diff ((lower(note) COLLATE "C"), ((note COLLATE "C")))')
+            record(writer, f"{prefix}.catalog_collated_expressions", """
+                SELECT indkey::text,pg_get_expr(indexprs,indrelid),
+                       pg_get_indexdef(indexrelid,0,false),pg_get_indexdef(indexrelid,1,false),
+                       pg_get_indexdef(indexrelid,2,false)
+                  FROM pg_index WHERE indexrelid='catalog_index_collate_expr_diff'::regclass
+            """)
             record(writer, f"{prefix}.catalog_index_vectors", """
                 SELECT indnatts,indnkeyatts,indoption::text,indcollation::text,
                        pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
@@ -856,6 +998,14 @@ def transcript(reader, writer):
             writer.execute("DROP OWNED BY catalog_parameter_writer_diff")
             writer.execute("DROP ROLE catalog_parameter_reader_diff")
             writer.execute("DROP ROLE catalog_parameter_writer_diff")
+    writer.execute(pg_sql.SQL("CREATE DATABASE {}").format(pg_sql.Identifier(report_database)))
+    try:
+        with connect(host, port, user, report_database) as other_reader, connect(host, port, user, report_database) as other_writer:
+            for isolation in ("READ COMMITTED", "REPEATABLE READ"):
+                prefix = "other_database." + isolation.lower().replace(" ", "_")
+                constraint_reports(other_reader, other_writer, isolation, prefix, record, record_outcome)
+    finally:
+        writer.execute(pg_sql.SQL("DROP DATABASE {}").format(pg_sql.Identifier(report_database)))
     return observed
 
 
@@ -865,10 +1015,13 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--user", required=True)
     parser.add_argument("--database", required=True)
+    parser.add_argument("--report-database", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--metadata-output", type=Path)
     arguments = parser.parse_args()
+    if arguments.report_database == arguments.database:
+        parser.error("--report-database must name a separate fixture database")
     with connect(arguments.host, arguments.port, arguments.user, arguments.database) as reader, connect(arguments.host, arguments.port, arguments.user, arguments.database) as writer:
         if arguments.metadata_output is not None:
             metadata = {
@@ -918,9 +1071,15 @@ def main():
                      WHERE n.nspname='pg_catalog'
                      ORDER BY t.oid
                 """).fetchall(),
+                "type_layouts": reader.execute("""
+                    SELECT t.oid,t.typname,t.typlen,t.typbyval,t.typalign,t.typstorage
+                      FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
+                     WHERE n.nspname='pg_catalog' AND t.oid<16384
+                     ORDER BY t.oid
+                """).fetchall(),
             }
             arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")
-        observed = transcript(reader, writer)
+        observed = transcript(reader, writer, arguments.host, arguments.port, arguments.user, arguments.report_database)
     # JSON normalizes driver tuples before comparing two independent servers.
     serialized = json.dumps(observed, indent=2) + "\n"
     arguments.output.write_text(serialized)

@@ -4734,8 +4734,17 @@ def test_partitioned_tables_over_raw_wire():
     check(
         "raw wire: partition bounds retain pg_node_tree metadata",
         row_description_type_oids(description) == [194]
-        and first_text_row(bound) == "FOR VALUES IN (1)",
+        and first_text_row(bound) is not None,
         bound,
+    )
+    deparsed_bound = simple_query(
+        s,
+        "SELECT pg_get_expr(relpartbound,oid) FROM pg_class WHERE relname = 'wire_partition_east'",
+    )
+    check(
+        "raw wire: partition bounds deparse through pg_get_expr",
+        first_text_row(deparsed_bound) == "FOR VALUES IN (1)",
+        deparsed_bound,
     )
     cleanup = simple_query(
         s,

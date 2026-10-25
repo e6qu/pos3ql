@@ -13,7 +13,7 @@ use core::{fmt::Write, num::NonZeroU32};
 const PUBLIC_COLUMNS: usize = 7;
 const VIEW_DEFINITION: usize = 7;
 const RULE_BODY: usize = 8;
-const PRIVATE_COLUMNS: &[(&str, crate::sql::types::ColType)] = &[
+pub(super) const PRIVATE_COLUMNS: &[(&str, crate::sql::types::ColType)] = &[
     ("_pos3ql_view_definition", crate::sql::types::ColType::Text),
     (
         "_pos3ql_rule_body",
@@ -94,7 +94,7 @@ pub(super) fn current<'a>(
     let hidden = if bodies { PRIVATE_COLUMNS } else { &[] };
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), hidden)?;
-    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
+    let definition = super::allocate_definition(definition, hidden_columns, arena)?;
     let output = super::catalog_rows(arena, storage.rules_visible_to(transaction).count())?;
     for (target, (_, rule)) in output.iter_mut().zip(storage.rules_visible_to(transaction)) {
         *target = rule_row(storage, rule, transaction, bodies, arena)?;
@@ -123,7 +123,7 @@ pub(super) fn selected<'a>(
     )?;
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), &[])?;
-    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
+    let definition = super::allocate_definition(definition, hidden_columns, arena)?;
     let rows = arena
         .alloc_slice_with(retained.rows.len(), |at| {
             &retained.rows[at][..PUBLIC_COLUMNS]

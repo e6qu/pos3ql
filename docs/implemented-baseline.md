@@ -1033,6 +1033,11 @@ transaction can reuse its old name. Savepoints restore both names and comments.
 Table deletion identifies its
 indexes by the selected table lifetime, including after a rename or schema move.
 
+An index built with a different text ordering cannot supply the column's normal
+ordering. For example, an index on `name COLLATE "C"` does not remove the need
+to sort `ORDER BY name` when that column uses another collation (text ordering).
+The same check applies after a restart.
+
 ### Changing rewrite rules
 
 A rewrite rule changes what a command does before it runs. For example, a rule
@@ -1140,11 +1145,40 @@ their statement or transaction. A read-committed statement can select newer
 rows; a repeatable-read transaction keeps its earlier listing. These reports
 build their results by joining the selected base rows:
 
-- `pg_tables`, `pg_roles`, `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
+- `pg_tables`, `pg_indexes`, `pg_roles`, `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
 - `information_schema.tables`, `columns`, `views`, `sequences`,
-  `view_table_usage` and `view_column_usage`.
+  `view_table_usage`, `view_column_usage`, `table_constraints`, `key_column_usage`,
+  `constraint_column_usage`, `constraint_table_usage`, `referential_constraints`,
+  `domain_constraints` and `check_constraints`.
 
 Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
+
+Column descriptions retain PostgreSQL's physical type properties. For example,
+`pg_attribute` reports alignment `s` for `smallint`, `d` for `bigint`, and `d`
+for `bigint[]`. These describe PostgreSQL's catalog contract; pos3ql chooses
+its object block layout separately.
+
+Catalog expression values have their own validated type. A user can copy
+`pg_constraint.conbin` into a `pg_node_tree` column and later display it with
+`pg_get_expr`. Supplying text or binary input for that type fails with `0A000`,
+including text that resembles the internal encoding. PostgreSQL makes this
+same distinction between copying a node and accepting client input.
+
+Removing an earlier column does not change the numbers of surviving columns.
+For example, after creating `parcels(old_code text, weight bigint CHECK(weight>0))`
+and dropping `old_code`, a metadata report still identifies `weight` as column 2.
+The dropped column remains an entry in `pg_attribute`; a new column receives
+number 3. Saved checks, indexes, permissions and comments keep referring to
+`weight`. Rollback, prepared transactions and recovery preserve those numbers.
+PostgreSQL's 1,600-column table limit includes these retained dropped entries;
+an addition beyond that limit fails with `54011`.
+
+Use `UNIQUE NULLS NOT DISTINCT(package_id, attempt)` when two rows such as
+`(17, NULL)` must conflict. The second insert fails with `23505`. Choose
+`UNIQUE NULLS DISTINCT` to permit those rows. These explicit choices work in
+table and column constraints, `ALTER TABLE`, conflict handling, deferred checks,
+table copying and recovery. Constraint reports expose the selected choice.
+Renaming a table or column preserves its stored NOT NULL constraint name.
 
 Object listings use the PostgreSQL metadata inventory independently of which
 catalog row queries are implemented. For example, `pg_statistic` appears in

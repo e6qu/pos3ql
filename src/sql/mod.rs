@@ -6,7 +6,9 @@ pub mod array;
 pub mod ast;
 mod brin_catalog;
 pub mod catalog;
+mod catalog_image;
 mod catalog_metadata;
+pub mod catalog_node;
 mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
@@ -57,6 +59,7 @@ pub mod timezone;
 pub mod to_char;
 pub(crate) mod two_phase;
 pub mod txn;
+pub(crate) mod type_layouts;
 pub mod types;
 pub mod tzif;
 pub(crate) mod unicode;
@@ -20987,6 +20990,7 @@ fn replay_transaction_batches(
                                     "invalid prepared catalog database scope"
                                 ));
                             }
+                            catalog::validate_restored_row(definition, row)?;
                             let transaction = &mut prepared.slot_mut(slot).transaction;
                             if transaction.catalog_history.is_none() {
                                 transaction.catalog_history = storage.reserve_catalog_history(
@@ -22884,6 +22888,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 base: def.base,
                 base_type_mod: def.base_type_mod,
                 not_null: def.not_null,
+                not_null_name: def.not_null_name,
                 default_expr: def.default_expr,
                 checks: def.checks,
                 n_checks: def.n_checks,

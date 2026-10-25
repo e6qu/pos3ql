@@ -2415,45 +2415,44 @@ impl ColType {
         )
     }
 
-    /// PostgreSQL's `typbyval` storage contract on the 64-bit targets this
-    /// server supports. Keep this property with the type rather than
-    /// reconstructing it from `typlen`: fixed-width values such as `tid`,
-    /// `uuid`, `interval`, and `timetz` are nevertheless passed by reference.
-    pub const fn is_pass_by_value(self) -> bool {
-        matches!(
-            self,
-            Self::Void
-                | Self::Internal
-                | Self::Bool
-                | Self::Char
-                | Self::Int2
-                | Self::Int4
-                | Self::Oid
-                | Self::Xid
-                | Self::Xid8
-                | Self::Cid
-                | Self::Regtype
-                | Self::Regproc
-                | Self::Regprocedure
-                | Self::Regoper
-                | Self::Regoperator
-                | Self::Regclass
-                | Self::Regnamespace
-                | Self::Regrole
-                | Self::Regconfig
-                | Self::Regdictionary
-                | Self::Regcollation
-                | Self::Int8
-                | Self::Float4
-                | Self::Float8
-                | Self::Date
-                | Self::Timestamp
-                | Self::Timestamptz
-                | Self::Time
-                | Self::PgLsn
-                | Self::Money
-                | Self::Enum(_)
-        )
+    pub(crate) fn physical_layout(self) -> super::type_layouts::PhysicalLayout {
+        use super::type_layouts::{PhysicalLayout, builtin};
+        match self {
+            Self::Enum(_) => PhysicalLayout {
+                length: 4,
+                by_value: true,
+                alignment: b'i',
+                storage: b'p',
+            },
+            Self::Composite(_) => PhysicalLayout {
+                length: -1,
+                by_value: false,
+                alignment: b'd',
+                storage: b'x',
+            },
+            Self::Array(
+                element @ (ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. }),
+            ) => {
+                let alignment = if element.to_coltype().physical_layout().alignment == b'd' {
+                    b'd'
+                } else {
+                    b'i'
+                };
+                PhysicalLayout {
+                    length: -1,
+                    by_value: false,
+                    alignment,
+                    storage: b'x',
+                }
+            }
+            _ => builtin(self.oid())
+                .expect("modeled built-in type has captured PostgreSQL physical properties"),
+        }
+    }
+
+    /// PostgreSQL physical passing convention on the supported 64-bit targets.
+    pub fn is_pass_by_value(self) -> bool {
+        self.physical_layout().by_value
     }
 
     /// Maps a SQL type name (already case-folded) to a column type.
@@ -2478,6 +2477,10 @@ impl ColType {
             "anyarray" => Self::AnyArray,
             "int2vector" => Self::Int2Vector,
             "oidvector" => Self::OidVector,
+            "pg_node_tree" => Self::PgNodeTree,
+            "pg_ndistinct" => Self::PgNdistinct,
+            "pg_dependencies" => Self::PgDependencies,
+            "pg_mcv_list" => Self::PgMcvList,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,
@@ -2749,74 +2752,7 @@ impl ColType {
     }
 
     pub fn typlen(self) -> i16 {
-        match self {
-            Self::Void | Self::Internal => 4,
-            Self::PgDdlCommand => 8,
-            Self::AnyArray => -1,
-            Self::Bool | Self::Char => 1,
-            Self::Int2 => 2,
-            Self::Tid => 6,
-            Self::Int2Vector
-            | Self::OidVector
-            | Self::PgNodeTree
-            | Self::PgNdistinct
-            | Self::PgDependencies
-            | Self::PgMcvList
-            | Self::PgStatisticArray => -1,
-            Self::Int4
-            | Self::Oid
-            | Self::Xid
-            | Self::Cid
-            | Self::Regtype
-            | Self::Regproc
-            | Self::Regprocedure
-            | Self::Regoper
-            | Self::Regoperator
-            | Self::Regclass
-            | Self::Regnamespace
-            | Self::Regrole
-            | Self::Regconfig
-            | Self::Regdictionary
-            | Self::Regcollation
-            | Self::Date
-            | Self::Float4 => 4,
-            Self::Int8
-            | Self::Xid8
-            | Self::PgLsn
-            | Self::Money
-            | Self::Float8
-            | Self::Timestamp
-            | Self::Timestamptz
-            | Self::Time => 8,
-            Self::Timetz => 12,
-            Self::Interval => 16,
-            Self::AclItem => 16,
-            Self::Uuid => 16,
-            Self::Macaddr => 6,
-            Self::Macaddr8 => 8,
-            Self::Geometry(_) => -1,
-            Self::Name => 64,
-            Self::Text
-            | Self::Refcursor
-            | Self::Varchar
-            | Self::Bpchar
-            | Self::Bytea
-            | Self::Numeric
-            | Self::Json
-            | Self::Xml
-            | Self::Jsonb
-            | Self::Jsonpath
-            | Self::TsVector
-            | Self::TsQuery
-            | Self::PgSnapshot
-            | Self::TxidSnapshot => -1,
-            Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
-            Self::Inet | Self::Cidr => -1,
-            Self::Record => -1,
-            // PostgreSQL enums are a fixed 4-byte OID on the wire.
-            Self::Enum(_) => 4,
-            Self::Composite(_) => -1,
-        }
+        self.physical_layout().length
     }
 
     /// The underlying storage/Datum type: int2 stores as int4, float4 as
@@ -2829,7 +2765,6 @@ impl ColType {
             | Self::Bpchar
             | Self::Name
             | Self::Refcursor
-            | Self::PgNodeTree
             | Self::PgNdistinct
             | Self::PgDependencies
             | Self::PgMcvList
@@ -4665,6 +4600,7 @@ pub enum Datum<'a> {
     /// ASCII from being silently transformed or rejected.
     Char(u8),
     Text(&'a str),
+    PgNodeTree(super::catalog_node::CatalogNode<'a>),
     /// PostgreSQL stores role OIDs, not role names, in an access-control item.
     AclItem(AclItem<'a>),
     /// A `char(n)` value, blank-padded to its declared width. The padding is
@@ -4821,6 +4757,7 @@ impl<'a> Datum<'a> {
             Datum::CompositeText { slot, .. } => oid::composite_oid(*slot),
             Datum::Null => oid::TEXT,
             Datum::PgDdlCommand => oid::PG_DDL_COMMAND,
+            Datum::PgNodeTree(_) => oid::PG_NODE_TREE,
             Datum::Bool(_) => oid::BOOL,
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
@@ -5054,6 +4991,7 @@ impl fmt::Display for Datum<'_> {
         match self {
             Datum::Null => Ok(()), // never rendered; NULL is a column-length of -1
             Datum::PgDdlCommand => f.write_str("<pg_ddl_command>"),
+            Datum::PgNodeTree(node) => f.write_str(node.as_str()),
             Datum::Bool(true) => f.write_str("t"),
             Datum::Bool(false) => f.write_str("f"),
             Datum::Int2(v) => write!(f, "{v}"),
@@ -5703,6 +5641,27 @@ mod tests {
                 .expect("built-in Bloom class")
                 .accepts(ColType::Int8)
         );
+    }
+
+    #[test]
+    fn catalog_snapshot_physical_layout_inventory_is_complete() {
+        crate::mem::guard::forbid_alloc(|| {
+            for code in 0..=u8::MAX {
+                if let Some(ctype) = ColType::from_code(code) {
+                    let layout = ctype.physical_layout();
+                    assert!(matches!(layout.alignment, b'c' | b's' | b'i' | b'd'));
+                    assert!(matches!(layout.storage, b'p' | b'e' | b'x' | b'm'));
+                }
+            }
+            for element in ArrElem::BUILTIN {
+                let array = ColType::Array(element).physical_layout();
+                assert_eq!(array.length, -1);
+                assert!(!array.by_value);
+                assert_eq!(array.storage, b'x');
+            }
+            assert_eq!(ColType::Internal.typlen(), 8);
+            assert_eq!(ColType::Geometry(GeometryKind::Point).typlen(), 16);
+        });
     }
 
     #[test]

@@ -648,6 +648,7 @@ mod tests {
             let held = storage.value_indexes.acquire().unwrap();
             assert!(storage.value_indexes.acquire().is_none());
             storage.rebuild_recovered_enforcers().unwrap();
+            assert!(!storage.statistics_wal_dirty(table));
             let enforcer = storage.tables[table].enforcer(0).unwrap();
             assert_eq!(enforcer.durable, Some(handle));
             assert!(!enforcer.durable_dirty);

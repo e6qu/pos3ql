@@ -3871,6 +3871,7 @@ pub enum TableConstraint<'a> {
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
+        nulls_not_distinct: bool,
     },
     Check {
         name: Option<&'a str>,

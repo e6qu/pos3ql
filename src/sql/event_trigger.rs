@@ -990,16 +990,20 @@ fn comment_reference(
                 EventObjectRef::Primary(relation)
             } else {
                 let column_name = match relation {
-                    ObjectRef::Table(table) => storage
-                        .table_def(table, txid)
-                        .columns()
-                        .get(subid as usize - 1)
-                        .map(|column| column.name),
-                    ObjectRef::MaterializedView(view_slot) => storage
-                        .table_def(storage.matview_table(view_slot), txid)
-                        .columns()
-                        .get(subid as usize - 1)
-                        .map(|column| column.name),
+                    ObjectRef::Table(table) => {
+                        let table = storage.table_def(table, txid);
+                        u16::try_from(subid)
+                            .ok()
+                            .and_then(|number| table.attribute_column(number))
+                            .map(|column| table.columns()[column].name)
+                    }
+                    ObjectRef::MaterializedView(view_slot) => {
+                        let table = storage.table_def(storage.matview_table(view_slot), txid);
+                        u16::try_from(subid)
+                            .ok()
+                            .and_then(|number| table.attribute_column(number))
+                            .map(|column| table.columns()[column].name)
+                    }
                     ObjectRef::View(_) => match statement {
                         Stmt::Comment {
                             target: crate::sql::ast::CommentTarget::Column { column, .. },
@@ -1401,11 +1405,12 @@ fn not_null_name(
     table: &crate::storage::TableDef,
     column: &crate::storage::ColumnMeta,
 ) -> StackStr<128> {
-    crate::stack_format!(
-        128,
-        "{}_{}_not_null",
-        table.name.as_str(),
-        column.name.as_str()
+    StackStr::from_str(
+        table.not_null_names[table
+            .column_index(column.name.as_str())
+            .expect("constraint column exists")]
+        .expect("required column has a durable constraint name")
+        .as_str(),
     )
 }
 
@@ -2169,7 +2174,7 @@ pub(crate) fn catalog_object_address(
                     EventObjectRef::Primary(reference) => reference,
                     _ => unreachable!("relation object is primary"),
                 },
-                attnum: (column + 1) as u16,
+                attnum: table.attribute_number(column),
                 name: definition.name,
             });
         }
@@ -2408,16 +2413,15 @@ fn relation_column_ref(
 ) -> Option<EventObjectRef> {
     let index = usize::try_from(attnum.checked_sub(1)?).ok()?;
     let (reference, name) = match relation {
-        EventObjectRef::Primary(reference @ ObjectRef::Table(slot)) => (
-            reference,
-            storage.table_def(slot, txid).columns().get(index)?.name,
-        ),
+        EventObjectRef::Primary(reference @ ObjectRef::Table(slot)) => {
+            let table = storage.table_def(slot, txid);
+            let column = table.attribute_column(u16::try_from(attnum).ok()?)?;
+            (reference, table.columns()[column].name)
+        }
         EventObjectRef::Primary(reference @ ObjectRef::MaterializedView(slot)) => {
-            let table = storage.matview_table(slot);
-            (
-                reference,
-                storage.table_def(table, txid).columns().get(index)?.name,
-            )
+            let table = storage.table_def(storage.matview_table(slot), txid);
+            let column = table.attribute_column(u16::try_from(attnum).ok()?)?;
+            (reference, table.columns()[column].name)
         }
         EventObjectRef::Primary(reference @ ObjectRef::View(slot)) => (
             reference,
@@ -3267,7 +3271,7 @@ fn push_alter_table_drops(
                         schema: old.schema,
                         table: old.name,
                         column: column.name,
-                        attnum: u16::try_from(column_index + 1).map_err(|_| graph_full())?,
+                        attnum: old.attribute_number(column_index),
                     },
                     true,
                     false,
@@ -3285,7 +3289,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::not_null_constraint_oid(slot, column_index),
+                            catalog::not_null_constraint_oid(
+                                slot,
+                                usize::from(old.attribute_number(column_index) - 1),
+                            ),
                             name.as_str(),
                         ),
                         true,
@@ -3417,7 +3424,10 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        catalog::not_null_constraint_oid(slot, column_index),
+                                        catalog::not_null_constraint_oid(
+                                            slot,
+                                            usize::from(old.attribute_number(column_index) - 1),
+                                        ),
                                         *name,
                                     ),
                                     true,
@@ -3478,7 +3488,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::not_null_constraint_oid(slot, column_index),
+                    catalog::not_null_constraint_oid(
+                        slot,
+                        usize::from(old.attribute_number(column_index) - 1),
+                    ),
                     name.as_str(),
                 ),
                 false,
@@ -3685,7 +3698,10 @@ fn push_table_drop_dependents(
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: catalog::not_null_constraint_oid(slot, index),
+                    oid: catalog::not_null_constraint_oid(
+                        slot,
+                        usize::from(table.attribute_number(index) - 1),
+                    ),
                     name,
                 },
                 false,

@@ -1595,6 +1595,7 @@ restart_p3_fresh || exit 1
 echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
 if "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --host "$PGHOST" --port "$PGPORT" --user "$PGUSER" --database postgres \
+    --report-database catalog_reports_diff \
     --metadata-output "$EVIDENCE/catalog-metadata.json" \
     --output "$EVIDENCE/catalog-postgresql.json" > "$EVIDENCE/catalog-reference.log" 2>&1 \
   && "$PY" tools/generate-pg18-view-definitions.py \
@@ -1602,8 +1603,14 @@ if "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --source "PostgreSQL 18.6 comparison service" \
     --mode check --output src/sql/catalog_view_definitions.rs \
     >> "$EVIDENCE/catalog-reference.log" 2>&1 \
+  && "$PY" tools/generate-pg18-type-layouts.py \
+    --metadata "$EVIDENCE/catalog-metadata.json" \
+    --source "PostgreSQL 18.6 comparison service" \
+    --mode check --output src/sql/type_layouts.rs \
+    >> "$EVIDENCE/catalog-reference.log" 2>&1 \
   && "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --host 127.0.0.1 --port "$P3_PORT" --user "$PGUSER" --database postgres \
+    --report-database catalog_reports_diff \
     --reference "$EVIDENCE/catalog-postgresql.json" \
     --output "$EVIDENCE/catalog-pos3ql.json" > "$EVIDENCE/catalog-comparison.log" 2>&1; then
   ok "catalog row visibility ($(tail -1 "$EVIDENCE/catalog-comparison.log"))"

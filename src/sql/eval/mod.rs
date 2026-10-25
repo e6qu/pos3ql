@@ -1280,9 +1280,22 @@ pub trait CatalogAccess {
     fn index_def<'a>(
         &self,
         oid: i32,
-        col: usize,
+        col: i32,
+        pretty: bool,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
+    fn expression_def<'a>(
+        &self,
+        _node: &str,
+        _relation: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "catalog expression deparsing requires catalog access"
+        ))
+    }
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
     fn constraint_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
@@ -1403,7 +1416,7 @@ pub trait CatalogAccess {
     fn has_type_privilege(
         &self,
         _role: Option<&str>,
-        _type_name: &str,
+        _target: PrivilegeType<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1649,6 +1662,12 @@ pub enum PrivilegeColumn<'a> {
 
 #[derive(Clone, Copy)]
 pub enum PrivilegeRelation<'a> {
+    Name(&'a str),
+    Oid(i32),
+}
+
+#[derive(Clone, Copy)]
+pub enum PrivilegeType<'a> {
     Name(&'a str),
     Oid(i32),
 }
@@ -2484,6 +2503,16 @@ fn eval_full_inner<'a>(
             type_mod,
         } => {
             let mut v = eval_full(operand, arena, params, row, hooks)?;
+            if ColType::from_sql_name(type_name) == Some(ColType::PgNodeTree)
+                && !v.is_null()
+                && expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v)
+                    != super::types::oid::PG_NODE_TREE
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot accept a value of type pg_node_tree"
+                ));
+            }
             if let Some(catalog) = hooks.catalog {
                 let source_oid =
                     expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
@@ -7590,6 +7619,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::OidVector { .. } => "oidvector",
         Datum::Null => "unknown",
         Datum::PgDdlCommand => "pg_ddl_command",
+        Datum::PgNodeTree(_) => "pg_node_tree",
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",

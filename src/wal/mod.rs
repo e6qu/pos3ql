@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 13;
+pub(crate) const RECORD_VERSION: u8 = 14;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,9 +252,8 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 8;
-const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
-const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 9;
+const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 2;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -1868,6 +1867,15 @@ impl From<BudgetError> for WalSetupError {
 }
 
 fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
+    if let WalOp::CreateTable { definition, .. } = operation {
+        crate::storage::Storage::validate_not_null_names(definition)?;
+        if !definition.attributes.validate(definition.n_columns) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid column attribute layout before journaling"
+            ));
+        }
+    }
     let payload_len = encoded_payload_len(operation);
     let total = HEADER_LEN + payload_len;
     if buffer.capacity() - buffer.len() < total {
@@ -2902,13 +2910,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             definition: def, ..
         } => {
             let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
+            n += def.attributes.encoded_len();
             n += match def.access_method {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
             };
-            for c in def.columns() {
+            for (column, c) in def.columns().iter().enumerate() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
+                n += 1 + def.not_null_names[column].map_or(0, |name| name.as_str().len());
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -3520,7 +3530,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 .base_user_type
                 .map(|d| d.schema.as_str().len())
                 .unwrap_or(0);
-            let mut n = 2
+            let mut n = 1
+                + def.not_null_name.map_or(0, |name| name.as_str().len())
+                + 2
                 + 8
                 + 1
                 + def.name.as_str().len()
@@ -4568,7 +4580,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             identity,
             definition: def,
         } => {
-            let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
+            let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
+                && def.attributes.validate(def.n_columns)
+                && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
                 && buffer.append(&identity.encode())
                 && name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -4592,7 +4606,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
                 }
             };
-            for c in def.columns() {
+            ok &= def.attributes.append(buffer);
+            for (column, c) in def.columns().iter().enumerate() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
                 // column, whose domain name is appended after the fixed fields.
@@ -4607,6 +4622,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&[c.not_null.code()]);
                 ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+                ok &= name_bytes(
+                    buffer,
+                    def.not_null_names[column]
+                        .as_ref()
+                        .map_or("", |name| name.as_str()),
+                );
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
                 ok &= append_default(buffer, &default_value);
@@ -4631,7 +4652,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[def.n_uniques as u8]);
             for uk in def.uniques() {
                 ok &= name_bytes(buffer, uk.name.as_str());
-                ok &= buffer.append(&[u8::from(uk.is_primary), uk.n_cols as u8, uk.timing.code()]);
+                ok &= buffer.append(&[uk.kind.code(), uk.n_cols as u8, uk.timing.code()]);
                 for &c in uk.columns() {
                     ok &= buffer.append(&c.to_le_bytes());
                 }
@@ -5642,11 +5663,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let base_name = def
                 .base_user_type
                 .map(crate::storage::UserTypeName::storage_name);
-            let mut ok = buffer.append(&slot.to_le_bytes())
+            let mut ok = def.not_null == def.not_null_name.is_some()
+                && def
+                    .not_null_name
+                    .is_none_or(|name| !name.as_str().is_empty())
+                && buffer.append(&slot.to_le_bytes())
                 && buffer.append(&def.created_at.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION])
+                && buffer.append(&[DOMAIN_PAYLOAD_VERSION])
                 && name_bytes(
                     buffer,
                     parent_name.as_ref().map(|name| name.as_str()).unwrap_or(""),
@@ -5673,6 +5698,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&domain_base_slot(def).to_le_bytes())
                 && buffer.append(&def.base_type_mod.to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
+                && name_bytes(
+                    buffer,
+                    def.not_null_name.as_ref().map_or("", |name| name.as_str()),
+                )
                 && buffer.append(&(de.len() as u16).to_le_bytes())
                 && buffer.append(de.as_bytes())
                 && buffer.append(&[def.n_checks as u8]);
@@ -7622,10 +7651,16 @@ fn decode_op_inner<'a>(
                 }
                 _ => return None,
             };
+            let attributes =
+                crate::storage::column_attributes::ColumnAttributes::decode(payload, &mut at)?;
+            if !attributes.validate(n_cols) {
+                return None;
+            }
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
+                attributes,
                 has_toast,
                 kind: table_kind,
                 persistence,
@@ -7646,6 +7681,15 @@ fn decode_op_inner<'a>(
                     _ => return None,
                 };
                 at += 1;
+                let name = take_name(&mut at)?;
+                let not_null_name = if name.is_empty() {
+                    None
+                } else {
+                    Some(SqlName::parse(name).ok()?)
+                };
+                if not_null.is_required() != not_null_name.is_some() {
+                    return None;
+                }
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
                 at += 4;
                 let default_value = decode_default(payload, &mut at)?;
@@ -7699,6 +7743,7 @@ fn decode_op_inner<'a>(
                 };
                 let default =
                     ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
+                def.not_null_names[i] = not_null_name;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
@@ -7732,17 +7777,23 @@ fn decode_op_inner<'a>(
                 let meta = payload.get(at..at + 3)?;
                 at += 3;
                 let n = meta[1] as usize;
-                if n > MAX_INDEX_COLS {
+                if n == 0 || n > MAX_INDEX_COLS {
                     return None;
                 }
                 let mut uk = UniqueKey::EMPTY;
                 uk.name = SqlName::parse(uname).ok()?;
-                uk.is_primary = stored_boolean(meta[0])?;
+                uk.kind = crate::storage::UniqueKeyKind::from_code(meta[0])?;
                 uk.timing = crate::storage::ConstraintTiming::from_code(meta[2])?;
                 uk.n_cols = n;
-                for c in uk.columns.iter_mut().take(n) {
-                    *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+                for position in 0..n {
+                    let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
+                    if usize::from(column) >= def.n_columns
+                        || uk.columns[..position].contains(&column)
+                    {
+                        return None;
+                    }
+                    uk.columns[position] = column;
                 }
                 def.uniques[u] = uk;
             }
@@ -9713,10 +9764,7 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
-            if !matches!(
-                payload_version,
-                DOMAIN_PAYLOAD_WITH_BASE_SLOT | DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION
-            ) {
+            if payload_version != DOMAIN_PAYLOAD_VERSION {
                 return None;
             }
             at += 1;
@@ -9794,6 +9842,15 @@ fn decode_op_inner<'a>(
             at += 4;
             let not_null = stored_boolean(*payload.get(at)?)?;
             at += 1;
+            let not_null_text = take_name(&mut at)?;
+            let not_null_name = if not_null_text.is_empty() {
+                None
+            } else {
+                Some(SqlName::parse(not_null_text).ok()?)
+            };
+            if not_null != not_null_name.is_some() {
+                return None;
+            }
             let de_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let de = core::str::from_utf8(payload.get(at..at + de_len)?).ok()?;
@@ -9817,14 +9874,9 @@ fn decode_op_inner<'a>(
                 at += 2;
                 let expr = core::str::from_utf8(payload.get(at..at + elen)?).ok()?;
                 at += elen;
-                let validation = if payload_version == DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION {
-                    let validation =
-                        crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
-                    at += 1;
-                    validation
-                } else {
-                    crate::storage::ConstraintValidation::EnforcedValidated
-                };
+                let validation =
+                    crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
+                at += 1;
                 *check = crate::storage::CheckConstraint {
                     name: SqlName::parse(cname).ok()?,
                     expression: bounded_wal_text(expr)?,
@@ -9845,6 +9897,7 @@ fn decode_op_inner<'a>(
                 base,
                 base_type_mod,
                 not_null,
+                not_null_name,
                 default_expr,
                 checks,
                 n_checks,
@@ -11643,6 +11696,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Timetz(..)) => 12,
         Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::PgNodeTree { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::JsonPath { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Geometry { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::TextSearch { len, .. }) => 2 + *len as usize,
@@ -11978,6 +12032,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             3 + *len as usize
         }
+        Some(OwnedDatum::PgNodeTree { len, bytes }) => {
+            out[0] = 43;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
+        }
         Some(OwnedDatum::Numeric {
             sign,
             weight,
@@ -12197,6 +12257,18 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
             Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
+        }
+        43 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            crate::sql::catalog_node::CatalogNode::from_encoded(
+                core::str::from_utf8(&bytes[..len]).ok()?,
+            )?;
+            Some(OwnedDatum::PgNodeTree {
+                len: len as u8,
+                bytes,
+            })
         }
         40 => {
             let len = *payload.get(*at)? as usize;
@@ -12932,6 +13004,30 @@ mod tests {
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
             Some(WalOp::SetTextSearch { slot: 7, .. })
         ));
+    }
+
+    #[test]
+    fn catalog_snapshot_node_defaults_validate_format_and_round_trip() {
+        use crate::sql::types::Datum;
+        let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
+        crate::mem::guard::forbid_alloc(|| {
+            let node = crate::sql::catalog_node::CatalogNode::NULL;
+            let value = OwnedDatum::from_datum(&Datum::PgNodeTree(node)).unwrap();
+            let length = encode_default_bytes(&Some(value), &mut encoded);
+            assert_eq!(length, encoded_default_len(&Some(value)));
+            let mut at = 0;
+            assert_eq!(
+                decode_default(&encoded[..length], &mut at),
+                Some(Some(value))
+            );
+            assert_eq!(value.as_datum(), Datum::PgNodeTree(node));
+            assert_eq!(at, length);
+            for truncated in 0..length {
+                assert!(decode_default(&encoded[..truncated], &mut 0).is_none());
+            }
+            encoded[2] = b'x';
+            assert!(decode_default(&encoded[..length], &mut 0).is_none());
+        });
     }
 
     #[test]
@@ -14345,6 +14441,8 @@ mod tests {
         exclusion.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
         def.exclusions[0] = exclusion;
         def.n_exclusions = 1;
+        def.attributes.initialize(def.n_columns).unwrap();
+        crate::storage::constraint_names::table(&mut def).unwrap();
         def
     }
 
@@ -14379,6 +14477,63 @@ mod tests {
             .into_iter()
             .filter(|record| !record.contains(":Commit {"))
             .collect()
+    }
+
+    #[test]
+    fn catalog_snapshot_table_payload_validates_unique_modes_and_attribute_layouts() {
+        use crate::storage::UniqueKeyKind;
+        let mut definition = sample_def();
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "typed table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for kind in [
+                UniqueKeyKind::UniqueNullsDistinct,
+                UniqueKeyKind::Primary,
+                UniqueKeyKind::UniqueNullsNotDistinct,
+            ] {
+                definition.uniques[0].kind = kind;
+                payload.clear();
+                assert!(append_payload(
+                    &mut payload,
+                    &WalOp::CreateTable {
+                        identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                        definition: &definition,
+                    }
+                ));
+                let (_, restored) = decode_table_payload(payload.readable()).unwrap();
+                assert_eq!(restored.uniques[0].kind, kind);
+                assert_eq!(restored.attributes, definition.attributes);
+                assert_eq!(restored.not_null_names[0], definition.not_null_names[0]);
+                let name = definition.uniques[0].name.as_str().as_bytes();
+                let kind_at = payload
+                    .readable()
+                    .windows(name.len())
+                    .position(|bytes| bytes == name)
+                    .unwrap()
+                    + name.len();
+                payload.filled_mut()[kind_at] = u8::MAX;
+                assert!(decode_table_payload(payload.readable()).is_none());
+                payload.filled_mut()[kind_at] = kind.code();
+                payload.filled_mut()[kind_at + 1] = 0;
+                assert!(decode_table_payload(payload.readable()).is_none());
+            }
+            definition.attributes.slots[1] = definition.attributes.slots[0];
+            payload.clear();
+            assert_eq!(
+                append_record(
+                    &mut payload,
+                    1,
+                    &WalOp::CreateTable {
+                        identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                        definition: &definition,
+                    }
+                )
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(payload.len(), 0);
+        });
     }
 
     #[test]
@@ -15924,7 +16079,7 @@ mod tests {
 
     #[test]
     fn domain_payload_rejects_overlong_text_and_invalid_boolean_codes() {
-        fn payload(default: &str, expression: &str, not_null: u8) -> Vec<u8> {
+        fn payload(default: &str, expression: &str, not_null: u8, not_null_name: &str) -> Vec<u8> {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&0u16.to_le_bytes());
             bytes.extend_from_slice(&1u64.to_le_bytes());
@@ -15932,11 +16087,13 @@ mod tests {
                 bytes.push(name.len() as u8);
                 bytes.extend_from_slice(name.as_bytes());
             }
-            bytes.extend_from_slice(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION, 0, 0, 0, 0]);
+            bytes.extend_from_slice(&[DOMAIN_PAYLOAD_VERSION, 0, 0, 0, 0]);
             bytes.push(ColType::Int4.code());
             bytes.extend_from_slice(&NO_DOMAIN_BASE_SLOT.to_le_bytes());
             bytes.extend_from_slice(&(-1_i32).to_le_bytes());
             bytes.push(not_null);
+            bytes.push(not_null_name.len() as u8);
+            bytes.extend_from_slice(not_null_name.as_bytes());
             bytes.extend_from_slice(&(default.len() as u16).to_le_bytes());
             bytes.extend_from_slice(default.as_bytes());
             bytes.extend_from_slice(&[1, 5]);
@@ -15946,16 +16103,33 @@ mod tests {
             bytes.push(crate::storage::ConstraintValidation::EnforcedValidated.code());
             bytes
         }
-        let valid = payload("7", "VALUE > 0", 1);
+        let valid = payload("7", "VALUE > 0", 1, "bounded_domain_not_null");
         assert!(decode_op(KIND_CREATE_DOMAIN, &valid).is_some());
+        let (_, restored) = decode_domain_payload(&valid).unwrap();
+        assert_eq!(
+            restored.not_null_name.unwrap().as_str(),
+            "bounded_domain_not_null"
+        );
+        assert!(decode_domain_payload(&payload("7", "VALUE > 0", 0, "")).is_some());
+        for end in 0..valid.len() {
+            assert!(decode_domain_payload(&valid[..end]).is_none());
+        }
         for invalid in [
             payload(
                 &"1".repeat(crate::storage::DEFAULT_EXPR_MAX + 1),
                 "VALUE > 0",
                 1,
+                "bounded_domain_not_null",
             ),
-            payload("7", &"x".repeat(crate::storage::CHECK_SQL_MAX + 1), 1),
-            payload("7", "VALUE > 0", 2),
+            payload(
+                "7",
+                &"x".repeat(crate::storage::CHECK_SQL_MAX + 1),
+                1,
+                "bounded_domain_not_null",
+            ),
+            payload("7", "VALUE > 0", 2, "bounded_domain_not_null"),
+            payload("7", "VALUE > 0", 1, ""),
+            payload("7", "VALUE > 0", 0, "unexpected_name"),
         ] {
             assert!(decode_op(KIND_CREATE_DOMAIN, &invalid).is_none());
             assert!(decode_domain_payload(&invalid).is_none());
@@ -15995,7 +16169,7 @@ mod tests {
         let mut payload = Vec::new();
         push_name(&mut payload, "child");
         push_name(&mut payload, "public");
-        payload.push(DOMAIN_PAYLOAD_WITH_BASE_SLOT);
+        payload.push(u8::MAX);
         push_name(&mut payload, "parent");
         push_name(&mut payload, "");
         payload.push(ColType::Int4.code());

@@ -134,6 +134,58 @@ impl AggregateOptions<'_> {
 }
 
 impl<'a> Parser<'a> {
+    fn index_collation_operand_source(&self, mut source: &'a str) -> Result<&'a str, ParseError> {
+        use crate::sql::lexer::Lexer;
+        loop {
+            source = source.trim();
+            if !source.starts_with('(') || !source.ends_with(')') {
+                break;
+            }
+            let mut lexer = Lexer::new(source, self.arena);
+            let mut depth = 0;
+            let mut grouped = false;
+            loop {
+                match lexer
+                    .next_token()
+                    .map_err(|_| self.err_here("invalid index expression"))?
+                {
+                    Tok::Op("(") => depth += 1,
+                    Tok::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            grouped = lexer.token_end() == source.len();
+                            break;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+            }
+            if !grouped {
+                break;
+            }
+            source = &source[1..source.len() - 1];
+        }
+        let mut lexer = Lexer::new(source, self.arena);
+        let mut depth = 0;
+        let mut collation = None;
+        loop {
+            match lexer
+                .next_token()
+                .map_err(|_| self.err_here("invalid index expression"))?
+            {
+                Tok::Op("(" | "[") => depth += 1,
+                Tok::Op(")" | "]") => depth -= 1,
+                Tok::Ident("collate") if depth == 0 => collation = Some(lexer.token_start()),
+                Tok::Eof => break,
+                _ => {}
+            }
+        }
+        collation
+            .map(|at| source[..at].trim_end())
+            .ok_or_else(|| self.err_here("index collation source is missing"))
+    }
+
     fn event_trigger_event(&mut self) -> Result<EventTriggerEvent, ParseError> {
         let event = self.any_ident("event trigger event")?;
         if event.eq_ignore_ascii_case("login") {
@@ -5284,9 +5336,15 @@ impl<'a> Parser<'a> {
         let mut columns = ArenaList::new(self.arena);
         loop {
             let start = self.peek_at;
-            let expression = self.expression(0)?;
-            let expression_text =
-                index_expression_source(expression, self.text[start..self.peek_at].trim_end());
+            let mut expression = self.expression(0)?;
+            let mut source = self.text[start..self.peek_at].trim_end();
+            let mut expression_collation = None;
+            while let Expr::Collate { operand, collation } = expression {
+                expression_collation.get_or_insert(*collation);
+                expression = operand;
+                source = self.index_collation_operand_source(source)?;
+            }
+            let expression_text = index_expression_source(expression, source);
             let column = match expression {
                 Expr::Column {
                     qualifier: None,
@@ -5297,7 +5355,7 @@ impl<'a> Parser<'a> {
             let collation = if self.eat_ident("collate")? {
                 Some(self.collation_name()?)
             } else {
-                None
+                expression_collation
             };
             let operator_class = match self.peeked {
                 Tok::Ident(word)
@@ -5370,13 +5428,7 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
-        let nulls_not_distinct = if self.eat_ident("nulls")? {
-            let not = self.eat_ident("not")?;
-            self.expect_ident("distinct")?;
-            not
-        } else {
-            false
-        };
+        let nulls_not_distinct = self.unique_nulls_not_distinct()?;
         let options = if self.eat_ident("with")? {
             self.expect_op("(")?;
             let options = self.index_storage_options()?;
@@ -7915,11 +7967,12 @@ impl<'a> Parser<'a> {
                     default = Some(self.column_default_expression()?);
                     default_text = Some(self.text[start..self.peek_at].trim_end());
                 } else if self.eat_ident("unique")? {
+                    let nulls_not_distinct = self.unique_nulls_not_distinct()?;
                     let timing = self.constraint_timing(false)?;
                     // A named or deferrable single-column constraint needs a
                     // durable key object; only the default unnamed form can use
                     // the compact column flag.
-                    if col_cons_name.is_some() || timing.is_deferrable() {
+                    if col_cons_name.is_some() || timing.is_deferrable() || nulls_not_distinct {
                         let key_columns = self.arena_slice(&[col_name])?;
                         self.push(
                             &mut cons,
@@ -7927,6 +7980,7 @@ impl<'a> Parser<'a> {
                                 name: col_cons_name,
                                 columns: key_columns,
                                 timing,
+                                nulls_not_distinct,
                             },
                         )?;
                         continue;
@@ -8260,12 +8314,14 @@ impl<'a> Parser<'a> {
                 timing,
             })
         } else if self.eat_ident("unique")? {
+            let nulls_not_distinct = self.unique_nulls_not_distinct()?;
             let columns = self.column_name_list()?;
             let timing = self.constraint_timing(false)?;
             Ok(TableConstraint::Unique {
                 name,
                 columns,
                 timing,
+                nulls_not_distinct,
             })
         } else if self.eat_ident("check")? {
             self.check_constraint(name, allow_not_valid)
@@ -8278,6 +8334,15 @@ impl<'a> Parser<'a> {
             self.expect_ident("references")?;
             self.references_tail(name, columns, allow_not_valid)
         }
+    }
+
+    pub(super) fn unique_nulls_not_distinct(&mut self) -> Result<bool, ParseError> {
+        if !self.eat_ident("nulls")? {
+            return Ok(false);
+        }
+        let not_distinct = self.eat_ident("not")?;
+        self.expect_ident("distinct")?;
+        Ok(not_distinct)
     }
 
     fn exclusion_constraint(

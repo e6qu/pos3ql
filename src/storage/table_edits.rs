@@ -222,6 +222,12 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 .iter()
                 .any(|column| column.ctype.typlen() == -1);
         definition.has_rules |= current.has_rules;
+        definition.attributes = super::column_attributes::ColumnAttributes::rewrite(
+            current,
+            definition.columns(),
+            column_mapping,
+        )?;
+        super::constraint_names::remap_table(current, &mut definition, column_mapping)?;
         // Column-only edits replace pg_attribute rows. Keep track of edits
         // that also fork pg_class, including a rename followed by renaming back.
         let class_tuple_private = prior

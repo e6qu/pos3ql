@@ -236,9 +236,7 @@ fn privilege_object_name<'a>(
             let oid = CatalogOid::parse(value)?
                 .expect("identity datum is non-null")
                 .0;
-            if function == "has_type_privilege" {
-                catalog.type_name(oid, arena)
-            } else if function == "has_function_privilege" {
+            if function == "has_function_privilege" {
                 catalog.routine_name(oid, true, arena)
             } else if function == "has_language_privilege" {
                 catalog.language_name(oid, arena)
@@ -792,6 +790,30 @@ fn describe_catalog_object(
 pub(crate) enum CatalogPredicateKind {
     Privilege,
     Object,
+}
+
+fn strict_catalog_arguments<'a>(
+    args: &[&Expr<'a>],
+    mut evaluate: impl FnMut(usize, &Expr<'a>) -> Result<Datum<'a>, SqlError>,
+) -> Result<Option<[Datum<'a>; 3]>, SqlError> {
+    assert!(args.len() <= 3, "catalog call arity was validated");
+    let mut values = [Datum::Null; 3];
+    let mut constant_null = false;
+    for (position, expression) in args.iter().enumerate() {
+        if expression.is_constant() {
+            values[position] = evaluate(position, expression)?;
+            constant_null |= values[position].is_null();
+        }
+    }
+    if constant_null {
+        return Ok(None);
+    }
+    for (position, expression) in args.iter().enumerate() {
+        if !expression.is_constant() {
+            values[position] = evaluate(position, expression)?;
+        }
+    }
+    Ok((!values[..args.len()].iter().any(Datum::is_null)).then_some(values))
 }
 
 /// Execution and result descriptions share these accepted Boolean families.
@@ -1786,6 +1808,17 @@ pub(crate) fn dispatch<'a>(
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
+                if name == "has_type_privilege" {
+                    let target = match object {
+                        Datum::Text(name) => super::super::PrivilegeType::Name(name),
+                        value => super::super::PrivilegeType::Oid(
+                            CatalogOid::parse(value)?.expect("non-null type identity").0,
+                        ),
+                    };
+                    return Ok(cat
+                        .has_type_privilege(role, target, privilege)?
+                        .map_or(Datum::Null, Datum::Bool));
+                }
                 let object = if name == "has_parameter_privilege" {
                     match object {
                         Datum::Text(parameter) => parameter,
@@ -1804,7 +1837,6 @@ pub(crate) fn dispatch<'a>(
                 };
                 let answer = match name {
                     "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
-                    "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
                     "has_language_privilege" => {
                         cat.has_language_privilege(role, object, privilege)?
                     }
@@ -1991,25 +2023,56 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Bool(catalog.is_other_temporary_namespace(oid)))
             }
             "pg_get_indexdef" => {
-                // `(oid, n, _)` with n>0 returns the n-th indexed column.
+                if !matches!(args.len(), 1 | 3) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_indexdef(...) does not exist"
+                    ));
+                }
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                let Some(values) =
+                    strict_catalog_arguments(args, |position, expression| {
+                        let value = eval_full(expression, arena, params, row, hooks)?;
+                        match position {
+                            0 => Ok(CatalogOid::parse(value)?
+                                .map_or(Datum::Null, |oid| Datum::Int4(oid.0))),
+                            1 => super::super::cast_to(value, ColType::Int4, arena),
+                            2 => super::super::cast_to(value, ColType::Bool, arena),
+                            _ => unreachable!("index definition call arity was validated"),
+                        }
+                    })?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(values[0])? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
                 let col = if args.len() >= 2 {
-                    match eval_full(args[1], arena, params, row, hooks)? {
-                        Datum::Int4(v) => v.max(0) as usize,
-                        Datum::Int8(v) => v.max(0) as usize,
-                        _ => 0,
+                    match values[1] {
+                        Datum::Null => return Ok(Datum::Null),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(value) => value,
+                            _ => unreachable!("integer argument was coerced"),
+                        },
                     }
                 } else {
                     0
                 };
+                let pretty = if args.len() == 3 {
+                    let pretty = values[2];
+                    match super::super::cast_to(pretty, ColType::Bool, arena)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => unreachable!("boolean argument was coerced"),
+                    }
+                } else {
+                    false
+                };
                 Ok(cat
-                    .index_def(oid, col, arena)?
+                    .index_def(oid, col, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2197,11 +2260,53 @@ pub(crate) fn dispatch<'a>(
                         "function pg_get_expr(...) does not exist"
                     ));
                 }
-                match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Text(expression) => Ok(Datum::Text(expression)),
-                    Datum::Null => Ok(Datum::Null),
-                    _ => Ok(Datum::Null),
+                if let Some(source_type) = super::super::static_type(args[0], row)
+                    && source_type != ColType::PgNodeTree
+                {
+                    if matches!(args[0], Expr::Str(_)) {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot accept a value of type pg_node_tree"
+                        ));
+                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_expr(...) does not exist"
+                    ));
                 }
+                let Some(values) =
+                    strict_catalog_arguments(args, |position, expression| {
+                        let value = eval_full(expression, arena, params, row, hooks)?;
+                        match position {
+                            0 => Ok(value),
+                            1 => Ok(CatalogOid::parse(value)?
+                                .map_or(Datum::Null, |oid| Datum::Int4(oid.0))),
+                            2 => super::super::cast_to(value, ColType::Bool, arena),
+                            _ => unreachable!("expression call arity was validated"),
+                        }
+                    })?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let Datum::PgNodeTree(node) = values[0] else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "pg_get_expr requires a pg_node_tree value"
+                    ));
+                };
+                let Datum::Int4(relation) = values[1] else {
+                    unreachable!("relation argument was coerced");
+                };
+                let pretty = args.len() == 3 && values[2] == Datum::Bool(true);
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "catalog expression deparsing requires catalog access"
+                    )
+                })?;
+                Ok(catalog
+                    .expression_def(node.as_str(), relation, pretty, arena)?
+                    .map_or(Datum::Null, Datum::Text))
             }
             "pg_get_viewdef" => {
                 if !(1..=2).contains(&args.len()) {
@@ -2742,6 +2847,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Enum { .. } => "enum",
                     Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
                     Datum::PgDdlCommand => "pg_ddl_command",
+                    Datum::PgNodeTree(_) => "pg_node_tree",
                 };
                 Ok(regtype(referenced_oid, name))
             }

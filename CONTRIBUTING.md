@@ -167,6 +167,12 @@ The generator requires PostgreSQL 18.6, records the metadata checksum and source
 and retains the upstream license reference. Its `check` mode compares SQL while
 preserving the provenance of the checked-in generation.
 
+Physical type properties use the same captured metadata. Generate them with
+`tools/generate-pg18-type-layouts.py`, supplying the same explicit `--mode`,
+`--metadata`, `--source`, and `--output` arguments, with
+`src/sql/type_layouts.rs` as the destination. These values describe PostgreSQL's
+catalog and wire contracts; they do not select pos3ql's object block layout.
+
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
 Pass the selected ownership filters together to share one interpreter startup;

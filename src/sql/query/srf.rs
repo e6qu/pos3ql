@@ -490,7 +490,11 @@ fn publication_output_relation_for(
     }
 }
 
-fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn publication_int2vector<'a>(
+    mask: ColumnSet,
+    table: &crate::storage::TableDef,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let count = mask.count_ones() as usize;
     let raw = arena
         .alloc_slice_with(count * 2, |_| 0u8)
@@ -500,7 +504,7 @@ fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum
         if !mask.contains(column) {
             continue;
         }
-        let attribute_number = i16::try_from(column + 1).map_err(|_| {
+        let attribute_number = i16::try_from(table.attribute_number(column)).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "publication column number is too large"
@@ -649,21 +653,19 @@ fn publication_table_rows<'a>(
             (implicit_mask(), None)
         };
         let qual = match filter {
-            Some(filter) => {
-                let rendered = crate::stack_format!(66, "({filter})");
-                Datum::Text(
-                    arena
-                        .alloc_str(rendered.as_str())
-                        .map_err(|_| arena_full())?,
-                )
-            }
+            Some(filter) => Datum::PgNodeTree(crate::sql::catalog::expressions::bind(
+                filter,
+                crate::sql::catalog::expressions::Kind::Expression,
+                Some(&table),
+                arena,
+            )?),
             None => Datum::Null,
         };
         rows[row_count] = crate::sql::exec::encode_projected_pub(
             &[
                 Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
                 Datum::Oid(crate::sql::catalog::user_table_oid(info.relation_slot) as u32),
-                publication_int2vector(column_mask, arena)?,
+                publication_int2vector(column_mask, &table, arena)?,
                 qual,
             ],
             arena,
@@ -1884,6 +1886,20 @@ pub(crate) fn synth_derived_def_outer<'a>(
     arena: &'a Arena,
     outer: Option<&QueryScope<'a>>,
 ) -> Result<&'a TableDef, SqlError> {
+    let definition =
+        describe_derived_definition(storage, sub, exposed, col_alias, txid, arena, outer)?;
+    super::scope::retain_query_definition(definition, arena)
+}
+
+pub(crate) fn describe_derived_definition<'a>(
+    storage: &'a Storage,
+    sub: &'a Select<'a>,
+    exposed: &'a str,
+    col_alias: Option<&'a [&'a str]>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&QueryScope<'a>>,
+) -> Result<TableDef, SqlError> {
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
@@ -2163,7 +2179,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         n_columns: n_cols,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+    Ok(def)
 }
 
 /// Synthesizes the single-column `TableDef` for a supported table function
@@ -3349,7 +3365,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         n_columns: n_out,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(def).map_err(|_| arena_full())?)
+    super::scope::retain_query_definition(def, arena)
 }
 
 fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
@@ -3413,7 +3429,7 @@ fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
         n_columns: count,
         ..TableDef::empty()
     };
-    Ok(&*arena.alloc(definition).map_err(|_| arena_full())?)
+    super::scope::retain_query_definition(definition, arena)
 }
 
 /// Whether `name` is one of the two-column `json_each` set-returning functions.

@@ -31,8 +31,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v25` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `13` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog images use declared field types and hidden system-column positions, including retained rewrite bodies. They retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v26` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Journal record | Version `14` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog images use declared field types and hidden system-column positions, including retained rewrite bodies. They retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -83,11 +83,42 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v25, journal v13, and table-definition payload v8.
+and readers use manifest v26, journal v14, and table-definition payload v9.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
 Existing startup buffers remain fixed; exhaustion fails explicitly.
+
+Table columns and domains store their NOT NULL constraint names. Renaming
+`orders` to `sales` preserves `orders_id_not_null`; recovery keeps that same
+name. Manifest `col4` and `dom5` records include its hexadecimal name, and the
+journal stores its length and bytes. Nullable columns and domains store an
+empty name. A missing required name or an unexpected name is corrupt data.
+Column names are hexadecimal fields too, preserving spaces and avoiding
+position-dependent parsing of the rest of a line. Extra fields are rejected.
+Domain journal payloads use marker 253 and reject earlier payload layouts.
+
+Table definitions retain a separate attribute layout. Live entries map a
+PostgreSQL column number to its current row position. Dropped entries retain
+length, passing convention, alignment, storage and compression; new columns
+append entries rather than reusing old numbers. The journal stores an entry
+count and eight bytes per entry. Manifest `attributes2` records store that count
+and each numbered entry as sixteen hexadecimal digits. Restore rejects missing,
+duplicate, out-of-range or incomplete layouts. PostgreSQL's 1,600-column table
+limit counts retained dropped entries too.
+
+Retained catalog expressions use `pos3ql-catalog-expression-v1` nodes. They
+contain validated source spans and bound column numbers, so a retained CHECK
+can display a column's current name after a rename. Scalar expressions, lists,
+partition bounds and SQL routine bodies have separate node kinds. PostgreSQL's
+`pg_get_expr` interface renders expression nodes; SQL cannot supply raw
+`pg_node_tree` input. Node text is an internal format, not PostgreSQL's tree
+serialization.
+
+Prepared catalog images are validated against their declared columns before
+restoring history or looking up tuple roots. Admission checks tagged field
+types, lengths, array elements, expression framing and the hidden relation
+identifier. Invalid images fail with `22000` before writer promotion.
 
 ## Format details for implementers
 
@@ -201,8 +232,14 @@ Retained `pg_rewrite` images have nine typed fields: the six public fields,
 `tableoid`, a private text field for the view definition, and a private text
 array containing the rule condition followed by its actions. A missing
 condition is NULL. SQL reads expose only the six public fields and the hidden
-system column; the two body fields exist only in catalog history. Journal v13
+system column; the two body fields exist only in catalog history. Journal v14
 rejects earlier framing before reading these images.
+
+Unique keys retain an explicit mode: tag `0` means NULLs are distinct, tag `1`
+means primary key, and tag `2` means `NULLS NOT DISTINCT`. Other tags are rejected.
+The checkpoint `ukey` record starts with this tag. Table-definition payload v9
+stores the tag, key-column count and timing as three bytes before the column
+positions. Manifest v26 and journal v14 reject earlier format identities.
 
 Table constraints are fixed at 64 entries per modeled kind and
 domain checks at 64 entries. Their journal counts are unsigned bytes, while
@@ -325,7 +362,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 8.
+contracts share this encoding. Table definition payloads use version 9.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.
@@ -448,7 +485,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v25. Startup, backup retention, and
+The only accepted checkpoint manifest is v26. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final

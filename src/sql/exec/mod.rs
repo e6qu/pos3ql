@@ -2848,6 +2848,7 @@ fn build_partitioned_table_def(
             def.name = SqlName::parse(statement.name.name)?;
             def.schema =
                 storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
+            def.not_null_names = [None; MAX_COLUMNS];
             for column in def.columns.iter_mut().take(def.n_columns) {
                 column.not_null = if column.not_null.is_required() {
                     crate::storage::NotNullOrigin::Inherited
@@ -2860,8 +2861,12 @@ fn build_partitioned_table_def(
                 def.uniques[index].name = auto_key_name(
                     &def,
                     constraint.columns(),
-                    if constraint.is_primary { "pkey" } else { "key" },
-                    !constraint.is_primary,
+                    if constraint.kind.is_primary() {
+                        "pkey"
+                    } else {
+                        "key"
+                    },
+                    !constraint.kind.is_primary(),
                 )?;
             }
             for index in 0..def.n_exclusions {
@@ -3694,7 +3699,7 @@ fn reject_multiple_primary(def: &TableDef) -> Result<(), SqlError> {
     let declared = def.columns().iter().filter(|c| c.primary).count()
         + def.uniques[..def.n_uniques]
             .iter()
-            .filter(|k| k.is_primary)
+            .filter(|k| k.kind.is_primary())
             .count();
     if declared > 1 {
         return Err(sql_err!(
@@ -3833,10 +3838,10 @@ fn copy_like_constraints(
                 add_unique_key(
                     def,
                     None,
-                    if key.is_primary { "pkey" } else { "key" },
+                    if key.kind.is_primary() { "pkey" } else { "key" },
                     &columns,
                     key.n_cols,
-                    key.is_primary,
+                    key.kind,
                     match key.timing {
                         crate::storage::ConstraintTiming::NotDeferrable => {
                             crate::sql::ast::ConstraintTiming::NotDeferrable
@@ -4200,26 +4205,27 @@ fn copy_like_comments(
         let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
         let source = *storage.table_def(source_slot, txn.txid);
         if like.comments {
-            for subid in 1..=source.n_columns {
+            for column in 0..source.n_columns {
+                let subid = u32::from(source.attribute_number(column));
                 let source_comment = storage.comment_text(
                     CommentClass::Relation,
                     source.schema.as_str(),
                     source.name.as_str(),
-                    subid as u32,
+                    subid,
                     txn.txid,
                 );
                 let Some(text) = source_comment else {
                     continue;
                 };
-                let source_column = source.columns()[subid - 1].name.as_str();
-                let target_subid = target.column_index(source_column).ok_or_else(|| {
+                let source_column = source.columns()[column].name.as_str();
+                let target_column = target.column_index(source_column).ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
                         "column \"{}\" does not exist",
                         source_column
                     )
-                })? as u32
-                    + 1;
+                })?;
+                let target_subid = u32::from(target.attribute_number(target_column));
                 stage_comment(
                     storage,
                     wal,
@@ -4281,18 +4287,12 @@ fn copy_like_comments(
                         source_column.name.as_str()
                     )
                 })?;
-            let source_name = stack_format!(
-                128,
-                "{}_{}_not_null",
-                source.name.as_str(),
-                source_column.name.as_str()
-            );
-            let target_name = stack_format!(
-                128,
-                "{}_{}_not_null",
-                target.name.as_str(),
-                target.columns()[target_column].name.as_str()
-            );
+            let source_name = source.not_null_names[source
+                .column_index(source_column.name.as_str())
+                .expect("source column exists")]
+            .expect("required source column has a durable constraint name");
+            let target_name = target.not_null_names[target_column]
+                .expect("required target column has a durable constraint name");
             copy_comment_if_present(
                 storage,
                 wal,
@@ -4300,13 +4300,13 @@ fn copy_like_comments(
                 CommentIdentity {
                     class: CommentClass::Constraint,
                     schema: source.schema,
-                    name: SqlName::parse(source_name.as_str())?,
+                    name: source_name,
                     subid: source_slot as u32,
                 },
                 CommentIdentity {
                     class: CommentClass::Constraint,
                     schema: target.schema,
-                    name: SqlName::parse(target_name.as_str())?,
+                    name: target_name,
                     subid: target_slot as u32,
                 },
             )?;
@@ -4464,17 +4464,20 @@ fn unique_arbiter_matches(
     txid: u32,
 ) -> Option<bool> {
     let same = |cols: &[u16]| cols.len() == want.len() && want.iter().all(|w| cols.contains(w));
+    let mut matched = false;
     for (i, c) in def.columns().iter().enumerate() {
         if c.unique && same(&[i as u16]) {
-            return Some(false);
+            matched = true;
         }
     }
     for uk in def.uniques() {
         if !uk.timing.is_deferrable() && same(uk.columns()) {
-            return Some(false);
+            matched = true;
+            if uk.kind.nulls_not_distinct() {
+                return Some(true);
+            }
         }
     }
-    let mut matched = false;
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if index.predicate.is_none() && same(&index.columns[..index.n_cols]) {
             matched = true;
@@ -4503,7 +4506,7 @@ fn arbiter_by_name(
             }
             let n = uk.n_cols;
             cols[..n].copy_from_slice(uk.columns());
-            return Ok(Some((cols, n, false)));
+            return Ok(Some((cols, n, uk.kind.nulls_not_distinct())));
         }
     }
     for (i, c) in def.columns().iter().enumerate() {
@@ -4835,7 +4838,9 @@ fn find_conflict<'a>(
                                 }
                             }
                             for uk in def.uniques() {
-                                if !uk.timing.is_deferrable() && key_hit(uk.columns(), false)? {
+                                if !uk.timing.is_deferrable()
+                                    && key_hit(uk.columns(), uk.kind.nulls_not_distinct())?
+                                {
                                     return Ok(true);
                                 }
                             }
@@ -39364,7 +39369,7 @@ pub fn create_table_as(
             } else {
                 crate::sql::ast::Collation::None
             },
-            storage: crate::sql::ast::ColumnStorage::Plain,
+            storage: ddl::default_column_storage(ctype),
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
@@ -39379,6 +39384,9 @@ pub fn create_table_as(
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
+    }
+    if let Err(error) = def.attributes.initialize(def.n_columns) {
+        return sql_fail(error);
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def, txn.txid) {
@@ -41104,6 +41112,7 @@ fn build_domain_spec(
         base,
         base_type_mod,
         not_null,
+        not_null_name: None,
         default_expr,
         checks,
         n_checks: n,
@@ -42031,6 +42040,7 @@ pub fn alter_domain(
         base: current.base,
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
+        not_null_name: current.not_null_name,
         default_expr: current.default_expr,
         checks: current.checks,
         n_checks: current.n_checks,
@@ -46560,6 +46570,7 @@ fn rewrite_composite_dependent_domains(
             base: current.base,
             base_type_mod: current.base_type_mod,
             not_null: current.not_null,
+            not_null_name: current.not_null_name,
             default_expr: current.default_expr,
             checks: current.checks,
             n_checks: current.n_checks,
@@ -54497,6 +54508,14 @@ pub(crate) fn decode_text_input<'a>(
         return crate::sql::eval::regtype_of_name(text);
     }
     let decode_builtin = |ctype| match ctype {
+        ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            ctype.name()
+        )),
         target if target.is_reg_object() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
@@ -54586,11 +54605,18 @@ fn decode_binary_field_with_context<'a>(
         }
         ColType::Int2Vector => decode_binary_vector(BinaryVectorKind::Int2, bytes, arena),
         ColType::OidVector => decode_binary_vector(BinaryVectorKind::Oid, bytes, arena),
-        ColType::PgNodeTree => Ok(Datum::Text(core::str::from_utf8(bytes).map_err(|_| bad())?)),
+        ColType::PgNodeTree => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type pg_node_tree"
+        )),
         ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
-        | ColType::PgStatisticArray => Err(bad()),
+        | ColType::PgStatisticArray => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            ctype.name()
+        )),
         ColType::Int4 => via(oids::INT4),
         ColType::Oid => via(oids::OID),
         ColType::Xid => {
@@ -57049,17 +57075,18 @@ pub(crate) fn merge<'a>(
         set_body: None,
         locking: &[],
     };
-    // Copy the synthesized def out of the borrow (it is tied to `storage`),
-    // so the write path below can borrow storage mutably.
-    let source_all_def = match super::query::synth_derived_def(
+    // Keep temporary source descriptions by value. Retaining full copies here
+    // would consume the fixed statement arena before selecting source rows.
+    let source_all_def = match super::query::describe_derived_definition(
         storage,
         &source_all_select,
         source_alias,
         statement.source.col_alias,
         txn.txid,
         arena,
+        None,
     ) {
-        Ok(d) => *d,
+        Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
     let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
@@ -57110,15 +57137,16 @@ pub(crate) fn merge<'a>(
         }
         None => source_all_select,
     };
-    let source_def = match super::query::synth_derived_def(
+    let source_def = match super::query::describe_derived_definition(
         storage,
         &source_select,
         source_alias,
         None,
         txn.txid,
         arena,
+        None,
     ) {
-        Ok(definition) => *definition,
+        Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
     let source_def = &source_def;
@@ -63528,10 +63556,9 @@ fn attach_constraint_using_index(
             index.name_for(txn.txid).as_str()
         ));
     }
-    if index.nulls_not_distinct
-        || index.descending[..index.n_cols]
-            .iter()
-            .any(|descending| *descending)
+    if index.descending[..index.n_cols]
+        .iter()
+        .any(|descending| *descending)
         || index.nulls_first[..index.n_cols]
             .iter()
             .any(|nulls_first| *nulls_first)
@@ -63562,7 +63589,10 @@ fn attach_constraint_using_index(
     }
     if primary {
         if new_definition.columns().iter().any(|column| column.primary)
-            || new_definition.uniques().iter().any(|key| key.is_primary)
+            || new_definition
+                .uniques()
+                .iter()
+                .any(|key| key.kind.is_primary())
         {
             return Err(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
@@ -63581,7 +63611,13 @@ fn attach_constraint_using_index(
         if primary { "pkey" } else { "key" },
         &index.columns,
         index.n_cols,
-        primary,
+        if primary {
+            crate::storage::UniqueKeyKind::Primary
+        } else if index.nulls_not_distinct {
+            crate::storage::UniqueKeyKind::UniqueNullsNotDistinct
+        } else {
+            crate::storage::UniqueKeyKind::UniqueNullsDistinct
+        },
         timing,
     )?;
     stage_index_rename(storage, wal, txn, slot, constraint_name)
@@ -63887,40 +63923,62 @@ fn drop_column_constraints(
     Ok(removed_count)
 }
 
-/// If two rewritten rows `a` and `b` collide on a uniqueness constraint of
-/// `new_def` — a single-column UNIQUE/PRIMARY KEY flag or a multi-column key,
-/// with every key column non-NULL and equal — returns the constraint's
-/// PostgreSQL name. Used to validate a uniqueness constraint added alongside an
-/// ALTER row rewrite, against the transformed images, before anything is
-/// journaled (a NULL in any key column makes the rows distinct).
-fn rewritten_dup_name(new_def: &TableDef, a: &[Datum], b: &[Datum]) -> Option<StackStr<128>> {
-    use core::fmt::Write as _;
-    let eq = |i: usize| {
-        !a[i].is_null()
-            && !b[i].is_null()
-            && compare_datums(&a[i], &b[i])
-                .map(|o| o.is_eq())
-                .unwrap_or(false)
+/// Rewritten rows use the same collations and NULL equality modes as ordinary
+/// writes. Comparison errors must stop the rewrite before it is journaled.
+fn rewritten_dup_name(
+    storage: &Storage,
+    transaction: u32,
+    new_def: &TableDef,
+    a: &[Datum],
+    b: &[Datum],
+) -> Result<Option<SqlName>, SqlError> {
+    let matches_key = |columns: &[u16], nulls_not_distinct: bool| -> Result<bool, SqlError> {
+        if columns.len() > crate::storage::MAX_INDEX_COLS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewritten unique key exceeds its column capacity"
+            ));
+        }
+        let mut left = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+        let mut right = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+        let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+        for (position, &column) in columns.iter().enumerate() {
+            let column = usize::from(column);
+            let invalid = || {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "rewritten unique key column is unavailable"
+                )
+            };
+            left[position] = *a.get(column).ok_or_else(invalid)?;
+            right[position] = *b.get(column).ok_or_else(invalid)?;
+            collations[position] = new_def.columns().get(column).ok_or_else(invalid)?.collation;
+        }
+        constraints::key_values_equal(
+            storage,
+            transaction,
+            &collations[..columns.len()],
+            &left[..columns.len()],
+            &right[..columns.len()],
+            nulls_not_distinct,
+        )
     };
     for (i, c) in new_def.columns().iter().enumerate() {
-        if c.unique && eq(i) {
-            let mut name = StackStr::<128>::new();
-            if c.primary {
-                let _ = write!(name, "{}_pkey", new_def.name.as_str());
-            } else {
-                let _ = write!(name, "{}_{}_key", new_def.name.as_str(), c.name.as_str());
-            }
-            return Some(name);
+        if c.unique && matches_key(&[i as u16], false)? {
+            return Ok(Some(auto_key_name(
+                new_def,
+                &[i as u16],
+                if c.primary { "pkey" } else { "key" },
+                !c.primary,
+            )?));
         }
     }
     for uk in new_def.uniques() {
-        if uk.columns().iter().all(|&col| eq(col as usize)) {
-            let mut name = StackStr::<128>::new();
-            let _ = write!(name, "{}", uk.name.as_str());
-            return Some(name);
+        if matches_key(uk.columns(), uk.kind.nulls_not_distinct())? {
+            return Ok(Some(uk.name));
         }
     }
-    None
+    Ok(None)
 }
 
 fn rewritten_exclusion_name(
@@ -64454,7 +64512,8 @@ fn inherit_partition_constraints(
         // copying the parent's name would collide because index names are
         // schema-wide and makes pg_dump emit self-referential INDEX ATTACHes.
         if child.uniques().iter().any(|existing| {
-            existing.is_primary == constraint.is_primary
+            existing.kind == constraint.kind
+                && existing.timing == constraint.timing
                 && existing.columns() == &columns[..constraint.n_cols]
         }) {
             continue;
@@ -64470,8 +64529,12 @@ fn inherit_partition_constraints(
         inherited.name = auto_key_name(
             child,
             &columns[..constraint.n_cols],
-            if constraint.is_primary { "pkey" } else { "key" },
-            !constraint.is_primary,
+            if constraint.kind.is_primary() {
+                "pkey"
+            } else {
+                "key"
+            },
+            !constraint.kind.is_primary(),
         )?;
         child.uniques[child.n_uniques] = inherited;
         child.n_uniques += 1;
@@ -64566,37 +64629,53 @@ fn inherit_partition_constraints(
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
     }
-    Ok(())
+    crate::storage::constraint_names::table(child)
 }
 
-fn has_unique_identity(definition: &TableDef, columns: &[u16], primary: bool) -> bool {
+fn has_unique_identity(
+    definition: &TableDef,
+    columns: &[u16],
+    kind: crate::storage::UniqueKeyKind,
+    timing: crate::storage::ConstraintTiming,
+) -> bool {
     definition
         .columns()
         .iter()
         .enumerate()
         .any(|(column, metadata)| {
             columns == [column as u16]
-                && if primary {
-                    metadata.primary
-                } else {
-                    metadata.unique && !metadata.primary
+                && timing == crate::storage::ConstraintTiming::NotDeferrable
+                && match kind {
+                    crate::storage::UniqueKeyKind::Primary => metadata.primary,
+                    crate::storage::UniqueKeyKind::UniqueNullsDistinct => {
+                        metadata.unique && !metadata.primary
+                    }
+                    crate::storage::UniqueKeyKind::UniqueNullsNotDistinct => false,
                 }
         })
         || definition
             .uniques()
             .iter()
-            .any(|key| key.is_primary == primary && key.columns() == columns)
+            .any(|key| key.kind == kind && key.timing == timing && key.columns() == columns)
 }
 
-fn drop_unique_identity(definition: &mut TableDef, columns: &[u16], primary: bool) -> bool {
-    if columns.len() == 1 {
+fn drop_unique_identity(
+    definition: &mut TableDef,
+    columns: &[u16],
+    kind: crate::storage::UniqueKeyKind,
+    timing: crate::storage::ConstraintTiming,
+) -> bool {
+    if columns.len() == 1 && timing == crate::storage::ConstraintTiming::NotDeferrable {
         let metadata = &mut definition.columns[usize::from(columns[0])];
-        if primary && metadata.primary {
+        if kind.is_primary() && metadata.primary {
             metadata.primary = false;
             metadata.unique = false;
             return true;
         }
-        if !primary && metadata.unique && !metadata.primary {
+        if kind == crate::storage::UniqueKeyKind::UniqueNullsDistinct
+            && metadata.unique
+            && !metadata.primary
+        {
             metadata.unique = false;
             return true;
         }
@@ -64604,7 +64683,7 @@ fn drop_unique_identity(definition: &mut TableDef, columns: &[u16], primary: boo
     let Some(index) = definition
         .uniques()
         .iter()
-        .position(|key| key.is_primary == primary && key.columns() == columns)
+        .position(|key| key.kind == kind && key.timing == timing && key.columns() == columns)
     else {
         return false;
     };
@@ -64652,19 +64731,41 @@ fn synchronize_inherited_constraint_changes(
                 "partition is missing an inherited column"
             )
         })? as u16;
-        if metadata.primary && !has_unique_identity(new_parent, &[column as u16], true) {
-            changed |= drop_unique_identity(child, &[child_column], true);
+        if metadata.primary
+            && !has_unique_identity(
+                new_parent,
+                &[column as u16],
+                crate::storage::UniqueKeyKind::Primary,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            )
+        {
+            changed |= drop_unique_identity(
+                child,
+                &[child_column],
+                crate::storage::UniqueKeyKind::Primary,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            );
         } else if metadata.unique
             && !metadata.primary
-            && !has_unique_identity(new_parent, &[column as u16], false)
+            && !has_unique_identity(
+                new_parent,
+                &[column as u16],
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            )
         {
-            changed |= drop_unique_identity(child, &[child_column], false);
+            changed |= drop_unique_identity(
+                child,
+                &[child_column],
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct,
+                crate::storage::ConstraintTiming::NotDeferrable,
+            );
         }
     }
     for key in old_parent.uniques() {
-        if !has_unique_identity(new_parent, key.columns(), key.is_primary) {
+        if !has_unique_identity(new_parent, key.columns(), key.kind, key.timing) {
             let columns = remap_columns(child, old_parent, key.columns())?;
-            changed |= drop_unique_identity(child, &columns[..key.n_cols], key.is_primary);
+            changed |= drop_unique_identity(child, &columns[..key.n_cols], key.kind, key.timing);
         }
     }
     for old in old_parent.checks() {
@@ -64878,6 +64979,9 @@ fn alter_table_inheritance(
                 crate::storage::NotNullOrigin::Nullable
             };
         }
+    }
+    if let Err(error) = crate::storage::constraint_names::table(&mut updated) {
+        return sql_fail(error);
     }
     let mut mapping = [None; MAX_COLUMNS];
     let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
@@ -65587,14 +65691,10 @@ fn alter_table_inner(
             } => {
                 let Some(column) = definition.columns().iter().find(|column| {
                     column.not_null.is_required()
-                        && stack_format!(
-                            128,
-                            "{}_{}_not_null",
-                            definition.name.as_str(),
-                            column.name.as_str()
-                        )
-                        .as_str()
-                            == *name
+                        && definition.not_null_names[definition
+                            .column_index(column.name.as_str())
+                            .expect("constraint column exists")]
+                        .is_some_and(|stored| stored.as_str() == *name)
                 }) else {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -67264,7 +67364,7 @@ fn alter_table_relation(
                 let in_primary_key = new_def.columns[i].primary
                     || new_def.uniques[..new_def.n_uniques]
                         .iter()
-                        .any(|k| k.is_primary && k.columns().contains(&(i as u16)));
+                        .any(|k| k.kind.is_primary() && k.columns().contains(&(i as u16)));
                 if in_primary_key {
                     return sql_fail(sql_err!(
                         sqlstate::INVALID_TABLE_DEFINITION,
@@ -67449,14 +67549,10 @@ fn alter_table_relation(
                     crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit } => {
                         let column = new_def.columns().iter().position(|column| {
                             column.not_null.is_required()
-                                && stack_format!(
-                                    128,
-                                    "{}_{}_not_null",
-                                    new_def.name.as_str(),
-                                    column.name.as_str()
-                                )
-                                .as_str()
-                                    == *name
+                                && new_def.not_null_names[new_def
+                                    .column_index(column.name.as_str())
+                                    .expect("constraint column exists")]
+                                .is_some_and(|stored| stored.as_str() == *name)
                         });
                         if let Some(column) = column {
                             new_def.columns[column].not_null_inheritable = *inherit;
@@ -67819,6 +67915,49 @@ fn alter_table_relation(
     def.schema(&mut old_schema);
     let old_schema = &old_schema[..def.n_columns];
 
+    let mut column_mapping = [None; MAX_COLUMNS];
+    let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
+    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
+        if let ColSource::Keep(old_column)
+        | ColSource::Cast {
+            orig: old_column, ..
+        } = *source
+        {
+            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
+            wal_column_mapping[old_column] = new_column as u16;
+        }
+    }
+    new_def.attributes = match crate::storage::column_attributes::ColumnAttributes::rewrite(
+        &def,
+        new_def.columns(),
+        &column_mapping,
+    ) {
+        Ok(attributes) => attributes,
+        Err(error) => return sql_fail(error),
+    };
+    for (column, destination) in column_mapping[..def.n_columns].iter().enumerate() {
+        if destination.is_none()
+            && let Err(error) = stage_comment(
+                storage,
+                wal,
+                txn,
+                CommentIdentity {
+                    class: crate::storage::CommentClass::Relation,
+                    schema: def.schema,
+                    name: def.name,
+                    subid: u32::from(def.attribute_number(column)),
+                },
+                None,
+            )
+        {
+            return sql_fail(error);
+        }
+    }
+    if let Err(error) =
+        crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping)
+    {
+        return sql_fail(error);
+    }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);
     let new_schema = &new_schema[..new_def.n_columns];
@@ -68039,11 +68178,17 @@ fn alter_table_relation(
                 if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
                     return sql_fail(e);
                 }
-                if let Some(name) = rewritten_dup_name(
+                let duplicate_name = match rewritten_dup_name(
+                    storage,
+                    txn.txid,
                     &new_def,
                     &avals[..new_def.n_columns],
                     &bvals[..new_def.n_columns],
                 ) {
+                    Ok(name) => name,
+                    Err(error) => return sql_fail(error),
+                };
+                if let Some(name) = duplicate_name {
                     return sql_fail(sql_err!(
                         sqlstate::UNIQUE_VIOLATION,
                         "duplicate key value violates unique constraint \"{}\"",
@@ -68073,18 +68218,6 @@ fn alter_table_relation(
         }
     }
 
-    let mut column_mapping = [None; MAX_COLUMNS];
-    let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
-    for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
-        if let ColSource::Keep(old_column)
-        | ColSource::Cast {
-            orig: old_column, ..
-        } = *source
-        {
-            column_mapping[old_column] = Some(new_def.columns()[new_column].name);
-            wal_column_mapping[old_column] = new_column as u16;
-        }
-    }
     if dropped_any
         && let Err(error) = remap_table_column_acls(
             storage,
@@ -68608,6 +68741,9 @@ fn alter_table_relation(
                 if !changed {
                     continue;
                 }
+                if let Err(error) = crate::storage::constraint_names::table(&mut dependent) {
+                    return sql_fail(error);
+                }
                 let mut mapping = [None; MAX_COLUMNS];
                 let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
                 for column in 0..current.n_columns {
@@ -69051,7 +69187,11 @@ fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
             if metadata.primary { "pkey" } else { "key" },
             &indices,
             1,
-            metadata.primary,
+            if metadata.primary {
+                crate::storage::UniqueKeyKind::Primary
+            } else {
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct
+            },
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
         def.columns[column].primary = false;
@@ -69095,7 +69235,11 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
                 if was_primary { "pkey" } else { "key" },
                 &indices,
                 1,
-                was_primary,
+                if was_primary {
+                    crate::storage::UniqueKeyKind::Primary
+                } else {
+                    crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                },
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
             return Ok(true);
@@ -69920,6 +70064,12 @@ pub(crate) fn coerce<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if !v.is_null() && col.ctype == ColType::PgStatisticArray {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing non-null pg_statistic[] values is not supported"
+        ));
+    }
     let mut v = v;
     if !v.is_null() {
         let source_oid = v.type_oid();
@@ -70013,7 +70163,7 @@ pub(crate) fn coerce<'a>(
         // Data errors (out of range, bad input syntax — class 22) keep their
         // specific message; only a genuine type mismatch is rewritten with the
         // column context.
-        if e.sqlstate.starts_with("22") {
+        if e.sqlstate.starts_with("22") || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED {
             e
         } else {
             sql_err!(

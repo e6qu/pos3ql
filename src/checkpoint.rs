@@ -209,7 +209,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v25";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v26";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -3949,6 +3949,10 @@ impl Checkpointer {
                         name: sql_name(name)?,
                         columns: [empty_column(); MAX_COLUMNS],
                         n_columns: n_cols,
+                        attributes: crate::storage::column_attributes::ColumnAttributes {
+                            count: u16::MAX,
+                            ..crate::storage::column_attributes::ColumnAttributes::EMPTY
+                        },
                         has_toast,
                         has_rules,
                         kind,
@@ -3968,6 +3972,60 @@ impl Checkpointer {
                         0,
                         [0i64; crate::storage::MAX_COLUMNS],
                     ));
+                }
+                Some("attributes2") => {
+                    use crate::storage::column_attributes::{AttributeSlot, ColumnAttributes};
+                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("attributes outside table"));
+                    };
+                    let number: usize = parse_field(words.next(), "attribute number")?;
+                    if number == 0 {
+                        let count: u16 = parse_field(words.next(), "attribute count")?;
+                        if def.attributes.count != u16::MAX
+                            || usize::from(count) > crate::storage::MAX_RELATION_COLUMNS
+                            || words.next().is_some()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute count",
+                            ));
+                        }
+                        def.attributes = ColumnAttributes {
+                            count,
+                            ..ColumnAttributes::EMPTY
+                        };
+                    } else {
+                        if def.attributes.count == u16::MAX
+                            || number > usize::from(def.attributes.count)
+                            || def.attributes.slots[number - 1] != AttributeSlot::Empty
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute number",
+                            ));
+                        }
+                        let encoded = words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("missing column attribute"))?;
+                        if encoded.len() != 16
+                            || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            || words.next().is_some()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute encoding",
+                            ));
+                        }
+                        let mut bytes = [0u8; 8];
+                        for (position, byte) in bytes.iter_mut().enumerate() {
+                            *byte =
+                                u8::from_str_radix(&encoded[position * 2..position * 2 + 2], 16)
+                                    .map_err(|_| {
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid column attribute encoding",
+                                        )
+                                    })?;
+                        }
+                        def.attributes.slots[number - 1] = AttributeSlot::decode(bytes)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid column attribute"))?;
+                    }
                 }
                 Some("persist") => {
                     let Some((_, _, def, _, _)) = pending_def.as_mut() else {
@@ -3998,6 +4056,23 @@ impl Checkpointer {
                     if not_null_inheritable > 1 {
                         return Err(CheckpointSetupError::Corrupt(
                             "invalid NOT NULL inheritance",
+                        ));
+                    }
+                    let not_null_text = match words.next() {
+                        Some("0") => String::new(),
+                        Some(value) => decode_hex_name(value)?,
+                        None => {
+                            return Err(CheckpointSetupError::Corrupt("col NOT NULL name missing"));
+                        }
+                    };
+                    let not_null_name = if not_null_text.is_empty() {
+                        None
+                    } else {
+                        Some(sql_name(&not_null_text)?)
+                    };
+                    if (not_null & 3 != 0) != not_null_name.is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid column NOT NULL name",
                         ));
                     }
                     let type_mod: i32 = parse_field(words.next(), "col typmod")?;
@@ -4082,7 +4157,16 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 17)?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("column name missing"))?,
+                    )?;
+                    if name.is_empty() || words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid column name or trailing fields",
+                        ));
+                    }
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -4094,8 +4178,9 @@ impl Checkpointer {
                     .ok_or(CheckpointSetupError::Corrupt(
                         "invalid column default state",
                     ))?;
+                    def.not_null_names[*seen] = not_null_name;
                     def.columns[*seen] = ColumnMeta {
-                        name: sql_name(name)?,
+                        name: sql_name(&name)?,
                         user_type,
                         ctype,
                         type_mod,
@@ -5288,19 +5373,27 @@ impl Checkpointer {
                     if def.n_uniques >= crate::storage::MAX_UNIQUES {
                         return Err(CheckpointSetupError::Corrupt("too many ukey lines"));
                     }
-                    let is_primary: u8 = parse_field(words.next(), "ukey primary")?;
+                    let kind: u8 = parse_field(words.next(), "ukey kind")?;
                     let timing: u8 = parse_field(words.next(), "ukey timing")?;
                     let n_cols: usize = parse_field(words.next(), "ukey ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad ukey ncols"));
                     }
                     let mut uk = crate::storage::UniqueKey::EMPTY;
-                    uk.is_primary = is_primary != 0;
+                    uk.kind = crate::storage::UniqueKeyKind::from_code(kind)
+                        .ok_or(CheckpointSetupError::Corrupt("bad ukey kind"))?;
                     uk.timing = crate::storage::ConstraintTiming::from_code(timing)
                         .ok_or(CheckpointSetupError::Corrupt("bad ukey timing"))?;
                     uk.n_cols = n_cols;
                     for c in uk.columns.iter_mut().take(n_cols) {
                         *c = parse_field(words.next(), "ukey col")?;
+                    }
+                    for (position, column) in uk.columns[..n_cols].iter().enumerate() {
+                        if usize::from(*column) >= def.n_columns
+                            || uk.columns[..position].contains(column)
+                        {
+                            return Err(CheckpointSetupError::Corrupt("bad ukey column"));
+                        }
                     }
                     let hex_name = words
                         .next()
@@ -7281,9 +7374,6 @@ impl Checkpointer {
                             "invalid domain source lifetime",
                         ));
                     }
-                    let has_parent = true;
-                    let has_base_identity = true;
-                    let has_validation = true;
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -7298,28 +7388,34 @@ impl Checkpointer {
                     let base_code: u8 = parse_field(words.next(), "dom base")?;
                     let base_type_mod: i32 = parse_field(words.next(), "dom typmod")?;
                     let not_null: u8 = parse_field(words.next(), "dom notnull")?;
+                    if not_null > 1 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid domain NOT NULL flag",
+                        ));
+                    }
                     let n_checks: usize = parse_field(words.next(), "dom nchecks")?;
                     if n_checks > crate::storage::MAX_DOMAIN_CHECKS {
                         return Err(CheckpointSetupError::Corrupt("too many domain checks"));
                     }
                     let schema = hexstr(words.next(), "dom schema missing")?;
                     let name = hexstr(words.next(), "dom name missing")?;
-                    let (base_domain, base_domain_schema) = if has_parent {
-                        (
-                            hexstr(words.next(), "dom base domain missing")?,
-                            hexstr(words.next(), "dom base domain schema missing")?,
-                        )
+                    let base_domain = hexstr(words.next(), "dom base domain missing")?;
+                    let base_domain_schema =
+                        hexstr(words.next(), "dom base domain schema missing")?;
+                    let base_user_type = hexstr(words.next(), "dom base type missing")?;
+                    let base_user_type_schema =
+                        hexstr(words.next(), "dom base type schema missing")?;
+                    let not_null_text = hexstr(words.next(), "dom NOT NULL name missing")?;
+                    let not_null_name = if not_null_text.is_empty() {
+                        None
                     } else {
-                        (String::new(), String::new())
+                        Some(sql_name(&not_null_text)?)
                     };
-                    let (base_user_type, base_user_type_schema) = if has_base_identity {
-                        (
-                            hexstr(words.next(), "dom base type missing")?,
-                            hexstr(words.next(), "dom base type schema missing")?,
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    };
+                    if (not_null != 0) != not_null_name.is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid domain NOT NULL name",
+                        ));
+                    }
                     let default_text = hexstr(words.next(), "dom default missing")?;
                     let base = crate::sql::types::ColType::from_code(base_code)
                         .ok_or(CheckpointSetupError::Corrupt("bad domain base type"))?;
@@ -7328,14 +7424,9 @@ impl Checkpointer {
                     for check in checks.iter_mut().take(n_checks) {
                         let cname = hexstr(words.next(), "dom check name missing")?;
                         let cexpr = hexstr(words.next(), "dom check expr missing")?;
-                        let validation = if has_validation {
-                            let code: u8 = parse_field(words.next(), "dom check validation")?;
-                            crate::storage::ConstraintValidation::from_code(code).ok_or(
-                                CheckpointSetupError::Corrupt("bad domain check validation"),
-                            )?
-                        } else {
-                            crate::storage::ConstraintValidation::EnforcedValidated
-                        };
+                        let code: u8 = parse_field(words.next(), "dom check validation")?;
+                        let validation = crate::storage::ConstraintValidation::from_code(code)
+                            .ok_or(CheckpointSetupError::Corrupt("bad domain check validation"))?;
                         *check = crate::storage::CheckConstraint {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
@@ -7378,12 +7469,16 @@ impl Checkpointer {
                                 ));
                             }
                         };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("unexpected domain fields"));
+                    }
                     let spec = crate::storage::DomainSpec {
                         base_domain,
                         base_user_type,
                         base,
                         base_type_mod,
                         not_null: not_null != 0,
+                        not_null_name,
                         default_expr: (!default_text.is_empty())
                             .then(|| crate::util::StackStr::from_str(&default_text)),
                         checks,
@@ -9706,6 +9801,11 @@ impl Checkpointer {
             let _ = write!(line, " ");
             hex(
                 &mut line,
+                d.not_null_name.as_ref().map_or("", |name| name.as_str()),
+            );
+            let _ = write!(line, " ");
+            hex(
+                &mut line,
                 d.default_expr.as_ref().map(|e| e.as_str()).unwrap_or(""),
             );
             for c in d.checks() {
@@ -9932,6 +10032,31 @@ impl Checkpointer {
                 &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
+            if !definition.attributes.validate(definition.n_columns) {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "invalid column attribute layout"
+                ));
+            }
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!("attributes2 0 {}", definition.attributes.count),
+            )?;
+            for (number, attribute) in definition.attributes.slots
+                [..usize::from(definition.attributes.count)]
+                .iter()
+                .enumerate()
+            {
+                use core::fmt::Write;
+                let mut encoded = StackStr::<16>::new();
+                for byte in attribute.encode() {
+                    write!(encoded, "{byte:02x}").expect("fixed attribute encoding fits");
+                }
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("attributes2 {} {}", number + 1, encoded.as_str()),
+                )?;
+            }
             if definition.schema.as_str() != "public" {
                 use core::fmt::Write;
                 let mut hex = StackStr::<130>::new();
@@ -9953,7 +10078,7 @@ impl Checkpointer {
                     definition.replica_identity.code(),
                 ),
             )?;
-            for c in definition.columns() {
+            for (column, c) in definition.columns().iter().enumerate() {
                 use core::fmt::Write as _;
                 let default_value = c.default.constant().copied();
                 let default_hex = default_to_hex(&default_value);
@@ -10002,13 +10127,26 @@ impl Checkpointer {
                         let _ = write!(domain_hex, "0");
                     }
                 }
+                let mut not_null_name_hex = StackStr::<128>::new();
+                if let Some(name) = definition.not_null_names[column] {
+                    for byte in name.as_str().as_bytes() {
+                        let _ = write!(not_null_name_hex, "{byte:02x}");
+                    }
+                } else {
+                    let _ = write!(not_null_name_hex, "0");
+                }
+                let mut column_name_hex = StackStr::<128>::new();
+                for byte in c.name.as_str().as_bytes() {
+                    let _ = write!(column_name_hex, "{byte:02x}");
+                }
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         u8::from(c.not_null_inheritable),
+                        not_null_name_hex.as_str(),
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
@@ -10022,7 +10160,7 @@ impl Checkpointer {
                         c.collation.code(),
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
-                        c.name.as_str()
+                        column_name_hex.as_str()
                     ),
                 )?;
             }
@@ -10073,7 +10211,7 @@ impl Checkpointer {
                 }
             }
             // Constraint lines (hex-encoded names/text tolerate spaces):
-            // `ukey <is_primary> <timing> <ncols> <c0..cN> <hex-name>`
+            // `ukey <kind> <timing> <ncols> <c0..cN> <hex-name>`
             for uk in definition.uniques() {
                 use core::fmt::Write;
                 let mut columns = StackStr::<64>::new();
@@ -10088,7 +10226,7 @@ impl Checkpointer {
                     &mut self.manifest_output,
                     format_args!(
                         "ukey {} {} {} {}{}",
-                        u8::from(uk.is_primary),
+                        uk.kind.code(),
                         uk.timing.code(),
                         uk.n_cols,
                         columns.as_str(),
@@ -17151,47 +17289,45 @@ fn finish_pending(
                 "manifest column count mismatch",
             ));
         }
-        let slot =
-            if storage
-                .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
+        let slot = if storage
+            .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
+        {
+            let slot = storage.large_object_page_table();
+            let expected = &*storage.table(slot).definition();
+            if manifest_index != slot
+                || created_at != 0
+                || definition.schema != expected.schema
+                || definition.name != expected.name
+                || definition.n_columns != expected.n_columns
+                || definition.not_null_names != expected.not_null_names
+                || definition.has_toast != expected.has_toast
+                || definition
+                    .columns()
+                    .iter()
+                    .zip(expected.columns())
+                    .any(|(actual, expected)| actual != expected)
             {
-                let slot = storage.large_object_page_table();
-                let expected = &*storage.table(slot).definition();
-                if manifest_index != slot
-                    || created_at != 0
-                    || definition.schema != expected.schema
-                    || definition.name != expected.name
-                    || definition.n_columns != expected.n_columns
-                    || definition.has_toast != expected.has_toast
-                    || definition.columns().iter().zip(expected.columns()).any(
-                        |(actual, expected)| {
-                            actual.name != expected.name
-                                || actual.ctype != expected.ctype
-                                || actual.not_null != expected.not_null
-                        },
-                    )
-                {
-                    return Err(CheckpointSetupError::Corrupt(
-                        "large-object page relation definition mismatch",
-                    ));
-                }
-                slot
-            } else {
-                let position = crate::storage::CatalogPosition::new(manifest_index, created_at)
-                    .map_err(|_| CheckpointSetupError::Corrupt("invalid table source identity"))?;
-                storage
-                    .restore_table(
-                        position,
-                        definition,
-                        crate::storage::TableCreation::Committed,
-                    )
-                    .map_err(|error| {
-                        CheckpointSetupError::ObjectStore(format!(
-                            "manifest table rejected: {}",
-                            error.message.as_str()
-                        ))
-                    })?
-            };
+                return Err(CheckpointSetupError::Corrupt(
+                    "large-object page relation definition mismatch",
+                ));
+            }
+            slot
+        } else {
+            let position = crate::storage::CatalogPosition::new(manifest_index, created_at)
+                .map_err(|_| CheckpointSetupError::Corrupt("invalid table source identity"))?;
+            storage
+                .restore_table(
+                    position,
+                    definition,
+                    crate::storage::TableCreation::Committed,
+                )
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "manifest table rejected: {}",
+                        error.message.as_str()
+                    ))
+                })?
+        };
         if slot_of
             .get(manifest_index)
             .is_some_and(|entry| entry.is_some())
@@ -19529,7 +19665,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v25\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v26\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -19933,7 +20069,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v26\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -19959,7 +20095,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v26\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -19968,7 +20104,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v25\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v26\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -20136,7 +20272,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v22",
                 "pos3ql-manifest-v23",
                 "pos3ql-manifest-v24",
-                "pos3ql-manifest-v25 trailing",
+                "pos3ql-manifest-v26 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20218,11 +20354,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v25\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v26\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v25\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v26\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20584,7 +20720,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v25\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v26\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

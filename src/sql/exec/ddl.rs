@@ -326,14 +326,9 @@ pub(super) fn build_column(
     })
 }
 
-/// PostgreSQL exposes `p` for fixed-width and tsquery values; the remaining
-/// modeled varlena types start at the ordinary EXTENDED policy.
 pub(super) fn default_column_storage(ctype: ColType) -> crate::sql::ast::ColumnStorage {
-    if ctype.typlen() >= 0 || matches!(ctype, ColType::TsQuery) {
-        crate::sql::ast::ColumnStorage::Plain
-    } else {
-        crate::sql::ast::ColumnStorage::Extended
-    }
+    crate::sql::ast::ColumnStorage::from_code(ctype.physical_layout().storage)
+        .expect("captured PostgreSQL type storage policy is valid")
 }
 
 /// Storage and compression are catalog-visible schema properties. They are
@@ -345,7 +340,7 @@ pub(super) fn validate_column_storage(
     storage: crate::sql::ast::ColumnStorage,
     compression: crate::sql::ast::ColumnCompression,
 ) -> Result<(), SqlError> {
-    let toastable = ctype.typlen() < 0 && !matches!(ctype, ColType::TsQuery);
+    let toastable = ctype.physical_layout().storage != b'p';
     if !toastable && storage != crate::sql::ast::ColumnStorage::Plain {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -356,13 +351,6 @@ pub(super) fn validate_column_storage(
                 crate::sql::ast::ColumnStorage::Extended => "EXTENDED",
                 crate::sql::ast::ColumnStorage::Main => "MAIN",
             },
-            name
-        ));
-    }
-    if toastable && storage == crate::sql::ast::ColumnStorage::Plain {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot set storage option to PLAIN for column \"{}\"",
             name
         ));
     }
@@ -732,7 +720,9 @@ pub(super) fn attach_constraints(
     // looking only at the columns would miss one a `LIKE ... INCLUDING INDEXES`
     // had already copied in and let the table end up with two.
     let mut has_primary = def.columns().iter().any(|c| c.primary)
-        || def.uniques[..def.n_uniques].iter().any(|k| k.is_primary);
+        || def.uniques[..def.n_uniques]
+            .iter()
+            .any(|k| k.kind.is_primary());
     for con in constraints {
         match con {
             TableConstraint::PrimaryKey {
@@ -772,27 +762,44 @@ pub(super) fn attach_constraints(
                             def.name.as_str()
                         ));
                     }
-                    add_unique_key(def, *name, "pkey", &indices, n, true, *timing)?;
+                    add_unique_key(
+                        def,
+                        *name,
+                        "pkey",
+                        &indices,
+                        n,
+                        crate::storage::UniqueKeyKind::Primary,
+                        *timing,
+                    )?;
                 }
             }
             TableConstraint::Unique {
                 name,
                 columns,
                 timing,
+                nulls_not_distinct,
             } => {
                 let (indices, n) = resolve_cols(def, columns)?;
                 let stored_timing = storage_timing(*timing);
                 let equivalent_flag = n == 1
+                    && !*nulls_not_distinct
                     && !stored_timing.is_deferrable()
                     && (def.columns[indices[0] as usize].unique
                         || def.columns[indices[0] as usize].primary);
                 let equivalent_key = def.uniques().iter().any(|key| {
-                    !key.is_primary && key.timing == stored_timing && key.columns() == &indices[..n]
+                    !key.kind.is_primary()
+                        && key.kind.nulls_not_distinct() == *nulls_not_distinct
+                        && key.timing == stored_timing
+                        && key.columns() == &indices[..n]
                 });
                 if merge_equivalent && (equivalent_flag || equivalent_key) {
                     continue;
                 }
-                if n == 1 && name.is_none() && !stored_timing.is_deferrable() {
+                if n == 1
+                    && name.is_none()
+                    && !stored_timing.is_deferrable()
+                    && !*nulls_not_distinct
+                {
                     def.columns[indices[0] as usize].unique = true;
                 } else {
                     if !merge_equivalent
@@ -806,7 +813,12 @@ pub(super) fn attach_constraints(
                             def.name.as_str()
                         ));
                     }
-                    add_unique_key(def, *name, "key", &indices, n, false, *timing)?;
+                    let kind = if *nulls_not_distinct {
+                        crate::storage::UniqueKeyKind::UniqueNullsNotDistinct
+                    } else {
+                        crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                    };
+                    add_unique_key(def, *name, "key", &indices, n, kind, *timing)?;
                 }
             }
             TableConstraint::Check {
@@ -972,7 +984,8 @@ pub(super) fn attach_constraints(
             }
         }
     }
-    Ok(())
+    def.attributes.initialize(def.n_columns)?;
+    crate::storage::constraint_names::table(def)
 }
 
 /// PostgreSQL's auto-generated constraint name: `<table>_pkey` for a primary
@@ -1104,7 +1117,7 @@ pub(super) fn add_unique_key(
     suffix: &str,
     indices: &[u16; MAX_INDEX_COLS],
     n: usize,
-    is_primary: bool,
+    kind: crate::storage::UniqueKeyKind,
     timing: AstConstraintTiming,
 ) -> Result<(), SqlError> {
     if def.n_uniques == crate::storage::MAX_UNIQUES {
@@ -1117,13 +1130,13 @@ pub(super) fn add_unique_key(
     let kname = match name {
         Some(nm) => SqlName::parse(nm)?,
         // A primary key is `<table>_pkey`; a unique key lists every column.
-        None => auto_key_name(def, &indices[..n], suffix, !is_primary)?,
+        None => auto_key_name(def, &indices[..n], suffix, !kind.is_primary())?,
     };
     let mut k = UniqueKey::EMPTY;
     k.name = kname;
     k.columns[..n].copy_from_slice(&indices[..n]);
     k.n_cols = n;
-    k.is_primary = is_primary;
+    k.kind = kind;
     k.timing = storage_timing(timing);
     def.uniques[def.n_uniques] = k;
     def.n_uniques += 1;
@@ -1334,7 +1347,7 @@ fn attach_fkey(
 pub(super) fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize) {
     let mut out = [0u16; MAX_INDEX_COLS];
     for uk in def.uniques() {
-        if uk.is_primary {
+        if uk.kind.is_primary() {
             let n = uk.n_cols.min(MAX_INDEX_COLS);
             out[..n].copy_from_slice(&uk.columns()[..n]);
             return (out, n);

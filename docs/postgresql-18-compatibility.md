@@ -41,6 +41,12 @@ containing an array of scalar domains is supported.
 For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
 from an unsupported `positive_ids[]` column.
 
+Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
+reject client text and binary input with `0A000`, matching PostgreSQL. Reports
+can display their generated values. Copying non-null statistics values into
+user tables, including `pg_statistic[]`, is unsupported and fails with `0A000`
+before storing unreadable data. NULL values remain valid.
+
 ## Physical access paths
 
 | Method | Object-native path |
@@ -99,7 +105,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 
 | Kind | Boundary | Source or qualification |
 |---|---|---|
-| PostgreSQL relation shape | 1,600 columns: tables, views, named composites, record definitions, explicit USING lists | `src/storage/rowenc.rs`; wide relation and record differential fixtures |
+| PostgreSQL relation shape | 1,600 columns: tables (including retained dropped columns), views, named composites, record definitions, explicit USING lists | `src/storage/rowenc.rs`; wide relation and record differential fixtures |
 | PostgreSQL executable result | 1,664 columns: SELECT targets, routine/table-function results, Describe and Bind formats | Wide result and routine fixtures |
 | PostgreSQL statement shapes | 100 routine inputs; 32 index/partition attributes; 4,096 grouping sets; 12 CUBE elements; 31 GROUPING arguments | Parser/type boundaries and accepted/rejected differential cases |
 | PostgreSQL wire parameters | 65,535 Parse/Bind and SQL PREPARE/EXECUTE parameters | Fixed prepared/portal buffers plus statement memory; maximum-width wire fixture |

@@ -129,10 +129,18 @@ fn describe_items_with_output_aliases<'q>(
         fn index_def<'a>(
             &self,
             oid: i32,
-            column: usize,
+            column: i32,
+            pretty: bool,
             arena: &'a crate::mem::arena::Arena,
         ) -> Result<Option<&'a str>, SqlError> {
-            super::super::catalog::index_def_text(self.storage, self.txid, oid, column, arena)
+            super::super::catalog::index_def_text(
+                self.storage,
+                self.txid,
+                oid,
+                column,
+                pretty,
+                arena,
+            )
         }
         fn constraint_def<'a>(
             &self,

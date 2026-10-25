@@ -106,6 +106,8 @@ mod snapshot_reclamation;
 mod transaction_admission;
 use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
+pub(crate) mod column_attributes;
+pub(crate) mod constraint_names;
 mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
@@ -745,6 +747,10 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    PgNodeTree {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Geometry {
         kind: crate::sql::types::GeometryKind,
         len: u8,
@@ -946,6 +952,10 @@ impl OwnedDatum {
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot store a pseudo-type value in a column"
                 ));
+            }
+            Datum::PgNodeTree(node) => {
+                let (len, bytes) = Self::bytes(node.as_str().as_bytes(), "pg_node_tree")?;
+                Self::PgNodeTree { len, bytes }
             }
             Datum::Int2Vector { raw, lower_bound } => {
                 let (len, bytes) = Self::bytes(raw, "int2vector")?;
@@ -1175,6 +1185,12 @@ impl OwnedDatum {
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
             ),
+            Self::PgNodeTree { len, bytes } => Datum::PgNodeTree(
+                crate::sql::catalog_node::CatalogNode::from_encoded(
+                    core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+                )
+                .expect("owned catalog node was validated before storage"),
+            ),
             Self::Geometry { kind, len, bytes } => Datum::Geometry {
                 kind: *kind,
                 text: core::str::from_utf8(&bytes[..*len as usize])
@@ -1339,7 +1355,7 @@ impl OwnedDatum {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnMeta {
     pub name: SqlName,
     pub ctype: ColType,
@@ -1710,15 +1726,41 @@ impl ConstraintValidation {
     }
 }
 
-/// A multi-column UNIQUE or PRIMARY KEY constraint. Single-column PK/UNIQUE
-/// declared inline on a column stays on that column's flags; this covers the
-/// multi-column table-level form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UniqueKeyKind {
+    UniqueNullsDistinct = 0,
+    Primary = 1,
+    UniqueNullsNotDistinct = 2,
+}
+
+impl UniqueKeyKind {
+    pub const fn is_primary(self) -> bool {
+        matches!(self, Self::Primary)
+    }
+    pub const fn nulls_not_distinct(self) -> bool {
+        matches!(self, Self::UniqueNullsNotDistinct)
+    }
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::UniqueNullsDistinct),
+            1 => Some(Self::Primary),
+            2 => Some(Self::UniqueNullsNotDistinct),
+            _ => None,
+        }
+    }
+}
+
+/// Named, multi-column, deferred or NULLS NOT DISTINCT key constraint.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
-    pub is_primary: bool,
+    pub kind: UniqueKeyKind,
     pub timing: ConstraintTiming,
 }
 
@@ -1727,7 +1769,7 @@ impl UniqueKey {
         name: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
-        is_primary: false,
+        kind: UniqueKeyKind::UniqueNullsDistinct,
         timing: ConstraintTiming::NotDeferrable,
     };
 
@@ -1871,6 +1913,8 @@ pub struct TableDef {
     pub tablespace: u16,
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
+    pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
+    pub(crate) attributes: column_attributes::ColumnAttributes,
     pub uniques: [UniqueKey; MAX_UNIQUES],
     pub n_uniques: usize,
     pub checks: [CheckConstraint; MAX_CHECKS],
@@ -2264,6 +2308,16 @@ pub(crate) const MAX_PARTITION_KEYS: usize = 32;
 pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
 impl TableDef {
+    pub(crate) fn attribute_number(&self, column: usize) -> u16 {
+        self.attributes
+            .number(column)
+            .expect("admitted table column has a stable attribute number")
+    }
+
+    pub(crate) fn attribute_column(&self, number: u16) -> Option<usize> {
+        self.attributes.column(number)
+    }
+
     /// A table with a name and no columns or constraints, for spread-init of
     /// the constraint arrays at construction sites.
     pub const fn empty() -> Self {
@@ -2278,6 +2332,8 @@ impl TableDef {
             tablespace: 0,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
+            not_null_names: [None; MAX_COLUMNS],
+            attributes: column_attributes::ColumnAttributes::EMPTY,
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
             checks: [CheckConstraint::EMPTY; MAX_CHECKS],
@@ -4238,8 +4294,9 @@ pub struct StoredQueryDependency {
     pub class: DependencyClass,
     pub slot: u16,
     pub identity: StoredDependencyIdentity,
-    /// One bit per referenced attribute (PostgreSQL attribute numbers start
-    /// at one, so bit zero represents attnum 1). Relation-only dependencies
+    /// One bit per referenced live column in the selected row schema.
+    /// Catalog output maps these positions to retained attribute numbers.
+    /// Relation-only dependencies
     /// retain zero; this avoids treating an unknown column set as every
     /// column when reconstructing catalog dependencies.
     pub referenced_columns: ColumnSet,
@@ -9498,6 +9555,7 @@ pub struct DomainDef {
     /// before the domain's own constraints.
     pub base_type_mod: i32,
     pub not_null: bool,
+    pub not_null_name: Option<SqlName>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -9531,6 +9589,7 @@ impl DomainDef {
         base: ColType::Bool,
         base_type_mod: -1,
         not_null: false,
+        not_null_name: None,
         default_expr: None,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
@@ -9559,6 +9618,7 @@ impl DomainDef {
                 base: pending.spec.base,
                 base_type_mod: pending.spec.base_type_mod,
                 not_null: pending.spec.not_null,
+                not_null_name: pending.spec.not_null_name,
                 default_expr: pending.spec.default_expr,
                 checks: pending.spec.checks,
                 n_checks: pending.spec.n_checks,
@@ -9577,6 +9637,7 @@ pub(crate) struct DomainSpec {
     pub base: ColType,
     pub base_type_mod: i32,
     pub not_null: bool,
+    pub not_null_name: Option<SqlName>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -18564,6 +18625,11 @@ impl Storage {
             }
             definition.n_columns = 4;
             definition.has_toast = true;
+            definition
+                .attributes
+                .initialize(definition.n_columns)
+                .expect("internal column attributes fit");
+            constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
             let mut state = table.definition.write();
             let mut identity = state.identity;
             identity.existence = CatalogDdlState::Present;
@@ -29871,14 +29937,14 @@ impl Storage {
         None
     }
 
-    /// The 1-based column number of `column` in the relation at `table_slot`, or
+    /// The retained PostgreSQL column number in the relation at `table_slot`, or
     /// `None` if the relation has no such column.
     pub fn column_number(&self, table_slot: usize, column: &str, txid: u32) -> Option<u32> {
         let def = self.table_def(table_slot, txid);
         def.columns()
             .iter()
             .position(|c| c.name.as_str() == column)
-            .map(|i| i as u32 + 1)
+            .map(|i| u32::from(def.attribute_number(i)))
     }
 
     /// The schema a new relation lands in: the qualifier if it names a
@@ -35056,6 +35122,14 @@ impl Storage {
             Ok(())
         })();
         crate::sql::set_execution_database_oid(prior_database);
+        if result.is_ok() {
+            // Replay installs already journaled definitions through the same
+            // cache builders as DDL. Their index hints still need checkpointing,
+            // but must not turn the first client read into another WAL write.
+            for table in self.tables.iter() {
+                table.statistics.clear_wal();
+            }
+        }
         result
     }
 
@@ -39369,6 +39443,7 @@ impl Storage {
         txid: u32,
         defer_manifest_binding: bool,
     ) -> Result<TypeDdlUndo, SqlError> {
+        constraint_names::domain(name, &mut spec)?;
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
         let created_at = self.catalog_sequence.next()?;
@@ -39410,6 +39485,7 @@ impl Storage {
             base: spec.base,
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
+            not_null_name: spec.not_null_name,
             default_expr: spec.default_expr,
             checks: spec.checks,
             n_checks: spec.n_checks,
@@ -39727,6 +39803,7 @@ impl Storage {
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
         let prior = domain.pending_definition;
+        constraint_names::domain(domain.definition_for(txid).name, &mut spec)?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -39790,6 +39867,7 @@ impl Storage {
                 base: domain.base,
                 base_type_mod: domain.base_type_mod,
                 not_null: domain.not_null,
+                not_null_name: domain.not_null_name,
                 default_expr: domain.default_expr,
                 checks: domain.checks,
                 n_checks: domain.n_checks,
@@ -46146,16 +46224,6 @@ impl Storage {
             .get(slot)
             .copied()
             .filter(|tablespace| tablespace.visible_to(txid))
-    }
-
-    pub(crate) fn tablespace_name(&self, id: u16, txid: u32) -> Option<SqlName> {
-        match id {
-            0 => SqlName::parse("pg_default").ok(),
-            1 => SqlName::parse("pg_global").ok(),
-            _ => self
-                .tablespace_by_id(id, txid)
-                .map(|tablespace| tablespace.name_for(txid)),
-        }
     }
 
     pub(crate) fn tablespace_id(&self, name: &str, txid: u32) -> Option<u16> {
@@ -57145,6 +57213,7 @@ mod tests {
                         base: ColType::Int4,
                         base_type_mod: -1,
                         not_null: false,
+                        not_null_name: None,
                         default_expr: None,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,

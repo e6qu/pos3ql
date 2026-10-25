@@ -43,11 +43,11 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Finish connecting the remaining derived reports, including index, schema,
-  constraint, routine, role and privilege views, to selected base rows. Preserve
-  PostgreSQL's column shapes, joins and current permission checks. The behavior
-  guide identifies the connected table, column, view, rule, sequence and
-  view-dependency reports and their current-lookup boundaries.
+- Finish connecting remaining schema, routine, role and privilege reports to
+  selected base rows, with PostgreSQL's exact joins and current access checks.
+  The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
+  owns the connected table, column, index, constraint, view, rule, sequence and
+  dependency reports, including stable column numbers and expression inputs.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

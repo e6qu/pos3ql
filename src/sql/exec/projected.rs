@@ -148,6 +148,7 @@ pub(crate) fn projected_row_width(bytes: &[u8]) -> usize {
 pub fn projected_value_len(v: &Datum) -> usize {
     1 + match v {
         Datum::Null | Datum::PgDdlCommand => 0,
+        Datum::PgNodeTree(node) => 4 + node.as_str().len(),
         Datum::Bool(_) => 1,
         Datum::Char(_) => 1,
         Datum::Int2(_) => 2,
@@ -243,6 +244,13 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         Datum::PgDdlCommand => {
             out[0] = 36;
             1
+        }
+        Datum::PgNodeTree(node) => {
+            let encoded = node.as_str().as_bytes();
+            out[0] = 50;
+            out[1..5].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out[5..5 + encoded.len()].copy_from_slice(encoded);
+            5 + encoded.len()
         }
         Datum::Bool(b) => {
             out[0] = 1;
@@ -643,6 +651,14 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
     match tag {
         0 => (Datum::Null, 0),
         36 => (Datum::PgDdlCommand, 0),
+        50 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let encoded = core::str::from_utf8(&bytes[at + 4..at + 4 + len])
+                .expect("projected catalog node was encoded from valid UTF-8");
+            let node = crate::sql::catalog_node::CatalogNode::from_encoded(encoded)
+                .expect("projected catalog node was validated before decoding");
+            (Datum::PgNodeTree(node), 4 + len)
+        }
         1 => (Datum::Bool(bytes[at] != 0), 1),
         40 => (Datum::Char(bytes[at]), 1),
         2 => (

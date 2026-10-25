@@ -26,6 +26,63 @@ const PRIVILEGE_NAMES: &[&str] = &[
     "MAINTAIN",
 ];
 
+/// PostgreSQL's closed one-byte object-class protocol for `acldefault`.
+#[derive(Clone, Copy)]
+pub(crate) enum DefaultObject {
+    Column,
+    Database,
+    ForeignDataWrapper,
+    ForeignServer,
+    Function,
+    Language,
+    LargeObject,
+    Parameter,
+    Relation,
+    Schema,
+    Sequence,
+    Tablespace,
+    Type,
+}
+
+impl DefaultObject {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value.as_bytes() {
+            b"c" => Self::Column,
+            b"d" => Self::Database,
+            b"F" => Self::ForeignDataWrapper,
+            b"S" => Self::ForeignServer,
+            b"f" => Self::Function,
+            b"l" => Self::Language,
+            b"L" => Self::LargeObject,
+            b"p" => Self::Parameter,
+            b"r" => Self::Relation,
+            b"n" => Self::Schema,
+            b"s" => Self::Sequence,
+            b"t" => Self::Tablespace,
+            b"T" => Self::Type,
+            _ => return None,
+        })
+    }
+
+    /// Owner privileges followed by PUBLIC privileges. PostgreSQL orders the
+    /// PUBLIC aclitem first when both exist.
+    fn privileges(self) -> (Option<&'static str>, Option<&'static str>) {
+        match self {
+            Self::Column => (None, None),
+            Self::Database => (Some("CTc"), Some("Tc")),
+            Self::ForeignDataWrapper | Self::ForeignServer => (Some("U"), None),
+            Self::Function => (Some("X"), Some("X")),
+            Self::Language | Self::Type => (Some("U"), Some("U")),
+            Self::LargeObject => (Some("rw"), None),
+            Self::Parameter => (Some("sA"), None),
+            Self::Relation => (Some("arwdDxtm"), None),
+            Self::Schema => (Some("UC"), None),
+            Self::Sequence => (Some("rwU"), None),
+            Self::Tablespace => (Some("C"), None),
+        }
+    }
+}
+
 enum RenderedRole<'a> {
     Public,
     Name(&'a str),
@@ -40,6 +97,33 @@ impl core::fmt::Display for RenderedRole<'_> {
             Self::Missing(oid) => oid.fmt(f),
         }
     }
+}
+
+pub(crate) fn default_acl<'a>(
+    object: DefaultObject,
+    owner_oid: u32,
+    catalog: &dyn crate::sql::eval::CatalogAccess,
+    arena: &'a Arena,
+) -> Result<crate::sql::types::Datum<'a>, SqlError> {
+    use crate::sql::types::{ArrElem, Datum};
+    let owner = match catalog.role_name(owner_oid as i32, arena)? {
+        Some(name) => RenderedRole::Name(name),
+        None => RenderedRole::Missing(owner_oid),
+    };
+    let (owner_privileges, public_privileges) = object.privileges();
+    let mut values = [Datum::Null; 2];
+    let mut count = 0;
+    if let Some(privileges) = public_privileges {
+        let source = crate::stack_format!(256, "={}/{}", privileges, owner);
+        values[count] = Datum::AclItem(with_identity(0, owner_oid, source.as_str(), arena)?);
+        count += 1;
+    }
+    if let Some(privileges) = owner_privileges {
+        let source = crate::stack_format!(256, "{}={}/{}", owner, privileges, owner);
+        values[count] = Datum::AclItem(with_identity(owner_oid, owner_oid, source.as_str(), arena)?);
+        count += 1;
+    }
+    Ok(Datum::Array { element: ArrElem::AclItem, raw: crate::sql::array::build(&values[..count], arena)? })
 }
 
 fn write_item(

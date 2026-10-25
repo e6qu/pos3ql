@@ -3659,18 +3659,35 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         };
         let oid = match schema {
             PrivilegeObject::Oid(oid) => oid,
-            PrivilegeObject::Name(name) => super::catalog::schema_oid_by_written(self.storage, self.txid, name)
-                .ok_or_else(|| sql_err!(sqlstate::INVALID_SCHEMA_NAME, "schema \"{}\" does not exist", name))?,
+            PrivilegeObject::Name(name) => {
+                super::catalog::schema_oid_by_written(self.storage, self.txid, name).ok_or_else(
+                    || {
+                        sql_err!(
+                            sqlstate::INVALID_SCHEMA_NAME,
+                            "schema \"{}\" does not exist",
+                            name
+                        )
+                    },
+                )?
+            }
         };
         let Some(schema) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
-        if matches!(schema.as_str(), "pg_catalog" | "information_schema" | "pg_toast") {
+        if matches!(
+            schema.as_str(),
+            "pg_catalog" | "information_schema" | "pg_toast"
+        ) {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
             let public = schema.as_str() != "pg_toast";
-            return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::SCHEMA_ALL,
+            return privilege_query(
+                privileges,
+                PrivilegeSet::NONE,
+                PrivilegeSet::SCHEMA_ALL,
                 |privilege| owner || (public && privilege == PrivilegeSet::USAGE),
-                |_| owner).map(Some);
+                |_| owner,
+            )
+            .map(Some);
         }
         let Some(slot) = self.storage.find_schema_visible(schema.as_str(), self.txid) else {
             return Ok(None);
@@ -3908,13 +3925,27 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         };
         let oid = match function {
             PrivilegeObject::Oid(oid) => oid,
-            PrivilegeObject::Name(name) => super::catalog::routine_oid_by_name(self.storage, self.txid, name, true)?
-                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_FUNCTION, "function \"{}\" does not exist", name))?,
+            PrivilegeObject::Name(name) => {
+                super::catalog::routine_oid_by_name(self.storage, self.txid, name, true)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function \"{}\" does not exist",
+                            name
+                        )
+                    })?
+            }
         };
         if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
-            return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::FUNCTION_ALL,
-                |_| owner || public, |_| owner).map(Some);
+            return privilege_query(
+                privileges,
+                PrivilegeSet::NONE,
+                PrivilegeSet::FUNCTION_ALL,
+                |_| owner || public,
+                |_| owner,
+            )
+            .map(Some);
         }
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Ok(None);

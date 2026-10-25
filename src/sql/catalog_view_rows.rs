@@ -130,10 +130,15 @@ pub(super) fn integers<'a>(value: Datum<'a>, arena: &'a Arena) -> Result<&'a [i3
         Datum::OidVector { raw, .. } => {
             let (values, remainder) = raw.as_chunks::<4>();
             if !remainder.is_empty() {
-                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "catalog OID vector has incomplete bytes"));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog OID vector has incomplete bytes"
+                ));
             }
-            arena.alloc_slice_with(values.len(), |index| i32::from_le_bytes(values[index]))
-                .map(|values| &*values).map_err(|_| arena_full())
+            arena
+                .alloc_slice_with(values.len(), |index| i32::from_le_bytes(values[index]))
+                .map(|values| &*values)
+                .map_err(|_| arena_full())
         }
         Datum::Int2Vector { raw, .. } => {
             let (values, remainder) = raw.as_chunks::<2>();

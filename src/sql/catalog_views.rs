@@ -390,16 +390,21 @@ pub(super) fn groups<'a>(
     })?;
     let mut output = Output::new(arena);
     for values in roles.rows {
-        let account = CatalogRow { definition: roles.def, values };
+        let account = CatalogRow {
+            definition: roles.def,
+            values,
+        };
         if boolean(account.get("rolcanlogin")?)? {
             continue;
         }
         let key = (account.integer("oid")? as u32, 0);
         let count = membership.matching(key).count();
         let mut matching = membership.matching(key);
-        let members = arena.alloc_slice_with(count, |_| {
-            matching.next().expect("counted selected membership")[member]
-        }).map_err(|_| arena_full())?;
+        let members = arena
+            .alloc_slice_with(count, |_| {
+                matching.next().expect("counted selected membership")[member]
+            })
+            .map_err(|_| arena_full())?;
         output.push(&[
             account.get("rolname")?,
             account.get("oid")?,
@@ -436,7 +441,10 @@ pub(super) fn accounts<'a>(
     let password = text("********", arena)?;
     let mut output = Output::new(arena);
     for values in roles.rows {
-        let account = CatalogRow { definition: roles.def, values };
+        let account = CatalogRow {
+            definition: roles.def,
+            values,
+        };
         if !account.boolean("rolcanlogin")? {
             continue;
         }
@@ -461,7 +469,13 @@ pub(super) fn accounts<'a>(
             ])?;
         }
     }
-    output.finish(match view { AccountView::Users => "pg_user", AccountView::Shadow => "pg_shadow" }, false)
+    output.finish(
+        match view {
+            AccountView::Users => "pg_user",
+            AccountView::Shadow => "pg_shadow",
+        },
+        false,
+    )
 }
 
 #[derive(Clone, Copy)]

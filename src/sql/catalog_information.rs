@@ -95,7 +95,12 @@ pub(super) fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) 
     if storage.role(actor).attributes_to(transaction).superuser {
         return true;
     }
-    let owner = if owner == super::PG_DATABASE_OWNER_OID {
+    role_slot(storage, transaction, owner)
+        .is_some_and(|owner| storage.role_is_enabled(owner as u16, transaction))
+}
+
+pub(super) fn role_slot(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
+    if oid == super::PG_DATABASE_OWNER_OID {
         let database = storage.current_database_name(transaction);
         storage
             .resolve_access_object(
@@ -106,9 +111,8 @@ pub(super) fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) 
             )
             .map(|object| storage.object_owner(object, transaction))
     } else {
-        storage.role_slot_by_oid(owner, transaction)
-    };
-    owner.is_some_and(|owner| storage.role_is_enabled(owner as u16, transaction))
+        storage.role_slot_by_oid(oid, transaction)
+    }
 }
 
 pub(super) fn schemata<'a>(

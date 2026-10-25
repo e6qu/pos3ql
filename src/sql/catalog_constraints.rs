@@ -6,7 +6,7 @@ use super::view_rows::{CatalogRow, Index, NamespaceJoin, Output, boolean, intege
 use super::views::{Base, Read, columns};
 use super::{Arena, Datum, SqlError, Storage, SynthTable, text};
 use crate::sql::eval::{
-    CatalogAccess, PrivilegeColumn, PrivilegeRelation, PrivilegeType, sqlstate,
+    CatalogAccess, PrivilegeColumn, PrivilegeRelation, PrivilegeObject, sqlstate,
 };
 use crate::sql_err;
 
@@ -631,7 +631,7 @@ pub(super) fn domains<'a>(
             if !owner_is_enabled(storage, transaction, ty.integer("typowner")?)
                 && catalog.has_type_privilege(
                     None,
-                    PrivilegeType::Oid(ty.integer("oid")?),
+                    PrivilegeObject::Oid(ty.integer("oid")?),
                     "USAGE",
                 )? != Some(true)
             {

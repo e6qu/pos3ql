@@ -45,6 +45,9 @@ Complete these remaining cases:
 
 - Finish connecting remaining schema, routine, role and privilege reports to
   selected base rows, with PostgreSQL's exact joins and current access checks.
+  Include account settings and group members, schema ownership and visibility,
+  routine signatures, and grants made through PUBLIC or inherited roles. Compare
+  complete result columns and SQL types as well as row values.
   The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
   owns the connected table, column, index, constraint, view, rule, sequence and
   dependency reports, including stable column numbers and expression inputs.

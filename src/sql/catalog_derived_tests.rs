@@ -1,5 +1,93 @@
 use super::*;
 
+#[test]
+fn catalog_snapshot_account_reports_join_selected_roles_memberships_and_settings() {
+    let report = "
+        SELECT usename,usecreatedb,useconfig,passwd FROM pg_user
+          WHERE usename LIKE 'snapshot_account_%' ORDER BY usename;
+        SELECT usename,usecreatedb,useconfig,passwd IS NULL FROM pg_shadow
+          WHERE usename LIKE 'snapshot_account_%' ORDER BY usename;
+        SELECT groname,array_length(grolist,1) FROM pg_group
+          WHERE groname='snapshot_group';
+    ";
+    let old = ["snapshot_account_before|f|{search_path=public}|********",
+        "snapshot_account_before|f|{search_path=public}|t", "snapshot_group|1"];
+    let new = ["snapshot_account_after|t|{search_path=pg_catalog}|********",
+        "snapshot_account_after|t|{search_path=pg_catalog}|t", "snapshot_group|2"];
+    for isolation in ["REPEATABLE READ", "READ COMMITTED"] {
+        let config = test_config("snapshot-account-reports");
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "
+            CREATE ROLE snapshot_group;
+            CREATE ROLE snapshot_account_before LOGIN;
+            CREATE ROLE snapshot_member;
+            GRANT snapshot_group TO snapshot_account_before;
+            ALTER ROLE snapshot_account_before SET search_path=public;
+        ", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)), old);
+        writer.success(&mut engine, "
+            ALTER ROLE snapshot_account_before RENAME TO snapshot_account_after;
+            ALTER ROLE snapshot_account_after CREATEDB;
+            ALTER ROLE snapshot_account_after SET search_path=pg_catalog;
+            GRANT snapshot_group TO snapshot_member;
+        ", true);
+        let selected = reader.success(&mut engine, report, true);
+        assert_eq!(data_rows(&selected), if isolation == "REPEATABLE READ" { old } else { new }, "{isolation}: {}", String::from_utf8_lossy(&selected));
+        reader.success(&mut engine, "COMMIT", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), new);
+        writer.success(&mut engine, "BEGIN; SAVEPOINT account_change; ALTER ROLE snapshot_account_after NOLOGIN; REVOKE snapshot_group FROM snapshot_member", true);
+        assert_eq!(data_rows(&writer.success(&mut engine, report, true)), ["snapshot_group|1"]);
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), new);
+        writer.success(&mut engine, "ROLLBACK TO account_change", true);
+        assert_eq!(data_rows(&writer.success(&mut engine, report, true)), new);
+        writer.success(&mut engine, "ROLLBACK; SET ROLE snapshot_member", true);
+        assert_eq!(error_sqlstates(&writer.execute(&mut engine, "SELECT * FROM pg_shadow", true)), ["42501"]);
+        let public = writer.success(&mut engine, "SELECT passwd FROM pg_user WHERE usename='snapshot_account_after'", true);
+        assert_eq!(data_rows(&public), ["********"]);
+    }
+}
+
+#[test]
+fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions() {
+    let report = "SELECT schema_name,schema_owner,pg_typeof(catalog_name)::text,pg_typeof(sql_path)::text
+        FROM information_schema.schemata WHERE schema_name LIKE 'snapshot_space_%' ORDER BY schema_name";
+    let config = test_config("snapshot-schema-reports");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(&mut engine, "
+        CREATE ROLE snapshot_schema_reader;
+        CREATE ROLE snapshot_schema_owner;
+        CREATE SCHEMA snapshot_space_visible AUTHORIZATION snapshot_schema_owner;
+        CREATE SCHEMA snapshot_space_hidden;
+        GRANT USAGE ON SCHEMA snapshot_space_visible TO snapshot_schema_reader;
+        CREATE TABLE snapshot_permission_refresh(id integer);
+        GRANT SELECT ON snapshot_permission_refresh TO snapshot_schema_reader;
+    ", true);
+    reader.success(&mut engine, "SET ROLE snapshot_schema_reader; BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["snapshot_space_visible|snapshot_schema_owner|name|character varying"]);
+    writer.success(&mut engine, "ALTER ROLE snapshot_schema_owner RENAME TO snapshot_schema_owner_after; GRANT CREATE ON SCHEMA snapshot_space_hidden TO snapshot_schema_reader", true);
+    reader.success(&mut engine, "LOCK TABLE snapshot_permission_refresh IN ACCESS SHARE MODE", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [
+        "snapshot_space_hidden|postgres|name|character varying",
+        "snapshot_space_visible|snapshot_schema_owner|name|character varying",
+    ]);
+    writer.success(&mut engine, "REVOKE USAGE ON SCHEMA snapshot_space_visible FROM snapshot_schema_reader", true);
+    reader.success(&mut engine, "LOCK TABLE snapshot_permission_refresh IN ACCESS SHARE MODE", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["snapshot_space_hidden|postgres|name|character varying"]);
+    reader.success(&mut engine, "COMMIT; RESET ROLE", true);
+    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [
+        "snapshot_space_hidden|postgres|name|character varying",
+        "snapshot_space_visible|snapshot_schema_owner_after|name|character varying",
+    ]);
+}
+
 const SETUP: &str = "
     CREATE TABLE derived_source(id integer, payload text);
     CREATE VIEW derived_view AS SELECT id, payload FROM derived_source WITH LOCAL CHECK OPTION;

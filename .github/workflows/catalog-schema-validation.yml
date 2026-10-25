@@ -1,0 +1,70 @@
+name: Catalog schema validation
+
+on:
+  push:
+    branches: [catalog-schema-routine-snapshots]
+
+concurrency:
+  group: catalog-schema-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-catalog-schema-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Format on the runner
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/formatting.patch"
+      - name: PostgreSQL namespaces and report schemas
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+        run: |
+          psql -X -v ON_ERROR_STOP=1 -P pager=off > "$RUNNER_TEMP/postgresql-report-schema.txt" <<'SQL'
+          SELECT version();
+          SELECT oid,nspname,nspowner,nspacl FROM pg_namespace ORDER BY nspname;
+          SELECT n.nspname,c.relname,a.attnum,a.attname,format_type(a.atttypid,NULL)
+            FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+            JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname='information_schema' AND c.relname IN ('schemata','routines','parameters','routine_privileges')
+             AND a.attnum>0 AND NOT a.attisdropped ORDER BY c.relname,a.attnum;
+          SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;
+          CREATE ROLE namespace_reader;
+          SET ROLE namespace_reader;
+          SELECT nspname,has_schema_privilege(oid,'USAGE'),has_schema_privilege(oid,'CREATE')
+            FROM pg_namespace ORDER BY nspname;
+          SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;
+          SQL
+      - name: Native catalog and schema regressions
+        run: |
+          cargo test --lib --locked -- catalog_snapshot_ schema_rename_ --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/catalog-tests.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: catalog-schema-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/formatting.patch
+            ${{ runner.temp }}/postgresql-report-schema.txt
+            ${{ runner.temp }}/catalog-tests.log

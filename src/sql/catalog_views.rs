@@ -30,6 +30,7 @@ pub(super) enum Base {
     Trigger,
     Constraint,
     Index,
+    RoleMembers,
 }
 
 pub(super) fn indexes<'a>(
@@ -133,6 +134,7 @@ impl Read {
             Base::Trigger => "pg_trigger",
             Base::Constraint => "pg_constraint",
             Base::Index => "pg_index",
+            Base::RoleMembers => "pg_auth_members",
         };
         match self {
             Self::Statement => super::synthesize(
@@ -154,7 +156,7 @@ impl Read {
         }
     }
 
-    fn authid_for_view<'a>(
+    pub(super) fn authid_for_view<'a>(
         self,
         storage: &Storage,
         transaction: u32,
@@ -367,6 +369,95 @@ pub(super) fn roles<'a>(
         }
     }
     finish(schema::require("pg_roles", false), output, arena)
+}
+
+pub(super) fn groups<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::{CatalogRow, boolean};
+    let roles = read.authid_for_view(storage, transaction, arena)?;
+    let membership = read.base(storage, Base::RoleMembers, transaction, arena)?;
+    let [role, member] = columns(&membership, ["roleid", "member"]);
+    let membership = Index::new(membership, arena, |values| {
+        Ok(Some((integer(values[role])? as u32, 0)))
+    })?;
+    let mut output = Output::new(arena);
+    for values in roles.rows {
+        let account = CatalogRow { definition: roles.def, values };
+        if boolean(account.get("rolcanlogin")?)? {
+            continue;
+        }
+        let key = (account.integer("oid")? as u32, 0);
+        let count = membership.matching(key).count();
+        let mut matching = membership.matching(key);
+        let members = arena.alloc_slice_with(count, |_| {
+            matching.next().expect("counted selected membership")[member]
+        }).map_err(|_| arena_full())?;
+        output.push(&[
+            account.get("rolname")?,
+            account.get("oid")?,
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Oid,
+                raw: crate::sql::array::build(members, arena)?,
+            },
+        ])?;
+    }
+    output.finish("pg_group", false)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AccountView {
+    Users,
+    Shadow,
+}
+
+pub(super) fn accounts<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    view: AccountView,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::CatalogRow;
+    if matches!(view, AccountView::Shadow) {
+        super::require_authid_read(storage, transaction)?;
+    }
+    let roles = read.authid_for_view(storage, transaction, arena)?;
+    let settings = read.base(storage, Base::RoleSettings, transaction, arena)?;
+    let [setting_role, setting_database, setting_config] =
+        columns(&settings, ["setrole", "setdatabase", "setconfig"]);
+    let password = text("********", arena)?;
+    let mut output = Output::new(arena);
+    for values in roles.rows {
+        let account = CatalogRow { definition: roles.def, values };
+        if !account.boolean("rolcanlogin")? {
+            continue;
+        }
+        let oid = account.integer("oid")?;
+        for setting in left_rows(settings.rows, move |values| {
+            integer(values[setting_role]).expect("built-in setting role OID") == oid
+                && integer(values[setting_database]).expect("built-in database OID") == 0
+        }) {
+            output.push(&[
+                account.get("rolname")?,
+                account.get("oid")?,
+                account.get("rolcreatedb")?,
+                account.get("rolsuper")?,
+                account.get("rolreplication")?,
+                account.get("rolbypassrls")?,
+                match view {
+                    AccountView::Users => password,
+                    AccountView::Shadow => account.get("rolpassword")?,
+                },
+                account.get("rolvaliduntil")?,
+                setting.map_or(Datum::Null, |values| values[setting_config]),
+            ])?;
+        }
+    }
+    output.finish(match view { AccountView::Users => "pg_user", AccountView::Shadow => "pg_shadow" }, false)
 }
 
 #[derive(Clone, Copy)]

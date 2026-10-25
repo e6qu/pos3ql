@@ -111,6 +111,45 @@ pub(super) fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) 
     owner.is_some_and(|owner| storage.role_is_enabled(owner as u16, transaction))
 }
 
+pub(super) fn schemata<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let namespaces = read.base(storage, Base::Namespace, transaction, arena)?;
+    let roles = Index::oid(read.authid_for_view(storage, transaction, arena)?, arena)?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let database = storage.current_database_name(transaction);
+    let database = text(database.as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for values in namespaces.rows {
+        let namespace = CatalogRow { definition: namespaces.def, values };
+        let owner = namespace.integer("nspowner")?;
+        let visible = owner_is_enabled(storage, transaction, owner)
+            || match catalog.schema_name(namespace.integer("oid")?, arena)? {
+                Some(name) => catalog.has_schema_privilege(None, name, "CREATE, USAGE")? == Some(true),
+                None => false,
+            };
+        if !visible {
+            continue;
+        }
+        for values in roles.matching((owner as u32, 0)) {
+            let role = CatalogRow { definition: roles.table.def, values };
+            output.push(&[
+                database,
+                namespace.get("nspname")?,
+                role.get("rolname")?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+            ])?;
+        }
+    }
+    output.finish("schemata", true)
+}
+
 fn relation_is_updatable(
     storage: &Storage,
     transaction: u32,

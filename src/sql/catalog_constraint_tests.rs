@@ -61,6 +61,18 @@ NULL',0)",
     assert_eq!(data_rows(&session.success(&mut engine,
         "ALTER TABLE node_source RENAME COLUMN a TO amount;
          SELECT pg_get_expr(expression,relation,false) FROM saved_nodes", true)), ["(amount > 0)"]);
+    let arena = Arena::new(&mut budget, "node parameter input", 1 << 20).unwrap();
+    for bytes in [b"not a node".as_slice(), crate::sql::catalog_node::CatalogNode::NULL.as_str().as_bytes()] {
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(engine.decode_binary_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                .unwrap_err().sqlstate, "0A000");
+            assert_eq!(engine.decode_text_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                .unwrap_err().sqlstate, "0A000");
+        });
+    }
+    session.success(&mut engine, "CREATE FUNCTION node_query() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END", true);
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "SELECT pg_get_expr(prosqlbody,0) FROM pg_proc WHERE proname='node_query'", true)), ["22023"]);
 }
 
 #[test]
@@ -549,9 +561,12 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             } else {
                 "saved_nulls"
             };
-            assert_eq!(data_rows(&session.success(&mut cold,
-                &format!("SELECT objsubid,description FROM pg_description WHERE objoid='{table}'::regclass ORDER BY objsubid"), true)),
-                if commit { vec!["2|retained comment"] } else { vec!["1|removed comment", "2|retained comment"] });
+            // SQL sorting uploads temporary objects to the growing simulator
+            // fixture. Keep the guarded recovery read free of fixture writes.
+            let mut comments = data_rows(&session.success(&mut cold,
+                &format!("SELECT objsubid,description FROM pg_description WHERE objoid='{table}'::regclass"), true));
+            comments.sort();
+            assert_eq!(comments, if commit { vec!["2|retained comment"] } else { vec!["1|removed comment", "2|retained comment"] });
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT pg_typeof(expression),pg_get_expr(expression,relation,false) FROM saved_nodes", true)),
                 ["pg_node_tree|(a > 0)"]);

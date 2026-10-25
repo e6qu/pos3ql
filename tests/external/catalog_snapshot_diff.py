@@ -103,6 +103,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         record(writer, f"{prefix}.constraint.index_columns", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,false),pg_get_indexdef('report_expression_diff'::regclass,2,false),pg_get_indexdef('report_expression_diff'::regclass,3,false)")
         record(writer, f"{prefix}.constraint.index_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,0,true),pg_get_indexdef('report_expression_diff'::regclass,1,true),pg_get_indexdef('report_expression_diff'::regclass,2,true)")
         writer.execute("CREATE SEQUENCE report_argument_diff")
+        writer.execute("CREATE FUNCTION report_node_query_diff() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END")
         writer.execute("BEGIN")
         try:
             for name, query in (
@@ -113,6 +114,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
                 ("expression_arguments_called", "SELECT last_value,is_called FROM report_argument_diff"),
                 ("expression_missing_relation", "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='report_positive_diff'"),
                 ("expression_invalid_input", "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)"),
+                ("expression_query_body", "SELECT pg_get_expr(prosqlbody,0) FROM pg_proc WHERE proname='report_node_query_diff'"),
                 ("index_negative_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,-1,false)"),
                 ("index_minimum_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,'-2147483648'::integer,false)"),
                 ("index_two_arguments", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1)"),
@@ -123,6 +125,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         finally:
             writer.execute("ROLLBACK")
             writer.execute("DROP SEQUENCE report_argument_diff")
+            writer.execute("DROP FUNCTION report_node_query_diff()")
 
         reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
         record(reader, f"{prefix}.constraint.listing.before", "SELECT table_name,constraint_name FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff') ORDER BY table_name,constraint_name")

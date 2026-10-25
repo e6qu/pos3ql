@@ -16141,6 +16141,37 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     definition
 }
 
+pub(crate) fn validate_restored_row(
+    relation: &super::catalog_snapshot::CatalogSnapshotRelation,
+    row: crate::storage::HistoricalCatalogRow<'_>,
+) -> Result<(), SqlError> {
+    let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "invalid restored {} catalog row", relation.name);
+    let specification = schema::definition(relation.name, false).ok_or_else(invalid)?;
+    let visible = || specification.columns.iter()
+        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+        .map(|(_, ctype)| *ctype);
+    let table_oid = specification.relation.map(core::num::NonZeroU32::get);
+    if let Some(image) = row.before {
+        super::catalog_image::validate(image.bytes, visible(), table_oid).ok_or_else(invalid)?;
+    }
+    match relation.key {
+        super::catalog_snapshot::CatalogRowKey::Tuple => {
+            super::catalog_image::validate(row.key, visible(), table_oid).ok_or_else(invalid)?;
+            if row.before.is_some_and(|image| image.bytes != row.key) { return Err(invalid()); }
+        }
+        super::catalog_snapshot::CatalogRowKey::Columns(names) => {
+            let mut columns = [ColType::Text; MAX_COLUMNS];
+            if names.is_empty() || names.len() > columns.len() { return Err(invalid()); }
+            for (target, name) in columns.iter_mut().zip(names) {
+                *target = specification.columns.iter().find(|(candidate, _)| candidate == name)
+                    .map(|(_, ctype)| *ctype).ok_or_else(invalid)?;
+            }
+            super::catalog_image::validate(row.key, columns[..names.len()].iter().copied(), None).ok_or_else(invalid)?;
+        }
+    }
+    Ok(())
+}
+
 /// Allocates `rows` (each a slice already in the arena) as a row slice.
 fn finish<'a>(
     specification: SynthDef<'_>,

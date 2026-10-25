@@ -115,6 +115,11 @@ partition bounds and SQL routine bodies have separate node kinds. PostgreSQL's
 `pg_node_tree` input. Node text is an internal format, not PostgreSQL's tree
 serialization.
 
+Prepared catalog images are validated against their declared columns before
+restoring history or looking up tuple roots. Admission checks tagged field
+types, lengths, array elements, expression framing and the hidden relation
+identifier. Invalid images fail with `22000` before writer promotion.
+
 ## Format details for implementers
 
 The manifest header versions the catalog and root record grammar. Each `dsst`

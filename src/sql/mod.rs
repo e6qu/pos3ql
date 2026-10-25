@@ -6,6 +6,7 @@ pub mod array;
 pub mod ast;
 mod brin_catalog;
 pub mod catalog;
+mod catalog_image;
 pub mod catalog_node;
 mod catalog_metadata;
 mod catalog_snapshot;
@@ -20989,6 +20990,7 @@ fn replay_transaction_batches(
                                     "invalid prepared catalog database scope"
                                 ));
                             }
+                            catalog::validate_restored_row(definition, row)?;
                             let transaction = &mut prepared.slot_mut(slot).transaction;
                             if transaction.catalog_history.is_none() {
                                 transaction.catalog_history = storage.reserve_catalog_history(

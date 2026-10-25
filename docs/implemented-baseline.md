@@ -1133,6 +1133,76 @@ that stale publication to fail with `40001`; it cannot insert an old binding's
 hash into a new cache. These checks do not yet provide the roadmap's
 whole-statement catalog capture or SQL execution on several CPU workers.
 
+### Reading database descriptions while they change
+
+With `transaction_mode = mvcc`, catalog listings retain the rows selected by
+their statement or transaction. A read-committed statement can select newer
+rows; a repeatable-read transaction keeps its earlier listing. `pg_tables`,
+`pg_roles`, `information_schema.tables` and `information_schema.columns` build
+their results from those selected base rows. Remaining derived views are
+tracked in [PLAN.md](../PLAN.md).
+
+**User example:** start a repeatable-read report listing `orders`. Another
+connection renames it to `sales` and commits. The report can still list
+`orders`, while `to_regclass('sales')` resolves the current name. An owner's
+displayed account name can also change after that account is renamed. Listing
+an old definition and resolving an object for use are different operations.
+
+Set `catalog_history_bytes` explicitly before startup; `16MiB` is one example
+for MVCC mode. It reserves space for earlier catalog rows. A full reservation
+returns `54000` before making the change durable. Rollback and savepoints release
+unfinished reservations; old readers retain the committed rows they need.
+Locking mode requires `catalog_history_bytes = 0` and waits for conflicting
+operations instead of retaining these earlier catalog rows.
+
+Catalog object identifiers have type `oid`, and `tableoid` is a hidden system
+column: name it explicitly rather than expecting it in `SELECT *`. Index
+vectors such as `pg_index.indoption` start at zero. For example,
+`indoption[0]` describes the first key; included columns have no option entry.
+
+Renaming a source column preserves a view's existing output names. For example,
+after `CREATE VIEW order_report AS SELECT customer_id FROM orders` and
+`ALTER TABLE orders RENAME customer_id TO account_id`, use
+`SELECT customer_id FROM order_report` as before. The view keeps reading the
+same source column. Rollback restores its earlier definition, and recovery
+retains the committed binding.
+
+Catalog vectors cast to ordinary arrays while keeping zero-based subscripts.
+For example, `('9 10'::oidvector)::oid[]::text` returns `[0:1]={9,10}`.
+The reverse SQL cast, `oid[]::oidvector` (or `smallint[]::int2vector`), fails
+with `42846`, matching PostgreSQL. `oidvector` equality compares its values;
+its ordering compares length before values. See the
+[PostgreSQL 18.6 comparison implementation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/nbtree/nbtcompare.c).
+Binary input must be nonempty, start at zero, and contain no NULL elements.
+Empty vectors still have PostgreSQL's one-dimensional binary
+result header; sending that result back as binary input is rejected by
+[PostgreSQL's receiver](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/oid.c).
+
+### What permission lookups see
+
+`pg_catalog.has_language_privilege('sql', 'USAGE')` has the Boolean result
+type, as do the other supported privilege, visibility and publication checks.
+The type stays Boolean when an argument is NULL, so clients receive type
+identifier `16` in both simple-query and prepared-statement descriptions.
+
+Catalog permission rows retain role identifiers. Renaming a role changes the
+name printed in an older permission list without adding later grants to that
+list. `pg_get_acl`, like PostgreSQL's object lookup, reads current permissions;
+an explicit catalog query still follows its statement snapshot. For example,
+an older repeatable-read query can list a role's SELECT grant while
+`pg_get_acl` also reports a later UPDATE grant for the same object.
+Its accepted object classes, large-object alias and sub-object numbers follow
+[PostgreSQL 18.6's object lookup](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/objectaddress.c).
+For example, a class without an ACL returns NULL, while an unrecognized class
+raises `XX000`; these cases are distinct.
+
+Permission lists keep grant order when storage slots are reused. Removing a
+grant and adding it again puts it at the end. Removing the last grant leaves
+an explicit empty list (`{}`), which survives restart; a later SELECT grant
+adds only that grant. An owner can revoke its own SELECT permission while
+retaining the right to grant SELECT. Concurrent changes to one object's list
+wait for its transaction, while changes to other objects can proceed.
+
 ### How statistics reads and journal batches stay consistent
 
 `ANALYZE` collects estimates used to choose query plans. Relation counts and
@@ -1141,6 +1211,19 @@ column estimates have different PostgreSQL lifetimes: rolling back can leave
 copy the image visible to their transaction under short guards. The private
 version pool, rollback, commit, replay, and table reuse use the same ownership
 order. Readers retain their copied values without holding these guards.
+
+Creating an index also refreshes the table's row estimate using the validation
+scan. `VACUUM` counts resident and saved rows in batches and preserves column
+estimates unless `ANALYZE` was requested. A table's `relhasindex` flag can remain
+true after an index is dropped or its creation is rolled back. `pg_index` lists
+the actual visible indexes; `VACUUM` clears the flag when none remain. The flag
+belongs to the table's lifetime and cannot leak to a replacement table.
+
+**User example:** after `DROP INDEX orders_lookup`, a catalog query can still
+show `relhasindex = true` for `orders`. Running `VACUUM orders` clears it when
+the table has no remaining indexes, and refreshes its row estimate. Restarting
+with empty caches preserves the saved flag and estimate. An unresolved prepared
+`ANALYZE` restores its relation counts while its column estimates remain private.
 
 Journal capture copies the visible estimates and records the exact relation-count
 revision from the same cell. Acknowledgement clears that captured revision's

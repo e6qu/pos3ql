@@ -160,19 +160,11 @@ fn describe_items_with_output_aliases<'q>(
         }
         fn comment<'a>(
             &self,
-            catalog_name: Option<&str>,
+            target: crate::sql::eval::DescriptionTarget<'_>,
             oid: u32,
-            subid: i32,
             arena: &'a crate::mem::arena::Arena,
         ) -> Result<Option<&'a str>, SqlError> {
-            super::super::catalog::comment_text_for(
-                self.storage,
-                self.txid,
-                catalog_name,
-                oid,
-                subid,
-                arena,
-            )
+            super::super::catalog::comment_text_for(self.storage, self.txid, target, oid, arena)
         }
     }
     let describe_catalog = storage.map(|storage| DescribeCatalog { storage, txid });
@@ -747,24 +739,15 @@ impl ColTypeResolver for CatalogCols<'_> {
     }
 
     fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
-        if !self
-            .storage
-            .composite_slot_visible_to(usize::from(slot), self.txid)
-        {
-            return None;
-        }
-        let definition = self.storage.composite_for(usize::from(slot), self.txid);
-        let field = definition
-            .active_fields()
-            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
-        Some(StaticTypeMeta {
-            ctype: field.ctype,
-            type_oid: self
-                .storage
-                .routine_type_oid(field.ctype, field.user_type, self.txid)?,
-            type_mod: field.type_mod,
-            collation: field.collation,
-        })
+        catalog_composite_field(self.storage, self.txid, slot, field)
+    }
+
+    fn visit_composite_fields(
+        &self,
+        slot: u16,
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Option<usize> {
+        visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
     }
 
     fn named_composite_field(
@@ -1400,8 +1383,8 @@ pub trait ColTypeResolver {
         self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
     }
 
-    fn validate_explicit_cast(&self, _source_oid: i32, _target: ColType) -> Result<(), SqlError> {
-        Ok(())
+    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+        super::super::eval::validate_catalog_reference_cast(source_oid, target)
     }
 
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
@@ -1505,7 +1488,21 @@ pub trait ColTypeResolver {
     /// One field of a named composite already resolved to its catalog slot.
     /// Catalog-free resolvers may still use the statement-scoped shape copy.
     fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
-        composite_slot_field_metadata(slot, field)
+        let mut found = None;
+        self.visit_composite_fields(slot, &mut |name, metadata| {
+            if name.eq_ignore_ascii_case(field) {
+                found = Some(metadata);
+            }
+        });
+        found
+    }
+
+    fn visit_composite_fields(
+        &self,
+        slot: u16,
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Option<usize> {
+        visit_registered_composite_fields(slot, visit)
     }
 
     /// One durable named-composite field, copied out of the bounded catalog.
@@ -1784,35 +1781,70 @@ pub fn register_named_composite_shape(
     })
 }
 
-fn visit_composite_slot_shape_metadata(
+fn composite_field_metadata(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    field: &crate::storage::CompositeFieldDef,
+) -> Option<StaticTypeMeta> {
+    Some(StaticTypeMeta {
+        ctype: field.ctype,
+        type_oid: storage.routine_type_oid(field.ctype, field.user_type, txid)?,
+        type_mod: field.type_mod,
+        collation: field.collation,
+    })
+}
+
+pub(crate) fn catalog_composite_field(
+    storage: &crate::storage::Storage,
+    txid: u32,
     slot: u16,
-    mut visit: impl FnMut(&str, StaticTypeMeta),
+    name: &str,
+) -> Option<StaticTypeMeta> {
+    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
+        return None;
+    }
+    let definition = storage.composite_for(usize::from(slot), txid);
+    let field = definition
+        .active_fields()
+        .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
+    composite_field_metadata(storage, txid, field)
+}
+
+pub(crate) fn visit_catalog_composite_fields(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    slot: u16,
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
+    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
+        return None;
+    }
+    let definition = storage.composite_for(usize::from(slot), txid);
+    let mut count = 0;
+    for field in definition.active_fields() {
+        visit(
+            field.name.as_str(),
+            composite_field_metadata(storage, txid, field)?,
+        );
+        count += 1;
+    }
+    Some(count)
+}
+
+fn visit_registered_composite_fields(
+    slot: u16,
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
-        let at = pool.named[..pool.named_n]
+        let shape = pool.named[..pool.named_n]
             .iter()
-            .position(|candidate| candidate.slot == slot)?;
-        let len = pool.named[at].len as usize;
-        for field in &pool.named[at].fields[..len] {
+            .find(|candidate| candidate.slot == slot)?;
+        for field in &shape.fields[..usize::from(shape.len)] {
             visit(field.name.as_str(), field.metadata());
         }
-        Some(len)
-    })
-}
-
-fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMeta> {
-    RECORD_SHAPES.with(|p| {
-        let p = p.borrow();
-        let pool = p.as_ref()?;
-        let at = pool.named[..pool.named_n]
-            .iter()
-            .position(|candidate| candidate.slot == slot)?;
-        pool.named[at].fields[..pool.named[at].len as usize]
-            .iter()
-            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
-            .map(|candidate| candidate.metadata())
+        Some(usize::from(shape.len))
     })
 }
 
@@ -2362,7 +2394,7 @@ fn record_shape_metadata_dyn(
             let ColType::Composite(slot) = columns.resolve(*qualifier, name).ok()? else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         Expr::Field { base, field }
             if matches!(
@@ -2373,7 +2405,7 @@ fn record_shape_metadata_dyn(
             let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
                 unreachable!()
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         Expr::Subscript { base: array, .. } => {
             let element = match &**array {
@@ -2405,7 +2437,7 @@ fn record_shape_metadata_dyn(
             let Some(ColType::Composite(slot)) = element else {
                 return None;
             };
-            visit_composite_slot_shape_metadata(slot, visit)
+            columns.visit_composite_fields(slot, visit)
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
@@ -2568,24 +2600,30 @@ pub fn record_field_metadata(
             qualifier: None,
             name,
         } if columns.is_whole_row(name) => columns.column_meta(Some(name), field),
-        Expr::Column { qualifier, name } => columns
-            .record_column_handle(*qualifier, name)
-            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
-            .or_else(|| match columns.resolve(*qualifier, name).ok()? {
-                ColType::Composite(slot) => columns.composite_field(slot, field),
-                _ => None,
-            }),
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name).ok() {
+            Some(ColType::Composite(slot)) => {
+                // A named type uses the selected catalog definition, including
+                // edits made after statement-local anonymous shapes were built.
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => columns
+                .record_column_handle(*qualifier, name)
+                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+        },
         Expr::Field {
             base: inner,
             field: inner_field,
-        } => expr_record_handle(base, columns)
-            .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
-            .or_else(
-                || match record_field_type(inner, inner_field, columns).ok()? {
-                    ColType::Composite(slot) => columns.composite_field(slot, field),
-                    _ => None,
-                },
-            ),
+        } => match record_field_type(inner, inner_field, columns).ok() {
+            Some(ColType::Composite(slot)) => {
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => expr_record_handle(base, columns)
+                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+        },
         Expr::Cast { type_name, .. } => {
             let mut index = 0usize;
             let mut found = None;
@@ -3639,9 +3677,11 @@ pub fn infer_type_res(
         Expr::Cast {
             operand, type_name, ..
         } => {
-            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+            if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
+                ColType::from_sql_name(type_name)
+            {
                 let source_oid = infer_routine_argument_oid(operand, columns)?;
-                columns.validate_explicit_cast(source_oid, ColType::Int2)?;
+                columns.validate_explicit_cast(source_oid, target)?;
             }
             if let Some(type_oid) = columns.named_type_oid(type_name) {
                 return Ok((
@@ -3929,8 +3969,8 @@ pub fn infer_type_res(
             "ts_lexize" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "get_current_ts_config" => of(ColType::Regconfig),
             // Catalog-introspection helpers (for psql \d).
-            "pg_get_userbyid"
-            | "format_type"
+            "pg_get_userbyid" => of(ColType::Name),
+            "format_type"
             | "pg_get_expr"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
@@ -4010,23 +4050,10 @@ pub fn infer_type_res(
             "pg_event_trigger_table_rewrite_reason" => of(ColType::Int4),
             "pg_extension_config_dump" => (oid::VOID, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
-            "pg_table_is_visible"
-            | "pg_type_is_visible"
-            | "pg_function_is_visible"
-            | "has_table_privilege"
-            | "has_column_privilege"
-            | "has_sequence_privilege"
-            | "has_schema_privilege"
-            | "has_type_privilege"
-            | "has_database_privilege"
-            | "has_foreign_data_wrapper_privilege"
-            | "has_server_privilege"
-            | "has_largeobject_privilege"
-            | "has_parameter_privilege"
-            | "pg_relation_is_publishable"
-            | "pg_input_is_valid"
-            | "booleq"
-            | "boolne" => of(ColType::Bool),
+            name if super::super::eval::funcs::system::catalog_predicate_kind(name).is_some() => {
+                of(ColType::Bool)
+            }
+            "pg_input_is_valid" | "booleq" | "boolne" => of(ColType::Bool),
             "pg_get_replica_identity_index" => of(ColType::Regclass),
             "pg_is_other_temp_schema" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {

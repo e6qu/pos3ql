@@ -55,10 +55,14 @@ impl Shape {
         let mut result = Self::empty();
         let mut count = 1usize;
         for (index, (&dimension, &lower_bound)) in dimensions.iter().zip(lower_bounds).enumerate() {
-            if dimension == 0 {
-                return Ok(Self::empty());
-            }
             let dimension = u16::try_from(dimension).map_err(|_| array_too_large())?;
+            // PostgreSQL requires the exclusive upper bound to fit in int32.
+            if lower_bound.checked_add(i32::from(dimension)).is_none() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "array lower bound is too large: {lower_bound}"
+                ));
+            }
             count = count
                 .checked_mul(usize::from(dimension))
                 .ok_or_else(array_too_large)?;
@@ -67,6 +71,9 @@ impl Shape {
             }
             result.dimensions[index] = dimension;
             result.lower_bounds[index] = lower_bound;
+        }
+        if count == 0 {
+            return Ok(Self::empty());
         }
         result.dimension_count = dimensions.len();
         result.element_count = count;
@@ -875,6 +882,30 @@ mod tests {
         let raw = parse_literal("{\"bé\",\"\\\\x\"}", ArrElem::Text, &arena).unwrap();
         assert_eq!(get(raw, ArrElem::Text, 0), Some(Datum::Text("bé")));
         assert_eq!(get(raw, ArrElem::Text, 1), Some(Datum::Text("\\x")));
+    }
+
+    #[test]
+    fn shape_rejects_overflowing_bounds_before_subscript_evaluation() {
+        assert_eq!(
+            Shape::new(&[1], &[i32::MAX]).unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(
+            Shape::new(&[2], &[i32::MAX - 1]).unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(
+            Shape::new(&[0, 1], &[0, i32::MAX]).unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(
+            Shape::new(&[1], &[i32::MAX - 1]).unwrap().upper_bound(0),
+            Some(i32::MAX - 1)
+        );
+        assert_eq!(
+            Shape::new(&[1], &[i32::MIN]).unwrap().lower_bound(0),
+            Some(i32::MIN)
+        );
     }
 
     #[test]

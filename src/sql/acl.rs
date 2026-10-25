@@ -172,6 +172,39 @@ pub fn materialize<'a>(
     )
 }
 
+/// Stable history bytes retain role OIDs; SQL output refreshes their names.
+pub(crate) fn canonical_identity<'a>(
+    item: AclItem<'_>,
+    arena: &'a Arena,
+) -> Result<AclItem<'a>, SqlError> {
+    let mut text = crate::util::StackStr::<64>::new();
+    write_item(
+        &mut text,
+        if item.grantee() == 0 {
+            RenderedRole::Public
+        } else {
+            RenderedRole::Missing(item.grantee())
+        },
+        RenderedRole::Missing(item.grantor()),
+        item.privileges(),
+        item.grant_options(),
+    )
+    .map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "canonical aclitem exceeds 64 bytes"
+        )
+    })?;
+    build_item(
+        item.grantee(),
+        item.grantor(),
+        item.privileges(),
+        item.grant_options(),
+        text.as_str(),
+        arena,
+    )
+}
+
 fn invalid(value: &str) -> SqlError {
     sql_err!(
         sqlstate::INVALID_TEXT_REPRESENTATION,

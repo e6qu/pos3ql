@@ -7,6 +7,8 @@ pub mod ast;
 mod brin_catalog;
 pub mod catalog;
 mod catalog_metadata;
+mod catalog_snapshot;
+mod catalog_snapshot_keys;
 pub(crate) mod commit;
 pub mod copy;
 pub mod cursor;
@@ -1658,6 +1660,13 @@ fn typmod_change_requires_rewrite(ctype: types::ColType, old: i32, new: i32) -> 
         (_, TypeMod::None) => false,
         (TypeMod::None, _) => true,
         (TypeMod::Length(old), TypeMod::Length(new)) => new < old,
+        (TypeMod::BitLength(old), TypeMod::BitLength(new)) => {
+            let base = match ctype {
+                types::ColType::Array(element) => element.to_coltype(),
+                scalar => scalar,
+            };
+            !matches!(base, types::ColType::Bit { varying: true }) || new < old
+        }
         (
             TypeMod::NumericPS {
                 precision: old_precision,
@@ -5480,6 +5489,26 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        let catalog_publication = if self.commit_progress == CommitProgressMode::Reactor
+            || self.commit_queue.is_some()
+            || matches!(target, txn::CommitTarget::Prepare { .. })
+        {
+            crate::storage::CatalogPublication::MayYield
+        } else {
+            crate::storage::CatalogPublication::Uninterrupted
+        };
+        match catalog_snapshot::capture_transaction(
+            &self.storage,
+            txn,
+            catalog_publication,
+            &self.work,
+        ) {
+            Ok(history) => txn.catalog_history = history,
+            Err(error) => {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
             let transaction_id = txn.txid;
@@ -5732,6 +5761,20 @@ impl Engine {
                 return Err(error);
             }
             if image.persistence == crate::storage::RelationPersistence::Temporary {
+                continue;
+            }
+            if let Err(error) = self.wal.stage_reserved(
+                txn.txid,
+                self.storage.bump_lsn(),
+                &WalOp::SetRelationIndexHint {
+                    position: image.position,
+                    has_index: image.has_index,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            if !image.statistics.valid {
                 continue;
             }
             let lsn = self.storage.bump_lsn();
@@ -6123,6 +6166,10 @@ impl Engine {
                     grantor: grantor_name.as_str(),
                     privileges,
                     grant_options,
+                    order: self
+                        .storage
+                        .object_acl_grant_order(object, grantee, grantor, txn.txid)
+                        .expect("staged object ACL has a grant order"),
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -6193,56 +6240,36 @@ impl Engine {
                 return Err(error);
             }
         }
-        for (position, undo) in txn.ddl().iter().enumerate() {
-            let DdlUndo::ParameterAclChanged { slot, .. } = *undo else {
-                continue;
-            };
-            if txn.ddl()[position + 1..].iter().any(
-                |later| matches!(later, DdlUndo::ParameterAclChanged { slot: later, .. } if *later == slot),
-            ) {
-                continue;
-            }
-            let entry = self.storage.parameter_acl_entry(slot as usize);
-            let (grantee, grantor) = self.storage.parameter_acl_identity(slot as usize, txn.txid);
-            if txn.ddl()[..position].iter().any(|earlier| {
-                let DdlUndo::ParameterAclChanged {
-                    slot: earlier_slot, ..
-                } = *earlier
-                else {
-                    return false;
-                };
-                if earlier_slot == slot {
-                    return false;
-                }
-                let earlier_entry = self.storage.parameter_acl_entry(earlier_slot as usize);
-                earlier_entry.parameter == entry.parameter
-                    && self
+        let parameter_acl_staging = (|| {
+            for (parameter, expected) in self.storage.pending_parameter_acl_rows(txn.txid) {
+                let mark = self.work.mark();
+                let result = (|| {
+                    let image = self
                         .storage
-                        .parameter_acl_identity(earlier_slot as usize, txn.txid)
-                        == (grantee, grantor)
-            }) {
-                continue;
+                        .snapshot_parameter_acl_row(parameter, txn.txid, &self.work)?;
+                    if expected.is_none() && image.is_none() {
+                        return Ok(());
+                    }
+                    let lsn = self.storage.bump_lsn();
+                    self.wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::SetParameterAcl {
+                            parameter: parameter.as_str(),
+                            expected,
+                            image,
+                        },
+                    )
+                })();
+                // stage_reserved copies the complete row into its reserved journal buffer.
+                unsafe { self.work.rewind_to(mark) };
+                result?;
             }
-            let (privileges, grant_options) =
-                self.storage.parameter_acl_state(slot as usize, txn.txid);
-            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| self.storage.role_name(grantee as usize, txn.txid));
-            let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
-            let lsn = self.storage.bump_lsn();
-            if let Err(error) = self.wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::SetParameterAcl {
-                    parameter: entry.parameter.as_str(),
-                    grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
-                    grantor: grantor_name.as_str(),
-                    privileges,
-                    grant_options,
-                },
-            ) {
-                self.rollback_txn(txn, guc);
-                return Err(error);
-            }
+            Ok::<(), SqlError>(())
+        })();
+        if let Err(error) = parameter_acl_staging {
+            self.rollback_txn(txn, guc);
+            return Err(error);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
@@ -6333,10 +6360,35 @@ impl Engine {
                 }
             }
         }
+        if prepared_slot.is_some()
+            && let Some(history) = txn.catalog_history.as_ref()
+        {
+            let staged = history.visit_rows(|relation, row| {
+                let lsn = self.storage.bump_lsn();
+                self.wal
+                    .stage_reserved(txn.txid, lsn, &WalOp::PreparedCatalogRow { relation, row })
+            });
+            if let Err(error) = staged {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
         // Keep the publication object inside its startup-reserved buffer.
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
         let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        let memory_catalog_lsn =
+            if prepared_slot.is_none() && staged_bytes == 0 && txn.catalog_history.is_some() {
+                match self.storage.bump_lsn().resolve() {
+                    Ok(position) => Some(position),
+                    Err(error) => {
+                        self.rollback_txn(txn, guc);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
         // ROLLBACK leaves an empty protocol transaction. Only a durable
         // change needs writer ownership at this final commit boundary.
         if (staged_bytes != 0 || target != txn::CommitTarget::Ordinary)
@@ -6471,20 +6523,22 @@ impl Engine {
             self.prepared_transactions.claim_resolution(slot, txn.txid);
         }
         let journal = prepared_slot.is_some() || staged_bytes != 0;
-        let publication_lsn =
-            if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor {
-                // Position zero denotes an absent deletion marker. Temporary data
-                // needs a real position even before the first durable transaction.
-                let visible = self.storage.visible_lsn();
-                if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
-                    self.storage.observe_lsn(1);
-                    1
-                } else {
-                    visible
-                }
+        let publication_lsn = if let Some(position) = memory_catalog_lsn {
+            commit_lsn.max(position)
+        } else if !journal && self.wal_upload && self.commit_progress == CommitProgressMode::Reactor
+        {
+            // Position zero denotes an absent deletion marker. Temporary data
+            // needs a real position even before the first durable transaction.
+            let visible = self.storage.visible_lsn();
+            if visible == 0 && (!txn.touched().is_empty() || !txn.ddl().is_empty()) {
+                self.storage.observe_lsn(1);
+                1
             } else {
-                commit_lsn
-            };
+                visible
+            }
+        } else {
+            commit_lsn
+        };
         txn.stage_commit(
             publication_lsn,
             target,
@@ -6609,6 +6663,25 @@ impl Engine {
                 self.storage
                     .begin_transaction_installation(txn.txid, staged.lsn)?,
             );
+            if !matches!(staged.target, txn::CommitTarget::Prepare { .. }) {
+                let committed_at = core::num::NonZeroU64::new(staged.lsn);
+                if let Some(history) = txn.catalog_history.take() {
+                    history
+                        .publish(committed_at.expect("catalog history has a publication identity"));
+                }
+                if let txn::CommitTarget::CommitPrepared { slot, .. } = staged.target
+                    && let Some(history) = self
+                        .prepared_transactions
+                        .slot_mut(slot)
+                        .transaction
+                        .catalog_history
+                        .take()
+                {
+                    history.publish(
+                        committed_at.expect("prepared catalog history has a publication identity"),
+                    );
+                }
+            }
             match staged.target {
                 txn::CommitTarget::Prepare { slot, .. } => {
                     txn.take_staged_commit();
@@ -7216,8 +7289,8 @@ impl Engine {
                 DdlUndo::DefaultAclChanged { slot, .. } => {
                     self.storage.commit_default_acl(*slot as usize, txn.txid);
                 }
-                DdlUndo::ParameterAclChanged { slot, .. } => {
-                    self.storage.commit_parameter_acl(*slot as usize, txn.txid);
+                DdlUndo::ParameterAclChanged { .. } => {
+                    self.storage.commit_parameter_acls(txn.txid);
                 }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
@@ -8437,7 +8510,7 @@ impl Engine {
     }
 
     fn record_vacuum_targets(
-        &self,
+        &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
         elapsed_micros: u64,
@@ -8447,6 +8520,10 @@ impl Engine {
                 if self.storage.table_slot_visible_to(slot, txid)
                     && self.storage.relation_visible_to_current_session(slot, txid)
                 {
+                    self.work.reset();
+                    self.storage
+                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
             }
@@ -8461,6 +8538,10 @@ impl Engine {
                         || (target.inheritance == ast::RelationInheritance::Descendants
                             && self.storage.relation_descends_from(slot, root, txid)))
                 {
+                    self.work.reset();
+                    self.storage
+                        .refresh_relation_counts(slot, txid, &self.work)?;
+                    self.storage.vacuum_relation_index_hint(slot)?;
                     self.storage.record_relation_vacuum(slot, elapsed_micros);
                 }
             }
@@ -20153,7 +20234,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.restore_object_owner(object, prior);
         }
         DdlUndo::ObjectAclChanged { slot, prior } => {
-            storage.restore_acl_pending(slot as usize, prior);
+            storage
+                .restore_acl_pending(slot as usize, prior)
+                .expect("transaction owns its object ACL undo");
         }
         DdlUndo::ColumnAclChanged { slot, prior } => {
             storage.restore_column_acl_pending(slot as usize, prior);
@@ -20161,8 +20244,10 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         DdlUndo::DefaultAclChanged { slot, prior } => {
             storage.restore_default_acl_pending(slot as usize, prior);
         }
-        DdlUndo::ParameterAclChanged { slot, prior } => {
-            storage.restore_parameter_acl_pending(slot as usize, prior);
+        DdlUndo::ParameterAclChanged { prior } => {
+            storage
+                .restore_parameter_acl_pending(prior)
+                .expect("transaction owns its parameter ACL undo");
         }
         DdlUndo::CommentSet { slot, prior } => {
             storage.restore_comment_pending(slot as usize, prior);
@@ -20409,7 +20494,7 @@ fn replay_transaction_batches(
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
                     prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
                 }
-                for (_, raw) in &batch[..batch.len() - 1] {
+                for (record_lsn, raw) in &batch[..batch.len() - 1] {
                     match crate::wal::decode_record(raw).ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
@@ -20769,6 +20854,129 @@ fn replay_transaction_batches(
                                     undo,
                                     crate::storage::CatalogDdlDecision::Rollback,
                                 );
+                                return Err(error);
+                            }
+                        }
+                        WalOp::SetRelationIndexHint {
+                            position,
+                            has_index,
+                        } => {
+                            if *record_lsn > apply_floor {
+                                storage.replay_relation_index_hint(
+                                    position,
+                                    has_index,
+                                    transaction_id,
+                                )?;
+                            }
+                        }
+                        WalOp::Analyze {
+                            schema,
+                            table,
+                            statistics,
+                        } => {
+                            if *record_lsn > apply_floor {
+                                let table_slot = storage
+                                    .find_visible(schema, table, transaction_id)
+                                    .ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_TABLE,
+                                            "prepared ANALYZE references an unknown table"
+                                        )
+                                    })?;
+                                storage.write_relation_counts(
+                                    table_slot,
+                                    statistics.materialize()?,
+                                    false,
+                                )?;
+                            }
+                        }
+                        WalOp::PreparedCatalogRow { relation, row } => {
+                            let definition = catalog_snapshot_keys::RELATIONS
+                                .iter()
+                                .find(|definition| definition.oid == relation.relation)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "unknown prepared catalog relation"
+                                    )
+                                })?;
+                            if relation.database.is_none() != definition.shared
+                                || relation
+                                    .database
+                                    .is_some_and(|database| database != metadata.database)
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "invalid prepared catalog database scope"
+                                ));
+                            }
+                            let transaction = &mut prepared.slot_mut(slot).transaction;
+                            if transaction.catalog_history.is_none() {
+                                transaction.catalog_history = storage.reserve_catalog_history(
+                                    transaction_id,
+                                    crate::storage::CatalogPublication::MayYield,
+                                )?;
+                            }
+                            if let Some(history) = transaction.catalog_history.as_mut() {
+                                let mut before = row.before;
+                                if let Some(image) = &mut before
+                                    && image.root.is_some()
+                                {
+                                    if !matches!(
+                                        definition.name,
+                                        "pg_description" | "pg_shdescription"
+                                    ) {
+                                        return Err(sql_err!(
+                                            sqlstate::INTERNAL_ERROR,
+                                            "prepared catalog tuple identity belongs to an unsupported relation"
+                                        ));
+                                    }
+                                    // Cache identities are local to this startup. Retained
+                                    // clients do not survive restart; match the restored row.
+                                    image.root =
+                                        Some(
+                                            catalog::catalog_row_state(
+                                                storage,
+                                                0,
+                                                definition.name,
+                                                row.key,
+                                            )?
+                                            .root
+                                            .ok_or_else(|| {
+                                                sql_err!(
+                                                    sqlstate::INTERNAL_ERROR,
+                                                    "prepared catalog tuple has no committed source"
+                                                )
+                                            })?,
+                                        );
+                                }
+                                history.record(relation, row.key, before)?;
+                            }
+                        }
+                        WalOp::SetParameterAcl {
+                            parameter,
+                            expected,
+                            image,
+                        } => {
+                            let parameter =
+                                ast::ParameterName::parse(parameter).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "invalid prepared parameter ACL name"
+                                    )
+                                })?;
+                            let prior = storage.reserve_prepared_parameter_acl(
+                                parameter,
+                                expected,
+                                image,
+                                transaction_id,
+                            )?;
+                            if let Err(error) = prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_ddl(DdlUndo::ParameterAclChanged { prior })
+                            {
+                                storage.restore_parameter_acl_pending(prior)?;
                                 return Err(error);
                             }
                         }
@@ -21138,6 +21346,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::Commit { .. }
         | WalOp::PrepareTransaction { .. }
         | WalOp::PreparedLocks { .. }
+        | WalOp::PreparedCatalogRow { .. }
         | WalOp::CommitPrepared { .. }
         | WalOp::RollbackPrepared { .. } => {}
         WalOp::Truncate { .. } | WalOp::LogicalMessage { .. } => {}
@@ -21611,6 +21820,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 });
             };
             storage.replay_table_serial_value(index, column as usize, last, 0)?;
+        }
+        WalOp::SetRelationIndexHint {
+            position,
+            has_index,
+        } => {
+            storage.replay_relation_index_hint(position, has_index, 0)?;
         }
         WalOp::Analyze {
             schema,
@@ -23450,40 +23665,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::SetParameterAcl {
             parameter,
-            grantee,
-            grantor,
-            privileges,
-            grant_options,
+            expected,
+            image,
         } => {
             let parameter = crate::sql::ast::ParameterName::parse(parameter).ok_or_else(|| {
                 sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL parameter ACL name")
             })?;
-            let grantee = if grantee.eq_ignore_ascii_case("public") {
-                crate::storage::PUBLIC_ROLE
-            } else {
-                storage.find_role(grantee).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "journal configures unknown role \"{}\"",
-                        grantee
-                    )
-                })? as u16
-            };
-            let grantor = storage.find_role(grantor).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "journal configures unknown role \"{}\"",
-                    grantor
-                )
-            })? as u16;
-            storage.change_parameter_acl(
-                parameter,
-                grantee,
-                grantor,
-                privileges,
-                grant_options,
-                0,
-            )?;
+            storage.restore_parameter_acl_row(parameter, expected, image)?;
         }
         WalOp::SetObjectOwner {
             class,
@@ -23542,7 +23730,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                             grantor
                         },
                         0,
-                    );
+                    )?;
                 }
             }
             let column_acl_count = storage.column_acl_entry_count();
@@ -23588,6 +23776,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             grantor,
             privileges,
             grant_options,
+            order,
         } => {
             let class = crate::storage::AccessClass::from_u8(class).ok_or_else(|| {
                 sql_err!(
@@ -23642,7 +23831,17 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             };
             let grantor = grantor_slot as u16;
-            storage.change_acl(object, grantee, grantor, privileges, grant_options, 0)?;
+            storage.change_acl(
+                object,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+                crate::storage::ObjectAclWrite::Exact {
+                    transaction: 0,
+                    order,
+                },
+            )?;
         }
         WalOp::SetColumnAcl {
             class,

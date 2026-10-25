@@ -1471,8 +1471,16 @@ fn subquery_exists<'a>(
         }
         return Ok(true);
     };
-    let scope =
-        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, hooks.sequences, outer)?;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        select.where_clause,
+        txid,
+        arena,
+        params,
+        hooks.sequences,
+        outer,
+    )?;
     let mut found = false;
     let pax_columns = match select.where_clause {
         Some(predicate) => pax_column_demand(&scope, from, &[predicate]),
@@ -2148,8 +2156,14 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
             element,
             raw: crate::sql::array::EMPTY,
         },
-        ColType::Int2Vector => Datum::Int2Vector(&[]),
-        ColType::OidVector => Datum::OidVector(&[]),
+        ColType::Int2Vector => Datum::Int2Vector {
+            lower_bound: 0,
+            raw: &[],
+        },
+        ColType::OidVector => Datum::OidVector {
+            lower_bound: 0,
+            raw: &[],
+        },
         ColType::Float4 => Datum::Float4(0.0),
         ColType::Float8 => Datum::Float8(0.0),
         ColType::Date => Datum::Date(0),
@@ -2703,8 +2717,16 @@ fn run_subquery<'a>(
             subquery_witness_with_outer(storage, txid, item, None, outer)?,
         ));
     };
-    let scope =
-        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, hooks.sequences, outer)?;
+    let scope = QueryScope::resolve_exec_outer(
+        storage,
+        from,
+        select.where_clause,
+        txid,
+        arena,
+        params,
+        hooks.sequences,
+        outer,
+    )?;
 
     // `SELECT *` is a single-column subquery only if the source is exactly one
     // column; expand it to that column so the row-value path below applies.

@@ -2512,9 +2512,9 @@ impl ColType {
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
-            "timestamp" => Self::Timestamp,
-            "timestamptz" => Self::Timestamptz,
-            "time" => Self::Time,
+            "timestamp" | "timestamp without time zone" => Self::Timestamp,
+            "timestamptz" | "timestamp with time zone" => Self::Timestamptz,
+            "time" | "time without time zone" => Self::Time,
             "timetz" | "time with time zone" => Self::Timetz,
             "interval" => Self::Interval,
             "json" => Self::Json,
@@ -3003,7 +3003,7 @@ impl ColType {
             Self::Jsonpath => "jsonpath",
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
-            Self::Array(_) => "array",
+            Self::Array(element) => element.array_name(),
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
             Self::Numeric => "numeric",
@@ -3531,7 +3531,7 @@ impl ArrElem {
             ArrElem::AclItem => "aclitem[]",
             ArrElem::Numeric => "numeric[]",
             ArrElem::Date => "date[]",
-            ArrElem::Timestamp => "timestamp[]",
+            ArrElem::Timestamp => "timestamp without time zone[]",
             ArrElem::Timestamptz => "timestamp with time zone[]",
             ArrElem::Int2 => "smallint[]",
             ArrElem::Float4 => "real[]",
@@ -4307,8 +4307,10 @@ impl IntervalRange {
 pub enum TypeMod {
     /// No modifier: `-1` on the wire, or a value meaningless for the type.
     None,
-    /// `varchar(n)` / `char(n)` / `bit(n)`: a length in characters or bits.
+    /// `varchar(n)` / `char(n)`: a character count with a four-byte header.
     Length(usize),
+    /// `bit(n)` / `varbit(n)`: a bit count without a header.
+    BitLength(usize),
     /// `numeric(p, s)`.
     NumericPS { precision: u16, scale: u16 },
     /// `timestamp(p)` / `timestamptz(p)` / `time(p)` / `timetz(p)`:
@@ -4340,13 +4342,14 @@ impl TypeMod {
         }
         match ctype {
             ColType::Array(element) => Self::decode(element.to_coltype(), atttypmod),
-            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Bit { .. } => {
+            ColType::Text | ColType::Varchar | ColType::Bpchar => {
                 if atttypmod >= 4 {
                     TypeMod::Length((atttypmod - 4) as usize)
                 } else {
                     TypeMod::None
                 }
             }
+            ColType::Bit { .. } => TypeMod::BitLength(atttypmod as usize),
             ColType::Numeric => {
                 if atttypmod >= 4 {
                     let packed = atttypmod - 4;
@@ -4388,6 +4391,7 @@ impl TypeMod {
         match *self {
             TypeMod::None => -1,
             TypeMod::Length(n) => n as i32 + 4,
+            TypeMod::BitLength(n) => n as i32,
             TypeMod::NumericPS { precision, scale } => {
                 (((precision as i32) << 16) | (scale as i32)) + 4
             }
@@ -4720,9 +4724,15 @@ pub enum Datum<'a> {
         raw: &'a [u8],
     },
     /// The fixed-width integer vector used by PostgreSQL system catalogs.
-    Int2Vector(&'a [u8]),
+    Int2Vector {
+        raw: &'a [u8],
+        lower_bound: i32,
+    },
     /// The fixed-width OID vector used by PostgreSQL system catalogs.
-    OidVector(&'a [u8]),
+    OidVector {
+        raw: &'a [u8],
+        lower_bound: i32,
+    },
     Uuid([u8; 16]),
     Bytea(&'a [u8]),
     Numeric(Numeric<'a>),
@@ -4844,8 +4854,8 @@ impl<'a> Datum<'a> {
             Datum::TsVector(_) => oid::TSVECTOR,
             Datum::TsQuery(_) => oid::TSQUERY,
             Datum::Array { element, .. } => element.array_oid(),
-            Datum::Int2Vector(_) => oid::INT2VECTOR,
-            Datum::OidVector(_) => oid::OIDVECTOR,
+            Datum::Int2Vector { .. } => oid::INT2VECTOR,
+            Datum::OidVector { .. } => oid::OIDVECTOR,
             Datum::Uuid(_) => oid::UUID,
             Datum::Bytea(_) => oid::BYTEA,
             Datum::Numeric(_) => oid::NUMERIC,
@@ -5095,7 +5105,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Bit { bits, .. } => f.write_str(bits),
             Datum::Multirange { text, .. } => f.write_str(text),
             Datum::Array { element, raw } => super::array::write(f, *element, raw),
-            Datum::Int2Vector(raw) => {
+            Datum::Int2Vector { raw, .. } => {
                 for (index, bytes) in raw.as_chunks::<2>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;
@@ -5105,7 +5115,7 @@ impl fmt::Display for Datum<'_> {
                 }
                 Ok(())
             }
-            Datum::OidVector(raw) => {
+            Datum::OidVector { raw, .. } => {
                 for (index, bytes) in raw.as_chunks::<4>().0.iter().enumerate() {
                     if index > 0 {
                         f.write_str(" ")?;
@@ -5358,6 +5368,8 @@ mod tests {
         // The values PostgreSQL 18.4 stores in pg_attribute, byte for byte.
         assert_eq!(TypeMod::Length(5).encode(), 9); // varchar(5)
         assert_eq!(TypeMod::Length(3).encode(), 7); // char(3)
+        assert_eq!(TypeMod::BitLength(6).encode(), 6);
+        assert_eq!(TypeMod::BitLength(8).encode(), 8);
         assert_eq!(
             TypeMod::NumericPS {
                 precision: 6,
@@ -5392,7 +5404,8 @@ mod tests {
         let cases: &[(ColType, TypeMod)] = &[
             (ColType::Varchar, TypeMod::Length(5)),
             (ColType::Bpchar, TypeMod::Length(3)),
-            (ColType::Bit { varying: false }, TypeMod::Length(8)),
+            (ColType::Bit { varying: false }, TypeMod::BitLength(8)),
+            (ColType::Bit { varying: true }, TypeMod::BitLength(8)),
             (
                 ColType::Numeric,
                 TypeMod::NumericPS {

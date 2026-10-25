@@ -24,6 +24,68 @@ use super::{
     table_func_rows_outer,
 };
 
+fn catalog_scan(
+    table: &TableRef<'_>,
+    predicate: Option<&Expr<'_>>,
+    unqualified: bool,
+) -> crate::sql::catalog_snapshot::CatalogScan {
+    use crate::sql::catalog_snapshot::{CatalogRowKey, CatalogScan};
+    fn constrained(expression: &Expr<'_>, column: &str, table: &str, unqualified: bool) -> bool {
+        match expression {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+            } => {
+                constrained(left, column, table, unqualified)
+                    || constrained(right, column, table, unqualified)
+            }
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let matches = |key: &Expr<'_>, value: &Expr<'_>| {
+                    let Expr::Column { qualifier, name } = key else {
+                        return false;
+                    };
+                    if *name != column || !qualifier.map_or(unqualified, |name| name == table) {
+                        return false;
+                    }
+                    let mut references = false;
+                    value.for_each_column_reference(&mut |_, _| references = true);
+                    !references
+                };
+                matches(left, right) || matches(right, left)
+            }
+            _ => false,
+        }
+    }
+    let Some(relation) = crate::sql::catalog_snapshot_keys::RELATIONS
+        .iter()
+        .find(|relation| relation.name == table.table)
+    else {
+        return CatalogScan::Sequential;
+    };
+    let CatalogRowKey::Columns(columns) = relation.key else {
+        return CatalogScan::Sequential;
+    };
+    if predicate.is_some_and(|predicate| {
+        columns.iter().all(|column| {
+            constrained(
+                predicate,
+                column,
+                table.alias.unwrap_or(table.table),
+                unqualified,
+            )
+        })
+    }) {
+        CatalogScan::Index
+    } else {
+        CatalogScan::Sequential
+    }
+}
+
 fn validate_table_sample<'a>(
     storage: &Storage,
     table: &TableRef<'a>,
@@ -458,20 +520,28 @@ impl<'d> QueryScope<'d> {
     pub fn resolve_exec<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
+        predicate: Option<&'a Expr<'a>>,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
         sequences: Option<&dyn SequenceAccess>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        Self::resolve_exec_outer(storage, from, txid, arena, params, sequences, None)
+        Self::resolve_exec_outer(
+            storage, from, predicate, txid, arena, params, sequences, None,
+        )
     }
 
     /// Execution scope with an enclosing row available while FROM items are
     /// resolved. Correlated subqueries need this for a base table function
     /// such as `unnest(outer.array)`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "scope construction carries explicit query restrictions and execution context"
+    )]
     pub fn resolve_exec_outer<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
+        predicate: Option<&'a Expr<'a>>,
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
@@ -479,9 +549,27 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
-        scope.add_exec(storage, &from.base, txid, arena, params, sequences, outer)?;
+        scope.add_exec(
+            storage,
+            &from.base,
+            txid,
+            arena,
+            params,
+            sequences,
+            outer,
+            catalog_scan(&from.base, predicate, from.joins.is_empty()),
+        )?;
         for j in from.joins {
-            scope.add_exec(storage, &j.table, txid, arena, params, sequences, outer)?;
+            scope.add_exec(
+                storage,
+                &j.table,
+                txid,
+                arena,
+                params,
+                sequences,
+                outer,
+                catalog_scan(&j.table, predicate, false),
+            )?;
         }
         scope.build_merges(from, arena, Some(arena))?;
         Ok(scope)
@@ -575,6 +663,7 @@ impl<'d> QueryScope<'d> {
         params: &[Datum<'a>],
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
+        catalog_scan: crate::sql::catalog_snapshot::CatalogScan,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -608,7 +697,7 @@ impl<'d> QueryScope<'d> {
                 storage.resolve_relation(tref.schema, tref.table, txid),
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
-                return self.add_catalog(storage, tref, txid, arena, true);
+                return self.add_catalog(storage, tref, txid, arena, true, catalog_scan);
             }
             if let Some(slot) = storage.sequence_on_path(tref.schema, tref.table, txid) {
                 return self.add_sequence(storage, tref, slot, txid, arena, true);
@@ -805,7 +894,14 @@ impl<'d> QueryScope<'d> {
                 storage.resolve_relation(tref.schema, tref.table, txid),
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
-                return self.add_catalog(storage, tref, txid, arena, false);
+                return self.add_catalog(
+                    storage,
+                    tref,
+                    txid,
+                    arena,
+                    false,
+                    crate::sql::catalog_snapshot::CatalogScan::Sequential,
+                );
             }
             if let Some(slot) = storage.sequence_on_path(tref.schema, tref.table, txid) {
                 return self.add_sequence(storage, tref, slot, txid, arena, false);
@@ -855,12 +951,13 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         materialize: bool,
+        scan: crate::sql::catalog_snapshot::CatalogScan,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
     {
         let synth = if materialize {
-            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?
+            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, scan, arena)?
         } else {
             crate::sql::catalog::synthesize_definition(tref.schema, tref.table, arena)?
         };

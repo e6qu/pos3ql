@@ -1,23 +1,17 @@
 # Blocked defects
 
-Only defects blocked by an external condition or a genuinely intractable repair
-belong here. Fix every other defect, including CI regressions, in the PR that
-finds it. Keep repaired defects and their evidence in the implementing PR.
-Planned work and acceptance checks belong in [PLAN.md](PLAN.md).
+No known defects are blocked by an external dependency or an intractable problem.
 
-No defects currently meet this boundary. Repair reproducible admission,
-publication, cancellation and recovery failures in the change that finds them.
+Fix reproducible defects in the PR that finds them, including incidental
+failures, invalid catalog identities, timeouts, rollback and recovery errors.
+Record a defect here only
+when an external blocker or genuine intractability prevents its repair.
+Each entry needs a reproducer, affected behavior, observed result and exact
+blocker. Remove repaired entries and retain their evidence in the fixing PR.
 
-Implemented guarantees belong in the [current behavior guide](docs/implemented-baseline.md)
-and [storage format guide](docs/durable-format.md). Keep regression evidence in
-the implementing PR.
-
-Each entry must include a reproducer, affected boundary, observed behavior and
-exact blocker. Publication, rollback and recovery defects follow the same rule.
-Fault tests must restart a terminally failed instance before checking recovery;
-they must reject partial transactions.
-Remove repaired entries; preserve their evidence in the implementing
-change instead of keeping a resolved-work journal.
+Unfinished features and acceptance criteria belong in [PLAN.md](PLAN.md).
+Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
+and [storage format guide](docs/durable-format.md).
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

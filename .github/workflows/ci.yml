@@ -88,6 +88,8 @@ jobs:
             type_publication_workspace_exact_startup_budget
             bound_type_origin_never_reuses_an_exhausted_identifier
             storage::catalog_sources::tests
+            storage::catalog_history::tests
+            sql::catalog_snapshot::tests
             transaction_admission_does_not_wait_for_existing_queries_to_finish
             lock_wait_handoff_
             mem::mutex::tests
@@ -206,6 +208,12 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Catalog rename regression diagnostics
+        run: >-
+          cargo test --lib --locked
+          sql::tests::catalog_snapshot_view_columns_survive_table_column_rename
+          -- --exact --nocapture
 
       - name: Integration guards
         run: cargo test --locked --test no_noops --test sqlstate_gate

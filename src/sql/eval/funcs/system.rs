@@ -69,6 +69,10 @@ impl ObjectOid {
         match value {
             Datum::Null => Ok(None),
             Datum::Oid(oid) => Ok(Some(Self(oid))),
+            Datum::Int2(oid) => u32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
                 .map(Self)
                 .map(Some)
@@ -782,6 +786,46 @@ fn describe_catalog_object(
         .map_err(|_| arena_full())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogPredicateKind {
+    Privilege,
+    Object,
+}
+
+/// Execution and result descriptions share these accepted Boolean families.
+pub(crate) fn catalog_predicate_kind(name: &str) -> Option<CatalogPredicateKind> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    match name {
+        "has_table_privilege"
+        | "has_column_privilege"
+        | "has_any_column_privilege"
+        | "has_sequence_privilege"
+        | "has_schema_privilege"
+        | "has_type_privilege"
+        | "has_language_privilege"
+        | "has_function_privilege"
+        | "has_database_privilege"
+        | "has_tablespace_privilege"
+        | "has_foreign_data_wrapper_privilege"
+        | "has_server_privilege"
+        | "has_largeobject_privilege"
+        | "has_parameter_privilege" => Some(CatalogPredicateKind::Privilege),
+        "pg_table_is_visible"
+        | "pg_type_is_visible"
+        | "pg_function_is_visible"
+        | "pg_collation_is_visible"
+        | "pg_operator_is_visible"
+        | "pg_opclass_is_visible"
+        | "pg_opfamily_is_visible"
+        | "pg_conversion_is_visible"
+        | "pg_statistics_obj_is_visible"
+        | "pg_ts_dict_is_visible"
+        | "pg_ts_config_is_visible"
+        | "pg_relation_is_publishable" => Some(CatalogPredicateKind::Object),
+        _ => None,
+    }
+}
+
 /// Handles the system/introspection family. Returns `None` if `name` is not one
 /// of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -794,137 +838,114 @@ pub(crate) fn dispatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Option<Result<Datum<'a>, SqlError>> {
-    if !matches!(
-        name,
-        "version"
-            | "pg_backend_pid"
-            | "pg_blocking_pids"
-            | "pg_cancel_backend"
-            | "pg_terminate_backend"
-            | "pg_listening_channels"
-            | "pg_notification_queue_usage"
-            | "pg_advisory_lock"
-            | "pg_advisory_lock_shared"
-            | "pg_try_advisory_lock"
-            | "pg_try_advisory_lock_shared"
-            | "pg_advisory_unlock"
-            | "pg_advisory_unlock_shared"
-            | "pg_advisory_unlock_all"
-            | "pg_advisory_xact_lock"
-            | "pg_advisory_xact_lock_shared"
-            | "pg_try_advisory_xact_lock"
-            | "pg_try_advisory_xact_lock_shared"
-            | "pg_is_in_recovery"
-            | "pg_reload_conf"
-            | "pg_event_trigger_table_rewrite_oid"
-            | "pg_event_trigger_table_rewrite_reason"
-            | "pg_extension_config_dump"
-            | "pg_input_is_valid"
-            | "current_database"
-            | "current_catalog"
-            | "current_schema"
-            | "current_schemas"
-            | "current_user"
-            | "current_role"
-            | "session_user"
-            | "user"
-            | "pg_get_userbyid"
-            | "pg_partition_ancestors"
-            | "pg_partition_root"
-            | "pg_partition_tree"
-            | "pg_table_is_visible"
-            | "pg_type_is_visible"
-            | "pg_function_is_visible"
-            | "pg_collation_is_visible"
-            | "pg_operator_is_visible"
-            | "pg_opclass_is_visible"
-            | "pg_opfamily_is_visible"
-            | "pg_conversion_is_visible"
-            | "pg_statistics_obj_is_visible"
-            | "pg_ts_dict_is_visible"
-            | "pg_ts_config_is_visible"
-            | "pg_identify_object"
-            | "pg_identify_object_as_address"
-            | "pg_get_object_address"
-            | "pg_describe_object"
-            | "pg_get_serial_sequence"
-            | "has_table_privilege"
-            | "has_column_privilege"
-            | "has_any_column_privilege"
-            | "has_sequence_privilege"
-            | "has_schema_privilege"
-            | "has_type_privilege"
-            | "has_language_privilege"
-            | "has_function_privilege"
-            | "has_database_privilege"
-            | "has_tablespace_privilege"
-            | "has_foreign_data_wrapper_privilege"
-            | "has_server_privilege"
-            | "has_largeobject_privilege"
-            | "has_parameter_privilege"
-            | "pg_relation_is_publishable"
-            | "pg_get_replica_identity_index"
-            | "pg_my_temp_schema"
-            | "pg_is_other_temp_schema"
-            | "pg_get_indexdef"
-            | "brin_summarize_new_values"
-            | "brin_summarize_range"
-            | "brin_desummarize_range"
-            | "pg_get_constraintdef"
-            | "pg_get_partkeydef"
-            | "pg_get_functiondef"
-            | "pg_get_triggerdef"
-            | "pg_get_function_arguments"
-            | "pg_get_function_identity_arguments"
-            | "pg_get_function_result"
-            | "pg_get_function_sqlbody"
-            | "pg_get_expr"
-            | "pg_get_viewdef"
-            | "pg_get_ruledef"
-            | "pg_table_size"
-            | "pg_database_size"
-            | "pg_tablespace_location"
-            | "pg_tablespace_size"
-            | "col_description"
-            | "obj_description"
-            | "shobj_description"
-            | "pg_get_statisticsobjdef"
-            | "pg_get_statisticsobjdef_expressions"
-            | "pg_get_statisticsobjdef_columns"
-            | "format_type"
-            | "to_regclass"
-            | "to_regproc"
-            | "to_regprocedure"
-            | "to_regoper"
-            | "to_regoperator"
-            | "to_regtype"
-            | "to_regnamespace"
-            | "to_regrole"
-            | "to_regcollation"
-            | "to_regtypemod"
-            | "pg_encoding_to_char"
-            | "pg_char_to_encoding"
-            | "getdatabaseencoding"
-            | "pg_current_xact_id"
-            | "pg_current_xact_id_if_assigned"
-            | "txid_current"
-            | "txid_current_if_assigned"
-            | "pg_current_snapshot"
-            | "txid_current_snapshot"
-            | "pg_snapshot_xmin"
-            | "pg_snapshot_xmax"
-            | "txid_snapshot_xmin"
-            | "txid_snapshot_xmax"
-            | "pg_visible_in_snapshot"
-            | "txid_visible_in_snapshot"
-            | "pg_xact_status"
-            | "txid_status"
-            | "pg_typeof"
-            | "current_setting"
-            | "set_config"
-            | "acldefault"
-            | "pg_get_acl"
-    ) {
+    let predicate = catalog_predicate_kind(name);
+    if predicate.is_none()
+        && !matches!(
+            name,
+            "version"
+                | "pg_backend_pid"
+                | "pg_blocking_pids"
+                | "pg_cancel_backend"
+                | "pg_terminate_backend"
+                | "pg_listening_channels"
+                | "pg_notification_queue_usage"
+                | "pg_advisory_lock"
+                | "pg_advisory_lock_shared"
+                | "pg_try_advisory_lock"
+                | "pg_try_advisory_lock_shared"
+                | "pg_advisory_unlock"
+                | "pg_advisory_unlock_shared"
+                | "pg_advisory_unlock_all"
+                | "pg_advisory_xact_lock"
+                | "pg_advisory_xact_lock_shared"
+                | "pg_try_advisory_xact_lock"
+                | "pg_try_advisory_xact_lock_shared"
+                | "pg_is_in_recovery"
+                | "pg_reload_conf"
+                | "pg_event_trigger_table_rewrite_oid"
+                | "pg_event_trigger_table_rewrite_reason"
+                | "pg_extension_config_dump"
+                | "pg_input_is_valid"
+                | "current_database"
+                | "current_catalog"
+                | "current_schema"
+                | "current_schemas"
+                | "current_user"
+                | "current_role"
+                | "session_user"
+                | "user"
+                | "pg_get_userbyid"
+                | "pg_partition_ancestors"
+                | "pg_partition_root"
+                | "pg_partition_tree"
+                | "pg_identify_object"
+                | "pg_identify_object_as_address"
+                | "pg_get_object_address"
+                | "pg_describe_object"
+                | "pg_get_serial_sequence"
+                | "pg_get_replica_identity_index"
+                | "pg_my_temp_schema"
+                | "pg_is_other_temp_schema"
+                | "pg_get_indexdef"
+                | "brin_summarize_new_values"
+                | "brin_summarize_range"
+                | "brin_desummarize_range"
+                | "pg_get_constraintdef"
+                | "pg_get_partkeydef"
+                | "pg_get_functiondef"
+                | "pg_get_triggerdef"
+                | "pg_get_function_arguments"
+                | "pg_get_function_identity_arguments"
+                | "pg_get_function_result"
+                | "pg_get_function_sqlbody"
+                | "pg_get_expr"
+                | "pg_get_viewdef"
+                | "pg_get_ruledef"
+                | "pg_table_size"
+                | "pg_database_size"
+                | "pg_tablespace_location"
+                | "pg_tablespace_size"
+                | "col_description"
+                | "obj_description"
+                | "shobj_description"
+                | "pg_get_statisticsobjdef"
+                | "pg_get_statisticsobjdef_expressions"
+                | "pg_get_statisticsobjdef_columns"
+                | "format_type"
+                | "to_regclass"
+                | "to_regproc"
+                | "to_regprocedure"
+                | "to_regoper"
+                | "to_regoperator"
+                | "to_regtype"
+                | "to_regnamespace"
+                | "to_regrole"
+                | "to_regcollation"
+                | "to_regtypemod"
+                | "pg_encoding_to_char"
+                | "pg_char_to_encoding"
+                | "getdatabaseencoding"
+                | "pg_current_xact_id"
+                | "pg_current_xact_id_if_assigned"
+                | "txid_current"
+                | "txid_current_if_assigned"
+                | "pg_current_snapshot"
+                | "txid_current_snapshot"
+                | "pg_snapshot_xmin"
+                | "pg_snapshot_xmax"
+                | "txid_snapshot_xmin"
+                | "txid_snapshot_xmax"
+                | "pg_visible_in_snapshot"
+                | "txid_visible_in_snapshot"
+                | "pg_xact_status"
+                | "txid_status"
+                | "pg_typeof"
+                | "current_setting"
+                | "set_config"
+                | "acldefault"
+                | "pg_get_acl"
+        )
+    {
         return None;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
@@ -1637,47 +1658,28 @@ pub(crate) fn dispatch<'a>(
                 arity(0)?;
                 Ok(Datum::Text(current_user_str(arena)?))
             }
-            // Catalog helpers for psql introspection. Every user object lives in the
-            // single visible schema owned by the connection role.
             "pg_get_userbyid" => {
                 arity(1)?;
-                let Some(cat) = hooks.catalog else {
-                    return Ok(Datum::Null);
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0 as i32,
+                    None => return Ok(Datum::Null),
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
-                    Some(oid) => oid.0,
-                    None => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "pg_get_userbyid() requires an oid"
-                        ));
-                    }
-                };
-                Ok(cat
-                    .role_name(oid, arena)?
-                    .map(Datum::Text)
-                    .unwrap_or(Datum::Null))
+                let cat = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_get_userbyid requires catalog access"
+                    )
+                })?;
+                Ok(Datum::Text(crate::sql::catalog::user_name_by_oid(
+                    cat, oid, arena,
+                )?))
             }
-            // A non-partitioned table is its own only ancestor/root; we have no
-            // partitioning, so these return the argument unchanged.
             "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
                 arity(1)?;
                 eval_full(args[0], arena, params, row, hooks)
             }
-            "has_table_privilege"
-            | "has_column_privilege"
-            | "has_any_column_privilege"
-            | "has_sequence_privilege"
-            | "has_schema_privilege"
-            | "has_type_privilege"
-            | "has_language_privilege"
-            | "has_function_privilege"
-            | "has_database_privilege"
-            | "has_tablespace_privilege"
-            | "has_foreign_data_wrapper_privilege"
-            | "has_server_privilege"
-            | "has_largeobject_privilege"
-            | "has_parameter_privilege" => {
+            _ if predicate == Some(CatalogPredicateKind::Privilege) => {
+                let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -1793,18 +1795,8 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))
             }
-            "pg_table_is_visible"
-            | "pg_type_is_visible"
-            | "pg_function_is_visible"
-            | "pg_collation_is_visible"
-            | "pg_operator_is_visible"
-            | "pg_opclass_is_visible"
-            | "pg_opfamily_is_visible"
-            | "pg_conversion_is_visible"
-            | "pg_statistics_obj_is_visible"
-            | "pg_ts_dict_is_visible"
-            | "pg_ts_config_is_visible"
-            | "pg_relation_is_publishable" => {
+            _ if predicate == Some(CatalogPredicateKind::Object) => {
+                let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 arity(1)?;
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -2099,14 +2091,15 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     None
                 };
-                if matches!(
-                    catalog_name,
-                    Some("pg_database" | "pg_tablespace" | "pg_authid")
-                ) {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(catalog_name, oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: catalog_name,
+                            column: 0,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2126,7 +2119,14 @@ pub(crate) fn dispatch<'a>(
                     _ => return Ok(Datum::Null),
                 };
                 Ok(cat
-                    .comment(Some("pg_class"), oid, col, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Local {
+                            catalog: Some("pg_class"),
+                            column: col,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2143,11 +2143,14 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(name) => name,
                     _ => return Ok(Datum::Null),
                 };
-                if !matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
-                    return Ok(Datum::Null);
-                }
                 Ok(cat
-                    .comment(Some(catalog_name), oid, 0, arena)?
+                    .comment(
+                        crate::sql::eval::DescriptionTarget::Shared {
+                            catalog: catalog_name,
+                        },
+                        oid,
+                        arena,
+                    )?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2331,7 +2334,9 @@ pub(crate) fn dispatch<'a>(
                 // that modifier, then attach [] as PostgreSQL does.
                 let mut text = match TypeMod::decode(base, type_mod) {
                     TypeMod::None => stack_format!(80, "{}", name),
-                    TypeMod::Length(n) => stack_format!(80, "{}({})", name, n),
+                    TypeMod::Length(n) | TypeMod::BitLength(n) => {
+                        stack_format!(80, "{}({})", name, n)
+                    }
                     TypeMod::NumericPS { precision, scale } => {
                         stack_format!(80, "{}({},{})", name, precision, scale)
                     }
@@ -2683,8 +2688,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::TsVector(_) => "tsvector",
                     Datum::TsQuery(_) => "tsquery",
                     Datum::Array { element, .. } => element.typeof_name(),
-                    Datum::Int2Vector(_) => "int2vector",
-                    Datum::OidVector(_) => "oidvector",
+                    Datum::Int2Vector { .. } => "int2vector",
+                    Datum::OidVector { .. } => "oidvector",
                     Datum::Uuid(_) => "uuid",
                     Datum::Bytea(_) => "bytea",
                     Datum::Numeric(_) => "numeric",

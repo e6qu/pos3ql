@@ -28,21 +28,44 @@ See the [current contract and examples](docs/implemented-baseline.md).
 **Example:** replacing a table must not invalidate a report that already selected
 its rows or definitions. Cleanup should let ordinary queries run between turns.
 
-Extend statement admission to consistent table/type definitions, rows, index
-bindings and comments, including lookups after a query has begun. A report must
-not combine its selected order rows with a replacement table's columns or
-later comments. Connect the guarded table/type publication and retirement paths
-to retained catalog versions before several CPU workers run statements.
-Extend the table-shape checks used by index keys to every later catalog lookup.
-Keep rewrite history cleanup paced during concurrent publication.
-Keep old row, index and backup data until their readers have finished.
-Check reader and backup retention while old files are replaced. Recovery may
-retain exclusive startup access; ordinary publication must let unrelated
-operations progress under their own owners.
-Some metadata capture and maintenance reads still block the worker. Raising
-memory limits is not a completion criterion. The
-[current behavior guide](docs/implemented-baseline.md) owns the implemented
-table, routine, type, account and saved-query guarantees.
+Connect retained catalog rows to every later lookup of table and type
+definitions, columns, index bindings and comments. The [behavior guide](docs/implemented-baseline.md)
+owns the implemented admission, permission, comment, statistics and bound-view
+rename guarantees;
+their regressions remain in the implementing change.
+
+Preserve PostgreSQL's distinction between listing rows and looking up an object
+for use. After another connection renames `orders` to `sales`, an older
+repeatable-read listing can still show `orders`, while `to_regclass('sales')`
+resolves the current name. Permission functions and displayed account names
+also follow their current lookup rules. Freezing every lookup at the report's
+read position would produce the wrong result.
+
+Complete these remaining cases:
+
+- Finish connecting derived system and information-schema views to selected
+  base rows, beyond the views covered in the behavior guide. Preserve
+  PostgreSQL's column shapes, joins and current permission checks. For example,
+  `pg_views` and `information_schema.views` must keep the view names an older
+  report selected.
+- Keep a schema rename private until commit, including names used by its own
+  transaction, rollback, dependent definitions and prepared recovery.
+- Cover private edits after another connection replaced a catalog tuple across
+  all catalog families. Listings and direct lookups can expose different rows;
+  dependency rows also need exact duplicate counts.
+- Give replacement objects fresh SQL object identifiers, independently of reused
+  storage slots. A cached identifier for a dropped table must not name its
+  replacement. Check shared catalogs across databases as well.
+- Keep old row, index and backup data until their readers finish. Pace history
+  pruning, file replacement and deletion without holding unrelated owners.
+- Replace remaining synchronous metadata and maintenance reads with bounded
+  work that yields while waiting for storage. Recovery may retain exclusive
+  startup access; ordinary publication must let unrelated operations progress.
+
+Raising memory limits is not a completion criterion. Preserve rollback,
+savepoints, prepared transactions, exhaustion cleanup and cold recovery as each
+case is connected. Validate restored catalogs and their captured root versions
+before writer promotion; rejected or stale restoration must change no roots.
 
 Done when publication and recovery preserve complete transactions, identity reuse cannot expose
 replacement data to old readers, deletion respects readers and backups, and

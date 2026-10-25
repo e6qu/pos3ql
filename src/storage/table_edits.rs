@@ -851,6 +851,7 @@ mod tests {
                     Some(comment_stackstr("text from seven").unwrap()),
                     7,
                 )
+                .unwrap()
                 .unwrap();
             storage
                 .stage_constraint_comment_rename(

@@ -686,6 +686,7 @@ mod tests {
                 Some(comment_stackstr("retained table comment").unwrap()),
                 7,
             )
+            .unwrap()
             .unwrap();
         storage.commit_comment(comment, 7);
         crate::mem::guard::forbid_alloc(|| {

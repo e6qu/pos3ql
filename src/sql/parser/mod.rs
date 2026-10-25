@@ -255,6 +255,8 @@ pub struct Parser<'a> {
     lexer: Lexer<'a>,
     peeked: Tok<'a>,
     peek_at: usize,
+    previous_token: Option<(Tok<'a>, usize, usize)>,
+    column_sources: Option<core::cell::RefCell<QuerySourceCollector<'a>>>,
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
@@ -289,6 +291,64 @@ pub struct Parser<'a> {
     /// column merely because the caller used the named spelling.
     routine_parameters: [Option<&'a str>; crate::storage::MAX_ROUTINE_ARGUMENTS],
     routine_name: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnSource<'a> {
+    pub name: &'a str,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProjectionSource<'a> {
+    pub name: &'a str,
+    pub start: usize,
+    pub end: usize,
+}
+
+struct QuerySourceCollector<'a> {
+    columns: ArenaList<'a, ColumnSource<'a>>,
+    projections: ArenaList<'a, ProjectionSource<'a>>,
+}
+
+pub(crate) struct QuerySources<'a> {
+    pub columns: &'a [ColumnSource<'a>],
+    pub projections: &'a [ProjectionSource<'a>],
+}
+
+/// Retain the exact identifier bytes that the parser bound as column nodes.
+pub(crate) fn parse_query_with_column_sources<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a Select<'a>, QuerySources<'a>), super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.column_sources = Some(core::cell::RefCell::new(QuerySourceCollector {
+        columns: ArenaList::new(arena),
+        projections: ArenaList::new(arena),
+    }));
+    let select = parser
+        .query_select()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            super::eval::sqlstate::SYNTAX_ERROR,
+            "trailing tokens after stored query"
+        ));
+    }
+    let collector = parser
+        .column_sources
+        .as_ref()
+        .expect("explicit column source capture")
+        .borrow();
+    let sources = QuerySources {
+        columns: collector.columns.as_slice(),
+        projections: collector.projections.as_slice(),
+    };
+    let select = arena
+        .alloc(select)
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok((select, sources))
 }
 
 /// Parses a stored view definition across PostgreSQL's complete query body,
@@ -449,6 +509,8 @@ impl<'a> Parser<'a> {
             arena,
             max_param: 0,
             string_parameters: &[],
+            previous_token: None,
+            column_sources: None,
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
             allow_into: false,
@@ -1486,8 +1548,26 @@ impl<'a> Parser<'a> {
             } else if let Some(table) = self.table_wildcard()? {
                 SelectItem::TableWildcard(table)
             } else {
+                let expression_start = self.peek_at;
                 let expression = self.expression(0)?;
+                let expression_end = self
+                    .previous_token
+                    .expect("a parsed expression consumed a token")
+                    .2;
                 let alias = self.alias()?;
+                if alias.is_none()
+                    && let Some(sources) = &self.column_sources
+                {
+                    sources
+                        .borrow_mut()
+                        .projections
+                        .push(ProjectionSource {
+                            name: super::exec::derived_name(expression),
+                            start: expression_start,
+                            end: expression_end,
+                        })
+                        .map_err(|_| self.arena_full("projection source map exceeds SQL arena"))?;
+                }
                 // A parenthesized `(t.*)` as a whole select item expands to
                 // the table's columns, exactly like `t.*` (PostgreSQL); only
                 // inside a larger expression (`(t.*)::text`, `row_to_json(t.*)`)
@@ -7483,6 +7563,8 @@ impl<'a> Parser<'a> {
             // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
             // is 'a'); only the internal name `bpchar` means unlimited.
             TypeMod::Length(1).encode()
+        } else if name == "bit" {
+            TypeMod::BitLength(1).encode()
         } else {
             -1
         };
@@ -7651,9 +7733,25 @@ impl<'a> Parser<'a> {
                     return Err(self.unexpected("length for bit type takes one argument"));
                 }
                 if nums[0] < 1 {
-                    return Err(self.unexpected("length for bit type must be at least 1"));
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "length for type {} must be at least 1", base),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
                 }
-                Ok(TypeMod::Length(nums[0] as usize).encode())
+                // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
+                if nums[0] > 83_886_080 {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "length for type {} cannot exceed 83886080",
+                            base
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                Ok(TypeMod::BitLength(nums[0] as usize).encode())
             }
             // Fractional-second precision, 0..=6. A larger value is clamped to
             // 6, and PostgreSQL warns when it does so.
@@ -7844,6 +7942,7 @@ impl<'a> Parser<'a> {
     // --- token helpers ---
 
     fn advance(&mut self) -> Result<(), ParseError> {
+        self.previous_token = Some((self.peeked, self.peek_at, self.lexer.token_end()));
         self.peeked = self.lexer.next_token()?;
         self.peek_at = self.lexer.token_start();
         Ok(())
@@ -7973,6 +8072,18 @@ impl<'a> Parser<'a> {
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
+        if let Some(sources) = &self.column_sources
+            && let Expr::Column { name, .. } | Expr::SchemaColumn { name, .. } = e
+            && let Some((Tok::Ident(token) | Tok::QuotedIdent(token), start, end)) =
+                self.previous_token
+            && token == name
+        {
+            sources
+                .borrow_mut()
+                .columns
+                .push(ColumnSource { name, start, end })
+                .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
+        }
         self.arena
             .alloc(e)
             .map(|m| &*m)

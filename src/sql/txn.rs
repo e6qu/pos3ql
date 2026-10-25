@@ -262,6 +262,7 @@ pub(super) struct CacheCapacityWait {
 
 pub struct TxnState {
     staged_commit: Option<StagedCommit>,
+    pub(super) catalog_history: Option<crate::storage::CatalogHistoryBatch>,
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
@@ -627,7 +628,7 @@ pub(crate) enum DdlUndo {
     },
     ObjectAclChanged {
         slot: u32,
-        prior: Option<crate::storage::PendingAcl>,
+        prior: crate::storage::ObjectAclUndo,
     },
     ColumnAclChanged {
         slot: u32,
@@ -638,8 +639,7 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingDefaultAcl>,
     },
     ParameterAclChanged {
-        slot: u32,
-        prior: Option<crate::storage::PendingParameterAcl>,
+        prior: crate::storage::ParameterAclUndo,
     },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
@@ -910,6 +910,7 @@ impl TxnState {
         }
         Ok(Self {
             staged_commit: None,
+            catalog_history: None,
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
@@ -2529,6 +2530,7 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.staged_commit = None;
+        self.catalog_history = None;
         self.mode = TxnMode::Idle;
         self.command_id = 0;
         self.command_counter = 0;

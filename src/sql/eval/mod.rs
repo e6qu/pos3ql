@@ -777,6 +777,17 @@ pub trait SequenceAccess {
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
+#[derive(Clone, Copy)]
+pub enum DescriptionTarget<'a> {
+    Local {
+        catalog: Option<&'a str>,
+        column: i32,
+    },
+    Shared {
+        catalog: &'a str,
+    },
+}
+
 pub trait CatalogAccess {
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
@@ -1501,9 +1512,8 @@ pub trait CatalogAccess {
     /// `obj_description`/`col_description`.
     fn comment<'a>(
         &self,
-        catalog_name: Option<&str>,
+        target: DescriptionTarget<'_>,
         oid: u32,
-        subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
     /// SQL spelling of a user-defined type OID for `format_type`.
@@ -2492,10 +2502,12 @@ fn eval_full_inner<'a>(
                     return Ok(value);
                 }
             }
-            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+            if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
+                ColType::from_sql_name(type_name)
+            {
                 let source_oid =
                     expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
-                validate_catalog_reference_cast(source_oid, ColType::Int2)?;
+                validate_catalog_reference_cast(source_oid, target)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
                 || matches!(
@@ -2541,7 +2553,7 @@ fn eval_full_inner<'a>(
                 && matches!(v, Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_))
             {
                 let n = match crate::sql::types::TypeMod::decode(ct, type_mod) {
-                    crate::sql::types::TypeMod::Length(n) => n,
+                    crate::sql::types::TypeMod::BitLength(n) => n,
                     _ => 1,
                 };
                 let value = match v {
@@ -3337,11 +3349,11 @@ fn eval_full_inner<'a>(
                         raw: super::array::build_shaped(items, shape.without_first()?, arena)?,
                     })
                 }
-                Datum::Int2Vector(raw) => {
+                Datum::Int2Vector { raw, lower_bound } => {
                     let index = integer_index(&i)?;
                     let Some(slot) = index
-                        .checked_sub(1)
-                        .and_then(|value| usize::try_from(value).ok())
+                        .checked_sub(i64::from(lower_bound))
+                        .and_then(|offset| usize::try_from(offset).ok())
                     else {
                         return Ok(Datum::Null);
                     };
@@ -3352,11 +3364,11 @@ fn eval_full_inner<'a>(
                         .map(|value| Datum::Int2(i16::from_le_bytes(*value)))
                         .unwrap_or(Datum::Null))
                 }
-                Datum::OidVector(raw) => {
+                Datum::OidVector { raw, lower_bound } => {
                     let index = integer_index(&i)?;
                     let Some(slot) = index
-                        .checked_sub(1)
-                        .and_then(|value| usize::try_from(value).ok())
+                        .checked_sub(i64::from(lower_bound))
+                        .and_then(|offset| usize::try_from(offset).ok())
                     else {
                         return Ok(Datum::Null);
                     };
@@ -3701,10 +3713,10 @@ fn eval_full_inner<'a>(
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let mut array = eval_full(array, arena, params, row, hooks)?;
             array = match array {
-                Datum::Int2Vector(_) => {
+                Datum::Int2Vector { .. } => {
                     cast_to(array, ColType::Array(super::types::ArrElem::Int2), arena)?
                 }
-                Datum::OidVector(_) => {
+                Datum::OidVector { .. } => {
                     cast_to(array, ColType::Array(super::types::ArrElem::Oid), arena)?
                 }
                 value => value,
@@ -4806,13 +4818,13 @@ fn call<'a>(
                 Datum::Array { element, raw } => {
                     super::array::get(raw, element, k - 1).unwrap_or(Datum::Null)
                 }
-                Datum::Int2Vector(raw) => raw
+                Datum::Int2Vector { raw, .. } => raw
                     .as_chunks::<2>()
                     .0
                     .get(k - 1)
                     .map(|bytes| Datum::Int4(i16::from_le_bytes(*bytes) as i32))
                     .unwrap_or(Datum::Null),
-                Datum::OidVector(raw) => raw
+                Datum::OidVector { raw, .. } => raw
                     .as_chunks::<4>()
                     .0
                     .get(k - 1)
@@ -7099,10 +7111,11 @@ pub(crate) fn regtype_cast<'a>(
             if let Some(catalog) = catalog
                 && let Some(referenced_oid) = catalog.user_type_oid(name)
             {
-                return Ok(Datum::Regtype {
-                    referenced_oid,
-                    name: catalog.user_type_name(name, arena)?.unwrap_or(name),
-                });
+                return regtype_of_oid_with_catalog(
+                    i64::from(referenced_oid),
+                    Some(catalog),
+                    arena,
+                );
             }
             regtype_of_name(name)
         }
@@ -7482,88 +7495,21 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             last_space = false;
         }
     }
-    let canonical = match collapsed.as_str() {
-        // These spell types the engine models; render via the one name table.
-        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
-            return Err(unknown());
-        }
-        "timestamp without time zone" | "timestamp" => "timestamp without time zone",
-        "timestamp with time zone" | "timestamptz" => "timestamp with time zone",
-        "time without time zone" | "time" => "time without time zone",
-        "time with time zone" | "timetz" => "time with time zone",
-        // Identifier/object types render as themselves.
-        "oid" => "oid",
-        s @ ("regtype"
-        | "regclass"
-        | "regproc"
-        | "regprocedure"
-        | "regrole"
-        | "regnamespace"
-        | "regoper"
-        | "regoperator"
-        | "regconfig"
-        | "regdictionary"
-        | "regcollation"
-        | "anyelement"
-        | "anyarray"
-        | "anynonarray"
-        | "anyenum"
-        | "anyrange"
-        | "anymultirange"
-        | "anycompatible"
-        | "anycompatiblearray"
-        | "anycompatiblenonarray"
-        | "anycompatiblerange"
-        | "anycompatiblemultirange"
-        | "fdw_handler") => match s {
-            "regtype" => "regtype",
-            "regclass" => "regclass",
-            "regproc" => "regproc",
-            "regprocedure" => "regprocedure",
-            "regrole" => "regrole",
-            "regnamespace" => "regnamespace",
-            "regoper" => "regoper",
-            "regoperator" => "regoperator",
-            "regconfig" => "regconfig",
-            "regdictionary" => "regdictionary",
-            "regcollation" => "regcollation",
-            "fdw_handler" => "fdw_handler",
-            "anyelement" => "anyelement",
-            "anyarray" => "anyarray",
-            "anynonarray" => "anynonarray",
-            "anyenum" => "anyenum",
-            "anyrange" => "anyrange",
-            "anymultirange" => "anymultirange",
-            "anycompatible" => "anycompatible",
-            "anycompatiblearray" => "anycompatiblearray",
-            "anycompatiblenonarray" => "anycompatiblenonarray",
-            "anycompatiblerange" => "anycompatiblerange",
-            "anycompatiblemultirange" => "anycompatiblemultirange",
-            _ => unreachable!(),
-        },
-        other => match ColType::from_sql_name(other) {
-            Some(ct) => ct.name(),
-            None => return Err(unknown()),
-        },
-    };
-    let referenced_oid = match canonical {
-        "timestamp without time zone" => crate::sql::types::oid::TIMESTAMP,
-        "timestamp with time zone" => crate::sql::types::oid::TIMESTAMPTZ,
-        "time without time zone" => crate::sql::types::oid::TIME,
-        "time with time zone" => crate::sql::types::oid::TIMETZ,
-        "regtype" => crate::sql::types::oid::REGTYPE,
-        "regclass" => crate::sql::types::oid::REGCLASS,
-        "regproc" => crate::sql::types::oid::REGPROC,
-        "regprocedure" => crate::sql::types::oid::REGPROCEDURE,
-        "regrole" => crate::sql::types::oid::REGROLE,
-        "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
-        "regoper" => crate::sql::types::oid::REGOPER,
-        "regoperator" => crate::sql::types::oid::REGOPERATOR,
-        "regconfig" => crate::sql::types::oid::REGCONFIG,
-        "regdictionary" => crate::sql::types::oid::REGDICTIONARY,
-        "regcollation" => crate::sql::types::oid::REGCOLLATION,
+    let name = collapsed.as_str();
+    if matches!(
+        name,
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+    ) {
+        return Err(unknown());
+    }
+    if let Some(ctype) = ColType::from_sql_name(name) {
+        return Ok(Datum::Regtype {
+            referenced_oid: ctype.oid(),
+            name: ctype.name(),
+        });
+    }
+    let referenced_oid = match name {
         "anyelement" => crate::sql::types::oid::ANYELEMENT,
-        "anyarray" => crate::sql::types::oid::ANYARRAY,
         "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
         "anyenum" => crate::sql::types::oid::ANYENUM,
         "anyrange" => crate::sql::types::oid::ANYRANGE,
@@ -7573,13 +7519,12 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "anycompatiblenonarray" => crate::sql::types::oid::ANYCOMPATIBLENONARRAY,
         "anycompatiblerange" => crate::sql::types::oid::ANYCOMPATIBLERANGE,
         "anycompatiblemultirange" => crate::sql::types::oid::ANYCOMPATIBLEMULTIRANGE,
-        _ => ColType::from_sql_name(canonical)
-            .expect("canonical type")
-            .oid(),
+        "fdw_handler" => crate::sql::types::oid::FDW_HANDLER,
+        _ => return Err(unknown()),
     };
     Ok(Datum::Regtype {
         referenced_oid,
-        name: canonical,
+        name: regtype_builtin_name(referenced_oid).expect("matched intrinsic type has a name"),
     })
 }
 
@@ -7635,8 +7580,8 @@ fn coerce_enum_literal<'a>(
 fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Array { element, .. } => element.array_name(),
-        Datum::Int2Vector(_) => "int2vector",
-        Datum::OidVector(_) => "oidvector",
+        Datum::Int2Vector { .. } => "int2vector",
+        Datum::OidVector { .. } => "oidvector",
         Datum::Null => "unknown",
         Datum::PgDdlCommand => "pg_ddl_command",
         Datum::Bool(_) => "boolean",

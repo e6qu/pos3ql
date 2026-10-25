@@ -100,6 +100,14 @@ implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values.
+Synchronize concurrent catalog changes before comparing current permission
+lookups. For example, after another connection grants access to `orders`,
+`LOCK TABLE orders IN ACCESS SHARE MODE` acquires a new relation lock and makes
+PostgreSQL process pending cache changes. A constant-only `pg_get_acl` query can
+otherwise reuse cached information in repeatable read. Keep checking ordinary
+catalog listings against the older transaction snapshot. See PostgreSQL 18.6's
+[relation lock refresh](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/storage/lmgr/lmgr.c#L110-L130)
+and [catalog snapshot invalidation](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/cache/inval.c#L768-L789).
 Use the same relation kind on both sides when checking accepted commands. For
 example, a PostgreSQL plain table cannot establish whether a command is accepted
 on a foreign table; use a PostgreSQL foreign table for that boundary.
@@ -132,6 +140,18 @@ Root-cause execution timeouts using step timings, logs, resource use, and the
 smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
+
+Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference
+with explicit container and output arguments:
+
+```sh
+tools/generate-pg18-catalog-metadata.sh pos3ql-pg18-ref src/sql/catalog_metadata.rs
+```
+
+The generator rejects other server versions and records the source version and
+container image. It includes the input/output routine identities reported by
+`pg_type`; user-defined domains, enums, arrays and row types derive those
+identities from their type definitions.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.

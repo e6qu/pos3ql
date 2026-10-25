@@ -515,7 +515,7 @@ pub(crate) fn default_expression<'a>(
     };
     if default.constant().is_none() {
         if let Some(base) = base {
-            return checks::resolve_default(expression.as_str(), base, storage, txid, arena)
+            return checks::describe_default(expression.as_str(), base, storage, txid, arena)
                 .map(Some);
         }
         if checks::is_bound(expression.as_str()) {
@@ -525,12 +525,7 @@ pub(crate) fn default_expression<'a>(
             ));
         }
     }
-    let copy_original = || {
-        arena
-            .alloc_str(expression.as_str())
-            .map(Some)
-            .map_err(|_| super::query::arena_full_pub())
-    };
+    let copy_original = || checks::canonical_display(expression.as_str(), arena).map(Some);
     let Some(constant) = default.constant() else {
         return copy_original();
     };

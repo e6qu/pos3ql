@@ -222,6 +222,7 @@ write_main_config() { # <object prefix> [data directory name]
   local data_name=${2:-data}
   cat > "$WORK/server.conf" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 listen_addr = 127.0.0.1:${PG_PORT}
 operations_listen_addr = 127.0.0.1:${OPERATIONS_PORT}
 operations_max_connections = 4
@@ -434,7 +435,7 @@ if want proto; then
 fi
 
 step "durability: kill -9, restart, data intact"
-"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -v ON_ERROR_STOP=1 \
   -c "CREATE TABLE crashy (id int, v text)" \
   -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')" \
   -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range, ip inet, mac macaddr)" \
@@ -470,7 +471,8 @@ step "durability: kill -9, restart, data intact"
   -c "ALTER TYPE crashy_coordinate RENAME ATTRIBUTE x TO east" \
   -c "CREATE SCHEMA crashy_types" \
   -c "ALTER TYPE crashy_coordinate SET SCHEMA crashy_types" \
-  -c "ALTER TYPE crashy_types.crashy_coordinate RENAME TO crashy_point"
+  -c "ALTER TYPE crashy_types.crashy_coordinate RENAME TO crashy_point" \
+  || { bad "crash recovery fixture setup"; exit 1; }
 # WAL upload is synchronous in durable mode. The trailing query still gives
 # the event loop an ordinary turn before this broader crash/restart fixture;
 # local recovery below replays the on-disk journal.
@@ -587,6 +589,7 @@ step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold star
 # kill needs no drain pause and the wiped-disk recovery needs no checkpoint.
 cat > "$WORK/rpo0.conf" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
 object_store = on
@@ -673,6 +676,7 @@ step "row count beyond table_rows: the map is an overlay, the bucket is the tabl
 # reach entry-less rows through the spill list.
 cat > "$WORK/overlay.conf" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 listen_addr = 127.0.0.1:$((PG_PORT + 3))
 data_dir = ${WORK}/overlay-data
 memtable_bytes = 512KiB
@@ -1105,6 +1109,7 @@ fi
 step "logical subscription apply from a pos3ql publisher"
 cat > "$WORK/subscription-pos3ql.conf" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 listen_addr = 127.0.0.1:${SUB_POS3QL_PORT}
 data_dir = ${WORK}/subscription-pos3ql-data
 max_connections = 6
@@ -1444,6 +1449,7 @@ openssl req -x509 -newkey rsa:2048 -keyout "$WORK/server-tls/key.pem" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
 cat > "$WORK/server-tls.conf" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data
 object_store = off

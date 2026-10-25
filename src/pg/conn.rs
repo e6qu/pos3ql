@@ -5795,12 +5795,29 @@ mod tests {
                 std::fs::remove_dir_all(&directory).unwrap();
                 let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
+                engine.enable_async_durability();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
                 conn.phase = Phase::Ready;
                 assert!(matches!(
                     message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
-                    Step::Continue
+                    Step::Continue | Step::Parked
                 ));
+                for _ in 0..64 {
+                    if !conn.parked {
+                        break;
+                    }
+                    assert_eq!(conn.parked_wait, crate::sql::StatementWait::ObjectIo);
+                    // The simulated remote store allocates its fixture objects.
+                    engine.commit_wal().unwrap();
+                    let step = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, &[0; 16], 0, true).unwrap()
+                    });
+                    assert_eq!(step.after, After::Continue);
+                }
+                assert!(
+                    !conn.parked,
+                    "recovered COPY query did not finish publication"
+                );
                 assert_rows(conn.send.readable());
                 drop(conn);
                 drop(engine);
@@ -8344,14 +8361,17 @@ mod tests {
             0, 0, 0, 0, // no nulls
             0, 0, 0, 21, // int2 element OID
             0, 0, 0, 2, // length
-            0, 0, 0, 1, // lower bound
+            0, 0, 0, 0, // lower bound
             0, 0, 0, 2, 0, 1, // first element
             0, 0, 0, 2, 0, 2, // second element
         ];
         assert_eq!(
             decode_binary_param(crate::sql::types::oid::INT2VECTOR, &bytes, &arena)
                 .expect("int2vector decodes"),
-            Datum::Int2Vector(&[1, 0, 2, 0])
+            Datum::Int2Vector {
+                lower_bound: 0,
+                raw: &[1, 0, 2, 0]
+            }
         );
     }
 
@@ -8370,7 +8390,10 @@ mod tests {
         assert_eq!(
             decode_binary_param(crate::sql::types::oid::OIDVECTOR, &bytes, &arena)
                 .expect("oidvector decodes"),
-            Datum::OidVector(&[54, 12, 0, 0])
+            Datum::OidVector {
+                lower_bound: 0,
+                raw: &[54, 12, 0, 0]
+            }
         );
     }
 

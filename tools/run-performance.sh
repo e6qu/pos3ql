@@ -262,6 +262,7 @@ write_config() {
   fi
   cat >"$config" <<EOF
 transaction_mode = mvcc
+catalog_history_bytes = 16MiB
 log_format = text
 listen_addr = 127.0.0.1:$port
 data_dir = $data

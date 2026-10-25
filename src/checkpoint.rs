@@ -20818,6 +20818,7 @@ mod stored_dependency_tests {
             parse_manifest_metadata(core::str::from_utf8(manifest.readable()).unwrap()).unwrap();
         assert_eq!(metadata.writer, replacement);
 
+        let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
         for header in [
             "pos3ql-manifest-v13",
             "pos3ql-manifest-v14",
@@ -20831,7 +20832,7 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v25",
             "pos3ql-manifest-v26",
         ] {
-            let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
+            rejected.clear();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());
             let before = rejected.readable().to_vec();
             assert!(matches!(

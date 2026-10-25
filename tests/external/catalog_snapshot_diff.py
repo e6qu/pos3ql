@@ -200,6 +200,9 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
 def schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome):
     try:
         writer.execute("CREATE SCHEMA sr_rename_before_diff")
+        writer.execute("CREATE SEQUENCE sr_rename_before_diff.ticket")
+        writer.execute("CREATE VIEW sr_rename_before_diff.ticket_view AS SELECT nextval('sr_rename_before_diff.ticket') AS id")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.next_ticket() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT nextval('sr_rename_before_diff.ticket'); END")
         writer.execute("CREATE TABLE sr_rename_before_diff.orders(id integer)")
         writer.execute("INSERT INTO sr_rename_before_diff.orders VALUES(17)")
         writer.execute("CREATE VIEW sr_rename_before_diff.order_view AS SELECT sr_rename_before_diff.id FROM sr_rename_before_diff /* namespace */ .orders AS sr_rename_before_diff")
@@ -215,6 +218,8 @@ def schema_rename_reports(reader, writer, isolation, prefix, record, record_outc
         record(writer, f"{prefix}.schema_rename.private.owner", namespaces)
         record(writer, f"{prefix}.schema_rename.private.view", "SELECT * FROM sr_rename_after_diff.order_view")
         record(writer, f"{prefix}.schema_rename.private.bound", "SELECT sr_rename_after_diff.bound()")
+        record(writer, f"{prefix}.schema_rename.private.sequence_view", "SELECT id FROM sr_rename_after_diff.ticket_view")
+        record(writer, f"{prefix}.schema_rename.private.sequence_routine", "SELECT sr_rename_after_diff.next_ticket()")
         writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")
         record(writer, f"{prefix}.schema_rename.private.materialized", "SELECT id FROM sr_rename_after_diff.order_cache")
         record(reader, f"{prefix}.schema_rename.private.observer", namespaces)
@@ -227,6 +232,8 @@ def schema_rename_reports(reader, writer, isolation, prefix, record, record_outc
         record(reader, f"{prefix}.schema_rename.current_lookup", lookup)
         record(reader, f"{prefix}.schema_rename.current_view", "SELECT * FROM sr_rename_after_diff.order_view")
         record(reader, f"{prefix}.schema_rename.current_bound", "SELECT sr_rename_after_diff.bound()")
+        record(reader, f"{prefix}.schema_rename.current_sequence_view", "SELECT id FROM sr_rename_after_diff.ticket_view")
+        record(reader, f"{prefix}.schema_rename.current_sequence_routine", "SELECT sr_rename_after_diff.next_ticket()")
         record_outcome(reader, f"{prefix}.schema_rename.current_unbound", "SELECT sr_rename_after_diff.unbound()", ())
         reader.execute("COMMIT")
         writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")

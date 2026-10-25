@@ -97,11 +97,26 @@ jobs:
           SELECT has_function_privilege('abs(integer)','EXECUTE'),has_function_privilege('abs(integer)'::regprocedure,'EXECUTE'),has_function_privilege('abs(integer)'::regprocedure,'EXECUTE WITH GRANT OPTION');
           SELECT has_function_privilege(0::oid,'EXECUTE'),has_schema_privilege(0::oid,'USAGE');
           RESET ROLE;
+          CREATE SCHEMA sequence_before;
+          CREATE SEQUENCE sequence_before.ticket START WITH 100;
+          CREATE VIEW bound_sequence_view AS SELECT nextval('sequence_before.ticket') AS id;
+          CREATE FUNCTION bound_sequence() RETURNS bigint LANGUAGE SQL
+            BEGIN ATOMIC SELECT nextval('sequence_before.ticket'); END;
+          BEGIN;
+          ALTER SCHEMA sequence_before RENAME TO sequence_after;
+          SELECT id FROM bound_sequence_view;
+          SELECT bound_sequence();
+          ROLLBACK;
+          SELECT id FROM bound_sequence_view;
+          SELECT bound_sequence();
+          ALTER SCHEMA sequence_before RENAME TO sequence_after;
+          SELECT id FROM bound_sequence_view;
+          SELECT bound_sequence();
           SQL
       - name: Native catalog and schema regressions
         shell: bash
         run: |
-          cargo test --lib --locked -- catalog_snapshot_ schema_rename_ schema_sql_rewrite_ schema_name_ --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/catalog-tests.log"
+          cargo test --lib --locked -- catalog_snapshot_ schema_rename_ schema_sql_rewrite_ schema_name_ promotion_retags_ --test-threads=1 --color=never --nocapture 2>&1 | tee "$RUNNER_TEMP/catalog-tests.log"
           python3 - "$RUNNER_TEMP/catalog-tests.log" <<'PY'
           import pathlib
           import re

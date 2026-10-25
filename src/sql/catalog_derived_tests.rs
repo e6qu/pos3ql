@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback() {
+    let config = test_config("schema-sequence-literals");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE SCHEMA sequence_before;
+        CREATE SEQUENCE sequence_before.ticket START WITH 100;
+        CREATE VIEW bound_sequence_view AS SELECT nextval('sequence_before.ticket') AS id;
+        CREATE FUNCTION bound_sequence() RETURNS bigint LANGUAGE SQL
+          BEGIN ATOMIC SELECT nextval('sequence_before.ticket'); END;
+        BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["100", "101"]);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["102", "103"]);
+    session.success(&mut engine, "ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["104", "105"]);
+}
+
+#[test]
 fn schema_rename_without_a_public_replacement_survives_empty_disk_recovery() {
     for checkpoint in [false, true] {
         let name = format!("schema-no-public-recovery-{checkpoint}");

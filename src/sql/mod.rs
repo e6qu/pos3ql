@@ -28,6 +28,7 @@ pub mod geometry;
 mod gin_catalog;
 mod gist_catalog;
 pub mod guc;
+mod identifiers;
 pub mod identity;
 pub(crate) mod index_interval;
 pub(crate) mod index_signature;

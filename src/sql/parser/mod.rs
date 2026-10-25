@@ -257,7 +257,7 @@ pub struct Parser<'a> {
     peek_at: usize,
     previous_token: Option<(Tok<'a>, usize, usize)>,
     column_sources: Option<core::cell::RefCell<QuerySourceCollector<'a>>>,
-    namespace_sources: Option<core::cell::RefCell<ArenaList<'a, NamespaceSource>>>,
+    namespace_sources: Option<core::cell::RefCell<SchemaSqlSourceCollector<'a>>>,
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
@@ -301,9 +301,55 @@ pub(crate) struct NamespaceSource {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum CatalogLiteralKind {
+    QualifiedName,
+    SchemaName,
+    TypeName,
+    RoutineIdentity,
+    OperatorName,
+    OperatorIdentity,
+}
+
+impl CatalogLiteralKind {
+    pub(super) fn for_cast(name: &str) -> Option<Self> {
+        match name {
+            "regclass" | "regproc" | "regcollation" | "regconfig" | "regdictionary" => Some(Self::QualifiedName),
+            "regnamespace" => Some(Self::SchemaName),
+            "regtype" => Some(Self::TypeName),
+            "regprocedure" => Some(Self::RoutineIdentity),
+            "regoper" => Some(Self::OperatorName),
+            "regoperator" => Some(Self::OperatorIdentity),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogLiteralSource<'a> {
+    pub(crate) kind: CatalogLiteralKind,
+    pub(crate) position: NamespaceSource,
+    pub(crate) value: &'a str,
+}
+
+struct SchemaSqlSourceCollector<'a> {
+    namespaces: ArenaList<'a, NamespaceSource>,
+    catalog_literals: ArenaList<'a, CatalogLiteralSource<'a>>,
+    string_literals: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
+}
+
+pub(crate) struct SchemaSqlSources<'a> {
+    pub(crate) namespaces: &'a [NamespaceSource],
+    pub(crate) catalog_literals: &'a [CatalogLiteralSource<'a>],
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum StoredSqlKind {
     Expression,
     Statements,
+    TypeName,
+    RoutineIdentity,
+    OperatorName,
+    OperatorIdentity,
 }
 
 /// Namespace positions come from grammar nodes, so table aliases and record
@@ -312,11 +358,18 @@ pub(crate) fn schema_namespace_sources<'arena>(
     sql: &str,
     kind: StoredSqlKind,
     arena: &'arena Arena,
-) -> Result<&'arena [NamespaceSource], super::eval::SqlError> {
+) -> Result<SchemaSqlSources<'arena>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
-    parser.namespace_sources = Some(core::cell::RefCell::new(ArenaList::new(arena)));
+    parser.namespace_sources = Some(core::cell::RefCell::new(SchemaSqlSourceCollector {
+        namespaces: ArenaList::new(arena), catalog_literals: ArenaList::new(arena),
+        string_literals: ArenaList::new(arena),
+    }));
     let parsed = match kind {
         StoredSqlKind::Expression => parser.expression(0).map(|_| ()),
+        StoredSqlKind::TypeName => parser.type_name_mod().map(|_| ()),
+        StoredSqlKind::RoutineIdentity => parser.routine_identity().map(|_| ()),
+        StoredSqlKind::OperatorName => parser.operator_qual_name("stored operator name is invalid").map(|_| ()),
+        StoredSqlKind::OperatorIdentity => parser.operator_identity().map(|_| ()),
         StoredSqlKind::Statements => (|| {
             while parser.peeked != Tok::Eof {
                 let _ = parser.statement()?;
@@ -340,10 +393,12 @@ pub(crate) fn schema_namespace_sources<'arena>(
         .expect("explicit namespace capture")
         .borrow();
     // The returned positions own no references into the source being edited.
-    arena
-        .alloc_slice_copy(sources.as_slice())
-        .map(|sources| &*sources)
-        .map_err(|_| super::query::arena_full_pub())
+    Ok(SchemaSqlSources {
+        namespaces: arena.alloc_slice_copy(sources.namespaces.as_slice())
+            .map_err(|_| super::query::arena_full_pub())?,
+        catalog_literals: arena.alloc_slice_copy(sources.catalog_literals.as_slice())
+            .map_err(|_| super::query::arena_full_pub())?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -8052,8 +8107,30 @@ impl<'a> Parser<'a> {
         if let Some(sources) = &self.namespace_sources {
             sources
                 .borrow_mut()
+                .namespaces
                 .push(source)
                 .map_err(|_| self.arena_full("namespace source map exceeds SQL arena"))?;
+        }
+        Ok(())
+    }
+
+    fn record_string_literal(&self, expression: &'a Expr<'a>, source: NamespaceSource) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources {
+            sources.borrow_mut().string_literals.push((expression, source))
+                .map_err(|_| self.arena_full("literal source map exceeds SQL arena"))?;
+        }
+        Ok(())
+    }
+
+    fn record_catalog_literal(&self, expression: &'a Expr<'a>, kind: CatalogLiteralKind) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources && let Expr::Str(value) = expression {
+            let source = sources.borrow().string_literals.as_slice().iter()
+                .find_map(|(candidate, source)| core::ptr::eq(*candidate, expression).then_some(*source));
+            let Some(source) = source else { return Ok(()); };
+            let value = self.arena.alloc_str(value)
+                .map_err(|_| self.arena_full("bound literal source exceeds SQL arena"))?;
+            sources.borrow_mut().catalog_literals.push(CatalogLiteralSource { kind, position: source, value })
+                .map_err(|_| self.arena_full("bound literal source map exceeds SQL arena"))?;
         }
         Ok(())
     }
@@ -8564,8 +8641,9 @@ mod tests {
         .map(|name| sql.find(name).unwrap());
         crate::mem::guard::forbid_alloc(|| {
             let sources = schema_namespace_sources(sql, StoredSqlKind::Statements, &arena).unwrap();
-            assert_eq!(sources.len(), expected.len());
-            for source in sources {
+            assert_eq!(sources.namespaces.len(), expected.len());
+            assert!(sources.catalog_literals.is_empty());
+            for source in sources.namespaces {
                 assert!(expected.contains(&source.start));
                 assert_eq!(&sql[source.start..source.end], "old");
             }

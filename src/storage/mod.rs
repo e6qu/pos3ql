@@ -15590,24 +15590,7 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     arena: &crate::mem::arena::Arena,
 ) -> Result<bool, SqlError> {
     if old.as_str().is_empty() {
-        return Err(sql_err!(
-            sqlstate::INVALID_SCHEMA_NAME,
-            "schema name is empty"
-        ));
-    }
-    let mut identifier = StackStr::<130>::from_str(old.as_str());
-    if old.as_str().contains('"') {
-        identifier.clear();
-        write_schema_identifier(&mut identifier, old);
-    }
-    let needle = identifier.as_str().as_bytes();
-    if !source
-        .as_str()
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-    {
-        return Ok(false);
+        return Err(sql_err!(sqlstate::INVALID_SCHEMA_NAME, "schema name is empty"));
     }
     let mark = arena.mark();
     let result = (|| {
@@ -15618,7 +15601,7 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
             spans,
             old,
             new,
-            NamespaceRewriteScope::Parsed(namespaces),
+            NamespaceRewriteScope::Parsed { sources: namespaces, arena },
         )
     })();
     // SAFETY: parsing contributes only byte positions to an inline SQL buffer.
@@ -15628,15 +15611,75 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
 }
 
 enum NamespaceRewriteScope<'a> {
-    Parsed(&'a [crate::sql::parser::NamespaceSource]),
+    Parsed { sources: crate::sql::parser::SchemaSqlSources<'a>, arena: &'a crate::mem::arena::Arena },
     #[cfg(test)]
     Lexical,
 }
 
 impl NamespaceRewriteScope<'_> {
+    fn rewrite_catalog_literal<const N: usize>(
+        &self, start: usize, old: SqlName, new: SqlName,
+    ) -> Result<Option<(usize, &str)>, SqlError> {
+        let Self::Parsed { sources, arena } = self else { return Ok(None); };
+        let Some(literal) = sources.catalog_literals.iter().find(|literal| literal.position.start == start)
+            else { return Ok(None); };
+        use crate::sql::parser::{CatalogLiteralKind, StoredSqlKind};
+        let mut name = StackStr::<N>::new();
+        use core::fmt::Write as _;
+        match literal.kind {
+            CatalogLiteralKind::QualifiedName | CatalogLiteralKind::SchemaName => {
+                let parsed = match crate::sql::identifiers::ObjectReference::parse(literal.value)? {
+                    crate::sql::identifiers::ObjectReference::Oid(_) => return Ok(None),
+                    crate::sql::identifiers::ObjectReference::Name(name) => name,
+                };
+                match literal.kind {
+                    CatalogLiteralKind::SchemaName => {
+                        if parsed.database.is_some() || parsed.schema.is_some() {
+                            return Err(sql_err!(sqlstate::INVALID_NAME, "schema reference has more than one identifier"));
+                        }
+                        if parsed.name != old { return Ok(None); }
+                        write_schema_identifier(&mut name, new);
+                    }
+                    CatalogLiteralKind::QualifiedName => {
+                        if parsed.schema != Some(old) { return Ok(None); }
+                        if let Some(database) = parsed.database {
+                            write_schema_identifier(&mut name, database);
+                            let _ = name.write_char('.');
+                        }
+                        write_schema_identifier(&mut name, new);
+                        let _ = name.write_char('.');
+                        write_schema_identifier(&mut name, parsed.name);
+                    }
+                    _ => unreachable!("the outer match selects name literals"),
+                }
+            }
+            kind => {
+                if !literal.value.is_empty() && literal.value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Ok(None);
+                }
+                let _ = name.write_str(literal.value);
+                let kind = match kind {
+                    CatalogLiteralKind::TypeName => StoredSqlKind::TypeName,
+                    CatalogLiteralKind::RoutineIdentity => StoredSqlKind::RoutineIdentity,
+                    CatalogLiteralKind::OperatorName => StoredSqlKind::OperatorName,
+                    CatalogLiteralKind::OperatorIdentity => StoredSqlKind::OperatorIdentity,
+                    _ => unreachable!("name literals were handled above"),
+                };
+                if !rename_schema_qualified_sql(&mut name, &mut [], old, new, kind, arena)? {
+                    return Ok(None);
+                }
+            }
+        }
+        if name.is_truncated() {
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "schema rename exceeds the stored reference literal limit"));
+        }
+        let quoted = crate::sql::eval::quote_literal_str(name.as_str(), arena)?;
+        Ok(Some((literal.position.end, quoted)))
+    }
+
     fn includes(&self, start: usize, end: usize, _followed_by_dot: bool) -> bool {
         match self {
-            Self::Parsed(sources) => sources
+            Self::Parsed { sources, .. } => sources.namespaces
                 .iter()
                 .any(|source| source.start == start && source.end == end),
             #[cfg(test)]
@@ -15723,6 +15766,14 @@ fn rewrite_schema_sql_tokens<const N: usize>(
     let mut copied = 0usize;
     let mut at = 0usize;
     while at < bytes.len() {
+        if let Some((end, literal)) = namespaces.rewrite_catalog_literal::<N>(at, old, new)? {
+            let _ = rewritten.write_str(&text[copied..at]);
+            let _ = rewritten.write_str(literal);
+            remap(at, end, literal.len())?;
+            copied = end;
+            at = end;
+            continue;
+        }
         match bytes[at] {
             b'E' | b'e' if bytes.get(at + 1) == Some(&b'\'') => {
                 at = quoted_end(bytes, at + 1, b'\'', true)

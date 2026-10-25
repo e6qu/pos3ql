@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn schema_rename_preserves_typed_reference_literals_and_leaves_text_unchanged() {
+    let config = test_config("schema-typed-reference-literals");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"
+        CREATE SCHEMA typed_before;
+        CREATE TABLE typed_before.items(id integer);
+        CREATE DOMAIN typed_before.amount AS integer;
+        CREATE FUNCTION typed_before.add_values(a typed_before.amount,b typed_before.amount)
+          RETURNS integer LANGUAGE SQL RETURN a+b;
+        CREATE OPERATOR typed_before.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=int4pl);
+        CREATE COLLATION typed_before.byte_order FROM "C";
+        CREATE VIEW typed_reference_view AS SELECT
+          'typed_before.items'::regclass AS relation_id,
+          'typed_before'::regnamespace AS schema_id,
+          'typed_before.amount[]'::regtype AS type_id,
+          'typed_before.add_values'::regproc AS routine_id,
+          'typed_before.add_values(typed_before.amount,typed_before.amount)'::regprocedure AS routine_signature,
+          'typed_before.+'::regoper AS operator_id,
+          'typed_before.+(integer,integer)'::regoperator AS operator_signature,
+          'typed_before.byte_order'::regcollation AS collation_id,
+          'typed_before.items'::text AS ordinary_text;
+    "#, true);
+    let check = |schema: &str| format!("SELECT
+        relation_id='{schema}.items'::regclass,
+        schema_id='{schema}'::regnamespace,
+        type_id='{schema}.amount[]'::regtype,
+        routine_id='{schema}.add_values'::regproc,
+        routine_signature='{schema}.add_values({schema}.amount,{schema}.amount)'::regprocedure,
+        operator_id='{schema}.+'::regoper,
+        operator_signature='{schema}.+(integer,integer)'::regoperator,
+        collation_id='{schema}.byte_order'::regcollation,
+        ordinary_text='typed_before.items' FROM typed_reference_view");
+    for (change, schema) in [
+        ("BEGIN; ALTER SCHEMA typed_before RENAME TO typed_after", "typed_after"),
+        ("ROLLBACK", "typed_before"),
+        ("ALTER SCHEMA typed_before RENAME TO typed_after", "typed_after"),
+    ] {
+        session.success(&mut engine, change, true);
+        assert_eq!(data_rows(&session.success(&mut engine, &check(schema), true)), ["t|t|t|t|t|t|t|t|t"]);
+    }
+}
+
+#[test]
+fn schema_name_sql_literals_preserve_unicode_quotes_and_long_identifiers() {
+    let config = test_config("schema-unicode-sequence-literals");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"
+        CREATE SCHEMA "Séquence.Before";
+        CREATE SEQUENCE "Séquence.Before"."tick""et" START WITH 7;
+        CREATE VIEW quoted_ticket_view AS SELECT nextval('"Séquence.Before"."tick""et"') AS id;
+        CREATE FUNCTION quoted_ticket() RETURNS bigint LANGUAGE SQL
+          BEGIN ATOMIC SELECT nextval('"Séquence.Before"."tick""et"'); END;
+        ALTER SCHEMA "Séquence.Before" RENAME TO "Après,'Schema";
+    "#, true);
+    assert_eq!(data_rows(&session.success(&mut engine, r#"
+        SELECT id FROM quoted_ticket_view;
+        SELECT quoted_ticket();
+        SELECT currval('"Après,''Schema"."tick""et"');
+        SELECT nextval('"Après,''Schema"."tick""et"'::regclass::oid);
+        SELECT parse_ident('"élève"."a""b"',true)=ARRAY['élève','a"b'];
+        SELECT parse_ident('"'||repeat('é',600)||'"',true)=ARRAY[repeat('é',600)];
+    "#, true)), ["7", "8", "8", "9", "t", "t"]);
+}
+
+#[test]
 fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback() {
     let config = test_config("schema-sequence-literals");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -12,6 +83,7 @@ fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback()
         CREATE VIEW bound_sequence_view AS SELECT nextval('sequence_before.ticket') AS id;
         CREATE FUNCTION bound_sequence() RETURNS bigint LANGUAGE SQL
           BEGIN ATOMIC SELECT nextval('sequence_before.ticket'); END;
+        CREATE VIEW late_sequence_view AS SELECT nextval('sequence_before.ticket'::text) AS id;
         BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["100", "101"]);
@@ -21,6 +93,7 @@ fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback()
     session.success(&mut engine, "ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["104", "105"]);
+    assert_eq!(error_sqlstates(&session.execute(&mut engine, "SELECT id FROM late_sequence_view", true)), ["42P01"]);
 }
 
 #[test]
@@ -504,12 +577,15 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
             session.success(&mut engine, "
                 CREATE SCHEMA prepared_schema_before;
                 CREATE TYPE prepared_schema_before.mood AS ENUM ('ready');
+                CREATE SEQUENCE prepared_schema_before.ticket START WITH 40;
                 CREATE TABLE prepared_schema_before.items(id integer,state prepared_schema_before.mood);
                 INSERT INTO prepared_schema_before.items VALUES (8,'ready');
                 CREATE VIEW prepared_schema_before.item_view AS SELECT id,state FROM prepared_schema_before.items;
                 CREATE MATERIALIZED VIEW prepared_schema_cache AS SELECT id FROM prepared_schema_before.items;
                 CREATE FUNCTION prepared_schema_before.bound() RETURNS integer LANGUAGE SQL
                   BEGIN ATOMIC SELECT id FROM prepared_schema_before.items; END;
+                CREATE FUNCTION prepared_schema_before.next_ticket() RETURNS bigint LANGUAGE SQL
+                  BEGIN ATOMIC SELECT nextval('prepared_schema_before.ticket'); END;
                 COMMENT ON SCHEMA prepared_schema_before IS 'prepared namespace';
             ", false);
             session.success(
@@ -556,6 +632,8 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
                 ["8", "8|ready", "prepared namespace"],
                 "{name}"
             );
+            assert_eq!(data_rows(&session.success(&mut cold,
+                &format!("SELECT {schema}.next_ticket()"), false)), ["40"], "{name}");
             // View materialization writes simulator objects, whose fixture
             // vectors grow. The rename and direct metadata reads stay guarded.
             assert_eq!(

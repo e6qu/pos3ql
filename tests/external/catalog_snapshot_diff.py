@@ -260,19 +260,28 @@ def schema_name_binding_reports(writer, prefix, record):
         record(writer, f"{prefix}.schema_binding.private_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
         writer.execute('COMMIT')
         record(writer, f"{prefix}.schema_binding.committed_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
-        writer.execute('CREATE SCHEMA "Sr,\"\"quoted\"\"Diff"')
-        writer.execute('SET search_path TO "Sr,\"\"quoted\"\"Diff"')
+        writer.execute('CREATE SCHEMA "SrÉ,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "SrÉ,\"\"quoted\"\"Diff"')
         writer.execute('CREATE TABLE items(id integer)')
         writer.execute('INSERT INTO items VALUES(12)')
         writer.execute('CREATE VIEW item_view AS SELECT id FROM items')
-        writer.execute('CREATE VIEW qualified_view AS SELECT id FROM "Sr,\"\"quoted\"\"Diff".items')
+        writer.execute('CREATE SEQUENCE "tick""et"')
+        sequence_name = '"SrÉ,""quoted""Diff"."tick""et"'
+        writer.execute(pg_sql.SQL('CREATE VIEW ticket_view AS SELECT nextval({}) AS id').format(pg_sql.Literal(sequence_name)))
+        writer.execute(pg_sql.SQL('CREATE FUNCTION next_ticket() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT nextval({}); END').format(pg_sql.Literal(sequence_name)))
+        writer.execute('CREATE VIEW qualified_view AS SELECT id FROM "SrÉ,\"\"quoted\"\"Diff".items')
         writer.execute('CREATE FUNCTION bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM items; END')
-        writer.execute('CREATE FUNCTION qualified_bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM "Sr,\"\"quoted\"\"Diff".items; END')
-        writer.execute('ALTER SCHEMA "Sr,\"\"quoted\"\"Diff" RENAME TO "MovedSr,\"\"quoted\"\"Diff"')
-        writer.execute('SET search_path TO "MovedSr,\"\"quoted\"\"Diff"')
+        writer.execute('CREATE FUNCTION qualified_bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM "SrÉ,\"\"quoted\"\"Diff".items; END')
+        writer.execute('ALTER SCHEMA "SrÉ,\"\"quoted\"\"Diff" RENAME TO "MovedSrÉ,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "MovedSrÉ,\"\"quoted\"\"Diff"')
         record(writer, f"{prefix}.schema_binding.quoted_path", 'SELECT current_schema()')
         record(writer, f"{prefix}.schema_binding.quoted_view", 'SELECT id FROM item_view')
         record(writer, f"{prefix}.schema_binding.quoted_routine", 'SELECT bound()')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_view", 'SELECT id FROM ticket_view')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_routine", 'SELECT next_ticket()')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_oid", "SELECT nextval('\"tick\"\"et\"'::regclass::oid)")
+        record(writer, f"{prefix}.schema_binding.unicode_identifier", "SELECT parse_ident('\"élève\".\"a\"\"b\"',true)=ARRAY['élève','a\"b']")
+        record(writer, f"{prefix}.schema_binding.long_identifier", "SELECT parse_ident('\"'||repeat('é',600)||'\"',true)=ARRAY[repeat('é',600)]")
         record(writer, f"{prefix}.schema_binding.qualified_quoted_view", 'SELECT id FROM qualified_view')
         record(writer, f"{prefix}.schema_binding.qualified_quoted_routine", 'SELECT qualified_bound()')
         writer.execute('RESET search_path')
@@ -296,8 +305,50 @@ def schema_name_binding_reports(writer, prefix, record):
             writer.execute('DROP SCHEMA IF EXISTS public CASCADE')
             writer.execute('ALTER SCHEMA sr_initial_public_diff RENAME TO public')
         writer.execute('DROP VIEW IF EXISTS sr_case_view_diff')
-        for schema in ('SrCaseDiff', 'srcasediff', 'MovedSrCaseDiff', 'Sr,"quoted"Diff', 'MovedSr,"quoted"Diff'):
+        for schema in ('SrCaseDiff', 'srcasediff', 'MovedSrCaseDiff', 'SrÉ,"quoted"Diff', 'MovedSrÉ,"quoted"Diff'):
             writer.execute(pg_sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(pg_sql.Identifier(schema)))
+
+
+def schema_reference_literal_reports(writer, prefix, record):
+    try:
+        writer.execute('CREATE SCHEMA sr_typed_before_diff')
+        writer.execute('CREATE TABLE sr_typed_before_diff.items(id integer)')
+        writer.execute('CREATE DOMAIN sr_typed_before_diff.amount AS integer')
+        writer.execute('CREATE FUNCTION sr_typed_before_diff.add_values(a sr_typed_before_diff.amount,b sr_typed_before_diff.amount) RETURNS integer LANGUAGE SQL RETURN a+b')
+        writer.execute('CREATE OPERATOR sr_typed_before_diff.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=int4pl)')
+        writer.execute('CREATE COLLATION sr_typed_before_diff.byte_order FROM "C"')
+        writer.execute("""CREATE VIEW sr_typed_reference_view_diff AS SELECT
+            'sr_typed_before_diff.items'::regclass AS relation_id,
+            'sr_typed_before_diff'::regnamespace AS schema_id,
+            'sr_typed_before_diff.amount[]'::regtype AS type_id,
+            'sr_typed_before_diff.add_values'::regproc AS routine_id,
+            'sr_typed_before_diff.add_values(sr_typed_before_diff.amount,sr_typed_before_diff.amount)'::regprocedure AS routine_signature,
+            'sr_typed_before_diff.+'::regoper AS operator_id,
+            'sr_typed_before_diff.+(integer,integer)'::regoperator AS operator_signature,
+            'sr_typed_before_diff.byte_order'::regcollation AS collation_id,
+            'sr_typed_before_diff.items'::text AS ordinary_text""")
+        for stage, statements, schema in (
+            ('private', ('BEGIN', 'ALTER SCHEMA sr_typed_before_diff RENAME TO sr_typed_after_diff'), 'sr_typed_after_diff'),
+            ('rollback', ('ROLLBACK',), 'sr_typed_before_diff'),
+            ('committed', ('ALTER SCHEMA sr_typed_before_diff RENAME TO sr_typed_after_diff',), 'sr_typed_after_diff'),
+        ):
+            for statement in statements:
+                writer.execute(statement)
+            record(writer, f"{prefix}.schema_binding.typed_literals.{stage}", f"""SELECT
+                relation_id='{schema}.items'::regclass,
+                schema_id='{schema}'::regnamespace,
+                type_id='{schema}.amount[]'::regtype,
+                routine_id='{schema}.add_values'::regproc,
+                routine_signature='{schema}.add_values({schema}.amount,{schema}.amount)'::regprocedure,
+                operator_id='{schema}.+'::regoper,
+                operator_signature='{schema}.+(integer,integer)'::regoperator,
+                collation_id='{schema}.byte_order'::regcollation,
+                ordinary_text='sr_typed_before_diff.items' FROM sr_typed_reference_view_diff""")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('DROP VIEW IF EXISTS sr_typed_reference_view_diff')
+        writer.execute('DROP SCHEMA IF EXISTS sr_typed_before_diff CASCADE')
+        writer.execute('DROP SCHEMA IF EXISTS sr_typed_after_diff CASCADE')
 
 
 def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
@@ -452,6 +503,7 @@ def transcript(reader, writer, host, port, user, report_database):
         schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_name_binding_reports(writer, prefix, record)
+        schema_reference_literal_reports(writer, prefix, record)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

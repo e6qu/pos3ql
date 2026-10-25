@@ -303,36 +303,38 @@ impl<'a> SeqEval<'a> {
     /// may be schema-qualified (`schema.seq`); resolution otherwise walks the
     /// search path, exactly as relation resolution does.
     fn resolve(&self, name: &str) -> Result<usize, SqlError> {
-        let (qualifier, base) = match name.rsplit_once('.') {
-            Some((q, b)) => (Some(q), b),
-            None => (None, name),
+        let slot = match crate::sql::identifiers::ObjectReference::parse(name)? {
+          crate::sql::identifiers::ObjectReference::Oid(oid) => {
+            let slot = (0..self.storage.sequence_count()).find(|slot|
+                self.storage.sequence_slot_visible_to(*slot, self.txid)
+                    && crate::sql::catalog::sequence_oid(*slot) as u32 == oid);
+            if slot.is_none() && i32::try_from(oid).ok().is_some_and(|oid|
+                crate::sql::catalog::relation_oid_is_visible(self.storage, self.txid, oid)) {
+                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "object {} is not a sequence", oid));
+            }
+            slot
+          }
+          crate::sql::identifiers::ObjectReference::Name(parsed) => {
+            if parsed.database.is_some_and(|database| database != self.storage.current_database_name(self.txid)) {
+                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cross-database sequence references are not supported"));
+            }
+            let qualifier = parsed.schema.as_ref().map(crate::storage::SqlName::as_str);
+            let base = parsed.name.as_str();
+            let slot = self.storage.sequence_on_path(qualifier, base, self.txid);
+            if slot.is_none() && self.storage.resolve_relation(qualifier, base, self.txid).is_some() {
+                return Err(sql_err!(sqlstate::WRONG_OBJECT_TYPE, "\"{}\" is not a sequence", base));
+            }
+            slot
+          }
         };
-        if let Some(slot) = self.storage.sequence_on_path(qualifier, base, self.txid) {
+        if let Some(slot) = slot {
             self.storage.require_schema_usage(
-                self.storage.sequence_for(slot, self.txid).schema.as_str(),
-                self.txid,
-            )?;
+                self.storage.sequence_for(slot, self.txid).schema.as_str(), self.txid)?;
             return Ok(slot);
         }
-        // Match PostgreSQL's phrasing: a relation of another kind is a type
-        // error; nothing at all is an undefined relation.
-        if self
-            .storage
-            .resolve_relation(qualifier, base, self.txid)
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a sequence",
-                base
-            ));
-        }
-        Err(sql_err!(
-            sqlstate::UNDEFINED_TABLE,
-            "relation \"{}\" does not exist",
-            name
-        ))
+        Err(sql_err!(sqlstate::UNDEFINED_TABLE, "relation \"{}\" does not exist", name))
     }
+
 
     fn require_any(
         &self,

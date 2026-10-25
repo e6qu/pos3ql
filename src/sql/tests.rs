@@ -68219,7 +68219,7 @@ fn psql_catalog_listing_contracts() {
              WHERE table_name = 'catalog_table_privileges' AND grantee <> 'postgres'
              ORDER BY grantee, privilege_type",
         )),
-        ["catalog_table_reader|SELECT", "catalog_table_reader|UPDATE"]
+        ["PUBLIC|INSERT", "catalog_table_reader|SELECT", "catalog_table_reader|UPDATE"]
     );
     run_with(
         &mut engine,

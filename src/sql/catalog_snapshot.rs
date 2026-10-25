@@ -405,7 +405,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
             "pg_shdepend",
             "pg_shdescription",
         ],
-        SchemaCreated(_) | SchemaDropped(_) | SchemaRenamed { .. } => {
+        SchemaCreated(_) | SchemaDropped(_) | SchemaRenamed(_) => {
             &["pg_namespace", "pg_depend", "pg_shdepend", "pg_description"]
         }
         ExtensionCreated(_)

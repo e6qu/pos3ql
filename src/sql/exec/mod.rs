@@ -691,6 +691,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 mod copy_transition;
 mod partition_insert;
 mod partition_update;
+mod schema;
 pub(crate) use copy_transition::CopyTransitionRows;
 
 mod describe;
@@ -6248,13 +6249,6 @@ pub fn alter_schema(
             responder,
         ),
         crate::sql::ast::AlterSchemaAction::RenameTo(new_name) => {
-            if new_name.starts_with("pg_") {
-                return sql_fail(sql_err!(
-                    sqlstate::RESERVED_NAME,
-                    "unacceptable schema name \"{}\"",
-                    new_name
-                ));
-            }
             let Some(slot) = storage.find_schema_visible(name, txn.txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -6262,6 +6256,10 @@ pub fn alter_schema(
                     name
                 ));
             };
+            if storage.find_schema_visible(new_name, txn.txid).is_some() {
+                return sql_fail(sql_err!(sqlstate::DUPLICATE_SCHEMA,
+                    "schema \"{}\" already exists", new_name));
+            }
             let object = crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,
@@ -6269,11 +6267,23 @@ pub fn alter_schema(
             if let Err(error) = storage.require_owner(object, txn.txid, "schema") {
                 return sql_fail(error);
             }
+            let Some(role) = storage.current_role_slot(txn.txid) else {
+                return sql_fail(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"));
+            };
+            if !storage.has_current_database_create_privilege(role, txn.txid) {
+                return sql_fail(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for database"));
+            }
+            if new_name.starts_with("pg_") {
+                return sql_fail(sql_err!(sqlstate::RESERVED_NAME,
+                    "unacceptable schema name \"{}\"", new_name));
+            }
             let new_name = match SqlName::parse(new_name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let prior_name = storage.schema_def(slot).name;
+            let prior_name = storage.schema_def_for(slot, txn.txid).name;
             // Sequence literals in column defaults are textual at the SQL
             // boundary. Rebind them while the old namespace still resolves,
             // then move the whole catalog identity as one WAL operation.
@@ -6301,27 +6311,18 @@ pub fn alter_schema(
                     return sql_fail(error);
                 }
             }
-            let prior = match storage.rename_schema(slot, new_name) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
-            };
+            if let Err(error) = schema::rename(storage, txn, slot, new_name, arena) {
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenameSchema {
-                    name: prior.as_str(),
+                    name: prior_name.as_str(),
                     new_name: new_name.as_str(),
                 },
             ) {
-                let _ = storage.rename_schema(slot, prior);
-                return sql_fail(error);
-            }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SchemaRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                let _ = storage.rename_schema(slot, prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER SCHEMA")?;

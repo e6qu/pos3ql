@@ -5008,6 +5008,7 @@ impl RuleDefinition {
 pub(crate) enum RuleMetadataChange {
     Rename(SqlName),
     SetEnabled(RuleEnabled),
+    Schema { old: SqlName, new: SqlName },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15327,41 +15328,48 @@ pub(crate) fn stored_query_dependency_budget_bytes(config: &Config) -> usize {
             * size_of::<PendingStoredQueryDependencies>()
 }
 
-fn rename_schema_name(value: &mut SqlName, old: SqlName, new: SqlName) {
-    if *value == old {
+pub(crate) fn rename_schema_name(value: &mut SqlName, old: SqlName, new: SqlName) -> bool {
+    if *value == old && old != new {
         *value = new;
+        true
+    } else {
+        false
     }
 }
 
-fn rename_user_type_schema(value: &mut Option<UserTypeName>, old: SqlName, new: SqlName) {
+pub(crate) fn rename_user_type_schema(value: &mut Option<UserTypeName>, old: SqlName, new: SqlName) -> bool {
     if let Some(identity) = value
-        && identity.schema == old
+        && identity.schema == old && old != new
     {
         identity.schema = new;
+        true
+    } else {
+        false
     }
 }
 
-fn rename_routine_result_schema(value: &mut RoutineResult, old: SqlName, new: SqlName) {
-    rename_user_type_schema(&mut value.user_type, old, new);
+fn rename_routine_result_schema(value: &mut RoutineResult, old: SqlName, new: SqlName) -> bool {
+    rename_user_type_schema(&mut value.user_type, old, new)
 }
 
-fn rename_routine_kind_schema(value: &mut RoutineKind, old: SqlName, new: SqlName) {
+fn rename_routine_kind_schema(value: &mut RoutineKind, old: SqlName, new: SqlName) -> bool {
     match value {
         RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-            rename_routine_result_schema(result, old, new);
+            rename_routine_result_schema(result, old, new)
         }
         RoutineKind::Aggregate(aggregate) => {
-            rename_routine_result_schema(&mut aggregate.state_type, old, new);
-            rename_routine_result_schema(&mut aggregate.result_type, old, new);
+            let mut changed = rename_routine_result_schema(&mut aggregate.state_type, old, new);
+            changed |= rename_routine_result_schema(&mut aggregate.result_type, old, new);
             if let Some(moving) = &mut aggregate.moving {
-                rename_routine_result_schema(&mut moving.state_type, old, new);
+                changed |= rename_routine_result_schema(&mut moving.state_type, old, new);
             }
+            changed
         }
         RoutineKind::RecordFunction { .. }
         | RoutineKind::TableFunction
         | RoutineKind::Trigger
         | RoutineKind::EventTrigger
-        | RoutineKind::Procedure => {}
+        | RoutineKind::Procedure => false,
     }
 }
 
@@ -15387,7 +15395,7 @@ fn rename_routine_parameters_schema(
     }
 }
 
-fn rename_schema_path(
+pub(crate) fn rename_schema_path(
     path: &mut StackStr<128>,
     old: SqlName,
     new: SqlName,
@@ -15422,12 +15430,12 @@ fn rename_schema_path(
 /// Stored SQL has already passed the parser when it reaches the catalog; this
 /// bounded pass preserves its source spelling while changing a resolved
 /// namespace identity.
-fn rename_schema_qualified_sql<const N: usize>(
+pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     source: &mut StackStr<N>,
     spans: &mut [RuleTextSpan],
     old: SqlName,
     new: SqlName,
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
     use core::fmt::Write as _;
 
     fn is_identifier(byte: u8) -> bool {
@@ -15592,7 +15600,7 @@ fn rename_schema_qualified_sql<const N: usize>(
         }
     }
     if copied == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let _ = rewritten.write_str(&text[copied..]);
     if rewritten.is_truncated() {
@@ -15612,35 +15620,35 @@ fn rename_schema_qualified_sql<const N: usize>(
     }
     spans.copy_from_slice(&adjusted[..spans.len()]);
     *source = rewritten;
-    Ok(())
+    Ok(true)
 }
 
 fn rename_column_default_schema(
     default: &mut ColumnDefault,
     old: SqlName,
     new: SqlName,
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
     match default {
-        ColumnDefault::None => {}
+        ColumnDefault::None => Ok(false),
         ColumnDefault::Constant { expression, .. }
         | ColumnDefault::Expression(expression)
         | ColumnDefault::Generated(expression) => {
-            rename_schema_qualified_sql(expression, &mut [], old, new)?;
+            rename_schema_qualified_sql(expression, &mut [], old, new)
         }
     }
-    Ok(())
 }
 
 fn rename_table_sql_identity(
     definition: &mut TableDef,
     old: SqlName,
     new: SqlName,
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
+    let mut changed = false;
     for column in definition.columns.iter_mut().take(definition.n_columns) {
-        rename_column_default_schema(&mut column.default, old, new)?;
+        changed |= rename_column_default_schema(&mut column.default, old, new)?;
     }
     for constraint in definition.checks.iter_mut().take(definition.n_checks) {
-        rename_schema_qualified_sql(&mut constraint.expression, &mut [], old, new)?;
+        changed |= rename_schema_qualified_sql(&mut constraint.expression, &mut [], old, new)?;
     }
     for exclusion in definition
         .exclusions
@@ -15648,10 +15656,10 @@ fn rename_table_sql_identity(
         .take(definition.n_exclusions)
     {
         if let Some(predicate) = &mut exclusion.predicate {
-            rename_schema_qualified_sql(predicate, &mut [], old, new)?;
+            changed |= rename_schema_qualified_sql(predicate, &mut [], old, new)?;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 impl Storage {
@@ -50118,6 +50126,10 @@ impl Storage {
         match change {
             RuleMetadataChange::Rename(name) => definition.name = name,
             RuleMetadataChange::SetEnabled(enabled) => definition.enabled = enabled,
+            RuleMetadataChange::Schema { old, new } => {
+                rename_schema_path(&mut definition.creation_path, old, new)?;
+                definition.rename_schema(old, new)?;
+            }
         }
         if owners
             .catalog
@@ -50182,6 +50194,13 @@ impl Storage {
             previous,
             txid,
         )?;
+        if let RuleMetadataChange::Schema { old, new } = change {
+            let count = owners.dependencies.pending[dependency_slot as usize].count;
+            rename_dependency_schema(owners.dependencies.image_mut(
+                self.stored_query_dependency_pending_base + dependency_slot as usize,
+                count, self.stored_query_dependencies_per_image,
+            ), old, new);
+        }
         owners.catalog.rules[slot].pending = Some(PendingRuleDefinition {
             txid,
             version,

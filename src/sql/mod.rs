@@ -7252,7 +7252,9 @@ impl Engine {
                     self.storage.commit_schema_create(*slot as usize);
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
-                DdlUndo::SchemaRenamed { .. } => {}
+                DdlUndo::SchemaRenamed(undo) => self.storage.finish_schema_name(
+                    *undo, crate::storage::CatalogDdlDecision::Commit,
+                ).expect("schema publication retains its selected source"),
                 DdlUndo::ExtensionCreated(slot) => self
                     .storage
                     .commit_extension_create(*slot as usize, txn.txid),
@@ -20207,9 +20209,9 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         }
         DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
         DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
-        DdlUndo::SchemaRenamed { slot, prior } => {
-            let _ = storage.rename_schema(slot as usize, prior);
-        }
+        DdlUndo::SchemaRenamed(undo) => storage.finish_schema_name(
+            undo, crate::storage::CatalogDdlDecision::Rollback,
+        ).expect("schema rollback retains its selected source"),
         DdlUndo::ExtensionCreated(slot) => storage.rollback_extension_create(slot as usize),
         DdlUndo::ExtensionDropped(slot) => storage.rollback_extension_drop(slot as usize, txid),
         DdlUndo::ExtensionAltered { slot, prior } => {

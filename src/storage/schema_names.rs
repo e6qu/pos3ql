@@ -12,7 +12,7 @@ pub(super) struct PendingSchemaName {
     pub(super) name: SqlName,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SchemaNameTarget {
     origin: CatalogOrigin,
     database: DatabaseOid,
@@ -24,7 +24,7 @@ pub(crate) struct SchemaNameTarget {
     name: SqlName,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SchemaNameUndo {
     target: SchemaNameTarget,
     prior: Option<PendingSchemaName>,
@@ -32,13 +32,75 @@ pub(crate) struct SchemaNameUndo {
 
 impl SchemaNameTarget {
     pub(crate) fn name(self) -> SqlName { self.name }
-}
 
-impl SchemaNameUndo {
-    pub(crate) fn slot(self) -> usize { self.target.slot }
+    pub(crate) fn rewrites_rule(self, name: SqlName, definition: super::RuleDefinition) -> Result<bool, SqlError> {
+        let mut changed = definition;
+        super::rename_schema_path(&mut changed.creation_path, self.name, name)?;
+        changed.rename_schema(self.name, name)?;
+        Ok(definition.source != changed.source || definition.creation_path != changed.creation_path)
+    }
+
+    pub(crate) fn rewrite_table(self, name: SqlName, definition: &mut super::TableDef) -> Result<bool, SqlError> {
+        let mut changed = super::rename_schema_name(&mut definition.schema, self.name, name);
+        for column in definition.columns.iter_mut().take(definition.n_columns) {
+            changed |= super::rename_user_type_schema(&mut column.user_type, self.name, name);
+        }
+        for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
+            changed |= super::rename_schema_name(&mut key.parent_schema, self.name, name);
+        }
+        changed |= super::rename_table_sql_identity(definition, self.name, name)?;
+        Ok(changed)
+    }
+
+    pub(crate) fn rewrite_routine(self, name: SqlName, definition: &mut super::RoutineDefinition) -> Result<bool, SqlError> {
+        let mut changed = false;
+        for argument in definition.arguments.iter_mut().take(definition.argument_count) {
+            changed |= super::rename_user_type_schema(&mut argument.user_type, self.name, name);
+        }
+        for parameter in definition.parameters.iter_mut().take(definition.parameter_count) {
+            changed |= super::rename_user_type_schema(&mut parameter.user_type, self.name, name);
+        }
+        for result in definition.result_columns.iter_mut().take(definition.result_column_count) {
+            changed |= super::rename_user_type_schema(&mut result.user_type, self.name, name);
+        }
+        changed |= super::rename_routine_kind_schema(&mut definition.kind, self.name, name);
+        if definition.body_kind != super::RoutineBodyKind::String {
+            let path = definition.creation_path;
+            super::rename_schema_path(&mut definition.creation_path, self.name, name)?;
+            changed |= path != definition.creation_path;
+            changed |= super::rename_schema_qualified_sql(&mut definition.body, &mut [], self.name, name)?;
+        }
+        Ok(changed)
+    }
 }
 
 impl Storage {
+    pub(crate) fn stage_schema_comment_name(
+        &self, slot: usize, old: SqlName, new: SqlName, transaction: u32,
+    ) -> Result<Option<Option<super::PendingCommentIdentity>>, SqlError> {
+        let mut comments = self.comment_catalog();
+        let comment = &comments.entries[slot];
+        if !comment.used || comment.database != Some(current_database()) { return Ok(None); }
+        let identity = comment.pending_identity.filter(|identity| identity.txid == transaction);
+        let mut schema = identity.map_or(comment.schema, |identity| identity.schema);
+        let mut name = identity.map_or(comment.name, |identity| identity.name);
+        let mut changed = super::rename_schema_name(&mut schema, old, new);
+        if comment.class == super::CommentClass::Schema {
+            changed |= super::rename_schema_name(&mut name, old, new);
+        }
+        if !changed { return Ok(None); }
+        if comment.pending_identity.is_some_and(|identity| identity.txid != transaction)
+            || comment.pending.is_some_and(|pending| pending.txid != transaction) {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE,
+                "schema comment identity belongs to another transaction"));
+        }
+        let prior = comment.pending_identity;
+        comments.entries[slot].pending_identity = Some(super::PendingCommentIdentity {
+            txid: transaction, schema, name,
+        });
+        Ok(Some(prior))
+    }
+
     pub(crate) fn prepare_schema_name(&self, slot: usize, transaction: u32) -> Result<SchemaNameTarget, SqlError> {
         if transaction == 0 {
             return Err(sql_err!(sqlstate::NO_ACTIVE_SQL_TRANSACTION, "schema name edit requires an active transaction"));

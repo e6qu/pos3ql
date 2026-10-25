@@ -86,6 +86,18 @@ impl TableStatisticsOwner {
             .is_some_and(|identity| identity.get() == created_at)
     }
 
+    pub(super) fn mark_index_created(&self, created_at: u64) {
+        let identity = NonZeroU64::new(created_at).expect("published table creation identity");
+        let mut state = self.write();
+        if state.has_index_at != Some(identity) {
+            // Receipts compare this lifetime-tagged field as well as revision.
+            // VACUUM advances revision before clearing it, preventing ABA.
+            state.has_index_at = Some(identity);
+            state.dirty = true;
+            state.wal_dirty = true;
+        }
+    }
+
     pub(super) fn set_index_hint(
         &self,
         created_at: u64,
@@ -191,12 +203,13 @@ impl StatisticsVersions {
 struct RelationStatisticsReceipt {
     state: Arc<RwLock<StatisticsState>>,
     revision: u64,
+    has_index_at: Option<NonZeroU64>,
 }
 
 impl RelationStatisticsReceipt {
     fn acknowledge(self) {
         let mut state = self.state.write().expect("table statistics lock poisoned");
-        if state.relation_revision == self.revision {
+        if state.relation_revision == self.revision && state.has_index_at == self.has_index_at {
             state.wal_dirty = false;
         }
     }
@@ -292,6 +305,7 @@ impl StatisticsReceiptLease {
         let receipt = RelationStatisticsReceipt {
             state: Arc::clone(&image.receipt.state),
             revision: image.receipt.revision,
+            has_index_at: image.receipt.has_index_at,
         };
         self.pool.slots[self.slot]
             .lock()
@@ -339,6 +353,52 @@ fn clear_pending(state: &mut StatisticsState, versions: &mut FixedVec<PendingTab
 }
 
 impl Storage {
+    pub(super) fn relation_catalog_tuple_is_private(&self, table: usize, transaction: u32) -> bool {
+        if transaction == 0 {
+            return false;
+        }
+        {
+            let definition = self.tables[table].definition.read();
+            if matches!(definition.identity.existence, super::CatalogDdlState::PendingCreate { txid } | super::CatalogDdlState::PendingCreateDrop { txid } if txid == transaction)
+                || self
+                    .pending_table_defs
+                    .latest_locked(&definition)
+                    .is_some_and(|pending| {
+                        pending.txid == transaction && pending.class_tuple_private
+                    })
+            {
+                return true;
+            }
+        }
+        let object = self.table_access_object(table, transaction);
+        if self
+            .ownership(object)
+            .pending
+            .is_some_and(|pending| pending.txid == transaction)
+        {
+            return true;
+        }
+        if object.class == super::AccessClass::MaterializedView
+            && self
+                .matview(usize::from(object.slot))
+                .pending_population
+                .is_some_and(|pending| pending.transaction == transaction)
+        {
+            return true;
+        }
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects
+            .iter()
+            .any(|entry| {
+                entry.object == object
+                    && entry
+                        .pending
+                        .is_some_and(|pending| pending.txid == transaction)
+            })
+    }
+
     pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
         let state = self.tables[table_slot].statistics.read();
         let mut image = state.committed;
@@ -410,6 +470,7 @@ impl Storage {
             receipt: RelationStatisticsReceipt {
                 state: Arc::clone(&self.tables[table_slot].statistics.state),
                 revision: state.relation_revision,
+                has_index_at: state.has_index_at,
             },
         })
     }
@@ -586,10 +647,37 @@ impl Storage {
         }
     }
 
-    pub(crate) fn relation_has_index(&self, position: CatalogPosition) -> bool {
-        self.tables[position.slot()]
+    pub(crate) fn relation_has_index(&self, position: CatalogPosition, transaction: u32) -> bool {
+        if self.tables[position.slot()]
             .statistics
             .has_index(position.created_at())
+        {
+            return true;
+        }
+        if transaction == 0 {
+            return false;
+        }
+        let (definition, indexes) = super::row_ownership::acquire(|| {
+            Ok((
+                self.tables[position.slot()]
+                    .definition
+                    .try_read_for_batch()?,
+                super::row_ownership::try_mutex(
+                    &self.index_catalog,
+                    "index catalog lock poisoned",
+                )?,
+            ))
+        });
+        let identity = definition.identity;
+        indexes.iter().any(|index| {
+            index.database == identity.database
+                && matches!(index.ddl_state,
+                    super::CatalogDdlState::PendingCreate { txid } | super::CatalogDdlState::PendingCreateDrop { txid } if txid == transaction)
+                && index.table_binding.is_some_and(|binding| {
+                    binding.source.slot() == super::catalog_sources::CatalogObjectSlot::Table(position.slot())
+                        && binding.source.matches_lifetime(self, identity.database, position.created_at(), identity.existence)
+                })
+        })
     }
 
     pub(crate) fn vacuum_relation_index_hint(&self, table_slot: usize) -> Result<(), SqlError> {
@@ -715,12 +803,21 @@ mod tests {
             receipt.retain_image(&captured).unwrap();
             storage.vacuum_relation_index_hint(table).unwrap();
             receipt.acknowledge();
-            assert!(!storage.relation_has_index(position));
+            assert!(!storage.relation_has_index(position, 0));
             assert!(storage.statistics_wal_dirty(table));
+            drop(receipt);
+            let captured = storage.capture_statistics_for_wal(table, 7).unwrap();
+            assert!(!captured.has_index);
+            let receipt = receipts.retain().unwrap();
+            receipt.retain_image(&captured).unwrap();
+            let checkpoint = storage.capture_checkpoint_statistics(table);
             storage.tables[table]
                 .statistics
-                .set_index_hint(position.created_at(), true, true)
-                .unwrap();
+                .mark_index_created(position.created_at());
+            receipt.acknowledge();
+            checkpoint.acknowledge(&storage);
+            assert!(storage.statistics_wal_dirty(table));
+            assert!(storage.statistics_dirty());
             let checkpoint = storage.capture_checkpoint_statistics(table);
             storage.vacuum_relation_index_hint(table).unwrap();
             checkpoint.acknowledge(&storage);
@@ -737,7 +834,7 @@ mod tests {
                 ))
                 .unwrap();
             assert_eq!(replacement, table);
-            assert!(!storage.relation_has_index(storage.table_position(replacement)));
+            assert!(!storage.relation_has_index(storage.table_position(replacement), 0));
             assert!(
                 storage
                     .replay_relation_index_hint(position, true, 0)
@@ -747,7 +844,7 @@ mod tests {
             storage
                 .replay_relation_index_hint(current, true, 0)
                 .unwrap();
-            assert!(storage.relation_has_index(current));
+            assert!(storage.relation_has_index(current, 0));
             storage.tables[table].statistics.write().relation_revision = u64::MAX;
             let error = storage.tables[table]
                 .statistics
@@ -758,7 +855,7 @@ mod tests {
                 error.message.as_str(),
                 "table statistics relation revision is exhausted"
             );
-            assert!(storage.relation_has_index(current));
+            assert!(storage.relation_has_index(current, 0));
         });
     }
 

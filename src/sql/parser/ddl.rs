@@ -5878,6 +5878,17 @@ impl<'a> Parser<'a> {
         let _ = self.query_select()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
+        if self.eat_ident("with")? {
+            let option = if self.eat_ident("local")? {
+                crate::sql::ast::ViewCheckOption::Local
+            } else {
+                let _ = self.eat_ident("cascaded")?;
+                crate::sql::ast::ViewCheckOption::Cascaded
+            };
+            self.expect_ident("check")?;
+            self.expect_ident("option")?;
+            check_option = Some(option);
+        }
         Ok(Stmt::CreateView {
             name,
             persistence,

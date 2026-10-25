@@ -1137,16 +1137,59 @@ whole-statement catalog capture or SQL execution on several CPU workers.
 
 With `transaction_mode = mvcc`, catalog listings retain the rows selected by
 their statement or transaction. A read-committed statement can select newer
-rows; a repeatable-read transaction keeps its earlier listing. `pg_tables`,
-`pg_roles`, `information_schema.tables` and `information_schema.columns` build
-their results from those selected base rows. Remaining derived views are
-tracked in [PLAN.md](../PLAN.md).
+rows; a repeatable-read transaction keeps its earlier listing. These reports
+build their results by joining the selected base rows:
+
+- `pg_tables`, `pg_roles`, `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
+- `information_schema.tables`, `columns`, `views`, `sequences`,
+  `view_table_usage` and `view_column_usage`.
+
+Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
+
+Object listings use the PostgreSQL metadata inventory independently of which
+catalog row queries are implemented. For example, `pg_statistic` appears in
+`pg_class` and resolves through `to_regclass`, while reading its raw rows fails
+explicitly with `0A000` (unsupported feature).
 
 **User example:** start a repeatable-read report listing `orders`. Another
 connection renames it to `sales` and commits. The report can still list
 `orders`, while `to_regclass('sales')` resolves the current name. An owner's
 displayed account name can also change after that account is renamed. Listing
 an old definition and resolving an object for use are different operations.
+
+`pg_get_viewdef` and `pg_get_ruledef` read the selected rule text. For example,
+replace a view's `SELECT 1 AS value` with `SELECT 2 AS value` in another
+connection. An older repeatable-read report can still show the definition
+containing 1, while executing `SELECT * FROM the_view` returns 2. This follows
+[PostgreSQL's rule lookups](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
+Retained rule text uses the existing catalog-history reservation; its internal
+fields are unavailable as SQL columns.
+If another connection drops the view, that older report can instead fail with
+`XX000`: the selected rule still exists in its snapshot, but the relation needed
+to print it no longer exists. A fresh read-committed listing omits the view,
+and looking up its old identifier with `pg_get_viewdef` returns NULL.
+
+The same report can keep a view's old name and check option, a materialized
+view's selected index and population flags, and a sequence's earlier increment.
+The sequence's latest value and its access checks remain current. For example,
+after another connection changes an increment from 2 to 5, an older
+`pg_sequences` listing can still show 2 while `last_value` reflects a later call
+to `nextval`.
+
+Information-schema reports apply current access checks. A user with SELECT on
+someone else's view can list it, but its definition is NULL unless its owner
+role is enabled. View dependencies list referenced tables and columns only
+when their owner role is enabled, and repeated references produce one output
+row. Identity sequences are excluded from `information_schema.sequences`.
+Permission checks keep numeric relation identifiers through lookup, including
+objects outside the search path that share a name with another schema's object.
+These joins and permission rules follow the pinned
+[PostgreSQL definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
+
+`pg_sequences.data_type` has type `regtype`; information-schema names have type
+`name`, and its textual details have type `character varying`. System view
+definitions come from retained PostgreSQL 18.6 metadata, with provenance in the
+generated source. The PostgreSQL comparison checks those definitions on each run.
 
 Set `catalog_history_bytes` explicitly before startup; `16MiB` is one example
 for MVCC mode. It reserves space for earlier catalog rows. A full reservation
@@ -1218,6 +1261,11 @@ estimates unless `ANALYZE` was requested. A table's `relhasindex` flag can remai
 true after an index is dropped or its creation is rolled back. `pg_index` lists
 the actual visible indexes; `VACUUM` clears the flag when none remain. The flag
 belongs to the table's lifetime and cannot leak to a replacement table.
+An earlier table rename gives the transaction a private catalog row. Creating
+an index then changes only that private row; rolling back restores the old flag.
+This remains true if the transaction renames the table back before creating
+the index. Without that prior edit, PostgreSQL updates the existing flag in
+place, so other connections can see it before commit and after rollback.
 
 **User example:** after `DROP INDEX orders_lookup`, a catalog query can still
 show `relhasindex = true` for `orders`. Running `VACUUM orders` clears it when
@@ -1226,8 +1274,8 @@ with empty caches preserves the saved flag and estimate. An unresolved prepared
 `ANALYZE` restores its relation counts while its column estimates remain private.
 
 Journal capture copies the visible estimates and records the exact relation-count
-revision from the same cell. Acknowledgement clears that captured revision's
-pending marker; a newer revision remains pending. Reused table slots preserve
+revision and index flag from the same cell. Acknowledgement clears the pending
+marker only when both still match; a newer count or flag remains pending. Reused table slots preserve
 revision identities, and an owned receipt cannot redirect to another Storage
 instance. Each query workspace reserves receipts for every physical table at
 startup. Full or already retained workspaces return `54000`; cancellation and

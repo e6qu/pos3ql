@@ -810,6 +810,7 @@ mod tests {
             transition: [u16::MAX; MAX_COLUMNS],
             column_mapping: [None; MAX_COLUMNS],
             rewrites_rows: false,
+            class_tuple_private: true,
         }
     }
 

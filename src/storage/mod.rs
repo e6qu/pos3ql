@@ -243,13 +243,6 @@ impl ColumnSet {
             })
     }
 
-    pub(crate) fn fits(self, columns: usize) -> bool {
-        if columns >= MAX_COLUMNS {
-            return true;
-        }
-        (columns..MAX_COLUMNS).all(|column| !self.contains(column))
-    }
-
     pub(crate) fn union_with(&mut self, other: Self) {
         for (target, source) in self.words.iter_mut().zip(other.words) {
             *target |= source;
@@ -3989,6 +3982,7 @@ struct PendingTableDef {
     /// Every visible row was re-homed into the heap under this definition, so
     /// the committed spill list becomes obsolete when this version commits.
     pub rewrites_rows: bool,
+    pub class_tuple_private: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -20913,7 +20907,7 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.table_statistics(source_slot, 0);
                 let has_index =
-                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?);
+                    self.relation_has_index(CatalogPosition::new(source_slot, created_at)?, 0);
                 let serial_values = self.table_serial_values(source_slot);
                 let target_slot = table_creation::allocate(
                     self,
@@ -26342,12 +26336,16 @@ impl Storage {
         let Some(current) = self.current_role_slot(txid) else {
             return false;
         };
-        if self.role(current).attributes_to(txid).superuser {
+        self.role_has_privileges_of(current, usize::from(role), txid)
+    }
+
+    pub(crate) fn role_has_privileges_of(&self, member: usize, target: usize, txid: u32) -> bool {
+        if self.role(member).attributes_to(txid).superuser {
             return true;
         }
         let mut roles = self.role_graph_scratch();
-        self.reachable_roles(current, txid, true, false, &mut roles);
-        roles.get(role as usize).copied().unwrap_or(false)
+        self.reachable_roles(member, txid, true, false, &mut roles);
+        roles.get(target).copied().unwrap_or(false)
     }
 
     pub(crate) fn has_object_privilege(
@@ -35082,7 +35080,13 @@ impl Storage {
             table_index,
             Some(txid),
             key_preparation::EnforcerRows::ReusePrepared,
-        )
+        )?;
+        if !self.relation_catalog_tuple_is_private(table_index, txid) {
+            self.tables[table_index]
+                .statistics
+                .mark_index_created(self.tables[table_index].identity().created_at);
+        }
+        Ok(())
     }
 
     fn refresh_enforcers_visible(
@@ -35455,11 +35459,13 @@ impl Storage {
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
-                self.tables[table_index].statistics.set_index_hint(
-                    definition.identity.created_at,
-                    true,
-                    true,
-                )?;
+                if txid.is_none() {
+                    self.tables[table_index].statistics.set_index_hint(
+                        definition.identity.created_at,
+                        true,
+                        true,
+                    )?;
+                }
                 publication.enforcers = candidate;
                 publication.n_enforcers = n_want;
                 return Ok(());
@@ -35529,11 +35535,13 @@ impl Storage {
                 "table changed while its value caches were being built"
             ));
         }
-        self.tables[table_index].statistics.set_index_hint(
-            definition.identity.created_at,
-            true,
-            true,
-        )?;
+        if txid.is_none() {
+            self.tables[table_index].statistics.set_index_hint(
+                definition.identity.created_at,
+                true,
+                true,
+            )?;
+        }
         publication.enforcers = candidate;
         publication.n_enforcers = n_want;
         Ok(())
@@ -38855,35 +38863,6 @@ impl Storage {
             value.dirty,
             value.generation,
         )
-    }
-
-    pub(crate) fn sequence_catalog_image_for(
-        &self,
-        slot: usize,
-        txid: u32,
-    ) -> Option<(SequenceDef, i64, bool, i64, bool, u64)> {
-        let catalog = self.sequence_catalog();
-        let sequence = catalog.definitions[slot];
-        if sequence.database != current_database() || !sequence.visible_to(txid) {
-            return None;
-        }
-        let pending = sequence
-            .pending_definition
-            .is_some_and(|pending| pending.txid == txid);
-        let definition = sequence.definition_for(txid);
-        let value = if pending {
-            catalog.values[slot].pending
-        } else {
-            catalog.values[slot].committed
-        };
-        Some((
-            definition,
-            value.last_value,
-            value.is_called,
-            value.log_count,
-            value.dirty,
-            value.generation,
-        ))
     }
 
     pub(crate) fn sequence_value_for(&self, slot: usize, txid: u32) -> (i64, bool) {
@@ -45763,6 +45742,11 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
     pub fn commit_index_create(&mut self, slot: usize) {
+        if let Some(table) = self.index_table_slot(slot) {
+            self.tables[table]
+                .statistics
+                .mark_index_created(self.tables[table].identity().created_at);
+        }
         {
             let mut catalog = self.index_catalog();
             catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
@@ -49693,6 +49677,12 @@ impl Storage {
         self.view_rule_catalog().rules[slot]
     }
 
+    pub(crate) fn rule_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.view_rule_catalog().rules.iter().position(|rule| {
+            rule.database == current_database() && rule.visible_to(txid) && rule.oid() == oid
+        })
+    }
+
     pub(crate) fn rule_dependencies(
         &self,
         slot: usize,
@@ -50206,7 +50196,9 @@ impl Storage {
                 || occupied.ddl_state != CatalogDdlState::Present
                 || occupied.pending.is_some()
                 || occupied.definition.target != definition.target
-                || occupied.definition.name != definition.name)
+                || (occupied.definition.name != definition.name
+                    && (occupied.definition.name.as_str() == "_RETURN"
+                        || definition.name.as_str() == "_RETURN")))
         {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
@@ -55177,6 +55169,28 @@ mod tests {
             );
             assert!(storage.rule_dependencies(1, 0).entries().is_empty());
             assert!(storage.table_has_rules(table, 0));
+            let renamed = RuleDefinition {
+                name: SqlName::parse("renamed_rule").unwrap(),
+                ..definition
+            };
+            storage
+                .replay_rule(1, 42, renamed, StoredQueryDependencies::EMPTY)
+                .unwrap();
+            assert_eq!(storage.rule(1).definition.name.as_str(), "renamed_rule");
+            let invalid_return = RuleDefinition {
+                name: SqlName::parse("renamed_return").unwrap(),
+                target: RuleTarget::View(0),
+                ..definition
+            };
+            assert_eq!(
+                storage
+                    .replay_rule(0, 8, invalid_return, StoredQueryDependencies::EMPTY)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.view_return_rule(0), 0);
+            assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
         });
     }
 

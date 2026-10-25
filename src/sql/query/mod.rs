@@ -22,8 +22,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, SequenceAccess, SqlError, SubqueryValues, eval_full,
-    resolved_expression_collation, sqlstate,
+    ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError, SubqueryValues,
+    eval_full, resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
@@ -77,14 +77,15 @@ pub use cte::{
     rewrite_view_dml,
 };
 
-pub fn stored_query_dependencies(
+pub(crate) fn stored_query_dependencies(
     sql: &str,
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
+    bindings: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
-    dependencies::collect(sql, storage, txid, path, arena)
+    dependencies::collect(sql, storage, txid, path, bindings, arena)
 }
 
 pub(crate) fn stored_routine_dependencies(
@@ -3325,15 +3326,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_table_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let object = match self.storage.resolve_relation(schema, name, self.txid) {
+        let object = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 self.storage.table_access_object(slot, self.txid)
             }
@@ -3342,12 +3342,48 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 slot: slot as u16,
             },
             Some(crate::storage::ResolvedRelation::Catalog) => {
+                let name = match relation {
+                    PrivilegeRelation::Name(name) => split_catalog_name(name).1,
+                    PrivilegeRelation::Oid(oid) => super::catalog::catalog_relation_name(oid)
+                        .expect("catalog identity was resolved"),
+                };
+                // PostgreSQL 18.6 system_views.sql revokes PUBLIC access to
+                // these views; initdb also protects pg_authid/pg_largeobject.
+                let public_select = !matches!(
+                    name,
+                    "pg_authid"
+                        | "pg_largeobject"
+                        | "pg_shadow"
+                        | "pg_statistic"
+                        | "pg_statistic_ext_data"
+                        | "pg_file_settings"
+                        | "pg_hba_file_rules"
+                        | "pg_ident_file_mappings"
+                        | "pg_config"
+                        | "pg_shmem_allocations"
+                        | "pg_shmem_allocations_numa"
+                        | "pg_backend_memory_contexts"
+                        | "pg_user_mapping"
+                        | "pg_replication_origin_status"
+                        | "pg_subscription"
+                        | "pg_aios"
+                );
+                let owned = self
+                    .storage
+                    .role_slot_by_oid(10, self.txid)
+                    .is_some_and(|owner| {
+                        self.storage.role_has_privileges_of(role, owner, self.txid)
+                    });
                 return privilege_query(
                     privileges,
-                    crate::storage::PrivilegeSet::SELECT,
+                    if public_select {
+                        crate::storage::PrivilegeSet::SELECT
+                    } else {
+                        crate::storage::PrivilegeSet::NONE
+                    },
                     crate::storage::PrivilegeSet::TABLE_ALL,
-                    |_| false,
-                    |_| false,
+                    |_| owned,
+                    |_| owned,
                 )
                 .map(Some);
             }
@@ -3372,7 +3408,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_column_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         column: super::eval::PrivilegeColumn<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
@@ -3380,8 +3416,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let (object, column) = match self.storage.resolve_relation(schema, name, self.txid) {
+        let (object, column) = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 let column = match column {
@@ -3448,15 +3483,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_any_column_privilege(
         &self,
         role: Option<&str>,
-        relation: &str,
+        relation: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(relation);
-        let (object, columns) = match self.storage.resolve_relation(schema, name, self.txid) {
+        let (object, columns) = match privilege_relation(self.storage, self.txid, relation) {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 (
@@ -3523,15 +3557,27 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_sequence_privilege(
         &self,
         role: Option<&str>,
-        sequence: &str,
+        sequence: PrivilegeRelation<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (schema, name) = split_catalog_name(sequence);
-        let Some(slot) = self.storage.sequence_on_path(schema, name, self.txid) else {
+        let slot = match sequence {
+            PrivilegeRelation::Name(sequence) => {
+                let (schema, name) = split_catalog_name(sequence);
+                self.storage.sequence_on_path(schema, name, self.txid)
+            }
+            PrivilegeRelation::Oid(oid) => oid
+                .checked_sub(super::catalog::sequence_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| {
+                    *slot < self.storage.sequence_count()
+                        && self.storage.sequence_slot_visible_to(*slot, self.txid)
+                }),
+        };
+        let Some(slot) = slot else {
             return Ok(None);
         };
         let object = crate::storage::AccessObject {
@@ -4244,6 +4290,40 @@ pub(super) fn split_catalog_name(name: &str) -> (Option<&str>, &str) {
         .map_or((None, name), |(schema, object)| (Some(schema), object))
 }
 
+pub(super) fn privilege_relation(
+    storage: &Storage,
+    transaction: u32,
+    relation: PrivilegeRelation<'_>,
+) -> Option<crate::storage::ResolvedRelation> {
+    match relation {
+        PrivilegeRelation::Name(name) => {
+            let (schema, name) = split_catalog_name(name);
+            storage.resolve_relation(schema, name, transaction)
+        }
+        PrivilegeRelation::Oid(oid) => {
+            if super::catalog::catalog_relation_oid_by_oid(oid) {
+                return Some(crate::storage::ResolvedRelation::Catalog);
+            }
+            if let Some(slot) = oid
+                .checked_sub(super::catalog::user_table_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| {
+                    *slot < storage.table_count()
+                        && storage.table_slot_visible_to(*slot, transaction)
+                })
+            {
+                return Some(crate::storage::ResolvedRelation::Table(slot));
+            }
+            oid.checked_sub(super::catalog::view_oid(0))
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| {
+                    *slot < storage.view_count() && storage.view_slot_visible_to(*slot, transaction)
+                })
+                .map(crate::storage::ResolvedRelation::View)
+        }
+    }
+}
+
 fn privilege_role(storage: &Storage, role: Option<&str>, txid: u32) -> Option<usize> {
     match role {
         Some(role) => storage.find_role_visible(role, txid),
@@ -4258,59 +4338,64 @@ fn privilege_query(
     has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
     has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
 ) -> Result<bool, SqlError> {
-    let mut answer = true;
+    let mut answer = false;
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
-        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
-            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        let (name, grant_option) = if item
+            .get(item.len().saturating_sub(GRANT_OPTION.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
         {
             (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
         } else {
             (item, false)
         };
-        let privilege =
-            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
-                all
-            } else if name.eq_ignore_ascii_case("select") {
-                crate::storage::PrivilegeSet::SELECT
-            } else if name.eq_ignore_ascii_case("insert") {
-                crate::storage::PrivilegeSet::INSERT
-            } else if name.eq_ignore_ascii_case("update") {
-                crate::storage::PrivilegeSet::UPDATE
-            } else if name.eq_ignore_ascii_case("delete") {
-                crate::storage::PrivilegeSet::DELETE
-            } else if name.eq_ignore_ascii_case("truncate") {
-                crate::storage::PrivilegeSet::TRUNCATE
-            } else if name.eq_ignore_ascii_case("references") {
-                crate::storage::PrivilegeSet::REFERENCES
-            } else if name.eq_ignore_ascii_case("trigger") {
-                crate::storage::PrivilegeSet::TRIGGER
-            } else if name.eq_ignore_ascii_case("usage") {
-                crate::storage::PrivilegeSet::USAGE
-            } else if name.eq_ignore_ascii_case("create") {
-                crate::storage::PrivilegeSet::CREATE
-            } else if name.eq_ignore_ascii_case("execute") {
-                crate::storage::PrivilegeSet::EXECUTE
-            } else if name.eq_ignore_ascii_case("maintain") {
-                crate::storage::PrivilegeSet::MAINTAIN
-            } else if name.eq_ignore_ascii_case("connect") {
-                crate::storage::PrivilegeSet::CONNECT
-            } else if name.eq_ignore_ascii_case("temporary") || name.eq_ignore_ascii_case("temp") {
-                crate::storage::PrivilegeSet::TEMPORARY
-            } else {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "unrecognized privilege type: \"{}\"",
-                    name
-                ));
-            };
+        let privilege = if name.eq_ignore_ascii_case("select") {
+            crate::storage::PrivilegeSet::SELECT
+        } else if name.eq_ignore_ascii_case("insert") {
+            crate::storage::PrivilegeSet::INSERT
+        } else if name.eq_ignore_ascii_case("update") {
+            crate::storage::PrivilegeSet::UPDATE
+        } else if name.eq_ignore_ascii_case("delete") {
+            crate::storage::PrivilegeSet::DELETE
+        } else if name.eq_ignore_ascii_case("truncate") {
+            crate::storage::PrivilegeSet::TRUNCATE
+        } else if name.eq_ignore_ascii_case("references") {
+            crate::storage::PrivilegeSet::REFERENCES
+        } else if name.eq_ignore_ascii_case("trigger") {
+            crate::storage::PrivilegeSet::TRIGGER
+        } else if name.eq_ignore_ascii_case("usage") {
+            crate::storage::PrivilegeSet::USAGE
+        } else if name.eq_ignore_ascii_case("create") {
+            crate::storage::PrivilegeSet::CREATE
+        } else if name.eq_ignore_ascii_case("execute") {
+            crate::storage::PrivilegeSet::EXECUTE
+        } else if name.eq_ignore_ascii_case("maintain") {
+            crate::storage::PrivilegeSet::MAINTAIN
+        } else if name.eq_ignore_ascii_case("connect") {
+            crate::storage::PrivilegeSet::CONNECT
+        } else if name.eq_ignore_ascii_case("temporary") || name.eq_ignore_ascii_case("temp") {
+            crate::storage::PrivilegeSet::TEMPORARY
+        } else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized privilege type: \"{}\"",
+                name
+            ));
+        };
+        if !all.contains(privilege) {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized privilege type: \"{}\"",
+                name
+            ));
+        }
         let allowed = if grant_option {
             has_grant_option(privilege)
         } else {
             catalog_default.contains(privilege) || has_privilege(privilege)
         };
-        answer &= allowed;
+        answer |= allowed;
     }
     Ok(answer)
 }
@@ -4346,32 +4431,30 @@ fn parameter_privilege_query(
     has_privilege: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
     has_grant_option: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
 ) -> Result<bool, SqlError> {
-    let mut answer = true;
+    let mut answer = false;
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
-        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
-            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        let (name, grant_option) = if item
+            .get(item.len().saturating_sub(GRANT_OPTION.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
         {
             (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
         } else {
             (item, false)
         };
-        let privilege =
-            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
-                crate::sql::ast::ParameterPrivileges::ALL
-            } else if name.eq_ignore_ascii_case("set") {
-                crate::sql::ast::ParameterPrivileges::SET
-            } else if name.eq_ignore_ascii_case("alter system") {
-                crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM
-            } else {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "unrecognized privilege type: \"{}\"",
-                    name
-                ));
-            };
-        answer &= if grant_option {
+        let privilege = if name.eq_ignore_ascii_case("set") {
+            crate::sql::ast::ParameterPrivileges::SET
+        } else if name.eq_ignore_ascii_case("alter system") {
+            crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM
+        } else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized privilege type: \"{}\"",
+                name
+            ));
+        };
+        answer |= if grant_option {
             has_grant_option(privilege)
         } else {
             has_privilege(privilege)

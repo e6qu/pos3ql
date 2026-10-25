@@ -28065,7 +28065,7 @@ fn validate_policy_definition(
         }
     }
     let dependencies =
-        super::query::stored_query_dependencies(sql, storage, txid, storage.path(), arena)?;
+        super::query::stored_query_dependencies(sql, storage, txid, storage.path(), None, arena)?;
     if storage.table_def(table, txid).persistence != crate::storage::RelationPersistence::Temporary
         && stored_query_uses_temporary_relation(storage, dependencies.view(), txid)
     {
@@ -36299,6 +36299,7 @@ pub fn create_view(
         storage,
         txn.txid,
         path,
+        None,
         arena,
     ) {
         Ok(dependencies) => dependencies,
@@ -37228,9 +37229,21 @@ fn publish_rewritten_view(
         storage,
         txn.txid,
         path,
+        Some(query.dependencies.view()),
         arena,
     )?;
-    if rebound.entries() != query.dependencies.entries() {
+    let previous = query.dependencies.entries();
+    let current = rebound.entries();
+    if previous.len() != current.len()
+        || previous.iter().zip(current).any(|(old, new)| {
+            old.class != new.class
+                || old.slot != new.slot
+                || old.identity != new.identity
+                || old.referenced_columns != new.referenced_columns
+                || old.referenced_schema != new.referenced_schema
+                || old.referenced_name != new.referenced_name
+        })
+    {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "view column rename would change a dependent view binding"
@@ -39244,11 +39257,12 @@ pub fn create_table_as(
     let dependencies = if materialized {
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
-        let dependencies =
-            match super::query::stored_query_dependencies(sql, storage, txn.txid, path, arena) {
-                Ok(dependencies) => dependencies,
-                Err(error) => return sql_fail(error),
-            };
+        let dependencies = match super::query::stored_query_dependencies(
+            sql, storage, txn.txid, path, None, arena,
+        ) {
+            Ok(dependencies) => dependencies,
+            Err(error) => return sql_fail(error),
+        };
         if stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -46765,6 +46779,7 @@ fn rewrite_composite_dependent_views(
             storage,
             txn.txid,
             path,
+            Some(dependencies.view()),
             arena,
         )?;
         let undo = storage.replace_view_definition(

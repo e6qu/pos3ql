@@ -22015,6 +22015,8 @@ fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
 
 #[path = "catalog_derived_tests.rs"]
 mod catalog_derived_tests;
+#[path = "catalog_constraint_tests.rs"]
+mod catalog_constraint_tests;
 
 #[test]
 fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {

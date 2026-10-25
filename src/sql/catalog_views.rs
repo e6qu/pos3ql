@@ -28,6 +28,49 @@ pub(super) enum Base {
     Sequence,
     Rewrite,
     Trigger,
+    Constraint,
+    Index,
+}
+
+pub(super) fn indexes<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::CatalogRow;
+    let indexes = read.base(storage, Base::Index, transaction, arena)?;
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let tablespaces = Index::oid(read.base(storage, Base::Tablespace, transaction, arena)?, arena)?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let mut output = Output::new(arena);
+    for values in indexes.rows {
+        let index = CatalogRow { definition: indexes.def, values };
+        for relation in classes.matching((index.integer("indrelid")? as u32, 0)) {
+            let relation = CatalogRow { definition: classes.table.def, values: relation };
+            if !matches!(relation.character("relkind")?, b'r' | b'm' | b'p') { continue; }
+            for indexed in classes.matching((index.integer("indexrelid")? as u32, 0)) {
+                let indexed = CatalogRow { definition: classes.table.def, values: indexed };
+                if !matches!(indexed.character("relkind")?, b'i' | b'I') { continue; }
+                let definition = catalog.index_def(indexed.integer("oid")?, 0, arena)?
+                    .map_or(Datum::Null, Datum::Text);
+                for namespace in namespaces.left(Some((relation.integer("relnamespace")? as u32, 0))) {
+                    let namespace = namespace.map(|values| CatalogRow { definition: namespaces.table.def, values });
+                    for tablespace in tablespaces.left(Some((indexed.integer("reltablespace")? as u32, 0))) {
+                        let tablespace = tablespace.map(|values| CatalogRow { definition: tablespaces.table.def, values });
+                        output.push(&[
+                            namespace.map(|row| row.get("nspname")).transpose()?.unwrap_or(Datum::Null),
+                            relation.get("relname")?, indexed.get("relname")?,
+                            tablespace.map(|row| row.get("spcname")).transpose()?.unwrap_or(Datum::Null),
+                            definition,
+                        ])?;
+                    }
+                }
+            }
+        }
+    }
+    output.finish("pg_indexes", false)
 }
 
 impl Read {
@@ -51,6 +94,8 @@ impl Read {
             Base::Sequence => "pg_sequence",
             Base::Rewrite => "pg_rewrite",
             Base::Trigger => "pg_trigger",
+            Base::Constraint => "pg_constraint",
+            Base::Index => "pg_index",
         };
         match self {
             Self::Statement => super::synthesize(

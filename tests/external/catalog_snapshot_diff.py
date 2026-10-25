@@ -68,6 +68,90 @@ def connect(host, port, user, database):
     return connection
 
 
+def constraint_reports(reader, writer, isolation, prefix, record, record_outcome):
+    writer.execute("CREATE TABLE report_parent_diff(a integer,b integer,CONSTRAINT report_parent_key_diff PRIMARY KEY(a,b),CONSTRAINT report_positive_diff CHECK(b>0))")
+    writer.execute("CREATE TABLE report_child_diff(x integer,y integer,CONSTRAINT report_child_unique_diff UNIQUE NULLS NOT DISTINCT(x,y),CONSTRAINT report_parent_fk_diff FOREIGN KEY(x,y) REFERENCES report_parent_diff(b,a) DEFERRABLE INITIALLY DEFERRED)")
+    writer.execute("CREATE DOMAIN report_domain_diff AS integer NOT NULL CONSTRAINT report_domain_check_diff CHECK(VALUE>0)")
+    writer.execute("CREATE INDEX report_expression_diff ON report_child_diff((x+1)) INCLUDE(y)")
+    reports = (
+        ("table_constraints", "SELECT * FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name"),
+        ("key_column_usage", "SELECT * FROM information_schema.key_column_usage WHERE table_name IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY table_name,constraint_name,ordinal_position"),
+        ("constraint_column_usage", "SELECT * FROM information_schema.constraint_column_usage WHERE constraint_name LIKE 'report_%' ORDER BY table_name,column_name,constraint_name"),
+        ("constraint_table_usage", "SELECT * FROM information_schema.constraint_table_usage WHERE constraint_name LIKE 'report_%' ORDER BY table_name,constraint_name"),
+        ("referential_constraints", "SELECT * FROM information_schema.referential_constraints WHERE constraint_name='report_parent_fk_diff'"),
+        ("domain_constraints", "SELECT * FROM information_schema.domain_constraints WHERE domain_name IN ('report_domain_diff','report_renamed_domain_diff') ORDER BY constraint_name"),
+        ("check_constraints", "SELECT * FROM information_schema.check_constraints WHERE constraint_name LIKE 'report_%' ORDER BY constraint_name"),
+        ("indexes", "SELECT * FROM pg_indexes WHERE tablename IN ('report_parent_diff','report_child_diff','report_renamed_parent_diff','report_renamed_child_diff') ORDER BY indexname"),
+    )
+    try:
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.types.{name}", f"SELECT * FROM ({query}) report LIMIT 0")
+        record(writer, f"{prefix}.constraint.index_columns", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,false),pg_get_indexdef('report_expression_diff'::regclass,2,false),pg_get_indexdef('report_expression_diff'::regclass,3,false)")
+        writer.execute("CREATE SEQUENCE report_argument_diff")
+        writer.execute("BEGIN")
+        try:
+            for name, query in (
+                ("expression_null_relation", "SELECT pg_get_expr(conbin,NULL::oid) IS NULL FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_null_pretty", "SELECT pg_get_expr(conbin,conrelid,NULL::boolean) IS NULL FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_null_first", "SELECT pg_get_expr(NULL::pg_node_tree,nextval('report_argument_diff')::oid,false) IS NULL"),
+                ("expression_null_row", "SELECT pg_get_expr(conbin,nextval('report_argument_diff')::oid,false) IS NULL FROM pg_constraint WHERE conname='report_parent_key_diff'"),
+                ("expression_arguments_called", "SELECT last_value,is_called FROM report_argument_diff"),
+                ("expression_missing_relation", "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='report_positive_diff'"),
+                ("expression_invalid_input", "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)"),
+                ("index_negative_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,-1,false)"),
+                ("index_null_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,NULL::integer,false) IS NULL"),
+                ("index_null_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,NULL::boolean) IS NULL"),
+            ):
+                record_outcome(writer, f"{prefix}.constraint.deparse.{name}", query, ())
+        finally:
+            writer.execute("ROLLBACK")
+            writer.execute("DROP SEQUENCE report_argument_diff")
+
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        record(reader, f"{prefix}.constraint.listing.before", "SELECT table_name,constraint_name FROM information_schema.table_constraints WHERE table_name IN ('report_parent_diff','report_child_diff') ORDER BY table_name,constraint_name")
+        writer.execute("ALTER TABLE report_parent_diff RENAME TO report_renamed_parent_diff")
+        writer.execute("ALTER TABLE report_renamed_parent_diff RENAME b TO renamed_b")
+        writer.execute("ALTER TABLE report_child_diff RENAME TO report_renamed_child_diff")
+        writer.execute("ALTER DOMAIN report_domain_diff RENAME TO report_renamed_domain_diff")
+        for name, query in reports:
+            record_outcome(reader, f"{prefix}.constraint.selected.{name}", query, ())
+        reader.execute("COMMIT")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.fresh.{name}", query)
+
+        writer.execute("BEGIN")
+        writer.execute("SAVEPOINT report_before_edit")
+        writer.execute("ALTER TABLE report_renamed_child_diff RENAME TO report_child_diff")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.private.{name}", query)
+        writer.execute("ROLLBACK TO report_before_edit")
+        for name, query in reports:
+            record(writer, f"{prefix}.constraint.savepoint.{name}", query)
+        writer.execute("ROLLBACK")
+
+        writer.execute("CREATE ROLE report_reader_diff")
+        writer.execute("GRANT SELECT ON report_renamed_child_diff TO report_reader_diff")
+        reader.execute("SET ROLE report_reader_diff")
+        try:
+            for name, query in reports:
+                record(reader, f"{prefix}.constraint.select_only.{name}", query)
+            writer.execute("GRANT UPDATE(y) ON report_renamed_child_diff TO report_reader_diff")
+            for name, query in reports:
+                record(reader, f"{prefix}.constraint.column_writer.{name}", query)
+        finally:
+            reader.execute("RESET ROLE")
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE IF EXISTS report_child_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_renamed_child_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_parent_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS report_renamed_parent_diff CASCADE")
+        writer.execute("DROP DOMAIN IF EXISTS report_domain_diff CASCADE")
+        writer.execute("DROP DOMAIN IF EXISTS report_renamed_domain_diff CASCADE")
+        writer.execute("DROP ROLE IF EXISTS report_reader_diff")
+
+
 def transcript(reader, writer):
     observed = []
 
@@ -100,6 +184,7 @@ def transcript(reader, writer):
 
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
+        constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

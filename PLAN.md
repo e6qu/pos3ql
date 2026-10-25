@@ -48,6 +48,9 @@ Complete these remaining cases:
   PostgreSQL's column shapes, joins and current permission checks. The behavior
   guide identifies the connected table, column, view, rule, sequence and
   view-dependency reports and their current-lookup boundaries.
+  Check remaining constraint reports in another database and with SELECT-only
+  and column-writing roles. Preserve foreign-key column order, duplicate rows,
+  exact result types, and named memory-exhaustion errors.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

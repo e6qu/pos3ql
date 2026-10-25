@@ -88,7 +88,7 @@ impl ScalarMetadata {
     }
 }
 
-fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) -> bool {
+pub(super) fn owner_is_enabled(storage: &Storage, transaction: u32, owner: i32) -> bool {
     let Some(actor) = storage.current_role_slot(transaction) else {
         return false;
     };

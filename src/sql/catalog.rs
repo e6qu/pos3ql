@@ -36,6 +36,8 @@ mod views;
 
 #[path = "catalog_information.rs"]
 mod information;
+#[path = "catalog_constraints.rs"]
+mod constraints;
 
 #[path = "catalog_type_io.rs"]
 mod type_io;
@@ -8690,6 +8692,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "table_constraints"
                 | "key_column_usage"
                 | "constraint_column_usage"
+                | "constraint_table_usage"
                 | "referential_constraints"
                 | "table_privileges"
                 | "role_table_grants"
@@ -8893,6 +8896,8 @@ pub(crate) fn synthesize<'a>(
                     arena,
                 );
             }
+            "table_constraints" => return constraints::tables(storage, txid, views::Read::Statement, arena),
+            "constraint_table_usage" => return constraints::table_usage(storage, txid, views::Read::Statement, arena),
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -8926,6 +8931,7 @@ pub(crate) fn synthesize<'a>(
                 return views::sequences(storage, txid, views::Read::Statement, arena);
             }
             "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
+            "pg_indexes" => return views::indexes(storage, txid, views::Read::Statement, arena),
             "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
             _ => {}
         }
@@ -9189,7 +9195,7 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_stat_progress_copy") => empty_monitoring_view("pg_stat_progress_copy", arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => views::tables(storage, txid, views::Read::Current, arena),
-        (false, "pg_indexes") => pg_indexes(storage, txid, arena),
+        (false, "pg_indexes") => views::indexes(storage, txid, views::Read::Current, arena),
         (false, "pg_am") => pg_am(storage, txid, arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
@@ -9306,7 +9312,8 @@ pub(crate) fn synthesize_current<'a>(
         (true, "foreign_table_options") => info_foreign_table_options(storage, txid, arena),
         (true, "foreign_tables") => info_foreign_tables(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, txid, arena),
-        (true, "table_constraints") => info_table_constraints(storage, txid, arena),
+        (true, "table_constraints") => constraints::tables(storage, txid, views::Read::Current, arena),
+        (true, "constraint_table_usage") => constraints::table_usage(storage, txid, views::Read::Current, arena),
         (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
         (true, "constraint_column_usage") => info_constraint_column_usage(storage, txid, arena),
         (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
@@ -15917,6 +15924,20 @@ pub fn index_def_text<'a>(
     col: usize,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    let builtin = match oid {
+        2683 => Some((
+            "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)",
+            &["loid", "pageno"][..],
+        )),
+        2996 => Some((
+            "CREATE UNIQUE INDEX pg_largeobject_metadata_oid_index ON pg_catalog.pg_largeobject_metadata USING btree (oid)",
+            &["oid"][..],
+        )),
+        _ => None,
+    };
+    if let Some((definition, columns)) = builtin {
+        return Ok(if col == 0 { Some(definition) } else { columns.get(col - 1).copied() });
+    }
     let indices = collect_indexes(storage, txid, arena)?;
     for info in indices {
         if info.oid != oid {
@@ -29630,148 +29651,6 @@ fn pg_namespace<'a>(
     finish(def, &out[..n], arena)
 }
 
-/// `pg_indexes`: one row per index relation, with the full `CREATE INDEX`
-/// text PostgreSQL's view reconstructs. The same enumeration as `pg_class`'s
-/// index rows, so psql and this view can never disagree about what exists.
-fn pg_indexes<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_indexes", false);
-    let indices = collect_indexes(storage, txid, arena)?;
-    let out = arena
-        .alloc_slice_with(indices.len() + 2, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut n = 0;
-    for info in indices {
-        let table_def = storage.table_def(info.table_slot, txid);
-        let mut indexdef = StackStr::<896>::new();
-        {
-            use core::fmt::Write as _;
-            let _ = write!(
-                indexdef,
-                "CREATE {}INDEX ",
-                if info.is_unique { "UNIQUE " } else { "" },
-            );
-            write_identifier(&mut indexdef, info.name.as_str());
-            write_index_target(&mut indexdef, &table_def, info);
-            let _ = write!(
-                indexdef,
-                " USING {} (",
-                if info.is_exclusion {
-                    "gist"
-                } else {
-                    info.method.name()
-                }
-            );
-            for k in 0..info.n_cols {
-                if k > 0 {
-                    let _ = indexdef.write_str(", ");
-                }
-                if let Some(expression) = index_expression_source(storage, info, k, txid) {
-                    let _ = indexdef.write_str(expression.as_str());
-                } else {
-                    write_identifier(
-                        &mut indexdef,
-                        table_def.columns()[info.columns[k] as usize].name.as_str(),
-                    );
-                }
-                write_index_key_metadata(&mut indexdef, storage, txid, info, k);
-                if info.descending[k] {
-                    let _ = indexdef.write_str(" DESC");
-                }
-                if info.nulls_first[k] != info.descending[k] {
-                    let _ = indexdef.write_str(if info.nulls_first[k] {
-                        " NULLS FIRST"
-                    } else {
-                        " NULLS LAST"
-                    });
-                }
-            }
-            let _ = indexdef.write_str(")");
-            if info.n_include_cols != 0 {
-                let _ = indexdef.write_str(" INCLUDE (");
-                for k in 0..info.n_include_cols {
-                    if k > 0 {
-                        let _ = indexdef.write_str(", ");
-                    }
-                    write_identifier(
-                        &mut indexdef,
-                        table_def.columns()[info.include_columns[k] as usize]
-                            .name
-                            .as_str(),
-                    );
-                }
-                let _ = indexdef.write_str(")");
-            }
-            if info.nulls_not_distinct {
-                let _ = indexdef.write_str(" NULLS NOT DISTINCT");
-            }
-            write_index_storage_options(&mut indexdef, info.explicit_definition);
-            if let Some(predicate) = info.predicate {
-                let _ = write!(indexdef, " WHERE {}", predicate.as_str());
-            }
-        }
-        out[n] = row(
-            &[
-                text(
-                    arena
-                        .alloc_str(table_def.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(table_def.name.as_str(), arena)?,
-                text(
-                    arena
-                        .alloc_str(info.name.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                match info.explicit_definition.and_then(|definition| {
-                    (definition.tablespace != 0)
-                        .then(|| storage.tablespace_name(definition.tablespace, txid))
-                        .flatten()
-                }) {
-                    Some(name) => text(name.as_str(), arena)?,
-                    None => Datum::Null,
-                },
-                text(
-                    alloc_rendered(&indexdef, "index definition is too long", arena)?,
-                    arena,
-                )?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    for (table_name, index_name, definition) in [
-        (
-            "pg_largeobject",
-            "pg_largeobject_loid_pn_index",
-            "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)",
-        ),
-        (
-            "pg_largeobject_metadata",
-            "pg_largeobject_metadata_oid_index",
-            "CREATE UNIQUE INDEX pg_largeobject_metadata_oid_index ON pg_catalog.pg_largeobject_metadata USING btree (oid)",
-        ),
-    ] {
-        out[n] = row(
-            &[
-                text("pg_catalog", arena)?,
-                text(table_name, arena)?,
-                text(index_name, arena)?,
-                Datum::Null,
-                text(definition, arena)?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
-
 fn pg_group<'a>(
     storage: &Storage,
     txid: u32,
@@ -31139,136 +31018,6 @@ fn view_column_catalog_type(
             oid
         )
     })
-}
-
-fn info_table_constraints<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("table_constraints", true);
-    let per_table = crate::storage::MAX_COLUMNS * 2
-        + crate::storage::MAX_UNIQUES
-        + crate::storage::MAX_CHECKS
-        + crate::storage::MAX_FKEYS;
-    let output = arena
-        .alloc_slice_with(storage.table_count().saturating_mul(per_table), |_| &[][..])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |name: &str,
-                      kind: &str,
-                      nulls_distinct: Option<&str>,
-                      timing: crate::storage::ConstraintTiming,
-                      validation: crate::storage::ConstraintValidation,
-                      table: &TableDef|
-     -> Result<(), SqlError> {
-        if count == output.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table_constraints exceeds static capacity"
-            ));
-        }
-        output[count] = row(
-            &[
-                text("postgres", arena)?,
-                text(table.schema.as_str(), arena)?,
-                text(name, arena)?,
-                text("postgres", arena)?,
-                text(table.schema.as_str(), arena)?,
-                text(table.name.as_str(), arena)?,
-                text(kind, arena)?,
-                text(if timing.is_deferrable() { "YES" } else { "NO" }, arena)?,
-                text(
-                    if timing.initially_deferred() {
-                        "YES"
-                    } else {
-                        "NO"
-                    },
-                    arena,
-                )?,
-                text(if validation.enforced() { "YES" } else { "NO" }, arena)?,
-                nulls_distinct.map_or(Ok(Datum::Null), |value| text(value, arena))?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        for column in table.columns() {
-            if column.primary {
-                let name = inline_primary_constraint_name(&table);
-                append(
-                    name.as_str(),
-                    "PRIMARY KEY",
-                    None,
-                    crate::storage::ConstraintTiming::NotDeferrable,
-                    crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
-                )?;
-            } else if column.unique {
-                let name = inline_unique_constraint_name(&table, column);
-                append(
-                    name.as_str(),
-                    "UNIQUE",
-                    Some("YES"),
-                    crate::storage::ConstraintTiming::NotDeferrable,
-                    crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
-                )?;
-            }
-            if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                append(
-                    name.as_str(),
-                    "CHECK",
-                    None,
-                    crate::storage::ConstraintTiming::NotDeferrable,
-                    crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
-                )?;
-            }
-        }
-        for unique in table.uniques() {
-            append(
-                unique.name.as_str(),
-                if unique.is_primary {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                },
-                (!unique.is_primary).then_some("YES"),
-                unique.timing,
-                crate::storage::ConstraintValidation::EnforcedValidated,
-                &table,
-            )?;
-        }
-        for check in table.checks() {
-            append(
-                check.name.as_str(),
-                "CHECK",
-                None,
-                crate::storage::ConstraintTiming::NotDeferrable,
-                check.validation,
-                &table,
-            )?;
-        }
-        for foreign_key in table.fkeys() {
-            append(
-                foreign_key.name.as_str(),
-                "FOREIGN KEY",
-                None,
-                foreign_key.timing,
-                foreign_key.validation,
-                &table,
-            )?;
-        }
-    }
-    finish(definition, &output[..count], arena)
 }
 
 fn inline_primary_constraint_name(table: &TableDef) -> StackStr<128> {

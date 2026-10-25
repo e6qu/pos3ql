@@ -1280,7 +1280,7 @@ pub trait CatalogAccess {
     fn index_def<'a>(
         &self,
         oid: i32,
-        col: usize,
+        col: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
@@ -1403,7 +1403,7 @@ pub trait CatalogAccess {
     fn has_type_privilege(
         &self,
         _role: Option<&str>,
-        _type_name: &str,
+        _target: PrivilegeType<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1649,6 +1649,12 @@ pub enum PrivilegeColumn<'a> {
 
 #[derive(Clone, Copy)]
 pub enum PrivilegeRelation<'a> {
+    Name(&'a str),
+    Oid(i32),
+}
+
+#[derive(Clone, Copy)]
+pub enum PrivilegeType<'a> {
     Name(&'a str),
     Oid(i32),
 }

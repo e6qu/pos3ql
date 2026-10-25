@@ -5,7 +5,7 @@ use super::information::owner_is_enabled;
 use super::view_rows::{CatalogRow, Index, NamespaceJoin, Output, boolean, integer};
 use super::views::{Base, Read, columns};
 use super::{Arena, Datum, SqlError, Storage, SynthTable, text};
-use crate::sql::eval::{CatalogAccess, PrivilegeColumn, PrivilegeRelation, sqlstate};
+use crate::sql::eval::{CatalogAccess, PrivilegeColumn, PrivilegeRelation, PrivilegeType, sqlstate};
 use crate::sql_err;
 
 pub(super) fn tables<'a>(
@@ -429,6 +429,39 @@ pub(super) fn references<'a>(
     output.finish("referential_constraints", true)
 }
 
+pub(super) fn domains<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let constraints = read.base(storage, Base::Constraint, transaction, arena)?;
+    let types = Index::oid(read.base(storage, Base::Type, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let types = NamespaceJoin::new(&types, &namespaces, "typnamespace")?;
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let database = storage.current_database_name(transaction);
+    let database = text(database.as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for values in constraints.rows {
+        let constraint = CatalogRow { definition: constraints.def, values };
+        for (ty, namespace) in types.joined(Some((constraint.integer("contypid")? as u32, 0))) {
+            if !owner_is_enabled(storage, transaction, ty.integer("typowner")?)
+                && catalog.has_type_privilege(None, PrivilegeType::Oid(ty.integer("oid")?), "USAGE")? != Some(true) {
+                continue;
+            }
+            for names in namespaces.matching((constraint.integer("connamespace")? as u32, 0)) {
+                let names = CatalogRow { definition: namespaces.table.def, values: names };
+                output.push(&[database, names.get("nspname")?, constraint.get("conname")?,
+                    database, namespace.get("nspname")?, ty.get("typname")?,
+                    Datum::Text(if constraint.boolean("condeferrable")? { "YES" } else { "NO" }),
+                    Datum::Text(if constraint.boolean("condeferred")? { "YES" } else { "NO" })])?;
+            }
+        }
+    }
+    output.finish("domain_constraints", true)
+}
+
 fn action(code: u8) -> Datum<'static> {
     match code {
         b'c' => Datum::Text("CASCADE"), b'n' => Datum::Text("SET NULL"), b'd' => Datum::Text("SET DEFAULT"),
@@ -440,8 +473,10 @@ pub(super) fn dependencies<'a>(
     storage: &Storage,
     transaction: u32,
     arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let constraints = super::pg_constraint(storage, transaction, arena)?;
+) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+    let constraints = super::pg_constraint_values(storage, transaction, arena)?;
+    let definition = super::schema::require("pg_constraint", false);
+    let [kind, oid, domain, table, key, index, parent, referenced] = ["contype", "oid", "contypid", "conrelid", "conkey", "conindid", "confrelid", "confkey"].map(|name| definition.columns.iter().position(|(field, _)| *field == name).expect("constraint source field exists"));
     let indexes = super::collect_indexes(storage, transaction, arena)?;
     let mut output = Output::new(arena);
     let mut push = |class, object, referenced_class, referenced_object, column, kind| {
@@ -449,37 +484,36 @@ pub(super) fn dependencies<'a>(
             Datum::Oid(referenced_class as u32), Datum::Oid(referenced_object as u32),
             Datum::Int4(column), Datum::Char(kind)])
     };
-    for values in constraints.rows {
-        let constraint = CatalogRow { definition: constraints.def, values };
-        let kind = constraint.character("contype")?;
-        if !matches!(kind, b'c' | b'n' | b'p' | b'u' | b'f') {
+    for values in constraints {
+        let constraint_kind = super::view_rows::character(values[kind])?;
+        if !matches!(constraint_kind, b'c' | b'n' | b'p' | b'u' | b'f') {
             continue;
         }
-        let oid = constraint.integer("oid")?;
-        let domain = constraint.integer("contypid")?;
+        let oid = integer(values[oid])?;
+        let domain = integer(values[domain])?;
         if domain != 0 {
             push(super::PG_CONSTRAINT_OID, oid, super::PG_TYPE_OID, domain, 0, b'a')?;
             continue;
         }
-        let table = constraint.integer("conrelid")?;
-        let key = constraint.integers("conkey", arena)?;
+        let table = integer(values[table])?;
+        let key = super::view_rows::integers(values[key], arena)?;
         if key.is_empty() {
             push(super::PG_CONSTRAINT_OID, oid, super::PG_CLASS_OID, table, 0, b'a')?;
         }
         for &column in key {
             push(super::PG_CONSTRAINT_OID, oid, super::PG_CLASS_OID, table, column, b'a')?;
-            if kind == b'c' {
+            if constraint_kind == b'c' {
                 push(super::PG_CONSTRAINT_OID, oid, super::PG_CLASS_OID, table, column, b'n')?;
             }
         }
-        let index = constraint.integer("conindid")?;
-        if matches!(kind, b'p' | b'u') {
+        let index = integer(values[index])?;
+        if matches!(constraint_kind, b'p' | b'u') {
             push(super::PG_CLASS_OID, index, super::PG_CONSTRAINT_OID, oid, 0, b'i')?;
-        } else if kind == b'f' {
+        } else if constraint_kind == b'f' {
             push(super::PG_CONSTRAINT_OID, oid, super::PG_CLASS_OID, index, 0, b'n')?;
-            for &column in constraint.integers("confkey", arena)? {
+            for &column in super::view_rows::integers(values[referenced], arena)? {
                 push(super::PG_CONSTRAINT_OID, oid, super::PG_CLASS_OID,
-                    constraint.integer("confrelid")?, column, b'n')?;
+                    integer(values[parent])?, column, b'n')?;
             }
         }
     }
@@ -516,5 +550,5 @@ pub(super) fn dependencies<'a>(
             }
         }
     }
-    output.finish("pg_depend", false)
+    output.rows().map(|rows| &*rows)
 }

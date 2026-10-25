@@ -3216,7 +3216,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn index_def<'a>(
         &self,
         oid: i32,
-        col: usize,
+        col: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::index_def_text(self.storage, self.txid, oid, col, arena)
@@ -3636,60 +3636,79 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_type_privilege(
         &self,
         role: Option<&str>,
-        type_name: &str,
+        target: super::eval::PrivilegeType<'_>,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        use crate::storage::{AccessClass, AccessObject, PrivilegeSet};
+        use super::types::oid;
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let (written_schema, name) = split_catalog_name(type_name);
-        let domain = match written_schema {
-            Some(schema) => self.storage.domain_slot(schema, name, self.txid),
-            None => self.storage.resolve_domain_slot(name, self.txid),
+        let type_oid = match target {
+            super::eval::PrivilegeType::Oid(oid) => oid,
+            super::eval::PrivilegeType::Name(name) => {
+                let resolved = super::eval::regtype_cast(Datum::Text(name), Some(self), self.routine_workspace)?;
+                let Datum::Regtype { referenced_oid, .. } = resolved else {
+                    unreachable!("type name resolved to regtype")
+                };
+                referenced_oid
+            }
         };
-        let enumeration = match written_schema {
-            Some(schema) => self.storage.enum_slot(schema, name, self.txid),
-            None => self.storage.resolve_enum_slot(name, self.txid),
-        };
-        let composite = match written_schema {
-            Some(schema) => self.storage.composite_slot(schema, name, self.txid),
-            None => self.storage.resolve_composite_slot(name, self.txid),
-        };
-        let object = domain
-            .map(|slot| crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Domain,
-                slot: slot as u16,
-            })
-            .or_else(|| {
-                enumeration.map(|slot| crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Enum,
-                    slot: slot as u16,
-                })
-            })
-            .or_else(|| {
-                composite.map(|slot| crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Composite,
-                    slot: slot as u16,
-                })
+        let named = [
+            (oid::FIRST_DOMAIN, self.storage.domain_count(), AccessClass::Domain, false),
+            (oid::FIRST_ENUM, self.storage.enum_count(), AccessClass::Enum, false),
+            (oid::FIRST_COMPOSITE, self.storage.composite_count(), AccessClass::Composite, false),
+            (oid::FIRST_DOMAIN_ARRAY, self.storage.domain_count(), AccessClass::Domain, true),
+            (oid::FIRST_ENUM_ARRAY, self.storage.enum_count(), AccessClass::Enum, true),
+            (oid::FIRST_COMPOSITE_ARRAY, self.storage.composite_count(), AccessClass::Composite, true),
+        ].into_iter().find_map(|(first, count, class, array)| {
+            let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
+            (slot < count).then_some((AccessObject { class, slot: slot as u16 }, array))
+        });
+        let owner = if let Some((object, array)) = named {
+            let slot = usize::from(object.slot);
+            let visible = match object.class {
+                AccessClass::Domain => self.storage.domain_slot_visible_to(slot, self.txid),
+                AccessClass::Enum => self.storage.enum_slot_visible_to(slot, self.txid),
+                AccessClass::Composite => self.storage.composite_slot_visible_to(slot, self.txid),
+                _ => unreachable!("named type object was classified"),
+            };
+            if !visible { return Ok(None); }
+            if !array {
+                return privilege_query(privileges, PrivilegeSet::NONE, PrivilegeSet::TYPE_ALL,
+                    |privilege| self.storage.has_object_privilege(object, role, privilege, self.txid),
+                    |privilege| self.storage.has_object_grant_option(object, role, privilege, self.txid)).map(Some);
+            }
+            self.storage.object_owner(object, self.txid)
+        } else {
+            let row_type = [
+                (super::catalog::FIRST_TABLE_COMPOSITE_TYPE_OID, self.storage.table_count(), AccessClass::Table),
+                (super::catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID, self.storage.table_count(), AccessClass::Table),
+                (super::catalog::FIRST_VIEW_COMPOSITE_TYPE_OID, self.storage.view_count(), AccessClass::View),
+                (super::catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID, self.storage.view_count(), AccessClass::View),
+            ].into_iter().find_map(|(first, count, class)| {
+                let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
+                (slot < count).then_some(AccessObject { class, slot: slot as u16 })
             });
-        let Some(object) = object else {
-            return Ok(None);
+            if let Some(object) = row_type {
+                let slot = usize::from(object.slot);
+                let visible = match object.class {
+                    AccessClass::Table => self.storage.table_slot_visible_to(slot, self.txid),
+                    AccessClass::View => self.storage.view_slot_visible_to(slot, self.txid),
+                    _ => unreachable!("row type was classified"),
+                };
+                if !visible { return Ok(None); }
+                self.storage.object_owner(object, self.txid)
+            } else if type_oid < oid::FIRST_DOMAIN && super::catalog::intrinsic_type_name(type_oid).is_some() {
+                self.storage.role_slot_by_oid(10, self.txid).expect("bootstrap type owner exists")
+            } else {
+                return Ok(None);
+            }
         };
-        privilege_query(
-            privileges,
-            crate::storage::PrivilegeSet::NONE,
-            crate::storage::PrivilegeSet::TYPE_ALL,
-            |privilege| {
-                self.storage
-                    .has_object_privilege(object, role, privilege, self.txid)
-            },
-            |privilege| {
-                self.storage
-                    .has_object_grant_option(object, role, privilege, self.txid)
-            },
-        )
-        .map(Some)
+        let owned = self.storage.role_has_privileges_of(role, owner, self.txid);
+        privilege_query(privileges, PrivilegeSet::USAGE, PrivilegeSet::TYPE_ALL,
+            |_| owned, |_| owned).map(Some)
     }
 
     fn has_language_privilege(

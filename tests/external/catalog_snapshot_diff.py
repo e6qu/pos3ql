@@ -101,6 +101,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         for name, query in reports:
             record(writer, f"{prefix}.constraint.types.{name}", f"SELECT * FROM ({query}) report LIMIT 0")
         record(writer, f"{prefix}.constraint.index_columns", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,false),pg_get_indexdef('report_expression_diff'::regclass,2,false),pg_get_indexdef('report_expression_diff'::regclass,3,false)")
+        record(writer, f"{prefix}.constraint.index_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,0,true),pg_get_indexdef('report_expression_diff'::regclass,1,true),pg_get_indexdef('report_expression_diff'::regclass,2,true)")
         writer.execute("CREATE SEQUENCE report_argument_diff")
         writer.execute("BEGIN")
         try:
@@ -113,6 +114,8 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
                 ("expression_missing_relation", "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='report_positive_diff'"),
                 ("expression_invalid_input", "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)"),
                 ("index_negative_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,-1,false)"),
+                ("index_minimum_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,'-2147483648'::integer,false)"),
+                ("index_two_arguments", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1)"),
                 ("index_null_column", "SELECT pg_get_indexdef('report_expression_diff'::regclass,NULL::integer,false) IS NULL"),
                 ("index_null_pretty", "SELECT pg_get_indexdef('report_expression_diff'::regclass,1,NULL::boolean) IS NULL"),
             ):
@@ -145,10 +148,15 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
 
         writer.execute("CREATE ROLE report_reader_diff")
         writer.execute("GRANT SELECT ON report_renamed_child_diff TO report_reader_diff")
+        record(writer, f"{prefix}.constraint.type_owner", "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE WITH GRANT OPTION')")
         reader.execute("SET ROLE report_reader_diff")
         try:
             for name, query in reports:
                 record(reader, f"{prefix}.constraint.select_only.{name}", query)
+            record(reader, f"{prefix}.constraint.type_public", "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE WITH GRANT OPTION')")
+            writer.execute("REVOKE USAGE ON DOMAIN report_renamed_domain_diff FROM PUBLIC")
+            record(reader, f"{prefix}.constraint.type_revoked", "SELECT has_type_privilege('report_renamed_domain_diff'::regtype,'USAGE'),has_type_privilege('report_renamed_domain_diff[]'::regtype,'USAGE')")
+            writer.execute("GRANT USAGE ON DOMAIN report_renamed_domain_diff TO PUBLIC")
             writer.execute("GRANT UPDATE(y) ON report_renamed_child_diff TO report_reader_diff")
             for name, query in reports:
                 record(reader, f"{prefix}.constraint.column_writer.{name}", query)

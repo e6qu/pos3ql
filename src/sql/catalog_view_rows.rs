@@ -120,8 +120,21 @@ impl<'a> CatalogRow<'a> {
     }
 
     pub(super) fn integers(self, field: &str, arena: &'a Arena) -> Result<&'a [i32], SqlError> {
-        match self.get(field)? {
+        integers(self.get(field)?, arena)
+    }
+}
+
+pub(super) fn integers<'a>(value: Datum<'a>, arena: &'a Arena) -> Result<&'a [i32], SqlError> {
+        match value {
             Datum::Null => Ok(&[]),
+            Datum::Int2Vector { raw, .. } => {
+                let (values, remainder) = raw.as_chunks::<2>();
+                if !remainder.is_empty() {
+                    return Err(sql_err!(sqlstate::INTERNAL_ERROR, "catalog integer vector has incomplete bytes"));
+                }
+                arena.alloc_slice_with(values.len(), |index| i32::from(i16::from_le_bytes(values[index])))
+                    .map(|values| &*values).map_err(|_| arena_full())
+            }
             Datum::Array { raw, element } => {
                 let mut count = 0;
                 for value in crate::sql::array::elements(raw, element) {
@@ -136,7 +149,6 @@ impl<'a> CatalogRow<'a> {
             }
             _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "catalog field is not an integer array")),
         }
-    }
 }
 
 pub(super) struct NamespaceJoin<'index, 'a> {

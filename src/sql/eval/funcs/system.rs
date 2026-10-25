@@ -236,9 +236,7 @@ fn privilege_object_name<'a>(
             let oid = CatalogOid::parse(value)?
                 .expect("identity datum is non-null")
                 .0;
-            if function == "has_type_privilege" {
-                catalog.type_name(oid, arena)
-            } else if function == "has_function_privilege" {
+            if function == "has_function_privilege" {
                 catalog.routine_name(oid, true, arena)
             } else if function == "has_language_privilege" {
                 catalog.language_name(oid, arena)
@@ -1786,6 +1784,13 @@ pub(crate) fn dispatch<'a>(
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
+                if name == "has_type_privilege" {
+                    let target = match object {
+                        Datum::Text(name) => super::super::PrivilegeType::Name(name),
+                        value => super::super::PrivilegeType::Oid(CatalogOid::parse(value)?.expect("non-null type identity").0),
+                    };
+                    return Ok(cat.has_type_privilege(role, target, privilege)?.map_or(Datum::Null, Datum::Bool));
+                }
                 let object = if name == "has_parameter_privilege" {
                     match object {
                         Datum::Text(parameter) => parameter,
@@ -1804,7 +1809,6 @@ pub(crate) fn dispatch<'a>(
                 };
                 let answer = match name {
                     "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
-                    "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
                     "has_language_privilege" => {
                         cat.has_language_privilege(role, object, privilege)?
                     }
@@ -1991,7 +1995,9 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Bool(catalog.is_other_temporary_namespace(oid)))
             }
             "pg_get_indexdef" => {
-                // `(oid, n, _)` with n>0 returns the n-th indexed column.
+                if !matches!(args.len(), 1 | 3) {
+                    return Err(sql_err!(sqlstate::UNDEFINED_FUNCTION, "function pg_get_indexdef(...) does not exist"));
+                }
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -2001,13 +2007,21 @@ pub(crate) fn dispatch<'a>(
                 };
                 let col = if args.len() >= 2 {
                     match eval_full(args[1], arena, params, row, hooks)? {
-                        Datum::Int4(v) => v.max(0) as usize,
-                        Datum::Int8(v) => v.max(0) as usize,
-                        _ => 0,
+                        Datum::Null => return Ok(Datum::Null),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(value) => value,
+                            _ => unreachable!("integer argument was coerced"),
+                        },
                     }
                 } else {
                     0
                 };
+                if args.len() == 3 {
+                    let pretty = eval_full(args[2], arena, params, row, hooks)?;
+                    if super::super::cast_to(pretty, ColType::Bool, arena)?.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                }
                 Ok(cat
                     .index_def(oid, col, arena)?
                     .map(Datum::Text)

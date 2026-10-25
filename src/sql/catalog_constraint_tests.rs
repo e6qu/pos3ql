@@ -55,6 +55,60 @@ fn catalog_constraint_key_reports_preserve_order_duplicates_and_selected_columns
 }
 
 #[test]
+fn catalog_constraint_index_columns_are_strict_and_cover_expressions_and_includes() {
+    let config = test_config("constraint-index-columns");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE expression_columns(x integer,y integer);
+        CREATE INDEX expression_columns_index ON expression_columns((x+1)) INCLUDE(y)", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT
+        pg_get_indexdef('expression_columns_index'::regclass,1,false),
+        pg_get_indexdef('expression_columns_index'::regclass,2,false),
+        pg_get_indexdef('expression_columns_index'::regclass,3,false),
+        pg_get_indexdef('expression_columns_index'::regclass,-1,false),
+        pg_get_indexdef('expression_columns_index'::regclass,'-2147483648'::integer,false),
+        pg_get_indexdef('expression_columns_index'::regclass,NULL::integer,false),
+        pg_get_indexdef('expression_columns_index'::regclass,1,NULL::boolean)", true)),
+        ["((x + 1))|y||||NULL|NULL"]);
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "SELECT pg_get_indexdef('expression_columns_index'::regclass,1)", true)), ["42883"]);
+}
+
+#[test]
+fn catalog_constraint_domains_keep_selected_names_and_current_type_permissions() {
+    for (isolation, retained) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
+        let mut config = test_config("constraint-domain-rows");
+        config.transaction_mode = crate::config::TransactionMode::Mvcc;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "CREATE DOMAIN constraint_domain AS integer CONSTRAINT domain_positive CHECK(VALUE>0);
+            CREATE ROLE domain_reader", true);
+        reader.success(&mut engine, "SET ROLE domain_reader", true);
+        let report = "SELECT domain_name,constraint_name FROM information_schema.domain_constraints WHERE constraint_name='domain_positive'";
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)),
+            ["constraint_domain|domain_positive"]);
+        writer.success(&mut engine, "ALTER DOMAIN constraint_domain RENAME TO renamed_constraint_domain", true);
+        let expected = if retained { "constraint_domain|domain_positive" } else { "renamed_constraint_domain|domain_positive" };
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [expected]);
+        writer.success(&mut engine, "REVOKE USAGE ON DOMAIN renamed_constraint_domain FROM PUBLIC", true);
+        assert!(data_rows(&reader.success(&mut engine, report, true)).is_empty());
+        writer.success(&mut engine, "GRANT USAGE ON DOMAIN renamed_constraint_domain TO domain_reader", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [expected]);
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),
+                has_type_privilege(23::oid,'USAGE WITH GRANT OPTION'),has_type_privilege(2147483647::oid,'USAGE');
+             SELECT has_type_privilege(oid,'USAGE') FROM pg_type WHERE typname='renamed_constraint_domain'", true)),
+            ["t|t|f|NULL", "t"]);
+        reader.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
 fn catalog_constraint_reports_keep_selected_names_and_private_edits() {
     for (isolation, retained) in [("READ COMMITTED", false), ("REPEATABLE READ", true)] {
         let mut config = test_config("constraint-report-rows");

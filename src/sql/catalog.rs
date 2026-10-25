@@ -8912,6 +8912,9 @@ pub(crate) fn synthesize<'a>(
             "referential_constraints" => {
                 return constraints::references(storage, txid, views::Read::Statement, arena);
             }
+            "domain_constraints" => {
+                return constraints::domains(storage, txid, views::Read::Statement, arena);
+            }
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9340,7 +9343,7 @@ pub(crate) fn synthesize_current<'a>(
         (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         (true, "domains") => info_domains(storage, txid, arena),
-        (true, "domain_constraints") => info_domain_constraints(storage, txid, arena),
+        (true, "domain_constraints") => constraints::domains(storage, txid, views::Read::Current, arena),
         (true, "check_constraints") => info_check_constraints(storage, txid, arena),
         (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
         (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
@@ -15948,7 +15951,7 @@ pub fn index_def_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
-    col: usize,
+    col: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let builtin = match oid {
@@ -15966,7 +15969,7 @@ pub fn index_def_text<'a>(
         return Ok(if col == 0 {
             Some(definition)
         } else {
-            columns.get(col - 1).copied()
+            Some(col.checked_sub(1).and_then(|number| usize::try_from(number).ok()).and_then(|position| columns.get(position).copied()).unwrap_or(""))
         });
     }
     let indices = collect_indexes(storage, txid, arena)?;
@@ -15976,17 +15979,23 @@ pub fn index_def_text<'a>(
         }
         let def = storage.table_def(info.table_slot, txid);
         let col_name = |ci: usize| def.columns()[info.columns[ci] as usize].name.as_str();
-        // `col > 0`: just the name of that 1-based indexed column.
-        if col > 0 {
-            let name = if col <= info.n_cols {
-                col_name(col - 1)
+        if col != 0 {
+            let Some(position) = col.checked_sub(1).and_then(|number| usize::try_from(number).ok()) else { return Ok(Some("")); };
+            let mut name = StackStr::<128>::new();
+            if position < info.n_cols {
+                if info.expression_keys[position] {
+                    let expression = index_expression_source(storage, info, position, txid)
+                        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
+                    return Ok(Some(index_expression_display(expression.as_str(), arena)?));
+                }
+                write_identifier(&mut name, col_name(position));
+            } else if position - info.n_cols < info.n_include_cols {
+                let column = info.include_columns[position - info.n_cols] as usize;
+                write_identifier(&mut name, def.columns()[column].name.as_str());
             } else {
-                return Ok(None);
-            };
-            let bytes = arena
-                .alloc_slice_copy(name.as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+                return Ok(Some(""));
+            }
+            return Ok(Some(alloc_rendered(&name, "index column name is too long", arena)?));
         }
         let mut s = StackStr::<896>::new();
         use core::fmt::Write as _;
@@ -16010,8 +16019,10 @@ pub fn index_def_text<'a>(
             if k > 0 {
                 let _ = s.write_str(", ");
             }
-            if let Some(expression) = index_expression_source(storage, info, k, txid) {
-                let _ = s.write_str(expression.as_str());
+            if info.expression_keys[k] {
+                let expression = index_expression_source(storage, info, k, txid)
+                    .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
+                let _ = s.write_str(index_expression_display(expression.as_str(), arena)?);
             } else {
                 write_identifier(&mut s, col_name(k));
             }
@@ -16057,6 +16068,18 @@ pub fn index_def_text<'a>(
         )?));
     }
     Ok(None)
+}
+
+fn index_expression_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    use core::fmt::Write;
+    let expression = super::parser::parse_expr(source, arena)?;
+    let display = super::enum_values::checks::canonical_display(source, arena)?;
+    if matches!(expression, super::ast::Expr::Call { .. }) {
+        return Ok(display);
+    }
+    let mut output = crate::mem::arena::ArenaString::new(arena);
+    write!(output, "({display})").map_err(|_| arena_full())?;
+    Ok(output.as_str())
 }
 
 #[derive(Clone, Copy)]
@@ -19895,6 +19918,16 @@ fn pg_constraint<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
+    let values = pg_constraint_values(storage, txid, arena)?;
+    let def = schema::require("pg_constraint", false);
+    finish_with_hidden(def, schema::hidden_columns(def.name, false), values, arena)
+}
+
+fn pg_constraint_values<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
     let def = schema::require("pg_constraint", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let fks = collect_fkeys(storage, txid, arena)?;
@@ -20395,12 +20428,7 @@ fn pg_constraint<'a>(
         values[28] = super::eval::cast_to(source[17], ColType::Oid, arena)?;
         *target = row(&values, arena)?;
     }
-    finish_with_hidden(
-        def,
-        schema::hidden_columns(def.name, false),
-        compatible,
-        arena,
-    )
+    Ok(compatible)
 }
 
 fn available_extension_requires<'a>(
@@ -20734,7 +20762,7 @@ fn pg_depend<'a>(
     let out = catalog_rows(
         arena,
         sequence_dependencies
-            + constraint_dependencies.rows.len()
+            + constraint_dependencies.len()
             + domain_dependencies
             + cast_dependencies
             + operator_dependencies
@@ -20749,7 +20777,8 @@ fn pg_depend<'a>(
             + trigger_dependencies
             + extension_dependencies,
     )?;
-    let mut count = 0usize;
+    out[..constraint_dependencies.len()].copy_from_slice(constraint_dependencies);
+    let mut count = constraint_dependencies.len();
     let mut push = |class: i32,
                     object: i32,
                     referenced_class: i32,
@@ -20782,14 +20811,6 @@ fn pg_depend<'a>(
     // Sequence ownership is how pg_dump distinguishes serial/identity
     // generators from independent sequences and orders them with the owning
     // column.
-    for values in constraint_dependencies.rows {
-        let value = view_rows::CatalogRow { definition: constraint_dependencies.def, values };
-        let kind = value.character("deptype")?;
-        let encoded = [kind];
-        let kind = core::str::from_utf8(&encoded).expect("dependency type is ASCII");
-        push(value.integer("classid")?, value.integer("objid")?, value.integer("refclassid")?,
-            value.integer("refobjid")?, value.integer("refobjsubid")?, kind)?;
-    }
     for sequence_slot in 0..storage.sequence_count() {
         let sequence = storage.sequence_for(sequence_slot, txid);
         if !storage.sequence_slot_visible_to(sequence_slot, txid) {
@@ -31788,66 +31809,6 @@ fn info_domains<'a>(
             arena,
         )?;
         count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_domain_constraints<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("domain_constraints", true);
-    let capacity = (0..storage.domain_count())
-        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
-        .map(|slot| {
-            let domain = storage.domain_for(slot, txid);
-            domain.checks().len() + usize::from(domain.not_null)
-        })
-        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
-        .ok_or_else(|| catalog_capacity_exceeded("information_schema.domain_constraints"))?;
-    let output = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    for slot in 0..storage.domain_count() {
-        let domain = storage.domain_for(slot, txid);
-        if !storage.domain_slot_visible_to(slot, txid) {
-            continue;
-        }
-        for check in domain.checks() {
-            output[count] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(check.name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(domain.name.as_str(), arena)?,
-                    text("NO", arena)?,
-                    text("NO", arena)?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
-        if domain.not_null {
-            let name = stack_format!(128, "{}_not_null", domain.name.as_str());
-            output[count] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(domain.schema.as_str(), arena)?,
-                    text(domain.name.as_str(), arena)?,
-                    text("NO", arena)?,
-                    text("NO", arena)?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
     }
     finish(definition, &output[..count], arena)
 }

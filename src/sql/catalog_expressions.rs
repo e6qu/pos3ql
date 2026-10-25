@@ -101,7 +101,11 @@ pub(super) fn current<'a>(
             });
             row[position] = Datum::PgNodeTree(if let Some(slot) = slot {
                 let definition = storage.table_def(slot, transaction);
-                bind(source, kind, Some(&definition), arena)?
+                if table.def.name.as_str() == "pg_policy" {
+                    bind_policy(storage, transaction, slot, source, &definition, arena)?
+                } else {
+                    bind(source, kind, Some(&definition), arena)?
+                }
             } else {
                 bind(source, kind, None, arena)?
             });
@@ -219,6 +223,52 @@ pub(crate) fn bind<'a>(
             };
         }
     }
+    encode(source, kind, sites, output)
+}
+
+fn bind_policy<'a>(
+    storage: &Storage,
+    transaction: u32,
+    slot: usize,
+    source: &str,
+    definition: &TableDef,
+    arena: &'a Arena,
+) -> Result<CatalogNode<'a>, SqlError> {
+    let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+    let mut relation = crate::util::StackStr::<260>::new();
+    super::write_identifier(&mut relation, definition.schema.as_str());
+    relation.write_char('.').map_err(|_| arena_full())?;
+    super::write_identifier(&mut relation, definition.name.as_str());
+    if relation.is_truncated() {
+        return Err(arena_full());
+    }
+    let query = arena.alloc_str_display(format_args!("SELECT {source} FROM {}", relation.as_str()))
+        .map_err(|_| arena_full())?;
+    let (select, sources) = parser::parse_query_with_column_sources(query, arena)?;
+    let bindings = super::super::query::catalog_expression_bindings(
+        select, sources.columns, storage, transaction, slot, arena,
+    )?;
+    let mut sites = crate::mem::arena::ArenaList::new(arena);
+    for (column, binding) in sources.columns.iter().zip(bindings) {
+        if let Some(position) = binding.get() {
+            sites.push(Site {
+                start: column.start - 7,
+                end: column.end - 7,
+                column: usize::from(definition.attribute_number(position)),
+            }).map_err(|_| arena_full())?;
+        }
+    }
+    let mut output = ArenaString::new(arena);
+    output.write_str(HEADER).map_err(|_| arena_full())?;
+    encode(source, Kind::Expression, sites.into_mut_slice().map_err(|_| arena_full())?, output)
+}
+
+fn encode<'a>(
+    source: &'a str,
+    kind: Kind,
+    sites: &mut [Site],
+    mut output: ArenaString<'a>,
+) -> Result<CatalogNode<'a>, SqlError> {
     sites.sort_unstable_by_key(|site| (site.start, site.end, site.column));
     let mut count = 0;
     for at in 0..sites.len() {

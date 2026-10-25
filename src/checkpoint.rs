@@ -4178,6 +4178,7 @@ impl Checkpointer {
                     .ok_or(CheckpointSetupError::Corrupt(
                         "invalid column default state",
                     ))?;
+                    def.not_null_names[*seen] = not_null_name;
                     def.columns[*seen] = ColumnMeta {
                         name: sql_name(&name)?,
                         user_type,
@@ -4189,7 +4190,6 @@ impl Checkpointer {
                         not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
                             .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
                         not_null_inheritable: not_null_inheritable != 0,
-                        not_null_name,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
                         auto_increment: not_null & 16 != 0,
@@ -10078,7 +10078,7 @@ impl Checkpointer {
                     definition.replica_identity.code(),
                 ),
             )?;
-            for c in definition.columns() {
+            for (column, c) in definition.columns().iter().enumerate() {
                 use core::fmt::Write as _;
                 let default_value = c.default.constant().copied();
                 let default_hex = default_to_hex(&default_value);
@@ -10128,7 +10128,7 @@ impl Checkpointer {
                     }
                 }
                 let mut not_null_name_hex = StackStr::<128>::new();
-                if let Some(name) = c.not_null_name {
+                if let Some(name) = definition.not_null_names[column] {
                     for byte in name.as_str().as_bytes() {
                         let _ = write!(not_null_name_hex, "{byte:02x}");
                     }
@@ -17299,6 +17299,7 @@ fn finish_pending(
                 || definition.schema != expected.schema
                 || definition.name != expected.name
                 || definition.n_columns != expected.n_columns
+                || definition.not_null_names != expected.not_null_names
                 || definition.has_toast != expected.has_toast
                 || definition
                     .columns()
@@ -18778,7 +18779,6 @@ fn empty_column() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
-        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -18790,9 +18790,7 @@ fn empty_column() -> ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
-}
-
-/// Column defaults travel in the manifest as hex of the WAL default
+ in the manifest as hex of the WAL default
 /// encoding ("-" for none-with-no-bytes readability).
 fn default_to_hex(d: &Option<OwnedDatum>) -> StackStr<{ 2 * crate::wal::MAX_DEFAULT_ENCODED }> {
     let mut scratch = [0u8; crate::wal::MAX_DEFAULT_ENCODED];

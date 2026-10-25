@@ -94,7 +94,6 @@ fn empty_meta() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
-        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -106,9 +105,7 @@ fn empty_meta() -> ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
-}
-
-/// Resolves one column definition, evaluating its DEFAULT (which must be a
+finition, evaluating its DEFAULT (which must be a
 /// constant) and coercing it to the column type.
 pub(super) fn build_column(
     c: &ColumnDef,
@@ -314,7 +311,6 @@ pub(super) fn build_column(
         compression: c.compression,
         not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
         not_null_inheritable: c.not_null_inheritable,
-        not_null_name: None,
         unique: c.unique,
         primary: c.primary,
         auto_increment,
@@ -342,7 +338,7 @@ pub(super) fn validate_column_storage(
     storage: crate::sql::ast::ColumnStorage,
     compression: crate::sql::ast::ColumnCompression,
 ) -> Result<(), SqlError> {
-    let toastable = ctype.typlen() < 0 && !matches!(ctype, ColType::TsQuery);
+    let toastable = ctype.physical_layout().storage != b'p';
     if !toastable && storage != crate::sql::ast::ColumnStorage::Plain {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -353,13 +349,6 @@ pub(super) fn validate_column_storage(
                 crate::sql::ast::ColumnStorage::Extended => "EXTENDED",
                 crate::sql::ast::ColumnStorage::Main => "MAIN",
             },
-            name
-        ));
-    }
-    if toastable && storage == crate::sql::ast::ColumnStorage::Plain {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot set storage option to PLAIN for column \"{}\"",
             name
         ));
     }

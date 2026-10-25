@@ -210,13 +210,16 @@ pub(crate) fn materialized_definition<'a>(
         };
     }
     arena
-        .alloc(TableDef {
+        .alloc_interned(TableDef {
             name: SqlName::parse(name)?,
             columns,
             n_columns: column_names.len(),
             ..TableDef::empty()
+        }, |left, right| {
+            // Both definitions are constructed above with empty non-column metadata.
+            left.name == right.name && left.n_columns == right.n_columns
+                && left.columns() == right.columns()
         })
-        .map(|definition| &*definition)
         .map_err(|_| arena_full())
 }
 

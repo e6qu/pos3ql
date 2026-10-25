@@ -2915,10 +2915,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
             };
-            for c in def.columns() {
+            for (column, c) in def.columns().iter().enumerate() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
-                n += 1 + c.not_null_name.map_or(0, |name| name.as_str().len());
+                n += 1 + def.not_null_names[column].map_or(0, |name| name.as_str().len());
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -4607,7 +4607,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 }
             };
             ok &= def.attributes.append(buffer);
-            for c in def.columns() {
+            for (column, c) in def.columns().iter().enumerate() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
                 // column, whose domain name is appended after the fixed fields.
@@ -4624,7 +4624,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
                 ok &= name_bytes(
                     buffer,
-                    c.not_null_name.as_ref().map_or("", |name| name.as_str()),
+                    def.not_null_names[column].as_ref().map_or("", |name| name.as_str()),
                 );
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
@@ -7741,6 +7741,7 @@ fn decode_op_inner<'a>(
                 };
                 let default =
                     ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
+                def.not_null_names[i] = not_null_name;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
                     ctype: ColType::from_code(meta[0])?,
@@ -7750,7 +7751,6 @@ fn decode_op_inner<'a>(
                     compression,
                     not_null,
                     not_null_inheritable,
-                    not_null_name,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -14369,7 +14369,6 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
             not_null_inheritable: true,
-            not_null_name: None,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -14390,7 +14389,6 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
-            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -14504,8 +14502,8 @@ mod tests {
                 assert_eq!(restored.uniques[0].kind, kind);
                 assert_eq!(restored.attributes, definition.attributes);
                 assert_eq!(
-                    restored.columns[0].not_null_name,
-                    definition.columns[0].not_null_name
+                    restored.not_null_names[0],
+                    definition.not_null_names[0]
                 );
                 let name = definition.uniques[0].name.as_str().as_bytes();
                 let kind_at = payload

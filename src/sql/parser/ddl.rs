@@ -134,6 +134,50 @@ impl AggregateOptions<'_> {
 }
 
 impl<'a> Parser<'a> {
+    fn index_collation_operand_source(&self, mut source: &'a str) -> Result<&'a str, ParseError> {
+        use crate::sql::lexer::Lexer;
+        loop {
+            source = source.trim();
+            if !source.starts_with('(') || !source.ends_with(')') {
+                break;
+            }
+            let mut lexer = Lexer::new(source, self.arena);
+            let mut depth = 0;
+            let mut grouped = false;
+            loop {
+                match lexer.next_token().map_err(|_| self.err_here("invalid index expression"))? {
+                    Tok::Op("(") => depth += 1,
+                    Tok::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            grouped = lexer.token_end() == source.len();
+                            break;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+            }
+            if !grouped {
+                break;
+            }
+            source = &source[1..source.len() - 1];
+        }
+        let mut lexer = Lexer::new(source, self.arena);
+        let mut depth = 0;
+        let mut collation = None;
+        loop {
+            match lexer.next_token().map_err(|_| self.err_here("invalid index expression"))? {
+                Tok::Op("(" | "[") => depth += 1,
+                Tok::Op(")" | "]") => depth -= 1,
+                Tok::Ident("collate") if depth == 0 => collation = Some(lexer.token_start()),
+                Tok::Eof => break,
+                _ => {}
+            }
+        }
+        collation.map(|at| source[..at].trim_end()).ok_or_else(|| self.err_here("index collation source is missing"))
+    }
+
     fn event_trigger_event(&mut self) -> Result<EventTriggerEvent, ParseError> {
         let event = self.any_ident("event trigger event")?;
         if event.eq_ignore_ascii_case("login") {
@@ -5284,9 +5328,15 @@ impl<'a> Parser<'a> {
         let mut columns = ArenaList::new(self.arena);
         loop {
             let start = self.peek_at;
-            let expression = self.expression(0)?;
-            let expression_text =
-                index_expression_source(expression, self.text[start..self.peek_at].trim_end());
+            let mut expression = self.expression(0)?;
+            let mut source = self.text[start..self.peek_at].trim_end();
+            let mut expression_collation = None;
+            while let Expr::Collate { operand, collation } = expression {
+                expression_collation.get_or_insert(*collation);
+                expression = operand;
+                source = self.index_collation_operand_source(source)?;
+            }
+            let expression_text = index_expression_source(expression, source);
             let column = match expression {
                 Expr::Column {
                     qualifier: None,
@@ -5297,7 +5347,7 @@ impl<'a> Parser<'a> {
             let collation = if self.eat_ident("collate")? {
                 Some(self.collation_name()?)
             } else {
-                None
+                expression_collation
             };
             let operator_class = match self.peeked {
                 Tok::Ident(word)

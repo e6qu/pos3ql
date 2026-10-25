@@ -19266,7 +19266,7 @@ fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
          SELECT value FROM view_default_source ORDER BY value;
          SELECT atthasdef FROM pg_attribute
           WHERE attrelid = 'view_default_gateway'::regclass AND attnum = 1;
-         SELECT adbin FROM pg_attrdef
+         SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef
           WHERE adrelid = 'view_default_gateway'::regclass AND adnum = 1;",
     );
     assert_eq!(
@@ -24742,7 +24742,7 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
                 assert_eq!(shape.def.name.as_str(), catalog);
                 assert_eq!(
                     arena.used() - before,
-                    core::mem::size_of::<(crate::storage::TableDef, usize)>()
+                    core::mem::size_of::<crate::mem::arena::InternedValue<(crate::storage::TableDef, usize)>>()
                 );
                 let materialized = crate::sql::catalog::synthesize(
                     &engine.storage,
@@ -34133,7 +34133,7 @@ fn catalog_indexes_and_constraints_for_psql_d() {
          JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'parent_pkey'",
     );
     assert!(
-        pk.contains("CREATE UNIQUE INDEX parent_pkey ON public.parent USING btree (a, b)"),
+        pk.contains("CREATE UNIQUE INDEX parent_pkey ON parent USING btree (a, b)"),
         "indexdef: {pk}"
     );
     // The foreign key: constraint def + parent name via oid::regclass.
@@ -35995,7 +35995,7 @@ fn every_mutation_path_raises_deferred_row_obligations() {
     assert!(updated.contains("23505"), "{updated}");
 
     run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
-    run_txn(
+    let merge_result = run_txn(
         &mut engine,
         &mut budget,
         &mut txn,
@@ -36003,6 +36003,7 @@ fn every_mutation_path_raises_deferred_row_obligations() {
            ON target.id = source.id \
          WHEN MATCHED THEN UPDATE SET key_value = source.key_value",
     );
+    assert!(!merge_result.contains("ERROR"), "{merge_result}");
     let merged = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
     assert!(merged.contains("23505"), "{merged}");
 
@@ -37891,7 +37892,7 @@ fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
                 pg_get_function_identity_arguments('f_out(integer)'::regprocedure), \
                 pg_get_function_result('f_out(integer)'::regprocedure); \
          SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
-                proargnames::text, proargdefaults::text, prosqlbody IS NULL \
+                proargnames::text, pg_get_expr(proargdefaults,0), prosqlbody IS NULL \
            FROM pg_proc WHERE proname = 'f_defaults'; \
          SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
                 proargnames::text, proargdefaults IS NULL, prosqlbody IS NULL \
@@ -66300,7 +66301,7 @@ fn partial_indexes_are_typed_transactional_and_durable() {
             &mut engine,
             &mut budget,
             "SELECT indexdef FROM pg_indexes WHERE indexname = 'partial_active_value'; \
-             SELECT indpred FROM pg_index index_catalog \
+             SELECT pg_get_expr(indpred,indrelid) FROM pg_index index_catalog \
              JOIN pg_class relation ON relation.oid = index_catalog.indexrelid \
              WHERE relation.relname = 'partial_active_value'",
         )),
@@ -66571,7 +66572,7 @@ fn unique_expression_indexes_are_transactional_and_durable() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT indkey, indexprs FROM pg_index index_catalog JOIN pg_class relation ON relation.oid = index_catalog.indexrelid WHERE relation.relname = 'normalized_email'",
+            "SELECT indkey, pg_get_expr(indexprs,indrelid) FROM pg_index index_catalog JOIN pg_class relation ON relation.oid = index_catalog.indexrelid WHERE relation.relname = 'normalized_email'",
         )),
         ["0|lower(email)"]
     );
@@ -72513,8 +72514,8 @@ fn publication_column_dependencies_restrict_cascade_and_remap_durably() {
             &mut budget,
             "SELECT prattrs::text FROM pg_publication_rel"
         )),
-        ["1 2"],
-        "a retained publication projection follows the compact table layout"
+        ["1 3"],
+        "a retained publication projection preserves PostgreSQL column numbers"
     );
     let rejected = run_with(
         &mut engine,

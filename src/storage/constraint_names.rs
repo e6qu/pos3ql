@@ -78,16 +78,13 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
         if !column.not_null.is_required() {
-            definition.columns[position].not_null_name = None;
-        } else if column.not_null_name.is_none() {
+            definition.not_null_names[position] = None;
+        } else if definition.not_null_names[position].is_none() {
             let name = choose(
                 definition.name.as_str(),
                 Some(column.name.as_str()),
                 |name| {
-                    definition
-                        .columns()
-                        .iter()
-                        .any(|column| column.not_null_name == Some(name))
+                    definition.not_null_names[..definition.n_columns].contains(&Some(name))
                         || definition
                             .checks()
                             .iter()
@@ -110,8 +107,8 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
                             .is_some_and(|constraint| constraint.name == name)
                 },
             )?;
-            definition.columns[position].not_null_name = Some(name);
-        } else if let Some(name) = column.not_null_name
+            definition.not_null_names[position] = Some(name);
+        } else if let Some(name) = definition.not_null_names[position]
             && (definition
                 .checks()
                 .iter()
@@ -128,9 +125,7 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
                     .exclusions()
                     .iter()
                     .any(|constraint| constraint.name == name)
-                || definition.columns()[..position]
-                    .iter()
-                    .any(|column| column.not_null_name == Some(name)))
+                || definition.not_null_names[..position].contains(&Some(name)))
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -140,6 +135,24 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn remap_table(
+    previous: &TableDef,
+    definition: &mut TableDef,
+    mapping: &[Option<SqlName>; super::MAX_COLUMNS],
+) -> Result<(), SqlError> {
+    let mut names = [None; super::MAX_COLUMNS];
+    for (column, destination) in mapping[..previous.n_columns].iter().enumerate() {
+        if let Some(destination) = destination {
+            let target = definition.column_index(destination.as_str()).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "constraint column mapping has no destination")
+            })?;
+            names[target] = previous.not_null_names[column];
+        }
+    }
+    definition.not_null_names = names;
+    table(definition)
 }
 
 pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlError> {
@@ -167,10 +180,9 @@ pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlErro
 
 impl Storage {
     pub(crate) fn validate_not_null_names(definition: &TableDef) -> Result<(), SqlError> {
-        for column in definition.columns() {
-            if column.not_null.is_required() != column.not_null_name.is_some()
-                || column
-                    .not_null_name
+        for (position, column) in definition.columns().iter().enumerate() {
+            if column.not_null.is_required() != definition.not_null_names[position].is_some()
+                || definition.not_null_names[position]
                     .is_some_and(|name| name.as_str().is_empty())
             {
                 return Err(sql_err!(
@@ -180,5 +192,41 @@ impl Storage {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{ColumnMeta, NotNullOrigin, MAX_COLUMNS};
+
+    #[test]
+    fn catalog_snapshot_not_null_names_follow_columns_through_compaction() {
+        let mut original = TableDef::empty();
+        original.name = SqlName::parse("original").unwrap();
+        original.n_columns = 2;
+        original.columns[0].name = SqlName::parse("removed").unwrap();
+        original.columns[1].name = SqlName::parse("retained").unwrap();
+        original.columns[1].not_null = NotNullOrigin::Local;
+        table(&mut original).unwrap();
+        let retained_name = original.not_null_names[1];
+        let mut replacement = original;
+        replacement.name = SqlName::parse("renamed").unwrap();
+        replacement.columns[0] = original.columns[1];
+        replacement.columns[1] = ColumnMeta {
+            name: original.columns[0].name,
+            not_null: NotNullOrigin::Local,
+            ..ColumnMeta::EMPTY
+        };
+        let mut mapping = [None; MAX_COLUMNS];
+        mapping[1] = Some(replacement.columns[0].name);
+        crate::mem::guard::forbid_alloc(|| {
+            remap_table(&original, &mut replacement, &mapping).unwrap();
+            assert_eq!(replacement.not_null_names[0], retained_name);
+            assert_eq!(replacement.not_null_names[1].unwrap().as_str(), "renamed_removed_not_null");
+            Storage::validate_not_null_names(&replacement).unwrap();
+            assert_eq!(original.not_null_names[0], None);
+            assert_eq!(original.not_null_names[1], retained_name);
+        });
     }
 }

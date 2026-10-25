@@ -15091,7 +15091,7 @@ pub(crate) fn table_constraint_oid(
         .iter()
         .enumerate()
         .find(|(_, column)| {
-            column.not_null.is_required() && not_null_constraint_name(column).as_str() == name
+            column.not_null.is_required() && not_null_constraint_name(&table, column).as_str() == name
         })
         .map(|(index, _)| {
             not_null_constraint_oid(table_slot, usize::from(table.attribute_number(index) - 1))
@@ -15135,7 +15135,7 @@ pub(crate) fn table_constraint_identity_by_oid(
         }
         for column in table.columns() {
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(column);
+                let name = not_null_constraint_name(&table, column);
                 if let Some(found) = candidate(name.as_str()) {
                     return Some(found);
                 }
@@ -20562,7 +20562,7 @@ fn pg_constraint_values<'a>(
                     "pg_constraint result exceeds static capacity"
                 ));
             }
-            let constraint_name = not_null_constraint_name(column);
+            let constraint_name = not_null_constraint_name(&table, column);
             out[n] = row(
                 &[
                     Datum::Int4(not_null_constraint_oid(
@@ -22409,7 +22409,6 @@ fn pg_attribute<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
-                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -31534,9 +31533,8 @@ fn view_column_catalog_type(
     })
 }
 
-fn not_null_constraint_name(column: &ColumnMeta) -> SqlName {
-    column
-        .not_null_name
+fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> SqlName {
+    table.not_null_names[table.column_index(column.name.as_str()).expect("constraint column exists")]
         .expect("stored NOT NULL constraint has a durable name")
 }
 
@@ -32079,7 +32077,6 @@ fn info_column_privileges<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
-                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -32363,7 +32360,6 @@ fn info_column_type_usage<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
-                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,

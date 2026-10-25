@@ -136,6 +136,11 @@ pub(crate) enum StoredQueryRenameTarget<'a> {
         column: usize,
         sources: &'a [super::parser::ColumnSource<'a>],
     },
+    CatalogColumns {
+        table: usize,
+        sources: &'a [super::parser::ColumnSource<'a>],
+        bindings: &'a [core::cell::Cell<Option<usize>>],
+    },
 }
 
 pub(crate) struct StoredQueryRename<'a> {
@@ -152,13 +157,11 @@ struct StoredQueryRenameScope<'scope, 'arena> {
 }
 
 impl StoredQueryRenameScope<'_, '_> {
-    fn references_column(
+    fn column_origin(
         &self,
         qualifier: Option<&str>,
         name: &str,
-        table: usize,
-        column: usize,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<Option<(usize, usize)>, SqlError> {
         match self.current.find_column(qualifier, name) {
             Ok(ResolvedColumn::Table(source, selected)) => {
                 let reference = if source == 0 {
@@ -166,22 +169,21 @@ impl StoredQueryRenameScope<'_, '_> {
                 } else {
                     &self.from.joins[source - 1].table
                 };
-                Ok(self.current.derived[source].is_none()
-                    && self.current.slots[source] == table
-                    && selected == column
+                Ok((self.current.derived[source].is_none()
                     && reference
                         .col_alias
                         .is_none_or(|aliases| selected >= aliases.len()))
+                    .then_some((self.current.slots[source], selected)))
             }
-            Ok(ResolvedColumn::Merged(_)) => Ok(false),
+            Ok(ResolvedColumn::Merged(_)) => Ok(None),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                self.outer.map_or(Ok(false), |outer| {
-                    outer.references_column(qualifier, name, table, column)
+                self.outer.map_or(Ok(None), |outer| {
+                    outer.column_origin(qualifier, name)
                 })
             }
             Err(error) => Err(error),
@@ -236,8 +238,12 @@ impl<'a> StoredQueryRename<'a> {
             }
             StoredQueryRenameTarget::TableColumn {
                 table,
-                column,
                 sources,
+                ..
+            } | StoredQueryRenameTarget::CatalogColumns {
+                table,
+                sources,
+                ..
             } => {
                 let (qualifier, name) = match expression {
                     Expr::Column { qualifier, name } => (*qualifier, *name),
@@ -258,14 +264,22 @@ impl<'a> StoredQueryRename<'a> {
                     }
                     _ => return Ok(()),
                 };
-                if outer_scope.map_or(Ok(false), |scope| {
-                    scope.references_column(qualifier, name, table, column)
-                })? {
+                if let Some((origin, column)) = outer_scope.map_or(Ok(None), |scope| {
+                    scope.column_origin(qualifier, name)
+                })? && origin == table {
                     for (index, source) in sources.iter().enumerate() {
                         if core::ptr::eq(source.name.as_ptr(), name.as_ptr())
                             && source.name.len() == name.len()
                         {
-                            sites[index] = true;
+                            match self.target {
+                                StoredQueryRenameTarget::TableColumn { column: target, .. } => {
+                                    sites[index] |= column == target;
+                                }
+                                StoredQueryRenameTarget::CatalogColumns { bindings, .. } => {
+                                    bindings[index].set(Some(column));
+                                }
+                                StoredQueryRenameTarget::CompositeField { .. } => unreachable!(),
+                            }
                         }
                     }
                 }
@@ -273,6 +287,26 @@ impl<'a> StoredQueryRename<'a> {
             }
         }
     }
+}
+
+pub(crate) fn catalog_expression_bindings<'a>(
+    select: &'a Select<'a>,
+    sources: &'a [super::parser::ColumnSource<'a>],
+    storage: &'a Storage,
+    txid: u32,
+    table: usize,
+    arena: &'a Arena,
+) -> Result<&'a [core::cell::Cell<Option<usize>>], SqlError> {
+    let bindings = arena.alloc_slice_with(sources.len(), |_| core::cell::Cell::new(None))
+        .map_err(|_| arena_full())?;
+    let selection = StoredQueryRename {
+        storage,
+        txid,
+        arena,
+        target: StoredQueryRenameTarget::CatalogColumns { table, sources, bindings },
+    };
+    collect_stored_query_composite_field_rename_select(select, &selection, None, &mut [], &mut 0)?;
+    Ok(bindings)
 }
 
 fn collect_stored_query_composite_field_rename_set_tree<'a>(

@@ -1371,7 +1371,6 @@ pub struct ColumnMeta {
     /// catalog). It is retained separately from the object block codec.
     pub compression: crate::sql::ast::ColumnCompression,
     pub not_null: NotNullOrigin,
-    pub not_null_name: Option<SqlName>,
     /// Whether this column's local NOT NULL constraint participates in
     /// ordinary table inheritance. It is irrelevant for a nullable column.
     pub not_null_inheritable: bool,
@@ -1588,7 +1587,6 @@ impl ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         not_null_inheritable: true,
-        not_null_name: None,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -1600,9 +1598,7 @@ impl ColumnMeta {
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     };
-}
-
-/// Per-kind table-constraint capacity. This follows the SQL parser's complete
+int capacity. This follows the SQL parser's complete
 /// bounded list instead of imposing a smaller storage-only ceiling after DDL
 /// has already been accepted.
 pub(crate) const MAX_TABLE_CONSTRAINTS: usize = MAX_DEFINITION_ITEMS;
@@ -1915,6 +1911,7 @@ pub struct TableDef {
     pub tablespace: u16,
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
+    pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
     pub(crate) attributes: column_attributes::ColumnAttributes,
     pub uniques: [UniqueKey; MAX_UNIQUES],
     pub n_uniques: usize,
@@ -2333,6 +2330,7 @@ impl TableDef {
             tablespace: 0,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
+            not_null_names: [None; MAX_COLUMNS],
             attributes: column_attributes::ColumnAttributes::EMPTY,
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
@@ -55778,7 +55776,6 @@ mod tests {
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 not_null_inheritable: true,
-                not_null_name: None,
                 unique: false,
                 primary: false,
                 auto_increment: false,

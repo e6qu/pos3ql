@@ -21,7 +21,7 @@ pub struct Arena {
     tail_offset: Cell<usize>,
     high_water: Cell<usize>,
     retention_identity: u64,
-    interned: Cell<Option<InternedAllocation>>,
+    interned: Cell<Option<core::ptr::NonNull<InternedAllocation>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +29,12 @@ struct InternedAllocation {
     value_type: core::any::TypeId,
     value: *const u8,
     end: usize,
+    previous: Option<core::ptr::NonNull<InternedAllocation>>,
+}
+
+pub(crate) struct InternedValue<T> {
+    value: T,
+    identity: InternedAllocation,
 }
 
 static NEXT_RETENTION_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -141,31 +147,37 @@ impl Arena {
         }
     }
 
-    /// Reuses the last interned immutable value when the caller's complete
-    /// identity comparison matches. This fixed one-entry cache is invalidated
-    /// whenever reset or rewind discards its allocation.
+    /// Shares immutable values already retained by this arena. The linked
+    /// identities consume the same fixed arena reservation as their values;
+    /// rewind discards their entries together with the allocations they describe.
     pub(crate) fn alloc_interned<T: Copy + Send + Sync + 'static>(
         &self,
         value: T,
-        equivalent: impl FnOnce(&T, &T) -> bool,
+        mut equivalent: impl FnMut(&T, &T) -> bool,
     ) -> Result<&T, ArenaFull> {
-        if let Some(previous) = self.interned.get()
-            && previous.value_type == core::any::TypeId::of::<T>()
-        {
-            // Only this method installs entries, after initializing a T.
-            // Rewind clears any entry whose allocation it invalidates.
-            let previous_value = unsafe { &*previous.value.cast::<T>() };
-            if equivalent(previous_value, &value) {
-                return Ok(previous_value);
+        let mut cursor = self.interned.get();
+        while let Some(previous) = cursor {
+            // Only this method installs entries, after initializing their T.
+            // Rewind removes every entry whose allocation it discards.
+            let previous = unsafe { previous.as_ref() };
+            if previous.value_type == core::any::TypeId::of::<T>() {
+                let previous_value = unsafe { &*previous.value.cast::<T>() };
+                if equivalent(previous_value, &value) {
+                    return Ok(previous_value);
+                }
             }
+            cursor = previous.previous;
         }
-        let allocated = self.alloc(value)?;
-        self.interned.set(Some(InternedAllocation {
+        let allocated = self.alloc(InternedValue { value, identity: InternedAllocation {
             value_type: core::any::TypeId::of::<T>(),
-            value: (allocated as *const T).cast(),
-            end: self.offset.get(),
-        }));
-        Ok(allocated)
+            value: core::ptr::null(),
+            end: 0,
+            previous: self.interned.get(),
+        }})?;
+        allocated.identity.value = (&allocated.value as *const T).cast();
+        allocated.identity.end = self.offset.get();
+        self.interned.set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
+        Ok(&allocated.value)
     }
 
     pub(crate) fn alloc_atomic_usize(
@@ -370,12 +382,13 @@ impl Arena {
             mark.offset <= self.offset.get(),
             "arena mark is ahead of the frontier"
         );
-        if self
-            .interned
-            .get()
-            .is_some_and(|cached| cached.end > mark.offset)
-        {
-            self.interned.set(None);
+        while let Some(cached) = self.interned.get() {
+            // Entries remain initialized until the frontier moves below them.
+            let cached = unsafe { cached.as_ref() };
+            if cached.end <= mark.offset {
+                break;
+            }
+            self.interned.set(cached.previous);
         }
         self.offset.set(mark.offset);
     }
@@ -918,6 +931,7 @@ mod tests {
             ));
             let different = arena.alloc_interned(9u64, PartialEq::eq).unwrap();
             assert!(!core::ptr::eq(first, different));
+            assert!(core::ptr::eq(first, arena.alloc_interned(7u64, PartialEq::eq).unwrap()));
             let typed = arena
                 .alloc_interned((1u32, 2u32), |_, _| {
                     panic!("different types cannot share a cache entry")

@@ -10123,6 +10123,9 @@ mod tests {
                 assert_eq!(scope, IndexTargetScope::Only);
                 assert!(if_not_exists && nulls_not_distinct && unique);
                 assert_eq!(columns.len(), 2);
+                assert_eq!(columns[1].column, Some("value"));
+                assert!(matches!(columns[1].expression, Expr::Column { name: "value", .. }));
+                assert!(columns[1].collation.is_some());
                 assert_eq!(include_columns, ["payload"]);
                 assert_eq!(options.fillfactor, Some(80));
                 assert_eq!(tablespace, Some("fast"));

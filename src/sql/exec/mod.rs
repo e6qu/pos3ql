@@ -2848,8 +2848,8 @@ fn build_partitioned_table_def(
             def.name = SqlName::parse(statement.name.name)?;
             def.schema =
                 storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
+            def.not_null_names = [None; MAX_COLUMNS];
             for column in def.columns.iter_mut().take(def.n_columns) {
-                column.not_null_name = None;
                 column.not_null = if column.not_null.is_required() {
                     crate::storage::NotNullOrigin::Inherited
                 } else {
@@ -3745,7 +3745,6 @@ fn build_def_with_likes(
             let source = like_source(storage, like, txid)?;
             for column in source.columns() {
                 let mut copied = *column;
-                copied.not_null_name = None;
                 if !like.defaults && !copied.default.is_generated() {
                     copied.default = crate::storage::ColumnDefault::NONE;
                 }
@@ -4288,18 +4287,8 @@ fn copy_like_comments(
                         source_column.name.as_str()
                     )
                 })?;
-            let source_name = stack_format!(
-                128,
-                "{}_{}_not_null",
-                source.name.as_str(),
-                source_column.name.as_str()
-            );
-            let target_name = stack_format!(
-                128,
-                "{}_{}_not_null",
-                target.name.as_str(),
-                target.columns()[target_column].name.as_str()
-            );
+            let source_name = source.not_null_names[source.column_index(source_column.name.as_str()).expect("source column exists")].expect("required source column has a durable constraint name");
+            let target_name = target.not_null_names[target_column].expect("required target column has a durable constraint name");
             copy_comment_if_present(
                 storage,
                 wal,
@@ -4307,13 +4296,13 @@ fn copy_like_comments(
                 CommentIdentity {
                     class: CommentClass::Constraint,
                     schema: source.schema,
-                    name: SqlName::parse(source_name.as_str())?,
+                    name: source_name,
                     subid: source_slot as u32,
                 },
                 CommentIdentity {
                     class: CommentClass::Constraint,
                     schema: target.schema,
-                    name: SqlName::parse(target_name.as_str())?,
+                    name: target_name,
                     subid: target_slot as u32,
                 },
             )?;
@@ -39380,7 +39369,6 @@ pub fn create_table_as(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
-            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -59160,7 +59148,6 @@ pub(crate) fn view_trigger_definition(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
-            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -64636,7 +64623,7 @@ fn inherit_partition_constraints(
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
     }
-    Ok(())
+    crate::storage::constraint_names::table(child)
 }
 
 fn has_unique_identity(
@@ -64986,6 +64973,9 @@ fn alter_table_inheritance(
                 crate::storage::NotNullOrigin::Nullable
             };
         }
+    }
+    if let Err(error) = crate::storage::constraint_names::table(&mut updated) {
+        return sql_fail(error);
     }
     let mut mapping = [None; MAX_COLUMNS];
     let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
@@ -65695,14 +65685,7 @@ fn alter_table_inner(
             } => {
                 let Some(column) = definition.columns().iter().find(|column| {
                     column.not_null.is_required()
-                        && stack_format!(
-                            128,
-                            "{}_{}_not_null",
-                            definition.name.as_str(),
-                            column.name.as_str()
-                        )
-                        .as_str()
-                            == *name
+                        && definition.not_null_names[definition.column_index(column.name.as_str()).expect("constraint column exists")].is_some_and(|stored| stored.as_str() == *name)
                 }) else {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -67557,14 +67540,7 @@ fn alter_table_relation(
                     crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit } => {
                         let column = new_def.columns().iter().position(|column| {
                             column.not_null.is_required()
-                                && stack_format!(
-                                    128,
-                                    "{}_{}_not_null",
-                                    new_def.name.as_str(),
-                                    column.name.as_str()
-                                )
-                                .as_str()
-                                    == *name
+                                && new_def.not_null_names[new_def.column_index(column.name.as_str()).expect("constraint column exists")].is_some_and(|stored| stored.as_str() == *name)
                         });
                         if let Some(column) = column {
                             new_def.columns[column].not_null_inheritable = *inherit;
@@ -67965,7 +67941,7 @@ fn alter_table_relation(
             return sql_fail(error);
         }
     }
-    if let Err(error) = crate::storage::constraint_names::table(&mut new_def) {
+    if let Err(error) = crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping) {
         return sql_fail(error);
     }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
@@ -68750,6 +68726,9 @@ fn alter_table_relation(
                 }
                 if !changed {
                     continue;
+                }
+                if let Err(error) = crate::storage::constraint_names::table(&mut dependent) {
+                    return sql_fail(error);
                 }
                 let mut mapping = [None; MAX_COLUMNS];
                 let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
@@ -70592,7 +70571,6 @@ fn coerce_composite_value_inner<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
             not_null_inheritable: true,
-            not_null_name: None,
             unique: false,
             primary: false,
             auto_increment: false,

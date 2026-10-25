@@ -48,8 +48,6 @@ Complete these remaining cases:
   The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
   owns the connected table, column, index, constraint, view, rule, sequence and
   dependency reports, including stable column numbers and expression inputs.
-  Finish qualification of constraint reports in another database, with
-  SELECT-only and column-writing roles, duplicate rows and bounded memory.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

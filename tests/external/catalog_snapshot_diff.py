@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import psycopg
-from psycopg import sql
+from psycopg import sql as pg_sql
 
 
 # Declared fields verified against the PostgreSQL reference metadata.
@@ -499,6 +499,18 @@ def transcript(reader, writer, host, port, user, report_database):
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
         try:
             writer.execute('CREATE INDEX catalog_index_vectors_diff_idx ON catalog_index_vectors_diff (id DESC NULLS LAST, note COLLATE "C" ASC NULLS FIRST) INCLUDE (extra)')
+            record(writer, f"{prefix}.catalog_collated_columns", """
+                SELECT indkey::text,pg_get_indexdef(indexrelid,0,false),
+                       pg_get_indexdef(indexrelid,0,true),pg_get_indexdef(indexrelid,2,false)
+                  FROM pg_index WHERE indexrelid='catalog_index_vectors_diff_idx'::regclass
+            """)
+            writer.execute('CREATE INDEX catalog_index_collate_expr_diff ON catalog_index_vectors_diff ((lower(note) COLLATE "C"), ((note COLLATE "C")))')
+            record(writer, f"{prefix}.catalog_collated_expressions", """
+                SELECT indkey::text,pg_get_expr(indexprs,indrelid),
+                       pg_get_indexdef(indexrelid,0,false),pg_get_indexdef(indexrelid,1,false),
+                       pg_get_indexdef(indexrelid,2,false)
+                  FROM pg_index WHERE indexrelid='catalog_index_collate_expr_diff'::regclass
+            """)
             record(writer, f"{prefix}.catalog_index_vectors", """
                 SELECT indnatts,indnkeyatts,indoption::text,indcollation::text,
                        pg_typeof(indoption)::text,pg_typeof(indcollation)::text,
@@ -986,14 +998,14 @@ def transcript(reader, writer, host, port, user, report_database):
             writer.execute("DROP OWNED BY catalog_parameter_writer_diff")
             writer.execute("DROP ROLE catalog_parameter_reader_diff")
             writer.execute("DROP ROLE catalog_parameter_writer_diff")
-    writer.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(report_database)))
+    writer.execute(pg_sql.SQL("CREATE DATABASE {}").format(pg_sql.Identifier(report_database)))
     try:
         with connect(host, port, user, report_database) as other_reader, connect(host, port, user, report_database) as other_writer:
             for isolation in ("READ COMMITTED", "REPEATABLE READ"):
                 prefix = "other_database." + isolation.lower().replace(" ", "_")
                 constraint_reports(other_reader, other_writer, isolation, prefix, record, record_outcome)
     finally:
-        writer.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(report_database)))
+        writer.execute(pg_sql.SQL("DROP DATABASE {}").format(pg_sql.Identifier(report_database)))
     return observed
 
 

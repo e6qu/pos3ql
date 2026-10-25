@@ -481,14 +481,17 @@ pub(super) fn sequences<'a>(
             name: sequence_type(type_oid)?,
         };
         // Settings are selected rows; values and access follow the live sequence.
-        let last = if catalog.has_sequence_privilege(None, PrivilegeRelation::Oid(oid), "SELECT, USAGE")? == Some(true) {
-            match catalog.sequence_state_by_oid(oid) {
-                Some((value, true)) => Datum::Int8(value),
-                _ => Datum::Null,
-            }
-        } else {
-            Datum::Null
-        };
+        let last =
+            if catalog.has_sequence_privilege(None, PrivilegeRelation::Oid(oid), "SELECT, USAGE")?
+                == Some(true)
+            {
+                match catalog.sequence_state_by_oid(oid) {
+                    Some((value, true)) => Datum::Int8(value),
+                    _ => Datum::Null,
+                }
+            } else {
+                Datum::Null
+            };
         for class in classes.matching((oid as u32, 0)) {
             if character(class[kind])? != b'S' {
                 continue;

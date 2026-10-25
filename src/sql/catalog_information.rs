@@ -191,16 +191,15 @@ pub(super) fn tables<'a>(
         let relation = PrivilegeRelation::Oid(relation_oid);
         let visible = owner_is_enabled(storage, transaction, integer(class[owner])?)
             || catalog.has_table_privilege(
-                    None,
-                    relation,
-                    "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
-                )? == Some(true)
-                    || catalog.has_any_column_privilege(
-                        None,
-                        relation,
-                        "SELECT, INSERT, UPDATE, REFERENCES",
-                    )? == Some(true)
-            ;
+                None,
+                relation,
+                "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
+            )? == Some(true)
+            || catalog.has_any_column_privilege(
+                None,
+                relation,
+                "SELECT, INSERT, UPDATE, REFERENCES",
+            )? == Some(true);
         if !visible {
             continue;
         }
@@ -607,12 +606,11 @@ pub(super) fn columns_view<'a>(
             let relation_identity = PrivilegeRelation::Oid(relation);
             let visible = owner_is_enabled(storage, transaction, class.integer("relowner")?)
                 || catalog.has_column_privilege(
-                        None,
-                        relation_identity,
-                        crate::sql::eval::PrivilegeColumn::Number(number),
-                        "SELECT, INSERT, UPDATE, REFERENCES",
-                    )? == Some(true)
-                ;
+                    None,
+                    relation_identity,
+                    crate::sql::eval::PrivilegeColumn::Number(number),
+                    "SELECT, INSERT, UPDATE, REFERENCES",
+                )? == Some(true);
             if !visible {
                 continue;
             }
@@ -721,16 +719,15 @@ pub(super) fn views<'a>(
         let relation = PrivilegeRelation::Oid(oid);
         if !(owned
             || catalog.has_table_privilege(
-                    None,
-                    relation,
-                    "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
-                )? == Some(true)
-                    || catalog.has_any_column_privilege(
-                        None,
-                        relation,
-                        "SELECT, INSERT, UPDATE, REFERENCES",
-                    )? == Some(true)
-            )
+                None,
+                relation,
+                "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
+            )? == Some(true)
+            || catalog.has_any_column_privilege(
+                None,
+                relation,
+                "SELECT, INSERT, UPDATE, REFERENCES",
+            )? == Some(true))
         {
             continue;
         }
@@ -872,7 +869,11 @@ pub(super) fn sequences<'a>(
                 continue;
             }
             if !(owner_is_enabled(storage, transaction, integer(class[owner])?)
-                || catalog.has_sequence_privilege(None, PrivilegeRelation::Oid(oid), "SELECT, UPDATE, USAGE")? == Some(true))
+                || catalog.has_sequence_privilege(
+                    None,
+                    PrivilegeRelation::Oid(oid),
+                    "SELECT, UPDATE, USAGE",
+                )? == Some(true))
             {
                 continue;
             }

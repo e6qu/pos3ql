@@ -83,7 +83,10 @@ fn catalog_snapshot_derived_reports_preserve_rows_without_freezing_current_value
         );
         assert_eq!(data_rows(&initial), OLD);
         writer.success(&mut engine, CHANGE, true);
-        assert_eq!(data_rows(&writer.success(&mut engine, "SELECT * FROM derived_renamed_view", true)), ["42|retained"]);
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, "SELECT * FROM derived_renamed_view", true)),
+            ["42|retained"]
+        );
         writer.success(
             &mut engine,
             "SELECT nextval('derived_renamed_sequence')",
@@ -194,7 +197,9 @@ fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_re
                 session.success(&mut engine, "PREPARE TRANSACTION 'derived-reports'", false);
                 assert_eq!(data_rows(&session.success(&mut engine, REPORT, true)), OLD);
             }
-            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
             drop(session);
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -205,8 +210,15 @@ fn catalog_snapshot_derived_reports_survive_prepared_decisions_and_empty_disk_re
                 assert_eq!(data_rows(&session.success(&mut cold, REPORT, true)), OLD);
                 session.success(&mut cold, &format!("{decision} 'derived-reports'"), false);
             }
-            assert_eq!(data_rows(&session.success(&mut cold, REPORT, true)),
-                if decision == "ROLLBACK PREPARED" { OLD } else { NEW }, "{name}");
+            assert_eq!(
+                data_rows(&session.success(&mut cold, REPORT, true)),
+                if decision == "ROLLBACK PREPARED" {
+                    OLD
+                } else {
+                    NEW
+                },
+                "{name}"
+            );
             drop(session);
             drop(cold);
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -221,7 +233,10 @@ fn catalog_snapshot_derived_builtins_return_postgresql_definitions() {
     let result = run_with_fixed_memory(&mut engine, &budget,
         "SELECT viewname,definition IS NOT NULL,definition=pg_get_viewdef(('pg_catalog.'||viewname)::regclass)
            FROM pg_views WHERE schemaname='pg_catalog' AND viewname IN ('pg_views','pg_matviews','pg_sequences') ORDER BY viewname", 4 << 20);
-    assert_eq!(data_rows(&result), ["pg_matviews|t|t", "pg_sequences|t|t", "pg_views|t|t"]);
+    assert_eq!(
+        data_rows(&result),
+        ["pg_matviews|t|t", "pg_sequences|t|t", "pg_views|t|t"]
+    );
 }
 
 #[test]
@@ -231,14 +246,17 @@ fn catalog_snapshot_privilege_lists_accept_any_grant_and_validate_every_item() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine,
+    session.success(
+        &mut engine,
         "CREATE ROLE list_reader;
          CREATE TABLE list_table(id integer);
          CREATE SEQUENCE list_sequence;
          GRANT SELECT ON list_table TO list_reader;
          GRANT UPDATE ON SEQUENCE list_sequence TO list_reader;
          GRANT SET ON PARAMETER track_functions TO list_reader;
-         SET ROLE list_reader", true);
+         SET ROLE list_reader",
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT has_table_privilege('list_table','SELECT, INSERT'),
                 has_column_privilege('list_table','id','UPDATE, SELECT'),
@@ -259,7 +277,12 @@ fn catalog_snapshot_privilege_lists_accept_any_grant_and_validate_every_item() {
         "SELECT has_table_privilege('list_table','🦀🦀🦀🦀🦀')",
     ] {
         let output = session.execute(&mut engine, sql, true);
-        assert_eq!(error_sqlstates(&output), ["22023"], "{sql}: {}", String::from_utf8_lossy(&output));
+        assert_eq!(
+            error_sqlstates(&output),
+            ["22023"],
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
 }
 
@@ -270,7 +293,8 @@ fn catalog_snapshot_derived_permissions_keep_oid_identity_outside_the_search_pat
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine,
+    session.success(
+        &mut engine,
         "CREATE ROLE identity_reader;
          CREATE SCHEMA identity_other;
          CREATE VIEW public.identity_collision AS SELECT 1 AS value;
@@ -280,7 +304,9 @@ fn catalog_snapshot_derived_permissions_keep_oid_identity_outside_the_search_pat
          SELECT nextval('public.identity_sequence'),nextval('identity_other.identity_sequence');
          GRANT SELECT ON identity_other.identity_collision TO identity_reader;
          GRANT USAGE ON SEQUENCE identity_other.identity_sequence TO identity_reader;
-         SET ROLE identity_reader;", true);
+         SET ROLE identity_reader;",
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT n.nspname,has_table_privilege(c.oid,'SELECT, INSERT'),
                 has_any_column_privilege(c.oid,'SELECT, UPDATE'),

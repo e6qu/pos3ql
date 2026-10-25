@@ -25,10 +25,10 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
-#[path = "catalog_view_rows.rs"]
-mod view_rows;
 #[path = "catalog_view_definitions.rs"]
 mod view_definitions;
+#[path = "catalog_view_rows.rs"]
+mod view_rows;
 #[path = "catalog_views.rs"]
 mod views;
 

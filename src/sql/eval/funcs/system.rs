@@ -1710,7 +1710,9 @@ pub(crate) fn dispatch<'a>(
                 };
                 let object = eval_full(args[at], arena, params, row, hooks)?;
                 at += 1;
-                if matches!(object, Datum::Null) { return Ok(Datum::Null); }
+                if matches!(object, Datum::Null) {
+                    return Ok(Datum::Null);
+                }
                 let privilege_column = if column {
                     let column = eval_full(args[at], arena, params, row, hooks)?;
                     at += 1;
@@ -1739,19 +1741,47 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                if matches!(name, "has_table_privilege" | "has_column_privilege" | "has_any_column_privilege" | "has_sequence_privilege") {
+                if matches!(
+                    name,
+                    "has_table_privilege"
+                        | "has_column_privilege"
+                        | "has_any_column_privilege"
+                        | "has_sequence_privilege"
+                ) {
                     let relation = match object {
                         Datum::Text(name) => super::super::PrivilegeRelation::Name(name),
-                        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. } | Datum::Regtype { .. }) => {
-                            super::super::PrivilegeRelation::Oid(CatalogOid::parse(value)?.expect("non-null relation identity").0)
+                        value @ (Datum::Int4(_)
+                        | Datum::Oid(_)
+                        | Datum::Int8(_)
+                        | Datum::RegObject { .. }
+                        | Datum::Regtype { .. }) => super::super::PrivilegeRelation::Oid(
+                            CatalogOid::parse(value)?
+                                .expect("non-null relation identity")
+                                .0,
+                        ),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "object must be specified by name or oid"
+                            ));
                         }
-                        _ => return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "object must be specified by name or oid")),
                     };
                     let answer = match name {
-                        "has_table_privilege" => cat.has_table_privilege(role, relation, privilege)?,
-                        "has_column_privilege" => cat.has_column_privilege(role, relation, privilege_column.expect("column function parsed a column"), privilege)?,
-                        "has_any_column_privilege" => cat.has_any_column_privilege(role, relation, privilege)?,
-                        "has_sequence_privilege" => cat.has_sequence_privilege(role, relation, privilege)?,
+                        "has_table_privilege" => {
+                            cat.has_table_privilege(role, relation, privilege)?
+                        }
+                        "has_column_privilege" => cat.has_column_privilege(
+                            role,
+                            relation,
+                            privilege_column.expect("column function parsed a column"),
+                            privilege,
+                        )?,
+                        "has_any_column_privilege" => {
+                            cat.has_any_column_privilege(role, relation, privilege)?
+                        }
+                        "has_sequence_privilege" => {
+                            cat.has_sequence_privilege(role, relation, privilege)?
+                        }
                         _ => unreachable!("relation privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
@@ -1759,7 +1789,12 @@ pub(crate) fn dispatch<'a>(
                 let object = if name == "has_parameter_privilege" {
                     match object {
                         Datum::Text(parameter) => parameter,
-                        _ => return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "has_parameter_privilege() requires a text parameter name")),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "has_parameter_privilege() requires a text parameter name"
+                            ));
+                        }
                     }
                 } else {
                     match privilege_object_name(object, name, cat, arena)? {

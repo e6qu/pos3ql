@@ -31,7 +31,7 @@ jobs:
           name: derived-catalog-formatting-${{ github.sha }}
           path: ${{ runner.temp }}/formatting.patch
       - name: Snapshot and view regressions
-        run: cargo test --lib --locked -- catalog_snapshot_ view_catalog_metadata_ --test-threads=1
+        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_snapshot_ view_catalog_metadata_ --nocapture --test-threads=1
       - name: Lint all targets
         run: cargo clippy --all-targets -- -D warnings
   postgresql:
@@ -59,13 +59,26 @@ jobs:
             target
           key: ${{ runner.os }}-derived-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-differential-build-
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Capture PostgreSQL reference before compilation
+        run: |
+          mkdir -p "$RUNNER_TEMP/derived-catalog-reference"
+          target/external-venv/bin/python -u tests/external/catalog_snapshot_diff.py \
+            --host 127.0.0.1 --port 5432 --user postgres --database postgres \
+            --metadata-output "$RUNNER_TEMP/derived-catalog-reference/catalog-metadata.json" \
+            --output "$RUNNER_TEMP/derived-catalog-reference/catalog-postgresql.json"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: derived-catalog-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/derived-catalog-reference/
+          if-no-files-found: ignore
       - name: Build checked-out release executable
         run: |
           cargo clean -p pos3ql
           cargo build --release --locked
-      - uses: ./.github/actions/python-test-environment
-        with:
-          venv: target/external-venv
       - name: Compare catalogs with PostgreSQL
         env:
           PGHOST: 127.0.0.1

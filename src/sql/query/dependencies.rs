@@ -30,7 +30,10 @@ struct CollectionContext<'a> {
 }
 
 impl<'a> CollectionContext<'a> {
-    fn ordinary(path: &'a PathContext, bindings: Option<crate::storage::StoredQueryDependencyView<'a>>) -> Self {
+    fn ordinary(
+        path: &'a PathContext,
+        bindings: Option<crate::storage::StoredQueryDependencyView<'a>>,
+    ) -> Self {
         Self {
             path,
             transition: None,
@@ -58,37 +61,75 @@ impl<'a> CollectionContext<'a> {
         transition.resolve(qualifier, name).map(|_| true)
     }
 
-    fn resolve_relation(self, storage: &Storage, txid: u32, schema: Option<&str>, name: &str) -> Result<Option<ResolvedRelation>, SqlError> {
-        if let Some(dependency) = self.bindings.and_then(|bindings| bindings.entries().iter().find(|dependency| {
-            matches!(dependency.class, DependencyClass::Table | DependencyClass::View)
-                && dependency.referenced_schema.as_str() == schema.unwrap_or("")
-                && dependency.referenced_name.as_str() == name
-        })) {
+    fn resolve_relation(
+        self,
+        storage: &Storage,
+        txid: u32,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<Option<ResolvedRelation>, SqlError> {
+        if let Some(dependency) = self.bindings.and_then(|bindings| {
+            bindings.entries().iter().find(|dependency| {
+                matches!(
+                    dependency.class,
+                    DependencyClass::Table | DependencyClass::View
+                ) && dependency.referenced_schema.as_str() == schema.unwrap_or("")
+                    && dependency.referenced_name.as_str() == name
+            })
+        }) {
             let slot = usize::from(dependency.slot);
             return match dependency.class {
-                DependencyClass::Table if slot < storage.table_count() && storage.table_slot_visible_to(slot, txid) => Ok(Some(ResolvedRelation::Table(slot))),
-                DependencyClass::View if slot < storage.view_count() && storage.view_slot_visible_to(slot, txid) => Ok(Some(ResolvedRelation::View(slot))),
-                _ => Err(sql_err!(sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE, "stored relation binding is no longer visible")),
+                DependencyClass::Table
+                    if slot < storage.table_count()
+                        && storage.table_slot_visible_to(slot, txid) =>
+                {
+                    Ok(Some(ResolvedRelation::Table(slot)))
+                }
+                DependencyClass::View
+                    if slot < storage.view_count() && storage.view_slot_visible_to(slot, txid) =>
+                {
+                    Ok(Some(ResolvedRelation::View(slot)))
+                }
+                _ => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "stored relation binding is no longer visible"
+                )),
             };
         }
         Ok(storage.resolve_relation_under(self.path, schema, name, txid))
     }
 
-    fn bound_from<'arena>(self, from: &FromClause<'arena>, storage: &Storage, txid: u32, ctes: CteNames<'_>, arena: &'arena Arena) -> Result<FromClause<'arena>, SqlError> {
-        if self.bindings.is_none() { return Ok(*from); }
+    fn bound_from<'arena>(
+        self,
+        from: &FromClause<'arena>,
+        storage: &Storage,
+        txid: u32,
+        ctes: CteNames<'_>,
+        arena: &'arena Arena,
+    ) -> Result<FromClause<'arena>, SqlError> {
+        if self.bindings.is_none() {
+            return Ok(*from);
+        }
         let bind = |table: TableRef<'arena>| -> Result<TableRef<'arena>, SqlError> {
-            if table.subquery.is_some() || table.is_function_source() || table.cte.is_some() || (table.schema.is_none() && ctes.contains(table.table)) { return Ok(table); }
-            let (schema, name) = match self.resolve_relation(storage, txid, table.schema, table.table)? {
-                Some(ResolvedRelation::Table(slot)) => {
-                    let definition = storage.table_def(slot, txid);
-                    (definition.schema, definition.name)
-                }
-                Some(ResolvedRelation::View(slot)) => {
-                    let view = storage.view(slot);
-                    (view.schema_for(txid), view.name_for(txid))
-                }
-                _ => return Ok(table),
-            };
+            if table.subquery.is_some()
+                || table.is_function_source()
+                || table.cte.is_some()
+                || (table.schema.is_none() && ctes.contains(table.table))
+            {
+                return Ok(table);
+            }
+            let (schema, name) =
+                match self.resolve_relation(storage, txid, table.schema, table.table)? {
+                    Some(ResolvedRelation::Table(slot)) => {
+                        let definition = storage.table_def(slot, txid);
+                        (definition.schema, definition.name)
+                    }
+                    Some(ResolvedRelation::View(slot)) => {
+                        let view = storage.view(slot);
+                        (view.schema_for(txid), view.name_for(txid))
+                    }
+                    _ => return Ok(table),
+                };
             Ok(TableRef {
                 schema: Some(arena.alloc_str(schema.as_str()).map_err(|_| arena_full())?),
                 table: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
@@ -99,9 +140,17 @@ impl<'a> CollectionContext<'a> {
         let base = bind(from.base)?;
         let mut joins = crate::mem::arena::ArenaList::new(arena);
         for join in from.joins {
-            joins.push(Join { table: bind(join.table)?, ..*join }).map_err(|_| arena_full())?;
+            joins
+                .push(Join {
+                    table: bind(join.table)?,
+                    ..*join
+                })
+                .map_err(|_| arena_full())?;
         }
-        Ok(FromClause { base, joins: joins.as_slice() })
+        Ok(FromClause {
+            base,
+            joins: joins.as_slice(),
+        })
     }
 }
 
@@ -1106,9 +1155,14 @@ fn collect_select<'a>(
         let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
         let mut all_tables = true;
         for source in sources {
-            if source.subquery.is_some() || source.is_function_source()
+            if source.subquery.is_some()
+                || source.is_function_source()
                 || (source.schema.is_none() && visible_ctes.contains(source.table))
-                || !matches!(context.resolve_relation(storage, txid, source.schema, source.table)?, Some(ResolvedRelation::Table(_))) {
+                || !matches!(
+                    context.resolve_relation(storage, txid, source.schema, source.table)?,
+                    Some(ResolvedRelation::Table(_))
+                )
+            {
                 all_tables = false;
                 break;
             }
@@ -1158,9 +1212,26 @@ fn collect_select<'a>(
                 record_column_references(expression, &scope, dependencies, context)?;
             }
         }
-        record_relation_column_references(storage, txid, context, visible_ctes, &from, select, dependencies, arena)?;
+        record_relation_column_references(
+            storage,
+            txid,
+            context,
+            visible_ctes,
+            &from,
+            select,
+            dependencies,
+            arena,
+        )?;
     }
-    collect_routine_dependencies(select, storage, txid, dependencies, arena, context, visible_ctes)?;
+    collect_routine_dependencies(
+        select,
+        storage,
+        txid,
+        dependencies,
+        arena,
+        context,
+        visible_ctes,
+    )?;
     Ok(())
 }
 
@@ -2009,7 +2080,10 @@ struct RelationSource<'a> {
     n_columns: usize,
 }
 
-#[expect(clippy::too_many_arguments, reason = "selected sources, CTE names and captured bindings are explicit")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selected sources, CTE names and captured bindings are explicit"
+)]
 fn record_relation_column_references<'a>(
     storage: &Storage,
     txid: u32,
@@ -2031,7 +2105,10 @@ fn record_relation_column_references<'a>(
         .map_err(|_| arena_full())?;
     let mut n_sources = 0;
     for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
-        if table.subquery.is_some() || table.is_function_source() || (table.schema.is_none() && ctes.contains(table.table)) {
+        if table.subquery.is_some()
+            || table.is_function_source()
+            || (table.schema.is_none() && ctes.contains(table.table))
+        {
             continue;
         }
         let Some(relation) = context.resolve_relation(storage, txid, table.schema, table.table)?

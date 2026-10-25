@@ -346,35 +346,6 @@ pub(crate) fn schema_namespace_sources<'arena>(
         .map_err(|_| super::query::arena_full_pub())
 }
 
-#[cfg(test)]
-mod namespace_source_tests {
-    use super::*;
-
-    #[test]
-    fn schema_sql_rewrite_sources_distinguish_namespaces_from_aliases_and_comments() {
-        let mut budget = crate::mem::budget::Budget::new(1 << 20);
-        let arena = Arena::new(&mut budget, "namespace source test", 1 << 20).unwrap();
-        let sql = "SELECT old.items.id, old.id, old.score(old.id)::old.kind COLLATE old.ordering FROM old /* namespace */ .items AS old WHERE old.id OPERATOR(old.=) 1";
-        let expected = [
-            "old.items.id",
-            "old.score",
-            "old.kind",
-            "old.ordering",
-            "old /* namespace */",
-            "old.=",
-        ]
-        .map(|name| sql.find(name).unwrap());
-        crate::mem::guard::forbid_alloc(|| {
-            let sources = schema_namespace_sources(sql, StoredSqlKind::Statements, &arena).unwrap();
-            assert_eq!(sources.len(), expected.len());
-            for source in sources {
-                assert!(expected.contains(&source.start));
-                assert_eq!(&sql[source.start..source.end], "old");
-            }
-        });
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct ColumnSource<'a> {
     pub name: &'a str,
@@ -8576,6 +8547,30 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::mem::Budget;
+
+    #[test]
+    fn schema_sql_rewrite_sources_distinguish_namespaces_from_aliases_and_comments() {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "namespace source test", 1 << 20).unwrap();
+        let sql = "SELECT old.items.id, old.id, old.score(old.id)::old.kind COLLATE old.ordering FROM old /* namespace */ .items AS old WHERE old.id OPERATOR(old.=) 1";
+        let expected = [
+            "old.items.id",
+            "old.score",
+            "old.kind",
+            "old.ordering",
+            "old /* namespace */",
+            "old.=",
+        ]
+        .map(|name| sql.find(name).unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let sources = schema_namespace_sources(sql, StoredSqlKind::Statements, &arena).unwrap();
+            assert_eq!(sources.len(), expected.len());
+            for source in sources {
+                assert!(expected.contains(&source.start));
+                assert_eq!(&sql[source.start..source.end], "old");
+            }
+        });
+    }
 
     /// The pre-arena parser's fixed list boundary; tests cross it to prove
     /// the boundary is gone.

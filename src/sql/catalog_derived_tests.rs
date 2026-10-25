@@ -26,17 +26,27 @@ const REPORT: &str = "
 ";
 
 const OLD: [&str; 9] = [
-    "derived_view", "derived_view|LOCAL", "derived_materialized|f|f",
-    "derived_rule|derived_source", "derived_sequence|2|regtype",
-    "derived_sequence|2", "derived_view|derived_source",
-    "derived_view|derived_source|id", "derived_view|derived_source|payload",
+    "derived_view",
+    "derived_view|LOCAL",
+    "derived_materialized|f|f",
+    "derived_rule|derived_source",
+    "derived_sequence|2|regtype",
+    "derived_sequence|2",
+    "derived_view|derived_source",
+    "derived_view|derived_source|id",
+    "derived_view|derived_source|payload",
 ];
 
 const NEW: [&str; 9] = [
-    "derived_renamed_view", "derived_renamed_view|CASCADED", "derived_renamed_materialized|t|f",
-    "derived_renamed_rule|derived_renamed_source", "derived_renamed_sequence|5|regtype",
-    "derived_renamed_sequence|5", "derived_renamed_view|derived_renamed_source",
-    "derived_renamed_view|derived_renamed_source|id", "derived_renamed_view|derived_renamed_source|renamed_payload",
+    "derived_renamed_view",
+    "derived_renamed_view|CASCADED",
+    "derived_renamed_materialized|t|f",
+    "derived_renamed_rule|derived_renamed_source",
+    "derived_renamed_sequence|5|regtype",
+    "derived_renamed_sequence|5",
+    "derived_renamed_view|derived_renamed_source",
+    "derived_renamed_view|derived_renamed_source|id",
+    "derived_renamed_view|derived_renamed_source|renamed_payload",
 ];
 
 const CHANGE: &str = "
@@ -58,15 +68,30 @@ fn catalog_snapshot_derived_reports_preserve_rows_without_freezing_current_value
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         writer.success(&mut engine, SETUP, true);
-        let initial = reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {REPORT}"), true);
+        let initial = reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL {isolation}; {REPORT}"),
+            true,
+        );
         assert_eq!(data_rows(&initial), OLD);
         writer.success(&mut engine, CHANGE, true);
-        writer.success(&mut engine, "SELECT nextval('derived_renamed_sequence')", true);
+        writer.success(
+            &mut engine,
+            "SELECT nextval('derived_renamed_sequence')",
+            true,
+        );
         let selected = reader.success(&mut engine, REPORT, true);
-        assert_eq!(data_rows(&selected), retained, "{isolation}: {}", String::from_utf8_lossy(&selected));
+        assert_eq!(
+            data_rows(&selected),
+            retained,
+            "{isolation}: {}",
+            String::from_utf8_lossy(&selected)
+        );
         let live = reader.success(&mut engine,
             "SELECT last_value FROM pg_sequences WHERE sequencename IN ('derived_sequence','derived_renamed_sequence');
              SELECT to_regclass('derived_view') IS NULL, to_regclass('derived_renamed_view') IS NOT NULL;
@@ -78,14 +103,19 @@ fn catalog_snapshot_derived_reports_preserve_rows_without_freezing_current_value
 
 #[test]
 fn catalog_snapshot_derived_reports_keep_private_edits_and_savepoint_rollback() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config("private-derived-catalog-reports");
         config.transaction_mode = mode;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut owner = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut observer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut owner =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut observer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         owner.success(&mut engine, SETUP, true);
         owner.success(&mut engine, "BEGIN; SAVEPOINT report_change", true);
         owner.success(&mut engine, CHANGE, true);
@@ -106,7 +136,9 @@ fn catalog_snapshot_derived_usage_is_distinct_and_checks_referenced_ownership() 
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "
+    session.success(
+        &mut engine,
+        "
         CREATE ROLE derived_reader;
         CREATE TABLE derived_private(id integer, payload text);
         CREATE VIEW derived_repeated AS SELECT a.id, b.id AS other, a.payload
@@ -114,7 +146,9 @@ fn catalog_snapshot_derived_usage_is_distinct_and_checks_referenced_ownership() 
         CREATE SEQUENCE derived_hidden_sequence;
         SELECT nextval('derived_hidden_sequence');
         GRANT SELECT ON derived_repeated TO derived_reader;
-    ", true);
+    ",
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT count(*) FROM information_schema.view_table_usage WHERE view_name='derived_repeated';
          SELECT column_name FROM information_schema.view_column_usage WHERE view_name='derived_repeated' ORDER BY column_name;

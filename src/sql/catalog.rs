@@ -9009,9 +9009,27 @@ pub(crate) fn synthesize<'a>(
     if qualifier == Some("information_schema") {
         match name {
             "views" => return information::views(storage, txid, views::Read::Statement, arena),
-            "sequences" => return information::sequences(storage, txid, views::Read::Statement, arena),
-            "view_table_usage" => return information::view_usage(storage, txid, views::Read::Statement, information::ViewUsage::Tables, arena),
-            "view_column_usage" => return information::view_usage(storage, txid, views::Read::Statement, information::ViewUsage::Columns, arena),
+            "sequences" => {
+                return information::sequences(storage, txid, views::Read::Statement, arena);
+            }
+            "view_table_usage" => {
+                return information::view_usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    information::ViewUsage::Tables,
+                    arena,
+                );
+            }
+            "view_column_usage" => {
+                return information::view_usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    information::ViewUsage::Columns,
+                    arena,
+                );
+            }
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9021,10 +9039,28 @@ pub(crate) fn synthesize<'a>(
     }
     if qualifier != Some("information_schema") {
         match name {
-            "pg_views" => return views::relations(storage, txid, views::Read::Statement, views::RelationView::Views, arena),
-            "pg_matviews" => return views::relations(storage, txid, views::Read::Statement, views::RelationView::MaterializedViews, arena),
+            "pg_views" => {
+                return views::relations(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::RelationView::Views,
+                    arena,
+                );
+            }
+            "pg_matviews" => {
+                return views::relations(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::RelationView::MaterializedViews,
+                    arena,
+                );
+            }
             "pg_rules" => return views::rules(storage, txid, views::Read::Statement, arena),
-            "pg_sequences" => return views::sequences(storage, txid, views::Read::Statement, arena),
+            "pg_sequences" => {
+                return views::sequences(storage, txid, views::Read::Statement, arena);
+            }
             "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
             "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
             _ => {}
@@ -9374,11 +9410,23 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_largeobject") => pg_largeobject(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, txid, arena),
         (false, "pg_range") => finish(schema::require("pg_range", false), &[], arena),
-        (false, "pg_matviews") => views::relations(storage, txid, views::Read::Current, views::RelationView::MaterializedViews, arena),
+        (false, "pg_matviews") => views::relations(
+            storage,
+            txid,
+            views::Read::Current,
+            views::RelationView::MaterializedViews,
+            arena,
+        ),
         (false, "pg_sequences") => views::sequences(storage, txid, views::Read::Current, arena),
         (false, "pg_sequence") => pg_sequence(storage, txid, arena),
         (false, "pg_database") => pg_database(storage, txid, arena),
-        (false, "pg_views") => views::relations(storage, txid, views::Read::Current, views::RelationView::Views, arena),
+        (false, "pg_views") => views::relations(
+            storage,
+            txid,
+            views::Read::Current,
+            views::RelationView::Views,
+            arena,
+        ),
         (false, "pg_rules") => views::rules(storage, txid, views::Read::Current, arena),
         (false, "pg_timezone_abbrevs") => pg_timezone_abbrevs(arena),
         (false, "pg_timezone_names") => pg_timezone_names(arena),
@@ -9424,8 +9472,20 @@ pub(crate) fn synthesize_current<'a>(
         (true, "parameters") => info_parameters(storage, txid, arena),
         (true, "routine_privileges") => info_routine_privileges(storage, txid, arena, true),
         (true, "role_routine_grants") => info_routine_privileges(storage, txid, arena, false),
-        (true, "view_table_usage") => information::view_usage(storage, txid, views::Read::Current, information::ViewUsage::Tables, arena),
-        (true, "view_column_usage") => information::view_usage(storage, txid, views::Read::Current, information::ViewUsage::Columns, arena),
+        (true, "view_table_usage") => information::view_usage(
+            storage,
+            txid,
+            views::Read::Current,
+            information::ViewUsage::Tables,
+            arena,
+        ),
+        (true, "view_column_usage") => information::view_usage(
+            storage,
+            txid,
+            views::Read::Current,
+            information::ViewUsage::Columns,
+            arena,
+        ),
         (true, "user_mapping_options") => info_user_mapping_options(storage, txid, arena),
         (true, "user_mappings") => info_user_mappings(storage, txid, arena),
         _ => Err(sql_err!(
@@ -30656,10 +30716,6 @@ fn pg_prepared_xacts<'a>(
     finish(definition, output, arena)
 }
 
-
-
-
-
 fn pg_sequence<'a>(
     storage: &Storage,
     txid: u32,
@@ -31338,9 +31394,6 @@ fn info_parameters<'a>(
     finish(definition, output, arena)
 }
 
-
-
-
 fn view_column_catalog_type(
     storage: &Storage,
     txid: u32,
@@ -31786,7 +31839,6 @@ fn info_role_table_grants<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     info_relation_privileges(storage, txid, arena, "role_table_grants", false)
 }
-
 
 fn info_usage_privileges<'a>(
     storage: &Storage,

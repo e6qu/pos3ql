@@ -37,7 +37,10 @@ CATALOG_SCALAR_COLUMNS = (
     ('pg_range', ('rngtypid', 'rngsubtype', 'rngmultitypid')),
     ('pg_rewrite', ('rulename', 'ev_class', 'ev_type', 'ev_enabled')),
     ('pg_seclabels', ('objoid', 'classoid', 'objnamespace')),
-    ('pg_sequences', ('schemaname', 'sequencename', 'sequenceowner')),
+    ('pg_sequences', ('schemaname', 'sequencename', 'sequenceowner', 'data_type', 'last_value')),
+    ('pg_views', ('schemaname', 'viewname', 'viewowner', 'definition')),
+    ('pg_matviews', ('schemaname', 'matviewname', 'matviewowner', 'tablespace', 'hasindexes', 'ispopulated', 'definition')),
+    ('pg_rules', ('schemaname', 'tablename', 'rulename', 'definition')),
     ('pg_shdescription', ('objoid', 'classoid')),
     ('pg_shseclabel', ('objoid', 'classoid')),
     ('pg_statistic_ext', ('stxrelid', 'stxnamespace', 'stxowner')),
@@ -97,6 +100,9 @@ def transcript(reader, writer):
 
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
+        for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
+            record(writer, f"{prefix}.information_types.{relation}",
+                   f"SELECT * FROM information_schema.{relation} LIMIT 0")
         for relation, fields in CATALOG_SCALAR_COLUMNS:
             record(
                 writer,
@@ -160,6 +166,88 @@ def transcript(reader, writer):
                     )
         finally:
             writer.execute("ROLLBACK")
+
+        writer.execute("CREATE TABLE derived_source_diff(id integer, payload text)")
+        writer.execute("CREATE VIEW derived_view_diff AS SELECT id,payload FROM derived_source_diff WITH LOCAL CHECK OPTION")
+        writer.execute("CREATE MATERIALIZED VIEW derived_materialized_diff AS SELECT id FROM derived_source_diff WITH NO DATA")
+        writer.execute("CREATE RULE derived_rule_diff AS ON INSERT TO derived_source_diff DO ALSO NOTHING")
+        writer.execute("CREATE SEQUENCE derived_sequence_diff AS integer START 3 INCREMENT 2")
+        reports = (
+            ("views", "SELECT viewname,viewowner,definition IS NOT NULL FROM pg_views WHERE viewname IN ('derived_view_diff','derived_renamed_view_diff') ORDER BY viewname"),
+            ("information_views", "SELECT table_catalog=current_database(),table_schema,table_name,view_definition IS NOT NULL,check_option,is_updatable,is_insertable_into,is_trigger_updatable,is_trigger_deletable,is_trigger_insertable_into FROM information_schema.views WHERE table_name IN ('derived_view_diff','derived_renamed_view_diff') ORDER BY table_name"),
+            ("materialized", "SELECT matviewname,tablespace,hasindexes,ispopulated,definition IS NOT NULL FROM pg_matviews WHERE matviewname IN ('derived_materialized_diff','derived_renamed_materialized_diff') ORDER BY matviewname"),
+            ("rules", "SELECT tablename,rulename,definition IS NOT NULL FROM pg_rules WHERE rulename IN ('derived_rule_diff','derived_renamed_rule_diff') ORDER BY rulename"),
+            ("sequences", "SELECT sequencename,data_type,start_value,min_value,max_value,increment_by,cycle,cache_size,last_value FROM pg_sequences WHERE sequencename IN ('derived_sequence_diff','derived_renamed_sequence_diff') ORDER BY sequencename"),
+            ("information_sequences", "SELECT sequence_catalog=current_database(),sequence_schema,sequence_name,data_type,numeric_precision,numeric_precision_radix,numeric_scale,start_value,minimum_value,maximum_value,increment,cycle_option FROM information_schema.sequences WHERE sequence_name IN ('derived_sequence_diff','derived_renamed_sequence_diff') ORDER BY sequence_name"),
+            ("tables", "SELECT view_catalog=current_database(),view_schema,view_name,table_catalog=current_database(),table_schema,table_name FROM information_schema.view_table_usage WHERE view_name IN ('derived_view_diff','derived_renamed_view_diff') ORDER BY view_name,table_name"),
+            ("columns", "SELECT view_name,table_name,column_name FROM information_schema.view_column_usage WHERE view_name IN ('derived_view_diff','derived_renamed_view_diff') ORDER BY view_name,table_name,column_name"),
+        )
+        changes = (
+            "ALTER VIEW derived_view_diff RENAME TO derived_renamed_view_diff",
+            "ALTER VIEW derived_renamed_view_diff SET (check_option=cascaded)",
+            "ALTER MATERIALIZED VIEW derived_materialized_diff RENAME TO derived_renamed_materialized_diff",
+            "CREATE INDEX derived_materialized_index_diff ON derived_renamed_materialized_diff(id)",
+            "ALTER RULE derived_rule_diff ON derived_source_diff RENAME TO derived_renamed_rule_diff",
+            "ALTER TABLE derived_source_diff RENAME TO derived_renamed_source_diff",
+            "ALTER TABLE derived_renamed_source_diff RENAME payload TO renamed_payload",
+            "ALTER SEQUENCE derived_sequence_diff RENAME TO derived_renamed_sequence_diff",
+            "ALTER SEQUENCE derived_renamed_sequence_diff INCREMENT 5",
+        )
+        try:
+            reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            for label, sql in reports:
+                record(reader, f"{prefix}.derived.before.{label}", sql)
+            writer.execute("BEGIN")
+            writer.execute("SAVEPOINT derived_change")
+            for sql in changes:
+                writer.execute(sql)
+            for label, sql in reports:
+                record(writer, f"{prefix}.derived.private.{label}", sql)
+                record(reader, f"{prefix}.derived.concurrent.{label}", sql)
+            writer.execute("ROLLBACK TO derived_change")
+            for label, sql in reports:
+                record(writer, f"{prefix}.derived.rollback.{label}", sql)
+            for sql in changes:
+                writer.execute(sql)
+            writer.execute("COMMIT")
+            writer.execute("SELECT nextval('derived_renamed_sequence_diff')")
+            for label, sql in reports:
+                record(reader, f"{prefix}.derived.retained.{label}", sql)
+            reader.execute("COMMIT")
+            for label, sql in reports:
+                record(reader, f"{prefix}.derived.fresh.{label}", sql)
+        finally:
+            reader.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+            writer.execute("DROP VIEW IF EXISTS derived_view_diff")
+            writer.execute("DROP VIEW IF EXISTS derived_renamed_view_diff")
+            writer.execute("DROP MATERIALIZED VIEW IF EXISTS derived_materialized_diff")
+            writer.execute("DROP MATERIALIZED VIEW IF EXISTS derived_renamed_materialized_diff")
+            writer.execute("DROP TABLE IF EXISTS derived_source_diff CASCADE")
+            writer.execute("DROP TABLE IF EXISTS derived_renamed_source_diff CASCADE")
+            writer.execute("DROP SEQUENCE IF EXISTS derived_sequence_diff")
+            writer.execute("DROP SEQUENCE IF EXISTS derived_renamed_sequence_diff")
+
+        writer.execute("CREATE ROLE derived_reader_diff")
+        writer.execute("CREATE TABLE derived_private_diff(id integer,payload text)")
+        writer.execute("CREATE VIEW derived_repeated_diff AS SELECT a.id,b.id AS other,a.payload FROM derived_private_diff a JOIN derived_private_diff b ON a.id=b.id")
+        writer.execute("CREATE SEQUENCE derived_hidden_sequence_diff")
+        writer.execute("SELECT nextval('derived_hidden_sequence_diff')")
+        writer.execute("GRANT SELECT ON derived_repeated_diff TO derived_reader_diff")
+        try:
+            for role in ("postgres", "derived_reader_diff"):
+                reader.execute(f"SET ROLE {role}")
+                record(reader, f"{prefix}.derived.privilege.{role}.view", "SELECT table_name,view_definition IS NULL FROM information_schema.views WHERE table_name='derived_repeated_diff'")
+                record(reader, f"{prefix}.derived.privilege.{role}.table", "SELECT table_name FROM information_schema.view_table_usage WHERE view_name='derived_repeated_diff'")
+                record(reader, f"{prefix}.derived.privilege.{role}.column", "SELECT table_name,column_name FROM information_schema.view_column_usage WHERE view_name='derived_repeated_diff' ORDER BY column_name")
+                record(reader, f"{prefix}.derived.privilege.{role}.sequence", "SELECT sequence_name FROM information_schema.sequences WHERE sequence_name='derived_hidden_sequence_diff'")
+                record(reader, f"{prefix}.derived.privilege.{role}.last", "SELECT last_value FROM pg_sequences WHERE sequencename='derived_hidden_sequence_diff'")
+        finally:
+            reader.execute("RESET ROLE")
+            writer.execute("DROP VIEW derived_repeated_diff")
+            writer.execute("DROP TABLE derived_private_diff")
+            writer.execute("DROP SEQUENCE derived_hidden_sequence_diff")
+            writer.execute("DROP ROLE derived_reader_diff")
 
         writer.execute("CREATE TABLE catalog_index_vectors_diff(id integer, note text, extra integer)")
         try:

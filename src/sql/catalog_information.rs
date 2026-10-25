@@ -1,8 +1,10 @@
 //! Projections of selected base catalogs for information_schema.
 //! Source: https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql
 
+use super::view_rows::{
+    CatalogRow, Index, Key, NamespaceJoin, Output, boolean, character, integer, string,
+};
 use super::views::{Base, Read, columns};
-use super::view_rows::{CatalogRow, Index, NamespaceJoin, Output, boolean, character, integer, string};
 use super::{Arena, Datum, SqlError, Storage, SynthTable, arena_full, text};
 use crate::sql::eval::{CatalogAccess, sqlstate};
 use crate::{sql_err, stack_format};
@@ -701,50 +703,112 @@ pub(super) fn views<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let classes = read.base(storage, Base::Class, transaction, arena)?;
-    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(
+        read.base(storage, Base::Namespace, transaction, arena)?,
+        arena,
+    )?;
     let triggers = read.base(storage, Base::Trigger, transaction, arena)?;
     let [trigger_relation, trigger_type] = columns(&triggers, ["tgrelid", "tgtype"]);
-    let triggers = Index::new(triggers, arena, |values| Ok(Some((integer(values[trigger_relation])? as u32, 0))))?;
-    let [oid, namespace, name, owner, kind, options] = columns(&classes, ["oid", "relnamespace", "relname", "relowner", "relkind", "reloptions"]);
+    let triggers = Index::new(triggers, arena, |values| {
+        Ok(Some((integer(values[trigger_relation])? as u32, 0)))
+    })?;
+    let [oid, namespace, name, owner, kind, options] = columns(
+        &classes,
+        [
+            "oid",
+            "relnamespace",
+            "relname",
+            "relowner",
+            "relkind",
+            "reloptions",
+        ],
+    );
     let [namespace_oid, namespace_name] = columns(&namespaces.table, ["oid", "nspname"]);
     let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
     let database = text(storage.current_database_name(transaction).as_str(), arena)?;
     let mut output = Output::new(arena);
     for class in classes.rows {
-        if character(class[kind])? != b'v' { continue; }
+        if character(class[kind])? != b'v' {
+            continue;
+        }
         let oid = integer(class[oid])?;
         let owned = owner_is_enabled(storage, transaction, integer(class[owner])?);
         let current_name = catalog.relname(oid, arena)?;
-        if !(owned || if let Some(name) = current_name {
-            catalog.has_table_privilege(None, name, "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER")? == Some(true)
-                || catalog.has_any_column_privilege(None, name, "SELECT, INSERT, UPDATE, REFERENCES")? == Some(true)
-        } else { false }) { continue; }
+        if !(owned
+            || if let Some(name) = current_name {
+                catalog.has_table_privilege(
+                    None,
+                    name,
+                    "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
+                )? == Some(true)
+                    || catalog.has_any_column_privilege(
+                        None,
+                        name,
+                        "SELECT, INSERT, UPDATE, REFERENCES",
+                    )? == Some(true)
+            } else {
+                false
+            })
+        {
+            continue;
+        }
         let definition = if owned {
-            catalog.view_def(oid, arena)?.map_or(Datum::Null, Datum::Text)
-        } else { Datum::Null };
+            catalog
+                .view_def(oid, arena)?
+                .map_or(Datum::Null, Datum::Text)
+        } else {
+            Datum::Null
+        };
         let check_option = match class[options] {
             Datum::Null => "NONE",
             Datum::Array { raw, element } => {
-                if crate::sql::array::elements(raw, element).any(|value| value == Datum::Text("check_option=cascaded")) { "CASCADED" }
-                else if crate::sql::array::elements(raw, element).any(|value| value == Datum::Text("check_option=local")) { "LOCAL" }
-                else { "NONE" }
+                if crate::sql::array::elements(raw, element)
+                    .any(|value| value == Datum::Text("check_option=cascaded"))
+                {
+                    "CASCADED"
+                } else if crate::sql::array::elements(raw, element)
+                    .any(|value| value == Datum::Text("check_option=local"))
+                {
+                    "LOCAL"
+                } else {
+                    "NONE"
+                }
             }
-            _ => return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid view relation options")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid view relation options"
+                ));
+            }
         };
         let updatable = if let Some(name) = current_name {
             relation_is_updatable(storage, transaction, name, arena)?
-        } else { false };
+        } else {
+            false
+        };
         let mut triggered = [false; 3];
         for trigger in triggers.matching((oid as u32, 0)) {
             let bits = integer(trigger[trigger_type])?;
-            for (found, mask) in triggered.iter_mut().zip([81, 73, 69]) { *found |= bits & mask == mask; }
+            for (found, mask) in triggered.iter_mut().zip([81, 73, 69]) {
+                *found |= bits & mask == mask;
+            }
         }
         for names in namespaces.matching((integer(class[namespace])? as u32, 0)) {
-            if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) { continue; }
+            if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) {
+                continue;
+            }
             let yes_no = |value| text(if value { "YES" } else { "NO" }, arena);
             output.push(&[
-                database, names[namespace_name], class[name], definition, text(check_option, arena)?,
-                yes_no(updatable)?, yes_no(updatable)?, yes_no(triggered[0])?, yes_no(triggered[1])?, yes_no(triggered[2])?,
+                database,
+                names[namespace_name],
+                class[name],
+                definition,
+                text(check_option, arena)?,
+                yes_no(updatable)?,
+                yes_no(updatable)?,
+                yes_no(triggered[0])?,
+                yes_no(triggered[1])?,
+                yes_no(triggered[2])?,
             ])?;
         }
     }
@@ -759,44 +823,111 @@ pub(super) fn sequences<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let sequences = read.base(storage, Base::Sequence, transaction, arena)?;
     let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
-    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(
+        read.base(storage, Base::Namespace, transaction, arena)?,
+        arena,
+    )?;
     let dependencies = read.base(storage, Base::Dependencies, transaction, arena)?;
-    let [dependency_class, dependency_object, dependency_kind] = columns(&dependencies, ["classid", "objid", "deptype"]);
+    let [dependency_class, dependency_object, dependency_kind] =
+        columns(&dependencies, ["classid", "objid", "deptype"]);
     let dependencies = Index::new(dependencies, arena, |values| {
-        Ok(if integer(values[dependency_class])? == super::PG_CLASS_OID && character(values[dependency_kind])? == b'i' {
-            Some((integer(values[dependency_object])? as u32, 0))
-        } else { None })
+        Ok(
+            if integer(values[dependency_class])? == super::PG_CLASS_OID
+                && character(values[dependency_kind])? == b'i'
+            {
+                Some((integer(values[dependency_object])? as u32, 0))
+            } else {
+                None
+            },
+        )
     })?;
-    let [relation, data_type, start, minimum, maximum, increment, cycle] = columns(&sequences,
-        ["seqrelid", "seqtypid", "seqstart", "seqmin", "seqmax", "seqincrement", "seqcycle"]);
-    let [namespace, name, owner, kind] = columns(&classes.table, ["relnamespace", "relname", "relowner", "relkind"]);
+    let [
+        relation,
+        data_type,
+        start,
+        minimum,
+        maximum,
+        increment,
+        cycle,
+    ] = columns(
+        &sequences,
+        [
+            "seqrelid",
+            "seqtypid",
+            "seqstart",
+            "seqmin",
+            "seqmax",
+            "seqincrement",
+            "seqcycle",
+        ],
+    );
+    let [namespace, name, owner, kind] = columns(
+        &classes.table,
+        ["relnamespace", "relname", "relowner", "relkind"],
+    );
     let [namespace_oid, namespace_name] = columns(&namespaces.table, ["oid", "nspname"]);
     let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
     let database = text(storage.current_database_name(transaction).as_str(), arena)?;
     let mut output = Output::new(arena);
     for sequence in sequences.rows {
         let oid = integer(sequence[relation])?;
-        if dependencies.matching((oid as u32, 0)).next().is_some() { continue; }
+        if dependencies.matching((oid as u32, 0)).next().is_some() {
+            continue;
+        }
         let type_oid = integer(sequence[data_type])?;
         let data_type = text(super::views::sequence_type(type_oid)?, arena)?;
-        let precision = ScalarMetadata::new(type_oid, -1, 1)?.precision.ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "sequence type has no precision"))?;
+        let precision = ScalarMetadata::new(type_oid, -1, 1)?
+            .precision
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "sequence type has no precision"))?;
         let numeric_text = |value| match value {
-            Datum::Int8(value) => arena.alloc_str_display(format_args!("{value}")).map(Datum::Text).map_err(|_| arena_full()),
-            _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid sequence setting")),
+            Datum::Int8(value) => arena
+                .alloc_str_display(format_args!("{value}"))
+                .map(Datum::Text)
+                .map_err(|_| arena_full()),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid sequence setting"
+            )),
         };
         for class in classes.matching((oid as u32, 0)) {
-            if character(class[kind])? != b'S' { continue; }
-            if !(owner_is_enabled(storage, transaction, integer(class[owner])?) || match catalog.relname(oid, arena)? {
-                Some(name) => catalog.has_sequence_privilege(None, name, "SELECT, UPDATE, USAGE")? == Some(true),
-                None => false,
-            }) { continue; }
+            if character(class[kind])? != b'S' {
+                continue;
+            }
+            if !(owner_is_enabled(storage, transaction, integer(class[owner])?)
+                || match catalog.relname(oid, arena)? {
+                    Some(name) => {
+                        catalog.has_sequence_privilege(None, name, "SELECT, UPDATE, USAGE")?
+                            == Some(true)
+                    }
+                    None => false,
+                })
+            {
+                continue;
+            }
             for names in namespaces.matching((integer(class[namespace])? as u32, 0)) {
-                if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) { continue; }
+                if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) {
+                    continue;
+                }
                 output.push(&[
-                    database, names[namespace_name], class[name], data_type,
-                    Datum::Int4(precision), Datum::Int4(2), Datum::Int4(0),
-                    numeric_text(sequence[start])?, numeric_text(sequence[minimum])?, numeric_text(sequence[maximum])?, numeric_text(sequence[increment])?,
-                    text(if boolean(sequence[cycle])? { "YES" } else { "NO" }, arena)?,
+                    database,
+                    names[namespace_name],
+                    class[name],
+                    data_type,
+                    Datum::Int4(precision),
+                    Datum::Int4(2),
+                    Datum::Int4(0),
+                    numeric_text(sequence[start])?,
+                    numeric_text(sequence[minimum])?,
+                    numeric_text(sequence[maximum])?,
+                    numeric_text(sequence[increment])?,
+                    text(
+                        if boolean(sequence[cycle])? {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                        arena,
+                    )?,
                 ])?;
             }
         }
@@ -818,46 +949,105 @@ pub(super) fn view_usage<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
-    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(
+        read.base(storage, Base::Namespace, transaction, arena)?,
+        arena,
+    )?;
     let dependencies = read.base(storage, Base::Dependencies, transaction, arena)?;
-    let [object_class, object, target_class, target, subobject, kind] = columns(&dependencies,
-        ["classid", "objid", "refclassid", "refobjid", "refobjsubid", "deptype"]);
+    let [object_class, object, target_class, target, subobject, kind] = columns(
+        &dependencies,
+        [
+            "classid",
+            "objid",
+            "refclassid",
+            "refobjid",
+            "refobjsubid",
+            "deptype",
+        ],
+    );
     let dependencies = Index::new(dependencies, arena, |values| {
-        Ok(if integer(values[object_class])? == 2618 && integer(values[target_class])? == super::PG_CLASS_OID {
-            Some((integer(values[object])? as u32, 0))
-        } else { None })
+        Ok(
+            if integer(values[object_class])? == 2618
+                && integer(values[target_class])? == super::PG_CLASS_OID
+            {
+                Some((integer(values[object])? as u32, 0))
+            } else {
+                None
+            },
+        )
     })?;
     let attributes = match usage {
         ViewUsage::Tables => None,
         ViewUsage::Columns => {
             let attributes = read.base(storage, Base::Attribute, transaction, arena)?;
             let [relation, number] = columns(&attributes, ["attrelid", "attnum"]);
-            Some(Index::new(attributes, arena, |values| Ok(Some((integer(values[relation])? as u32, integer(values[number])?))))?)
+            Some(Index::new(attributes, arena, |values| {
+                Ok(Some((
+                    integer(values[relation])? as u32,
+                    integer(values[number])?,
+                )))
+            })?)
         }
     };
-    let [class_kind, namespace, name, owner] = columns(&classes.table, ["relkind", "relnamespace", "relname", "relowner"]);
+    let [class_kind, namespace, name, owner] = columns(
+        &classes.table,
+        ["relkind", "relnamespace", "relname", "relowner"],
+    );
     let [namespace_name] = columns(&namespaces.table, ["nspname"]);
     let database = text(storage.current_database_name(transaction).as_str(), arena)?;
     let mut output = Output::new(arena);
     for dependent in dependencies.table.rows {
-        if integer(dependent[object_class])? != 2618 || integer(dependent[target_class])? != super::PG_CLASS_OID || character(dependent[kind])? != b'i' { continue; }
+        if integer(dependent[object_class])? != 2618
+            || integer(dependent[target_class])? != super::PG_CLASS_OID
+            || character(dependent[kind])? != b'i'
+        {
+            continue;
+        }
         let view_oid = integer(dependent[target])?;
         for view in classes.matching((view_oid as u32, 0)) {
-            if character(view[class_kind])? != b'v' { continue; }
+            if character(view[class_kind])? != b'v' {
+                continue;
+            }
             for reference in dependencies.matching((integer(dependent[object])? as u32, 0)) {
                 let table_oid = integer(reference[target])?;
-                if table_oid == view_oid { continue; }
+                if table_oid == view_oid {
+                    continue;
+                }
                 for table in classes.matching((table_oid as u32, 0)) {
-                    if !matches!(character(table[class_kind])?, b'r' | b'v' | b'f' | b'p') || !owner_is_enabled(storage, transaction, integer(table[owner])?) { continue; }
+                    if !matches!(character(table[class_kind])?, b'r' | b'v' | b'f' | b'p')
+                        || !owner_is_enabled(storage, transaction, integer(table[owner])?)
+                    {
+                        continue;
+                    }
                     for view_names in namespaces.matching((integer(view[namespace])? as u32, 0)) {
-                        for table_names in namespaces.matching((integer(table[namespace])? as u32, 0)) {
-                            let values = [database, view_names[namespace_name], view[name], database, table_names[namespace_name], table[name]];
+                        for table_names in
+                            namespaces.matching((integer(table[namespace])? as u32, 0))
+                        {
+                            let values = [
+                                database,
+                                view_names[namespace_name],
+                                view[name],
+                                database,
+                                table_names[namespace_name],
+                                table[name],
+                            ];
                             match &attributes {
                                 None => output.push(&values)?,
                                 Some(attributes) => {
                                     let [attribute_name] = columns(&attributes.table, ["attname"]);
-                                    for attribute in attributes.matching((table_oid as u32, integer(reference[subobject])?)) {
-                                        output.push(&[values[0], values[1], values[2], values[3], values[4], values[5], attribute[attribute_name]])?;
+                                    for attribute in attributes.matching((
+                                        table_oid as u32,
+                                        integer(reference[subobject])?,
+                                    )) {
+                                        output.push(&[
+                                            values[0],
+                                            values[1],
+                                            values[2],
+                                            values[3],
+                                            values[4],
+                                            values[5],
+                                            attribute[attribute_name],
+                                        ])?;
                                     }
                                 }
                             }
@@ -867,5 +1057,8 @@ pub(super) fn view_usage<'a>(
             }
         }
     }
-    output.finish_distinct_names(match usage { ViewUsage::Tables => "view_table_usage", ViewUsage::Columns => "view_column_usage" })
+    output.finish_distinct_names(match usage {
+        ViewUsage::Tables => "view_table_usage",
+        ViewUsage::Columns => "view_column_usage",
+    })
 }

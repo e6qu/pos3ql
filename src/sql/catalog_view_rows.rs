@@ -5,7 +5,7 @@ use super::{Arena, Datum, SqlError, SynthTable, arena_full, finish, row, schema}
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
 
-type Key = (u32, i32);
+pub(super) type Key = (u32, i32);
 
 pub(super) struct Index<'a> {
     pub(super) table: SynthTable<'a>,
@@ -74,7 +74,10 @@ impl<'a> Index<'a> {
             .map(|(_, position)| self.table.rows[*position])
     }
 
-    pub(super) fn left(&self, key: Option<Key>) -> impl Iterator<Item = Option<&'a [Datum<'a>]>> + '_ {
+    pub(super) fn left(
+        &self,
+        key: Option<Key>,
+    ) -> impl Iterator<Item = Option<&'a [Datum<'a>]>> + '_ {
         let missing = self.optional(key).next().is_none();
         self.optional(key).map(Some).chain(missing.then_some(None))
     }
@@ -186,7 +189,7 @@ struct OutputNode<'a> {
 }
 
 pub(super) struct Output<'a> {
-    arena: &'a Arena,
+    pub(super) arena: &'a Arena,
     last: Option<&'a OutputNode<'a>>,
     count: usize,
 }
@@ -223,7 +226,12 @@ impl<'a> Output<'a> {
         self.finish_rows(name, true, true)
     }
 
-    fn finish_rows(self, name: &str, information: bool, distinct_names: bool) -> Result<SynthTable<'a>, SqlError> {
+    fn finish_rows(
+        self,
+        name: &str,
+        information: bool,
+        distinct_names: bool,
+    ) -> Result<SynthTable<'a>, SqlError> {
         let rows = self
             .arena
             .alloc_slice_with(self.count, |_| &[] as &[Datum])
@@ -237,11 +245,18 @@ impl<'a> Output<'a> {
         let mut count = rows.len();
         if distinct_names {
             for values in rows.iter() {
-                for value in *values { string(*value)?; }
+                for value in *values {
+                    string(*value)?;
+                }
             }
             rows.sort_unstable_by(|left, right| {
-                left.iter().map(|value| string(*value).expect("validated name"))
-                    .cmp(right.iter().map(|value| string(*value).expect("validated name")))
+                left.iter()
+                    .map(|value| string(*value).expect("validated name"))
+                    .cmp(
+                        right
+                            .iter()
+                            .map(|value| string(*value).expect("validated name")),
+                    )
             });
             count = 0;
             for at in 0..rows.len() {
@@ -251,7 +266,11 @@ impl<'a> Output<'a> {
                 }
             }
         }
-        finish(schema::require(name, information), &rows[..count], self.arena)
+        finish(
+            schema::require(name, information),
+            &rows[..count],
+            self.arena,
+        )
     }
 }
 
@@ -296,4 +315,3 @@ pub(super) fn boolean(value: Datum<'_>) -> Result<bool, SqlError> {
         )),
     }
 }
-

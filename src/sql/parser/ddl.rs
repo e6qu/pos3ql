@@ -1664,7 +1664,10 @@ impl<'a> Parser<'a> {
         if wrapped {
             self.expect_op("(")?;
         }
-        let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.any_op_token()?;
         let qualified = if self.eat_op(".")? {
             self.record_namespace(source)?;

@@ -202,7 +202,8 @@ def schema_rename_reports(reader, writer, isolation, prefix, record, record_outc
         writer.execute("CREATE SCHEMA sr_rename_before_diff")
         writer.execute("CREATE TABLE sr_rename_before_diff.orders(id integer)")
         writer.execute("INSERT INTO sr_rename_before_diff.orders VALUES(17)")
-        writer.execute("CREATE VIEW sr_rename_before_diff.order_view AS SELECT id FROM sr_rename_before_diff.orders")
+        writer.execute("CREATE VIEW sr_rename_before_diff.order_view AS SELECT sr_rename_before_diff.id FROM sr_rename_before_diff /* namespace */ .orders AS sr_rename_before_diff")
+        writer.execute("CREATE MATERIALIZED VIEW sr_rename_before_diff.order_cache AS SELECT id FROM sr_rename_before_diff.orders")
         writer.execute("CREATE FUNCTION sr_rename_before_diff.bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM sr_rename_before_diff.orders; END")
         writer.execute("CREATE FUNCTION sr_rename_before_diff.unbound() RETURNS integer LANGUAGE SQL AS 'SELECT id FROM sr_rename_before_diff.orders'")
         namespaces = "SELECT nspname FROM pg_namespace WHERE nspname IN ('sr_rename_before_diff','sr_rename_after_diff') ORDER BY nspname"
@@ -214,6 +215,8 @@ def schema_rename_reports(reader, writer, isolation, prefix, record, record_outc
         record(writer, f"{prefix}.schema_rename.private.owner", namespaces)
         record(writer, f"{prefix}.schema_rename.private.view", "SELECT * FROM sr_rename_after_diff.order_view")
         record(writer, f"{prefix}.schema_rename.private.bound", "SELECT sr_rename_after_diff.bound()")
+        writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")
+        record(writer, f"{prefix}.schema_rename.private.materialized", "SELECT id FROM sr_rename_after_diff.order_cache")
         record(reader, f"{prefix}.schema_rename.private.observer", namespaces)
         record(reader, f"{prefix}.schema_rename.private.lookup", lookup)
         record(reader, f"{prefix}.schema_rename.private.original", "SELECT * FROM sr_rename_before_diff.order_view")
@@ -226,11 +229,64 @@ def schema_rename_reports(reader, writer, isolation, prefix, record, record_outc
         record(reader, f"{prefix}.schema_rename.current_bound", "SELECT sr_rename_after_diff.bound()")
         record_outcome(reader, f"{prefix}.schema_rename.current_unbound", "SELECT sr_rename_after_diff.unbound()", ())
         reader.execute("COMMIT")
+        writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")
+        record(writer, f"{prefix}.schema_rename.current_materialized", "SELECT id FROM sr_rename_after_diff.order_cache")
     finally:
         reader.execute("ROLLBACK")
         writer.execute("ROLLBACK")
         writer.execute("DROP SCHEMA IF EXISTS sr_rename_before_diff CASCADE")
         writer.execute("DROP SCHEMA IF EXISTS sr_rename_after_diff CASCADE")
+
+
+def schema_name_binding_reports(writer, prefix, record):
+    public_renamed = False
+    try:
+        writer.execute('CREATE SCHEMA "SrCaseDiff"')
+        writer.execute('CREATE SCHEMA srcasediff')
+        writer.execute('CREATE TABLE "SrCaseDiff".items(id integer)')
+        writer.execute('CREATE TABLE srcasediff.items(id integer)')
+        writer.execute('INSERT INTO "SrCaseDiff".items VALUES(31)')
+        writer.execute('INSERT INTO srcasediff.items VALUES(41)')
+        writer.execute('CREATE VIEW sr_case_view_diff AS SELECT a.id AS quoted,b.id AS unquoted FROM "SrCaseDiff".items AS a CROSS JOIN SRCASEDIFF.items AS b')
+        writer.execute('BEGIN')
+        writer.execute('ALTER SCHEMA "SrCaseDiff" RENAME TO "MovedSrCaseDiff"')
+        record(writer, f"{prefix}.schema_binding.private_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
+        writer.execute('COMMIT')
+        record(writer, f"{prefix}.schema_binding.committed_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
+        writer.execute('CREATE SCHEMA "Sr,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "Sr,\"\"quoted\"\"Diff"')
+        writer.execute('CREATE TABLE items(id integer)')
+        writer.execute('INSERT INTO items VALUES(12)')
+        writer.execute('CREATE VIEW item_view AS SELECT id FROM items')
+        writer.execute('CREATE FUNCTION bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM items; END')
+        writer.execute('ALTER SCHEMA "Sr,\"\"quoted\"\"Diff" RENAME TO "MovedSr,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "MovedSr,\"\"quoted\"\"Diff"')
+        record(writer, f"{prefix}.schema_binding.quoted_path", 'SELECT current_schema()')
+        record(writer, f"{prefix}.schema_binding.quoted_view", 'SELECT id FROM item_view')
+        record(writer, f"{prefix}.schema_binding.quoted_routine", 'SELECT bound()')
+        writer.execute('RESET search_path')
+        writer.execute('ALTER SCHEMA public RENAME TO sr_initial_public_diff')
+        public_renamed = True
+        record(writer, f"{prefix}.schema_binding.no_public", "SELECT to_regnamespace('public') IS NULL")
+        record(writer, f"{prefix}.schema_binding.initial_identity", "SELECT oid=2200,nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('CREATE SCHEMA public')
+        record(writer, f"{prefix}.schema_binding.replacement_identity", "SELECT oid<>2200,nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='public'")
+        writer.execute('BEGIN')
+        writer.execute('SAVEPOINT before_owner')
+        writer.execute('ALTER SCHEMA sr_initial_public_diff OWNER TO postgres')
+        record(writer, f"{prefix}.schema_binding.private_owner", "SELECT nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('ROLLBACK TO before_owner')
+        record(writer, f"{prefix}.schema_binding.restored_owner", "SELECT nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('ROLLBACK')
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET search_path')
+        if public_renamed:
+            writer.execute('DROP SCHEMA IF EXISTS public CASCADE')
+            writer.execute('ALTER SCHEMA sr_initial_public_diff RENAME TO public')
+        writer.execute('DROP VIEW IF EXISTS sr_case_view_diff')
+        for schema in ('SrCaseDiff', 'srcasediff', 'MovedSrCaseDiff', 'Sr,"quoted"Diff', 'MovedSr,"quoted"Diff'):
+            writer.execute(pg_sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(pg_sql.Identifier(schema)))
 
 
 def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
@@ -384,6 +440,7 @@ def transcript(reader, writer, host, port, user, report_database):
         constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome)
         schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_name_binding_reports(writer, prefix, record)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

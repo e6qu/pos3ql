@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn schema_rename_without_a_public_replacement_survives_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        let name = format!("schema-no-public-recovery-{checkpoint}");
+        let mut config = test_config(&name);
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE TABLE public.items(id integer);
+            INSERT INTO public.items VALUES(23);
+            ALTER SCHEMA public RENAME TO archived", false);
+        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold, "
+            SELECT to_regnamespace('public') IS NULL;
+            SELECT 'archived'::regnamespace::oid=2200;
+            SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='archived';
+            SELECT id FROM archived.items;
+        ", true)), ["t", "t", "pg_database_owner", "23"], "{name}");
+        session.success(&mut cold, "CREATE SCHEMA public; CREATE TABLE public.items(id integer)", false);
+        assert_eq!(data_rows(&session.success(&mut cold, "
+            SELECT 'public'::regnamespace::oid<>2200;
+            SELECT id FROM archived.items;
+        ", true)), ["t", "23"], "{name}");
+        drop(session);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
     for checkpoint in [false, true] {
         let name = format!("schema-owner-recovery-{checkpoint}");
@@ -40,7 +82,8 @@ fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
                 class: crate::storage::AccessClass::Schema, slot: slot as u16,
             }, transaction), owner, "{name}: {schema}");
         }
-        session.success(&mut cold, "ROLLBACK PREPARED 'schema_owner'; DROP ROLE retained_schema_owner", false);
+        session.success(&mut cold, "ROLLBACK PREPARED 'schema_owner'", false);
+        session.success(&mut cold, "DROP ROLE retained_schema_owner", false);
         assert!(cold.storage.find_role_visible("retained_schema_owner", 0).is_none());
         drop(session);
         drop(cold);

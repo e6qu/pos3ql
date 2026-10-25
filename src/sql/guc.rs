@@ -2874,8 +2874,15 @@ fn canonicalize_search_path(
         }
         let mut name = StackStr::<64>::new();
         if element.starts_with('"') {
-            let raw = element.strip_prefix('"').and_then(|raw| raw.strip_suffix('"'))
-                .ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid quoted search_path identifier"))?;
+            let raw = element
+                .strip_prefix('"')
+                .and_then(|raw| raw.strip_suffix('"'))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "invalid quoted search_path identifier"
+                    )
+                })?;
             let mut chars = raw.chars().peekable();
             while let Some(c) = chars.next() {
                 let _ = write!(name, "{c}");
@@ -2884,8 +2891,15 @@ fn canonicalize_search_path(
                 }
             }
         } else if element.starts_with('\'') {
-            let raw = element.strip_prefix('\'').and_then(|raw| raw.strip_suffix('\''))
-                .ok_or_else(|| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "invalid quoted search_path identifier"))?;
+            let raw = element
+                .strip_prefix('\'')
+                .and_then(|raw| raw.strip_suffix('\''))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "invalid quoted search_path identifier"
+                    )
+                })?;
             let mut chars = raw.chars().peekable();
             while let Some(c) = chars.next() {
                 let _ = write!(name, "{c}");

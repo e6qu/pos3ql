@@ -85,10 +85,24 @@ pub(crate) fn rename(
         let mut changed = rename_user_type_schema(&mut spec.base_domain, old, name);
         changed |= rename_user_type_schema(&mut spec.base_user_type, old, name);
         if let Some(default) = &mut spec.default_expr {
-            changed |= rename_schema_qualified_sql(default, &mut [], old, name, crate::sql::parser::StoredSqlKind::Expression, arena)?;
+            changed |= rename_schema_qualified_sql(
+                default,
+                &mut [],
+                old,
+                name,
+                crate::sql::parser::StoredSqlKind::Expression,
+                arena,
+            )?;
         }
         for check in spec.checks.iter_mut().take(spec.n_checks) {
-            changed |= rename_schema_qualified_sql(&mut check.expression, &mut [], old, name, crate::sql::parser::StoredSqlKind::Expression, arena)?;
+            changed |= rename_schema_qualified_sql(
+                &mut check.expression,
+                &mut [],
+                old,
+                name,
+                crate::sql::parser::StoredSqlKind::Expression,
+                arena,
+            )?;
         }
         if changed {
             let (_, target) = storage.prepare_domain_edit(slot, txn.txid)?;
@@ -113,7 +127,9 @@ pub(crate) fn rename(
         }
     }
     for slot in 0..storage.index_count() {
-        if let Some(prior) = storage.stage_index_schema_references(slot, old, name, txn.txid, arena)? {
+        if let Some(prior) =
+            storage.stage_index_schema_references(slot, old, name, txn.txid, arena)?
+        {
             txn.record_catalog_change(
                 storage,
                 DdlUndo::IndexAltered {
@@ -245,7 +261,11 @@ pub(crate) fn rename(
         }
         let (change, _) = storage.alter_rule(
             storage.prepare_rule_edit(slot, txn.txid)?,
-            crate::storage::RuleMetadataChange::Schema { old, new: name, arena },
+            crate::storage::RuleMetadataChange::Schema {
+                old,
+                new: name,
+                arena,
+            },
             txn.txid,
         )?;
         txn.record_catalog_change(storage, DdlUndo::RuleAltered(change))?;
@@ -261,7 +281,14 @@ pub(crate) fn rename(
             .into_iter()
             .flatten()
         {
-            changed |= rename_schema_qualified_sql(expression, &mut [], old, name, crate::sql::parser::StoredSqlKind::Expression, arena)?;
+            changed |= rename_schema_qualified_sql(
+                expression,
+                &mut [],
+                old,
+                name,
+                crate::sql::parser::StoredSqlKind::Expression,
+                arena,
+            )?;
         }
         let mut dependencies = storage.snapshot_policy_dependencies(slot, txn.txid, arena)?;
         changed |= dependencies.rename_schema(old, name);
@@ -290,7 +317,14 @@ pub(crate) fn rename(
         let mut sql = view.sql;
         let mut path = view.creation_path;
         crate::storage::rename_schema_path(&mut path, old, name)?;
-        let changed = rename_schema_qualified_sql(&mut sql, &mut [], old, name, crate::sql::parser::StoredSqlKind::Statements, arena)?;
+        let changed = rename_schema_qualified_sql(
+            &mut sql,
+            &mut [],
+            old,
+            name,
+            crate::sql::parser::StoredSqlKind::Statements,
+            arena,
+        )?;
         let dependencies = storage.snapshot_matview_dependencies(slot, txn.txid, arena)?;
         if changed
             || path != view.creation_path

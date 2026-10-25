@@ -10634,7 +10634,10 @@ fn pg_default_acl<'a>(
 use crate::storage::FIRST_TEMP_NAMESPACE_OID;
 /// Durable schema identities survive renames, slot reuse and database clones.
 pub(crate) fn namespace_oid_for_slot(storage: &Storage, slot: usize) -> i32 {
-    storage.schema_def(slot).identity().map_or(0, crate::storage::SchemaIdentity::oid)
+    storage
+        .schema_def(slot)
+        .identity()
+        .map_or(0, crate::storage::SchemaIdentity::oid)
 }
 
 fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {

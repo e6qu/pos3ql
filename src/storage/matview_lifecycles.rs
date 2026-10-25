@@ -220,7 +220,14 @@ impl Storage {
         let mut sql = selected.sql;
         let mut creation_path = selected.creation_path;
         rename_schema_path(&mut creation_path, old, new)?;
-        rename_schema_qualified_sql(&mut sql, &mut [], old, new, crate::sql::parser::StoredSqlKind::Statements, arena)?;
+        rename_schema_qualified_sql(
+            &mut sql,
+            &mut [],
+            old,
+            new,
+            crate::sql::parser::StoredSqlKind::Statements,
+            arena,
+        )?;
         let version = self.catalog_sequence.next()?;
         let dependency_slot = owners.allocate_preserved_query_image(
             self,

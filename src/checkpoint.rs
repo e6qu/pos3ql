@@ -4584,14 +4584,23 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at = parse_field::<u64>(words.next(), "schema creation identity")?;
                     if created_at > metadata.catalog_sequence {
-                        return Err(CheckpointSetupError::Corrupt("schema creation identity exceeds its allocator"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "schema creation identity exceeds its allocator",
+                        ));
                     }
-                    let identity = crate::storage::SchemaIdentity::parse(created_at)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid schema creation identity"))?;
-                    let database_owner = match parse_field::<u8>(words.next(), "schema database owner")? {
-                        0 => false, 1 => true,
-                        _ => return Err(CheckpointSetupError::Corrupt("invalid schema database owner")),
-                    };
+                    let identity = crate::storage::SchemaIdentity::parse(created_at).ok_or(
+                        CheckpointSetupError::Corrupt("invalid schema creation identity"),
+                    )?;
+                    let database_owner =
+                        match parse_field::<u8>(words.next(), "schema database owner")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid schema database owner",
+                                ));
+                            }
+                        };
                     let hex = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("nsp name missing"))?;
@@ -4599,9 +4608,19 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing schema fields"));
                     }
-                    storage.restore_schema(identity, name, crate::storage::CatalogDdlState::Present, database_owner)
-                        .map_err(|e| CheckpointSetupError::ObjectStore(format!(
-                            "manifest schema rejected: {}", e.message.as_str())))?;
+                    storage
+                        .restore_schema(
+                            identity,
+                            name,
+                            crate::storage::CatalogDdlState::Present,
+                            database_owner,
+                        )
+                        .map_err(|e| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest schema rejected: {}",
+                                e.message.as_str()
+                            ))
+                        })?;
                 }
                 Some("lob") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -9718,8 +9737,15 @@ impl Checkpointer {
             }
             write_manifest(
                 &mut self.manifest_output,
-                format_args!("nsp {} {} {}", schema.identity().expect("checkpoint selects a schema").created_at(),
-                    u8::from(schema.has_database_owner(0)), hex.as_str()),
+                format_args!(
+                    "nsp {} {} {}",
+                    schema
+                        .identity()
+                        .expect("checkpoint selects a schema")
+                        .created_at(),
+                    u8::from(schema.has_database_owner(0)),
+                    hex.as_str()
+                ),
             )?;
         }
         for (_, object) in storage.checkpoint_large_objects() {
@@ -12477,7 +12503,9 @@ impl Checkpointer {
             })?;
         }
         for (slot, schema) in storage.checkpoint_schemas() {
-            if schema.has_database_owner(0) { continue; }
+            if schema.has_database_owner(0) {
+                continue;
+            }
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,
@@ -20035,7 +20063,7 @@ mod stored_dependency_tests {
     }
 
     #[test]
-    fn manifest_catalog_duplicates_reject_before_replacement() {
+    fn schema_name_manifest_catalog_duplicates_reject_before_replacement() {
         let result = std::thread::Builder::new()
             .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
             .spawn(|| {
@@ -20060,6 +20088,26 @@ mod stored_dependency_tests {
                     + Storage::extra_budget_bytes(&config)
                     + Checkpointer::budget_bytes(&config)
                     + (1 << 20);
+                for (sequence, records) in [
+                    (10, "nsp 7 0 6669727374\nnsp 7 0 7365636f6e64\n"),
+                    (10, "nsp 7 0 6669727374\nnsp 8 0 6669727374\n"),
+                    (10, "nsp 7 0 6669727374\nnsp 11 0 7365636f6e64\n"),
+                    (1_920_000, "nsp 7 0 6669727374\nnsp 1920000 0 7365636f6e64\n"),
+                    (10, "nsp 7 0 6669727374\nnsp 8 2 7365636f6e64\n"),
+                    (10, "nsp 7 0 6669727374\nnsp 8 0 7365636f6e64 trailing\n"),
+                    (10, "nsp 7 0 6669727374\nnsp 8 0 \n"),
+                    (10, "nsp 7 0 6669727374\nnsp 8 0 70675f636174616c6f67\n"),
+                ] {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let manifest = format!("{MANIFEST_HEADER}\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence {sequence}\nrole_sequence 16384\nwriter 00000000000000000000000000000001\n{records}types_end\nend\n");
+                    assert!(checkpointer.load_manifest_text(&mut storage, &manifest).is_err(), "{records}");
+                    let slot = storage.find_schema("first").unwrap();
+                    assert_eq!(storage.schema_def(slot).identity().unwrap().created_at(), 7);
+                    assert_eq!(storage.find_schema("second"), None);
+                    assert_eq!(storage.find_schema("public"), None);
+                }
                 for (first_oid, second_oid, first_name, second_name) in [
                     (5, 5, "postgres", "replacement"),
                     (5, 100_001, "postgres", "postgres"),

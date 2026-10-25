@@ -309,7 +309,9 @@ pub(crate) enum StoredSqlKind {
 /// Namespace positions come from grammar nodes, so table aliases and record
 /// fields cannot be mistaken for namespaces during a stored definition edit.
 pub(crate) fn schema_namespace_sources<'arena>(
-    sql: &str, kind: StoredSqlKind, arena: &'arena Arena,
+    sql: &str,
+    kind: StoredSqlKind,
+    arena: &'arena Arena,
 ) -> Result<&'arena [NamespaceSource], super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.namespace_sources = Some(core::cell::RefCell::new(ArenaList::new(arena)));
@@ -318,18 +320,29 @@ pub(crate) fn schema_namespace_sources<'arena>(
         StoredSqlKind::Statements => (|| {
             while parser.peeked != Tok::Eof {
                 let _ = parser.statement()?;
-                if parser.peeked != Tok::Eof { parser.expect_op(";")?; }
+                if parser.peeked != Tok::Eof {
+                    parser.expect_op(";")?;
+                }
             }
             Ok(())
         })(),
     };
     parsed.map_err(|error| super::parse_error_to_sql(&error))?;
     if parser.peeked != Tok::Eof {
-        return Err(crate::sql_err!(sqlstate::SYNTAX_ERROR, "trailing tokens after stored SQL"));
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after stored SQL"
+        ));
     }
-    let sources = parser.namespace_sources.as_ref().expect("explicit namespace capture").borrow();
+    let sources = parser
+        .namespace_sources
+        .as_ref()
+        .expect("explicit namespace capture")
+        .borrow();
     // The returned positions own no references into the source being edited.
-    arena.alloc_slice_copy(sources.as_slice()).map(|sources| &*sources)
+    arena
+        .alloc_slice_copy(sources.as_slice())
+        .map(|sources| &*sources)
         .map_err(|_| super::query::arena_full_pub())
 }
 
@@ -342,8 +355,15 @@ mod namespace_source_tests {
         let mut budget = crate::mem::budget::Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "namespace source test", 1 << 20).unwrap();
         let sql = "SELECT old.items.id, old.id, old.score(old.id)::old.kind COLLATE old.ordering FROM old /* namespace */ .items AS old WHERE old.id OPERATOR(old.=) 1";
-        let expected = ["old.items.id", "old.score", "old.kind", "old.ordering", "old /* namespace */", "old.="]
-            .map(|name| sql.find(name).unwrap());
+        let expected = [
+            "old.items.id",
+            "old.score",
+            "old.kind",
+            "old.ordering",
+            "old /* namespace */",
+            "old.=",
+        ]
+        .map(|name| sql.find(name).unwrap());
         crate::mem::guard::forbid_alloc(|| {
             let sources = schema_namespace_sources(sql, StoredSqlKind::Statements, &arena).unwrap();
             assert_eq!(sources.len(), expected.len());
@@ -693,7 +713,10 @@ impl<'a> Parser<'a> {
     /// `[schema.]name` — a possibly-qualified relation name in a statement
     /// position (DDL targets, DML tables).
     fn qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
-        let source = NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
@@ -707,7 +730,10 @@ impl<'a> Parser<'a> {
     }
 
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
-        let source = NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.any_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
@@ -2772,7 +2798,10 @@ impl<'a> Parser<'a> {
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
-        let source = NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
@@ -7594,7 +7623,10 @@ impl<'a> Parser<'a> {
     /// `(...)`). varchar/char carry a length; numeric/decimal carry
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
-        let source = NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
         let mut name = self.any_ident("type name")?;
         // System-qualified built-ins normalize to their bare spelling. A user
@@ -8047,7 +8079,9 @@ impl<'a> Parser<'a> {
 
     fn record_namespace(&self, source: NamespaceSource) -> Result<(), ParseError> {
         if let Some(sources) = &self.namespace_sources {
-            sources.borrow_mut().push(source)
+            sources
+                .borrow_mut()
+                .push(source)
                 .map_err(|_| self.arena_full("namespace source map exceeds SQL arena"))?;
         }
         Ok(())

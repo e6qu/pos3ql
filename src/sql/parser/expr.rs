@@ -239,7 +239,10 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("operator") {
                 self.advance()?;
                 self.expect_op("(")?;
-                let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+                let source = super::NamespaceSource {
+                    start: self.peek_at,
+                    end: self.lexer.token_end(),
+                };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;
@@ -525,7 +528,10 @@ impl<'a> Parser<'a> {
         &mut self,
     ) -> Result<crate::sql::ast::ParsedCollation<'a>, ParseError> {
         use crate::sql::ast::{Collation, ParsedCollation, QualName};
-        let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.any_ident("collation name")?;
         let mut schema = None;
         let mut name = first;
@@ -557,7 +563,10 @@ impl<'a> Parser<'a> {
 
     pub(super) fn prefix(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         let tok = self.peeked;
-        let namespace_source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+        let namespace_source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         match tok {
             Tok::Num(text) => {
                 self.advance()?;
@@ -717,7 +726,10 @@ impl<'a> Parser<'a> {
             Tok::Ident("operator") => {
                 self.advance()?;
                 self.expect_op("(")?;
-                let source = super::NamespaceSource { start: self.peek_at, end: self.lexer.token_end() };
+                let source = super::NamespaceSource {
+                    start: self.peek_at,
+                    end: self.lexer.token_end(),
+                };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;

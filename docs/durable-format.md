@@ -82,7 +82,8 @@ the highest reservation, including deleted objects. Schema creation returns
 `54000` before changing the catalog if that sequence reaches 1,920,000. Schema
 journal records begin with the eight-byte creation stamp and validate it before
 renaming or dropping an existing object. Missing, duplicate or mismatched
-identities are rejected.
+identities are rejected. A restored object must also have a schema in its own
+database; missing schema records stop restoration before writer promotion.
 
 ## Why the storage layout matters
 

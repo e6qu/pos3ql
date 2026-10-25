@@ -8799,6 +8799,9 @@ impl Checkpointer {
         if !saw_end {
             return Err(CheckpointSetupError::Corrupt("manifest truncated (no end)"));
         }
+        storage.validate_restored_schema_references().map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("manifest schema references rejected: {}", error.message.as_str()))
+        })?;
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
@@ -20088,6 +20091,36 @@ mod stored_dependency_tests {
                     + Storage::extra_budget_bytes(&config)
                     + Checkpointer::budget_bytes(&config)
                     + (1 << 20);
+                let saved = {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let mut definition = TableDef::empty();
+                    definition.schema = SqlName::parse("public").unwrap();
+                    definition.name = SqlName::parse("schema_manifest_table").unwrap();
+                    storage.create_table(definition).unwrap();
+                    checkpointer.prepare_manifest(&storage, 0).unwrap();
+                    String::from_utf8(checkpointer.manifest_output.readable().to_vec()).unwrap()
+                };
+                for remove_namespaces in [false, true] {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let manifest = saved.lines()
+                        .filter(|line| !remove_namespaces || !line.starts_with("nsp "))
+                        .map(|line| format!("{line}\n")).collect::<String>();
+                    let restored = checkpointer.load_manifest_text(&mut storage, &manifest);
+                    if remove_namespaces {
+                        match restored {
+                            Err(CheckpointSetupError::ObjectStore(message)) =>
+                                assert!(message.contains("manifest schema references rejected")),
+                            other => panic!("expected missing namespace rejection: {other:?}"),
+                        }
+                    } else {
+                        restored.unwrap();
+                        assert!(storage.find_table("public", "schema_manifest_table").is_some());
+                    }
+                }
                 for (sequence, records) in [
                     (10, "nsp 7 0 6669727374\nnsp 7 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 6669727374\n"),

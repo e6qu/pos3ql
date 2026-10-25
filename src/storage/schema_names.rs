@@ -194,6 +194,52 @@ impl SchemaNameTarget {
 }
 
 impl Storage {
+    pub(crate) fn validate_restored_schema_references(&self) -> Result<(), SqlError> {
+        let require = |database: DatabaseOid, name: SqlName| {
+            if matches!(name.as_str(), "pg_catalog" | "pg_toast" | "information_schema")
+                || self.checkpoint_schemas().any(|(_, schema)| schema.database == database && schema.name == name)
+            {
+                Ok(())
+            } else {
+                Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                    "restored object refers to missing schema \"{}\"", name.as_str()))
+            }
+        };
+        for slot in 0..self.table_count() {
+            let table = self.table(slot);
+            if table.live() && slot != self.large_object_page_table() {
+                require(table.database(), self.table_def(slot, 0).schema)?;
+            }
+        }
+        for (_, definition) in self.checkpoint_views() { require(definition.database, definition.schema)?; }
+        for (_, definition, ..) in self.checkpoint_sequences_with_slots() { require(definition.database, definition.schema)?; }
+        for (_, definition) in self.checkpoint_domains() { require(definition.database, definition.schema)?; }
+        for (_, definition) in self.checkpoint_enums() { require(definition.database, definition.schema)?; }
+        for (_, definition) in self.checkpoint_composites() { require(definition.database, definition.schema)?; }
+        for slot in 0..self.routine_count() {
+            let definition = self.routine_for(slot, 0);
+            if definition.visible_to(0) { require(definition.database, definition.schema)?; }
+        }
+        for (_, definition) in self.checkpoint_indexes() { require(definition.database, definition.schema)?; }
+        for (_, definition) in self.checkpoint_extended_statistics() { require(definition.database, definition.mutable.schema)?; }
+        for (_, definition) in self.checkpoint_collations() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_conversions() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_text_search_objects() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_operators() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_operator_families() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_operator_classes() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_extensions() {
+            if usize::from(definition.namespace) >= self.schema_count() {
+                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "restored extension refers to missing schema"));
+            }
+            let schema = self.schema_def(usize::from(definition.namespace));
+            if schema.database != definition.database || !schema.visible_to(0) {
+                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "restored extension refers to missing schema"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_schemas_for_restore(&mut self) {
         self.schemas
             .lock()
@@ -536,6 +582,26 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::storage::tests::{test_budget, test_config};
+
+    #[test]
+    fn schema_name_restoration_requires_each_objects_own_database_namespace() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let public = storage.find_schema("public").unwrap();
+        let mut definition = super::super::TableDef::empty();
+        definition.schema = SqlName::parse("public").unwrap();
+        definition.name = SqlName::parse("namespace_bound_table").unwrap();
+        let table = storage.create_table(definition).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.validate_restored_schema_references().unwrap();
+            storage.drop_schema(public);
+            assert_eq!(storage.validate_restored_schema_references().unwrap_err().sqlstate,
+                sqlstate::DATA_EXCEPTION);
+            assert!(storage.table(table).live());
+            assert!(storage.checkpoint_schemas().any(|(_, schema)| schema.name.as_str() == "public"));
+        });
+    }
 
     #[test]
     fn schema_name_identities_reject_replacement_replay_and_duplicate_restore() {

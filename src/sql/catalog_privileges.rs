@@ -19,13 +19,24 @@ struct Roles<'s, 'a> {
     transaction: u32,
     selected: Index<'a>,
     name: usize,
+    enabled_names: &'a [&'a str],
 }
 
 impl<'s, 'a> Roles<'s, 'a> {
     fn new(storage: &'s Storage, transaction: u32, read: Read, arena: &'a Arena) -> Result<Self, SqlError> {
         let selected = Index::oid(read.authid_for_view(storage, transaction, arena)?, arena)?;
-        let [name] = columns(&selected.table, ["rolname"]);
-        Ok(Self { storage, transaction, selected, name })
+        let [name, oid] = columns(&selected.table, ["rolname", "oid"]);
+        let names = arena.alloc_slice_with(selected.table.rows.len(), |_| "").map_err(|_| super::arena_full())?;
+        let mut count = 0;
+        for values in selected.table.rows {
+            if super::information::owner_is_enabled(storage, transaction, super::view_rows::integer(values[oid])?) {
+                names[count] = super::view_rows::string(values[name])?;
+                count += 1;
+            }
+        }
+        let names = &mut names[..count];
+        names.sort_unstable();
+        Ok(Self { storage, transaction, selected, name, enabled_names: names })
     }
 
     fn enabled(&self, oid: u32) -> bool {
@@ -33,8 +44,15 @@ impl<'s, 'a> Roles<'s, 'a> {
     }
 
     fn visible(&self, grant: Exploded, visibility: Visibility) -> bool {
-        self.enabled(grant.grantor) || self.enabled(grant.grantee)
-            || (matches!(visibility, Visibility::Accessible) && grant.grantee == 0)
+        match visibility {
+            Visibility::Accessible => self.enabled(grant.grantor) || self.enabled(grant.grantee)
+                || self.names(grant).any(|(_, grantee)| super::view_rows::string(grantee).expect("selected role name") == "PUBLIC"),
+            Visibility::EnabledRoles => self.names(grant).any(|(grantor, grantee)| {
+                [grantor, grantee].into_iter().any(|name| {
+                    self.enabled_names.binary_search(&super::view_rows::string(name).expect("selected role name")).is_ok()
+                })
+            }),
+        }
     }
 
     fn grantable(&self, grant: Exploded, owner: u32) -> bool {

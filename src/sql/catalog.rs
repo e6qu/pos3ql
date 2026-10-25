@@ -64,7 +64,7 @@ const FIRST_USER_OID: i32 = 16384;
 const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
-// Captured from the pinned PostgreSQL 18.6 initdb image.
+// PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
 const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
@@ -8895,6 +8895,9 @@ pub(crate) fn synthesize<'a>(
             "role_column_grants" => return privileges::columns_view(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
             "usage_privileges" => return privileges::usage(storage, txid, views::Read::Statement, privileges::Visibility::Accessible, arena),
             "role_usage_grants" => return privileges::usage(storage, txid, views::Read::Statement, privileges::Visibility::EnabledRoles, arena),
+            "enabled_roles" => return views::enabled_roles(storage, txid, views::Read::Statement, arena),
+            "applicable_roles" => return views::applicable_roles(storage, txid, views::Read::Statement, views::MembershipView::Applicable, arena),
+            "administrable_role_authorizations" => return views::applicable_roles(storage, txid, views::Read::Statement, views::MembershipView::Administrable, arena),
             "views" => return information::views(storage, txid, views::Read::Statement, arena),
             "sequences" => {
                 return information::sequences(storage, txid, views::Read::Statement, arena);
@@ -9387,11 +9390,11 @@ pub(crate) fn synthesize_current<'a>(
         (true, "collation_character_set_applicability") => {
             info_collation_character_set_applicability(storage, txid, arena)
         }
-        (true, "applicable_roles") => info_applicable_roles(storage, txid, arena, false),
+        (true, "applicable_roles") => views::applicable_roles(storage, txid, views::Read::Current, views::MembershipView::Applicable, arena),
         (true, "administrable_role_authorizations") => {
-            info_applicable_roles(storage, txid, arena, true)
+            views::applicable_roles(storage, txid, views::Read::Current, views::MembershipView::Administrable, arena)
         }
-        (true, "enabled_roles") => info_enabled_roles(storage, txid, arena),
+        (true, "enabled_roles") => views::enabled_roles(storage, txid, views::Read::Current, arena),
         (true, "column_privileges") => privileges::columns_view(storage, txid, views::Read::Current, privileges::Visibility::Accessible, arena),
         (true, "role_column_grants") => privileges::columns_view(storage, txid, views::Read::Current, privileges::Visibility::EnabledRoles, arena),
         (true, "views") => information::views(storage, txid, views::Read::Current, arena),
@@ -31620,88 +31623,6 @@ fn info_collation_character_set_applicability<'a>(
             arena,
         )?;
         count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_enabled_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("enabled_roles", true);
-    let output = arena
-        .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    for slot in 0..storage.role_count() {
-        if !storage.role(slot).visible_to(txid) || !storage.role_is_enabled(slot as u16, txid) {
-            continue;
-        }
-        output[count] = row(
-            &[text(storage.role_name(slot, txid).as_str(), arena)?],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_applicable_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    administrators_only: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require(
-        if administrators_only {
-            "administrable_role_authorizations"
-        } else {
-            "applicable_roles"
-        },
-        true,
-    );
-    let output = arena
-        .alloc_slice_with(storage.role_membership_count() + 1, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |grantee: &str, role: &str, admin: bool| -> Result<(), SqlError> {
-        if administrators_only && !admin {
-            return Ok(());
-        }
-        if count == output.len() {
-            return Err(catalog_capacity_exceeded(
-                "information_schema.applicable_roles",
-            ));
-        }
-        output[count] = row(
-            &[
-                text(grantee, arena)?,
-                text(role, arena)?,
-                text(if admin { "YES" } else { "NO" }, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.role_membership_count() {
-        let membership = storage.role_membership(slot);
-        if !membership.visible_to(txid) || !storage.role_is_enabled(membership.member, txid) {
-            continue;
-        }
-        append(
-            storage.role_name(membership.member as usize, txid).as_str(),
-            storage.role_name(membership.role as usize, txid).as_str(),
-            membership.options_to(txid).admin,
-        )?;
-    }
-    if storage.role_count() > 0 && storage.role_is_enabled(0, txid) {
-        append(
-            storage.role_name(0, txid).as_str(),
-            "pg_database_owner",
-            false,
-        )?;
     }
     finish(definition, &output[..count], arena)
 }

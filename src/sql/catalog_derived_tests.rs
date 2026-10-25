@@ -92,6 +92,34 @@ fn catalog_snapshot_usage_reports_include_domains_collations_and_sequence_acl_ro
 }
 
 #[test]
+fn catalog_snapshot_role_reports_join_selected_memberships_and_database_owners() {
+    let report = "SELECT grantee,role_name,is_grantable FROM information_schema.applicable_roles
+        WHERE role_name IN ('snapshot_role_target','pg_database_owner') ORDER BY role_name,grantee;
+        SELECT grantee,role_name FROM information_schema.administrable_role_authorizations
+        WHERE role_name='snapshot_role_target';
+        SELECT role_name FROM information_schema.enabled_roles WHERE role_name LIKE 'snapshot_role_%' ORDER BY role_name";
+    let old = ["postgres|pg_database_owner|NO", "snapshot_role_member|snapshot_role_target|NO", "snapshot_role_member", "snapshot_role_target"];
+    let new = ["snapshot_role_target|pg_database_owner|NO", "snapshot_role_renamed|snapshot_role_target|YES", "snapshot_role_renamed|snapshot_role_target", "snapshot_role_renamed", "snapshot_role_target"];
+    for isolation in ["REPEATABLE READ", "READ COMMITTED"] {
+        let config = test_config("snapshot-role-membership-reports");
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine.commit_progress = CommitProgressMode::Reactor;
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "CREATE ROLE snapshot_role_target; CREATE ROLE snapshot_role_member;
+            GRANT snapshot_role_target TO snapshot_role_member", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)), old);
+        writer.success(&mut engine, "ALTER ROLE snapshot_role_member RENAME TO snapshot_role_renamed;
+            GRANT snapshot_role_target TO snapshot_role_renamed WITH ADMIN OPTION;
+            ALTER DATABASE postgres OWNER TO snapshot_role_target", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), if isolation == "REPEATABLE READ" { old.as_slice() } else { new.as_slice() }, "{isolation}");
+        reader.success(&mut engine, "COMMIT", true);
+        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), new);
+    }
+}
+
+#[test]
 fn catalog_snapshot_account_reports_join_selected_roles_memberships_and_settings() {
     let report = "
         SELECT usename,usecreatedb,useconfig,passwd FROM pg_user

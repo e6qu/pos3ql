@@ -198,6 +198,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
 
 
 def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
+    database = writer.execute("SELECT current_database()").fetchone()[0]
     roles = ("sr_owner_diff", "sr_owner_after_diff", "sr_reader_diff", "sr_account_diff", "sr_account_after_diff", "sr_group_diff")
     reports = (
         ("schemata", "schema_name LIKE 'sr_%%'", "schema_name"),
@@ -209,8 +210,11 @@ def schema_routine_reports(reader, writer, isolation, prefix, record, record_out
         ("role_table_grants", "table_schema='sr_visible_diff'", "table_name,grantor,grantee,privilege_type"),
         ("column_privileges", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
         ("role_column_grants", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
-        ("usage_privileges", "object_name LIKE 'sr_%%'", "object_type,object_name,grantor,grantee,is_grantable"),
-        ("role_usage_grants", "object_name LIKE 'sr_%%'", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("usage_privileges", "object_schema IN ('sr_visible_diff','sr_hidden_diff') OR object_name IN ('sr_wrapper_diff','sr_server_diff')", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("role_usage_grants", "object_schema IN ('sr_visible_diff','sr_hidden_diff') OR object_name IN ('sr_wrapper_diff','sr_server_diff')", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("enabled_roles", "role_name LIKE 'sr_%%'", "role_name"),
+        ("applicable_roles", "role_name LIKE 'sr_%%' OR role_name='pg_database_owner'", "role_name,grantee,is_grantable"),
+        ("administrable_role_authorizations", "role_name LIKE 'sr_%%'", "role_name,grantee,is_grantable"),
     )
     projections = {}
     try:
@@ -264,6 +268,7 @@ def schema_routine_reports(reader, writer, isolation, prefix, record, record_out
         writer.execute("ALTER ROLE sr_account_after_diff SET search_path=pg_catalog")
         writer.execute("GRANT sr_group_diff TO sr_reader_diff")
         writer.execute("ALTER ROLE sr_owner_diff RENAME TO sr_owner_after_diff")
+        writer.execute(pg_sql.SQL("ALTER DATABASE {} OWNER TO sr_owner_after_diff").format(pg_sql.Identifier(database)))
         writer.execute("CREATE OR REPLACE FUNCTION sr_visible_diff.sr_function_diff(a integer,b integer DEFAULT 23) RETURNS integer LANGUAGE SQL VOLATILE CALLED ON NULL INPUT SECURITY INVOKER AS 'SELECT a-b'")
         writer.execute("ALTER FUNCTION sr_visible_diff.sr_function_diff(integer,integer) RENAME TO sr_function_after_diff")
         writer.execute("REVOKE SELECT ON sr_visible_diff.orders FROM PUBLIC")
@@ -298,6 +303,7 @@ def schema_routine_reports(reader, writer, isolation, prefix, record, record_out
     finally:
         reader.execute("ROLLBACK")
         reader.execute("RESET ROLE")
+        writer.execute(pg_sql.SQL("ALTER DATABASE {} OWNER TO postgres").format(pg_sql.Identifier(database)))
         writer.execute("DROP SCHEMA IF EXISTS sr_visible_diff CASCADE")
         writer.execute("DROP SCHEMA IF EXISTS sr_hidden_diff CASCADE")
         writer.execute("DROP TABLE IF EXISTS sr_permission_refresh_diff")

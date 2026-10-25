@@ -1145,13 +1145,36 @@ their statement or transaction. A read-committed statement can select newer
 rows; a repeatable-read transaction keeps its earlier listing. These reports
 build their results by joining the selected base rows:
 
-- `pg_tables`, `pg_indexes`, `pg_roles`, `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
+- `pg_tables`, `pg_indexes`, `pg_roles`, `pg_group`, `pg_user`, `pg_shadow`,
+  `pg_views`, `pg_matviews`, `pg_rules` and `pg_sequences`;
 - `information_schema.tables`, `columns`, `views`, `sequences`,
   `view_table_usage`, `view_column_usage`, `table_constraints`, `key_column_usage`,
   `constraint_column_usage`, `constraint_table_usage`, `referential_constraints`,
-  `domain_constraints` and `check_constraints`.
+  `domain_constraints`, `check_constraints`, `schemata`, `routines`, `parameters`,
+  `enabled_roles`, `applicable_roles`, `administrable_role_authorizations`,
+  `table_privileges`, `column_privileges`, `routine_privileges`, `usage_privileges`
+  and their `role_*_grants` reports.
 
 Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
+
+**User example:** an older repeatable-read report can still show a function's
+previous name and SQL body after another connection replaces and renames it.
+Its permission checks remain current: revoking EXECUTE can remove the function
+from `information_schema.routines`, and a user who can execute it without owning
+it sees a NULL definition. Parameter names and types come from the selected
+description; parameter defaults are looked up in the current function. The
+routine and parameter reports expose PostgreSQL's complete 82-column and
+32-column result shapes, including the built-in routines represented in
+`pg_proc`.
+
+Schema listings show the current database name and only schemas the user owns
+or can access. Account reports retain selected login settings and group members;
+`pg_user` masks passwords and `pg_shadow` requires a superuser. Grant reports
+retain selected grants and account names while checking current role membership.
+For example, if a role inherits the owner's rights, the report can say that it
+may pass a grant on. Overlapping table and column grants follow PostgreSQL's
+rules for combining rows before that check. These reports follow the
+[PostgreSQL 18.6 definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
 
 Column descriptions retain PostgreSQL's physical type properties. For example,
 `pg_attribute` reports alignment `s` for `smallint`, `d` for `bigint`, and `d`

@@ -2,183 +2,10 @@
 //! Source: https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql
 
 use super::views::{Base, Read, columns};
-use super::{Arena, Datum, SqlError, Storage, SynthTable, arena_full, finish, row, schema, text};
+use super::view_rows::{CatalogRow, Index, NamespaceJoin, Output, boolean, character, integer, string};
+use super::{Arena, Datum, SqlError, Storage, SynthTable, arena_full, text};
 use crate::sql::eval::{CatalogAccess, sqlstate};
 use crate::{sql_err, stack_format};
-
-type Key = (u32, i32);
-
-struct Index<'a> {
-    table: SynthTable<'a>,
-    entries: &'a [(Key, usize)],
-}
-
-impl<'a> Index<'a> {
-    fn new(
-        table: SynthTable<'a>,
-        arena: &'a Arena,
-        key: impl Fn(&[Datum<'a>]) -> Result<Option<Key>, SqlError>,
-    ) -> Result<Self, SqlError> {
-        let mut count = 0;
-        for values in table.rows {
-            count += usize::from(key(values)?.is_some());
-        }
-        let mut selected = table
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(position, values)| {
-                key(values)
-                    .expect("immutable catalog index keys were validated")
-                    .map(|key| (key, position))
-            });
-        let entries = arena
-            .alloc_slice_with(count, |_| {
-                selected.next().expect("counted catalog index row")
-            })
-            .map_err(|_| arena_full())?;
-        entries.sort_unstable_by_key(|(key, position)| (*key, *position));
-        Ok(Self { table, entries })
-    }
-
-    fn oid(table: SynthTable<'a>, arena: &'a Arena) -> Result<Self, SqlError> {
-        let [oid] = columns(&table, ["oid"]);
-        Self::new(table, arena, move |values| {
-            Ok(Some((integer(values[oid])? as u32, 0)))
-        })
-    }
-
-    fn matching(&self, key: Key) -> impl Iterator<Item = &'a [Datum<'a>]> + '_ {
-        let begin = self
-            .entries
-            .partition_point(|(candidate, _)| *candidate < key);
-        let end = self
-            .entries
-            .partition_point(|(candidate, _)| *candidate <= key);
-        self.entries[begin..end]
-            .iter()
-            .map(|(_, position)| self.table.rows[*position])
-    }
-
-    fn optional(&self, key: Option<Key>) -> impl Iterator<Item = &'a [Datum<'a>]> + '_ {
-        let (begin, end) = match key {
-            Some(key) => (
-                self.entries
-                    .partition_point(|(candidate, _)| *candidate < key),
-                self.entries
-                    .partition_point(|(candidate, _)| *candidate <= key),
-            ),
-            None => (0, 0),
-        };
-        self.entries[begin..end]
-            .iter()
-            .map(|(_, position)| self.table.rows[*position])
-    }
-
-    fn left(&self, key: Option<Key>) -> impl Iterator<Item = Option<&'a [Datum<'a>]>> + '_ {
-        let missing = self.optional(key).next().is_none();
-        self.optional(key).map(Some).chain(missing.then_some(None))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CatalogRow<'a> {
-    definition: &'a crate::storage::TableDef,
-    values: &'a [Datum<'a>],
-}
-
-impl<'a> CatalogRow<'a> {
-    fn get(self, field: &str) -> Result<Datum<'a>, SqlError> {
-        let position = self.definition.column_index(field).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "catalog source is missing field {}",
-                field
-            )
-        })?;
-        self.values.get(position).copied().ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "catalog source row is missing field {}",
-                field
-            )
-        })
-    }
-    fn integer(self, field: &str) -> Result<i32, SqlError> {
-        integer(self.get(field)?)
-    }
-    fn string(self, field: &str) -> Result<&'a str, SqlError> {
-        string(self.get(field)?)
-    }
-    fn character(self, field: &str) -> Result<u8, SqlError> {
-        character(self.get(field)?)
-    }
-    fn boolean(self, field: &str) -> Result<bool, SqlError> {
-        boolean(self.get(field)?)
-    }
-}
-
-struct NamespaceJoin<'index, 'a> {
-    objects: &'index Index<'a>,
-    namespaces: &'index Index<'a>,
-    namespace: usize,
-}
-
-impl<'index, 'a> NamespaceJoin<'index, 'a> {
-    fn new(
-        objects: &'index Index<'a>,
-        namespaces: &'index Index<'a>,
-        namespace: &str,
-    ) -> Result<Self, SqlError> {
-        let [namespace] = columns(&objects.table, [namespace]);
-        for values in objects.table.rows {
-            integer(values[namespace])?;
-        }
-        Ok(Self {
-            objects,
-            namespaces,
-            namespace,
-        })
-    }
-
-    fn joined(
-        &self,
-        key: Option<Key>,
-    ) -> impl Iterator<Item = (CatalogRow<'a>, CatalogRow<'a>)> + '_ {
-        self.objects.optional(key).flat_map(move |values| {
-            let namespace = integer(values[self.namespace])
-                .expect("immutable namespace identifiers were validated");
-            self.namespaces
-                .matching((namespace as u32, 0))
-                .map(move |names| {
-                    (
-                        CatalogRow {
-                            definition: self.objects.table.def,
-                            values,
-                        },
-                        CatalogRow {
-                            definition: self.namespaces.table.def,
-                            values: names,
-                        },
-                    )
-                })
-        })
-    }
-
-    fn left<'join>(
-        &'join self,
-        key: Option<Key>,
-        include: impl Fn(CatalogRow<'a>, CatalogRow<'a>) -> bool + Copy + 'join,
-    ) -> impl Iterator<Item = Option<(CatalogRow<'a>, CatalogRow<'a>)>> + 'join {
-        let missing = !self
-            .joined(key)
-            .any(|(object, namespace)| include(object, namespace));
-        self.joined(key)
-            .filter(move |(object, namespace)| include(*object, *namespace))
-            .map(Some)
-            .chain(missing.then_some(None))
-    }
-}
 
 pub(super) struct ScalarMetadata {
     pub character_length: Option<i32>,
@@ -256,99 +83,6 @@ impl ScalarMetadata {
             scale,
             datetime_precision,
         })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct OutputNode<'a> {
-    values: &'a [Datum<'a>],
-    previous: Option<&'a OutputNode<'a>>,
-}
-
-struct Output<'a> {
-    arena: &'a Arena,
-    last: Option<&'a OutputNode<'a>>,
-    count: usize,
-}
-
-impl<'a> Output<'a> {
-    fn new(arena: &'a Arena) -> Self {
-        Self {
-            arena,
-            last: None,
-            count: 0,
-        }
-    }
-
-    fn push(&mut self, values: &[Datum<'a>]) -> Result<(), SqlError> {
-        let count = self.count.checked_add(1).ok_or_else(arena_full)?;
-        let values = row(values, self.arena)?;
-        let node = self
-            .arena
-            .alloc(OutputNode {
-                values,
-                previous: self.last,
-            })
-            .map_err(|_| arena_full())?;
-        self.last = Some(node);
-        self.count = count;
-        Ok(())
-    }
-
-    fn finish(self, name: &str) -> Result<SynthTable<'a>, SqlError> {
-        let rows = self
-            .arena
-            .alloc_slice_with(self.count, |_| &[] as &[Datum])
-            .map_err(|_| arena_full())?;
-        let mut current = self.last;
-        for target in rows.iter_mut().rev() {
-            let node = current.expect("each counted output row has an arena node");
-            *target = node.values;
-            current = node.previous;
-        }
-        finish(schema::require(name, true), rows, self.arena)
-    }
-}
-
-fn integer(value: Datum<'_>) -> Result<i32, SqlError> {
-    match value {
-        Datum::Int2(value) => Ok(i32::from(value)),
-        Datum::Int4(value) => Ok(value),
-        Datum::Oid(value) => Ok(value as i32),
-        _ => Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "catalog field is not an integer"
-        )),
-    }
-}
-
-fn string(value: Datum<'_>) -> Result<&str, SqlError> {
-    match value {
-        Datum::Text(value) => Ok(value),
-        _ => Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "catalog field is not text"
-        )),
-    }
-}
-
-fn character(value: Datum<'_>) -> Result<u8, SqlError> {
-    match value {
-        Datum::Char(value) => Ok(value),
-        _ => Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "catalog field is not char"
-        )),
-    }
-}
-
-fn boolean(value: Datum<'_>) -> Result<bool, SqlError> {
-    match value {
-        Datum::Bool(value) => Ok(value),
-        _ => Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "catalog field is not boolean"
-        )),
     }
 }
 
@@ -532,7 +266,7 @@ pub(super) fn tables<'a>(
             }
         }
     }
-    output.finish("tables")
+    output.finish("tables", true)
 }
 
 struct ColumnSources<'a> {
@@ -957,5 +691,181 @@ pub(super) fn columns_view<'a>(
             }
         }
     }
-    output.finish("columns")
+    output.finish("columns", true)
+}
+
+pub(super) fn views<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let classes = read.base(storage, Base::Class, transaction, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let triggers = read.base(storage, Base::Trigger, transaction, arena)?;
+    let [trigger_relation, trigger_type] = columns(&triggers, ["tgrelid", "tgtype"]);
+    let triggers = Index::new(triggers, arena, |values| Ok(Some((integer(values[trigger_relation])? as u32, 0))))?;
+    let [oid, namespace, name, owner, kind, options] = columns(&classes, ["oid", "relnamespace", "relname", "relowner", "relkind", "reloptions"]);
+    let [namespace_oid, namespace_name] = columns(&namespaces.table, ["oid", "nspname"]);
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let database = text(storage.current_database_name(transaction).as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for class in classes.rows {
+        if character(class[kind])? != b'v' { continue; }
+        let oid = integer(class[oid])?;
+        let owned = owner_is_enabled(storage, transaction, integer(class[owner])?);
+        let current_name = catalog.relname(oid, arena)?;
+        if !(owned || if let Some(name) = current_name {
+            catalog.has_table_privilege(None, name, "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER")? == Some(true)
+                || catalog.has_any_column_privilege(None, name, "SELECT, INSERT, UPDATE, REFERENCES")? == Some(true)
+        } else { false }) { continue; }
+        let definition = if owned {
+            catalog.view_def(oid, arena)?.map_or(Datum::Null, Datum::Text)
+        } else { Datum::Null };
+        let check_option = match class[options] {
+            Datum::Null => "NONE",
+            Datum::Array { raw, element } => {
+                if crate::sql::array::elements(raw, element).any(|value| value == Datum::Text("check_option=cascaded")) { "CASCADED" }
+                else if crate::sql::array::elements(raw, element).any(|value| value == Datum::Text("check_option=local")) { "LOCAL" }
+                else { "NONE" }
+            }
+            _ => return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid view relation options")),
+        };
+        let updatable = if let Some(name) = current_name {
+            relation_is_updatable(storage, transaction, name, arena)?
+        } else { false };
+        let mut triggered = [false; 3];
+        for trigger in triggers.matching((oid as u32, 0)) {
+            let bits = integer(trigger[trigger_type])?;
+            for (found, mask) in triggered.iter_mut().zip([81, 73, 69]) { *found |= bits & mask == mask; }
+        }
+        for names in namespaces.matching((integer(class[namespace])? as u32, 0)) {
+            if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) { continue; }
+            let yes_no = |value| text(if value { "YES" } else { "NO" }, arena);
+            output.push(&[
+                database, names[namespace_name], class[name], definition, text(check_option, arena)?,
+                yes_no(updatable)?, yes_no(updatable)?, yes_no(triggered[0])?, yes_no(triggered[1])?, yes_no(triggered[2])?,
+            ])?;
+        }
+    }
+    output.finish("views", true)
+}
+
+pub(super) fn sequences<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let sequences = read.base(storage, Base::Sequence, transaction, arena)?;
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let dependencies = read.base(storage, Base::Dependencies, transaction, arena)?;
+    let [dependency_class, dependency_object, dependency_kind] = columns(&dependencies, ["classid", "objid", "deptype"]);
+    let dependencies = Index::new(dependencies, arena, |values| {
+        Ok(if integer(values[dependency_class])? == super::PG_CLASS_OID && character(values[dependency_kind])? == b'i' {
+            Some((integer(values[dependency_object])? as u32, 0))
+        } else { None })
+    })?;
+    let [relation, data_type, start, minimum, maximum, increment, cycle] = columns(&sequences,
+        ["seqrelid", "seqtypid", "seqstart", "seqmin", "seqmax", "seqincrement", "seqcycle"]);
+    let [namespace, name, owner, kind] = columns(&classes.table, ["relnamespace", "relname", "relowner", "relkind"]);
+    let [namespace_oid, namespace_name] = columns(&namespaces.table, ["oid", "nspname"]);
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let database = text(storage.current_database_name(transaction).as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for sequence in sequences.rows {
+        let oid = integer(sequence[relation])?;
+        if dependencies.matching((oid as u32, 0)).next().is_some() { continue; }
+        let type_oid = integer(sequence[data_type])?;
+        let data_type = text(super::views::sequence_type(type_oid)?, arena)?;
+        let precision = ScalarMetadata::new(type_oid, -1, 1)?.precision.ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "sequence type has no precision"))?;
+        let numeric_text = |value| match value {
+            Datum::Int8(value) => arena.alloc_str_display(format_args!("{value}")).map(Datum::Text).map_err(|_| arena_full()),
+            _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid sequence setting")),
+        };
+        for class in classes.matching((oid as u32, 0)) {
+            if character(class[kind])? != b'S' { continue; }
+            if !(owner_is_enabled(storage, transaction, integer(class[owner])?) || match catalog.relname(oid, arena)? {
+                Some(name) => catalog.has_sequence_privilege(None, name, "SELECT, UPDATE, USAGE")? == Some(true),
+                None => false,
+            }) { continue; }
+            for names in namespaces.matching((integer(class[namespace])? as u32, 0)) {
+                if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) { continue; }
+                output.push(&[
+                    database, names[namespace_name], class[name], data_type,
+                    Datum::Int4(precision), Datum::Int4(2), Datum::Int4(0),
+                    numeric_text(sequence[start])?, numeric_text(sequence[minimum])?, numeric_text(sequence[maximum])?, numeric_text(sequence[increment])?,
+                    text(if boolean(sequence[cycle])? { "YES" } else { "NO" }, arena)?,
+                ])?;
+            }
+        }
+    }
+    output.finish("sequences", true)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ViewUsage {
+    Tables,
+    Columns,
+}
+
+pub(super) fn view_usage<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    usage: ViewUsage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let dependencies = read.base(storage, Base::Dependencies, transaction, arena)?;
+    let [object_class, object, target_class, target, subobject, kind] = columns(&dependencies,
+        ["classid", "objid", "refclassid", "refobjid", "refobjsubid", "deptype"]);
+    let dependencies = Index::new(dependencies, arena, |values| {
+        Ok(if integer(values[object_class])? == 2618 && integer(values[target_class])? == super::PG_CLASS_OID {
+            Some((integer(values[object])? as u32, 0))
+        } else { None })
+    })?;
+    let attributes = match usage {
+        ViewUsage::Tables => None,
+        ViewUsage::Columns => {
+            let attributes = read.base(storage, Base::Attribute, transaction, arena)?;
+            let [relation, number] = columns(&attributes, ["attrelid", "attnum"]);
+            Some(Index::new(attributes, arena, |values| Ok(Some((integer(values[relation])? as u32, integer(values[number])?))))?)
+        }
+    };
+    let [class_kind, namespace, name, owner] = columns(&classes.table, ["relkind", "relnamespace", "relname", "relowner"]);
+    let [namespace_name] = columns(&namespaces.table, ["nspname"]);
+    let database = text(storage.current_database_name(transaction).as_str(), arena)?;
+    let mut output = Output::new(arena);
+    for dependent in dependencies.table.rows {
+        if integer(dependent[object_class])? != 2618 || integer(dependent[target_class])? != super::PG_CLASS_OID || character(dependent[kind])? != b'i' { continue; }
+        let view_oid = integer(dependent[target])?;
+        for view in classes.matching((view_oid as u32, 0)) {
+            if character(view[class_kind])? != b'v' { continue; }
+            for reference in dependencies.matching((integer(dependent[object])? as u32, 0)) {
+                let table_oid = integer(reference[target])?;
+                if table_oid == view_oid { continue; }
+                for table in classes.matching((table_oid as u32, 0)) {
+                    if !matches!(character(table[class_kind])?, b'r' | b'v' | b'f' | b'p') || !owner_is_enabled(storage, transaction, integer(table[owner])?) { continue; }
+                    for view_names in namespaces.matching((integer(view[namespace])? as u32, 0)) {
+                        for table_names in namespaces.matching((integer(table[namespace])? as u32, 0)) {
+                            let values = [database, view_names[namespace_name], view[name], database, table_names[namespace_name], table[name]];
+                            match &attributes {
+                                None => output.push(&values)?,
+                                Some(attributes) => {
+                                    let [attribute_name] = columns(&attributes.table, ["attname"]);
+                                    for attribute in attributes.matching((table_oid as u32, integer(reference[subobject])?)) {
+                                        output.push(&[values[0], values[1], values[2], values[3], values[4], values[5], attribute[attribute_name]])?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output.finish_distinct_names(match usage { ViewUsage::Tables => "view_table_usage", ViewUsage::Columns => "view_column_usage" })
 }

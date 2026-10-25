@@ -1,0 +1,89 @@
+name: Derived catalog validation
+
+on:
+  push:
+    branches: [derived-catalog-view-snapshots]
+
+concurrency:
+  group: derived-catalog-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-derived-catalog-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Format on the runner
+        run: |
+          cargo fmt --all
+          git diff --binary > "$RUNNER_TEMP/formatting.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: derived-catalog-formatting-${{ github.sha }}
+          path: ${{ runner.temp }}/formatting.patch
+      - name: Snapshot and view regressions
+        run: cargo test --lib --locked -- catalog_snapshot_ view_catalog_metadata_ --test-threads=1
+      - name: Lint all targets
+        run: cargo clippy --all-targets -- -D warnings
+  postgresql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-derived-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-differential-build-
+      - name: Build checked-out release executable
+        run: |
+          cargo clean -p pos3ql
+          cargo build --release --locked
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Compare catalogs with PostgreSQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "0"
+          RUN_AUX: "1"
+          AUXILIARY_PHASE: types
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+        run: bash tests/external/ci_diff.sh "$PWD/target/release/pos3ql" "$RUNNER_TEMP/derived-catalog-evidence"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: derived-catalog-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/derived-catalog-evidence/
+          if-no-files-found: ignore

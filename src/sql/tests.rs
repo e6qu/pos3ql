@@ -22013,6 +22013,9 @@ fn catalog_snapshot_index_metadata_uses_postgresql_vectors() {
     );
 }
 
+#[path = "catalog_derived_tests.rs"]
+mod catalog_derived_tests;
+
 #[test]
 fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
     let (mut engine, mut budget) = test_engine();

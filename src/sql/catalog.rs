@@ -25,6 +25,8 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_view_rows.rs"]
+mod view_rows;
 #[path = "catalog_views.rs"]
 mod views;
 
@@ -9006,6 +9008,10 @@ pub(crate) fn synthesize<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     if qualifier == Some("information_schema") {
         match name {
+            "views" => return information::views(storage, txid, views::Read::Statement, arena),
+            "sequences" => return information::sequences(storage, txid, views::Read::Statement, arena),
+            "view_table_usage" => return information::view_usage(storage, txid, views::Read::Statement, information::ViewUsage::Tables, arena),
+            "view_column_usage" => return information::view_usage(storage, txid, views::Read::Statement, information::ViewUsage::Columns, arena),
             "tables" => return information::tables(storage, txid, views::Read::Statement, arena),
             "columns" => {
                 return information::columns_view(storage, txid, views::Read::Statement, arena);
@@ -9015,6 +9021,10 @@ pub(crate) fn synthesize<'a>(
     }
     if qualifier != Some("information_schema") {
         match name {
+            "pg_views" => return views::relations(storage, txid, views::Read::Statement, views::RelationView::Views, arena),
+            "pg_matviews" => return views::relations(storage, txid, views::Read::Statement, views::RelationView::MaterializedViews, arena),
+            "pg_rules" => return views::rules(storage, txid, views::Read::Statement, arena),
+            "pg_sequences" => return views::sequences(storage, txid, views::Read::Statement, arena),
             "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
             "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
             _ => {}
@@ -9364,12 +9374,12 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_largeobject") => pg_largeobject(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, txid, arena),
         (false, "pg_range") => finish(schema::require("pg_range", false), &[], arena),
-        (false, "pg_matviews") => pg_matviews(storage, txid, arena),
-        (false, "pg_sequences") => pg_sequences(storage, txid, arena),
+        (false, "pg_matviews") => views::relations(storage, txid, views::Read::Current, views::RelationView::MaterializedViews, arena),
+        (false, "pg_sequences") => views::sequences(storage, txid, views::Read::Current, arena),
         (false, "pg_sequence") => pg_sequence(storage, txid, arena),
         (false, "pg_database") => pg_database(storage, txid, arena),
-        (false, "pg_views") => pg_views(storage, txid, arena),
-        (false, "pg_rules") => pg_rules(storage, txid, arena),
+        (false, "pg_views") => views::relations(storage, txid, views::Read::Current, views::RelationView::Views, arena),
+        (false, "pg_rules") => views::rules(storage, txid, views::Read::Current, arena),
         (false, "pg_timezone_abbrevs") => pg_timezone_abbrevs(arena),
         (false, "pg_timezone_names") => pg_timezone_names(arena),
         (true, "tables") => information::tables(storage, txid, views::Read::Current, arena),
@@ -9390,7 +9400,7 @@ pub(crate) fn synthesize_current<'a>(
         (true, "referential_constraints") => info_referential_constraints(storage, txid, arena),
         (true, "table_privileges") => info_table_privileges(storage, txid, arena),
         (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
-        (true, "sequences") => info_sequences(storage, txid, arena),
+        (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         (true, "domains") => info_domains(storage, txid, arena),
         (true, "domain_constraints") => info_domain_constraints(storage, txid, arena),
@@ -9409,13 +9419,13 @@ pub(crate) fn synthesize_current<'a>(
         (true, "enabled_roles") => info_enabled_roles(storage, txid, arena),
         (true, "column_privileges") => info_column_privileges(storage, txid, arena, true),
         (true, "role_column_grants") => info_column_privileges(storage, txid, arena, false),
-        (true, "views") => info_views(storage, txid, arena),
+        (true, "views") => information::views(storage, txid, views::Read::Current, arena),
         (true, "routines") => info_routines(storage, txid, arena),
         (true, "parameters") => info_parameters(storage, txid, arena),
         (true, "routine_privileges") => info_routine_privileges(storage, txid, arena, true),
         (true, "role_routine_grants") => info_routine_privileges(storage, txid, arena, false),
-        (true, "view_table_usage") => info_view_table_usage(storage, txid, arena),
-        (true, "view_column_usage") => info_view_column_usage(storage, txid, arena),
+        (true, "view_table_usage") => information::view_usage(storage, txid, views::Read::Current, information::ViewUsage::Tables, arena),
+        (true, "view_column_usage") => information::view_usage(storage, txid, views::Read::Current, information::ViewUsage::Columns, arena),
         (true, "user_mapping_options") => info_user_mapping_options(storage, txid, arena),
         (true, "user_mappings") => info_user_mappings(storage, txid, arena),
         _ => Err(sql_err!(
@@ -30646,188 +30656,9 @@ fn pg_prepared_xacts<'a>(
     finish(definition, output, arena)
 }
 
-fn pg_views<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_views", false);
-    let out = catalog_rows(arena, storage.views_visible_to(txid).count())?;
-    let mut n = 0;
-    for slot in 0..storage.view_count() {
-        let view = storage.view(slot);
-        if !storage.view_slot_visible_to(slot, txid) {
-            continue;
-        }
-        out[n] = row(
-            &[
-                text(view.schema_for(txid).as_str(), arena)?,
-                text(view.name_for(txid).as_str(), arena)?,
-                owner_name(
-                    storage,
-                    crate::storage::AccessClass::View,
-                    slot,
-                    txid,
-                    arena,
-                )?,
-                text(
-                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
-                    arena,
-                )?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
 
-fn pg_rules<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_rules", false);
-    let visible_rules = || {
-        storage
-            .rules_visible_to(txid)
-            .filter(|(_, rule)| rule.definition_for(txid).name.as_str() != "_RETURN")
-    };
-    let count = visible_rules().count();
-    let rows = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    for (index, (_, rule)) in visible_rules().enumerate() {
-        let definition = rule.definition_for(txid);
-        let (schema, relation) = storage.rule_target_names(definition.target, txid);
-        rows[index] = row(
-            &[
-                text(schema.as_str(), arena)?,
-                text(relation.as_str(), arena)?,
-                text(definition.name.as_str(), arena)?,
-                rule_def_text(storage, txid, rule.oid(), arena)?
-                    .map(Datum::Text)
-                    .unwrap_or(Datum::Null),
-            ],
-            arena,
-        )?;
-    }
-    finish(def, rows, arena)
-}
 
-fn pg_matviews<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_matviews", false);
-    let indexes = collect_indexes(storage, txid, arena)?;
-    let out = catalog_rows(arena, storage.matviews_visible_to(txid).count())?;
-    let mut n = 0;
-    for (slot, mv) in storage.matviews_visible_to(txid) {
-        let backing = storage.table_def(storage.matview_table(slot), txid);
-        out[n] = row(
-            &[
-                text(
-                    arena
-                        .alloc_str(backing.schema.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(
-                    arena
-                        .alloc_str(backing.name.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                owner_name(
-                    storage,
-                    crate::storage::AccessClass::MaterializedView,
-                    slot,
-                    txid,
-                    arena,
-                )?,
-                match backing.tablespace {
-                    0 => Datum::Null,
-                    tablespace => storage
-                        .tablespace_name(tablespace, txid)
-                        .map_or(Ok(Datum::Null), |name| text(name.as_str(), arena))?,
-                },
-                Datum::Bool(
-                    indexes
-                        .iter()
-                        .any(|index| index.table_slot == storage.matview_table(slot)),
-                ),
-                Datum::Bool(mv.populated_for(txid)),
-                text(
-                    arena
-                        .alloc_str(mv.sql.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
 
-fn pg_sequences<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("pg_sequences", false);
-    let out = catalog_rows(
-        arena,
-        (0..storage.sequence_count())
-            .filter(|slot| storage.sequence_slot_visible_to(*slot, txid))
-            .count(),
-    )?;
-    let mut n = 0;
-    for slot in 0..storage.sequence_count() {
-        let Some((seq, sequence_last_value, sequence_is_called, _, _, _)) =
-            storage.sequence_catalog_image_for(slot, txid)
-        else {
-            continue;
-        };
-        if n == out.len() {
-            return Err(catalog_capacity_exceeded("pg_sequences"));
-        }
-        // last_value is NULL until the sequence has been advanced at least once,
-        // exactly as PostgreSQL reports it.
-        let last_value = if sequence_is_called {
-            Datum::Int8(sequence_last_value)
-        } else {
-            Datum::Null
-        };
-        out[n] = row(
-            &[
-                text(seq.schema.as_str(), arena)?,
-                text(seq.name.as_str(), arena)?,
-                owner_name(
-                    storage,
-                    crate::storage::AccessClass::Sequence,
-                    slot,
-                    txid,
-                    arena,
-                )?,
-                text(seq.data_type.sql_name(), arena)?,
-                Datum::Int8(seq.start_value),
-                Datum::Int8(seq.min_value),
-                Datum::Int8(seq.max_value),
-                Datum::Int8(seq.increment),
-                Datum::Bool(seq.cycle),
-                Datum::Int8(seq.cache),
-                last_value,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    finish(def, &out[..n], arena)
-}
 
 fn pg_sequence<'a>(
     storage: &Storage,
@@ -31507,250 +31338,8 @@ fn info_parameters<'a>(
     finish(definition, output, arena)
 }
 
-fn info_views<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("views", true);
-    let count = storage.views_visible_to(txid).count();
-    let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    for (index, (slot, view)) in storage.views_visible_to(txid).enumerate() {
-        let is_updatable = super::query::view_is_auto_updatable(
-            storage,
-            view.schema_for(txid).as_str(),
-            view.name_for(txid).as_str(),
-            txid,
-            arena,
-        )?;
-        let writable = if is_updatable { "YES" } else { "NO" };
-        out[index] = row(
-            &[
-                text("postgres", arena)?,
-                text(view.schema_for(txid).as_str(), arena)?,
-                text(view.name_for(txid).as_str(), arena)?,
-                text(
-                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
-                    arena,
-                )?,
-                text(
-                    match view.check_option_for(txid) {
-                        None => "NONE",
-                        Some(crate::storage::ViewCheckOption::Local) => "LOCAL",
-                        Some(crate::storage::ViewCheckOption::Cascaded) => "CASCADED",
-                    },
-                    arena,
-                )?,
-                text(writable, arena)?,
-                text(writable, arena)?,
-                text("NO", arena)?,
-                text("NO", arena)?,
-                text("NO", arena)?,
-            ],
-            arena,
-        )?;
-    }
-    finish(def, out, arena)
-}
 
-fn info_view_table_usage<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("view_table_usage", true);
-    let mut count = 0usize;
-    for (view_slot, _) in storage.views_visible_to(txid) {
-        for dependency in storage
-            .snapshot_view_dependencies(view_slot, txid, arena)?
-            .entries()
-        {
-            if matches!(
-                dependency.class,
-                crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
-            ) {
-                count = count.checked_add(1).ok_or_else(|| {
-                    catalog_capacity_exceeded("information_schema.view_table_usage")
-                })?;
-            }
-        }
-    }
-    let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut index = 0usize;
-    for (view_slot, view) in storage.views_visible_to(txid) {
-        for dependency in storage
-            .snapshot_view_dependencies(view_slot, txid, arena)?
-            .entries()
-        {
-            let (schema, name): (SqlName, SqlName) = match dependency.class {
-                crate::storage::DependencyClass::Table => {
-                    let slot = dependency.slot as usize;
-                    if !storage.table_slot_visible_to(slot, txid) {
-                        return Err(sql_err!(
-                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                            "view \"{}\" has a stale table dependency",
-                            view.name_for(txid).as_str()
-                        ));
-                    }
-                    let table = storage.table_def(slot, txid);
-                    (table.schema, table.name)
-                }
-                crate::storage::DependencyClass::View => {
-                    let slot = dependency.slot as usize;
-                    let source = storage.view(slot);
-                    if !storage.view_slot_visible_to(slot, txid) {
-                        return Err(sql_err!(
-                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                            "view \"{}\" has a stale view dependency",
-                            view.name_for(txid).as_str()
-                        ));
-                    }
-                    (source.schema_for(txid), source.name_for(txid))
-                }
-                _ => continue,
-            };
-            out[index] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(view.schema_for(txid).as_str(), arena)?,
-                    text(view.name_for(txid).as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(schema.as_str(), arena)?,
-                    text(name.as_str(), arena)?,
-                ],
-                arena,
-            )?;
-            index += 1;
-        }
-    }
-    debug_assert_eq!(index, out.len());
-    finish(def, out, arena)
-}
 
-fn info_view_column_usage<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("view_column_usage", true);
-    let mut count = 0usize;
-    for (view_slot, view) in storage.views_visible_to(txid) {
-        let dependencies = storage.snapshot_view_dependencies(view_slot, txid, arena)?;
-        for dependency in dependencies.entries() {
-            if dependency.class == crate::storage::DependencyClass::Table {
-                let table_slot = dependency.slot as usize;
-                if !storage.table_slot_visible_to(table_slot, txid) {
-                    return Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "view \"{}\" has a stale table dependency",
-                        view.name_for(txid).as_str()
-                    ));
-                }
-                let columns = storage.table_def(table_slot, txid).columns().len();
-                if !dependency.referenced_columns.fits(columns) {
-                    return Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "view \"{}\" has a stale column dependency",
-                        view.name_for(txid).as_str()
-                    ));
-                }
-                count = count
-                    .checked_add(dependency.referenced_columns.count_ones() as usize)
-                    .ok_or_else(|| {
-                        catalog_capacity_exceeded("information_schema.view_column_usage")
-                    })?;
-            } else if dependency.class == crate::storage::DependencyClass::View {
-                let source_slot = dependency.slot as usize;
-                if !storage.view_slot_visible_to(source_slot, txid) {
-                    return Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "view \"{}\" has a stale view dependency",
-                        view.name_for(txid).as_str()
-                    ));
-                }
-                let mut columns =
-                    [super::types::ColDesc::new("", 0, 0); crate::storage::MAX_COLUMNS];
-                let n_columns =
-                    describe_stored_view(storage, txid, source_slot, arena, &mut columns)?;
-                if !dependency.referenced_columns.fits(n_columns) {
-                    return Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "view \"{}\" has a stale column dependency",
-                        view.name_for(txid).as_str()
-                    ));
-                }
-                count = count
-                    .checked_add(dependency.referenced_columns.count_ones() as usize)
-                    .ok_or_else(|| {
-                        catalog_capacity_exceeded("information_schema.view_column_usage")
-                    })?;
-            }
-        }
-    }
-    let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut index = 0usize;
-    for (view_slot, view) in storage.views_visible_to(txid) {
-        let dependencies = storage.snapshot_view_dependencies(view_slot, txid, arena)?;
-        for dependency in dependencies.entries() {
-            match dependency.class {
-                crate::storage::DependencyClass::Table => {
-                    let table = storage.table_def(dependency.slot as usize, txid);
-                    for column in 0..table.columns().len() {
-                        if dependency.referenced_columns.contains(column) {
-                            out[index] = row(
-                                &[
-                                    text("postgres", arena)?,
-                                    text(view.schema_for(txid).as_str(), arena)?,
-                                    text(view.name_for(txid).as_str(), arena)?,
-                                    text("postgres", arena)?,
-                                    text(table.schema.as_str(), arena)?,
-                                    text(table.name.as_str(), arena)?,
-                                    text(table.columns()[column].name.as_str(), arena)?,
-                                ],
-                                arena,
-                            )?;
-                            index += 1;
-                        }
-                    }
-                }
-                crate::storage::DependencyClass::View => {
-                    let source_slot = dependency.slot as usize;
-                    let source = storage.view(source_slot);
-                    let mut columns =
-                        [super::types::ColDesc::new("", 0, 0); crate::storage::MAX_COLUMNS];
-                    let n_columns =
-                        describe_stored_view(storage, txid, source_slot, arena, &mut columns)?;
-                    for (column, descriptor) in columns.iter().enumerate().take(n_columns) {
-                        if dependency.referenced_columns.contains(column) {
-                            out[index] = row(
-                                &[
-                                    text("postgres", arena)?,
-                                    text(view.schema_for(txid).as_str(), arena)?,
-                                    text(view.name_for(txid).as_str(), arena)?,
-                                    text("postgres", arena)?,
-                                    text(source.schema_for(txid).as_str(), arena)?,
-                                    text(source.name_for(txid).as_str(), arena)?,
-                                    text(descriptor.name, arena)?,
-                                ],
-                                arena,
-                            )?;
-                            index += 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    debug_assert_eq!(index, out.len());
-    finish(def, out, arena)
-}
 
 fn view_column_catalog_type(
     storage: &Storage,
@@ -32198,55 +31787,6 @@ fn info_role_table_grants<'a>(
     info_relation_privileges(storage, txid, arena, "role_table_grants", false)
 }
 
-fn info_sequences<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("sequences", true);
-    let mut output: [&[Datum]; 256] = [&[]; 256];
-    let mut count = 0usize;
-    for slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence_for(slot, txid);
-        if !storage.sequence_slot_visible_to(slot, txid) {
-            continue;
-        }
-        if count == output.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "information_schema.sequences exceeds static capacity"
-            ));
-        }
-        let precision = match sequence.data_type {
-            crate::storage::SeqType::Smallint => 16,
-            crate::storage::SeqType::Integer => 32,
-            crate::storage::SeqType::Bigint => 64,
-        };
-        let start = stack_format!(32, "{}", sequence.start_value);
-        let minimum = stack_format!(32, "{}", sequence.min_value);
-        let maximum = stack_format!(32, "{}", sequence.max_value);
-        let increment = stack_format!(32, "{}", sequence.increment);
-        output[count] = row(
-            &[
-                text("postgres", arena)?,
-                text(sequence.schema.as_str(), arena)?,
-                text(sequence.name.as_str(), arena)?,
-                text(sequence.data_type.sql_name(), arena)?,
-                Datum::Int4(precision),
-                Datum::Int4(2),
-                Datum::Int4(0),
-                text(start.as_str(), arena)?,
-                text(minimum.as_str(), arena)?,
-                text(maximum.as_str(), arena)?,
-                text(increment.as_str(), arena)?,
-                text(if sequence.cycle { "YES" } else { "NO" }, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
 
 fn info_usage_privileges<'a>(
     storage: &Storage,

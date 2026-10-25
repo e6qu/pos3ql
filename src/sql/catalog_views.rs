@@ -5,6 +5,8 @@ use super::{
     Arena, Datum, SqlError, Storage, SynthTable, arena_full, catalog_rows, finish, row, schema,
     text,
 };
+use super::view_rows::{Index, Output, character, integer};
+use crate::sql::eval::CatalogAccess;
 
 #[derive(Clone, Copy)]
 pub(super) enum Read {
@@ -24,6 +26,8 @@ pub(super) enum Base {
     Collation,
     Dependencies,
     Sequence,
+    Rewrite,
+    Trigger,
 }
 
 impl Read {
@@ -45,6 +49,8 @@ impl Read {
             Base::Collation => "pg_collation",
             Base::Dependencies => "pg_depend",
             Base::Sequence => "pg_sequence",
+            Base::Rewrite => "pg_rewrite",
+            Base::Trigger => "pg_trigger",
         };
         match self {
             Self::Statement => super::synthesize(
@@ -279,4 +285,145 @@ pub(super) fn roles<'a>(
         }
     }
     finish(schema::require("pg_roles", false), output, arena)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RelationView {
+    Views,
+    MaterializedViews,
+}
+
+pub(super) fn relations<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    kind: RelationView,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let classes = read.base(storage, Base::Class, transaction, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let tablespaces = match kind {
+        RelationView::Views => None,
+        RelationView::MaterializedViews => Some(Index::oid(
+            read.base(storage, Base::Tablespace, transaction, arena)?, arena,
+        )?),
+    };
+    let [oid, namespace, name, owner, relation_kind, tablespace, indexes, populated] = columns(
+        &classes,
+        ["oid", "relnamespace", "relname", "relowner", "relkind", "reltablespace", "relhasindex", "relispopulated"],
+    );
+    let [namespace_name] = columns(&namespaces.table, ["nspname"]);
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let mut output = Output::new(arena);
+    for class in classes.rows {
+        if character(class[relation_kind])? != match kind { RelationView::Views => b'v', RelationView::MaterializedViews => b'm' } {
+            continue;
+        }
+        let owner = Datum::Text(super::user_name_by_oid(&catalog, integer(class[owner])?, arena)?);
+        let definition = super::view_def_text(storage, transaction, integer(class[oid])?, arena)?
+            .map_or(Datum::Null, Datum::Text);
+        for names in namespaces.left(Some((integer(class[namespace])? as u32, 0))) {
+            let namespace = names.map_or(Datum::Null, |values| values[namespace_name]);
+            match &tablespaces {
+                None => output.push(&[namespace, class[name], owner, definition])?,
+                Some(tablespaces) => {
+                    let [tablespace_name] = columns(&tablespaces.table, ["spcname"]);
+                    for space in tablespaces.left(Some((integer(class[tablespace])? as u32, 0))) {
+                        output.push(&[
+                            namespace, class[name], owner,
+                            space.map_or(Datum::Null, |values| values[tablespace_name]),
+                            class[indexes], class[populated], definition,
+                        ])?;
+                    }
+                }
+            }
+        }
+    }
+    output.finish(match kind { RelationView::Views => "pg_views", RelationView::MaterializedViews => "pg_matviews" }, false)
+}
+
+pub(super) fn rules<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let rules = read.base(storage, Base::Rewrite, transaction, arena)?;
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let [oid, name, relation] = columns(&rules, ["oid", "rulename", "ev_class"]);
+    let [class_name, namespace] = columns(&classes.table, ["relname", "relnamespace"]);
+    let [namespace_name] = columns(&namespaces.table, ["nspname"]);
+    let mut output = Output::new(arena);
+    for rule in rules.rows {
+        if rule[name] == Datum::Text("_RETURN") { continue; }
+        let definition = super::rule_def_text(storage, transaction, integer(rule[oid])?, arena)?
+            .map_or(Datum::Null, Datum::Text);
+        for class in classes.matching((integer(rule[relation])? as u32, 0)) {
+            for names in namespaces.left(Some((integer(class[namespace])? as u32, 0))) {
+                output.push(&[
+                    names.map_or(Datum::Null, |values| values[namespace_name]),
+                    class[class_name], rule[name], definition,
+                ])?;
+            }
+        }
+    }
+    output.finish("pg_rules", false)
+}
+
+pub(super) fn sequence_type(oid: i32) -> Result<&'static str, SqlError> {
+    match oid {
+        21 => Ok("smallint"),
+        23 => Ok("integer"),
+        20 => Ok("bigint"),
+        _ => Err(crate::sql_err!(crate::sql::eval::sqlstate::INTERNAL_ERROR,
+            "invalid sequence data type identifier {}", oid)),
+    }
+}
+
+pub(super) fn sequences<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let sequences = read.base(storage, Base::Sequence, transaction, arena)?;
+    let classes = Index::oid(read.base(storage, Base::Class, transaction, arena)?, arena)?;
+    let namespaces = Index::oid(read.base(storage, Base::Namespace, transaction, arena)?, arena)?;
+    let [relation, data_type, start, minimum, maximum, increment, cycle, cache] = columns(
+        &sequences, ["seqrelid", "seqtypid", "seqstart", "seqmin", "seqmax", "seqincrement", "seqcycle", "seqcache"],
+    );
+    let [namespace, name, owner, kind] = columns(&classes.table, ["relnamespace", "relname", "relowner", "relkind"]);
+    let [namespace_oid, namespace_name] = columns(&namespaces.table, ["oid", "nspname"]);
+    let catalog = crate::sql::query::storage_catalog(storage, arena, transaction);
+    let mut output = Output::new(arena);
+    for sequence in sequences.rows {
+        let oid = integer(sequence[relation])?;
+        let type_oid = integer(sequence[data_type])?;
+        let data_type = Datum::Regtype { referenced_oid: type_oid, name: sequence_type(type_oid)? };
+        // Settings are selected rows; values and access follow the live sequence.
+        let last = match catalog.relname(oid, arena)? {
+            Some(name) if catalog.has_sequence_privilege(None, name, "SELECT, USAGE")? == Some(true) => {
+                match catalog.sequence_state_by_oid(oid) {
+                    Some((value, true)) => Datum::Int8(value),
+                    _ => Datum::Null,
+                }
+            }
+            _ => Datum::Null,
+        };
+        for class in classes.matching((oid as u32, 0)) {
+            if character(class[kind])? != b'S' { continue; }
+            let owner = Datum::Text(super::user_name_by_oid(&catalog, integer(class[owner])?, arena)?);
+            for names in namespaces.left(Some((integer(class[namespace])? as u32, 0))) {
+                if let Some(names) = names {
+                    if catalog.is_other_temporary_namespace(integer(names[namespace_oid])?) { continue; }
+                }
+                output.push(&[
+                    names.map_or(Datum::Null, |values| values[namespace_name]), class[name], owner, data_type,
+                    sequence[start], sequence[minimum], sequence[maximum], sequence[increment], sequence[cycle], sequence[cache], last,
+                ])?;
+            }
+        }
+    }
+    output.finish("pg_sequences", false)
 }

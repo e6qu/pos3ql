@@ -4000,7 +4000,11 @@ impl Checkpointer {
                             "invalid NOT NULL inheritance",
                         ));
                     }
-                    let not_null_text = hexstr(words.next(), "col NOT NULL name missing")?;
+                    let not_null_text = match words.next() {
+                        Some("0") => String::new(),
+                        Some(value) => decode_hex_name(value)?,
+                        None => return Err(CheckpointSetupError::Corrupt("col NOT NULL name missing")),
+                    };
                     let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
                     if (not_null & 3 != 0) != not_null_name.is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid column NOT NULL name"));

@@ -51,6 +51,9 @@ Complete these remaining cases:
   Check remaining constraint reports in another database and with SELECT-only
   and column-writing roles. Preserve foreign-key column order, duplicate rows,
   exact result types, and named memory-exhaustion errors.
+  Keep constraint names and column numbers stable through renames, column
+  removal, savepoints, prepared decisions and recovery. Retained expressions
+  must use those column identities when displaying current names.
 - Keep a schema rename private until commit, including names used by its own
   transaction, rollback, dependent definitions and prepared recovery.
 - Cover private edits after another connection replaced a catalog tuple across

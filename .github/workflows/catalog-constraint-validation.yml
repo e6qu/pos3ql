@@ -69,3 +69,96 @@ jobs:
           name: constraint-catalog-reference-${{ github.sha }}
           path: ${{ runner.temp }}/constraint-reference/
           if-no-files-found: ignore
+
+  build:
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-constraint-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-differential-build-
+      - name: Build checked release
+        run: |
+          cargo clean -p pos3ql
+          cargo build --release --locked
+          mkdir -p "$RUNNER_TEMP/constraint-release"
+          cp target/release/pos3ql "$RUNNER_TEMP/constraint-release/pos3ql"
+          git rev-parse HEAD > "$RUNNER_TEMP/constraint-release/revision"
+          cd "$RUNNER_TEMP/constraint-release"
+          sha256sum pos3ql > SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: constraint-catalog-release-${{ github.sha }}
+          path: ${{ runner.temp }}/constraint-release/
+
+  compare:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: constraint-catalog-release-${{ github.sha }}
+          path: ${{ runner.temp }}/constraint-release/
+      - name: Verify release provenance
+        run: |
+          test "$(cat "$RUNNER_TEMP/constraint-release/revision")" = "$(git rev-parse HEAD)"
+          cd "$RUNNER_TEMP/constraint-release"
+          sha256sum --strict --check SHA256SUMS
+          chmod +x pos3ql
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Install reference fixtures and dump tools
+        run: |
+          postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
+          mkdir -p .ci-bin
+          for client in pg_dump pg_restore; do
+            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 $client \"\$@\"" > ".ci-bin/$client"
+          done
+          chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
+      - name: Compare catalogs and type behavior with PostgreSQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "0"
+          RUN_AUX: "1"
+          AUXILIARY_PHASE: types
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh "$RUNNER_TEMP/constraint-release/pos3ql" "$RUNNER_TEMP/constraint-comparison"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: constraint-catalog-comparison-${{ github.sha }}
+          path: ${{ runner.temp }}/constraint-comparison/
+          if-no-files-found: error

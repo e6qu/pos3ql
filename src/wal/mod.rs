@@ -5645,6 +5645,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 .base_user_type
                 .map(crate::storage::UserTypeName::storage_name);
             let mut ok = def.not_null == def.not_null_name.is_some()
+                && def.not_null_name.is_none_or(|name| !name.as_str().is_empty())
                 && buffer.append(&slot.to_le_bytes())
                 && buffer.append(&def.created_at.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())

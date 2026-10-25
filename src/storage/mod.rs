@@ -25,7 +25,7 @@ mod matview_lifecycles;
 mod query_lifecycles;
 mod routine_lifecycles;
 mod schema_names;
-pub(crate) use schema_names::SchemaNameUndo;
+pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 mod sequence_lifecycles;
@@ -11790,6 +11790,7 @@ pub struct SchemaDef {
     pub(crate) database: DatabaseOid,
     pub name: SqlName,
     pub ownership: Ownership,
+    database_owner: bool,
     ddl_state: CatalogDdlState,
     created_at: u64,
     version: u64,
@@ -11801,6 +11802,7 @@ impl SchemaDef {
         database: DatabaseOid::POSTGRES,
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
+        database_owner: false,
         ddl_state: CatalogDdlState::Absent,
         created_at: 0,
         version: 0,
@@ -11810,6 +11812,15 @@ impl SchemaDef {
     /// Whether `txid` sees this schema exist.
     pub fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn identity(self) -> Option<SchemaIdentity> {
+        (self.ddl_state != CatalogDdlState::Absent).then(||
+            SchemaIdentity::parse(self.created_at).expect("schema identity crossed its admission boundary"))
+    }
+
+    pub(crate) fn has_database_owner(self, transaction: u32) -> bool {
+        self.database_owner && self.ownership.pending.is_none_or(|pending| pending.txid != transaction)
     }
 
     pub(crate) fn name_for(self, transaction: u32) -> SqlName {
@@ -19174,6 +19185,7 @@ impl Storage {
                         SqlName::EMPTY
                     },
                     ownership: Ownership::BOOTSTRAP,
+                    database_owner: i < 3,
                     ddl_state: if i < 3 {
                         CatalogDdlState::Present
                     } else {
@@ -20709,21 +20721,15 @@ impl Storage {
                 database.get()
             ));
         }
-        let prior = current_database();
         crate::sql::set_execution_database_oid(database);
-        let Some(public) = self.find_schema("public") else {
-            crate::sql::set_execution_database_oid(prior);
-            return Err(sql_err!(
-                sqlstate::INVALID_SCHEMA_NAME,
-                "database with OID {} has no public schema",
-                database.get()
-            ));
-        };
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
-        entries[1] = PathEntry::Schema(public as u16);
+        let n = if let Some(public) = self.find_schema("public") {
+            entries[1] = PathEntry::Schema(public as u16);
+            2
+        } else { 1 };
         replace_execution_path(PathContext {
             entries,
-            n: 2,
+            n,
             explicit_catalog: false,
         });
         Ok(())
@@ -20933,6 +20939,10 @@ impl Storage {
                     source_schema.name,
                     CatalogDdlState::PendingCreate { txid },
                     source_schema.ownership.committed(),
+                    schema_names::SchemaAllocation::Restore {
+                        identity: source_schema.identity().expect("visible source schema"),
+                        database_owner: source_schema.database_owner,
+                    },
                 )?;
             }
 
@@ -23343,6 +23353,18 @@ impl Storage {
     }
 
     pub(crate) fn object_owner(&self, object: AccessObject, txid: u32) -> usize {
+        if object.class == AccessClass::Schema {
+            let schema = self.schema_def(usize::from(object.slot));
+            if schema.has_database_owner(txid) {
+                for slot in 0..self.database_count() {
+                    let database = self.database(slot);
+                    if database.oid == schema.database && database.ddl_state != CatalogDdlState::Absent {
+                        return usize::from(database.ownership.owner_to(txid));
+                    }
+                }
+                unreachable!("schema ownership retains its database");
+            }
+        }
         if object.class == AccessClass::Language {
             return usize::from(BOOTSTRAP_ROLE);
         }
@@ -24564,7 +24586,9 @@ impl Storage {
             drop(schemas);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let ownership = &mut schemas[slot].ownership;
+        let schema = &mut schemas[slot];
+        if txid == 0 { schema.database_owner = false; }
+        let ownership = &mut schema.ownership;
         let prior = ownership.pending;
         if txid == 0 {
             ownership.owner = owner as u16;
@@ -24967,12 +24991,14 @@ impl Storage {
         }
         if object.class == AccessClass::Schema {
             let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
-            let ownership = &mut schemas[usize::from(object.slot)].ownership;
+            let schema = &mut schemas[usize::from(object.slot)];
+            let ownership = &mut schema.ownership;
             if let Some(pending) = ownership.pending
                 && pending.txid == txid
             {
                 ownership.owner = pending.owner;
                 ownership.pending = None;
+                schema.database_owner = false;
             }
             return;
         }
@@ -28558,7 +28584,7 @@ impl Storage {
     /// Committed create (journal replay): the schema is immediately part of
     /// the durable image.
     pub fn create_schema(&self, name: SqlName) -> Result<usize, SqlError> {
-        self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP)
+        self.alloc_schema(name, CatalogDdlState::Present, Ownership::BOOTSTRAP, schema_names::SchemaAllocation::New)
     }
 
     pub(crate) fn table_position(&self, slot: usize) -> CatalogPosition {
@@ -28604,6 +28630,7 @@ impl Storage {
             name,
             CatalogDdlState::PendingCreate { txid },
             self.initial_ownership(txid)?,
+            schema_names::SchemaAllocation::New,
         )
     }
 
@@ -28612,7 +28639,9 @@ impl Storage {
         name: SqlName,
         ddl_state: CatalogDdlState,
         ownership: Ownership,
+        allocation: schema_names::SchemaAllocation,
     ) -> Result<usize, SqlError> {
+        schema_names::validate_schema_name(name)?;
         let txid = ddl_state.pending_txid().unwrap_or(0);
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         if let Some(blocker) = schemas.iter().find_map(|schema| {
@@ -28642,7 +28671,22 @@ impl Storage {
                 schemas.len()
             ));
         };
-        let version = self.catalog_sequence.next()?;
+        let version = match allocation {
+            schema_names::SchemaAllocation::New => {
+                let version = self.catalog_sequence.next()?;
+                SchemaIdentity::parse(version).ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "schema object identifier range is exhausted"))?;
+                version
+            }
+            schema_names::SchemaAllocation::Restore { identity, .. } => {
+                if schemas.iter().any(|schema| schema.database == current_database()
+                    && schema.identity() == Some(identity)) {
+                    return Err(sql_err!(sqlstate::DATA_EXCEPTION, "schema creation identity is already in use"));
+                }
+                self.catalog_sequence.observe(identity.created_at());
+                identity.created_at()
+            }
+        };
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Schema,
             slot: slot as u16,
@@ -28651,6 +28695,10 @@ impl Storage {
             database: current_database(),
             name,
             ownership,
+            database_owner: match allocation {
+                schema_names::SchemaAllocation::New => false,
+                schema_names::SchemaAllocation::Restore { database_owner, .. } => database_owner,
+            },
             ddl_state,
             created_at: version,
             version,
@@ -28731,10 +28779,11 @@ impl Storage {
         name: SqlName,
         arena: &crate::mem::arena::Arena,
     ) -> Result<SqlName, SqlError> {
+        schema_names::validate_schema_name(name)?;
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         let prior = schemas[slot].name;
         if prior == name {
-            return Ok(prior);
+            return Err(sql_err!(sqlstate::DUPLICATE_SCHEMA, "schema \"{}\" already exists", name.as_str()));
         }
         if schemas.iter().enumerate().any(|(other, schema)| {
             other != slot
@@ -53906,7 +53955,7 @@ mod tests {
                     SqlName::parse("replayed_schema").unwrap(),
                     CatalogDdlState::Present,
                     Ownership::BOOTSTRAP,
-                )
+                 schema_names::SchemaAllocation::New)
                 .unwrap();
             let schemas = storage.schemas.lock().unwrap();
             assert_eq!(schemas[slot].ownership.owner, BOOTSTRAP_ROLE);
@@ -54680,7 +54729,7 @@ mod tests {
                     SqlName::parse("clone_extra").unwrap(),
                     CatalogDdlState::Present,
                     Ownership::BOOTSTRAP,
-                )
+                 schema_names::SchemaAllocation::New)
                 .unwrap();
             assert_eq!(
                 storage
@@ -60028,7 +60077,7 @@ mod tests {
                         owner: BOOTSTRAP_ROLE,
                     }),
                 },
-            )
+             schema_names::SchemaAllocation::New)
             .unwrap();
         assert_eq!(reused, reclaimed);
         storage.rollback_schema_create(reused);
@@ -60047,7 +60096,7 @@ mod tests {
                         owner: BOOTSTRAP_ROLE,
                     }),
                 },
-            )
+             schema_names::SchemaAllocation::New)
             .unwrap();
         storage.commit_schema_create(committed);
         let definition = storage.schema_def(committed);
@@ -60060,7 +60109,7 @@ mod tests {
                 SqlName::parse("schema_pending").unwrap(),
                 CatalogDdlState::PendingCreate { txid: 20 },
                 Ownership::BOOTSTRAP,
-            )
+             schema_names::SchemaAllocation::New)
             .unwrap();
         assert_eq!(
             storage
@@ -60068,7 +60117,7 @@ mod tests {
                     SqlName::parse("schema_pending").unwrap(),
                     CatalogDdlState::PendingCreate { txid: 21 },
                     Ownership::BOOTSTRAP,
-                )
+                 schema_names::SchemaAllocation::New)
                 .unwrap_err()
                 .sqlstate,
             sqlstate::INTERNAL_LOCK_WAIT

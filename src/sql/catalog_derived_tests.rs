@@ -1,6 +1,140 @@
 use super::*;
 
 #[test]
+fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        let name = format!("schema-owner-recovery-{checkpoint}");
+        let mut config = test_config(&name);
+        config.max_prepared_transactions = 1;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE ROLE retained_schema_owner; CREATE SCHEMA existing_schema_owner", false);
+        session.success(&mut engine, "BEGIN;
+            ALTER SCHEMA existing_schema_owner OWNER TO retained_schema_owner;
+            CREATE SCHEMA created_schema_owner AUTHORIZATION retained_schema_owner;
+            PREPARE TRANSACTION 'schema_owner'", false);
+        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold, "
+            SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='existing_schema_owner';
+            SELECT to_regnamespace('created_schema_owner') IS NULL;
+        ", true)), ["postgres", "t"]);
+        let prepared = cold.prepared_transactions.find(ast::PreparedTransactionId::parse("schema_owner").unwrap()).unwrap();
+        let transaction = cold.prepared_transactions.slot(prepared).metadata().transaction_id;
+        let owner = cold.storage.find_role_visible("retained_schema_owner", 0).unwrap();
+        for schema in ["existing_schema_owner", "created_schema_owner"] {
+            let slot = cold.storage.find_schema_visible(schema, transaction).unwrap();
+            assert_eq!(cold.storage.object_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Schema, slot: slot as u16,
+            }, transaction), owner, "{name}: {schema}");
+        }
+        session.success(&mut cold, "ROLLBACK PREPARED 'schema_owner'; DROP ROLE retained_schema_owner", false);
+        assert!(cold.storage.find_role_visible("retained_schema_owner", 0).is_none());
+        drop(session);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn schema_rename_identities_and_reused_slots_survive_wal_and_empty_disk_recovery() {
+    for checkpoint in [false, true] {
+        let name = format!("schema-identity-recovery-{checkpoint}");
+        let mut config = test_config(&name);
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "
+            COMMENT ON SCHEMA public IS 'original public identity';
+            ALTER SCHEMA public RENAME TO public_before;
+            CREATE SCHEMA public;
+            CREATE SCHEMA reused_namespace;
+        ", false);
+        let previous = data_rows(&session.success(&mut engine,
+            "SELECT 'reused_namespace'::regnamespace::oid", true));
+        session.success(&mut engine, "DROP SCHEMA reused_namespace", false);
+        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold, "
+            SELECT 'public_before'::regnamespace::oid=2200,'public'::regnamespace::oid<>2200;
+            SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
+            SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
+            SELECT obj_description(2200,'pg_namespace');
+        ", true)), ["t|t", "pg_database_owner", "postgres", "original public identity"], "{name}");
+        session.success(&mut cold, "CREATE SCHEMA reused_namespace", false);
+        assert_ne!(data_rows(&session.success(&mut cold,
+            "SELECT 'reused_namespace'::regnamespace::oid", true)), previous, "{name}");
+        drop(session);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn schema_rename_preserves_public_identity_and_a_replacement_gets_its_own_identity() {
+    let config = test_config("public-schema-identity");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "
+        COMMENT ON SCHEMA public IS 'initial public namespace';
+        BEGIN; ALTER SCHEMA public RENAME TO public_before;
+    ", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT oid=2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
+        SELECT to_regnamespace('public') IS NULL;
+        SELECT obj_description(2200,'pg_namespace');
+    ", true)), ["t|pg_database_owner", "t", "initial public namespace"]);
+    session.success(&mut engine, "CREATE SCHEMA public", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT oid<>2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
+        SELECT to_regnamespace('public_before')::oid=2200;
+    ", true)), ["t|postgres", "t"]);
+    session.success(&mut engine, "COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT oid=2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
+        SELECT oid<>2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
+        SELECT obj_description(2200,'pg_namespace');
+    ", true)), ["t|pg_database_owner", "t|postgres", "initial public namespace"]);
+    session.success(&mut engine, "BEGIN; SAVEPOINT before_owner;
+        ALTER SCHEMA public_before OWNER TO postgres", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["postgres"]);
+    session.success(&mut engine, "ROLLBACK TO before_owner", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["pg_database_owner"]);
+    session.success(&mut engine, "ALTER SCHEMA public_before OWNER TO postgres; COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["postgres"]);
+}
+
+#[test]
 fn schema_rename_preserves_aliases_and_distinguishes_quoted_schema_names() {
     let config = test_config("bound-schema-qualifiers");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

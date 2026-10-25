@@ -61,7 +61,6 @@ pub struct SynthTable<'a> {
 /// Stable per-name OIDs so a table's oid is consistent within a session.
 /// User relations start above the reserved range.
 const FIRST_USER_OID: i32 = 16384;
-const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
 // PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
@@ -10002,9 +10001,7 @@ fn catalog_owner(
     if matches!(object.class, crate::storage::AccessClass::Schema)
         && storage
             .schema_def_for(usize::from(object.slot), txid)
-            .name
-            .as_str()
-            == "public"
+            .has_database_owner(txid)
     {
         CatalogOwner::DatabaseOwner
     } else {
@@ -10634,17 +10631,14 @@ fn pg_default_acl<'a>(
     finish(def, &rows[..row_count], arena)
 }
 
-/// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
-/// schema's OID is derived from its registry slot, above the table range.
-const FIRST_SCHEMA_OID: i32 = 80_000;
-const FIRST_TEMP_NAMESPACE_OID: i32 = 2_000_000;
-pub(crate) const fn namespace_oid_for_slot(slot: usize) -> i32 {
-    FIRST_SCHEMA_OID + slot as i32
+use crate::storage::FIRST_TEMP_NAMESPACE_OID;
+/// Durable schema identities survive renames, slot reuse and database clones.
+pub(crate) fn namespace_oid_for_slot(storage: &Storage, slot: usize) -> i32 {
+    storage.schema_def(slot).identity().map_or(0, crate::storage::SchemaIdentity::oid)
 }
 
 fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
     match schema {
-        "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         "pg_toast" => PG_TOAST_NS_OID,
         "information_schema" => INFORMATION_SCHEMA_NS_OID,
@@ -10655,7 +10649,7 @@ fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
             .unwrap_or(0),
         _ => storage
             .find_schema_visible(schema, txid)
-            .map(namespace_oid_for_slot)
+            .map(|slot| namespace_oid_for_slot(storage, slot))
             .unwrap_or(0),
     }
 }
@@ -10709,7 +10703,6 @@ pub(crate) fn schema_name_by_oid(
     oid: i32,
 ) -> Option<crate::storage::SqlName> {
     match oid {
-        PUBLIC_NS_OID => crate::storage::SqlName::parse("public").ok(),
         PG_CATALOG_NS_OID => crate::storage::SqlName::parse("pg_catalog").ok(),
         PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
         INFORMATION_SCHEMA_NS_OID => crate::storage::SqlName::parse("information_schema").ok(),
@@ -10724,7 +10717,7 @@ pub(crate) fn schema_name_by_oid(
             .or_else(|| {
                 storage
                     .visible_schemas(txid)
-                    .find(|(slot, _)| namespace_oid_for_slot(*slot) == oid)
+                    .find(|(slot, _)| namespace_oid_for_slot(storage, *slot) == oid)
                     .map(|(_, schema)| schema.name)
             }),
     }
@@ -10732,7 +10725,6 @@ pub(crate) fn schema_name_by_oid(
 
 pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
     match name {
-        "public" => Some(PUBLIC_NS_OID),
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
         "information_schema" => Some(INFORMATION_SCHEMA_NS_OID),
@@ -10756,7 +10748,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         }
         _ => storage
             .find_schema_visible(name, txid)
-            .map(namespace_oid_for_slot),
+            .map(|slot| namespace_oid_for_slot(storage, slot)),
     }
 }
 
@@ -10794,7 +10786,7 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
     }
     storage.visible_schemas(txid).find_map(|(slot, schema)| {
         identifier_spelling_matches(written, schema.name.as_str())
-            .then_some(namespace_oid_for_slot(slot))
+            .then_some(namespace_oid_for_slot(storage, slot))
     })
 }
 
@@ -29272,7 +29264,7 @@ fn pg_shdepend<'a>(
     for (slot, _) in storage.visible_schemas(txid) {
         append(
             PG_NAMESPACE_OID,
-            namespace_oid_for_slot(slot),
+            namespace_oid_for_slot(storage, slot),
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,

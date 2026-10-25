@@ -43,16 +43,9 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Finish connecting remaining schema, routine, role and privilege reports to
-  selected base rows, with PostgreSQL's exact joins and current access checks.
-  Include account settings and group members, schema ownership and visibility,
-  routine signatures, and grants made through PUBLIC or inherited roles. Compare
-  complete result columns and SQL types as well as row values.
-  The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
-  owns the connected table, column, index, constraint, view, rule, sequence and
-  dependency reports, including stable column numbers and expression inputs.
 - Keep a schema rename private until commit, including names used by its own
-  transaction, rollback, dependent definitions and prepared recovery.
+  transaction, rollback, dependent definitions and prepared recovery. Preserve
+  the schema's object identifier and distinguish schema names from query aliases.
 - Cover private edits after another connection replaced a catalog tuple across
   all catalog families. Listings and direct lookups can expose different rows;
   dependency rows also need exact duplicate counts.

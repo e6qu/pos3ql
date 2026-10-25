@@ -5,6 +5,52 @@ use super::{CatalogDdlDecision, DatabaseOid, SchemaDef, SqlName, Storage, curren
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+const FIRST_SCHEMA_OID: u64 = 80_000;
+pub(crate) const FIRST_TEMP_NAMESPACE_OID: i32 = 2_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SchemaIdentity {
+    created_at: u64,
+}
+
+impl SchemaIdentity {
+    pub(crate) fn parse(created_at: u64) -> Option<Self> {
+        (created_at < FIRST_TEMP_NAMESPACE_OID as u64 - FIRST_SCHEMA_OID)
+            .then_some(Self { created_at })
+    }
+
+    pub(crate) fn created_at(self) -> u64 {
+        self.created_at
+    }
+
+    pub(crate) fn oid(self) -> i32 {
+        if self.is_initial_public() { 2200 } else { (FIRST_SCHEMA_OID + self.created_at) as i32 }
+    }
+
+    pub(crate) fn is_initial_public(self) -> bool {
+        self.created_at == 0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SchemaAllocation {
+    New,
+    Restore { identity: SchemaIdentity, database_owner: bool },
+}
+
+pub(super) fn validate_schema_name(name: SqlName) -> Result<(), SqlError> {
+    if name.as_str().is_empty() {
+        return Err(sql_err!(sqlstate::INVALID_SCHEMA_NAME, "schema name is empty"));
+    }
+    if matches!(name.as_str(), "pg_catalog" | "pg_toast" | "information_schema") {
+        return Err(sql_err!(sqlstate::DUPLICATE_SCHEMA, "schema \"{}\" already exists", name.as_str()));
+    }
+    if name.as_str().starts_with("pg_") {
+        return Err(sql_err!(sqlstate::RESERVED_NAME, "unacceptable schema name \"{}\"", name.as_str()));
+    }
+    Ok(())
+}
+
 impl super::RoutineBodyKind {
     pub(super) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
         match self {
@@ -86,6 +132,28 @@ impl SchemaNameTarget {
 }
 
 impl Storage {
+    pub(crate) fn clear_schemas_for_restore(&mut self) {
+        self.schemas.lock().expect("schema catalog lock poisoned").fill(SchemaDef::EMPTY);
+    }
+
+    pub(crate) fn restore_schema(
+        &self, identity: SchemaIdentity, name: SqlName, state: super::CatalogDdlState,
+        database_owner: bool,
+    ) -> Result<usize, SqlError> {
+        self.alloc_schema(name, state, super::Ownership::BOOTSTRAP, SchemaAllocation::Restore { identity, database_owner })
+    }
+
+    pub(crate) fn schema_replay_slot(
+        &self, name: &str, identity: SchemaIdentity, transaction: u32,
+    ) -> Result<usize, SqlError> {
+        let slot = self.find_schema_visible(name, transaction)
+            .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "journal schema source does not exist"))?;
+        if self.schema_def_for(slot, transaction).identity() != Some(identity) {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "journal schema source identity does not match"));
+        }
+        Ok(slot)
+    }
+
     pub(crate) fn commit_comment_identity(&self, slot: usize, transaction: u32) {
         let mut comments = self.comment_catalog();
         let comment = &mut comments.entries[slot];
@@ -180,6 +248,7 @@ impl Storage {
     }
 
     pub(crate) fn stage_schema_name(&self, target: SchemaNameTarget, name: SqlName) -> Result<SchemaNameUndo, SqlError> {
+        validate_schema_name(name)?;
         let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
         let schema = schemas.get(target.slot).filter(|schema| self.schema_name_source_matches(schema, target))
             .ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE, "schema edit source has been replaced"))?;
@@ -242,6 +311,56 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::storage::tests::{test_budget, test_config};
+
+    #[test]
+    fn schema_name_identities_reject_replacement_replay_and_duplicate_restore() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let name = SqlName::parse("reused_schema").unwrap();
+        let other = SqlName::parse("duplicate_identity").unwrap();
+        let slot = storage.create_schema(name).unwrap();
+        let original = storage.schema_def(slot).identity().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.restore_schema(original, other, super::super::CatalogDdlState::Present, false)
+                .unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.find_schema(name.as_str()), Some(slot));
+            assert_eq!(storage.find_schema(other.as_str()), None);
+            storage.drop_schema(slot);
+            assert_eq!(storage.create_schema(name).unwrap(), slot);
+            assert_ne!(storage.schema_def(slot).identity(), Some(original));
+            assert_eq!(storage.schema_replay_slot(name.as_str(), original, 0).unwrap_err().sqlstate,
+                sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.find_schema(name.as_str()), Some(slot));
+        });
+    }
+
+    #[test]
+    fn schema_name_identifier_exhaustion_preserves_existing_names_and_allows_renames() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let name = SqlName::parse("existing_schema").unwrap();
+        let new = SqlName::parse("renamed_schema").unwrap();
+        let rejected = SqlName::parse("exhausted_schema").unwrap();
+        let slot = storage.create_schema(name).unwrap();
+        let identity = storage.schema_def(slot).identity().unwrap();
+        storage.replace_catalog_sequence_for_test(1_919_999);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(SchemaIdentity::parse(0).unwrap().oid(), 2200);
+            assert_eq!(SchemaIdentity::parse(1_919_999).unwrap().oid(), 1_999_999);
+            assert!(SchemaIdentity::parse(1_920_000).is_none());
+            assert!(SchemaIdentity::parse(u64::MAX).is_none());
+            assert_eq!(storage.create_schema(rejected).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.find_schema(rejected.as_str()), None);
+            assert_eq!(storage.schema_def(slot).identity(), Some(identity));
+            let undo = storage.stage_schema_name(storage.prepare_schema_name(slot, 7).unwrap(), new).unwrap();
+            storage.finish_schema_name(undo, CatalogDdlDecision::Commit).unwrap();
+            assert_eq!(storage.schema_def(slot).name, new);
+            assert_eq!(storage.schema_def(slot).identity(), Some(identity));
+        });
+    }
 
     #[test]
     fn schema_name_paths_preserve_quoted_commas_quotes_and_unrelated_spacing() {

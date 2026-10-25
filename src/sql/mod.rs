@@ -20580,40 +20580,24 @@ fn replay_transaction_batches(
                             "prepared transaction WAL is corrupt"
                         )
                     })? {
-                        WalOp::CreateSchema(name) => {
-                            let selected = storage.create_schema_in(
-                                crate::storage::SqlName::parse(name)?,
-                                transaction_id,
-                            )?;
+                        WalOp::CreateSchema { identity, name } => {
+                            let selected = storage.restore_schema(identity, crate::storage::SqlName::parse(name)?,
+                                crate::storage::CatalogDdlState::PendingCreate { txid: transaction_id }, false)?;
                             prepared.slot_mut(slot).transaction.record_catalog_change(
                                 storage,
                                 DdlUndo::SchemaCreated(selected as u32),
                             )?;
                         }
-                        WalOp::DropSchema(name) => {
-                            let selected = storage
-                                .find_schema_visible(name, transaction_id)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "prepared transaction drops an unknown schema"
-                                    )
-                                })?;
+                        WalOp::DropSchema { identity, name } => {
+                            let selected = storage.schema_replay_slot(name, identity, transaction_id)?;
                             storage.drop_schema_in(selected, transaction_id)?;
                             prepared.slot_mut(slot).transaction.record_catalog_change(
                                 storage,
                                 DdlUndo::SchemaDropped(selected as u32),
                             )?;
                         }
-                        WalOp::RenameSchema { name, new_name } => {
-                            let selected = storage
-                                .find_schema_visible(name, transaction_id)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "prepared transaction renames an unknown schema"
-                                    )
-                                })?;
+                        WalOp::RenameSchema { identity, name, new_name } => {
+                            let selected = storage.schema_replay_slot(name, identity, transaction_id)?;
                             arena.reset();
                             exec::stage_schema_rename(
                                 storage,
@@ -20623,6 +20607,25 @@ fn replay_transaction_batches(
                                 arena,
                             )?;
                             arena.reset();
+                        }
+                        WalOp::SetObjectOwner { class, object_oid, schema, name, owner }
+                            if class == crate::storage::AccessClass::Schema as u8 => {
+                            if object_oid != 0 || !schema.is_empty() {
+                                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "invalid prepared schema ownership target"));
+                            }
+                            let selected = storage.find_schema_visible(name, transaction_id)
+                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                                    "prepared schema ownership source does not exist"))?;
+                            let owner = storage.find_role_visible(owner, transaction_id)
+                                .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                                    "prepared schema owner does not exist"))?;
+                            let prior = storage.set_schema_owner(selected, owner, transaction_id)?;
+                            prepared.slot_mut(slot).transaction.record_catalog_change(storage,
+                                DdlUndo::ObjectOwnerChanged {
+                                    object: crate::storage::AccessObject {
+                                        class: crate::storage::AccessClass::Schema, slot: selected as u16,
+                                    }, prior,
+                                })?;
                         }
                         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => {
                             apply_prepared_table_wal_payload(
@@ -23465,18 +23468,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp, arena: &Arena)
                 storage.commit_index_drop(slot);
             }
         }
-        WalOp::CreateSchema(name) => {
-            storage.create_schema(crate::storage::SqlName::parse(name)?)?;
+        WalOp::CreateSchema { identity, name } => {
+            storage.restore_schema(identity, crate::storage::SqlName::parse(name)?,
+                crate::storage::CatalogDdlState::Present, false)?;
         }
-        WalOp::DropSchema(name) => {
-            if let Some(slot) = storage.find_schema(name) {
-                storage.drop_schema(slot);
-            }
+        WalOp::DropSchema { identity, name } => {
+            let slot = storage.schema_replay_slot(name, identity, 0)?;
+            storage.drop_schema(slot);
         }
-        WalOp::RenameSchema { name, new_name } => {
-            let slot = storage.find_schema(name).ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "journal schema does not exist")
-            })?;
+        WalOp::RenameSchema { identity, name, new_name } => {
+            let slot = storage.schema_replay_slot(name, identity, 0)?;
             storage.rename_schema(slot, crate::storage::SqlName::parse(new_name)?, arena)?;
         }
         WalOp::UpsertExtension {

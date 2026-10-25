@@ -6196,7 +6196,9 @@ pub fn create_schema(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSchema(name)) {
+            if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSchema {
+                identity: storage.schema_def(slot).identity().expect("created schema retains its identity"), name,
+            }) {
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
@@ -6257,7 +6259,8 @@ pub fn alter_schema(
                     name
                 ));
             };
-            if storage.find_schema_visible(new_name, txn.txid).is_some() {
+            if matches!(new_name, "pg_catalog" | "pg_toast" | "information_schema")
+                || storage.find_schema_visible(new_name, txn.txid).is_some() {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_SCHEMA,
                     "schema \"{}\" already exists",
@@ -6330,6 +6333,7 @@ pub fn alter_schema(
                 txn.txid,
                 lsn,
                 &WalOp::RenameSchema {
+                    identity: storage.schema_def(slot).identity().expect("renamed schema retains its identity"),
                     name: prior_name.as_str(),
                     new_name: new_name.as_str(),
                 },
@@ -13804,7 +13808,10 @@ pub(crate) fn drop_schema(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
+        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSchema {
+            identity: storage.schema_def(slot).identity().expect("dropped schema retains its identity"),
+            name: name.as_str(),
+        }) {
             storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }

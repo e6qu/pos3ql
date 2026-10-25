@@ -1177,7 +1177,7 @@ build their results by joining the selected base rows:
   `table_privileges`, `column_privileges`, `routine_privileges`, `usage_privileges`
   and their `role_*_grants` reports.
 
-Remaining derived reports are tracked in [PLAN.md](../PLAN.md).
+Remaining shared-publication work is tracked in [PLAN.md](../PLAN.md).
 
 **User example:** an older repeatable-read report can still show a function's
 previous name and SQL body after another connection replaces and renames it.

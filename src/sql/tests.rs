@@ -3932,7 +3932,7 @@ fn execution_identity_is_thread_private() {
 }
 
 #[test]
-fn failed_database_selection_restores_workspace_context() {
+fn schema_rename_database_selection_accepts_missing_public_and_rejects_unknown_databases() {
     let config = test_config("failed-database-selection");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -3949,15 +3949,21 @@ fn failed_database_selection_restores_workspace_context() {
         .select_database(crate::storage::DatabaseOid::POSTGRES)
         .unwrap();
 
-    let error = engine.select_database(template).unwrap_err();
-    assert_eq!(error.sqlstate, eval::sqlstate::INVALID_SCHEMA_NAME);
+    engine.select_database(template).unwrap();
+    assert_eq!(engine.storage.current_database_oid(), template);
+    assert_eq!(engine.work.database_oid(), template);
+    assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
+        "SELECT to_regnamespace('public') IS NULL; SELECT current_schema() IS NULL")), ["t", "t"]);
+    let unknown = crate::storage::DatabaseOid::parse(i32::MAX).unwrap();
+    let error = engine.select_database(unknown).unwrap_err();
+    assert_eq!(error.sqlstate, eval::sqlstate::INVALID_CATALOG_NAME);
     assert_eq!(
         engine.storage.current_database_oid(),
-        crate::storage::DatabaseOid::POSTGRES
+        template
     );
     assert_eq!(
         engine.work.database_oid(),
-        crate::storage::DatabaseOid::POSTGRES
+        template
     );
 }
 

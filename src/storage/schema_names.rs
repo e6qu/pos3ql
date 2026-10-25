@@ -196,13 +196,20 @@ impl SchemaNameTarget {
 impl Storage {
     pub(crate) fn validate_restored_schema_references(&self) -> Result<(), SqlError> {
         let require = |database: DatabaseOid, name: SqlName| {
-            if matches!(name.as_str(), "pg_catalog" | "pg_toast" | "information_schema")
-                || self.checkpoint_schemas().any(|(_, schema)| schema.database == database && schema.name == name)
+            if matches!(
+                name.as_str(),
+                "pg_catalog" | "pg_toast" | "information_schema"
+            ) || self
+                .checkpoint_schemas()
+                .any(|(_, schema)| schema.database == database && schema.name == name)
             {
                 Ok(())
             } else {
-                Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                    "restored object refers to missing schema \"{}\"", name.as_str()))
+                Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "restored object refers to missing schema \"{}\"",
+                    name.as_str()
+                ))
             }
         };
         for slot in 0..self.table_count() {
@@ -211,30 +218,64 @@ impl Storage {
                 require(table.database(), self.table_def(slot, 0).schema)?;
             }
         }
-        for (_, definition) in self.checkpoint_views() { require(definition.database, definition.schema)?; }
-        for (_, definition, ..) in self.checkpoint_sequences_with_slots() { require(definition.database, definition.schema)?; }
-        for (_, definition) in self.checkpoint_domains() { require(definition.database, definition.schema)?; }
-        for (_, definition) in self.checkpoint_enums() { require(definition.database, definition.schema)?; }
-        for (_, definition) in self.checkpoint_composites() { require(definition.database, definition.schema)?; }
+        for (_, definition) in self.checkpoint_views() {
+            require(definition.database, definition.schema)?;
+        }
+        for (_, definition, ..) in self.checkpoint_sequences_with_slots() {
+            require(definition.database, definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_domains() {
+            require(definition.database, definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_enums() {
+            require(definition.database, definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_composites() {
+            require(definition.database, definition.schema)?;
+        }
         for slot in 0..self.routine_count() {
             let definition = self.routine_for(slot, 0);
-            if definition.visible_to(0) { require(definition.database, definition.schema)?; }
+            if definition.visible_to(0) {
+                require(definition.database, definition.schema)?;
+            }
         }
-        for (_, definition) in self.checkpoint_indexes() { require(definition.database, definition.schema)?; }
-        for (_, definition) in self.checkpoint_extended_statistics() { require(definition.database, definition.mutable.schema)?; }
-        for (_, definition) in self.checkpoint_collations() { require(definition.database, definition.definition.schema)?; }
-        for (_, definition) in self.checkpoint_conversions() { require(definition.database, definition.definition.schema)?; }
-        for (_, definition) in self.checkpoint_text_search_objects() { require(definition.database, definition.definition.schema)?; }
-        for (_, definition) in self.checkpoint_operators() { require(definition.database, definition.definition.schema)?; }
-        for (_, definition) in self.checkpoint_operator_families() { require(definition.database, definition.definition.schema)?; }
-        for (_, definition) in self.checkpoint_operator_classes() { require(definition.database, definition.definition.schema)?; }
+        for (_, definition) in self.checkpoint_indexes() {
+            require(definition.database, definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_extended_statistics() {
+            require(definition.database, definition.mutable.schema)?;
+        }
+        for (_, definition) in self.checkpoint_collations() {
+            require(definition.database, definition.definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_conversions() {
+            require(definition.database, definition.definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_text_search_objects() {
+            require(definition.database, definition.definition.schema())?;
+        }
+        for (_, definition) in self.checkpoint_operators() {
+            require(definition.database, definition.definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_operator_families() {
+            require(definition.database, definition.definition.schema)?;
+        }
+        for (_, definition) in self.checkpoint_operator_classes() {
+            require(definition.database, definition.definition.schema)?;
+        }
         for (_, definition) in self.checkpoint_extensions() {
             if usize::from(definition.namespace) >= self.schema_count() {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "restored extension refers to missing schema"));
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "restored extension refers to missing schema"
+                ));
             }
             let schema = self.schema_def(usize::from(definition.namespace));
             if schema.database != definition.database || !schema.visible_to(0) {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "restored extension refers to missing schema"));
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "restored extension refers to missing schema"
+                ));
             }
         }
         Ok(())
@@ -596,10 +637,19 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage.validate_restored_schema_references().unwrap();
             storage.drop_schema(public);
-            assert_eq!(storage.validate_restored_schema_references().unwrap_err().sqlstate,
-                sqlstate::DATA_EXCEPTION);
+            assert_eq!(
+                storage
+                    .validate_restored_schema_references()
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             assert!(storage.table(table).live());
-            assert!(storage.checkpoint_schemas().any(|(_, schema)| schema.name.as_str() == "public"));
+            assert!(
+                storage
+                    .checkpoint_schemas()
+                    .any(|(_, schema)| schema.name.as_str() == "public")
+            );
         });
     }
 

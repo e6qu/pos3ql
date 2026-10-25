@@ -14,27 +14,54 @@ fn schema_rename_without_a_public_replacement_survives_empty_disk_recovery() {
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine, "CREATE TABLE public.items(id integer);
+        session.success(
+            &mut engine,
+            "CREATE TABLE public.items(id integer);
             INSERT INTO public.items VALUES(23);
-            ALTER SCHEMA public RENAME TO archived", false);
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            ALTER SCHEMA public RENAME TO archived",
+            false,
+        );
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
         drop(session);
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let mut cold = Engine::new(&config, &mut cold_budget)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
-        assert_eq!(data_rows(&session.success(&mut cold, "
+        assert_eq!(
+            data_rows(&session.success(
+                &mut cold,
+                "
             SELECT to_regnamespace('public') IS NULL;
             SELECT 'archived'::regnamespace::oid=2200;
             SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='archived';
             SELECT id FROM archived.items;
-        ", true)), ["t", "t", "pg_database_owner", "23"], "{name}");
-        session.success(&mut cold, "CREATE SCHEMA public; CREATE TABLE public.items(id integer)", false);
-        assert_eq!(data_rows(&session.success(&mut cold, "
+        ",
+                true
+            )),
+            ["t", "t", "pg_database_owner", "23"],
+            "{name}"
+        );
+        session.success(
+            &mut cold,
+            "CREATE SCHEMA public; CREATE TABLE public.items(id integer)",
+            false,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut cold,
+                "
             SELECT 'public'::regnamespace::oid<>2200;
             SELECT id FROM archived.items;
-        ", true)), ["t", "23"], "{name}");
+        ",
+                true
+            )),
+            ["t", "23"],
+            "{name}"
+        );
         drop(session);
         drop(cold);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -45,69 +72,126 @@ fn schema_rename_without_a_public_replacement_survives_empty_disk_recovery() {
 #[test]
 fn schema_rename_prepared_owners_remain_reserved_after_empty_disk_recovery() {
     for checkpoint in [false, true] {
-      for decision in ["COMMIT", "ROLLBACK"] {
-        let name = format!("schema-owner-recovery-{checkpoint}-{decision}");
-        let mut config = test_config(&name);
-        config.max_prepared_transactions = 1;
-        config.object_store_on = true;
-        config.object_store_sim = true;
-        config.wal_upload = true;
-        config.wal_upload_sync = true;
-        config.object_store_bucket = format!("{name}-{}", std::process::id());
-        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine, "CREATE ROLE retained_schema_owner; CREATE SCHEMA existing_schema_owner", false);
-        session.success(&mut engine, "BEGIN;
+        for decision in ["COMMIT", "ROLLBACK"] {
+            let name = format!("schema-owner-recovery-{checkpoint}-{decision}");
+            let mut config = test_config(&name);
+            config.max_prepared_transactions = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(
+                &mut engine,
+                "CREATE ROLE retained_schema_owner; CREATE SCHEMA existing_schema_owner",
+                false,
+            );
+            session.success(
+                &mut engine,
+                "BEGIN;
             ALTER SCHEMA existing_schema_owner OWNER TO retained_schema_owner;
             CREATE SCHEMA created_schema_owner AUTHORIZATION retained_schema_owner;
-            PREPARE TRANSACTION 'schema_owner'", false);
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
-        drop(session);
-        drop(engine);
-        std::fs::remove_dir_all(&config.data_dir).unwrap();
-        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
-        assert_eq!(data_rows(&session.success(&mut cold, "
+            PREPARE TRANSACTION 'schema_owner'",
+                false,
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    "
             SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='existing_schema_owner';
             SELECT to_regnamespace('created_schema_owner') IS NULL;
-        ", true)), ["postgres", "t"]);
-        let prepared = cold.prepared_transactions.find(ast::PreparedTransactionId::parse("schema_owner").unwrap()).unwrap();
-        let transaction = cold.prepared_transactions.slot(prepared).metadata().transaction_id;
-        let owner = cold.storage.find_role_visible("retained_schema_owner", 0).unwrap();
-        for schema in ["existing_schema_owner", "created_schema_owner"] {
-            let slot = cold.storage.find_schema_visible(schema, transaction).unwrap();
-            assert_eq!(cold.storage.object_owner(crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Schema, slot: slot as u16,
-            }, transaction), owner, "{name}: {schema}");
-        }
-        let target = crate::storage::ObjectLockTarget::Role(cold.storage.role(owner).oid());
-        crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(cold.storage.lock_object(1000, target,
-                ast::TableLockMode::AccessExclusive, true).unwrap_err().sqlstate,
-                crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE);
-        });
-        session.success(&mut cold, &format!("{decision} PREPARED 'schema_owner'"), false);
-        crate::mem::guard::forbid_alloc(|| {
-            cold.storage.lock_object(1000, target, ast::TableLockMode::AccessExclusive, true).unwrap();
-            cold.storage.release_object_locks(1000);
-        });
-        if decision == "COMMIT" {
-            assert_eq!(data_rows(&session.success(&mut cold, "
+        ",
+                    true
+                )),
+                ["postgres", "t"]
+            );
+            let prepared = cold
+                .prepared_transactions
+                .find(ast::PreparedTransactionId::parse("schema_owner").unwrap())
+                .unwrap();
+            let transaction = cold
+                .prepared_transactions
+                .slot(prepared)
+                .metadata()
+                .transaction_id;
+            let owner = cold
+                .storage
+                .find_role_visible("retained_schema_owner", 0)
+                .unwrap();
+            for schema in ["existing_schema_owner", "created_schema_owner"] {
+                let slot = cold
+                    .storage
+                    .find_schema_visible(schema, transaction)
+                    .unwrap();
+                assert_eq!(
+                    cold.storage.object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Schema,
+                            slot: slot as u16,
+                        },
+                        transaction
+                    ),
+                    owner,
+                    "{name}: {schema}"
+                );
+            }
+            let target = crate::storage::ObjectLockTarget::Role(cold.storage.role(owner).oid());
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    cold.storage
+                        .lock_object(1000, target, ast::TableLockMode::AccessExclusive, true)
+                        .unwrap_err()
+                        .sqlstate,
+                    crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE
+                );
+            });
+            session.success(
+                &mut cold,
+                &format!("{decision} PREPARED 'schema_owner'"),
+                false,
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                cold.storage
+                    .lock_object(1000, target, ast::TableLockMode::AccessExclusive, true)
+                    .unwrap();
+                cold.storage.release_object_locks(1000);
+            });
+            if decision == "COMMIT" {
+                assert_eq!(data_rows(&session.success(&mut cold, "
                 SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='created_schema_owner';
                 SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='existing_schema_owner';
             ", true)), ["retained_schema_owner", "retained_schema_owner"]);
-            session.success(&mut cold, "DROP SCHEMA created_schema_owner; DROP SCHEMA existing_schema_owner", false);
+                session.success(
+                    &mut cold,
+                    "DROP SCHEMA created_schema_owner; DROP SCHEMA existing_schema_owner",
+                    false,
+                );
+            }
+            session.success(&mut cold, "DROP ROLE retained_schema_owner", false);
+            assert!(
+                cold.storage
+                    .find_role_visible("retained_schema_owner", 0)
+                    .is_none()
+            );
+            drop(session);
+            drop(cold);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
         }
-        session.success(&mut cold, "DROP ROLE retained_schema_owner", false);
-        assert!(cold.storage.find_role_visible("retained_schema_owner", 0).is_none());
-        drop(session);
-        drop(cold);
-        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-        std::fs::remove_dir_all(&config.data_dir).unwrap();
-      }
     }
 }
 
@@ -125,31 +209,61 @@ fn schema_rename_identities_and_reused_slots_survive_wal_and_empty_disk_recovery
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine, "
+        session.success(
+            &mut engine,
+            "
             COMMENT ON SCHEMA public IS 'original public identity';
             ALTER SCHEMA public RENAME TO public_before;
             CREATE SCHEMA public;
             CREATE SCHEMA reused_namespace;
-        ", false);
-        let previous = data_rows(&session.success(&mut engine,
-            "SELECT 'reused_namespace'::regnamespace::oid", true));
+        ",
+            false,
+        );
+        let previous = data_rows(&session.success(
+            &mut engine,
+            "SELECT 'reused_namespace'::regnamespace::oid",
+            true,
+        ));
         session.success(&mut engine, "DROP SCHEMA reused_namespace", false);
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
         drop(session);
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-        let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let mut cold = Engine::new(&config, &mut cold_budget)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
-        assert_eq!(data_rows(&session.success(&mut cold, "
+        assert_eq!(
+            data_rows(&session.success(
+                &mut cold,
+                "
             SELECT 'public_before'::regnamespace::oid=2200,'public'::regnamespace::oid<>2200;
             SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
             SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
             SELECT obj_description(2200,'pg_namespace');
-        ", true)), ["t|t", "pg_database_owner", "postgres", "original public identity"], "{name}");
+        ",
+                true
+            )),
+            [
+                "t|t",
+                "pg_database_owner",
+                "postgres",
+                "original public identity"
+            ],
+            "{name}"
+        );
         session.success(&mut cold, "CREATE SCHEMA reused_namespace", false);
-        assert_ne!(data_rows(&session.success(&mut cold,
-            "SELECT 'reused_namespace'::regnamespace::oid", true)), previous, "{name}");
+        assert_ne!(
+            data_rows(&session.success(
+                &mut cold,
+                "SELECT 'reused_namespace'::regnamespace::oid",
+                true
+            )),
+            previous,
+            "{name}"
+        );
         drop(session);
         drop(cold);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -164,36 +278,91 @@ fn schema_rename_preserves_public_identity_and_a_replacement_gets_its_own_identi
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "
+    session.success(
+        &mut engine,
+        "
         COMMENT ON SCHEMA public IS 'initial public namespace';
         BEGIN; ALTER SCHEMA public RENAME TO public_before;
-    ", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "
+    ",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "
         SELECT oid=2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
         SELECT to_regnamespace('public') IS NULL;
         SELECT obj_description(2200,'pg_namespace');
-    ", true)), ["t|pg_database_owner", "t", "initial public namespace"]);
+    ",
+            true
+        )),
+        ["t|pg_database_owner", "t", "initial public namespace"]
+    );
     session.success(&mut engine, "CREATE SCHEMA public", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "
         SELECT oid<>2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
         SELECT to_regnamespace('public_before')::oid=2200;
-    ", true)), ["t|postgres", "t"]);
+    ",
+            true
+        )),
+        ["t|postgres", "t"]
+    );
     session.success(&mut engine, "COMMIT", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "
         SELECT oid=2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before';
         SELECT oid<>2200,nspowner::regrole::text FROM pg_namespace WHERE nspname='public';
         SELECT obj_description(2200,'pg_namespace');
-    ", true)), ["t|pg_database_owner", "t|postgres", "initial public namespace"]);
-    session.success(&mut engine, "BEGIN; SAVEPOINT before_owner;
-        ALTER SCHEMA public_before OWNER TO postgres", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["postgres"]);
+    ",
+            true
+        )),
+        [
+            "t|pg_database_owner",
+            "t|postgres",
+            "initial public namespace"
+        ]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; SAVEPOINT before_owner;
+        ALTER SCHEMA public_before OWNER TO postgres",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'",
+            true
+        )),
+        ["postgres"]
+    );
     session.success(&mut engine, "ROLLBACK TO before_owner", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["pg_database_owner"]);
-    session.success(&mut engine, "ALTER SCHEMA public_before OWNER TO postgres; COMMIT", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'", true)), ["postgres"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'",
+            true
+        )),
+        ["pg_database_owner"]
+    );
+    session.success(
+        &mut engine,
+        "ALTER SCHEMA public_before OWNER TO postgres; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public_before'",
+            true
+        )),
+        ["postgres"]
+    );
 }
 
 #[test]
@@ -203,7 +372,9 @@ fn schema_rename_preserves_aliases_and_distinguishes_quoted_schema_names() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, r#"
+    session.success(
+        &mut engine,
+        r#"
         CREATE SCHEMA alias_schema;
         CREATE TABLE alias_schema.items(id integer);
         INSERT INTO alias_schema.items VALUES (21);
@@ -220,16 +391,32 @@ fn schema_rename_preserves_aliases_and_distinguishes_quoted_schema_names() {
         BEGIN;
         ALTER SCHEMA alias_schema RENAME TO alias_after;
         ALTER SCHEMA "CaseSchema" RENAME TO "MovedCaseSchema";
-    "#, true);
-    assert_eq!(data_rows(&session.success(&mut engine, "
+    "#,
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "
         SELECT id FROM alias_after.item_view;
         SELECT quoted,unquoted FROM both_case_schemas;
-    ", true)), ["21", "31|41"]);
+    ",
+            true
+        )),
+        ["21", "31|41"]
+    );
     session.success(&mut engine, "COMMIT", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "
         SELECT id FROM alias_after.item_view;
         SELECT quoted,unquoted FROM both_case_schemas;
-    ", true)), ["21", "31|41"]);
+    ",
+            true
+        )),
+        ["21", "31|41"]
+    );
 }
 
 #[test]
@@ -239,7 +426,9 @@ fn schema_rename_preserves_quoted_search_paths_and_unqualified_bound_queries() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, r#"
+    session.success(
+        &mut engine,
+        r#"
         CREATE SCHEMA "schema,""quoted""";
         SET search_path TO "schema,""quoted""";
         CREATE TABLE items(id integer);
@@ -252,16 +441,25 @@ fn schema_rename_preserves_quoted_search_paths_and_unqualified_bound_queries() {
         BEGIN;
         ALTER SCHEMA "schema,""quoted""" RENAME TO "Next,""quoted""";
         SET LOCAL search_path TO "Next,""quoted""";
-    "#, true);
+    "#,
+        true,
+    );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT current_schema(); SELECT id FROM item_view; SELECT bound(); SELECT id FROM qualified_view; SELECT qualified_bound()", true)),
         ["Next,\"quoted\"", "12", "12", "12", "12"]);
     session.success(&mut engine, "COMMIT", true);
-    assert_eq!(data_rows(&session.success(&mut engine, r#"
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            r#"
         SET search_path TO "Next,""quoted""";
         SELECT current_schema(); SELECT id FROM item_view; SELECT bound();
         SELECT id FROM qualified_view; SELECT qualified_bound();
-    "#, true)), ["Next,\"quoted\"", "12", "12", "12", "12"]);
+    "#,
+            true
+        )),
+        ["Next,\"quoted\"", "12", "12", "12", "12"]
+    );
 }
 
 #[test]
@@ -291,17 +489,24 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
                   BEGIN ATOMIC SELECT id FROM prepared_schema_before.items; END;
                 COMMENT ON SCHEMA prepared_schema_before IS 'prepared namespace';
             ", false);
-            session.success(&mut engine, "BEGIN; ALTER SCHEMA prepared_schema_before RENAME TO prepared_schema_after", true);
+            session.success(
+                &mut engine,
+                "BEGIN; ALTER SCHEMA prepared_schema_before RENAME TO prepared_schema_after",
+                true,
+            );
             assert_eq!(data_rows(&session.success(&mut engine,
                 "SELECT prepared_schema_after.bound(); SELECT id,state FROM prepared_schema_after.items", true)),
                 ["8", "8|ready"]);
             session.success(&mut engine, "PREPARE TRANSACTION 'schema_move'", false);
-            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
             drop(session);
             drop(engine);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-            let mut cold = Engine::new(&config, &mut cold_budget).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let mut cold = Engine::new(&config, &mut cold_budget)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             assert_eq!(data_rows(&session.success(&mut cold, "
                 SELECT to_regnamespace('prepared_schema_before') IS NOT NULL,to_regnamespace('prepared_schema_after') IS NULL;
@@ -309,18 +514,42 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
                 SELECT pg_get_viewdef('prepared_schema_cache'::regclass) LIKE '%prepared_schema_before%';
             ", true)), ["t|t", "8", "t"], "{name}");
             session.success(&mut cold, &format!("{decision} 'schema_move'"), false);
-            let schema = if decision == "COMMIT PREPARED" { "prepared_schema_after" } else { "prepared_schema_before" };
-            assert_eq!(data_rows(&session.success(&mut cold, &format!("
+            let schema = if decision == "COMMIT PREPARED" {
+                "prepared_schema_after"
+            } else {
+                "prepared_schema_before"
+            };
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    &format!(
+                        "
                 SELECT {schema}.bound(); SELECT id,state FROM {schema}.items;
                 SELECT obj_description('{schema}'::regnamespace,'pg_namespace');
-            "), true)), ["8", "8|ready", "prepared namespace"], "{name}");
+            "
+                    ),
+                    true
+                )),
+                ["8", "8|ready", "prepared namespace"],
+                "{name}"
+            );
             // View materialization writes simulator objects, whose fixture
             // vectors grow. The rename and direct metadata reads stay guarded.
-            assert_eq!(data_rows(&session.success(&mut cold, &format!("
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    &format!(
+                        "
                 SELECT id,state FROM {schema}.item_view;
                 REFRESH MATERIALIZED VIEW prepared_schema_cache;
                 SELECT id FROM prepared_schema_cache;
-            "), false)), ["8|ready", "8"], "{name}");
+            "
+                    ),
+                    false
+                )),
+                ["8|ready", "8"],
+                "{name}"
+            );
             drop(session);
             drop(cold);
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -337,7 +566,9 @@ fn schema_rename_rewrites_private_materialized_queries_and_index_expressions() {
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
     let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    writer.success(&mut engine, "
+    writer.success(
+        &mut engine,
+        "
         CREATE SCHEMA query_schema_before;
         CREATE FUNCTION query_schema_before.score(value integer) RETURNS integer
           LANGUAGE SQL IMMUTABLE AS 'SELECT value+1';
@@ -347,29 +578,66 @@ fn schema_rename_rewrites_private_materialized_queries_and_index_expressions() {
           ((query_schema_before.score(id))) WHERE query_schema_before.score(id)>0;
         CREATE MATERIALIZED VIEW cached_schema_items AS
           SELECT query_schema_before.score(id) AS score FROM query_schema_before.items;
-    ", true);
-    writer.success(&mut engine, "BEGIN; SAVEPOINT before_move;
+    ",
+        true,
+    );
+    writer.success(
+        &mut engine,
+        "BEGIN; SAVEPOINT before_move;
         ALTER SCHEMA query_schema_before RENAME TO query_schema_after;
-        REFRESH MATERIALIZED VIEW cached_schema_items", true);
-    assert_eq!(data_rows(&writer.success(&mut engine, "
+        REFRESH MATERIALIZED VIEW cached_schema_items",
+        true,
+    );
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "
         SELECT query_schema_after.score(id) FROM query_schema_after.items;
         SELECT score FROM cached_schema_items;
         SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_after%';
-    ", true)), ["5", "5", "t"]);
-    assert_eq!(data_rows(&reader.success(&mut engine, "
+    ",
+            true
+        )),
+        ["5", "5", "t"]
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "
         SELECT query_schema_before.score(id) FROM query_schema_before.items;
         SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_before%';
-    ", true)), ["5", "t"]);
+    ",
+            true
+        )),
+        ["5", "t"]
+    );
     writer.success(&mut engine, "ROLLBACK TO before_move", true);
-    assert_eq!(data_rows(&writer.success(&mut engine,
-        "SELECT query_schema_before.score(id) FROM query_schema_before.items", true)), ["5"]);
-    writer.success(&mut engine, "ALTER SCHEMA query_schema_before RENAME TO query_schema_after;
-        REFRESH MATERIALIZED VIEW cached_schema_items; COMMIT", true);
-    assert_eq!(data_rows(&reader.success(&mut engine, "
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "SELECT query_schema_before.score(id) FROM query_schema_before.items",
+            true
+        )),
+        ["5"]
+    );
+    writer.success(
+        &mut engine,
+        "ALTER SCHEMA query_schema_before RENAME TO query_schema_after;
+        REFRESH MATERIALIZED VIEW cached_schema_items; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "
         REFRESH MATERIALIZED VIEW cached_schema_items;
         SELECT score FROM cached_schema_items;
         SELECT pg_get_viewdef('cached_schema_items'::regclass) LIKE '%query_schema_after%';
-    ", true)), ["5", "t"]);
+    ",
+            true
+        )),
+        ["5", "t"]
+    );
 }
 
 #[test]
@@ -397,26 +665,49 @@ fn schema_rename_keeps_names_and_dependent_definitions_private_until_commit() {
         SELECT private_schema_after.bound();
         SELECT obj_description('private_schema_after.orders'::regclass);
         SELECT obj_description('private_schema_after'::regnamespace,'pg_namespace');";
-    for mode in [crate::config::TransactionMode::Mvcc,crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config("private-schema-rename");
         config.transaction_mode = mode;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         writer.success(&mut engine, setup, true);
         let old_rows = ["t|t", "private_schema_before", "1|ready", "1"];
-        let new_rows = ["t|t", "private_schema_after", "1|ready", "1", "private table", "private namespace"];
+        let new_rows = [
+            "t|t",
+            "private_schema_after",
+            "1|ready",
+            "1",
+            "private table",
+            "private namespace",
+        ];
         assert_eq!(data_rows(&reader.success(&mut engine, old, true)), old_rows);
         writer.success(&mut engine, "BEGIN; SAVEPOINT schema_change; ALTER SCHEMA private_schema_before RENAME TO private_schema_after", true);
         assert_eq!(data_rows(&writer.success(&mut engine, new, true)), new_rows);
         assert_eq!(data_rows(&reader.success(&mut engine, old, true)), old_rows);
         writer.success(&mut engine, "ROLLBACK TO schema_change", true);
         assert_eq!(data_rows(&writer.success(&mut engine, old, true)), old_rows);
-        writer.success(&mut engine, "ALTER SCHEMA private_schema_before RENAME TO private_schema_after; COMMIT", true);
+        writer.success(
+            &mut engine,
+            "ALTER SCHEMA private_schema_before RENAME TO private_schema_after; COMMIT",
+            true,
+        );
         assert_eq!(data_rows(&reader.success(&mut engine, new, true)), new_rows);
-        assert_eq!(error_sqlstates(&reader.execute(&mut engine, "SELECT private_schema_after.unbound()", true)), ["42P01"]);
+        assert_eq!(
+            error_sqlstates(&reader.execute(
+                &mut engine,
+                "SELECT private_schema_after.unbound()",
+                true
+            )),
+            ["42P01"]
+        );
     }
 }
 

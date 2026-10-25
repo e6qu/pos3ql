@@ -18597,6 +18597,7 @@ impl Storage {
             }
             definition.n_columns = 4;
             definition.has_toast = true;
+            constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
             let mut state = table.definition.write();
             let mut identity = state.identity;
             identity.existence = CatalogDdlState::Present;

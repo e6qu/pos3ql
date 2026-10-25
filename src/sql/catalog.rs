@@ -16207,7 +16207,15 @@ fn finish_with_hidden<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
-    let def = arena.alloc(definition).map_err(|_| arena_full())?;
+    let def = arena.alloc_interned((definition, hidden_columns), |(left, left_hidden), (right, right_hidden)| {
+        // These definitions come only from materialize_with_hidden: all other
+        // TableDef fields have its fixed empty values.
+        left_hidden == right_hidden && left.name == right.name && left.n_columns == right.n_columns
+            && left.columns[..left.n_columns + left_hidden].iter()
+                .zip(&right.columns[..right.n_columns + right_hidden])
+                .all(|(left, right)| left.name == right.name && left.ctype == right.ctype && left.collation == right.collation)
+    }).map_err(|_| arena_full())?;
+    let def = &def.0;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;

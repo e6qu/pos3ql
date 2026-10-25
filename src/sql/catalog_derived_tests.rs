@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn schema_rename_preserves_aliases_and_distinguishes_quoted_schema_names() {
+    let config = test_config("bound-schema-qualifiers");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    engine.commit_progress = CommitProgressMode::Reactor;
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, r#"
+        CREATE SCHEMA alias_schema;
+        CREATE TABLE alias_schema.items(id integer);
+        INSERT INTO alias_schema.items VALUES (21);
+        CREATE VIEW alias_schema.item_view AS
+          SELECT alias_schema.id FROM alias_schema /* namespace */ .items AS alias_schema;
+        CREATE SCHEMA "CaseSchema";
+        CREATE SCHEMA caseschema;
+        CREATE TABLE "CaseSchema".items(id integer);
+        CREATE TABLE caseschema.items(id integer);
+        INSERT INTO "CaseSchema".items VALUES (31);
+        INSERT INTO caseschema.items VALUES (41);
+        CREATE VIEW both_case_schemas AS SELECT a.id AS quoted,b.id AS unquoted
+          FROM "CaseSchema".items AS a CROSS JOIN CASESCHEMA.items AS b;
+        BEGIN;
+        ALTER SCHEMA alias_schema RENAME TO alias_after;
+        ALTER SCHEMA "CaseSchema" RENAME TO "MovedCaseSchema";
+    "#, true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT id FROM alias_after.item_view;
+        SELECT quoted,unquoted FROM both_case_schemas;
+    ", true)), ["21", "31|41"]);
+    session.success(&mut engine, "COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "
+        SELECT id FROM alias_after.item_view;
+        SELECT quoted,unquoted FROM both_case_schemas;
+    ", true)), ["21", "31|41"]);
+}
+
+#[test]
 fn schema_rename_preserves_quoted_search_paths_and_unqualified_bound_queries() {
     let config = test_config("quoted-schema-paths");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

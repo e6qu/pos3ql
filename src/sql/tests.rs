@@ -31276,6 +31276,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                 column: 0,
                 last: 81,
             },
+            &engine.work,
         )
         .unwrap();
         for column in [1, u16::MAX] {
@@ -31289,6 +31290,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                         column,
                         last: 99
                     },
+                    &engine.work,
                 )
                 .unwrap_err()
                 .sqlstate,
@@ -31305,6 +31307,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                     column: 0,
                     last: 99
                 },
+                &engine.work,
             )
             .unwrap_err()
             .sqlstate,

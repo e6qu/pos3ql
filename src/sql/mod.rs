@@ -7838,7 +7838,7 @@ impl Engine {
                             "prepared transaction WAL is corrupt"
                         )
                     })?;
-                    apply_wal_op(&mut self.storage, resolution_lsn, operation)
+                    apply_wal_op(&mut self.storage, resolution_lsn, operation, &self.work)
                 })
         } else if commit {
             self.storage
@@ -21311,7 +21311,7 @@ fn replay_transaction_batches(
                                     "prepared transaction WAL is corrupt"
                                 )
                             })?;
-                            apply_wal_op(storage, *lsn, operation)
+                            apply_wal_op(storage, *lsn, operation, arena)
                         })?;
                     }
                     prepared.release(slot);
@@ -21322,7 +21322,7 @@ fn replay_transaction_batches(
                             let operation = crate::wal::decode_record(raw).ok_or_else(|| {
                                 sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt")
                             })?;
-                            apply_wal_op(storage, *record_lsn, operation)?;
+                            apply_wal_op(storage, *record_lsn, operation, arena)?;
                         }
                     }
                 }
@@ -21440,7 +21440,7 @@ fn apply_composite_wal_definition(
     Ok(())
 }
 
-fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
+fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp, arena: &Arena) -> Result<(), SqlError> {
     match operator {
         WalOp::DatabaseScope { oid } => {
             let database = crate::storage::DatabaseOid::parse(oid)
@@ -23477,7 +23477,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let slot = storage.find_schema(name).ok_or_else(|| {
                 sql_err!(sqlstate::INTERNAL_ERROR, "journal schema does not exist")
             })?;
-            storage.rename_schema(slot, crate::storage::SqlName::parse(new_name)?)?;
+            storage.rename_schema(slot, crate::storage::SqlName::parse(new_name)?, arena)?;
         }
         WalOp::UpsertExtension {
             name,

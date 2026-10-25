@@ -273,13 +273,14 @@ impl DefinitionVersions {
         definition: &TableDefinition,
         prior: super::SqlName,
         name: super::SqlName,
+        arena: &crate::mem::arena::Arena,
     ) -> Result<(), SqlError> {
         let state = definition.read();
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
             let entry = self.read(slot as usize);
             let mut copied = entry.version.def;
-            super::rename_table_sql_identity(&mut copied, prior, name)?;
+            super::rename_table_sql_identity(&mut copied, prior, name, arena)?;
             tail = entry.previous;
         }
         Ok(())
@@ -367,6 +368,7 @@ impl DefinitionVersions {
         definition: &mut TableDefinition,
         prior: super::SqlName,
         name: super::SqlName,
+        arena: &crate::mem::arena::Arena,
     ) -> Result<(), SqlError> {
         let mut state = definition.exclusive();
         let result: Result<(), SqlError> = (|| {
@@ -385,7 +387,7 @@ impl DefinitionVersions {
                 for key in pending.def.fkeys.iter_mut().take(pending.def.n_fkeys) {
                     super::rename_schema_name(&mut key.parent_schema, prior, name);
                 }
-                super::rename_table_sql_identity(&mut pending.def, prior, name)?;
+                super::rename_table_sql_identity(&mut pending.def, prior, name, arena)?;
                 tail = entry.previous;
             }
             Ok(())

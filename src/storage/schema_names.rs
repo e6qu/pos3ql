@@ -5,6 +5,17 @@ use super::{CatalogDdlDecision, DatabaseOid, SchemaDef, SqlName, Storage, curren
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+impl super::RoutineBodyKind {
+    pub(super) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
+        match self {
+            Self::Return => Ok(crate::sql::parser::StoredSqlKind::Expression),
+            Self::Atomic => Ok(crate::sql::parser::StoredSqlKind::Statements),
+            Self::String => Err(sql_err!(sqlstate::INVALID_FUNCTION_DEFINITION,
+                "a string routine body has no bound namespace positions")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PendingSchemaName {
     pub(super) transaction: u32,
@@ -33,14 +44,14 @@ pub(crate) struct SchemaNameUndo {
 impl SchemaNameTarget {
     pub(crate) fn name(self) -> SqlName { self.name }
 
-    pub(crate) fn rewrites_rule(self, name: SqlName, definition: super::RuleDefinition) -> Result<bool, SqlError> {
+    pub(crate) fn rewrites_rule(self, name: SqlName, definition: super::RuleDefinition, arena: &crate::mem::arena::Arena) -> Result<bool, SqlError> {
         let mut changed = definition;
         super::rename_schema_path(&mut changed.creation_path, self.name, name)?;
-        changed.rename_schema(self.name, name)?;
+        changed.rename_schema(self.name, name, arena)?;
         Ok(definition.source != changed.source || definition.creation_path != changed.creation_path)
     }
 
-    pub(crate) fn rewrite_table(self, name: SqlName, definition: &mut super::TableDef) -> Result<bool, SqlError> {
+    pub(crate) fn rewrite_table(self, name: SqlName, definition: &mut super::TableDef, arena: &crate::mem::arena::Arena) -> Result<bool, SqlError> {
         let mut changed = super::rename_schema_name(&mut definition.schema, self.name, name);
         for column in definition.columns.iter_mut().take(definition.n_columns) {
             changed |= super::rename_user_type_schema(&mut column.user_type, self.name, name);
@@ -48,11 +59,11 @@ impl SchemaNameTarget {
         for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
             changed |= super::rename_schema_name(&mut key.parent_schema, self.name, name);
         }
-        changed |= super::rename_table_sql_identity(definition, self.name, name)?;
+        changed |= super::rename_table_sql_identity(definition, self.name, name, arena)?;
         Ok(changed)
     }
 
-    pub(crate) fn rewrite_routine(self, name: SqlName, definition: &mut super::RoutineDefinition) -> Result<bool, SqlError> {
+    pub(crate) fn rewrite_routine(self, name: SqlName, definition: &mut super::RoutineDefinition, arena: &crate::mem::arena::Arena) -> Result<bool, SqlError> {
         let mut changed = false;
         for argument in definition.arguments.iter_mut().take(definition.argument_count) {
             changed |= super::rename_user_type_schema(&mut argument.user_type, self.name, name);
@@ -68,7 +79,7 @@ impl SchemaNameTarget {
             let path = definition.creation_path;
             super::rename_schema_path(&mut definition.creation_path, self.name, name)?;
             changed |= path != definition.creation_path;
-            changed |= super::rename_schema_qualified_sql(&mut definition.body, &mut [], self.name, name)?;
+            changed |= super::rename_schema_qualified_sql(&mut definition.body, &mut [], self.name, name, definition.body_kind.bound_sql_kind()?, arena)?;
         }
         Ok(changed)
     }
@@ -88,6 +99,7 @@ impl Storage {
 
     pub(crate) fn stage_index_schema_references(
         &self, slot: usize, old: SqlName, new: SqlName, transaction: u32,
+        arena: &crate::mem::arena::Arena,
     ) -> Result<Option<Option<super::PendingIndexDefinition>>, SqlError> {
         let mut indexes = self.index_catalog();
         let index = indexes[slot];
@@ -95,10 +107,10 @@ impl Storage {
         let mut definition = index.definition_for(transaction);
         let mut changed = false;
         for expression in definition.expressions.iter_mut().flatten() {
-            changed |= super::rename_schema_qualified_sql(expression, &mut [], old, new)?;
+            changed |= super::rename_schema_qualified_sql(expression, &mut [], old, new, crate::sql::parser::StoredSqlKind::Expression, arena)?;
         }
         if let Some(predicate) = &mut definition.predicate {
-            changed |= super::rename_schema_qualified_sql(predicate, &mut [], old, new)?;
+            changed |= super::rename_schema_qualified_sql(predicate, &mut [], old, new, crate::sql::parser::StoredSqlKind::Expression, arena)?;
         }
         if !changed { return Ok(None); }
         if let Some(owner) = index.pending_owner_other_than(transaction) {

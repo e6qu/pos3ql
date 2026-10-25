@@ -71,8 +71,15 @@ def main() -> None:
     result = render(json.loads(arguments.metadata.read_text()), arguments.source)
     if arguments.mode == "write":
         arguments.output.write_text(result)
-    elif arguments.output.read_text() != result:
-        raise SystemExit("physical type properties differ from PostgreSQL")
+    else:
+        captured = arguments.output.read_text().splitlines()
+        generated = result.splitlines()
+        if (
+            len(captured) < 2
+            or not captured[1].startswith("//! Source: ")
+            or captured[:1] + captured[2:] != generated[:1] + generated[2:]
+        ):
+            raise SystemExit("physical type properties differ from PostgreSQL")
 
 
 if __name__ == "__main__":

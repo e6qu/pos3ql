@@ -1603,6 +1603,11 @@ if "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --source "PostgreSQL 18.6 comparison service" \
     --mode check --output src/sql/catalog_view_definitions.rs \
     >> "$EVIDENCE/catalog-reference.log" 2>&1 \
+  && "$PY" tools/generate-pg18-type-layouts.py \
+    --metadata "$EVIDENCE/catalog-metadata.json" \
+    --source "PostgreSQL 18.6 comparison service" \
+    --mode check --output src/sql/type_layouts.rs \
+    >> "$EVIDENCE/catalog-reference.log" 2>&1 \
   && "$PY" -u "$EXT/catalog_snapshot_diff.py" \
     --host 127.0.0.1 --port "$P3_PORT" --user "$PGUSER" --database postgres \
     --report-database catalog_reports_diff \

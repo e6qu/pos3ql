@@ -555,7 +555,10 @@ mod key_definitions {
                 .find(|definition| definition.name == relation.name)
                 .unwrap();
             assert_eq!(baseline.oid as u32, identity.relation.get());
-            assert!(super::super::catalog::is_catalog_relation(None, relation.name));
+            assert!(super::super::catalog::is_catalog_relation(
+                None,
+                relation.name
+            ));
             let supported = super::super::catalog::CATALOG_RELATIONS.contains(&relation.name);
             arena.reset();
             let result = forbid_alloc(|| {
@@ -616,7 +619,10 @@ mod key_definitions {
         let mut matched = 0;
         let mut errors = Vec::new();
         for relation in super::super::catalog_snapshot_keys::RELATIONS {
-            assert!(super::super::catalog::is_catalog_relation(None, relation.name));
+            assert!(super::super::catalog::is_catalog_relation(
+                None,
+                relation.name
+            ));
             let supported = super::super::catalog::CATALOG_RELATIONS.contains(&relation.name);
             arena.reset();
             let result = forbid_alloc(|| {

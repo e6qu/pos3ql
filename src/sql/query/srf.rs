@@ -490,7 +490,11 @@ fn publication_output_relation_for(
     }
 }
 
-fn publication_int2vector<'a>(mask: ColumnSet, table: &crate::storage::TableDef, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn publication_int2vector<'a>(
+    mask: ColumnSet,
+    table: &crate::storage::TableDef,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let count = mask.count_ones() as usize;
     let raw = arena
         .alloc_slice_with(count * 2, |_| 0u8)
@@ -650,7 +654,10 @@ fn publication_table_rows<'a>(
         };
         let qual = match filter {
             Some(filter) => Datum::PgNodeTree(crate::sql::catalog::expressions::bind(
-                filter, crate::sql::catalog::expressions::Kind::Expression, Some(&table), arena,
+                filter,
+                crate::sql::catalog::expressions::Kind::Expression,
+                Some(&table),
+                arena,
             )?),
             None => Datum::Null,
         };

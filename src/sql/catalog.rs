@@ -9341,15 +9341,23 @@ pub(crate) fn synthesize_current<'a>(
             constraints::table_usage(storage, txid, views::Read::Current, arena)
         }
         (true, "key_column_usage") => constraints::keys(storage, txid, views::Read::Current, arena),
-        (true, "constraint_column_usage") => constraints::column_usage(storage, txid, views::Read::Current, arena),
-        (true, "referential_constraints") => constraints::references(storage, txid, views::Read::Current, arena),
+        (true, "constraint_column_usage") => {
+            constraints::column_usage(storage, txid, views::Read::Current, arena)
+        }
+        (true, "referential_constraints") => {
+            constraints::references(storage, txid, views::Read::Current, arena)
+        }
         (true, "table_privileges") => info_table_privileges(storage, txid, arena),
         (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
         (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
         (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
         (true, "domains") => info_domains(storage, txid, arena),
-        (true, "domain_constraints") => constraints::domains(storage, txid, views::Read::Current, arena),
-        (true, "check_constraints") => constraints::checks(storage, txid, views::Read::Current, arena),
+        (true, "domain_constraints") => {
+            constraints::domains(storage, txid, views::Read::Current, arena)
+        }
+        (true, "check_constraints") => {
+            constraints::checks(storage, txid, views::Read::Current, arena)
+        }
         (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
         (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
         (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
@@ -9410,8 +9418,14 @@ fn table_oid(_storage: &Storage, slot: usize) -> i32 {
     user_table_oid(slot)
 }
 
-pub(crate) fn expression_def_text<'a>(storage: &Storage, transaction: u32, node: &str, relation: i32, pretty: bool, arena: &'a Arena)
-    -> Result<Option<&'a str>, SqlError> {
+pub(crate) fn expression_def_text<'a>(
+    storage: &Storage,
+    transaction: u32,
+    node: &str,
+    relation: i32,
+    pretty: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
     expressions::deparse(storage, transaction, node, relation, pretty, arena)
 }
 
@@ -11549,7 +11563,8 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         (None, schema) => schema,
     };
     if schema.is_none_or(|schema| schema == "pg_catalog")
-        && let Some(oid) = catalog_relation_oid(relation) {
+        && let Some(oid) = catalog_relation_oid(relation)
+    {
         return Some(oid);
     }
     match storage.resolve_relation(schema, relation, txid) {
@@ -15076,10 +15091,11 @@ pub(crate) fn table_constraint_oid(
         .iter()
         .enumerate()
         .find(|(_, column)| {
-            column.not_null.is_required()
-                && not_null_constraint_name(column).as_str() == name
+            column.not_null.is_required() && not_null_constraint_name(column).as_str() == name
         })
-        .map(|(index, _)| not_null_constraint_oid(table_slot, usize::from(table.attribute_number(index) - 1)))
+        .map(|(index, _)| {
+            not_null_constraint_oid(table_slot, usize::from(table.attribute_number(index) - 1))
+        })
 }
 
 /// Resolve a table constraint OID back to its stable table/name identity.
@@ -15882,7 +15898,12 @@ fn write_index_key_metadata(
     }
 }
 
-fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo, qualify: bool) {
+fn write_index_target(
+    out: &mut impl core::fmt::Write,
+    table: &TableDef,
+    info: &IdxInfo,
+    qualify: bool,
+) {
     let _ = out.write_str(" ON ");
     if info
         .explicit_definition
@@ -15986,12 +16007,25 @@ pub fn index_def_text<'a>(
     };
     if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
-            Some(if pretty && reloid_of_name(storage, txid, name) == Some(relation) {
-                let (before, after) = definition.split_once("pg_catalog.").expect("builtin definition names its schema");
-                arena.alloc_str_display(format_args!("{before}{after}")).map_err(|_| arena_full())?
-            } else { definition })
+            Some(
+                if pretty && reloid_of_name(storage, txid, name) == Some(relation) {
+                    let (before, after) = definition
+                        .split_once("pg_catalog.")
+                        .expect("builtin definition names its schema");
+                    arena
+                        .alloc_str_display(format_args!("{before}{after}"))
+                        .map_err(|_| arena_full())?
+                } else {
+                    definition
+                },
+            )
         } else {
-            Some(col.checked_sub(1).and_then(|number| usize::try_from(number).ok()).and_then(|position| columns.get(position).copied()).unwrap_or(""))
+            Some(
+                col.checked_sub(1)
+                    .and_then(|number| usize::try_from(number).ok())
+                    .and_then(|position| columns.get(position).copied())
+                    .unwrap_or(""),
+            )
         });
     }
     let indices = collect_indexes(storage, txid, arena)?;
@@ -16002,13 +16036,27 @@ pub fn index_def_text<'a>(
         let def = storage.table_def(info.table_slot, txid);
         let col_name = |ci: usize| def.columns()[info.columns[ci] as usize].name.as_str();
         if col != 0 {
-            let Some(position) = col.checked_sub(1).and_then(|number| usize::try_from(number).ok()) else { return Ok(Some("")); };
+            let Some(position) = col
+                .checked_sub(1)
+                .and_then(|number| usize::try_from(number).ok())
+            else {
+                return Ok(Some(""));
+            };
             let mut name = StackStr::<128>::new();
             if position < info.n_cols {
                 if info.expression_keys[position] {
                     let expression = index_expression_source(storage, info, position, txid)
-                        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
-                    return Ok(Some(index_expression_display(expression.as_str(), pretty, arena)?));
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "index expression source is absent"
+                            )
+                        })?;
+                    return Ok(Some(index_expression_display(
+                        expression.as_str(),
+                        pretty,
+                        arena,
+                    )?));
                 }
                 write_identifier(&mut name, col_name(position));
             } else if position - info.n_cols < info.n_include_cols {
@@ -16017,7 +16065,11 @@ pub fn index_def_text<'a>(
             } else {
                 return Ok(Some(""));
             }
-            return Ok(Some(alloc_rendered(&name, "index column name is too long", arena)?));
+            return Ok(Some(alloc_rendered(
+                &name,
+                "index column name is too long",
+                arena,
+            )?));
         }
         let mut s = StackStr::<896>::new();
         use core::fmt::Write as _;
@@ -16044,9 +16096,18 @@ pub fn index_def_text<'a>(
                 let _ = s.write_str(", ");
             }
             if info.expression_keys[k] {
-                let expression = index_expression_source(storage, info, k, txid)
-                    .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index expression source is absent"))?;
-                let _ = s.write_str(index_expression_display(expression.as_str(), pretty, arena)?);
+                let expression =
+                    index_expression_source(storage, info, k, txid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "index expression source is absent"
+                        )
+                    })?;
+                let _ = s.write_str(index_expression_display(
+                    expression.as_str(),
+                    pretty,
+                    arena,
+                )?);
             } else {
                 write_identifier(&mut s, col_name(k));
             }
@@ -16094,7 +16155,11 @@ pub fn index_def_text<'a>(
     Ok(None)
 }
 
-fn index_expression_display<'a>(source: &str, pretty: bool, arena: &'a Arena) -> Result<&'a str, SqlError> {
+fn index_expression_display<'a>(
+    source: &str,
+    pretty: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let expression = super::parser::parse_expr(source, arena)?;
     let display = super::enum_values::checks::canonical_display(source, arena)?;
@@ -16145,29 +16210,69 @@ pub(crate) fn validate_restored_row(
     relation: &super::catalog_snapshot::CatalogSnapshotRelation,
     row: crate::storage::HistoricalCatalogRow<'_>,
 ) -> Result<(), SqlError> {
-    let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "invalid restored {} catalog row", relation.name);
+    let invalid = || {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid restored {} catalog row",
+            relation.name
+        )
+    };
     let specification = schema::definition(relation.name, false).ok_or_else(invalid)?;
-    let visible = || specification.columns.iter()
-        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
-        .map(|(_, ctype)| *ctype);
+    let visible = || {
+        specification
+            .columns
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
+            .map(|(_, ctype)| *ctype)
+    };
     let table_oid = specification.relation.map(core::num::NonZeroU32::get);
-    let private = if relation.name == "pg_rewrite" { rewrite::PRIVATE_COLUMNS } else { &[] };
+    let private = if relation.name == "pg_rewrite" {
+        rewrite::PRIVATE_COLUMNS
+    } else {
+        &[]
+    };
     if let Some(image) = row.before {
-        super::catalog_image::validate(image.bytes, visible(), table_oid, private.iter().map(|(_, ctype)| *ctype)).ok_or_else(invalid)?;
+        super::catalog_image::validate(
+            image.bytes,
+            visible(),
+            table_oid,
+            private.iter().map(|(_, ctype)| *ctype),
+        )
+        .ok_or_else(invalid)?;
     }
     match relation.key {
         super::catalog_snapshot::CatalogRowKey::Tuple => {
-            super::catalog_image::validate(row.key, visible(), table_oid, private.iter().map(|(_, ctype)| *ctype)).ok_or_else(invalid)?;
-            if row.before.is_some_and(|image| image.bytes != row.key) { return Err(invalid()); }
+            super::catalog_image::validate(
+                row.key,
+                visible(),
+                table_oid,
+                private.iter().map(|(_, ctype)| *ctype),
+            )
+            .ok_or_else(invalid)?;
+            if row.before.is_some_and(|image| image.bytes != row.key) {
+                return Err(invalid());
+            }
         }
         super::catalog_snapshot::CatalogRowKey::Columns(names) => {
             let mut columns = [ColType::Text; MAX_COLUMNS];
-            if names.is_empty() || names.len() > columns.len() { return Err(invalid()); }
-            for (target, name) in columns.iter_mut().zip(names) {
-                *target = specification.columns.iter().find(|(candidate, _)| candidate == name)
-                    .map(|(_, ctype)| *ctype).ok_or_else(invalid)?;
+            if names.is_empty() || names.len() > columns.len() {
+                return Err(invalid());
             }
-            super::catalog_image::validate(row.key, columns[..names.len()].iter().copied(), None, [].into_iter()).ok_or_else(invalid)?;
+            for (target, name) in columns.iter_mut().zip(names) {
+                *target = specification
+                    .columns
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, ctype)| *ctype)
+                    .ok_or_else(invalid)?;
+            }
+            super::catalog_image::validate(
+                row.key,
+                columns[..names.len()].iter().copied(),
+                None,
+                [].into_iter(),
+            )
+            .ok_or_else(invalid)?;
         }
     }
     Ok(())
@@ -16239,13 +16344,25 @@ fn materialize_with_hidden(
     Ok((definition, count))
 }
 
-fn allocate_definition(definition: TableDef, hidden_columns: usize, arena: &Arena) -> Result<&TableDef, SqlError> {
-    let def = arena.alloc_interned((definition, hidden_columns), |(left, left_hidden), (right, right_hidden)| {
-        // These definitions come only from materialize_with_hidden: all other
-        // TableDef fields have its fixed empty values.
-        left_hidden == right_hidden && left.name == right.name && left.n_columns == right.n_columns
-            && left.columns[..left.n_columns + left_hidden] == right.columns[..right.n_columns + right_hidden]
-    }).map_err(|_| arena_full())?;
+fn allocate_definition(
+    definition: TableDef,
+    hidden_columns: usize,
+    arena: &Arena,
+) -> Result<&TableDef, SqlError> {
+    let def = arena
+        .alloc_interned(
+            (definition, hidden_columns),
+            |(left, left_hidden), (right, right_hidden)| {
+                // These definitions come only from materialize_with_hidden: all other
+                // TableDef fields have its fixed empty values.
+                left_hidden == right_hidden
+                    && left.name == right.name
+                    && left.n_columns == right.n_columns
+                    && left.columns[..left.n_columns + left_hidden]
+                        == right.columns[..right.n_columns + right_hidden]
+            },
+        )
+        .map_err(|_| arena_full())?;
     Ok(&def.0)
 }
 
@@ -16300,8 +16417,14 @@ fn finish_with_hidden<'a>(
             // notably oid rather than int4, before hashing or wire encoding.
             // These private source rows bind node SQL to column identities
             // in expressions::current before any catalog row is exposed.
-            let value = if matches!(*column_type, ColType::PgNodeTree | ColType::PgNdistinct | ColType::PgDependencies | ColType::PgMcvList)
-                && matches!(value, Datum::Text(_)) {
+            let value = if matches!(
+                *column_type,
+                ColType::PgNodeTree
+                    | ColType::PgNdistinct
+                    | ColType::PgDependencies
+                    | ColType::PgMcvList
+            ) && matches!(value, Datum::Text(_))
+            {
                 value
             } else {
                 super::eval::cast_to(value, *column_type, arena)?
@@ -16668,7 +16791,11 @@ fn pg_statistic_ext<'a>(
                     slot,
                     txid,
                 )),
-                int2vector(&columns[..n_columns], Some(&storage.table_def(usize::from(statistics.table), txid)), arena)?,
+                int2vector(
+                    &columns[..n_columns],
+                    Some(&storage.table_def(usize::from(statistics.table), txid)),
+                    arena,
+                )?,
                 mutable
                     .target
                     .map_or(Datum::Null, |target| Datum::Int2(target as i16)),
@@ -17484,7 +17611,11 @@ fn pg_publication_rel<'a>(
                         attribute_count += 1;
                     }
                 }
-                int2vector(&attributes[..attribute_count], Some(&storage.table_def(usize::from(*member), txid)), arena)?
+                int2vector(
+                    &attributes[..attribute_count],
+                    Some(&storage.table_def(usize::from(*member), txid)),
+                    arena,
+                )?
             };
             rows[count] = row(
                 &[
@@ -20046,7 +20177,10 @@ fn pg_constraint_values<'a>(
         .sum::<usize>();
     let domain_constraints = (0..storage.domain_count())
         .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
-        .map(|slot| { let domain = storage.domain_for(slot, txid); domain.checks().len() + usize::from(domain.not_null) })
+        .map(|slot| {
+            let domain = storage.domain_for(slot, txid);
+            domain.checks().len() + usize::from(domain.not_null)
+        })
         .sum::<usize>();
     let out = catalog_rows(
         arena,
@@ -20092,7 +20226,11 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?,  // confupdtype (n/a for non-FK)
                 text(" ", arena)?,  // confdeltype
-                attnum_array(&info.columns[..info.n_cols], &storage.table_def(info.table_slot, txid), arena)?,
+                attnum_array(
+                    &info.columns[..info.n_cols],
+                    &storage.table_def(info.table_slot, txid),
+                    arena,
+                )?,
                 empty_int_array(arena)?,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
@@ -20142,9 +20280,12 @@ fn pg_constraint_values<'a>(
                 ix.table_oid == info.confrelid
                     && ix.is_unique
                     && ix.predicate.is_none()
-                    && !ix.expression_keys[..ix.n_cols].iter().any(|expression| *expression)
+                    && !ix.expression_keys[..ix.n_cols]
+                        .iter()
+                        .any(|expression| *expression)
                     && ix.n_cols == fk.n_parent_cols
-                    && fk.parent_cols[..fk.n_parent_cols].iter()
+                    && fk.parent_cols[..fk.n_parent_cols]
+                        .iter()
                         .all(|column| ix.columns[..ix.n_cols].contains(column))
             })
             .map_or(0, |ix| ix.oid);
@@ -20165,8 +20306,16 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false),
                 text(fk_action_char(fk.on_update), arena)?,
                 text(fk_action_char(fk.on_delete), arena)?,
-                attnum_array(&fk.columns[..fk.n_cols], &storage.table_def(info.child_slot, txid), arena)?,
-                attnum_array(&fk.parent_cols[..fk.n_parent_cols], &storage.table_def(info.parent_slot, txid), arena)?,
+                attnum_array(
+                    &fk.columns[..fk.n_cols],
+                    &storage.table_def(info.child_slot, txid),
+                    arena,
+                )?,
+                attnum_array(
+                    &fk.parent_cols[..fk.n_parent_cols],
+                    &storage.table_def(info.parent_slot, txid),
+                    arena,
+                )?,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
                     storage,
@@ -20311,7 +20460,11 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
-                    if count == 0 { Datum::Null } else { attnum_array(&columns[..count], &table, arena)? },
+                    if count == 0 {
+                        Datum::Null
+                    } else {
+                        attnum_array(&columns[..count], &table, arena)?
+                    },
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
                     Datum::Int4(namespace_oid(
@@ -20346,7 +20499,15 @@ fn pg_constraint_values<'a>(
             return Err(catalog_capacity_exceeded("pg_constraint"));
         }
         let rendered = detached_partition_constraint_def_text(&table, constraint, arena)?;
-        let expression = rendered.strip_prefix("CHECK (").and_then(|text| text.strip_suffix(")")).ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "detached CHECK expression framing is invalid"))?;
+        let expression = rendered
+            .strip_prefix("CHECK (")
+            .and_then(|text| text.strip_suffix(")"))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "detached CHECK expression framing is invalid"
+                )
+            })?;
         out[n] = row(
             &[
                 Datum::Int4(FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32),
@@ -20404,7 +20565,10 @@ fn pg_constraint_values<'a>(
             let constraint_name = not_null_constraint_name(column);
             out[n] = row(
                 &[
-                    Datum::Int4(not_null_constraint_oid(slot, usize::from(table.attribute_number(column_index) - 1))),
+                    Datum::Int4(not_null_constraint_oid(
+                        slot,
+                        usize::from(table.attribute_number(column_index) - 1),
+                    )),
                     text(constraint_name.as_str(), arena)?,
                     Datum::Int4(table_oid(storage, slot)),
                     Datum::Int4(0),
@@ -20479,25 +20643,62 @@ fn pg_constraint_values<'a>(
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
-                    text(super::enum_values::checks::resolve(check.expression.as_str(), domain.base, storage, txid, arena)?, arena)?,
+                    text(
+                        super::enum_values::checks::resolve(
+                            check.expression.as_str(),
+                            domain.base,
+                            storage,
+                            txid,
+                            arena,
+                        )?,
+                        arena,
+                    )?,
                 ],
                 arena,
             )?;
             n += 1;
         }
         if domain.not_null {
-            if n == out.len() { return Err(catalog_capacity_exceeded("pg_constraint")); }
-            let name = domain.not_null_name.expect("stored domain NOT NULL constraint has a name");
-            out[n] = row(&[
-                Datum::Int4(FIRST_DOMAIN_NOT_NULL_OID + slot as i32), text(name.as_str(), arena)?,
-                Datum::Int4(0), Datum::Int4(domain_oid(slot)), text("n", arena)?,
-                Datum::Int4(0), Datum::Int4(0), Datum::Int4(0),
-                Datum::Bool(false), Datum::Bool(false), Datum::Bool(true), Datum::Bool(true), Datum::Bool(false),
-                text(" ", arena)?, text(" ", arena)?, Datum::Null, Datum::Null,
-                Datum::Int4(PG_CONSTRAINT_OID), Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
-                text(" ", arena)?, Datum::Bool(true), Datum::Int4(0), Datum::Bool(false),
-                Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null,
-            ], arena)?;
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_constraint"));
+            }
+            let name = domain
+                .not_null_name
+                .expect("stored domain NOT NULL constraint has a name");
+            out[n] = row(
+                &[
+                    Datum::Int4(FIRST_DOMAIN_NOT_NULL_OID + slot as i32),
+                    text(name.as_str(), arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(domain_oid(slot)),
+                    text("n", arena)?,
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(true),
+                    Datum::Bool(true),
+                    Datum::Bool(false),
+                    text(" ", arena)?,
+                    text(" ", arena)?,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Int4(PG_CONSTRAINT_OID),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    text(" ", arena)?,
+                    Datum::Bool(true),
+                    Datum::Int4(0),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
             n += 1;
         }
     }
@@ -20513,11 +20714,12 @@ fn pg_constraint_values<'a>(
     for (target, source) in compatible.iter_mut().zip(&out[..n]) {
         let mut values = [Datum::Null; 29];
         for (column, ((_, ctype), original)) in def.columns.iter().zip(SOURCE_COLUMNS).enumerate() {
-            values[column] = if *ctype == ColType::PgNodeTree && matches!(source[original], Datum::Text(_)) {
-                source[original]
-            } else {
-                super::eval::cast_to(source[original], *ctype, arena)?
-            };
+            values[column] =
+                if *ctype == ColType::PgNodeTree && matches!(source[original], Datum::Text(_)) {
+                    source[original]
+                } else {
+                    super::eval::cast_to(source[original], *ctype, arena)?
+                };
         }
         values[28] = super::eval::cast_to(source[17], ColType::Oid, arena)?;
         *target = row(&values, arena)?;
@@ -21277,7 +21479,11 @@ fn pg_depend<'a>(
     };
     let referenced_column = |dependency: &crate::storage::StoredQueryDependency, column: usize| {
         match dependency.class {
-            crate::storage::DependencyClass::Table => i32::from(storage.table_def(usize::from(dependency.slot), txid).attribute_number(column)),
+            crate::storage::DependencyClass::Table => i32::from(
+                storage
+                    .table_def(usize::from(dependency.slot), txid)
+                    .attribute_number(column),
+            ),
             crate::storage::DependencyClass::View => column as i32 + 1,
             _ => unreachable!("only relation dependencies contain column positions"),
         }
@@ -21424,7 +21630,11 @@ fn pg_depend<'a>(
                     PG_CLASS_OID,
                     relation_oid,
                     match trigger.target {
-                        crate::storage::TriggerTarget::Table(slot) => i32::from(storage.table_def(usize::from(slot), txid).attribute_number(column)),
+                        crate::storage::TriggerTarget::Table(slot) => i32::from(
+                            storage
+                                .table_def(usize::from(slot), txid)
+                                .attribute_number(column),
+                        ),
                         crate::storage::TriggerTarget::View(_) => column as i32 + 1,
                     },
                     "n",
@@ -21491,7 +21701,8 @@ fn pg_depend<'a>(
                         {
                             let parent = storage.table_def(parent_table, txid);
                             let child = storage.table_def(child, txid);
-                            let column = child.column_index(parent.columns()[column].name.as_str())
+                            let column = child
+                                .column_index(parent.columns()[column].name.as_str())
                                 .expect("partition trigger column remains present in its child");
                             i32::from(child.attribute_number(column))
                         },
@@ -21552,8 +21763,17 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
 
 /// A `Datum::Array` of stable attribute numbers, the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
-fn attnum_array<'a>(columns: &[u16], table: &TableDef, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let vals = arena.alloc_slice_with(columns.len(), |index| Datum::Int4(i32::from(table.attribute_number(usize::from(columns[index])))))
+fn attnum_array<'a>(
+    columns: &[u16],
+    table: &TableDef,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let vals = arena
+        .alloc_slice_with(columns.len(), |index| {
+            Datum::Int4(i32::from(
+                table.attribute_number(usize::from(columns[index])),
+            ))
+        })
         .map_err(|_| arena_full())?;
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
@@ -21638,7 +21858,11 @@ fn pg_index<'a>(
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),
-                int2vector(&attributes[..info.n_cols + info.n_include_cols], Some(&storage.table_def(info.table_slot, txid)), arena)?,
+                int2vector(
+                    &attributes[..info.n_cols + info.n_include_cols],
+                    Some(&storage.table_def(info.table_slot, txid)),
+                    arena,
+                )?,
                 index_options(info, arena)?,
                 match info.predicate {
                     Some(predicate) => text(predicate.as_str(), arena)?,
@@ -21849,7 +22073,11 @@ impl<'a> ColumnLookup<'a> for TableColumnTypes<'_> {
     }
 }
 
-fn int2vector<'a>(columns: &[u16], table: Option<&TableDef>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn int2vector<'a>(
+    columns: &[u16],
+    table: Option<&TableDef>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let raw = arena
         .alloc_slice_with(columns.len() * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
@@ -21857,7 +22085,9 @@ fn int2vector<'a>(columns: &[u16], table: Option<&TableDef>, arena: &'a Arena) -
         let attribute_number = if *column == u16::MAX {
             0
         } else {
-            table.map_or(*column + 1, |table| table.attribute_number(usize::from(*column))) as i16
+            table.map_or(*column + 1, |table| {
+                table.attribute_number(usize::from(*column))
+            }) as i16
         };
         raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
@@ -22454,16 +22684,18 @@ fn pg_attribute<'a>(
         let layout = if type_oid == 0 && matches!(source[14], Datum::Bool(true)) {
             None
         } else {
-            Some(super::exec::catalog_column_type(storage, txid, type_oid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "pg_attribute cannot resolve type OID {}",
-                        type_oid
-                    )
-                })?
-                .0
-                .physical_layout())
+            Some(
+                super::exec::catalog_column_type(storage, txid, type_oid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pg_attribute cannot resolve type OID {}",
+                            type_oid
+                        )
+                    })?
+                    .0
+                    .physical_layout(),
+            )
         };
         *target = row(
             &[
@@ -22475,7 +22707,10 @@ fn pg_attribute<'a>(
                 source[6],
                 Datum::Int2(0),
                 Datum::Bool(layout.is_some_and(|layout| layout.by_value)),
-                layout.map_or_else(|| character(source[16]), |layout| Ok(Datum::Char(layout.alignment)))?,
+                layout.map_or_else(
+                    || character(source[16]),
+                    |layout| Ok(Datum::Char(layout.alignment)),
+                )?,
                 character(source[11])?,
                 character(source[12])?,
                 source[4],
@@ -22497,22 +22732,58 @@ fn pg_attribute<'a>(
         )?;
     }
     for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) { continue; }
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
         let table = storage.table_def(slot, txid);
-        for (attribute, state) in table.attributes.slots[..usize::from(table.attributes.count)].iter().enumerate() {
-            let crate::storage::column_attributes::AttributeSlot::Dropped { layout, compression } = *state else { continue; };
-            if n == out.len() { return Err(catalog_capacity_exceeded("pg_attribute")); }
+        for (attribute, state) in table.attributes.slots[..usize::from(table.attributes.count)]
+            .iter()
+            .enumerate()
+        {
+            let crate::storage::column_attributes::AttributeSlot::Dropped {
+                layout,
+                compression,
+            } = *state
+            else {
+                continue;
+            };
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
+            }
             let number = attribute as i16 + 1;
-            out[n] = row(&[
-                Datum::Oid(table_oid(storage, slot) as u32),
-                text(stack_format!(64, "........pg.dropped.{number}........").as_str(), arena)?,
-                Datum::Oid(0), Datum::Int2(layout.length), Datum::Int2(number),
-                Datum::Int4(-1), Datum::Int2(0), Datum::Bool(layout.by_value),
-                Datum::Char(layout.alignment), Datum::Char(layout.storage), Datum::Char(compression),
-                Datum::Bool(false), Datum::Bool(false), Datum::Bool(false), Datum::Char(0), Datum::Char(0),
-                Datum::Bool(true), Datum::Bool(true), Datum::Int2(0), Datum::Oid(0),
-                Datum::Null, Datum::Null, Datum::Null, Datum::Null, Datum::Null,
-            ], arena)?;
+            out[n] = row(
+                &[
+                    Datum::Oid(table_oid(storage, slot) as u32),
+                    text(
+                        stack_format!(64, "........pg.dropped.{number}........").as_str(),
+                        arena,
+                    )?,
+                    Datum::Oid(0),
+                    Datum::Int2(layout.length),
+                    Datum::Int2(number),
+                    Datum::Int4(-1),
+                    Datum::Int2(0),
+                    Datum::Bool(layout.by_value),
+                    Datum::Char(layout.alignment),
+                    Datum::Char(layout.storage),
+                    Datum::Char(compression),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Char(0),
+                    Datum::Char(0),
+                    Datum::Bool(true),
+                    Datum::Bool(true),
+                    Datum::Int2(0),
+                    Datum::Oid(0),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
             n += 1;
         }
     }
@@ -22576,7 +22847,12 @@ fn pg_attrdef<'a>(
             }
             out[n] = row(
                 &[
-                    Datum::Oid((400_000_000 + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32 + i32::from(table.attribute_number(ci)) - 1) as u32),
+                    Datum::Oid(
+                        (400_000_000
+                            + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
+                            + i32::from(table.attribute_number(ci))
+                            - 1) as u32,
+                    ),
                     Datum::Oid(relid as u32),
                     Datum::Int2(table.attribute_number(ci) as i16),
                     Datum::Text(text_expr),
@@ -22624,7 +22900,11 @@ fn pg_attrdef<'a>(
             let relid = view_oid(slot);
             out[n] = row(
                 &[
-                    Datum::Oid((600_000_000 + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32 + column as i32) as u32),
+                    Datum::Oid(
+                        (600_000_000
+                            + slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
+                            + column as i32) as u32,
+                    ),
                     Datum::Oid(relid as u32),
                     Datum::Int2(column as i16 + 1),
                     Datum::Text(default),
@@ -25704,8 +25984,14 @@ fn pg_trigger<'a>(
                 Datum::Bool(constraint_timing.initially_deferred()),
                 Datum::Int2(trigger.arguments.values().len() as i16),
                 match trigger.target {
-                    crate::storage::TriggerTarget::Table(slot) => int2vector(&update_columns[..update_count], Some(&storage.table_def(usize::from(slot), txid)), arena)?,
-                    crate::storage::TriggerTarget::View(_) => int2vector(&update_columns[..update_count], None, arena)?,
+                    crate::storage::TriggerTarget::Table(slot) => int2vector(
+                        &update_columns[..update_count],
+                        Some(&storage.table_def(usize::from(slot), txid)),
+                        arena,
+                    )?,
+                    crate::storage::TriggerTarget::View(_) => {
+                        int2vector(&update_columns[..update_count], None, arena)?
+                    }
                 },
                 Datum::Bytea(encoded_arguments),
                 trigger
@@ -25752,9 +26038,18 @@ fn pg_trigger<'a>(
             let parent_definition = storage.table_def(parent_table, txid);
             let child_definition = storage.table_def(child, txid);
             let mut columns = [0u16; MAX_COLUMNS];
-            for (target, parent_column) in columns[..update_count].iter_mut().zip(&update_columns[..update_count]) {
-                *target = child_definition.column_index(parent_definition.columns()[usize::from(*parent_column)].name.as_str())
-                    .expect("partition trigger column remains present in its child") as u16;
+            for (target, parent_column) in columns[..update_count]
+                .iter_mut()
+                .zip(&update_columns[..update_count])
+            {
+                *target = child_definition
+                    .column_index(
+                        parent_definition.columns()[usize::from(*parent_column)]
+                            .name
+                            .as_str(),
+                    )
+                    .expect("partition trigger column remains present in its child")
+                    as u16;
             }
             clone[15] = int2vector(&columns[..update_count], Some(&child_definition), arena)?;
             clone[1] = Datum::Int4(clone_oid);
@@ -31240,7 +31535,9 @@ fn view_column_catalog_type(
 }
 
 fn not_null_constraint_name(column: &ColumnMeta) -> SqlName {
-    column.not_null_name.expect("stored NOT NULL constraint has a durable name")
+    column
+        .not_null_name
+        .expect("stored NOT NULL constraint has a durable name")
 }
 
 fn info_table_privileges<'a>(

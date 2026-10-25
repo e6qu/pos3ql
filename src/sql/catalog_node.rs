@@ -34,9 +34,14 @@ impl<'a> CatalogNode<'a> {
             let start = number(fields.next()?)?;
             let end = number(fields.next()?)?;
             let column = number(fields.next()?)?;
-            if fields.next().is_some() || column == 0 || column > crate::storage::MAX_COLUMNS
-                || start < previous_end || end <= start
-                || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+            if fields.next().is_some()
+                || column == 0
+                || column > crate::storage::MAX_COLUMNS
+                || start < previous_end
+                || end <= start
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+            {
                 return None;
             }
             previous_end = end;
@@ -54,8 +59,10 @@ impl<'a> CatalogNode<'a> {
 }
 
 fn number(value: &str) -> Option<usize> {
-    if value.is_empty() || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     value.parse().ok()
@@ -75,7 +82,10 @@ mod tests {
                 "pos3ql-catalog-expression-v1\nquery\n0\n\nSELECT 1",
                 "pos3ql-catalog-expression-v1\nexpression\n1\n0,2,1\n\né > 0",
             ] {
-                assert_eq!(CatalogNode::from_encoded(encoded).unwrap().as_str(), encoded);
+                assert_eq!(
+                    CatalogNode::from_encoded(encoded).unwrap().as_str(),
+                    encoded
+                );
             }
             for encoded in [
                 "NULL",

@@ -1284,9 +1284,17 @@ pub trait CatalogAccess {
         pretty: bool,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
-    fn expression_def<'a>(&self, _node: &str, _relation: i32, _pretty: bool, _arena: &'a Arena)
-        -> Result<Option<&'a str>, SqlError> {
-        Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "catalog expression deparsing requires catalog access"))
+    fn expression_def<'a>(
+        &self,
+        _node: &str,
+        _relation: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "catalog expression deparsing requires catalog access"
+        ))
     }
     /// The `FOREIGN KEY (...) REFERENCES ...` definition of the constraint with
     /// this OID, or `None` if no such foreign-key constraint is known.
@@ -2497,8 +2505,13 @@ fn eval_full_inner<'a>(
             let mut v = eval_full(operand, arena, params, row, hooks)?;
             if ColType::from_sql_name(type_name) == Some(ColType::PgNodeTree)
                 && !v.is_null()
-                && expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v) != super::types::oid::PG_NODE_TREE {
-                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cannot accept a value of type pg_node_tree"));
+                && expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v)
+                    != super::types::oid::PG_NODE_TREE
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot accept a value of type pg_node_tree"
+                ));
             }
             if let Some(catalog) = hooks.catalog {
                 let source_oid =

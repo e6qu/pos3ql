@@ -106,9 +106,9 @@ mod snapshot_reclamation;
 mod transaction_admission;
 use snapshot_reclamation::SnapshotReclamation;
 pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
-mod statistics;
-pub(crate) mod constraint_names;
 pub(crate) mod column_attributes;
+pub(crate) mod constraint_names;
+mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
@@ -1188,7 +1188,8 @@ impl OwnedDatum {
             Self::PgNodeTree { len, bytes } => Datum::PgNodeTree(
                 crate::sql::catalog_node::CatalogNode::from_encoded(
                     core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
-                ).expect("owned catalog node was validated before storage"),
+                )
+                .expect("owned catalog node was validated before storage"),
             ),
             Self::Geometry { kind, len, bytes } => Datum::Geometry {
                 kind: *kind,
@@ -2309,7 +2310,9 @@ pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
 impl TableDef {
     pub(crate) fn attribute_number(&self, column: usize) -> u16 {
-        self.attributes.number(column).expect("admitted table column has a stable attribute number")
+        self.attributes
+            .number(column)
+            .expect("admitted table column has a stable attribute number")
     }
 
     pub(crate) fn attribute_column(&self, number: u16) -> Option<usize> {
@@ -18622,7 +18625,10 @@ impl Storage {
             }
             definition.n_columns = 4;
             definition.has_toast = true;
-            definition.attributes.initialize(definition.n_columns).expect("internal column attributes fit");
+            definition
+                .attributes
+                .initialize(definition.n_columns)
+                .expect("internal column attributes fit");
             constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
             let mut state = table.definition.write();
             let mut identity = state.identity;

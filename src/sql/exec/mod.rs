@@ -39393,7 +39393,9 @@ pub fn create_table_as(
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
     }
-    if let Err(error) = def.attributes.initialize(def.n_columns) { return sql_fail(error); }
+    if let Err(error) = def.attributes.initialize(def.n_columns) {
+        return sql_fail(error);
+    }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
@@ -54514,8 +54516,14 @@ pub(crate) fn decode_text_input<'a>(
         return crate::sql::eval::regtype_of_name(text);
     }
     let decode_builtin = |ctype| match ctype {
-        ColType::PgNdistinct | ColType::PgDependencies | ColType::PgMcvList | ColType::PgStatisticArray =>
-            Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cannot accept a value of type {}", ctype.name())),
+        ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            ctype.name()
+        )),
         target if target.is_reg_object() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::regobject_cast(Datum::Text(text), target, Some(&catalog), arena)
@@ -54605,13 +54613,18 @@ fn decode_binary_field_with_context<'a>(
         }
         ColType::Int2Vector => decode_binary_vector(BinaryVectorKind::Int2, bytes, arena),
         ColType::OidVector => decode_binary_vector(BinaryVectorKind::Oid, bytes, arena),
-        ColType::PgNodeTree => Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot accept a value of type pg_node_tree")),
+        ColType::PgNodeTree => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type pg_node_tree"
+        )),
         ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
-        | ColType::PgStatisticArray => Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot accept a value of type {}", ctype.name())),
+        | ColType::PgStatisticArray => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            ctype.name()
+        )),
         ColType::Int4 => via(oids::INT4),
         ColType::Oid => via(oids::OID),
         ColType::Xid => {
@@ -67926,22 +67939,35 @@ fn alter_table_relation(
             wal_column_mapping[old_column] = new_column as u16;
         }
     }
-    new_def.attributes = match crate::storage::column_attributes::ColumnAttributes::rewrite(&def, new_def.columns(), &column_mapping) {
+    new_def.attributes = match crate::storage::column_attributes::ColumnAttributes::rewrite(
+        &def,
+        new_def.columns(),
+        &column_mapping,
+    ) {
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
     for (column, destination) in column_mapping[..def.n_columns].iter().enumerate() {
         if destination.is_none()
-            && let Err(error) = stage_comment(storage, wal, txn, CommentIdentity {
-                class: crate::storage::CommentClass::Relation,
-                schema: def.schema,
-                name: def.name,
-                subid: u32::from(def.attribute_number(column)),
-            }, None) {
+            && let Err(error) = stage_comment(
+                storage,
+                wal,
+                txn,
+                CommentIdentity {
+                    class: crate::storage::CommentClass::Relation,
+                    schema: def.schema,
+                    name: def.name,
+                    subid: u32::from(def.attribute_number(column)),
+                },
+                None,
+            )
+        {
             return sql_fail(error);
         }
     }
-    if let Err(error) = crate::storage::constraint_names::table(&mut new_def) { return sql_fail(error); }
+    if let Err(error) = crate::storage::constraint_names::table(&mut new_def) {
+        return sql_fail(error);
+    }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut new_schema);
     let new_schema = &new_schema[..new_def.n_columns];
@@ -70046,8 +70072,10 @@ pub(crate) fn coerce<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     if !v.is_null() && col.ctype == ColType::PgStatisticArray {
-        return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-            "storing non-null pg_statistic[] values is not supported"));
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing non-null pg_statistic[] values is not supported"
+        ));
     }
     let mut v = v;
     if !v.is_null() {

@@ -150,11 +150,14 @@ impl Arena {
         equivalent: impl FnOnce(&T, &T) -> bool,
     ) -> Result<&T, ArenaFull> {
         if let Some(previous) = self.interned.get()
-            && previous.value_type == core::any::TypeId::of::<T>() {
+            && previous.value_type == core::any::TypeId::of::<T>()
+        {
             // Only this method installs entries, after initializing a T.
             // Rewind clears any entry whose allocation it invalidates.
             let previous_value = unsafe { &*previous.value.cast::<T>() };
-            if equivalent(previous_value, &value) { return Ok(previous_value); }
+            if equivalent(previous_value, &value) {
+                return Ok(previous_value);
+            }
         }
         let allocated = self.alloc(value)?;
         self.interned.set(Some(InternedAllocation {
@@ -367,7 +370,11 @@ impl Arena {
             mark.offset <= self.offset.get(),
             "arena mark is ahead of the frontier"
         );
-        if self.interned.get().is_some_and(|cached| cached.end > mark.offset) {
+        if self
+            .interned
+            .get()
+            .is_some_and(|cached| cached.end > mark.offset)
+        {
             self.interned.set(None);
         }
         self.offset.set(mark.offset);
@@ -905,16 +912,24 @@ mod tests {
             assert!(core::ptr::eq(first, same));
             assert_eq!(arena.used(), used);
             assert!(arena.alloc_interned([0u8; 512], PartialEq::eq).is_err());
-            assert!(core::ptr::eq(first, arena.alloc_interned(7u64, PartialEq::eq).unwrap()));
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+            ));
             let different = arena.alloc_interned(9u64, PartialEq::eq).unwrap();
             assert!(!core::ptr::eq(first, different));
-            let typed = arena.alloc_interned((1u32, 2u32), |_, _| panic!("different types cannot share a cache entry")).unwrap();
+            let typed = arena
+                .alloc_interned((1u32, 2u32), |_, _| {
+                    panic!("different types cannot share a cache entry")
+                })
+                .unwrap();
             assert_eq!(*typed, (1, 2));
         });
     }
 
     #[test]
-    fn catalog_snapshot_schema_cache_invalidates_discarded_values_without_reusing_other_allocations() {
+    fn catalog_snapshot_schema_cache_invalidates_discarded_values_without_reusing_other_allocations()
+     {
         let mut budget = Budget::new(256);
         let mut arena = Arena::new(&mut budget, "schema rewind", 256).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -929,7 +944,10 @@ mod tests {
             arena.alloc(123u32).unwrap();
             // Both retained references point below the rewind frontier.
             unsafe { arena.rewind_to(retained) };
-            assert!(core::ptr::eq(current, arena.alloc_interned(7u64, PartialEq::eq).unwrap()));
+            assert!(core::ptr::eq(
+                current,
+                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+            ));
         });
         arena.reset();
         crate::mem::guard::forbid_alloc(|| {

@@ -247,7 +247,8 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         && image.base == base
         && image.base_type_mod == type_mod
         && image.not_null == not_null
-        && image.not_null_name == pending.map_or(source.not_null_name, |pending| pending.spec.not_null_name)
+        && image.not_null_name
+            == pending.map_or(source.not_null_name, |pending| pending.spec.not_null_name)
         && image.default_expr == default
         && image.checks().len() == checks.len()
         && image.checks().iter().zip(checks).all(|(left, right)| {

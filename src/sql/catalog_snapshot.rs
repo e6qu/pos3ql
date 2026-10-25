@@ -636,8 +636,13 @@ mod key_definitions {
                 )?;
                 let indexed = KeyedRows::from_catalog(&catalog, relation.key, &arena)?;
                 for row in indexed.iter() {
-                    super::super::catalog::validate_restored_row(relation,
-                        crate::storage::HistoricalCatalogRow { key: row.key, before: row.image })?;
+                    super::super::catalog::validate_restored_row(
+                        relation,
+                        crate::storage::HistoricalCatalogRow {
+                            key: row.key,
+                            before: row.image,
+                        },
+                    )?;
                 }
                 Ok::<_, SqlError>((
                     indexed

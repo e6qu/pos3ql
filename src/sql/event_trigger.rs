@@ -992,12 +992,16 @@ fn comment_reference(
                 let column_name = match relation {
                     ObjectRef::Table(table) => {
                         let table = storage.table_def(table, txid);
-                        u16::try_from(subid).ok().and_then(|number| table.attribute_column(number))
+                        u16::try_from(subid)
+                            .ok()
+                            .and_then(|number| table.attribute_column(number))
                             .map(|column| table.columns()[column].name)
                     }
                     ObjectRef::MaterializedView(view_slot) => {
                         let table = storage.table_def(storage.matview_table(view_slot), txid);
-                        u16::try_from(subid).ok().and_then(|number| table.attribute_column(number))
+                        u16::try_from(subid)
+                            .ok()
+                            .and_then(|number| table.attribute_column(number))
                             .map(|column| table.columns()[column].name)
                     }
                     ObjectRef::View(_) => match statement {
@@ -2416,10 +2420,7 @@ fn relation_column_ref(
         EventObjectRef::Primary(reference @ ObjectRef::MaterializedView(slot)) => {
             let table = storage.table_def(storage.matview_table(slot), txid);
             let column = table.attribute_column(u16::try_from(attnum).ok()?)?;
-            (
-                reference,
-                table.columns()[column].name,
-            )
+            (reference, table.columns()[column].name)
         }
         EventObjectRef::Primary(reference @ ObjectRef::View(slot)) => (
             reference,
@@ -3287,7 +3288,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::not_null_constraint_oid(slot, usize::from(old.attribute_number(column_index) - 1)),
+                            catalog::not_null_constraint_oid(
+                                slot,
+                                usize::from(old.attribute_number(column_index) - 1),
+                            ),
                             name.as_str(),
                         ),
                         true,
@@ -3419,7 +3423,10 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        catalog::not_null_constraint_oid(slot, usize::from(old.attribute_number(column_index) - 1)),
+                                        catalog::not_null_constraint_oid(
+                                            slot,
+                                            usize::from(old.attribute_number(column_index) - 1),
+                                        ),
                                         *name,
                                     ),
                                     true,
@@ -3480,7 +3487,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::not_null_constraint_oid(slot, usize::from(old.attribute_number(column_index) - 1)),
+                    catalog::not_null_constraint_oid(
+                        slot,
+                        usize::from(old.attribute_number(column_index) - 1),
+                    ),
                     name.as_str(),
                 ),
                 false,
@@ -3687,7 +3697,10 @@ fn push_table_drop_dependents(
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: catalog::not_null_constraint_oid(slot, usize::from(table.attribute_number(index) - 1)),
+                    oid: catalog::not_null_constraint_oid(
+                        slot,
+                        usize::from(table.attribute_number(index) - 1),
+                    ),
                     name,
                 },
                 false,

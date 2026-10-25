@@ -2418,13 +2418,35 @@ impl ColType {
     pub(crate) fn physical_layout(self) -> super::type_layouts::PhysicalLayout {
         use super::type_layouts::{PhysicalLayout, builtin};
         match self {
-            Self::Enum(_) => PhysicalLayout { length: 4, by_value: true, alignment: b'i', storage: b'p' },
-            Self::Composite(_) => PhysicalLayout { length: -1, by_value: false, alignment: b'd', storage: b'x' },
-            Self::Array(element @ (ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. })) => {
-                let alignment = if element.to_coltype().physical_layout().alignment == b'd' { b'd' } else { b'i' };
-                PhysicalLayout { length: -1, by_value: false, alignment, storage: b'x' }
+            Self::Enum(_) => PhysicalLayout {
+                length: 4,
+                by_value: true,
+                alignment: b'i',
+                storage: b'p',
+            },
+            Self::Composite(_) => PhysicalLayout {
+                length: -1,
+                by_value: false,
+                alignment: b'd',
+                storage: b'x',
+            },
+            Self::Array(
+                element @ (ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. }),
+            ) => {
+                let alignment = if element.to_coltype().physical_layout().alignment == b'd' {
+                    b'd'
+                } else {
+                    b'i'
+                };
+                PhysicalLayout {
+                    length: -1,
+                    by_value: false,
+                    alignment,
+                    storage: b'x',
+                }
             }
-            _ => builtin(self.oid()).expect("modeled built-in type has captured PostgreSQL physical properties"),
+            _ => builtin(self.oid())
+                .expect("modeled built-in type has captured PostgreSQL physical properties"),
         }
     }
 

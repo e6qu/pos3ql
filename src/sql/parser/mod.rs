@@ -468,11 +468,20 @@ pub(crate) fn parse_expr_with_column_sources<'a>(
         columns: ArenaList::new(arena),
         projections: ArenaList::new(arena),
     }));
-    let expression = parser.expression(0).map_err(|error| super::parse_error_to_sql(&error))?;
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
     if parser.peeked != Tok::Eof {
-        return Err(crate::sql_err!(sqlstate::SYNTAX_ERROR, "trailing tokens after stored expression"));
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after stored expression"
+        ));
     }
-    let collector = parser.column_sources.as_ref().expect("explicit column source capture").borrow();
+    let collector = parser
+        .column_sources
+        .as_ref()
+        .expect("explicit column source capture")
+        .borrow();
     Ok((expression, collector.columns.as_slice()))
 }
 
@@ -8105,11 +8114,18 @@ impl<'a> Parser<'a> {
             sources
                 .borrow_mut()
                 .columns
-                .push(ColumnSource { name, start, end, qualifier_parts: match e {
-                    Expr::Column { qualifier: Some(_), .. } => 1,
-                    Expr::SchemaColumn { .. } => 2,
-                    _ => 0,
-                } })
+                .push(ColumnSource {
+                    name,
+                    start,
+                    end,
+                    qualifier_parts: match e {
+                        Expr::Column {
+                            qualifier: Some(_), ..
+                        } => 1,
+                        Expr::SchemaColumn { .. } => 2,
+                        _ => 0,
+                    },
+                })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
         }
         self.arena

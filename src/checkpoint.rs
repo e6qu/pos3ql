@@ -3981,25 +3981,47 @@ impl Checkpointer {
                     let number: usize = parse_field(words.next(), "attribute number")?;
                     if number == 0 {
                         let count: u16 = parse_field(words.next(), "attribute count")?;
-                        if def.attributes.count != u16::MAX || usize::from(count) > crate::storage::MAX_RELATION_COLUMNS
-                            || words.next().is_some() {
-                            return Err(CheckpointSetupError::Corrupt("invalid column attribute count"));
+                        if def.attributes.count != u16::MAX
+                            || usize::from(count) > crate::storage::MAX_RELATION_COLUMNS
+                            || words.next().is_some()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute count",
+                            ));
                         }
-                        def.attributes = ColumnAttributes { count, ..ColumnAttributes::EMPTY };
+                        def.attributes = ColumnAttributes {
+                            count,
+                            ..ColumnAttributes::EMPTY
+                        };
                     } else {
-                        if def.attributes.count == u16::MAX || number > usize::from(def.attributes.count)
-                            || def.attributes.slots[number - 1] != AttributeSlot::Empty {
-                            return Err(CheckpointSetupError::Corrupt("invalid column attribute number"));
+                        if def.attributes.count == u16::MAX
+                            || number > usize::from(def.attributes.count)
+                            || def.attributes.slots[number - 1] != AttributeSlot::Empty
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute number",
+                            ));
                         }
-                        let encoded = words.next().ok_or(CheckpointSetupError::Corrupt("missing column attribute"))?;
-                        if encoded.len() != 16 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            || words.next().is_some() {
-                            return Err(CheckpointSetupError::Corrupt("invalid column attribute encoding"));
+                        let encoded = words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("missing column attribute"))?;
+                        if encoded.len() != 16
+                            || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            || words.next().is_some()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid column attribute encoding",
+                            ));
                         }
                         let mut bytes = [0u8; 8];
                         for (position, byte) in bytes.iter_mut().enumerate() {
-                            *byte = u8::from_str_radix(&encoded[position * 2..position * 2 + 2], 16)
-                                .map_err(|_| CheckpointSetupError::Corrupt("invalid column attribute encoding"))?;
+                            *byte =
+                                u8::from_str_radix(&encoded[position * 2..position * 2 + 2], 16)
+                                    .map_err(|_| {
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid column attribute encoding",
+                                        )
+                                    })?;
                         }
                         def.attributes.slots[number - 1] = AttributeSlot::decode(bytes)
                             .ok_or(CheckpointSetupError::Corrupt("invalid column attribute"))?;
@@ -4039,11 +4061,19 @@ impl Checkpointer {
                     let not_null_text = match words.next() {
                         Some("0") => String::new(),
                         Some(value) => decode_hex_name(value)?,
-                        None => return Err(CheckpointSetupError::Corrupt("col NOT NULL name missing")),
+                        None => {
+                            return Err(CheckpointSetupError::Corrupt("col NOT NULL name missing"));
+                        }
                     };
-                    let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
+                    let not_null_name = if not_null_text.is_empty() {
+                        None
+                    } else {
+                        Some(sql_name(&not_null_text)?)
+                    };
                     if (not_null & 3 != 0) != not_null_name.is_some() {
-                        return Err(CheckpointSetupError::Corrupt("invalid column NOT NULL name"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid column NOT NULL name",
+                        ));
                     }
                     let type_mod: i32 = parse_field(words.next(), "col typmod")?;
                     let default_hex = words
@@ -4127,9 +4157,15 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt("column name missing"))?)?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("column name missing"))?,
+                    )?;
                     if name.is_empty() || words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt("invalid column name or trailing fields"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid column name or trailing fields",
+                        ));
                     }
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
@@ -7352,7 +7388,11 @@ impl Checkpointer {
                     let base_code: u8 = parse_field(words.next(), "dom base")?;
                     let base_type_mod: i32 = parse_field(words.next(), "dom typmod")?;
                     let not_null: u8 = parse_field(words.next(), "dom notnull")?;
-                    if not_null > 1 { return Err(CheckpointSetupError::Corrupt("invalid domain NOT NULL flag")); }
+                    if not_null > 1 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid domain NOT NULL flag",
+                        ));
+                    }
                     let n_checks: usize = parse_field(words.next(), "dom nchecks")?;
                     if n_checks > crate::storage::MAX_DOMAIN_CHECKS {
                         return Err(CheckpointSetupError::Corrupt("too many domain checks"));
@@ -7360,13 +7400,21 @@ impl Checkpointer {
                     let schema = hexstr(words.next(), "dom schema missing")?;
                     let name = hexstr(words.next(), "dom name missing")?;
                     let base_domain = hexstr(words.next(), "dom base domain missing")?;
-                    let base_domain_schema = hexstr(words.next(), "dom base domain schema missing")?;
+                    let base_domain_schema =
+                        hexstr(words.next(), "dom base domain schema missing")?;
                     let base_user_type = hexstr(words.next(), "dom base type missing")?;
-                    let base_user_type_schema = hexstr(words.next(), "dom base type schema missing")?;
+                    let base_user_type_schema =
+                        hexstr(words.next(), "dom base type schema missing")?;
                     let not_null_text = hexstr(words.next(), "dom NOT NULL name missing")?;
-                    let not_null_name = if not_null_text.is_empty() { None } else { Some(sql_name(&not_null_text)?) };
+                    let not_null_name = if not_null_text.is_empty() {
+                        None
+                    } else {
+                        Some(sql_name(&not_null_text)?)
+                    };
                     if (not_null != 0) != not_null_name.is_some() {
-                        return Err(CheckpointSetupError::Corrupt("invalid domain NOT NULL name"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid domain NOT NULL name",
+                        ));
                     }
                     let default_text = hexstr(words.next(), "dom default missing")?;
                     let base = crate::sql::types::ColType::from_code(base_code)
@@ -7377,8 +7425,8 @@ impl Checkpointer {
                         let cname = hexstr(words.next(), "dom check name missing")?;
                         let cexpr = hexstr(words.next(), "dom check expr missing")?;
                         let code: u8 = parse_field(words.next(), "dom check validation")?;
-                        let validation = crate::storage::ConstraintValidation::from_code(code).ok_or(
-                            CheckpointSetupError::Corrupt("bad domain check validation"))?;
+                        let validation = crate::storage::ConstraintValidation::from_code(code)
+                            .ok_or(CheckpointSetupError::Corrupt("bad domain check validation"))?;
                         *check = crate::storage::CheckConstraint {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
@@ -7421,7 +7469,9 @@ impl Checkpointer {
                                 ));
                             }
                         };
-                    if words.next().is_some() { return Err(CheckpointSetupError::Corrupt("unexpected domain fields")); }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("unexpected domain fields"));
+                    }
                     let spec = crate::storage::DomainSpec {
                         base_domain,
                         base_user_type,
@@ -9749,7 +9799,10 @@ impl Checkpointer {
                     .unwrap_or(""),
             );
             let _ = write!(line, " ");
-            hex(&mut line, d.not_null_name.as_ref().map_or("", |name| name.as_str()));
+            hex(
+                &mut line,
+                d.not_null_name.as_ref().map_or("", |name| name.as_str()),
+            );
             let _ = write!(line, " ");
             hex(
                 &mut line,
@@ -9980,14 +10033,29 @@ impl Checkpointer {
                 format_args!("persist {}", definition.persistence.code() as char),
             )?;
             if !definition.attributes.validate(definition.n_columns) {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "invalid column attribute layout"));
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "invalid column attribute layout"
+                ));
             }
-            write_manifest(&mut self.manifest_output, format_args!("attributes2 0 {}", definition.attributes.count))?;
-            for (number, attribute) in definition.attributes.slots[..usize::from(definition.attributes.count)].iter().enumerate() {
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!("attributes2 0 {}", definition.attributes.count),
+            )?;
+            for (number, attribute) in definition.attributes.slots
+                [..usize::from(definition.attributes.count)]
+                .iter()
+                .enumerate()
+            {
                 use core::fmt::Write;
                 let mut encoded = StackStr::<16>::new();
-                for byte in attribute.encode() { write!(encoded, "{byte:02x}").expect("fixed attribute encoding fits"); }
-                write_manifest(&mut self.manifest_output, format_args!("attributes2 {} {}", number + 1, encoded.as_str()))?;
+                for byte in attribute.encode() {
+                    write!(encoded, "{byte:02x}").expect("fixed attribute encoding fits");
+                }
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("attributes2 {} {}", number + 1, encoded.as_str()),
+                )?;
             }
             if definition.schema.as_str() != "public" {
                 use core::fmt::Write;
@@ -10061,10 +10129,16 @@ impl Checkpointer {
                 }
                 let mut not_null_name_hex = StackStr::<128>::new();
                 if let Some(name) = c.not_null_name {
-                    for byte in name.as_str().as_bytes() { let _ = write!(not_null_name_hex, "{byte:02x}"); }
-                } else { let _ = write!(not_null_name_hex, "0"); }
+                    for byte in name.as_str().as_bytes() {
+                        let _ = write!(not_null_name_hex, "{byte:02x}");
+                    }
+                } else {
+                    let _ = write!(not_null_name_hex, "0");
+                }
                 let mut column_name_hex = StackStr::<128>::new();
-                for byte in c.name.as_str().as_bytes() { let _ = write!(column_name_hex, "{byte:02x}"); }
+                for byte in c.name.as_str().as_bytes() {
+                    let _ = write!(column_name_hex, "{byte:02x}");
+                }
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
@@ -17215,45 +17289,44 @@ fn finish_pending(
                 "manifest column count mismatch",
             ));
         }
-        let slot =
-            if storage
-                .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
+        let slot = if storage
+            .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
+        {
+            let slot = storage.large_object_page_table();
+            let expected = &*storage.table(slot).definition();
+            if manifest_index != slot
+                || created_at != 0
+                || definition.schema != expected.schema
+                || definition.name != expected.name
+                || definition.n_columns != expected.n_columns
+                || definition.has_toast != expected.has_toast
+                || definition
+                    .columns()
+                    .iter()
+                    .zip(expected.columns())
+                    .any(|(actual, expected)| actual != expected)
             {
-                let slot = storage.large_object_page_table();
-                let expected = &*storage.table(slot).definition();
-                if manifest_index != slot
-                    || created_at != 0
-                    || definition.schema != expected.schema
-                    || definition.name != expected.name
-                    || definition.n_columns != expected.n_columns
-                    || definition.has_toast != expected.has_toast
-                    || definition.columns().iter().zip(expected.columns()).any(
-                        |(actual, expected)| {
-                            actual != expected
-                        },
-                    )
-                {
-                    return Err(CheckpointSetupError::Corrupt(
-                        "large-object page relation definition mismatch",
-                    ));
-                }
-                slot
-            } else {
-                let position = crate::storage::CatalogPosition::new(manifest_index, created_at)
-                    .map_err(|_| CheckpointSetupError::Corrupt("invalid table source identity"))?;
-                storage
-                    .restore_table(
-                        position,
-                        definition,
-                        crate::storage::TableCreation::Committed,
-                    )
-                    .map_err(|error| {
-                        CheckpointSetupError::ObjectStore(format!(
-                            "manifest table rejected: {}",
-                            error.message.as_str()
-                        ))
-                    })?
-            };
+                return Err(CheckpointSetupError::Corrupt(
+                    "large-object page relation definition mismatch",
+                ));
+            }
+            slot
+        } else {
+            let position = crate::storage::CatalogPosition::new(manifest_index, created_at)
+                .map_err(|_| CheckpointSetupError::Corrupt("invalid table source identity"))?;
+            storage
+                .restore_table(
+                    position,
+                    definition,
+                    crate::storage::TableCreation::Committed,
+                )
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "manifest table rejected: {}",
+                        error.message.as_str()
+                    ))
+                })?
+        };
         if slot_of
             .get(manifest_index)
             .is_some_and(|entry| entry.is_some())

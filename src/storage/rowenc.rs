@@ -428,7 +428,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Geometry(_)
         | ColType::PgSnapshot
         | ColType::TxidSnapshot
-        | ColType::Bytea | ColType::PgNodeTree => {
+        | ColType::Bytea
+        | ColType::PgNodeTree => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }

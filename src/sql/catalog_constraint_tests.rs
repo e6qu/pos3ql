@@ -3,24 +3,48 @@ use super::*;
 #[test]
 fn catalog_constraint_attributes_use_postgresql_physical_type_properties() {
     let (mut engine, mut budget) = test_engine();
-    run_with(&mut engine, &mut budget,
+    run_with(
+        &mut engine,
+        &mut budget,
         "CREATE DOMAIN layout_domain AS bigint;
          CREATE TYPE layout_enum AS ENUM ('a');
          CREATE TYPE layout_record AS (a bigint);
          CREATE TABLE layout_columns (
            a boolean, b smallint, c bigint, d text, e bigint[], f smallint[],
            g layout_domain, h layout_domain[], i layout_enum,
-           j layout_enum[], k layout_record, l layout_record[], m inet, n cidr, o point)");
-    let result = run_with(&mut engine, &mut budget,
+           j layout_enum[], k layout_record, l layout_record[], m inet, n cidr, o point)",
+    );
+    let result = run_with(
+        &mut engine,
+        &mut budget,
         "SELECT attname,attlen,attbyval,attalign,attstorage FROM pg_attribute
-           WHERE attrelid='layout_columns'::regclass AND attnum>0 ORDER BY attnum");
-    assert!(!message_types(&result).contains(&b'E'), "{}", String::from_utf8_lossy(&result));
-    assert_eq!(data_rows(&result), [
-        "a|1|t|c|p", "b|2|t|s|p", "c|8|t|d|p", "d|-1|f|i|x",
-        "e|-1|f|d|x", "f|-1|f|i|x", "g|8|t|d|p", "h|-1|f|d|x",
-        "i|4|t|i|p", "j|-1|f|i|x", "k|-1|f|d|x", "l|-1|f|d|x",
-        "m|-1|f|i|m", "n|-1|f|i|m", "o|16|f|d|p",
-    ]);
+           WHERE attrelid='layout_columns'::regclass AND attnum>0 ORDER BY attnum",
+    );
+    assert!(
+        !message_types(&result).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&result)
+    );
+    assert_eq!(
+        data_rows(&result),
+        [
+            "a|1|t|c|p",
+            "b|2|t|s|p",
+            "c|8|t|d|p",
+            "d|-1|f|i|x",
+            "e|-1|f|d|x",
+            "f|-1|f|i|x",
+            "g|8|t|d|p",
+            "h|-1|f|d|x",
+            "i|4|t|i|p",
+            "j|-1|f|i|x",
+            "k|-1|f|d|x",
+            "l|-1|f|d|x",
+            "m|-1|f|i|m",
+            "n|-1|f|i|m",
+            "o|16|f|d|p",
+        ]
+    );
 }
 
 const SETUP: &str = "
@@ -56,23 +80,58 @@ NULL',0)",
         "SELECT 'a > 0'::pg_node_tree",
         "SELECT expression::text::pg_node_tree FROM saved_nodes",
     ] {
-        assert_eq!(error_sqlstates(&session.execute(&mut engine, command, true)), ["0A000"], "{command}");
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, command, true)),
+            ["0A000"],
+            "{command}"
+        );
     }
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "ALTER TABLE node_source RENAME COLUMN a TO amount;
-         SELECT pg_get_expr(expression,relation,false) FROM saved_nodes", true)), ["(amount > 0)"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER TABLE node_source RENAME COLUMN a TO amount;
+         SELECT pg_get_expr(expression,relation,false) FROM saved_nodes",
+            true
+        )),
+        ["(amount > 0)"]
+    );
     let arena = Arena::new(&mut budget, "node parameter input", 1 << 20).unwrap();
-    for bytes in [b"not a node".as_slice(), crate::sql::catalog_node::CatalogNode::NULL.as_str().as_bytes()] {
+    for bytes in [
+        b"not a node".as_slice(),
+        crate::sql::catalog_node::CatalogNode::NULL
+            .as_str()
+            .as_bytes(),
+    ] {
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(engine.decode_binary_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
-                .unwrap_err().sqlstate, "0A000");
-            assert_eq!(engine.decode_text_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
-                .unwrap_err().sqlstate, "0A000");
+            assert_eq!(
+                engine
+                    .decode_binary_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+            assert_eq!(
+                engine
+                    .decode_text_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
         });
     }
-    session.success(&mut engine, "CREATE FUNCTION node_query() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END", true);
-    assert_eq!(error_sqlstates(&session.execute(&mut engine,
-        "SELECT pg_get_expr(prosqlbody,0) FROM pg_proc WHERE proname='node_query'", true)), ["22023"]);
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION node_query() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT 1; END",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT pg_get_expr(prosqlbody,0) FROM pg_proc WHERE proname='node_query'",
+            true
+        )),
+        ["22023"]
+    );
 }
 
 #[test]
@@ -82,30 +141,69 @@ fn catalog_constraint_internal_statistics_types_reject_client_values() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine,
+    session.success(
+        &mut engine,
         "CREATE TABLE opaque_statistics(a pg_ndistinct,b pg_dependencies,c pg_mcv_list);
-         INSERT INTO opaque_statistics VALUES(NULL,NULL,NULL)", true);
-    for (name, oid) in [("pg_ndistinct", crate::sql::types::oid::PG_NDISTINCT),
+         INSERT INTO opaque_statistics VALUES(NULL,NULL,NULL)",
+        true,
+    );
+    for (name, oid) in [
+        ("pg_ndistinct", crate::sql::types::oid::PG_NDISTINCT),
         ("pg_dependencies", crate::sql::types::oid::PG_DEPENDENCIES),
-        ("pg_mcv_list", crate::sql::types::oid::PG_MCV_LIST)] {
-        assert_eq!(error_sqlstates(&session.execute(&mut engine, &format!("SELECT 'invalid'::{name}"), true)), ["0A000"]);
+        ("pg_mcv_list", crate::sql::types::oid::PG_MCV_LIST),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("SELECT 'invalid'::{name}"),
+                true
+            )),
+            ["0A000"]
+        );
         let arena = Arena::new(&mut budget, "statistics input", 1 << 20).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            assert_eq!(engine.decode_text_parameter(oid, b"invalid", &arena, 0).unwrap_err().sqlstate, "0A000");
-            assert_eq!(engine.decode_binary_parameter(oid, b"invalid", &arena, 0).unwrap_err().sqlstate, "0A000");
+            assert_eq!(
+                engine
+                    .decode_text_parameter(oid, b"invalid", &arena, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+            assert_eq!(
+                engine
+                    .decode_binary_parameter(oid, b"invalid", &arena, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
         });
     }
-    assert_eq!(error_sqlstates(&session.execute(&mut engine,
-        "INSERT INTO opaque_statistics(a) VALUES('invalid')", true)), ["0A000"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "INSERT INTO opaque_statistics(a) VALUES('invalid')",
+            true
+        )),
+        ["0A000"]
+    );
     session.success(&mut engine,
         "CREATE TABLE statistics_source(a integer,b integer);
          INSERT INTO statistics_source VALUES(1,1),(1,1),(2,2);
          CREATE STATISTICS generated_statistics(ndistinct,dependencies) ON a,b FROM statistics_source;
          ANALYZE statistics_source", true);
-    assert_eq!(error_sqlstates(&session.execute(&mut engine,
-        "INSERT INTO opaque_statistics(a) SELECT stxdndistinct FROM pg_statistic_ext_data
-          WHERE stxoid=(SELECT oid FROM pg_statistic_ext WHERE stxname='generated_statistics')", true)), ["0A000"]);
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM opaque_statistics", true)), ["1"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "INSERT INTO opaque_statistics(a) SELECT stxdndistinct FROM pg_statistic_ext_data
+          WHERE stxoid=(SELECT oid FROM pg_statistic_ext WHERE stxname='generated_statistics')",
+            true
+        )),
+        ["0A000"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM opaque_statistics", true)),
+        ["1"]
+    );
 }
 
 #[test]
@@ -115,11 +213,20 @@ fn catalog_constraint_default_identifiers_do_not_overlap_on_wide_tables() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    let columns = (0..101).map(|column| format!("c{column} integer DEFAULT 1")).collect::<Vec<_>>().join(",");
+    let columns = (0..101)
+        .map(|column| format!("c{column} integer DEFAULT 1"))
+        .collect::<Vec<_>>()
+        .join(",");
     session.success(&mut engine, &format!("CREATE TABLE wide_defaults({columns}); CREATE TABLE following_defaults(a integer DEFAULT 1)"), true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT count(*),count(DISTINCT oid) FROM pg_attrdef
-          WHERE adrelid IN ('wide_defaults'::regclass,'following_defaults'::regclass)", true)), ["102|102"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*),count(DISTINCT oid) FROM pg_attrdef
+          WHERE adrelid IN ('wide_defaults'::regclass,'following_defaults'::regclass)",
+            true
+        )),
+        ["102|102"]
+    );
 }
 
 #[test]
@@ -131,17 +238,34 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
     let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    writer.success(&mut engine,
+    writer.success(
+        &mut engine,
         "CREATE TABLE ordinal_columns(lost text,kept bigint NOT NULL,
             g bigint GENERATED ALWAYS AS(kept+1) STORED,
             CONSTRAINT ordinal_positive CHECK(kept>0), CONSTRAINT ordinal_key UNIQUE(kept));
          COMMENT ON COLUMN ordinal_columns.kept IS 'retained comment';
          COMMENT ON COLUMN ordinal_columns.lost IS 'removed comment';
-         CREATE ROLE ordinal_reader; GRANT SELECT(kept) ON ordinal_columns TO ordinal_reader", true);
+         CREATE ROLE ordinal_reader; GRANT SELECT(kept) ON ordinal_columns TO ordinal_reader",
+        true,
+    );
     let report = "SELECT pg_get_expr(conbin,conrelid,false) FROM pg_constraint WHERE conname='ordinal_positive'";
-    assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)), ["(kept > 0)"]);
-    writer.success(&mut engine, "ALTER TABLE ordinal_columns DROP COLUMN lost, ADD COLUMN fresh smallint", true);
-    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["(kept > 0)"]);
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"),
+            true
+        )),
+        ["(kept > 0)"]
+    );
+    writer.success(
+        &mut engine,
+        "ALTER TABLE ordinal_columns DROP COLUMN lost, ADD COLUMN fresh smallint",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, report, true)),
+        ["(kept > 0)"]
+    );
     assert_eq!(data_rows(&writer.success(&mut engine,
         "SELECT attname,attnum,atttypid,attlen,attbyval,attalign,attisdropped FROM pg_attribute
            WHERE attrelid='ordinal_columns'::regclass AND attnum>0 ORDER BY attnum;
@@ -149,16 +273,31 @@ fn catalog_constraint_dropped_columns_keep_numbers_and_retained_expression_bindi
          SELECT relnatts FROM pg_class WHERE oid='ordinal_columns'::regclass", true)),
         ["........pg.dropped.1........|1|0|-1|f|i|t", "kept|2|20|8|t|d|f",
          "g|3|20|8|t|d|f", "fresh|4|21|2|t|s|f", "ordinal_key|{2}", "ordinal_positive|{2}", "4"]);
-    assert_eq!(data_rows(&writer.success(&mut engine,
-        "SELECT has_column_privilege('ordinal_reader','ordinal_columns',2::smallint,'SELECT'),
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "SELECT has_column_privilege('ordinal_reader','ordinal_columns',2::smallint,'SELECT'),
                 has_column_privilege('ordinal_reader','ordinal_columns',3::smallint,'SELECT'),
                 col_description('ordinal_columns'::regclass,2);
          SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass;
-         SELECT (pg_identify_object('pg_class'::regclass,'ordinal_columns'::regclass,2)).identity", true)),
-        ["t|f|retained comment", "2|retained comment", "public.ordinal_columns.kept"]);
-    assert_eq!(data_rows(&writer.success(&mut engine,
-        "COMMENT ON COLUMN ordinal_columns.kept IS 'updated comment';
-         SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass", true)), ["2|updated comment"]);
+         SELECT (pg_identify_object('pg_class'::regclass,'ordinal_columns'::regclass,2)).identity",
+            true
+        )),
+        [
+            "t|f|retained comment",
+            "2|retained comment",
+            "public.ordinal_columns.kept"
+        ]
+    );
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "COMMENT ON COLUMN ordinal_columns.kept IS 'updated comment';
+         SELECT objsubid,description FROM pg_description WHERE objoid='ordinal_columns'::regclass",
+            true
+        )),
+        ["2|updated comment"]
+    );
     reader.success(&mut engine, "ROLLBACK", true);
 }
 
@@ -180,8 +319,10 @@ fn catalog_constraint_key_reports_preserve_order_duplicates_and_selected_columns
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         writer.success(&mut engine, SETUP, true);
         writer.success(&mut engine,
             "ALTER TABLE constraint_parent ADD CONSTRAINT parent_positive CHECK(b>0);
@@ -197,13 +338,38 @@ fn catalog_constraint_key_reports_preserve_order_duplicates_and_selected_columns
             SELECT constraint_name,unique_constraint_name FROM information_schema.referential_constraints
               WHERE constraint_name='constraint_child_parent' ORDER BY constraint_name;
         ";
-        let old = data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true));
-        assert_eq!(old, ["another_child|x|1|2", "another_child|y|2|1", "constraint_child|x|1|2", "constraint_child|y|2|1",
-            "constraint_parent|a|2", "constraint_parent|b|2", "constraint_parent|b",
-            "constraint_child_parent|constraint_parent_key", "constraint_child_parent|constraint_parent_key"]);
-        writer.success(&mut engine, "ALTER TABLE constraint_parent RENAME COLUMN b TO new_b", true);
-        let expected = old.iter().map(|row| row.replacen("constraint_parent|b", "constraint_parent|new_b", 1)).collect::<Vec<_>>();
-        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), if retained { old } else { expected });
+        let old = data_rows(&reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"),
+            true,
+        ));
+        assert_eq!(
+            old,
+            [
+                "another_child|x|1|2",
+                "another_child|y|2|1",
+                "constraint_child|x|1|2",
+                "constraint_child|y|2|1",
+                "constraint_parent|a|2",
+                "constraint_parent|b|2",
+                "constraint_parent|b",
+                "constraint_child_parent|constraint_parent_key",
+                "constraint_child_parent|constraint_parent_key"
+            ]
+        );
+        writer.success(
+            &mut engine,
+            "ALTER TABLE constraint_parent RENAME COLUMN b TO new_b",
+            true,
+        );
+        let expected = old
+            .iter()
+            .map(|row| row.replacen("constraint_parent|b", "constraint_parent|new_b", 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, report, true)),
+            if retained { old } else { expected }
+        );
         reader.success(&mut engine, "ROLLBACK", true);
     }
 }
@@ -215,31 +381,62 @@ fn catalog_constraint_index_columns_are_strict_and_cover_expressions_and_include
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE TABLE expression_columns(x integer,y integer);
-        CREATE INDEX expression_columns_index ON expression_columns((x+1)) INCLUDE(y)", true);
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT
+    session.success(
+        &mut engine,
+        "CREATE TABLE expression_columns(x integer,y integer);
+        CREATE INDEX expression_columns_index ON expression_columns((x+1)) INCLUDE(y)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT
         pg_get_indexdef('expression_columns_index'::regclass,1,false),
         pg_get_indexdef('expression_columns_index'::regclass,2,false),
         pg_get_indexdef('expression_columns_index'::regclass,3,false),
         pg_get_indexdef('expression_columns_index'::regclass,-1,false),
         pg_get_indexdef('expression_columns_index'::regclass,'-2147483648'::integer,false),
         pg_get_indexdef('expression_columns_index'::regclass,NULL::integer,false),
-        pg_get_indexdef('expression_columns_index'::regclass,1,NULL::boolean)", true)),
-        ["((x + 1))|y||||NULL|NULL"]);
-    assert_eq!(error_sqlstates(&session.execute(&mut engine,
-        "SELECT pg_get_indexdef('expression_columns_index'::regclass,1)", true)), ["42883"]);
-    assert_eq!(data_rows(&session.success(&mut engine, "SELECT
+        pg_get_indexdef('expression_columns_index'::regclass,1,NULL::boolean)",
+            true
+        )),
+        ["((x + 1))|y||||NULL|NULL"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT pg_get_indexdef('expression_columns_index'::regclass,1)",
+            true
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT
         pg_get_indexdef('expression_columns_index'::regclass,0,true),
-        pg_get_indexdef('expression_columns_index'::regclass,1,true)", true)),
-        ["CREATE INDEX expression_columns_index ON expression_columns USING btree ((x + 1)) INCLUDE (y)|(x + 1)"]);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT pg_get_indexdef(2683,0,true);
+        pg_get_indexdef('expression_columns_index'::regclass,1,true)",
+            true
+        )),
+        [
+            "CREATE INDEX expression_columns_index ON expression_columns USING btree ((x + 1)) INCLUDE (y)|(x + 1)"
+        ]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT pg_get_indexdef(2683,0,true);
          CREATE TABLE public.pg_largeobject(loid oid,pageno integer);
          SET search_path=public,pg_catalog;
          SELECT pg_get_indexdef(2683,0,true),pg_table_is_visible(2613);
-         RESET search_path", true)),
-        ["CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_largeobject USING btree (loid, pageno)",
-         "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)|f"]);
+         RESET search_path",
+            true
+        )),
+        [
+            "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_largeobject USING btree (loid, pageno)",
+            "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)|f"
+        ]
+    );
 }
 
 #[test]
@@ -251,16 +448,40 @@ fn catalog_constraint_check_nodes_use_current_columns_and_strict_arguments() {
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
     let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    writer.success(&mut engine, "CREATE TABLE expression_checks(a integer PRIMARY KEY,b integer,
+    writer.success(
+        &mut engine,
+        "CREATE TABLE expression_checks(a integer PRIMARY KEY,b integer,
         g integer GENERATED ALWAYS AS (b+1) STORED, CONSTRAINT expression_positive CHECK(b>0));
-        CREATE SEQUENCE expression_arguments", true);
+        CREATE SEQUENCE expression_arguments",
+        true,
+    );
     let report = "SELECT constraint_name,check_clause FROM information_schema.check_constraints WHERE constraint_name='expression_positive'";
-    assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"), true)),
-        ["expression_positive|(b > 0)"]);
-    writer.success(&mut engine, "ALTER TABLE expression_checks RENAME b TO renamed_b", true);
-    assert_eq!(data_rows(&reader.success(&mut engine, report, true)), ["expression_positive|(renamed_b > 0)"]);
-    assert_eq!(data_rows(&reader.success(&mut engine, "SELECT generation_expression FROM information_schema.columns
-        WHERE table_name='expression_checks' AND column_name='g'", true)), ["(renamed_b + 1)"]);
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {report}"),
+            true
+        )),
+        ["expression_positive|(b > 0)"]
+    );
+    writer.success(
+        &mut engine,
+        "ALTER TABLE expression_checks RENAME b TO renamed_b",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, report, true)),
+        ["expression_positive|(renamed_b > 0)"]
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT generation_expression FROM information_schema.columns
+        WHERE table_name='expression_checks' AND column_name='g'",
+            true
+        )),
+        ["(renamed_b + 1)"]
+    );
     assert_eq!(data_rows(&reader.success(&mut engine, "SELECT
         pg_get_expr(conbin,NULL::oid),pg_get_expr(conbin,conrelid,NULL::boolean),pg_get_expr(conbin,conrelid,true)
         FROM pg_constraint WHERE conname='expression_positive'", true)), ["NULL|NULL|renamed_b > 0"]);
@@ -270,7 +491,14 @@ fn catalog_constraint_check_nodes_use_current_columns_and_strict_arguments() {
         SELECT pg_get_expr(conbin,nextval('expression_arguments')::oid,false) IS NULL FROM pg_constraint WHERE conname='expression_checks_pkey';
         SELECT last_value,is_called FROM expression_arguments", true)), ["t", "f", "t", "1|t"]);
     assert_eq!(error_sqlstates(&writer.execute(&mut engine, "SELECT pg_get_expr(conbin,0,false) FROM pg_constraint WHERE conname='expression_positive'", true)), ["22023"]);
-    assert_eq!(error_sqlstates(&writer.execute(&mut engine, "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)", true)), ["0A000"]);
+    assert_eq!(
+        error_sqlstates(&writer.execute(
+            &mut engine,
+            "SELECT pg_get_expr('not a node'::pg_node_tree,0,false)",
+            true
+        )),
+        ["0A000"]
+    );
 }
 
 #[test]
@@ -281,21 +509,55 @@ fn catalog_constraint_domains_keep_selected_names_and_current_type_permissions()
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         engine.commit_progress = CommitProgressMode::Reactor;
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
-        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(&mut engine, "CREATE DOMAIN constraint_domain AS integer CONSTRAINT domain_positive CHECK(VALUE>0);
-            CREATE ROLE domain_reader", true);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(
+            &mut engine,
+            "CREATE DOMAIN constraint_domain AS integer CONSTRAINT domain_positive CHECK(VALUE>0);
+            CREATE ROLE domain_reader",
+            true,
+        );
         reader.success(&mut engine, "SET ROLE domain_reader", true);
         let report = "SELECT domain_name,constraint_name FROM information_schema.domain_constraints WHERE constraint_name='domain_positive'";
-        assert_eq!(data_rows(&reader.success(&mut engine, &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"), true)),
-            ["constraint_domain|domain_positive"]);
-        writer.success(&mut engine, "ALTER DOMAIN constraint_domain RENAME TO renamed_constraint_domain", true);
-        let expected = if retained { "constraint_domain|domain_positive" } else { "renamed_constraint_domain|domain_positive" };
-        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [expected]);
-        writer.success(&mut engine, "REVOKE USAGE ON DOMAIN renamed_constraint_domain FROM PUBLIC", true);
+        assert_eq!(
+            data_rows(&reader.success(
+                &mut engine,
+                &format!("BEGIN ISOLATION LEVEL {isolation}; {report}"),
+                true
+            )),
+            ["constraint_domain|domain_positive"]
+        );
+        writer.success(
+            &mut engine,
+            "ALTER DOMAIN constraint_domain RENAME TO renamed_constraint_domain",
+            true,
+        );
+        let expected = if retained {
+            "constraint_domain|domain_positive"
+        } else {
+            "renamed_constraint_domain|domain_positive"
+        };
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, report, true)),
+            [expected]
+        );
+        writer.success(
+            &mut engine,
+            "REVOKE USAGE ON DOMAIN renamed_constraint_domain FROM PUBLIC",
+            true,
+        );
         assert!(data_rows(&reader.success(&mut engine, report, true)).is_empty());
-        writer.success(&mut engine, "GRANT USAGE ON DOMAIN renamed_constraint_domain TO domain_reader", true);
-        assert_eq!(data_rows(&reader.success(&mut engine, report, true)), [expected]);
+        writer.success(
+            &mut engine,
+            "GRANT USAGE ON DOMAIN renamed_constraint_domain TO domain_reader",
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, report, true)),
+            [expected]
+        );
         assert_eq!(data_rows(&reader.success(&mut engine,
             "SELECT has_type_privilege('integer','USAGE'),has_type_privilege(23::oid,'USAGE'),
                 has_type_privilege(23::oid,'USAGE WITH GRANT OPTION'),has_type_privilege(2147483647::oid,'USAGE');
@@ -561,7 +823,10 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             let mut cold = Engine::new(&config, &mut cold_budget)
                 .unwrap_or_else(|error| panic!("{name}: {error:?}"));
             for slot in 0..cold.storage.table_count() {
-                assert!(!cold.storage.statistics_wal_dirty(slot), "{name}: table {slot}");
+                assert!(
+                    !cold.storage.statistics_wal_dirty(slot),
+                    "{name}: table {slot}"
+                );
             }
             let recovered_journal = cold.journal_lsn();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
@@ -599,7 +864,14 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
             let mut comments = data_rows(&session.success(&mut cold,
                 &format!("SELECT objsubid,description FROM pg_description WHERE objoid='{table}'::regclass"), true));
             comments.sort();
-            assert_eq!(comments, if commit { vec!["2|retained comment"] } else { vec!["1|removed comment", "2|retained comment"] });
+            assert_eq!(
+                comments,
+                if commit {
+                    vec!["2|retained comment"]
+                } else {
+                    vec!["1|removed comment", "2|retained comment"]
+                }
+            );
             assert_eq!(data_rows(&session.success(&mut cold,
                 "SELECT pg_typeof(expression),pg_get_expr(expression,relation,false) FROM saved_nodes", true)),
                 ["pg_node_tree|(a > 0)"]);
@@ -612,7 +884,11 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                  SELECT check_clause FROM information_schema.check_constraints WHERE constraint_name='saved_nulls_a_not_null'", true)),
                 [if commit { "saved_renamed_domain|saved_domain_not_null" } else { "saved_domain|saved_domain_not_null" }, "a IS NOT NULL"]);
             if !commit {
-                session.success(&mut cold, "INSERT INTO saved_nulls(a,b) VALUES(1,NULL)", false);
+                session.success(
+                    &mut cold,
+                    "INSERT INTO saved_nulls(a,b) VALUES(1,NULL)",
+                    false,
+                );
             }
             assert_eq!(
                 error_sqlstates(&session.execute(

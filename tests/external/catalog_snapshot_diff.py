@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
 
 # Declared fields verified against the PostgreSQL reference metadata.
@@ -196,7 +197,7 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         writer.execute("DROP ROLE IF EXISTS report_reader_diff")
 
 
-def transcript(reader, writer):
+def transcript(reader, writer, host, port, user, report_database):
     observed = []
 
     def record(connection, label, sql, parameters=()):
@@ -985,6 +986,14 @@ def transcript(reader, writer):
             writer.execute("DROP OWNED BY catalog_parameter_writer_diff")
             writer.execute("DROP ROLE catalog_parameter_reader_diff")
             writer.execute("DROP ROLE catalog_parameter_writer_diff")
+    writer.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(report_database)))
+    try:
+        with connect(host, port, user, report_database) as other_reader, connect(host, port, user, report_database) as other_writer:
+            for isolation in ("READ COMMITTED", "REPEATABLE READ"):
+                prefix = "other_database." + isolation.lower().replace(" ", "_")
+                constraint_reports(other_reader, other_writer, isolation, prefix, record, record_outcome)
+    finally:
+        writer.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(report_database)))
     return observed
 
 
@@ -994,10 +1003,13 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--user", required=True)
     parser.add_argument("--database", required=True)
+    parser.add_argument("--report-database", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--metadata-output", type=Path)
     arguments = parser.parse_args()
+    if arguments.report_database == arguments.database:
+        parser.error("--report-database must name a separate fixture database")
     with connect(arguments.host, arguments.port, arguments.user, arguments.database) as reader, connect(arguments.host, arguments.port, arguments.user, arguments.database) as writer:
         if arguments.metadata_output is not None:
             metadata = {
@@ -1055,7 +1067,7 @@ def main():
                 """).fetchall(),
             }
             arguments.metadata_output.write_text(json.dumps(metadata, indent=2) + "\n")
-        observed = transcript(reader, writer)
+        observed = transcript(reader, writer, arguments.host, arguments.port, arguments.user, arguments.report_database)
     # JSON normalizes driver tuples before comparing two independent servers.
     serialized = json.dumps(observed, indent=2) + "\n"
     arguments.output.write_text(serialized)

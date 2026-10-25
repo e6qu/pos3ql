@@ -177,13 +177,20 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::PgNodeTree => match v {
             Datum::PgNodeTree(_) => v,
-            _ => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot accept a value of type pg_node_tree")),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot accept a value of type pg_node_tree"
+                ));
+            }
         },
-        ColType::PgNdistinct
-        | ColType::PgDependencies
-        | ColType::PgMcvList => return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot accept a value of type {}", target.name())),
+        ColType::PgNdistinct | ColType::PgDependencies | ColType::PgMcvList => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot accept a value of type {}",
+                target.name()
+            ));
+        }
         ColType::PgStatisticArray => match v {
             Datum::Text(_) => v,
             _ => return Err(cast_unsupported(&v, target.name())),

@@ -3932,7 +3932,7 @@ fn execution_identity_is_thread_private() {
 }
 
 #[test]
-fn failed_database_selection_restores_workspace_context() {
+fn schema_rename_database_selection_accepts_missing_public_and_rejects_unknown_databases() {
     let config = test_config("failed-database-selection");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -3949,16 +3949,22 @@ fn failed_database_selection_restores_workspace_context() {
         .select_database(crate::storage::DatabaseOid::POSTGRES)
         .unwrap();
 
-    let error = engine.select_database(template).unwrap_err();
-    assert_eq!(error.sqlstate, eval::sqlstate::INVALID_SCHEMA_NAME);
+    engine.select_database(template).unwrap();
+    assert_eq!(engine.storage.current_database_oid(), template);
+    assert_eq!(engine.work.database_oid(), template);
     assert_eq!(
-        engine.storage.current_database_oid(),
-        crate::storage::DatabaseOid::POSTGRES
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT to_regnamespace('public') IS NULL; SELECT current_schema() IS NULL"
+        )),
+        ["t", "t"]
     );
-    assert_eq!(
-        engine.work.database_oid(),
-        crate::storage::DatabaseOid::POSTGRES
-    );
+    let unknown = crate::storage::DatabaseOid::parse(i32::MAX).unwrap();
+    let error = engine.select_database(unknown).unwrap_err();
+    assert_eq!(error.sqlstate, eval::sqlstate::INVALID_CATALOG_NAME);
+    assert_eq!(engine.storage.current_database_oid(), template);
+    assert_eq!(engine.work.database_oid(), template);
 }
 
 #[test]
@@ -24858,7 +24864,9 @@ fn relation_oid_names_need_only_the_rendered_name_arena() {
     ] {
         let mark = arena.mark();
         crate::mem::guard::forbid_alloc(|| {
-            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name).unwrap();
+            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name)
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
                 Some(name)
@@ -31276,6 +31284,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                 column: 0,
                 last: 81,
             },
+            &engine.work,
         )
         .unwrap();
         for column in [1, u16::MAX] {
@@ -31289,6 +31298,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                         column,
                         last: 99
                     },
+                    &engine.work,
                 )
                 .unwrap_err()
                 .sqlstate,
@@ -31305,6 +31315,7 @@ fn table_serial_state_wal_recovery_rejects_unknown_positions() {
                     column: 0,
                     last: 99
                 },
+                &engine.work,
             )
             .unwrap_err()
             .sqlstate,
@@ -68219,7 +68230,11 @@ fn psql_catalog_listing_contracts() {
              WHERE table_name = 'catalog_table_privileges' AND grantee <> 'postgres'
              ORDER BY grantee, privilege_type",
         )),
-        ["catalog_table_reader|SELECT", "catalog_table_reader|UPDATE"]
+        [
+            "PUBLIC|INSERT",
+            "catalog_table_reader|SELECT",
+            "catalog_table_reader|UPDATE"
+        ]
     );
     run_with(
         &mut engine,
@@ -81149,7 +81164,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v26\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v27\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -81364,7 +81379,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v26\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v27\n"))
     );
     drop(recovered);
 

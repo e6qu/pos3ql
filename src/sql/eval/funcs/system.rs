@@ -148,63 +148,6 @@ fn advisory_key<'a>(
     }
 }
 
-/// PostgreSQL's closed one-byte object-class protocol for `acldefault`.
-#[derive(Clone, Copy)]
-enum AclDefaultObject {
-    Column,
-    Database,
-    ForeignDataWrapper,
-    ForeignServer,
-    Function,
-    Language,
-    LargeObject,
-    Parameter,
-    Relation,
-    Schema,
-    Sequence,
-    Tablespace,
-    Type,
-}
-
-impl AclDefaultObject {
-    fn parse(value: &str) -> Option<Self> {
-        Some(match value.as_bytes() {
-            b"c" => Self::Column,
-            b"d" => Self::Database,
-            b"F" => Self::ForeignDataWrapper,
-            b"S" => Self::ForeignServer,
-            b"f" => Self::Function,
-            b"l" => Self::Language,
-            b"L" => Self::LargeObject,
-            b"p" => Self::Parameter,
-            b"r" => Self::Relation,
-            b"n" => Self::Schema,
-            b"s" => Self::Sequence,
-            b"t" => Self::Tablespace,
-            b"T" => Self::Type,
-            _ => return None,
-        })
-    }
-
-    /// Owner privileges followed by PUBLIC privileges. PostgreSQL orders the
-    /// PUBLIC aclitem first when both exist.
-    fn privileges(self) -> (Option<&'static str>, Option<&'static str>) {
-        match self {
-            Self::Column => (None, None),
-            Self::Database => (Some("CTc"), Some("Tc")),
-            Self::ForeignDataWrapper | Self::ForeignServer => (Some("U"), None),
-            Self::Function => (Some("X"), Some("X")),
-            Self::Language | Self::Type => (Some("U"), Some("U")),
-            Self::LargeObject => (Some("rw"), None),
-            Self::Parameter => (Some("sA"), None),
-            Self::Relation => (Some("arwdDxtm"), None),
-            Self::Schema => (Some("UC"), None),
-            Self::Sequence => (Some("rwU"), None),
-            Self::Tablespace => (Some("C"), None),
-        }
-    }
-}
-
 fn privilege_role_name<'a>(
     value: Datum<'a>,
     catalog: &dyn super::super::CatalogAccess,
@@ -1505,37 +1448,15 @@ pub(crate) fn dispatch<'a>(
                 let Some(catalog) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let Some(owner) = catalog.role_name(owner_oid, arena)? else {
-                    return Ok(Datum::Null);
-                };
-                let object = AclDefaultObject::parse(object_type).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "unrecognized object type abbreviation: {}",
-                        object_type
-                    )
-                })?;
-                let owner = crate::sql::types::acl_identifier(owner);
-                let (owner_privileges, public_privileges) = object.privileges();
-                let mut values = [Datum::Null; 2];
-                let mut count = 0;
-                if let Some(privileges) = public_privileges {
-                    let acl = stack_format!(256, "={}/{}", privileges, owner.as_str());
-                    values[count] =
-                        Datum::Text(arena.alloc_str(acl.as_str()).map_err(|_| arena_full())?);
-                    count += 1;
-                }
-                if let Some(privileges) = owner_privileges {
-                    let acl =
-                        stack_format!(256, "{}={}/{}", owner.as_str(), privileges, owner.as_str());
-                    values[count] =
-                        Datum::Text(arena.alloc_str(acl.as_str()).map_err(|_| arena_full())?);
-                    count += 1;
-                }
-                Ok(Datum::Array {
-                    element: crate::sql::types::ArrElem::AclItem,
-                    raw: crate::sql::array::build(&values[..count], arena)?,
-                })
+                let object =
+                    crate::sql::acl::DefaultObject::parse(object_type).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unrecognized object type abbreviation: {}",
+                            object_type
+                        )
+                    })?;
+                crate::sql::acl::default_acl(object, owner_oid as u32, catalog, arena)
             }
             "current_database" | "current_catalog" => {
                 arity(0)?;
@@ -1808,16 +1729,29 @@ pub(crate) fn dispatch<'a>(
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
-                if name == "has_type_privilege" {
+                if matches!(
+                    name,
+                    "has_type_privilege" | "has_schema_privilege" | "has_function_privilege"
+                ) {
                     let target = match object {
-                        Datum::Text(name) => super::super::PrivilegeType::Name(name),
-                        value => super::super::PrivilegeType::Oid(
-                            CatalogOid::parse(value)?.expect("non-null type identity").0,
+                        Datum::Text(name) => super::super::PrivilegeObject::Name(name),
+                        value => super::super::PrivilegeObject::Oid(
+                            CatalogOid::parse(value)?
+                                .expect("non-null object identity")
+                                .0,
                         ),
                     };
-                    return Ok(cat
-                        .has_type_privilege(role, target, privilege)?
-                        .map_or(Datum::Null, Datum::Bool));
+                    let answer = match name {
+                        "has_type_privilege" => cat.has_type_privilege(role, target, privilege)?,
+                        "has_schema_privilege" => {
+                            cat.has_schema_privilege(role, target, privilege)?
+                        }
+                        "has_function_privilege" => {
+                            cat.has_function_privilege(role, target, privilege)?
+                        }
+                        _ => unreachable!("typed object privilege function was classified"),
+                    };
+                    return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
                 let object = if name == "has_parameter_privilege" {
                     match object {
@@ -1836,12 +1770,8 @@ pub(crate) fn dispatch<'a>(
                     }
                 };
                 let answer = match name {
-                    "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
                     "has_language_privilege" => {
                         cat.has_language_privilege(role, object, privilege)?
-                    }
-                    "has_function_privilege" => {
-                        cat.has_function_privilege(role, object, privilege)?
                     }
                     "has_database_privilege" => {
                         cat.has_database_privilege(role, object, privilege)?
@@ -2518,7 +2448,8 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 let value = eval_full(args[0], arena, params, row, hooks)?;
                 let written = match value {
-                    Datum::Text(written) | Datum::Bpchar(written) => written.trim_end_matches(' '),
+                    Datum::Text(written) => written,
+                    Datum::Bpchar(written) => written.trim_end_matches(' '),
                     Datum::Null => return Ok(Datum::Null),
                     other => return Err(type_mismatch(name, &other)),
                 };
@@ -2595,6 +2526,9 @@ pub(crate) fn dispatch<'a>(
                                 | sqlstate::UNDEFINED_TABLE
                                 | sqlstate::INVALID_SCHEMA_NAME
                                 | sqlstate::AMBIGUOUS_FUNCTION
+                                | sqlstate::INVALID_NAME
+                                | sqlstate::INVALID_TEXT_REPRESENTATION
+                                | sqlstate::NUMERIC_OUT_OF_RANGE
                         ) =>
                     {
                         Ok(Datum::Null)

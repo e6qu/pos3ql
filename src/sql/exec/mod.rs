@@ -691,7 +691,9 @@ fn sql_fail(e: SqlError) -> Outcome {
 mod copy_transition;
 mod partition_insert;
 mod partition_update;
+mod schema;
 pub(crate) use copy_transition::CopyTransitionRows;
+pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_composite_fields};
@@ -6194,7 +6196,17 @@ pub fn create_schema(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSchema(name)) {
+            if let Err(e) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::CreateSchema {
+                    identity: storage
+                        .schema_def(slot)
+                        .identity()
+                        .expect("created schema retains its identity"),
+                    name,
+                },
+            ) {
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
@@ -6248,13 +6260,6 @@ pub fn alter_schema(
             responder,
         ),
         crate::sql::ast::AlterSchemaAction::RenameTo(new_name) => {
-            if new_name.starts_with("pg_") {
-                return sql_fail(sql_err!(
-                    sqlstate::RESERVED_NAME,
-                    "unacceptable schema name \"{}\"",
-                    new_name
-                ));
-            }
             let Some(slot) = storage.find_schema_visible(name, txn.txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -6262,6 +6267,15 @@ pub fn alter_schema(
                     name
                 ));
             };
+            if matches!(new_name, "pg_catalog" | "pg_toast" | "information_schema")
+                || storage.find_schema_visible(new_name, txn.txid).is_some()
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_SCHEMA,
+                    "schema \"{}\" already exists",
+                    new_name
+                ));
+            }
             let object = crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,
@@ -6269,11 +6283,30 @@ pub fn alter_schema(
             if let Err(error) = storage.require_owner(object, txn.txid, "schema") {
                 return sql_fail(error);
             }
+            let Some(role) = storage.current_role_slot(txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                ));
+            };
+            if !storage.has_current_database_create_privilege(role, txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for database"
+                ));
+            }
+            if new_name.starts_with("pg_") {
+                return sql_fail(sql_err!(
+                    sqlstate::RESERVED_NAME,
+                    "unacceptable schema name \"{}\"",
+                    new_name
+                ));
+            }
             let new_name = match SqlName::parse(new_name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let prior_name = storage.schema_def(slot).name;
+            let prior_name = storage.schema_def_for(slot, txn.txid).name;
             // Sequence literals in column defaults are textual at the SQL
             // boundary. Rebind them while the old namespace still resolves,
             // then move the whole catalog identity as one WAL operation.
@@ -6301,27 +6334,22 @@ pub fn alter_schema(
                     return sql_fail(error);
                 }
             }
-            let prior = match storage.rename_schema(slot, new_name) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
-            };
+            if let Err(error) = schema::rename(storage, txn, slot, new_name, arena) {
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenameSchema {
-                    name: prior.as_str(),
+                    identity: storage
+                        .schema_def(slot)
+                        .identity()
+                        .expect("renamed schema retains its identity"),
+                    name: prior_name.as_str(),
                     new_name: new_name.as_str(),
                 },
             ) {
-                let _ = storage.rename_schema(slot, prior);
-                return sql_fail(error);
-            }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SchemaRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                let _ = storage.rename_schema(slot, prior);
                 return sql_fail(error);
             }
             responder.command_complete("ALTER SCHEMA")?;
@@ -10028,7 +10056,7 @@ pub(crate) fn drop_owned(
             {
                 continue;
             }
-            let schema = storage.schema_def(slot).name;
+            let schema = storage.schema_def_for(slot, txn.txid).name;
             let owner = storage.role_name(
                 storage.object_owner(
                     AccessObject {
@@ -10405,7 +10433,7 @@ pub(crate) fn drop_owned(
             if !selected || !storage.access_object_visible_to(object, txn.txid) {
                 continue;
             }
-            let schema = storage.schema_def(slot).name;
+            let schema = storage.schema_def_for(slot, txn.txid).name;
             let owner = storage.role_name(storage.object_owner(object, txn.txid), txn.txid);
             let owner = match storage.capture_role(owner.as_str(), txn.txid) {
                 Ok(role) => crate::storage::SessionIdentity::bound(role),
@@ -12083,10 +12111,15 @@ pub(crate) fn drop_schema(
         }
     }
     // Everything the drop sweeps up, across all listed schemas.
+    let schema_transaction = txn.txid;
     let in_listed = |storage: &Storage, schema: &str| {
-        slots[..n_slots]
-            .iter()
-            .any(|&slot| storage.schema_def(slot).name.as_str() == schema)
+        slots[..n_slots].iter().any(|&slot| {
+            storage
+                .schema_def_for(slot, schema_transaction)
+                .name
+                .as_str()
+                == schema
+        })
     };
     let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
     {
@@ -12510,7 +12543,7 @@ pub(crate) fn drop_schema(
                             slot: policy_slot,
                             root_schema: direct_dependency
                                 .map(|dependency| dependency.schema)
-                                .unwrap_or(storage.schema_def(slots[0]).name),
+                                .unwrap_or(storage.schema_def_for(slots[0], txn.txid).name),
                             root_class: direct_dependency.map(|dependency| dependency.class),
                             root_slot: direct_dependency
                                 .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
@@ -12568,7 +12601,7 @@ pub(crate) fn drop_schema(
                         slot: policy_slot,
                         root_schema: direct_dependency
                             .map(|dependency| dependency.schema)
-                            .unwrap_or(storage.schema_def(slots[0]).name),
+                            .unwrap_or(storage.schema_def_for(slots[0], txn.txid).name),
                         root_class: direct_dependency.map(|dependency| dependency.class),
                         root_slot: direct_dependency
                             .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
@@ -12607,7 +12640,7 @@ pub(crate) fn drop_schema(
     let schema_rank = |storage: &Storage, schema: &str| -> usize {
         slots[..n_slots]
             .iter()
-            .position(|&slot| storage.schema_def(slot).name.as_str() == schema)
+            .position(|&slot| storage.schema_def_for(slot, txn.txid).name.as_str() == schema)
             .map(|p| n_slots - p)
             .unwrap_or(0)
     };
@@ -12766,7 +12799,11 @@ pub(crate) fn drop_schema(
     let in_path = |storage: &Storage, schema: &str| {
         storage.path().entries().iter().any(|e| match e {
             crate::storage::PathEntry::Schema(slot) => {
-                storage.schema_def(*slot as usize).name.as_str() == schema
+                storage
+                    .schema_def_for(*slot as usize, txn.txid)
+                    .name
+                    .as_str()
+                    == schema
             }
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
         })
@@ -12808,7 +12845,7 @@ pub(crate) fn drop_schema(
                     &routine.schema_for(txn.txid),
                     &routine.name_for(txn.txid),
                 );
-                let signature = routine_dependency_suffix(storage, &routine)?;
+                let signature = routine_dependency_suffix(storage, txn.txid, &routine)?;
                 let _ = write!(out, "{}", signature.as_str());
             }
             SchemaObject::Collation(slot) => {
@@ -12861,6 +12898,7 @@ pub(crate) fn drop_schema(
                 let _ = out.write_str(definition.name.as_str());
                 let signature = dependency_signature_suffix(
                     storage,
+                    txn.txid,
                     "operator",
                     [definition.signature.left, definition.signature.right],
                 )?;
@@ -13090,7 +13128,7 @@ pub(crate) fn drop_schema(
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop schema {} because other objects depend on it",
-            storage.schema_def(first).name.as_str()
+            storage.schema_def_for(first, txn.txid).name.as_str()
         ));
     }
     let table_locks = match arena.alloc_slice_with(storage.table_count(), |_| None) {
@@ -13773,7 +13811,7 @@ pub(crate) fn drop_schema(
         }
     }
     for &slot in &slots[..n_slots] {
-        let name = storage.schema_def(slot).name;
+        let name = storage.schema_def_for(slot, txn.txid).name;
         if let Err(error) = storage.drop_schema_in(slot, txn.txid) {
             return sql_fail(error);
         }
@@ -13782,7 +13820,17 @@ pub(crate) fn drop_schema(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
+        if let Err(e) = wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::DropSchema {
+                identity: storage
+                    .schema_def(slot)
+                    .identity()
+                    .expect("dropped schema retains its identity"),
+                name: name.as_str(),
+            },
+        ) {
             storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
@@ -28977,7 +29025,7 @@ fn resolve_cast_function_name(
         let schema_name = match entry {
             crate::storage::PathEntry::Catalog => None,
             crate::storage::PathEntry::Schema(slot) => {
-                Some(storage.schema_def(usize::from(*slot)).name)
+                Some(storage.schema_def_for(usize::from(*slot), txid).name)
             }
         };
         let schema = schema_name
@@ -29301,7 +29349,7 @@ fn operator_link_or_shell(
     let schema = match request.name.schema {
         Some(schema) => storage
             .find_schema_visible(schema, txn.txid)
-            .map(|slot| storage.schema_def(slot).name)
+            .map(|slot| storage.schema_def_for(slot, txn.txid).name)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -34431,7 +34479,7 @@ pub(crate) fn prepare_update_extension(
     }
     let (namespace, _relocatable, current) = storage.extension(extension).definition_to(txn.txid);
     if let Some(required_schema) = definition.schema
-        && storage.schema_def(namespace as usize).name != required_schema
+        && storage.schema_def_for(namespace as usize, txn.txid).name != required_schema
     {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -34857,7 +34905,8 @@ pub(crate) fn resolve_routine_identity(
             let crate::storage::PathEntry::Schema(slot) = entry else {
                 continue;
             };
-            if let Some(slot) = find_in(storage.schema_def(*slot as usize).name.as_str())? {
+            if let Some(slot) = find_in(storage.schema_def_for(*slot as usize, txid).name.as_str())?
+            {
                 found = Some(slot);
                 break;
             }
@@ -35942,7 +35991,7 @@ pub fn drop_routine(
                 dependent_matviews,
                 dependent_routines,
             );
-        let dependency_suffix = match routine_dependency_suffix(storage, &routine) {
+        let dependency_suffix = match routine_dependency_suffix(storage, txn.txid, &routine) {
             Ok(suffix) => suffix,
             Err(error) => return sql_fail(error),
         };
@@ -39553,7 +39602,7 @@ pub fn create_table_as(
                 let slot = change.slot();
                 let lsn = storage.bump_lsn();
                 let wal_result = {
-                    let dependencies = storage.matview_dependencies(slot);
+                    let dependencies = storage.matview_dependencies(slot, txn.txid);
                     wal.stage_reserved(
                         txn.txid,
                         lsn,
@@ -39663,7 +39712,7 @@ pub fn refresh_materialized_view(
         return sql_fail(error);
     }
     // Copy the stored query out before mutating storage.
-    let matview = storage.matview(slot);
+    let matview = storage.matview_for(slot, txn.txid);
     let sql = match arena.alloc_str(matview.sql.as_str()) {
         Ok(s) => s,
         Err(_) => {
@@ -39690,7 +39739,7 @@ pub fn refresh_materialized_view(
         crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
         &replay_state,
     );
-    let dependencies = match storage.snapshot_matview_dependencies(slot, arena) {
+    let dependencies = match storage.snapshot_matview_dependencies(slot, txn.txid, arena) {
         Ok(dependencies) => dependencies,
         Err(error) => return sql_fail(error),
     };
@@ -43892,7 +43941,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .snapshot_matview_dependencies(slot, arena)?
+                .snapshot_matview_dependencies(slot, txid, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -44417,10 +44466,12 @@ struct StoredQueryRoot {
 
 fn routine_dependency_suffix(
     storage: &Storage,
+    txid: u32,
     routine: &crate::storage::RoutineDef,
 ) -> Result<crate::util::StackStr<192>, SqlError> {
     dependency_signature_suffix(
         storage,
+        txid,
         "routine",
         routine.arguments().iter().map(|argument| {
             Some(crate::storage::RoutineResult {
@@ -44433,6 +44484,7 @@ fn routine_dependency_suffix(
 
 fn dependency_signature_suffix(
     storage: &Storage,
+    txid: u32,
     kind: &str,
     arguments: impl IntoIterator<Item = Option<crate::storage::RoutineResult>>,
 ) -> Result<crate::util::StackStr<192>, SqlError> {
@@ -44455,7 +44507,7 @@ fn dependency_signature_suffix(
             continue;
         };
         match argument.user_type {
-            Some(identity) if storage.schema_is_on_path(identity.schema) => {
+            Some(identity) if storage.schema_is_on_path(identity.schema, txid) => {
                 suffix.write_str(identity.name.as_str())
             }
             Some(identity) => write!(
@@ -44662,7 +44714,7 @@ fn report_stored_query_dependents(
             }
             let mut depth = 0usize;
             for dependency in storage
-                .snapshot_matview_dependencies(slot, arena)?
+                .snapshot_matview_dependencies(slot, txid, arena)?
                 .entries()
             {
                 let parent_depth = match dependency.class {
@@ -44693,7 +44745,7 @@ fn report_stored_query_dependents(
     let in_path = |schema: &str| {
         storage.path().entries().iter().any(|entry| match entry {
             crate::storage::PathEntry::Schema(slot) => {
-                storage.schema_def(*slot as usize).name.as_str() == schema
+                storage.schema_def_for(*slot as usize, txid).name.as_str() == schema
             }
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
         })
@@ -44725,7 +44777,7 @@ fn report_stored_query_dependents(
             };
             let _ = write!(out, "{} ", noun);
             write_name(out, &routine.schema_for(txid), &routine.name_for(txid));
-            let suffix = routine_dependency_suffix(storage, &routine)?;
+            let suffix = routine_dependency_suffix(storage, txid, &routine)?;
             let _ = write!(out, "{}", suffix.as_str());
             Ok(())
         };
@@ -44998,7 +45050,7 @@ fn report_stored_query_dependents(
                         }
                     } else {
                         for dependency in storage
-                            .snapshot_matview_dependencies(slot, arena)?
+                            .snapshot_matview_dependencies(slot, txid, arena)?
                             .entries()
                         {
                             if dependency.class == DependencyClass::View
@@ -51613,7 +51665,10 @@ pub fn reindex(
                     .iter()
                     .find_map(|entry| match entry {
                         crate::storage::PathEntry::Schema(slot) => storage.index_definition(
-                            storage.schema_def(*slot as usize).name.as_str(),
+                            storage
+                                .schema_def_for(*slot as usize, txn.txid)
+                                .name
+                                .as_str(),
                             name.name,
                             txn.txid,
                         ),
@@ -68570,7 +68625,7 @@ fn alter_table_relation(
                 "constraint comment disappeared during rename"
             ));
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConstraintCommentRenamed {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentIdentityChanged {
             slot: slot as u32,
             prior,
         }) {

@@ -764,14 +764,34 @@ pub struct ProjectSetValue<'a> {
     pub fixed_index: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub enum SequenceReference<'a> {
+    Name(&'a str),
+    Oid(u32),
+}
+
+impl core::fmt::Display for SequenceReference<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Name(name) => output.write_str(name),
+            Self::Oid(oid) => core::fmt::Display::fmt(oid, output),
+        }
+    }
+}
+
 /// The side-effecting sequence functions, abstracted so `eval` need not depend
 /// on `Storage`. The implementor advances/reads generators (through `Cell`
 /// interior mutability) and the session's `currval`/`lastval` state.
 pub trait SequenceAccess {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError>;
-    fn currval(&self, name: &str) -> Result<i64, SqlError>;
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError>;
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -1308,7 +1328,7 @@ pub trait CatalogAccess {
     /// The relation name for an OID, for rendering `oid::regclass`.
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError>;
     /// The OID of the relation named `name`, for `'relname'::regclass`.
-    fn reloid(&self, name: &str) -> Option<i32>;
+    fn reloid(&self, name: &str) -> Result<Option<i32>, SqlError>;
     /// Resolve a role OID to its catalog name.
     fn role_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
@@ -1408,7 +1428,7 @@ pub trait CatalogAccess {
     fn has_schema_privilege(
         &self,
         _role: Option<&str>,
-        _schema: &str,
+        _schema: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1416,7 +1436,7 @@ pub trait CatalogAccess {
     fn has_type_privilege(
         &self,
         _role: Option<&str>,
-        _target: PrivilegeType<'_>,
+        _target: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1432,7 +1452,7 @@ pub trait CatalogAccess {
     fn has_function_privilege(
         &self,
         _role: Option<&str>,
-        _function: &str,
+        _function: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1667,7 +1687,7 @@ pub enum PrivilegeRelation<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub enum PrivilegeType<'a> {
+pub enum PrivilegeObject<'a> {
     Name(&'a str),
     Oid(i32),
 }
@@ -4610,6 +4630,17 @@ fn call<'a>(
         // Sequence functions: side-effecting, so they run through the
         // `hooks.sequences` bridge (interior-mutable) rather than as pure eval.
         "nextval" | "currval" | "setval" => {
+            if name == "setval" {
+                if args.len() != 2 && args.len() != 3 || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function setval(...) with {} arguments does not exist",
+                        args.len()
+                    ));
+                }
+            } else {
+                arity(1)?;
+            }
             let engine = hooks.sequences.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4617,27 +4648,33 @@ fn call<'a>(
                     name
                 )
             })?;
-            let seq_name = match args::text_arg(name, args, 0, arena, params, row, hooks)? {
-                Some(s) => s,
-                None => return Ok(Datum::Null),
+            let seq_name = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Null => return Ok(Datum::Null),
+                Datum::Text(value) => SequenceReference::Name(value),
+                Datum::Oid(value) => SequenceReference::Oid(value),
+                Datum::Int2(value) => SequenceReference::Oid(i32::from(value) as u32),
+                Datum::Int4(value) => SequenceReference::Oid(value as u32),
+                Datum::Int8(value) => {
+                    SequenceReference::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?)
+                }
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGCLASS,
+                    referenced_oid,
+                    ..
+                } => SequenceReference::Oid(referenced_oid as u32),
+                other => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}({}) does not exist",
+                        name,
+                        type_name_of(&other)
+                    ));
+                }
             };
             let result = match name {
-                "nextval" => {
-                    arity(1)?;
-                    engine.nextval(seq_name)?
-                }
-                "currval" => {
-                    arity(1)?;
-                    engine.currval(seq_name)?
-                }
+                "nextval" => engine.nextval(seq_name)?,
+                "currval" => engine.currval(seq_name)?,
                 _ => {
-                    if args.len() != 2 && args.len() != 3 || star {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_FUNCTION,
-                            "function setval(...) with {} arguments does not exist",
-                            args.len()
-                        ));
-                    }
                     let value = match args::int_arg(name, args, 1, arena, params, row, hooks)? {
                         Some(v) => v,
                         None => return Ok(Datum::Null),
@@ -7219,6 +7256,10 @@ pub(crate) fn regobject_cast<'a>(
     if value.is_null() {
         return Ok(Datum::Null);
     }
+    let value = match value {
+        Datum::Bpchar(name) => Datum::Text(name.trim_end_matches(' ')),
+        other => other,
+    };
     let object_oid = match value {
         Datum::RegObject {
             type_oid,
@@ -7240,17 +7281,17 @@ pub(crate) fn regobject_cast<'a>(
         Datum::Int4(value) => value,
         Datum::Oid(value) => value as i32,
         Datum::Int8(value) => u32::try_from(value).map_err(|_| overflow(target.name()))? as i32,
-        Datum::Text(name) | Datum::Bpchar(name) => {
-            let name = name.trim_end_matches(' ');
-            if let Ok(value) = name.parse::<u32>() {
-                value as i32
+        Datum::Text(name) => {
+            if name == "-" {
+                0
+            } else if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+                name.parse::<u32>().map_err(|_| overflow(target.name()))? as i32
             } else {
                 let signature_required =
                     matches!(target, ColType::Regprocedure | ColType::Regoperator);
                 if matches!(
                     target,
-                    ColType::Regclass
-                        | ColType::Regproc
+                    ColType::Regproc
                         | ColType::Regprocedure
                         | ColType::Regoper
                         | ColType::Regoperator
@@ -7272,7 +7313,7 @@ pub(crate) fn regobject_cast<'a>(
                     )
                 })?;
                 match target {
-                    ColType::Regclass => catalog.reloid(name).ok_or_else(|| {
+                    ColType::Regclass => catalog.reloid(name)?.ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_TABLE,
                             "relation \"{}\" does not exist",

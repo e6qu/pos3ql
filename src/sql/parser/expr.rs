@@ -32,6 +32,9 @@ impl<'a> Parser<'a> {
             if self.peeked == Tok::Op("::") {
                 self.advance()?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                if let Some(kind) = super::CatalogLiteralKind::for_cast(type_name) {
+                    self.record_catalog_literal(left, kind)?;
+                }
                 left = self.arena_expr(Expr::Cast {
                     operand: left,
                     type_name,
@@ -239,10 +242,15 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("operator") {
                 self.advance()?;
                 self.expect_op("(")?;
+                let source = super::NamespaceSource {
+                    start: self.peek_at,
+                    end: self.lexer.token_end(),
+                };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;
                 if self.eat_op(".")? {
+                    self.record_namespace(source)?;
                     schema = Some(first);
                     operator = self.any_op_token()?;
                 }
@@ -523,10 +531,15 @@ impl<'a> Parser<'a> {
         &mut self,
     ) -> Result<crate::sql::ast::ParsedCollation<'a>, ParseError> {
         use crate::sql::ast::{Collation, ParsedCollation, QualName};
+        let source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.any_ident("collation name")?;
         let mut schema = None;
         let mut name = first;
         if self.eat_op(".")? {
+            self.record_namespace(source)?;
             schema = Some(first);
             name = self.any_ident("collation name")?;
         }
@@ -553,6 +566,10 @@ impl<'a> Parser<'a> {
 
     pub(super) fn prefix(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         let tok = self.peeked;
+        let namespace_source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         match tok {
             Tok::Num(text) => {
                 self.advance()?;
@@ -570,7 +587,9 @@ impl<'a> Parser<'a> {
             Tok::Str(s) => {
                 let source_at = self.peek_at;
                 self.advance()?;
-                self.string_expression(s, source_at)
+                let expression = self.string_expression(s, source_at)?;
+                self.record_string_literal(expression, namespace_source)?;
+                Ok(expression)
             }
             Tok::Bit(s) => {
                 self.advance()?;
@@ -712,10 +731,15 @@ impl<'a> Parser<'a> {
             Tok::Ident("operator") => {
                 self.advance()?;
                 self.expect_op("(")?;
+                let source = super::NamespaceSource {
+                    start: self.peek_at,
+                    end: self.lexer.token_end(),
+                };
                 let first = self.any_op_token()?;
                 let mut schema = None;
                 let mut operator = first;
                 if self.eat_op(".")? {
+                    self.record_namespace(source)?;
                     schema = Some(first);
                     operator = self.any_op_token()?;
                 }
@@ -828,6 +852,9 @@ impl<'a> Parser<'a> {
                 self.expect_ident("as")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 self.expect_op(")")?;
+                if let Some(kind) = super::CatalogLiteralKind::for_cast(type_name) {
+                    self.record_catalog_literal(operand, kind)?;
+                }
                 self.arena_expr(Expr::Cast {
                     operand,
                     type_name,
@@ -847,6 +874,7 @@ impl<'a> Parser<'a> {
                     && self.peeked == Tok::Op(".")
                 {
                     let stripped = name;
+                    self.record_namespace(namespace_source)?;
                     self.advance()?;
                     (self.any_ident("function or column name")?, Some(stripped))
                 } else {
@@ -970,6 +998,10 @@ impl<'a> Parser<'a> {
                 if let Tok::Str(lit) = self.peeked
                     && crate::sql::types::ColType::from_sql_name(name).is_some()
                 {
+                    let literal_source = super::NamespaceSource {
+                        start: self.peek_at,
+                        end: self.lexer.token_end(),
+                    };
                     self.advance()?;
                     // `INTERVAL '1' DAY`: the SQL-standard trailing unit
                     // qualifier interprets an otherwise-unitless value in
@@ -981,6 +1013,10 @@ impl<'a> Parser<'a> {
                         (lit, -1)
                     };
                     let operand = self.arena_expr(Expr::Str(lit))?;
+                    self.record_string_literal(operand, literal_source)?;
+                    if let Some(kind) = super::CatalogLiteralKind::for_cast(name) {
+                        self.record_catalog_literal(operand, kind)?;
+                    }
                     return self.arena_expr(Expr::Cast {
                         operand,
                         type_name: name,
@@ -995,6 +1031,7 @@ impl<'a> Parser<'a> {
                     }
                     let column = self.any_ident("column name")?;
                     if self.peeked == Tok::Op("(") {
+                        self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
                         return self.call(routine);
                     }
@@ -1002,6 +1039,7 @@ impl<'a> Parser<'a> {
                     // transparently stripped `pg_catalog.`/`information_schema.`
                     // prefix, which must still validate as the schema part.
                     if self.peeked == Tok::Op(".") {
+                        self.record_namespace(namespace_source)?;
                         self.advance()?;
                         if self.peeked == Tok::Op("*") {
                             self.advance()?;
@@ -1115,10 +1153,12 @@ impl<'a> Parser<'a> {
                     }
                     let column = self.any_ident("column name")?;
                     if self.peeked == Tok::Op("(") {
+                        self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
                         return self.call(routine);
                     }
                     if self.peeked == Tok::Op(".") {
+                        self.record_namespace(namespace_source)?;
                         self.advance()?;
                         if self.peeked == Tok::Op("*") {
                             self.advance()?;
@@ -2164,6 +2204,11 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = args.as_slice();
+        if matches!(name, "nextval" | "currval" | "setval")
+            && let Some(first) = args.first()
+        {
+            self.record_catalog_literal(first, super::CatalogLiteralKind::QualifiedName)?;
+        }
         let argument_names = if saw_named {
             argument_names.as_slice()
         } else {

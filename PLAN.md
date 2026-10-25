@@ -43,19 +43,14 @@ read position would produce the wrong result.
 
 Complete these remaining cases:
 
-- Finish connecting remaining schema, routine, role and privilege reports to
-  selected base rows, with PostgreSQL's exact joins and current access checks.
-  The [behavior guide](docs/implemented-baseline.md#reading-database-descriptions-while-they-change)
-  owns the connected table, column, index, constraint, view, rule, sequence and
-  dependency reports, including stable column numbers and expression inputs.
-- Keep a schema rename private until commit, including names used by its own
-  transaction, rollback, dependent definitions and prepared recovery.
-- Cover private edits after another connection replaced a catalog tuple across
-  all catalog families. Listings and direct lookups can expose different rows;
-  dependency rows also need exact duplicate counts.
-- Give replacement objects fresh SQL object identifiers, independently of reused
-  storage slots. A cached identifier for a dropped table must not name its
-  replacement. Check shared catalogs across databases as well.
+- Apply checked source identities and private publication to the remaining
+  catalog families. Cover edits after another connection replaced a catalog
+  tuple. Listings and direct lookups can expose different rows; dependency rows
+  also need exact duplicate counts.
+- Give replacement tables, indexes, sequences and other remaining objects fresh
+  SQL object identifiers, independently of reused storage slots. A cached
+  identifier for a dropped table must not name its replacement. Check shared
+  catalogs across databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.
 - Replace remaining synchronous metadata and maintenance reads with bounded

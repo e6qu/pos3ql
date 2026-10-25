@@ -197,6 +197,443 @@ def constraint_reports(reader, writer, isolation, prefix, record, record_outcome
         writer.execute("DROP ROLE IF EXISTS report_reader_diff")
 
 
+def schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome):
+    try:
+        writer.execute("CREATE SCHEMA sr_rename_before_diff")
+        writer.execute("CREATE SEQUENCE sr_rename_before_diff.ticket")
+        writer.execute("CREATE VIEW sr_rename_before_diff.ticket_view AS SELECT nextval('sr_rename_before_diff.ticket') AS id")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.next_ticket() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT nextval('sr_rename_before_diff.ticket'); END")
+        writer.execute("CREATE TABLE sr_rename_before_diff.orders(id integer)")
+        writer.execute("INSERT INTO sr_rename_before_diff.orders VALUES(17)")
+        writer.execute("CREATE VIEW sr_rename_before_diff.order_view AS SELECT sr_rename_before_diff.id FROM sr_rename_before_diff /* namespace */ .orders AS sr_rename_before_diff")
+        writer.execute("CREATE MATERIALIZED VIEW sr_rename_before_diff.order_cache AS SELECT id FROM sr_rename_before_diff.orders")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM sr_rename_before_diff.orders; END")
+        writer.execute("CREATE FUNCTION sr_rename_before_diff.unbound() RETURNS integer LANGUAGE SQL AS 'SELECT id FROM sr_rename_before_diff.orders'")
+        namespaces = "SELECT nspname FROM pg_namespace WHERE nspname IN ('sr_rename_before_diff','sr_rename_after_diff') ORDER BY nspname"
+        lookup = "SELECT to_regnamespace('sr_rename_before_diff') IS NOT NULL,to_regnamespace('sr_rename_after_diff') IS NOT NULL"
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        record(reader, f"{prefix}.schema_rename.before", namespaces)
+        writer.execute("BEGIN")
+        writer.execute("ALTER SCHEMA sr_rename_before_diff RENAME TO sr_rename_after_diff")
+        record(writer, f"{prefix}.schema_rename.private.owner", namespaces)
+        record(writer, f"{prefix}.schema_rename.private.view", "SELECT * FROM sr_rename_after_diff.order_view")
+        record(writer, f"{prefix}.schema_rename.private.bound", "SELECT sr_rename_after_diff.bound()")
+        record(writer, f"{prefix}.schema_rename.private.sequence_view", "SELECT id FROM sr_rename_after_diff.ticket_view")
+        record(writer, f"{prefix}.schema_rename.private.sequence_routine", "SELECT sr_rename_after_diff.next_ticket()")
+        writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")
+        record(writer, f"{prefix}.schema_rename.private.materialized", "SELECT id FROM sr_rename_after_diff.order_cache")
+        record(reader, f"{prefix}.schema_rename.private.observer", namespaces)
+        record(reader, f"{prefix}.schema_rename.private.lookup", lookup)
+        record(reader, f"{prefix}.schema_rename.private.original", "SELECT * FROM sr_rename_before_diff.order_view")
+        writer.execute("ROLLBACK")
+        record(reader, f"{prefix}.schema_rename.rollback", namespaces)
+        writer.execute("ALTER SCHEMA sr_rename_before_diff RENAME TO sr_rename_after_diff")
+        record(reader, f"{prefix}.schema_rename.selected", namespaces)
+        record(reader, f"{prefix}.schema_rename.current_lookup", lookup)
+        record(reader, f"{prefix}.schema_rename.current_view", "SELECT * FROM sr_rename_after_diff.order_view")
+        record(reader, f"{prefix}.schema_rename.current_bound", "SELECT sr_rename_after_diff.bound()")
+        record(reader, f"{prefix}.schema_rename.current_sequence_view", "SELECT id FROM sr_rename_after_diff.ticket_view")
+        record(reader, f"{prefix}.schema_rename.current_sequence_routine", "SELECT sr_rename_after_diff.next_ticket()")
+        record_outcome(reader, f"{prefix}.schema_rename.current_unbound", "SELECT sr_rename_after_diff.unbound()", ())
+        reader.execute("COMMIT")
+        writer.execute("REFRESH MATERIALIZED VIEW sr_rename_after_diff.order_cache")
+        record(writer, f"{prefix}.schema_rename.current_materialized", "SELECT id FROM sr_rename_after_diff.order_cache")
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP SCHEMA IF EXISTS sr_rename_before_diff CASCADE")
+        writer.execute("DROP SCHEMA IF EXISTS sr_rename_after_diff CASCADE")
+
+
+def schema_name_binding_reports(writer, prefix, record):
+    public_renamed = False
+    try:
+        writer.execute('CREATE SCHEMA "SrCaseDiff"')
+        writer.execute('CREATE SCHEMA srcasediff')
+        writer.execute('CREATE TABLE "SrCaseDiff".items(id integer)')
+        writer.execute('CREATE TABLE srcasediff.items(id integer)')
+        writer.execute('INSERT INTO "SrCaseDiff".items VALUES(31)')
+        writer.execute('INSERT INTO srcasediff.items VALUES(41)')
+        writer.execute('CREATE VIEW sr_case_view_diff AS SELECT a.id AS quoted,b.id AS unquoted FROM "SrCaseDiff".items AS a CROSS JOIN SRCASEDIFF.items AS b')
+        writer.execute('BEGIN')
+        writer.execute('ALTER SCHEMA "SrCaseDiff" RENAME TO "MovedSrCaseDiff"')
+        record(writer, f"{prefix}.schema_binding.private_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
+        writer.execute('COMMIT')
+        record(writer, f"{prefix}.schema_binding.committed_case", "SELECT quoted,unquoted FROM sr_case_view_diff")
+        writer.execute('CREATE SCHEMA "SrÉ,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "SrÉ,\"\"quoted\"\"Diff"')
+        writer.execute('CREATE TABLE items(id integer)')
+        writer.execute('INSERT INTO items VALUES(12)')
+        writer.execute('CREATE VIEW item_view AS SELECT id FROM items')
+        writer.execute('CREATE SEQUENCE "tick""et"')
+        sequence_name = '"SrÉ,""quoted""Diff"."tick""et"'
+        writer.execute(pg_sql.SQL('CREATE VIEW ticket_view AS SELECT nextval({}) AS id').format(pg_sql.Literal(sequence_name)))
+        writer.execute(pg_sql.SQL('CREATE FUNCTION next_ticket() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT nextval({}); END').format(pg_sql.Literal(sequence_name)))
+        writer.execute('CREATE VIEW qualified_view AS SELECT id FROM "SrÉ,\"\"quoted\"\"Diff".items')
+        writer.execute('CREATE FUNCTION bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM items; END')
+        writer.execute('CREATE FUNCTION qualified_bound() RETURNS integer LANGUAGE SQL BEGIN ATOMIC SELECT id FROM "SrÉ,\"\"quoted\"\"Diff".items; END')
+        writer.execute('ALTER SCHEMA "SrÉ,\"\"quoted\"\"Diff" RENAME TO "MovedSrÉ,\"\"quoted\"\"Diff"')
+        writer.execute('SET search_path TO "MovedSrÉ,\"\"quoted\"\"Diff"')
+        record(writer, f"{prefix}.schema_binding.quoted_path", 'SELECT current_schema()')
+        record(writer, f"{prefix}.schema_binding.quoted_view", 'SELECT id FROM item_view')
+        record(writer, f"{prefix}.schema_binding.quoted_routine", 'SELECT bound()')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_view", 'SELECT id FROM ticket_view')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_routine", 'SELECT next_ticket()')
+        record(writer, f"{prefix}.schema_binding.quoted_sequence_oid", "SELECT nextval('\"tick\"\"et\"'::regclass::oid)")
+        record(writer, f"{prefix}.schema_binding.unicode_identifier", "SELECT parse_ident('\"élève\".\"a\"\"b\"',true)=ARRAY['élève','a\"b']")
+        record(writer, f"{prefix}.schema_binding.long_identifier", "SELECT parse_ident('\"'||repeat('é',600)||'\"',true)=ARRAY[repeat('é',600)]")
+        record(writer, f"{prefix}.schema_binding.qualified_quoted_view", 'SELECT id FROM qualified_view')
+        record(writer, f"{prefix}.schema_binding.qualified_quoted_routine", 'SELECT qualified_bound()')
+        writer.execute('RESET search_path')
+        writer.execute('ALTER SCHEMA public RENAME TO sr_initial_public_diff')
+        public_renamed = True
+        record(writer, f"{prefix}.schema_binding.no_public", "SELECT to_regnamespace('public') IS NULL")
+        record(writer, f"{prefix}.schema_binding.initial_identity", "SELECT oid=2200,nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('CREATE SCHEMA public')
+        record(writer, f"{prefix}.schema_binding.replacement_identity", "SELECT oid<>2200,nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='public'")
+        writer.execute('BEGIN')
+        writer.execute('SAVEPOINT before_owner')
+        writer.execute('ALTER SCHEMA sr_initial_public_diff OWNER TO postgres')
+        record(writer, f"{prefix}.schema_binding.private_owner", "SELECT nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('ROLLBACK TO before_owner')
+        record(writer, f"{prefix}.schema_binding.restored_owner", "SELECT nspowner::regrole::text,nspacl::text FROM pg_namespace WHERE nspname='sr_initial_public_diff'")
+        writer.execute('ROLLBACK')
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET search_path')
+        if public_renamed:
+            writer.execute('DROP SCHEMA IF EXISTS public CASCADE')
+            writer.execute('ALTER SCHEMA sr_initial_public_diff RENAME TO public')
+        writer.execute('DROP VIEW IF EXISTS sr_case_view_diff')
+        for schema in ('SrCaseDiff', 'srcasediff', 'MovedSrCaseDiff', 'SrÉ,"quoted"Diff', 'MovedSrÉ,"quoted"Diff'):
+            writer.execute(pg_sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(pg_sql.Identifier(schema)))
+
+
+def schema_regclass_lookup_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE ROLE sr_lookup_reader_diff')
+        writer.execute('CREATE SCHEMA sr_hidden_relations_diff')
+        writer.execute('CREATE TABLE sr_hidden_relations_diff."a.b"(id integer)')
+        writer.execute('CREATE TABLE public.pg_class(id integer)')
+        for name in ('ticket-1', '123', '-'):
+            writer.execute(pg_sql.SQL('CREATE TABLE public.{}(id integer)').format(pg_sql.Identifier(name)))
+        record(writer, f"{prefix}.schema_binding.outside_path", "SELECT to_regclass('\"a.b\"') IS NULL")
+        record(writer, f"{prefix}.schema_binding.implicit_catalog", "SELECT 'pg_class'::regclass::oid=1259")
+        record(writer, f"{prefix}.schema_binding.current_database", "SELECT to_regclass(quote_ident(current_database())||'.sr_hidden_relations_diff.\"a.b\"')='sr_hidden_relations_diff.\"a.b\"'::regclass")
+        writer.execute('SET search_path TO sr_hidden_relations_diff,public')
+        record(writer, f"{prefix}.schema_binding.on_path", "SELECT '\"a.b\"'::regclass='sr_hidden_relations_diff.\"a.b\"'::regclass,pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
+        writer.execute('SET search_path TO public,pg_catalog')
+        record(writer, f"{prefix}.schema_binding.explicit_catalog", "SELECT 'pg_class'::regclass='public.pg_class'::regclass,NOT pg_table_is_visible('sr_hidden_relations_diff.\"a.b\"'::regclass)")
+        writer.execute('CREATE TEMP TABLE sr_temporary_lookup_diff(id integer)')
+        writer.execute('CREATE INDEX pg_class ON sr_temporary_lookup_diff(id)')
+        record(writer, f"{prefix}.schema_binding.regclass.temporary_index", "SELECT 'pg_class'::regclass::oid<>1259,'pg_catalog.pg_class'::regclass::oid=1259")
+        writer.execute('DROP TABLE sr_temporary_lookup_diff')
+        writer.execute('BEGIN')
+        for label, query in (
+            ('invalid_inquiry', "SELECT to_regclass('broken..name') IS NULL"),
+            ('overflow_inquiry', "SELECT to_regclass('4294967296') IS NULL"),
+            ('empty_inquiry', "SELECT to_regclass('\"\"') IS NULL"),
+            ('zero_identifier', "SELECT '-'::regclass::oid=0,'-'::regclass::text='-'"),
+            ('punctuation', "SELECT 'ticket-1'::regclass='\"ticket-1\"'::regclass"),
+            ('numeric_name', "SELECT ' 123 '::regclass='\"123\"'::regclass,'123 '::text::regclass='\"123\"'::regclass"),
+            ('numeric_identifier', "SELECT '123'::regclass::oid=123"),
+            ('quoted_dash', "SELECT '\"-\"'::regclass='public.\"-\"'::regclass"),
+            ('invalid_cast', "SELECT 'broken..name'::regclass"),
+            ('overflow_cast', "SELECT '4294967296'::regclass"),
+            ('too_many_parts', "SELECT to_regclass('a.b.c.d')"),
+            ('strict_identifier', "SELECT parse_ident('ticket-1')"),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.regclass.{label}", query, ())
+        writer.execute('SET search_path TO sr_hidden_relations_diff')
+        writer.execute('SET ROLE sr_lookup_reader_diff')
+        record(writer, f"{prefix}.schema_binding.regclass.inaccessible_path", "SELECT to_regclass('\"a.b\"') IS NULL,current_schema() IS NULL")
+        record_outcome(writer, f"{prefix}.schema_binding.regclass.denied_inquiry", "SELECT to_regclass('sr_hidden_relations_diff.\"a.b\"')", ())
+        record_outcome(writer, f"{prefix}.schema_binding.regclass.denied_cast", "SELECT 'sr_hidden_relations_diff.\"a.b\"'::regclass", ())
+        record(writer, f"{prefix}.schema_binding.regclass.missing_namespace", "SELECT to_regclass('sr_absent_lookup_diff.orders') IS NULL")
+        writer.execute('RESET ROLE')
+        writer.execute('GRANT USAGE ON SCHEMA sr_hidden_relations_diff TO sr_lookup_reader_diff')
+        writer.execute('SET ROLE sr_lookup_reader_diff')
+        record(writer, f"{prefix}.schema_binding.regclass.usage_without_select", "SELECT to_regclass('\"a.b\"') IS NOT NULL,has_table_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.quoted_privileges", "SELECT has_table_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT'),has_column_privilege('sr_hidden_relations_diff.\"a.b\"','id','SELECT'),has_any_column_privilege('sr_hidden_relations_diff.\"a.b\"','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.quoted_catalog_privileges", "SELECT has_table_privilege('\"pg_authid\"','SELECT'),has_table_privilege('\"pg_class\"','SELECT')")
+        writer.execute('SET search_path TO public,pg_catalog')
+        record(writer, f"{prefix}.schema_binding.regclass.privilege_path", "SELECT has_table_privilege('pg_class','SELECT'),has_table_privilege('pg_catalog.pg_class','SELECT')")
+        record(writer, f"{prefix}.schema_binding.regclass.privilege_numeric_name", "SELECT has_table_privilege('123','SELECT'),has_table_privilege(123::oid,'SELECT') IS NULL")
+        for label, query in (
+            ('missing_privilege_relation', "SELECT has_table_privilege('sr_hidden_relations_diff.missing','SELECT')"),
+            ('missing_privilege_schema', "SELECT has_table_privilege('sr_absent_lookup_diff.orders','SELECT')"),
+            ('malformed_privilege_relation', "SELECT has_table_privilege('broken..name','SELECT')"),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.regclass.{label}", query, ())
+        writer.execute('RESET ROLE')
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET ROLE')
+        writer.execute('RESET search_path')
+        writer.execute('DROP TABLE IF EXISTS sr_temporary_lookup_diff')
+        writer.execute('DROP TABLE IF EXISTS public.pg_class')
+        for name in ('ticket-1', '123', '-'):
+            writer.execute(pg_sql.SQL('DROP TABLE IF EXISTS public.{}').format(pg_sql.Identifier(name)))
+        writer.execute('DROP SCHEMA IF EXISTS sr_hidden_relations_diff CASCADE')
+        writer.execute('DROP ROLE IF EXISTS sr_lookup_reader_diff')
+
+
+def schema_composite_lookup_reports(reader, writer, prefix, record):
+    try:
+        writer.execute('CREATE SCHEMA sr_composite_before_diff')
+        writer.execute('CREATE TYPE sr_composite_before_diff.row_type AS (id integer,label text)')
+        writer.execute('CREATE TABLE sr_composite_holder_diff(item sr_composite_before_diff.row_type)')
+        writer.execute("INSERT INTO sr_composite_holder_diff VALUES(ROW(7,'original')::sr_composite_before_diff.row_type)")
+        writer.execute('BEGIN')
+        writer.execute('ALTER SCHEMA sr_composite_before_diff RENAME TO sr_composite_after_diff')
+        record(writer, f"{prefix}.schema_binding.composite.private_names", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_before_diff.row_type') IS NULL")
+        record(writer, f"{prefix}.schema_binding.composite.private_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        record(reader, f"{prefix}.schema_binding.composite.other_names", "SELECT to_regclass('sr_composite_before_diff.row_type') IS NOT NULL,to_regclass('sr_composite_after_diff.row_type') IS NULL")
+        record(reader, f"{prefix}.schema_binding.composite.other_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('SAVEPOINT before_type_name')
+        writer.execute('ALTER TYPE sr_composite_after_diff.row_type RENAME TO renamed_type')
+        record(writer, f"{prefix}.schema_binding.composite.private_type", "SELECT to_regclass('sr_composite_after_diff.renamed_type') IS NOT NULL,to_regclass('sr_composite_after_diff.row_type') IS NULL")
+        record(writer, f"{prefix}.schema_binding.composite.renamed_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('ROLLBACK TO before_type_name')
+        record(writer, f"{prefix}.schema_binding.composite.savepoint", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_after_diff.renamed_type') IS NULL")
+        writer.execute('ROLLBACK')
+        record(writer, f"{prefix}.schema_binding.composite.rollback", "SELECT to_regclass('sr_composite_before_diff.row_type') IS NOT NULL")
+        record(writer, f"{prefix}.schema_binding.composite.rollback_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+        writer.execute('ALTER SCHEMA sr_composite_before_diff RENAME TO sr_composite_after_diff')
+        record(reader, f"{prefix}.schema_binding.composite.committed", "SELECT to_regclass('sr_composite_after_diff.row_type') IS NOT NULL,to_regclass('sr_composite_before_diff.row_type') IS NULL")
+        record(reader, f"{prefix}.schema_binding.composite.committed_layout", 'SELECT (item).id,(item).label FROM sr_composite_holder_diff')
+    finally:
+        reader.execute('ROLLBACK')
+        writer.execute('ROLLBACK')
+        writer.execute('DROP TABLE IF EXISTS sr_composite_holder_diff')
+        writer.execute('DROP SCHEMA IF EXISTS sr_composite_before_diff CASCADE')
+        writer.execute('DROP SCHEMA IF EXISTS sr_composite_after_diff CASCADE')
+
+
+def schema_sequence_argument_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE SEQUENCE sr_argument_ticket_diff START WITH 100')
+        for label, query in (
+            ('regclass', "SELECT nextval('sr_argument_ticket_diff'::regclass)"),
+            ('current_oid', "SELECT currval('sr_argument_ticket_diff'::regclass::oid)"),
+            ('set_oid', "SELECT setval('sr_argument_ticket_diff'::regclass::oid,200,false)"),
+            ('next_oid', "SELECT nextval('sr_argument_ticket_diff'::regclass::oid)"),
+            ('integer', "SELECT nextval('sr_argument_ticket_diff'::regclass::integer)"),
+            ('bigint', "SELECT nextval('sr_argument_ticket_diff'::regclass::bigint)"),
+            ('set_regclass', "SELECT setval('sr_argument_ticket_diff'::regclass,500,true)"),
+            ('current_name', "SELECT currval('sr_argument_ticket_diff')"),
+            ('null', 'SELECT currval(NULL::oid) IS NULL'),
+        ):
+            record(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query)
+        writer.execute('BEGIN')
+        for label, query in (
+            ('empty_next', 'SELECT nextval()'),
+            ('empty_current', 'SELECT currval()'),
+            ('empty_set', 'SELECT setval()'),
+            ('extra_set', "SELECT setval('sr_argument_ticket_diff',1,true,false)"),
+            ('boolean', 'SELECT nextval(true)'),
+            ('numeric', 'SELECT nextval(1.5::numeric)'),
+            ('character', "SELECT nextval('sr_argument_ticket_diff'::character(30))"),
+            ('negative_bigint', 'SELECT nextval(-1::bigint)'),
+            ('missing_smallint', 'SELECT nextval(0::smallint)'),
+            ('missing_current_oid', 'SELECT currval(0::oid)'),
+            ('missing_set_oid', 'SELECT setval(0::oid,1)'),
+            ('negative_integer', 'SELECT nextval(-1::integer)'),
+        ):
+            record_outcome(writer, f"{prefix}.schema_binding.sequence_arguments.{label}", query, ())
+        record(writer, f"{prefix}.schema_binding.sequence_arguments.after_errors", "SELECT currval('sr_argument_ticket_diff')")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('DROP SEQUENCE IF EXISTS sr_argument_ticket_diff')
+
+
+def schema_sequence_oid_permission_reports(writer, prefix, record, record_outcome):
+    try:
+        writer.execute('CREATE ROLE sr_oid_sequence_reader_diff')
+        writer.execute('CREATE SCHEMA sr_oid_sequence_private_diff')
+        writer.execute('CREATE SEQUENCE sr_oid_sequence_private_diff."tick.et" START WITH 700')
+        writer.execute('CREATE TABLE sr_oid_sequence_private_diff.not_sequence(id integer)')
+        writer.execute('GRANT USAGE ON SEQUENCE sr_oid_sequence_private_diff."tick.et" TO sr_oid_sequence_reader_diff')
+        sequence = writer.execute("SELECT 'sr_oid_sequence_private_diff.\"tick.et\"'::regclass::oid").fetchone()[0]
+        table = writer.execute("SELECT 'sr_oid_sequence_private_diff.not_sequence'::regclass::oid").fetchone()[0]
+        writer.execute('BEGIN')
+        writer.execute('SET ROLE sr_oid_sequence_reader_diff')
+        record(writer, f"{prefix}.schema_binding.sequence_oid.without_namespace", "SELECT nextval(%s::oid),has_sequence_privilege(%s::oid,'USAGE')", (sequence, sequence))
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.denied_name", "SELECT nextval('sr_oid_sequence_private_diff.\"tick.et\"')", ())
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.wrong_kind", 'SELECT nextval(%s::oid)', (table,))
+        record_outcome(writer, f"{prefix}.schema_binding.sequence_oid.wrong_privilege_kind", "SELECT has_sequence_privilege(%s::oid,'USAGE')", (table,))
+        writer.execute('RESET ROLE')
+        writer.execute('GRANT USAGE ON SCHEMA sr_oid_sequence_private_diff TO sr_oid_sequence_reader_diff')
+        writer.execute('SET ROLE sr_oid_sequence_reader_diff')
+        record(writer, f"{prefix}.schema_binding.sequence_oid.quoted_name", "SELECT nextval('sr_oid_sequence_private_diff.\"tick.et\"'),has_sequence_privilege('sr_oid_sequence_private_diff.\"tick.et\"','USAGE')")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('RESET ROLE')
+        writer.execute('DROP TABLE IF EXISTS sr_oid_sequence_private_diff.not_sequence')
+        writer.execute('DROP SEQUENCE IF EXISTS sr_oid_sequence_private_diff."tick.et"')
+        writer.execute('DROP SCHEMA IF EXISTS sr_oid_sequence_private_diff')
+        writer.execute('DROP ROLE IF EXISTS sr_oid_sequence_reader_diff')
+
+
+def schema_reference_literal_reports(writer, prefix, record):
+    try:
+        writer.execute('CREATE SCHEMA sr_typed_before_diff')
+        writer.execute('CREATE TABLE sr_typed_before_diff.items(id integer)')
+        writer.execute('CREATE DOMAIN sr_typed_before_diff.amount AS integer')
+        writer.execute('CREATE FUNCTION sr_typed_before_diff.add_values(a sr_typed_before_diff.amount,b sr_typed_before_diff.amount) RETURNS integer LANGUAGE SQL RETURN a+b')
+        writer.execute('CREATE FUNCTION sr_typed_before_diff.add_integers(a integer,b integer) RETURNS integer LANGUAGE SQL RETURN a+b')
+        writer.execute('CREATE OPERATOR sr_typed_before_diff.+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=sr_typed_before_diff.add_integers)')
+        writer.execute('CREATE COLLATION sr_typed_before_diff.byte_order FROM "C"')
+        writer.execute("""CREATE VIEW sr_typed_reference_view_diff AS SELECT
+            'sr_typed_before_diff.items'::regclass AS relation_id,
+            'sr_typed_before_diff'::regnamespace AS schema_id,
+            'sr_typed_before_diff.amount[]'::regtype AS type_id,
+            'sr_typed_before_diff.add_values'::regproc AS routine_id,
+            'sr_typed_before_diff.add_values(sr_typed_before_diff.amount,sr_typed_before_diff.amount)'::regprocedure AS routine_signature,
+            'sr_typed_before_diff.+'::regoper AS operator_id,
+            'sr_typed_before_diff.+(integer,integer)'::regoperator AS operator_signature,
+            'sr_typed_before_diff.byte_order'::regcollation AS collation_id,
+            'sr_typed_before_diff.items'::text AS ordinary_text""")
+        for stage, statements, schema in (
+            ('private', ('BEGIN', 'ALTER SCHEMA sr_typed_before_diff RENAME TO sr_typed_after_diff'), 'sr_typed_after_diff'),
+            ('rollback', ('ROLLBACK',), 'sr_typed_before_diff'),
+            ('committed', ('ALTER SCHEMA sr_typed_before_diff RENAME TO sr_typed_after_diff',), 'sr_typed_after_diff'),
+        ):
+            for statement in statements:
+                writer.execute(statement)
+            record(writer, f"{prefix}.schema_binding.typed_literals.{stage}", f"""SELECT
+                relation_id='{schema}.items'::regclass,
+                schema_id='{schema}'::regnamespace,
+                type_id='{schema}.amount[]'::regtype,
+                routine_id='{schema}.add_values'::regproc,
+                routine_signature='{schema}.add_values({schema}.amount,{schema}.amount)'::regprocedure,
+                operator_id='{schema}.+'::regoper,
+                operator_signature='{schema}.+(integer,integer)'::regoperator,
+                collation_id='{schema}.byte_order'::regcollation,
+                ordinary_text='sr_typed_before_diff.items' FROM sr_typed_reference_view_diff""")
+    finally:
+        writer.execute('ROLLBACK')
+        writer.execute('DROP VIEW IF EXISTS sr_typed_reference_view_diff')
+        writer.execute('DROP SCHEMA IF EXISTS sr_typed_before_diff CASCADE')
+        writer.execute('DROP SCHEMA IF EXISTS sr_typed_after_diff CASCADE')
+
+
+def schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome):
+    database = writer.execute("SELECT current_database()").fetchone()[0]
+    roles = ("sr_owner_diff", "sr_owner_after_diff", "sr_reader_diff", "sr_account_diff", "sr_account_after_diff", "sr_group_diff")
+    reports = (
+        ("schemata", "schema_name LIKE 'sr_%%'", "schema_name"),
+        ("routines", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name"),
+        ("parameters", "specific_schema IN ('sr_visible_diff','sr_hidden_diff')", "specific_schema,specific_name,ordinal_position"),
+        ("routine_privileges", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name,grantor,grantee"),
+        ("role_routine_grants", "routine_schema IN ('sr_visible_diff','sr_hidden_diff')", "routine_schema,routine_name,specific_name,grantor,grantee"),
+        ("table_privileges", "table_schema='sr_visible_diff'", "table_name,grantor,grantee,privilege_type"),
+        ("role_table_grants", "table_schema='sr_visible_diff'", "table_name,grantor,grantee,privilege_type"),
+        ("column_privileges", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
+        ("role_column_grants", "table_schema='sr_visible_diff'", "table_name,column_name,grantor,grantee,privilege_type,is_grantable"),
+        ("usage_privileges", "object_schema IN ('sr_visible_diff','sr_hidden_diff') OR object_name IN ('sr_wrapper_diff','sr_server_diff')", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("role_usage_grants", "object_schema IN ('sr_visible_diff','sr_hidden_diff') OR object_name IN ('sr_wrapper_diff','sr_server_diff')", "object_type,object_name,grantor,grantee,is_grantable"),
+        ("enabled_roles", "role_name LIKE 'sr_%%'", "role_name"),
+        ("applicable_roles", "role_name LIKE 'sr_%%' OR role_name='pg_database_owner'", "role_name,grantee,is_grantable"),
+        ("administrable_role_authorizations", "role_name LIKE 'sr_%%'", "role_name,grantee,is_grantable"),
+    )
+    projections = {}
+    try:
+        for role in ("sr_owner_diff", "sr_reader_diff", "sr_group_diff"):
+            writer.execute(pg_sql.SQL("CREATE ROLE {}").format(pg_sql.Identifier(role)))
+        writer.execute("CREATE ROLE sr_account_diff LOGIN")
+        writer.execute("GRANT sr_group_diff TO sr_account_diff")
+        writer.execute("ALTER ROLE sr_account_diff SET search_path=public")
+        writer.execute("CREATE SCHEMA sr_visible_diff AUTHORIZATION sr_owner_diff")
+        writer.execute("CREATE SCHEMA sr_hidden_diff")
+        writer.execute("GRANT USAGE ON SCHEMA sr_visible_diff TO sr_reader_diff")
+        writer.execute("CREATE TABLE sr_visible_diff.orders(id integer,payload text)")
+        writer.execute("CREATE TABLE sr_permission_refresh_diff(id integer)")
+        writer.execute("GRANT SELECT ON sr_permission_refresh_diff TO sr_reader_diff")
+        writer.execute("GRANT SELECT ON sr_visible_diff.orders TO PUBLIC")
+        writer.execute("GRANT SELECT ON sr_visible_diff.orders TO sr_reader_diff")
+        writer.execute("GRANT SELECT(id) ON sr_visible_diff.orders TO sr_reader_diff")
+        writer.execute("CREATE DOMAIN sr_visible_diff.sr_domain_diff AS integer")
+        writer.execute("CREATE COLLATION sr_visible_diff.sr_collation_diff FROM \"C\"")
+        writer.execute("CREATE SEQUENCE sr_visible_diff.sr_sequence_diff")
+        writer.execute("CREATE FOREIGN DATA WRAPPER sr_wrapper_diff")
+        writer.execute("CREATE SERVER sr_server_diff FOREIGN DATA WRAPPER sr_wrapper_diff")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_function_diff(a integer,b integer DEFAULT 17) RETURNS integer LANGUAGE SQL IMMUTABLE STRICT SECURITY DEFINER AS 'SELECT a+b'")
+        writer.execute("CREATE PROCEDURE sr_visible_diff.sr_procedure_diff(INOUT value integer) LANGUAGE SQL AS 'SELECT value'")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_output_diff(a integer) RETURNS TABLE(id integer,label text) LANGUAGE SQL AS 'SELECT a, a::text'")
+        writer.execute("CREATE FUNCTION sr_visible_diff.sr_array_diff(items integer[]) RETURNS integer[] LANGUAGE SQL AS 'SELECT items'")
+        for name, _, _ in reports:
+            query = f"SELECT * FROM information_schema.{name} LIMIT 0"
+            record(writer, f"{prefix}.schema_routine.types.{name}", query)
+            fields = writer.execute(query).description
+            projections[name] = pg_sql.SQL(",").join(
+                pg_sql.SQL("regexp_replace(specific_name::text,'_[0-9]+$','_OID')::name AS specific_name")
+                if field.name == "specific_name" else pg_sql.Identifier(field.name)
+                for field in fields
+            )
+
+        def capture(connection, label):
+            for name, condition, order in reports:
+                query = pg_sql.SQL("SELECT {} FROM information_schema.{} WHERE {} ORDER BY {}").format(
+                    projections[name], pg_sql.Identifier(name), pg_sql.SQL(condition), pg_sql.SQL(order)
+                )
+                record(connection, f"{prefix}.schema_routine.{label}.{name}", query)
+            record(connection, f"{prefix}.schema_routine.{label}.users", "SELECT usename,usecreatedb,passwd,useconfig FROM pg_user WHERE usename LIKE 'sr_account_%%' ORDER BY usename")
+            record(connection, f"{prefix}.schema_routine.{label}.shadow", "SELECT usename,usecreatedb,passwd,useconfig FROM pg_shadow WHERE usename LIKE 'sr_account_%%' ORDER BY usename")
+            record(connection, f"{prefix}.schema_routine.{label}.groups", "SELECT groname,array_length(grolist,1) FROM pg_group WHERE groname='sr_group_diff'")
+
+        reader.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+        capture(reader, "before")
+        writer.execute("ALTER ROLE sr_account_diff RENAME TO sr_account_after_diff")
+        writer.execute("ALTER ROLE sr_account_after_diff CREATEDB")
+        writer.execute("ALTER ROLE sr_account_after_diff SET search_path=pg_catalog")
+        writer.execute("GRANT sr_group_diff TO sr_reader_diff")
+        writer.execute("ALTER ROLE sr_owner_diff RENAME TO sr_owner_after_diff")
+        writer.execute(pg_sql.SQL("ALTER DATABASE {} OWNER TO sr_owner_after_diff").format(pg_sql.Identifier(database)))
+        writer.execute("CREATE OR REPLACE FUNCTION sr_visible_diff.sr_function_diff(a integer,b integer DEFAULT 23) RETURNS integer LANGUAGE SQL VOLATILE CALLED ON NULL INPUT SECURITY INVOKER AS 'SELECT a-b'")
+        writer.execute("ALTER FUNCTION sr_visible_diff.sr_function_diff(integer,integer) RENAME TO sr_function_after_diff")
+        writer.execute("REVOKE SELECT ON sr_visible_diff.orders FROM PUBLIC")
+        writer.execute("GRANT UPDATE ON sr_visible_diff.orders TO sr_reader_diff WITH GRANT OPTION")
+        writer.execute("GRANT SELECT(id) ON sr_visible_diff.orders TO sr_reader_diff WITH GRANT OPTION")
+        writer.execute("GRANT USAGE ON SEQUENCE sr_visible_diff.sr_sequence_diff TO sr_reader_diff")
+        writer.execute("GRANT USAGE ON FOREIGN DATA WRAPPER sr_wrapper_diff TO sr_reader_diff")
+        writer.execute("GRANT USAGE ON FOREIGN SERVER sr_server_diff TO sr_reader_diff")
+        writer.execute("ALTER TABLE sr_visible_diff.orders RENAME TO sales")
+        capture(reader, "selected")
+        reader.execute("COMMIT")
+        capture(reader, "committed")
+
+        reader.execute("SET ROLE sr_reader_diff")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        record(reader, f"{prefix}.schema_routine.access.before", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record(reader, f"{prefix}.schema_routine.access.schemas_before", "SELECT schema_name,schema_owner FROM information_schema.schemata WHERE schema_name LIKE 'sr_%%' ORDER BY schema_name")
+        writer.execute("REVOKE EXECUTE ON FUNCTION sr_visible_diff.sr_function_after_diff(integer,integer) FROM PUBLIC")
+        writer.execute("GRANT CREATE ON SCHEMA sr_hidden_diff TO sr_reader_diff")
+        reader.execute("LOCK TABLE sr_permission_refresh_diff IN ACCESS SHARE MODE")
+        record(reader, f"{prefix}.schema_routine.access.revoked", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record(reader, f"{prefix}.schema_routine.access.schemas_current", "SELECT schema_name,schema_owner FROM information_schema.schemata WHERE schema_name LIKE 'sr_%%' ORDER BY schema_name")
+        writer.execute("GRANT EXECUTE ON FUNCTION sr_visible_diff.sr_function_after_diff(integer,integer) TO sr_reader_diff")
+        reader.execute("LOCK TABLE sr_permission_refresh_diff IN ACCESS SHARE MODE")
+        record(reader, f"{prefix}.schema_routine.access.granted", "SELECT routine_name,routine_definition IS NULL FROM information_schema.routines WHERE routine_schema='sr_visible_diff' ORDER BY routine_name")
+        record_outcome(reader, f"{prefix}.schema_routine.access.shadow", "SELECT * FROM pg_shadow", ())
+        reader.execute("COMMIT")
+        reader.execute("RESET ROLE")
+        record(writer, f"{prefix}.schema_routine.builtin", "SELECT routine_name,data_type,routine_body,external_language,is_deterministic,is_null_call,security_type FROM information_schema.routines WHERE specific_schema='pg_catalog' AND routine_name='abs' ORDER BY data_type")
+        record(writer, f"{prefix}.schema_routine.builtin_namespaces", "SELECT nspname,has_schema_privilege('sr_reader_diff',oid,'USAGE'),has_schema_privilege('sr_reader_diff',oid,'CREATE') FROM pg_namespace WHERE nspname IN ('pg_catalog','pg_toast','information_schema') ORDER BY nspname")
+        record(writer, f"{prefix}.schema_routine.default_acl", "SELECT acldefault('f',12345::oid)::text,acldefault('c',12345::oid)::text,acldefault('r',12345::oid) IS NOT NULL")
+    finally:
+        reader.execute("ROLLBACK")
+        reader.execute("RESET ROLE")
+        writer.execute(pg_sql.SQL("ALTER DATABASE {} OWNER TO postgres").format(pg_sql.Identifier(database)))
+        writer.execute("DROP SCHEMA IF EXISTS sr_visible_diff CASCADE")
+        writer.execute("DROP SCHEMA IF EXISTS sr_hidden_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS sr_permission_refresh_diff")
+        writer.execute("DROP SERVER IF EXISTS sr_server_diff")
+        writer.execute("DROP FOREIGN DATA WRAPPER IF EXISTS sr_wrapper_diff")
+        for role in roles:
+            writer.execute(pg_sql.SQL("DROP ROLE IF EXISTS {}").format(pg_sql.Identifier(role)))
+
+
 def transcript(reader, writer, host, port, user, report_database):
     observed = []
 
@@ -230,6 +667,14 @@ def transcript(reader, writer, host, port, user, report_database):
     for isolation in ("READ COMMITTED", "REPEATABLE READ"):
         prefix = isolation.lower().replace(" ", "_")
         constraint_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_routine_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_rename_reports(reader, writer, isolation, prefix, record, record_outcome)
+        schema_name_binding_reports(writer, prefix, record)
+        schema_reference_literal_reports(writer, prefix, record)
+        schema_regclass_lookup_reports(writer, prefix, record, record_outcome)
+        schema_sequence_argument_reports(writer, prefix, record, record_outcome)
+        schema_composite_lookup_reports(reader, writer, prefix, record)
+        schema_sequence_oid_permission_reports(writer, prefix, record, record_outcome)
         for relation in ("views", "sequences", "view_table_usage", "view_column_usage"):
             record(writer, f"{prefix}.information_types.{relation}",
                    f"SELECT * FROM information_schema.{relation} LIMIT 0")

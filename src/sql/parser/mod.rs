@@ -257,6 +257,7 @@ pub struct Parser<'a> {
     peek_at: usize,
     previous_token: Option<(Tok<'a>, usize, usize)>,
     column_sources: Option<core::cell::RefCell<QuerySourceCollector<'a>>>,
+    namespace_sources: Option<core::cell::RefCell<SchemaSqlSourceCollector<'a>>>,
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
@@ -291,6 +292,123 @@ pub struct Parser<'a> {
     /// column merely because the caller used the named spelling.
     routine_parameters: [Option<&'a str>; crate::storage::MAX_ROUTINE_ARGUMENTS],
     routine_name: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NamespaceSource {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogLiteralKind {
+    QualifiedName,
+    SchemaName,
+    TypeName,
+    RoutineIdentity,
+    OperatorName,
+    OperatorIdentity,
+}
+
+impl CatalogLiteralKind {
+    pub(super) fn for_cast(name: &str) -> Option<Self> {
+        match name {
+            "regclass" | "regproc" | "regcollation" | "regconfig" | "regdictionary" => {
+                Some(Self::QualifiedName)
+            }
+            "regnamespace" => Some(Self::SchemaName),
+            "regtype" => Some(Self::TypeName),
+            "regprocedure" => Some(Self::RoutineIdentity),
+            "regoper" => Some(Self::OperatorName),
+            "regoperator" => Some(Self::OperatorIdentity),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogLiteralSource<'a> {
+    pub(crate) kind: CatalogLiteralKind,
+    pub(crate) position: NamespaceSource,
+    pub(crate) value: &'a str,
+}
+
+struct SchemaSqlSourceCollector<'a> {
+    namespaces: ArenaList<'a, NamespaceSource>,
+    catalog_literals: ArenaList<'a, CatalogLiteralSource<'a>>,
+    string_literals: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
+}
+
+pub(crate) struct SchemaSqlSources<'a> {
+    pub(crate) namespaces: &'a [NamespaceSource],
+    pub(crate) catalog_literals: &'a [CatalogLiteralSource<'a>],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StoredSqlKind {
+    Expression,
+    Statements,
+    TypeName,
+    RoutineIdentity,
+    OperatorName,
+    OperatorIdentity,
+}
+
+/// Namespace positions come from grammar nodes, so table aliases and record
+/// fields cannot be mistaken for namespaces during a stored definition edit.
+pub(crate) fn schema_namespace_sources<'arena>(
+    sql: &str,
+    kind: StoredSqlKind,
+    arena: &'arena Arena,
+) -> Result<SchemaSqlSources<'arena>, super::eval::SqlError> {
+    let sql = arena
+        .alloc_str(sql)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.namespace_sources = Some(core::cell::RefCell::new(SchemaSqlSourceCollector {
+        namespaces: ArenaList::new(arena),
+        catalog_literals: ArenaList::new(arena),
+        string_literals: ArenaList::new(arena),
+    }));
+    let parsed = match kind {
+        StoredSqlKind::Expression => parser.expression(0).map(|_| ()),
+        StoredSqlKind::TypeName => parser.type_name_mod().map(|_| ()),
+        StoredSqlKind::RoutineIdentity => parser.routine_identity().map(|_| ()),
+        StoredSqlKind::OperatorName => parser
+            .operator_qual_name("stored operator name is invalid")
+            .map(|_| ()),
+        StoredSqlKind::OperatorIdentity => parser.operator_identity().map(|_| ()),
+        StoredSqlKind::Statements => (|| {
+            while parser.peeked != Tok::Eof {
+                let _ = parser.statement()?;
+                if parser.peeked != Tok::Eof {
+                    parser.expect_op(";")?;
+                }
+            }
+            Ok(())
+        })(),
+    };
+    parsed.map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after stored SQL"
+        ));
+    }
+    let sources = parser
+        .namespace_sources
+        .as_ref()
+        .expect("explicit namespace capture")
+        .borrow();
+    // The returned positions own no references into the source being edited.
+    Ok(SchemaSqlSources {
+        namespaces: arena
+            .alloc_slice_copy(sources.namespaces.as_slice())
+            .map_err(|_| super::query::arena_full_pub())?,
+        catalog_literals: arena
+            .alloc_slice_copy(sources.catalog_literals.as_slice())
+            .map_err(|_| super::query::arena_full_pub())?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -538,6 +656,7 @@ impl<'a> Parser<'a> {
             string_parameters: &[],
             previous_token: None,
             column_sources: None,
+            namespace_sources: None,
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
             allow_into: false,
@@ -630,8 +749,13 @@ impl<'a> Parser<'a> {
     /// `[schema.]name` — a possibly-qualified relation name in a statement
     /// position (DDL targets, DML tables).
     fn qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
+            self.record_namespace(source)?;
             Ok(QualName {
                 schema: Some(first),
                 name: self.col_ident(what)?,
@@ -642,8 +766,13 @@ impl<'a> Parser<'a> {
     }
 
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.any_ident(what)?;
         if self.eat_op(".")? {
+            self.record_namespace(source)?;
             Ok(QualName {
                 schema: Some(first),
                 name: self.any_ident(what)?,
@@ -2705,8 +2834,13 @@ impl<'a> Parser<'a> {
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
+            self.record_namespace(source)?;
             (Some(first), self.col_ident("table name")?)
         } else {
             (None, first)
@@ -7525,12 +7659,17 @@ impl<'a> Parser<'a> {
     /// `(...)`). varchar/char carry a length; numeric/decimal carry
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
+        let source = NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
         let mut name = self.any_ident("type name")?;
         // System-qualified built-ins normalize to their bare spelling. A user
         // schema is part of the type identity and must survive parsing; dropping
         // it aliases same-named domains/enums in different schemas.
         if self.peeked == Tok::Op(".") {
+            self.record_namespace(source)?;
             let schema = name;
             self.advance()?;
             let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
@@ -7973,6 +8112,63 @@ impl<'a> Parser<'a> {
     }
 
     // --- token helpers ---
+
+    fn record_namespace(&self, source: NamespaceSource) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources {
+            sources
+                .borrow_mut()
+                .namespaces
+                .push(source)
+                .map_err(|_| self.arena_full("namespace source map exceeds SQL arena"))?;
+        }
+        Ok(())
+    }
+
+    fn record_string_literal(
+        &self,
+        expression: &'a Expr<'a>,
+        source: NamespaceSource,
+    ) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources {
+            sources
+                .borrow_mut()
+                .string_literals
+                .push((expression, source))
+                .map_err(|_| self.arena_full("literal source map exceeds SQL arena"))?;
+        }
+        Ok(())
+    }
+
+    fn record_catalog_literal(
+        &self,
+        expression: &'a Expr<'a>,
+        kind: CatalogLiteralKind,
+    ) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources
+            && let Expr::Str(value) = expression
+        {
+            let source = sources.borrow().string_literals.as_slice().iter().find_map(
+                |(candidate, source)| core::ptr::eq(*candidate, expression).then_some(*source),
+            );
+            let Some(source) = source else {
+                return Ok(());
+            };
+            let value = self
+                .arena
+                .alloc_str(value)
+                .map_err(|_| self.arena_full("bound literal source exceeds SQL arena"))?;
+            sources
+                .borrow_mut()
+                .catalog_literals
+                .push(CatalogLiteralSource {
+                    kind,
+                    position: source,
+                    value,
+                })
+                .map_err(|_| self.arena_full("bound literal source map exceeds SQL arena"))?;
+        }
+        Ok(())
+    }
 
     fn advance(&mut self) -> Result<(), ParseError> {
         self.previous_token = Some((self.peeked, self.peek_at, self.lexer.token_end()));
@@ -8463,6 +8659,31 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::mem::Budget;
+
+    #[test]
+    fn schema_sql_rewrite_sources_distinguish_namespaces_from_aliases_and_comments() {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "namespace source test", 1 << 20).unwrap();
+        let sql = "SELECT old.items.id, old.id, old.score(old.id)::old.kind COLLATE old.ordering FROM old /* namespace */ .items AS old WHERE old.id OPERATOR(old.=) 1";
+        let expected = [
+            "old.items.id",
+            "old.score",
+            "old.kind",
+            "old.ordering",
+            "old /* namespace */",
+            "old.=",
+        ]
+        .map(|name| sql.find(name).unwrap());
+        crate::mem::guard::forbid_alloc(|| {
+            let sources = schema_namespace_sources(sql, StoredSqlKind::Statements, &arena).unwrap();
+            assert_eq!(sources.namespaces.len(), expected.len());
+            assert!(sources.catalog_literals.is_empty());
+            for source in sources.namespaces {
+                assert!(expected.contains(&source.start));
+                assert_eq!(&sql[source.start..source.end], "old");
+            }
+        });
+    }
 
     /// The pre-arena parser's fixed list boundary; tests cross it to prove
     /// the boundary is gone.

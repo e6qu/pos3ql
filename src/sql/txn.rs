@@ -359,6 +359,7 @@ pub(crate) enum DdlUndo {
     ViewChanged(crate::storage::ViewPublication),
     ViewDropped(crate::storage::CatalogDdlUndo),
     MatviewPopulationChanged(crate::storage::MatviewPopulationUndo),
+    MatviewQueryChanged(crate::storage::MatviewQueryUndo),
     RuleChanged {
         publication: crate::storage::RulePublication,
         prior_table_rule_txid: Option<u32>,
@@ -586,10 +587,7 @@ pub(crate) enum DdlUndo {
     /// DROP SCHEMA at this slot — undo by reviving it.
     SchemaDropped(u32),
     /// ALTER SCHEMA ... RENAME TO changed a schema identity in place.
-    SchemaRenamed {
-        slot: u32,
-        prior: crate::storage::SqlName,
-    },
+    SchemaRenamed(crate::storage::SchemaNameUndo),
     ExtensionCreated(u32),
     ExtensionDropped(u32),
     ExtensionAltered {
@@ -649,7 +647,7 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingComment>,
     },
     /// A table-constraint rename changed a comment's transaction-local name.
-    ConstraintCommentRenamed {
+    CommentIdentityChanged {
         slot: u32,
         prior: Option<crate::storage::PendingCommentIdentity>,
     },
@@ -2479,6 +2477,18 @@ impl TxnState {
         storage.validate_sequence_change(change, self.txid)?;
         if let Err(error) = self.record_ddl(DdlUndo::SequenceChanged(change)) {
             storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_catalog_change(
+        &mut self,
+        storage: &mut crate::storage::Storage,
+        undo: DdlUndo,
+    ) -> Result<(), SqlError> {
+        if let Err(error) = self.record_ddl(undo) {
+            super::rollback_catalog_change(storage, undo, self.txid);
             return Err(error);
         }
         Ok(())

@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 14;
+pub(crate) const RECORD_VERSION: u8 = 15;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1377,9 +1377,16 @@ pub(crate) enum WalOp<'a> {
         column: u16,
         last: i64,
     },
-    CreateSchema(&'a str),
-    DropSchema(&'a str),
+    CreateSchema {
+        identity: crate::storage::SchemaIdentity,
+        name: &'a str,
+    },
+    DropSchema {
+        identity: crate::storage::SchemaIdentity,
+        name: &'a str,
+    },
     RenameSchema {
+        identity: crate::storage::SchemaIdentity,
         name: &'a str,
         new_name: &'a str,
     },
@@ -2710,8 +2717,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::RenameIndex { .. } => KIND_RENAME_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
-        WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
-        WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
+        WalOp::CreateSchema { .. } => KIND_CREATE_SCHEMA,
+        WalOp::DropSchema { .. } => KIND_DROP_SCHEMA,
         WalOp::RenameSchema { .. } => KIND_RENAME_SCHEMA,
         WalOp::UpsertExtension { .. } => KIND_UPSERT_EXTENSION,
         WalOp::DropExtension { .. } => KIND_DROP_EXTENSION,
@@ -3385,8 +3392,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             new_name,
         } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
-        WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
-        WalOp::RenameSchema { name, new_name } => 1 + name.len() + 1 + new_name.len(),
+        WalOp::CreateSchema { name, .. } | WalOp::DropSchema { name, .. } => 8 + 1 + name.len(),
+        WalOp::RenameSchema { name, new_name, .. } => 8 + 1 + name.len() + 1 + new_name.len(),
         WalOp::UpsertExtension {
             name,
             schema,
@@ -5466,9 +5473,17 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= name_bytes(buffer, schema);
             ok
         }
-        WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
-        WalOp::RenameSchema { name, new_name } => {
-            name_bytes(buffer, name) && name_bytes(buffer, new_name)
+        WalOp::CreateSchema { identity, name } | WalOp::DropSchema { identity, name } => {
+            buffer.append(&identity.created_at().to_le_bytes()) && name_bytes(buffer, name)
+        }
+        WalOp::RenameSchema {
+            identity,
+            name,
+            new_name,
+        } => {
+            buffer.append(&identity.created_at().to_le_bytes())
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, new_name)
         }
         WalOp::UpsertExtension {
             name,
@@ -11016,17 +11031,43 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_CREATE_SCHEMA => decode_large_op(|| {
+            let identity = crate::storage::SchemaIdentity::parse(u64::from_le_bytes(
+                payload.get(at..at + 8)?.try_into().ok()?,
+            ))?;
+            at += 8;
+            if identity.is_initial_public() {
+                return None;
+            }
             let name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::CreateSchema(name))
+            let _ = crate::storage::SqlName::parse(name).ok()?;
+            (at == payload.len() && !name.is_empty())
+                .then_some(WalOp::CreateSchema { identity, name })
         }),
         KIND_DROP_SCHEMA => decode_large_op(|| {
+            let identity = crate::storage::SchemaIdentity::parse(u64::from_le_bytes(
+                payload.get(at..at + 8)?.try_into().ok()?,
+            ))?;
+            at += 8;
             let name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropSchema(name))
+            let _ = crate::storage::SqlName::parse(name).ok()?;
+            (at == payload.len() && !name.is_empty())
+                .then_some(WalOp::DropSchema { identity, name })
         }),
         KIND_RENAME_SCHEMA => decode_large_op(|| {
+            let identity = crate::storage::SchemaIdentity::parse(u64::from_le_bytes(
+                payload.get(at..at + 8)?.try_into().ok()?,
+            ))?;
+            at += 8;
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::RenameSchema { name, new_name })
+            let _ = crate::storage::SqlName::parse(name).ok()?;
+            let _ = crate::storage::SqlName::parse(new_name).ok()?;
+            (at == payload.len() && !name.is_empty() && !new_name.is_empty() && name != new_name)
+                .then_some(WalOp::RenameSchema {
+                    identity,
+                    name,
+                    new_name,
+                })
         }),
         KIND_UPSERT_EXTENSION => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -12787,6 +12828,52 @@ fn decode_bounded_default_bytes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn schema_name_wal_records_reject_invalid_identities_names_and_trailing_bytes() {
+        crate::mem::guard::forbid_alloc(|| {
+            let mut record = [0_u8; 128];
+            record[0] = KIND_CREATE_SCHEMA;
+            record[1] = RECORD_VERSION;
+            record[8..16].copy_from_slice(&77_u64.to_le_bytes());
+            record[16] = 3;
+            record[17..20].copy_from_slice(b"nsp");
+            match decode_record(&record[..20]) {
+                Some(WalOp::CreateSchema { identity, name }) => {
+                    assert_eq!(identity.created_at(), 77);
+                    assert_eq!(name, "nsp");
+                }
+                _ => panic!("valid schema creation record rejected"),
+            }
+            assert!(decode_record(&record[..21]).is_none());
+            for created_at in [0_u64, 1_920_000, u64::MAX] {
+                record[8..16].copy_from_slice(&created_at.to_le_bytes());
+                assert!(decode_record(&record[..20]).is_none());
+            }
+            record[8..16].copy_from_slice(&77_u64.to_le_bytes());
+            record[16] = 0;
+            assert!(decode_record(&record[..17]).is_none());
+            record[16] = 64;
+            record[17..81].fill(b'n');
+            assert!(decode_record(&record[..81]).is_none());
+            record[16] = 3;
+            record[17..20].copy_from_slice(b"nsp");
+            record[8..16].copy_from_slice(&0_u64.to_le_bytes());
+            record[0] = KIND_DROP_SCHEMA;
+            assert!(
+                matches!(decode_record(&record[..20]), Some(WalOp::DropSchema { identity, .. }) if identity.is_initial_public())
+            );
+            record[0] = KIND_RENAME_SCHEMA;
+            record[20] = 3;
+            record[21..24].copy_from_slice(b"new");
+            assert!(
+                matches!(decode_record(&record[..24]), Some(WalOp::RenameSchema { identity, name: "nsp", new_name: "new" }) if identity.is_initial_public())
+            );
+            record[21..24].copy_from_slice(b"nsp");
+            assert!(decode_record(&record[..24]).is_none());
+            record[20] = 0;
+            assert!(decode_record(&record[..21]).is_none());
+        });
+    }
     fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8]) -> &'a [u8] {
         let mut budget = Budget::new(bytes.len());
         let mut payload = FixedBuf::new(

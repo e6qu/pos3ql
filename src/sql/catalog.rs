@@ -40,6 +40,10 @@ mod constraints;
 pub(crate) mod expressions;
 #[path = "catalog_information.rs"]
 mod information;
+#[path = "catalog_privileges.rs"]
+mod privileges;
+#[path = "catalog_routines.rs"]
+mod routines;
 
 #[path = "catalog_type_io.rs"]
 mod type_io;
@@ -57,9 +61,10 @@ pub struct SynthTable<'a> {
 /// Stable per-name OIDs so a table's oid is consistent within a session.
 /// User relations start above the reserved range.
 const FIRST_USER_OID: i32 = 16384;
-const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
+// PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
+const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
@@ -8701,6 +8706,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "role_table_grants"
                 | "sequences"
                 | "usage_privileges"
+                | "role_usage_grants"
                 | "domains"
                 | "domain_constraints"
                 | "check_constraints"
@@ -8877,6 +8883,106 @@ pub(crate) fn synthesize<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     if qualifier == Some("information_schema") {
         match name {
+            "schemata" => {
+                return information::schemata(storage, txid, views::Read::Statement, arena);
+            }
+            "routines" => return routines::routines(storage, txid, views::Read::Statement, arena),
+            "parameters" => {
+                return routines::parameters(storage, txid, views::Read::Statement, arena);
+            }
+            "routine_privileges" => {
+                return privileges::routines(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_routine_grants" => {
+                return privileges::routines(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "table_privileges" => {
+                return privileges::tables(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_table_grants" => {
+                return privileges::tables(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "column_privileges" => {
+                return privileges::columns_view(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_column_grants" => {
+                return privileges::columns_view(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "usage_privileges" => {
+                return privileges::usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::Accessible,
+                    arena,
+                );
+            }
+            "role_usage_grants" => {
+                return privileges::usage(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    privileges::Visibility::EnabledRoles,
+                    arena,
+                );
+            }
+            "enabled_roles" => {
+                return views::enabled_roles(storage, txid, views::Read::Statement, arena);
+            }
+            "applicable_roles" => {
+                return views::applicable_roles(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::MembershipView::Applicable,
+                    arena,
+                );
+            }
+            "administrable_role_authorizations" => {
+                return views::applicable_roles(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::MembershipView::Administrable,
+                    arena,
+                );
+            }
             "views" => return information::views(storage, txid, views::Read::Statement, arena),
             "sequences" => {
                 return information::sequences(storage, txid, views::Read::Statement, arena);
@@ -8955,6 +9061,25 @@ pub(crate) fn synthesize<'a>(
             "pg_tables" => return views::tables(storage, txid, views::Read::Statement, arena),
             "pg_indexes" => return views::indexes(storage, txid, views::Read::Statement, arena),
             "pg_roles" => return views::roles(storage, txid, views::Read::Statement, arena),
+            "pg_group" => return views::groups(storage, txid, views::Read::Statement, arena),
+            "pg_user" => {
+                return views::accounts(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::AccountView::Users,
+                    arena,
+                );
+            }
+            "pg_shadow" => {
+                return views::accounts(
+                    storage,
+                    txid,
+                    views::Read::Statement,
+                    views::AccountView::Shadow,
+                    arena,
+                );
+            }
             _ => {}
         }
     }
@@ -9283,9 +9408,21 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_depend") => pg_depend(storage, txid, arena),
         (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
         (false, "pg_roles") => views::roles(storage, txid, views::Read::Current, arena),
-        (false, "pg_group") => pg_group(storage, txid, arena),
-        (false, "pg_shadow") => pg_shadow(storage, txid, arena, false),
-        (false, "pg_user") => pg_shadow(storage, txid, arena, true),
+        (false, "pg_group") => views::groups(storage, txid, views::Read::Current, arena),
+        (false, "pg_shadow") => views::accounts(
+            storage,
+            txid,
+            views::Read::Current,
+            views::AccountView::Shadow,
+            arena,
+        ),
+        (false, "pg_user") => views::accounts(
+            storage,
+            txid,
+            views::Read::Current,
+            views::AccountView::Users,
+            arena,
+        ),
         (false, "pg_authid") => pg_authid(
             storage,
             txid,
@@ -9333,7 +9470,7 @@ pub(crate) fn synthesize_current<'a>(
         (true, "foreign_servers") => info_foreign_servers(storage, txid, arena),
         (true, "foreign_table_options") => info_foreign_table_options(storage, txid, arena),
         (true, "foreign_tables") => info_foreign_tables(storage, txid, arena),
-        (true, "schemata") => info_schemata(storage, txid, arena),
+        (true, "schemata") => information::schemata(storage, txid, views::Read::Current, arena),
         (true, "table_constraints") => {
             constraints::tables(storage, txid, views::Read::Current, arena)
         }
@@ -9347,10 +9484,35 @@ pub(crate) fn synthesize_current<'a>(
         (true, "referential_constraints") => {
             constraints::references(storage, txid, views::Read::Current, arena)
         }
-        (true, "table_privileges") => info_table_privileges(storage, txid, arena),
-        (true, "role_table_grants") => info_role_table_grants(storage, txid, arena),
+        (true, "table_privileges") => privileges::tables(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_table_grants") => privileges::tables(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "sequences") => information::sequences(storage, txid, views::Read::Current, arena),
-        (true, "usage_privileges") => info_usage_privileges(storage, txid, arena),
+        (true, "usage_privileges") => privileges::usage(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_usage_grants") => privileges::usage(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "domains") => info_domains(storage, txid, arena),
         (true, "domain_constraints") => {
             constraints::domains(storage, txid, views::Read::Current, arena)
@@ -9365,18 +9527,52 @@ pub(crate) fn synthesize_current<'a>(
         (true, "collation_character_set_applicability") => {
             info_collation_character_set_applicability(storage, txid, arena)
         }
-        (true, "applicable_roles") => info_applicable_roles(storage, txid, arena, false),
-        (true, "administrable_role_authorizations") => {
-            info_applicable_roles(storage, txid, arena, true)
-        }
-        (true, "enabled_roles") => info_enabled_roles(storage, txid, arena),
-        (true, "column_privileges") => info_column_privileges(storage, txid, arena, true),
-        (true, "role_column_grants") => info_column_privileges(storage, txid, arena, false),
+        (true, "applicable_roles") => views::applicable_roles(
+            storage,
+            txid,
+            views::Read::Current,
+            views::MembershipView::Applicable,
+            arena,
+        ),
+        (true, "administrable_role_authorizations") => views::applicable_roles(
+            storage,
+            txid,
+            views::Read::Current,
+            views::MembershipView::Administrable,
+            arena,
+        ),
+        (true, "enabled_roles") => views::enabled_roles(storage, txid, views::Read::Current, arena),
+        (true, "column_privileges") => privileges::columns_view(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_column_grants") => privileges::columns_view(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "views") => information::views(storage, txid, views::Read::Current, arena),
-        (true, "routines") => info_routines(storage, txid, arena),
-        (true, "parameters") => info_parameters(storage, txid, arena),
-        (true, "routine_privileges") => info_routine_privileges(storage, txid, arena, true),
-        (true, "role_routine_grants") => info_routine_privileges(storage, txid, arena, false),
+        (true, "routines") => routines::routines(storage, txid, views::Read::Current, arena),
+        (true, "parameters") => routines::parameters(storage, txid, views::Read::Current, arena),
+        (true, "routine_privileges") => privileges::routines(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::Accessible,
+            arena,
+        ),
+        (true, "role_routine_grants") => privileges::routines(
+            storage,
+            txid,
+            views::Read::Current,
+            privileges::Visibility::EnabledRoles,
+            arena,
+        ),
         (true, "view_table_usage") => information::view_usage(
             storage,
             txid,
@@ -9803,7 +9999,9 @@ fn catalog_owner(
     txid: u32,
 ) -> CatalogOwner {
     if matches!(object.class, crate::storage::AccessClass::Schema)
-        && storage.schema_def(usize::from(object.slot)).name.as_str() == "public"
+        && storage
+            .schema_def_for(usize::from(object.slot), txid)
+            .has_database_owner(txid)
     {
         CatalogOwner::DatabaseOwner
     } else {
@@ -10400,7 +10598,11 @@ fn pg_default_acl<'a>(
         } else {
             namespace_oid(
                 storage,
-                storage.schema_def(entry.schema as usize).name.as_str(),
+                storage
+                    .schema_def_for(entry.schema as usize, txid)
+                    .name
+                    .as_str(),
+                txid,
             )
         };
         let object_type = match entry.class {
@@ -10429,31 +10631,28 @@ fn pg_default_acl<'a>(
     finish(def, &rows[..row_count], arena)
 }
 
-/// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
-/// schema's OID is derived from its registry slot, above the table range.
-const FIRST_SCHEMA_OID: i32 = 80_000;
-const FIRST_TEMP_NAMESPACE_OID: i32 = 2_000_000;
-pub(crate) const fn namespace_oid_for_slot(slot: usize) -> i32 {
-    FIRST_SCHEMA_OID + slot as i32
+use crate::storage::FIRST_TEMP_NAMESPACE_OID;
+/// Durable schema identities survive renames, slot reuse and database clones.
+pub(crate) fn namespace_oid_for_slot(storage: &Storage, slot: usize) -> i32 {
+    storage
+        .schema_def(slot)
+        .identity()
+        .map_or(0, crate::storage::SchemaIdentity::oid)
 }
 
-fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
+fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
     match schema {
-        "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         "pg_toast" => PG_TOAST_NS_OID,
+        "information_schema" => INFORMATION_SCHEMA_NS_OID,
         _ if schema.starts_with("pg_temp_") => schema[8..]
             .parse::<i32>()
             .ok()
             .and_then(|connection| connection.checked_add(FIRST_TEMP_NAMESPACE_OID))
             .unwrap_or(0),
         _ => storage
-            .find_schema(schema)
-            .or_else(|| {
-                (0..storage.schema_count())
-                    .find(|slot| storage.schema_def(*slot).name.as_str() == schema)
-            })
-            .map(namespace_oid_for_slot)
+            .find_schema_visible(schema, txid)
+            .map(|slot| namespace_oid_for_slot(storage, slot))
             .unwrap_or(0),
     }
 }
@@ -10474,7 +10673,7 @@ pub(crate) fn current_temporary_namespace_oid(storage: &Storage, txid: u32) -> i
                 == crate::storage::RelationPersistence::Temporary
     });
     if exists {
-        namespace_oid(storage, schema.as_str())
+        namespace_oid(storage, schema.as_str(), txid)
     } else {
         0
     }
@@ -10487,12 +10686,17 @@ pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i3
             storage.table_slot_visible_to(slot, txid)
                 && storage.table_def(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str()) == oid
+                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str(), txid)
+                    == oid
         }) || (0..storage.sequence_count()).any(|slot| {
             storage.sequence_slot_visible_to(slot, txid)
                 && storage.sequence_for(slot, txid).persistence
                     == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.sequence_for(slot, txid).schema.as_str()) == oid
+                && namespace_oid(
+                    storage,
+                    storage.sequence_for(slot, txid).schema.as_str(),
+                    txid,
+                ) == oid
         }))
 }
 
@@ -10502,21 +10706,21 @@ pub(crate) fn schema_name_by_oid(
     oid: i32,
 ) -> Option<crate::storage::SqlName> {
     match oid {
-        PUBLIC_NS_OID => crate::storage::SqlName::parse("public").ok(),
         PG_CATALOG_NS_OID => crate::storage::SqlName::parse("pg_catalog").ok(),
         PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
+        INFORMATION_SCHEMA_NS_OID => crate::storage::SqlName::parse("information_schema").ok(),
         _ => (0..storage.table_count())
             .find_map(|slot| {
                 let table = storage.table_def(slot, txid);
                 (storage.table_slot_visible_to(slot, txid)
                     && table.persistence == crate::storage::RelationPersistence::Temporary
-                    && namespace_oid(storage, table.schema.as_str()) == oid)
+                    && namespace_oid(storage, table.schema.as_str(), txid) == oid)
                     .then_some(table.schema)
             })
             .or_else(|| {
                 storage
                     .visible_schemas(txid)
-                    .find(|(slot, _)| namespace_oid_for_slot(*slot) == oid)
+                    .find(|(slot, _)| namespace_oid_for_slot(storage, *slot) == oid)
                     .map(|(_, schema)| schema.name)
             }),
     }
@@ -10524,13 +10728,13 @@ pub(crate) fn schema_name_by_oid(
 
 pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
     match name {
-        "public" => Some(PUBLIC_NS_OID),
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
+        "information_schema" => Some(INFORMATION_SCHEMA_NS_OID),
         "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
             .then(|| current_temporary_namespace_oid(storage, txid)),
         _ if name.starts_with("pg_temp_") => {
-            let oid = namespace_oid(storage, name);
+            let oid = namespace_oid(storage, name, txid);
             (oid != 0
                 && ((0..storage.table_count()).any(|slot| {
                     storage.table_slot_visible_to(slot, txid)
@@ -10547,12 +10751,18 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         }
         _ => storage
             .find_schema_visible(name, txid)
-            .map(namespace_oid_for_slot),
+            .map(|slot| namespace_oid_for_slot(storage, slot)),
     }
 }
 
 pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    for name in ["public", "pg_catalog", "pg_toast", "pg_temp"] {
+    for name in [
+        "public",
+        "pg_catalog",
+        "pg_toast",
+        "information_schema",
+        "pg_temp",
+    ] {
         if identifier_spelling_matches(written, name) {
             return schema_oid_by_name(storage, txid, name);
         }
@@ -10579,7 +10789,7 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
     }
     storage.visible_schemas(txid).find_map(|(slot, schema)| {
         identifier_spelling_matches(written, schema.name.as_str())
-            .then_some(namespace_oid_for_slot(slot))
+            .then_some(namespace_oid_for_slot(storage, slot))
     })
 }
 
@@ -10985,12 +11195,20 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
 /// UNIQUE (from column flags), a multi-column PK/UNIQUE (from `uniques`), and
 /// explicit `CREATE INDEX`es. OIDs are assigned by table slot + position so the
 /// same index resolves identically here and in `pg_get_indexdef`.
-fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
+fn visit_indexes(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    mut visit: impl FnMut(IdxInfo),
+) {
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
         let def = storage.table_def(slot, txid);
+        if schema.is_some_and(|schema| def.schema.as_str() != schema) {
+            continue;
+        }
         let table_name = def.name.as_str();
         let toid = table_oid(storage, slot);
         let mut pos = 0usize;
@@ -11192,7 +11410,7 @@ pub(crate) fn value_index_identity(
 ) -> Option<(i32, StackStr<64>, crate::sql::ast::IndexAccessMethod)> {
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if found.is_none()
             && index.table_slot == table_slot
             && index.n_cols == columns.len()
@@ -11236,7 +11454,7 @@ pub(crate) fn ordered_value_index_identity(
     }
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot
             || index.method != crate::sql::ast::IndexAccessMethod::Btree
             || index.n_cols != columns.len()
@@ -11306,7 +11524,7 @@ pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid
         return;
     }
     let mut is_index = false;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         is_index |= index.oid == oid;
     });
     if is_index {
@@ -11324,7 +11542,7 @@ pub(crate) fn replica_identity_index_oid(
     })?;
     let mode = storage.table_def(table_slot, txid).replica_identity;
     let mut selected = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot || selected.is_some() {
             return;
         }
@@ -11402,12 +11620,12 @@ fn collect_indexes<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [IdxInfo], SqlError> {
     let mut count = 0usize;
-    visit_indexes(storage, txid, |_| count += 1);
+    visit_indexes(storage, txid, None, |_| count += 1);
     let indexes = arena
         .alloc_slice_with(count, |_| empty_index())
         .map_err(|_| arena_full())?;
     let mut next = 0usize;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         indexes[next] = index;
         next += 1;
     });
@@ -11422,7 +11640,7 @@ fn index_oid_by_name(
 ) -> Option<i32> {
     let current_temporary_schema = storage.temporary_schema().ok();
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, schema, |index| {
         let table = storage.table_def(index.table_slot, txid);
         let is_current_temporary = table.persistence
             == crate::storage::RelationPersistence::Temporary
@@ -11445,7 +11663,7 @@ fn index_oid_by_name(
 
 fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
     let mut found = false;
-    visit_indexes(storage, txid, |index| found |= index.oid == oid);
+    visit_indexes(storage, txid, None, |index| found |= index.oid == oid);
     found
 }
 
@@ -11458,7 +11676,7 @@ pub(crate) fn index_identity_by_oid(
     oid: i32,
 ) -> Option<(crate::storage::SqlName, StackStr<128>)> {
     let mut found = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.oid == oid {
             found = Some((
                 storage.table_def(index.table_slot, txid).schema,
@@ -11540,84 +11758,106 @@ pub fn relname_text<'a>(
 /// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
 /// ordinary tables, synthesized index relations, sequences, plain views, and
 /// named composite backing relations; `None` if no such relation.
-pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
-    let (requested_schema, relation) = name
-        .split_once('.')
-        .map_or((None, name), |(schema, relation)| (Some(schema), relation));
-    let current_temporary_schema = storage.temporary_schema().ok();
-    let classified_schema = storage
-        .classify_relation(requested_schema, relation, txid)
-        .map(|(schema, _)| schema);
-    let schema = match (classified_schema.as_ref(), requested_schema) {
-        (Some(schema), _) => Some(schema.as_str()),
-        (None, Some("pg_temp")) => Some(current_temporary_schema.as_ref()?.as_str()),
-        (None, Some(schema)) if schema.starts_with("pg_temp_") => {
-            if current_temporary_schema
-                .as_ref()
-                .is_none_or(|current| current.as_str() != schema)
+pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option<i32>, SqlError> {
+    match crate::sql::identifiers::ObjectReference::parse(name)? {
+        crate::sql::identifiers::ObjectReference::Oid(oid) => Ok(Some(oid as i32)),
+        crate::sql::identifiers::ObjectReference::Name(parsed) => {
+            if parsed
+                .database
+                .is_some_and(|database| database != storage.current_database_name(txid))
             {
-                return None;
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cross-database relation references are not supported"
+                ));
             }
-            Some(schema)
+            if let Some(schema) = parsed.schema.as_ref()
+                && storage.find_schema_visible(schema.as_str(), txid).is_some()
+            {
+                storage.require_schema_usage(schema.as_str(), txid)?;
+            }
+            Ok(relation_oid_for_name(
+                storage,
+                txid,
+                parsed.schema.as_ref().map(SqlName::as_str),
+                parsed.name.as_str(),
+            ))
         }
-        (None, schema) => schema,
-    };
-    if schema.is_none_or(|schema| schema == "pg_catalog")
+    }
+}
+
+pub(super) fn relation_oid_for_name(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<i32> {
+    if let Some(schema) = schema {
+        if schema == "pg_temp" {
+            return relation_oid_in_schema(
+                storage,
+                txid,
+                storage.temporary_schema().ok()?.as_str(),
+                name,
+            );
+        }
+        if schema.starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema) {
+            return None;
+        }
+        return relation_oid_in_schema(storage, txid, schema, name);
+    }
+    if let Ok(temporary) = storage.temporary_schema()
+        && let Some(oid) = relation_oid_in_schema(storage, txid, temporary.as_str(), name)
+    {
+        return Some(oid);
+    }
+    for entry in storage.path().entries() {
+        let schema = match entry {
+            crate::storage::PathEntry::Catalog => {
+                SqlName::parse("pg_catalog").expect("catalog name fits")
+            }
+            crate::storage::PathEntry::Schema(slot) => {
+                let definition = storage.schema_def_for(usize::from(*slot), txid);
+                if !definition.visible_to(txid) {
+                    continue;
+                }
+                definition.name
+            }
+        };
+        if let Some(oid) = relation_oid_in_schema(storage, txid, schema.as_str(), name) {
+            return Some(oid);
+        }
+    }
+    None
+}
+
+fn relation_oid_in_schema(
+    storage: &Storage,
+    txid: u32,
+    schema: &str,
+    relation: &str,
+) -> Option<i32> {
+    if schema == "pg_catalog"
         && let Some(oid) = catalog_relation_oid(relation)
     {
         return Some(oid);
     }
-    match storage.resolve_relation(schema, relation, txid) {
+    match storage.resolve_relation(Some(schema), relation, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
             return Some(table_oid(storage, slot));
         }
         Some(crate::storage::ResolvedRelation::View(slot)) => return Some(view_oid(slot)),
         Some(crate::storage::ResolvedRelation::Catalog) | None => {}
     }
-    for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid)
-            && storage.table_def(slot, txid).name.as_str() == relation
-            && schema.is_none_or(|schema| storage.table_def(slot, txid).schema.as_str() == schema)
-            && (storage.table_def(slot, txid).persistence
-                != crate::storage::RelationPersistence::Temporary
-                || current_temporary_schema
-                    .as_ref()
-                    .is_some_and(|current| *current == storage.table_def(slot, txid).schema))
-        {
-            return Some(table_oid(storage, slot));
-        }
-    }
-    if let Some(oid) = index_oid_by_name(storage, txid, schema, relation) {
+    if let Some(oid) = index_oid_by_name(storage, txid, Some(schema), relation) {
         return Some(oid);
     }
-    for slot in 0..storage.sequence_count() {
-        let sequence = storage.sequence_for(slot, txid);
-        if storage.sequence_slot_visible_to(slot, txid)
-            && sequence.name.as_str() == relation
-            && schema.is_none_or(|schema| sequence.schema.as_str() == schema)
-            && (sequence.persistence != crate::storage::RelationPersistence::Temporary
-                || current_temporary_schema
-                    .as_ref()
-                    .is_some_and(|current| *current == sequence.schema))
-        {
-            return Some(sequence_oid(slot));
-        }
+    if let Some(slot) = storage.sequence_slot(schema, relation, txid) {
+        return Some(sequence_oid(slot));
     }
-    let composite_slot = schema.map_or_else(
-        || storage.resolve_composite_slot(relation, txid),
-        |schema| storage.composite_slot(schema, relation, txid),
-    );
-    if let Some(slot) = composite_slot {
-        return Some(named_composite_relation_oid(slot));
-    }
-    (0..storage.view_count())
-        .find(|&slot| {
-            storage.view_slot_visible_to(slot, txid)
-                && storage.view(slot).name_for(txid).as_str() == relation
-                && schema
-                    .is_none_or(|schema| storage.view(slot).schema_for(txid).as_str() == schema)
-        })
-        .map(view_oid)
+    storage
+        .composite_slot(schema, relation, txid)
+        .map(named_composite_relation_oid)
 }
 
 fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
@@ -11634,7 +11874,7 @@ fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Op
     };
     if let Some(written_schema) = written_schema {
         let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def(slot);
+            let definition = storage.schema_def_for(slot, txid);
             (definition.visible_to(txid)
                 && identifier_spelling_matches(written_schema, definition.name.as_str()))
             .then_some(definition.name)
@@ -11648,7 +11888,8 @@ fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Op
     }
     for entry in storage.path().entries() {
         if let crate::storage::PathEntry::Schema(schema) = entry
-            && let Some(slot) = in_schema(storage.schema_def(*schema as usize).name.as_str())
+            && let Some(slot) =
+                in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
         {
             return Some(slot);
         }
@@ -11723,12 +11964,14 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     if let Some(name) = catalog_relation_name(oid) {
-        return Some(reloid_of_name(storage, txid, name) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name) == Some(oid));
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid {
             let table = storage.table_def(slot, txid);
-            return Some(reloid_of_name(storage, txid, table.name.as_str()) == Some(oid));
+            return Some(
+                relation_oid_for_name(storage, txid, None, table.name.as_str()) == Some(oid),
+            );
         }
     }
     if let Some((_, name)) = index_identity_by_oid(storage, txid, oid) {
@@ -11737,20 +11980,28 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
     for slot in 0..storage.sequence_count() {
         if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid {
             let sequence = storage.sequence_for(slot, txid);
-            return Some(reloid_of_name(storage, txid, sequence.name.as_str()) == Some(oid));
+            return Some(
+                relation_oid_for_name(storage, txid, None, sequence.name.as_str()) == Some(oid),
+            );
         }
     }
     for slot in 0..storage.view_count() {
         if storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid {
             return Some(
-                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
-                    == Some(oid),
+                relation_oid_for_name(
+                    storage,
+                    txid,
+                    None,
+                    storage.view(slot).name_for(txid).as_str(),
+                ) == Some(oid),
             );
         }
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if named_composite_relation_oid(slot) == oid {
-            return Some(reloid_of_name(storage, txid, composite.name.as_str()) == Some(oid));
+            return Some(
+                relation_oid_for_name(storage, txid, None, composite.name.as_str()) == Some(oid),
+            );
         }
     }
     None
@@ -11862,7 +12113,7 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
             || oid == FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
         {
             return Some(
-                reloid_of_name(storage, txid, table.name.as_str())
+                relation_oid_for_name(storage, txid, None, table.name.as_str())
                     == Some(table_oid(storage, slot)),
             );
         }
@@ -11875,8 +12126,12 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
             || oid == FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
         {
             return Some(
-                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
-                    == Some(view_oid(slot)),
+                relation_oid_for_name(
+                    storage,
+                    txid,
+                    None,
+                    storage.view(slot).name_for(txid).as_str(),
+                ) == Some(view_oid(slot)),
             );
         }
     }
@@ -11950,6 +12205,29 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
+    function_oid_is_visible(oid).then_some(!matches!(
+        oid,
+        764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
+    ))
+}
+
+fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
+    Some(match oid {
+        2096 => (1, "0"),
+        3577 | 3578 | 3960 | 3961 => (1, "false"),
+        3786 => (3, "false, false, false"),
+        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
+            (2, "'{}'::jsonb, false")
+        }
+        6212 => (2, "0, 1"),
+        1268 => (1, "true"),
+        4350 | 4351 => (1, "'NFC'::text"),
+        3464 => (7, "0, 0, 0, 0, 0, 0, 0.0"),
+        _ => return None,
+    })
 }
 
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -12480,7 +12758,7 @@ fn routine_declared_signature<'a>(
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     let schema = routine.schema_for(txid);
-    if !storage.schema_is_on_path(schema) {
+    if !storage.schema_is_on_path(schema, txid) {
         write_identifier(&mut text, schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -12494,7 +12772,7 @@ fn routine_declared_signature<'a>(
         }
         let qualified = argument
             .user_type
-            .is_some_and(|identity| !storage.schema_is_on_path(identity.schema));
+            .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
         write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
             .map_err(|_| super::eval::arena_full())?;
     }
@@ -12639,7 +12917,7 @@ pub(crate) fn routine_name_by_oid<'a>(
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
-        if !storage.schema_is_on_path(routine.schema_for(txid)) {
+        if !storage.schema_is_on_path(routine.schema_for(txid), txid) {
             let mut qualified = StackStr::<256>::new();
             write_identifier(&mut qualified, routine.schema_for(txid).as_str());
             use core::fmt::Write;
@@ -12805,7 +13083,7 @@ pub(crate) fn operator_oid_by_name(
             builtin()
         } else {
             let schema = (0..storage.schema_count()).find_map(|slot| {
-                let definition = storage.schema_def(slot);
+                let definition = storage.schema_def_for(slot, txid);
                 (definition.visible_to(txid)
                     && identifier_spelling_matches(schema, definition.name.as_str()))
                 .then_some(definition.name)
@@ -12819,9 +13097,12 @@ pub(crate) fn operator_oid_by_name(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin()?,
-            crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def(usize::from(*slot)).name.as_str())?
-            }
+            crate::storage::PathEntry::Schema(slot) => user(
+                storage
+                    .schema_def_for(usize::from(*slot), txid)
+                    .name
+                    .as_str(),
+            )?,
         };
         if found.is_some() {
             return Ok(found);
@@ -12913,7 +13194,7 @@ pub(crate) fn operator_name_by_oid<'a>(
     let operator = storage.operator_for(slot, txid);
     let mut text = StackStr::<256>::new();
     use core::fmt::Write;
-    if !storage.schema_is_on_path(operator.schema) {
+    if !storage.schema_is_on_path(operator.schema, txid) {
         write_identifier(&mut text, operator.schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -12934,7 +13215,7 @@ pub(crate) fn operator_name_by_oid<'a>(
             if let Some(argument) = argument {
                 let qualified = argument
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema));
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
                 write_routine_type_name(&mut text, argument.ctype, argument.user_type, qualified)
                     .map_err(|_| super::eval::arena_full())?;
             } else {
@@ -13475,9 +13756,9 @@ pub fn function_arguments_text<'a>(
             &mut output,
             parameter.ctype,
             parameter.user_type,
-            parameter
-                .user_type
-                .is_some_and(|type_identity| !storage.schema_is_on_path(type_identity.schema)),
+            parameter.user_type.is_some_and(|type_identity| {
+                !storage.schema_is_on_path(type_identity.schema, txid)
+            }),
         )
         .map_err(|_| super::eval::arena_full())?;
         if !identity && let Some(default) = parameter.mode.default() {
@@ -13519,7 +13800,7 @@ pub fn function_result_text<'a>(
                 result.user_type,
                 result
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13531,7 +13812,7 @@ pub fn function_result_text<'a>(
                 result.user_type,
                 result
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13554,7 +13835,7 @@ pub fn function_result_text<'a>(
                     column.user_type,
                     column
                         .user_type
-                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                        .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
                 )
                 .map_err(|_| super::eval::arena_full())?;
             }
@@ -13583,7 +13864,7 @@ pub fn function_result_text<'a>(
                 aggregate
                     .result_type
                     .user_type
-                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                    .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid)),
             )
             .map_err(|_| super::eval::arena_full())?;
         }
@@ -13658,7 +13939,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
             return builtin();
         }
         let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def(slot);
+            let definition = storage.schema_def_for(slot, txid);
             (definition.visible_to(txid)
                 && identifier_spelling_matches(schema, definition.name.as_str()))
             .then_some(definition.name)
@@ -13668,9 +13949,12 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
-            crate::storage::PathEntry::Schema(slot) => {
-                user(storage.schema_def(usize::from(*slot)).name.as_str())
-            }
+            crate::storage::PathEntry::Schema(slot) => user(
+                storage
+                    .schema_def_for(usize::from(*slot), txid)
+                    .name
+                    .as_str(),
+            ),
         };
         if found.is_some() {
             return found;
@@ -13850,7 +14134,7 @@ fn pg_description<'a>(
                 }
             }
             crate::storage::CommentClass::Schema => {
-                (namespace_oid(storage, name), PG_NAMESPACE_OID)
+                (namespace_oid(storage, name, txid), PG_NAMESPACE_OID)
             }
             crate::storage::CommentClass::Type => match type_oid_of(storage, schema, name, txid) {
                 Some(oid) => (oid, PG_TYPE_OID),
@@ -14706,7 +14990,7 @@ fn visit_comments_for_object(
             "pg_namespace" => {
                 class == crate::storage::CommentClass::Schema
                     && subid == 0
-                    && Some(namespace_oid(storage, name)) == signed_oid
+                    && Some(namespace_oid(storage, name, txid)) == signed_oid
             }
             "pg_type" => {
                 class == crate::storage::CommentClass::Type
@@ -15054,7 +15338,7 @@ pub(crate) fn table_constraint_oid(
         return None;
     }
     let mut index_constraint = None;
-    visit_indexes(storage, txid, |index| {
+    visit_indexes(storage, txid, None, |index| {
         if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
             index_constraint = Some(index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET);
         }
@@ -15143,7 +15427,7 @@ pub(crate) fn table_constraint_identity_by_oid(
             }
         }
         let mut index_name = None;
-        visit_indexes(storage, txid, |index| {
+        visit_indexes(storage, txid, None, |index| {
             if index.table_slot == table_slot
                 && index.is_constraint
                 && index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET == oid
@@ -15832,7 +16116,7 @@ fn write_index_key_metadata(
             .operator_class_slot_by_oid(oid, txid)
             .expect("index operator class dependency is visible");
         let definition = storage.operator_class_for(slot, txid);
-        if !storage.schema_is_on_path(definition.schema) {
+        if !storage.schema_is_on_path(definition.schema, txid) {
             write_identifier(out, definition.schema.as_str());
             let _ = out.write_char('.');
         }
@@ -16009,7 +16293,7 @@ pub fn index_def_text<'a>(
     if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
             Some(
-                if pretty && reloid_of_name(storage, txid, name) == Some(relation) {
+                if pretty && relation_oid_for_name(storage, txid, None, name) == Some(relation) {
                     let (before, after) = definition
                         .split_once("pg_catalog.")
                         .expect("builtin definition names its schema");
@@ -16785,7 +17069,7 @@ fn pg_statistic_ext<'a>(
                 Datum::Int4(extended_statistics_oid(slot)),
                 Datum::Int4(table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, mutable.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Statistics,
@@ -17548,7 +17832,7 @@ fn pg_publication_namespace<'a>(
                     ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
-                    Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                    Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 ],
                 arena,
             )?;
@@ -19315,7 +19599,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(toid),
                 text(table_def.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, table_def.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table_def.schema.as_str(), txid)),
                 text(relkind, arena)?, // relkind: ordinary table 'r' / matview 'm'
                 Datum::Int4(i32::from(table_def.attributes.count)),
                 Datum::Float8(reltuples),
@@ -19494,7 +19778,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(named_composite_relation_oid(slot)),
                 text(composite.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("c", arena)?,
                 Datum::Int4(composite.active_field_count() as i32),
                 Datum::Float8(-1.0),
@@ -19541,6 +19825,7 @@ fn pg_class<'a>(
                 Datum::Int4(namespace_oid(
                     storage,
                     storage.table_def(info.table_slot, txid).schema.as_str(),
+                    txid,
                 )),
                 text(
                     if info
@@ -19624,7 +19909,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(sequence_oid(slot)),
                 text(seq.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, seq.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, seq.schema.as_str(), txid)),
                 text("S", arena)?, // relkind: sequence
                 Datum::Int4(1),    // a sequence has one row of state
                 Datum::Float8(1.0),
@@ -19724,7 +20009,7 @@ fn pg_class<'a>(
             &[
                 Datum::Int4(view_oid(slot)),
                 text(view.name_for(txid).as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("v", arena)?,
                 Datum::Int4(n_columns as i32),
                 Datum::Float8(0.0),
@@ -20237,6 +20522,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(namespace_oid(
                     storage,
                     storage.table_def(info.table_slot, txid).schema.as_str(),
+                    txid,
                 )),
                 text(" ", arena)?,
                 Datum::Bool(info.constraint_parent_oid == 0),
@@ -20321,6 +20607,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(namespace_oid(
                     storage,
                     storage.table_def(info.child_slot, txid).schema.as_str(),
+                    txid,
                 )),
                 text("s", arena)?,
                 Datum::Bool(constraint_parent_oid == 0),
@@ -20377,6 +20664,7 @@ fn pg_constraint_values<'a>(
                 Datum::Int4(namespace_oid(
                     storage,
                     storage.table_def(table, txid).schema.as_str(),
+                    txid,
                 )),
                 text(" ", arena)?,
                 Datum::Bool(true),
@@ -20414,6 +20702,7 @@ fn pg_constraint_values<'a>(
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
                 storage.table_def(child, txid).schema.as_str(),
+                txid,
             ));
             out[n] = row(&clone, arena)?;
             n += 1;
@@ -20471,6 +20760,7 @@ fn pg_constraint_values<'a>(
                     Datum::Int4(namespace_oid(
                         storage,
                         storage.table_def(slot, txid).schema.as_str(),
+                        txid,
                     )),
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
@@ -20529,7 +20819,7 @@ fn pg_constraint_values<'a>(
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 Datum::Int4(2606),
-                Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table.schema.as_str(), txid)),
                 text(" ", arena)?,
                 Datum::Bool(true),
                 Datum::Int4(0),
@@ -20587,7 +20877,7 @@ fn pg_constraint_values<'a>(
                     attnum_array(&[column_index as u16], &table, arena)?,
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
-                    Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, table.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(column.not_null.is_local()),
                     Datum::Int4(i32::from(column.not_null.is_inherited())),
@@ -20634,7 +20924,7 @@ fn pg_constraint_values<'a>(
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     Datum::Int4(2606),
-                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(true),
                     Datum::Int4(0),
@@ -20686,7 +20976,7 @@ fn pg_constraint_values<'a>(
                     Datum::Null,
                     Datum::Null,
                     Datum::Int4(PG_CONSTRAINT_OID),
-                    Datum::Int4(namespace_oid(storage, domain.schema.as_str())),
+                    Datum::Int4(namespace_oid(storage, domain.schema.as_str(), txid)),
                     text(" ", arena)?,
                     Datum::Bool(true),
                     Datum::Int4(0),
@@ -20900,7 +21190,11 @@ fn pg_extension<'a>(
                 )),
                 Datum::Int4(namespace_oid(
                     storage,
-                    storage.schema_def(namespace as usize).name.as_str(),
+                    storage
+                        .schema_def_for(namespace as usize, txid)
+                        .name
+                        .as_str(),
+                    txid,
                 )),
                 Datum::Bool(relocatable),
                 text(version.as_str(), arena)?,
@@ -20947,7 +21241,11 @@ fn extension_dependency_catalog_identity(
         }
         AccessClass::Schema => (
             PG_NAMESPACE_OID,
-            namespace_oid(storage, storage.schema_def(slot).name.as_str()),
+            namespace_oid(
+                storage,
+                storage.schema_def_for(slot, txid).name.as_str(),
+                txid,
+            ),
         ),
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
@@ -21028,7 +21326,7 @@ fn pg_depend<'a>(
         .sum::<usize>();
     let matview_dependencies = storage
         .matviews_visible_to(txid)
-        .map(|(slot, _)| storage.matview_dependencies(slot).entries().len())
+        .map(|(slot, _)| storage.matview_dependencies(slot, txid).entries().len())
         .sum::<usize>();
     let trigger_dependencies = storage
         .triggers_with_slots_visible_to(txid)
@@ -21204,7 +21502,7 @@ fn pg_depend<'a>(
             PG_OPERATOR_OID,
             oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, operator.schema.as_str()),
+            namespace_oid(storage, operator.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21227,7 +21525,7 @@ fn pg_depend<'a>(
             PG_COLLATION_OID,
             storage.collation(slot).oid(slot),
             PG_NAMESPACE_OID,
-            namespace_oid(storage, collation.schema.as_str()),
+            namespace_oid(storage, collation.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21238,7 +21536,7 @@ fn pg_depend<'a>(
             PG_CONVERSION_OID,
             oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, conversion.schema.as_str()),
+            namespace_oid(storage, conversion.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21257,7 +21555,7 @@ fn pg_depend<'a>(
             PG_OPFAMILY_OID,
             storage.operator_family(slot).oid(),
             PG_NAMESPACE_OID,
-            namespace_oid(storage, family.schema.as_str()),
+            namespace_oid(storage, family.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21269,7 +21567,7 @@ fn pg_depend<'a>(
             PG_OPCLASS_OID,
             class_oid,
             PG_NAMESPACE_OID,
-            namespace_oid(storage, class.schema.as_str()),
+            namespace_oid(storage, class.schema.as_str(), txid),
             0,
             "n",
         )?;
@@ -21569,7 +21867,7 @@ fn pg_depend<'a>(
     for (materialized_slot, _) in storage.matviews_visible_to(txid) {
         let table_slot = storage.matview_table(materialized_slot);
         for dependency in storage
-            .snapshot_matview_dependencies(materialized_slot, arena)?
+            .snapshot_matview_dependencies(materialized_slot, txid, arena)?
             .entries()
         {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
@@ -23476,7 +23774,7 @@ fn pg_operator<'a>(
                 Datum::Int4(2617),
                 Datum::Int4(storage.operator(slot).oid()),
                 text(operator.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, operator.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, operator.schema.as_str(), txid)),
                 Datum::Int4(operator.owner),
                 Datum::Bpchar(match (operator.signature.left, operator.signature.right) {
                     (None, Some(_)) => "l",
@@ -23821,7 +24119,7 @@ fn pg_opfamily<'a>(
                 Datum::Int4(storage.operator_family(slot).oid()),
                 Datum::Int4(403),
                 text(family.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, family.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, family.schema.as_str(), txid)),
                 Datum::Int4(family.owner),
             ],
             arena,
@@ -24322,7 +24620,7 @@ fn pg_opclass<'a>(
                 Datum::Int4(storage.operator_class(slot).oid()),
                 Datum::Int4(403),
                 text(class.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, class.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, class.schema.as_str(), txid)),
                 Datum::Int4(class.owner),
                 Datum::Int4(class.family),
                 Datum::Int4(catalog_routine_result_oid(storage, txid, class.input)?),
@@ -26359,10 +26657,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
-                if matches!(
-                    routine.oid,
-                    764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
-                ) {
+                if intrinsic_routine_public_execute(routine.oid) == Some(false) {
                     builtin_acl(&["postgres=X/postgres"], arena)?
                 } else {
                     Datum::Null
@@ -26422,17 +26717,9 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         name: "-",
                     },
                 },
-                Datum::Int4(match routine.oid {
-                    2096 => 1,
-                    3577 | 3578 => 1,
-                    3786 => 3,
-                    6212 => 2,
-                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => 2,
-                    3960 | 3961 => 1,
-                    1268 | 4350 | 4351 => 1,
-                    3464 => 7,
-                    _ => 0,
-                }),
+                Datum::Int4(
+                    intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32),
+                ),
                 Datum::Int4(match routine.oid {
                     6119 => super::types::oid::TEXT,
                     3058 | 3059 | 3539 => 2276,
@@ -26503,20 +26790,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     (_, None) => Datum::Null,
                 },
-                match routine.oid {
-                    2096 => Datum::Text("0"),
-                    3577 | 3578 => Datum::Text("false"),
-                    3786 => Datum::Text("false, false, false"),
-                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
-                        Datum::Text("'{}'::jsonb, false")
-                    }
-                    3960 | 3961 => Datum::Text("false"),
-                    6212 => Datum::Text("0, 1"),
-                    1268 => Datum::Text("true"),
-                    4350 | 4351 => Datum::Text("'NFC'::text"),
-                    3464 => Datum::Text("0, 0, 0, 0, 0, 0, 0.0"),
-                    _ => Datum::Null,
-                },
+                intrinsic_routine_defaults(routine.oid)
+                    .map_or(Datum::Null, |(_, source)| Datum::Text(source)),
                 Datum::Null,
             ],
             arena,
@@ -26643,7 +26918,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(1255),
                 Datum::Int4(crate::storage::routine_oid(&routine)),
                 text(routine.name_for(txid).as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, routine.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    routine.schema_for(txid).as_str(),
+                    txid,
+                )),
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Function { .. }
@@ -27373,7 +27652,7 @@ fn pg_ts_parser<'a>(
                 Datum::Oid(PG_TS_PARSER_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 text_search_regproc(start, arena)?,
                 text_search_regproc(gettoken, arena)?,
                 text_search_regproc(end, arena)?,
@@ -27414,7 +27693,7 @@ fn pg_ts_template<'a>(
                 Datum::Oid(PG_TS_TEMPLATE_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 text_search_regproc(init, arena)?,
                 text_search_regproc(lexize, arena)?,
             ],
@@ -27453,7 +27732,7 @@ fn pg_ts_dict<'a>(
                 Datum::Oid(PG_TS_DICT_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 Datum::Oid(owner as u32),
                 Datum::Oid(template as u32),
                 if options.is_empty() {
@@ -27496,7 +27775,7 @@ fn pg_ts_config<'a>(
                 Datum::Oid(PG_TS_CONFIG_OID as u32),
                 Datum::Oid(oid as u32),
                 text(name.as_str(), arena)?,
-                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(namespace_oid(storage, schema.as_str(), txid) as u32),
                 Datum::Oid(owner as u32),
                 Datum::Oid(parser as u32),
             ],
@@ -27611,7 +27890,7 @@ fn pg_collation<'a>(
                 Datum::Int4(PG_COLLATION_OID),
                 Datum::Int4(stored.oid(slot)),
                 text(collation.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, collation.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, collation.schema.as_str(), txid)),
                 Datum::Int4(collation.owner),
                 Datum::Bpchar(collation.provider.code()),
                 Datum::Bool(collation.deterministic),
@@ -27645,7 +27924,7 @@ fn pg_conversion<'a>(
                 Datum::Int4(PG_CONVERSION_OID),
                 Datum::Int4(storage.conversion(slot).oid(slot)),
                 text(conversion.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, conversion.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, conversion.schema.as_str(), txid)),
                 Datum::Int4(conversion.owner),
                 Datum::Int4(conversion.source.code()),
                 Datum::Int4(conversion.destination.code()),
@@ -29032,7 +29311,7 @@ fn pg_shdepend<'a>(
     for (slot, _) in storage.visible_schemas(txid) {
         append(
             PG_NAMESPACE_OID,
-            namespace_oid_for_slot(slot),
+            namespace_oid_for_slot(storage, slot),
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,
@@ -29564,7 +29843,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(i32::from(d.base.typlen())),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("d", arena)?,
                 text(category(&d.base), arena)?,
                 Datum::Int4(base_oid),
@@ -29629,7 +29908,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, d.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, d.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29674,7 +29953,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(4), // typlen: enums are a 4-byte oid on the wire
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str(), txid)),
                 text("e", arena)?,
                 text("E", arena)?,
                 Datum::Int4(0), // typbasetype
@@ -29721,7 +30000,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, e.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, e.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29766,7 +30045,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -29813,7 +30092,7 @@ fn pg_type<'a>(
                 )?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, composite.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29859,7 +30138,7 @@ fn pg_type<'a>(
                 text(name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -29914,7 +30193,7 @@ fn pg_type<'a>(
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -29952,7 +30231,7 @@ fn pg_type<'a>(
                 text(view.name_for(txid).as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -29991,7 +30270,7 @@ fn pg_type<'a>(
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -30063,7 +30342,7 @@ fn pg_namespace<'a>(
             Datum::Int4(PG_CATALOG_NS_OID),
             text("pg_catalog", arena)?,
             Datum::Int4(10),
-            Datum::Null,
+            builtin_acl(&["postgres=UC/postgres", "=U/postgres"], arena)?,
         ],
         arena,
     )?;
@@ -30077,12 +30356,22 @@ fn pg_namespace<'a>(
         ],
         arena,
     )?;
-    let mut n = 2;
+    out[2] = row(
+        &[
+            Datum::Int4(PG_NAMESPACE_OID),
+            Datum::Int4(INFORMATION_SCHEMA_NS_OID),
+            text("information_schema", arena)?,
+            Datum::Int4(10),
+            builtin_acl(&["postgres=UC/postgres", "=U/postgres"], arena)?,
+        ],
+        arena,
+    )?;
+    let mut n = 3;
     for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
-                Datum::Int4(namespace_oid(storage, schema.name.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 text(
                     arena
                         .alloc_str(schema.name.as_str())
@@ -30153,7 +30442,7 @@ fn pg_namespace<'a>(
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
-                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
                 text(schema.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(usize::from(owner))),
                 Datum::Null,
@@ -30163,159 +30452,6 @@ fn pg_namespace<'a>(
         n += 1;
     }
     finish(def, &out[..n], arena)
-}
-
-fn pg_group<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("pg_group", false);
-    let rows = arena
-        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
-            &[] as &[Datum]
-        })
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut append = |oid: i32, name: &str, slot: Option<usize>| -> Result<(), SqlError> {
-        let member_capacity = slot.map_or(0, |slot| {
-            (0..storage.role_membership_count())
-                .filter(|&membership_slot| {
-                    let membership = storage.role_membership(membership_slot);
-                    membership.visible_to(txid) && usize::from(membership.role) == slot
-                })
-                .count()
-        });
-        let members = arena
-            .alloc_slice_with(member_capacity, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        let mut member_count = 0usize;
-        if let Some(slot) = slot {
-            for membership_slot in 0..storage.role_membership_count() {
-                let membership = storage.role_membership(membership_slot);
-                if membership.visible_to(txid) && usize::from(membership.role) == slot {
-                    members[member_count] =
-                        Datum::Oid(storage.role_oid(usize::from(membership.member)) as u32);
-                    member_count += 1;
-                }
-            }
-        }
-        rows[count] = row(
-            &[
-                text(name, arena)?,
-                Datum::Oid(oid as u32),
-                Datum::Array {
-                    element: super::types::ArrElem::Oid,
-                    raw: super::array::build(&members[..member_count], arena)?,
-                },
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for &(oid, name) in PREDEFINED_ROLES {
-        append(oid, name, None)?;
-    }
-    for slot in 0..storage.role_count() {
-        let role = storage.role(slot);
-        if role.visible_to(txid) && !role.attributes_to(txid).can_login {
-            append(
-                storage.role_oid(slot),
-                role.name_to(txid).as_str(),
-                Some(slot),
-            )?;
-        }
-    }
-    finish(definition, &rows[..count], arena)
-}
-
-fn pg_shadow<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    mask_password: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let name = if mask_password {
-        "pg_user"
-    } else {
-        "pg_shadow"
-    };
-    let definition = schema::require(name, false);
-    let authid = pg_authid(storage, txid, arena, !mask_password)?;
-    let rows = arena
-        .alloc_slice_with(authid.rows.len(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    for auth in authid.rows {
-        if auth[6] != Datum::Bool(true) {
-            continue;
-        }
-        let role_oid = match auth[0] {
-            Datum::Int4(oid) => oid,
-            Datum::Oid(oid) => oid as i32,
-            _ => return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid role OID")),
-        };
-        let role_slot = storage.role_slot_by_oid(role_oid, txid);
-        let config_capacity = role_slot.map_or(0, |role_slot| {
-            use crate::storage::RoleSettingScope;
-            storage
-                .role_settings()
-                .filter(|(_, setting)| {
-                    setting.visible_to(txid)
-                        && setting.scope == RoleSettingScope::RoleAllDatabases(role_slot as u16)
-                })
-                .count()
-        });
-        let configs = arena
-            .alloc_slice_with(config_capacity, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        let mut config_count = 0usize;
-        if let Some(role_slot) = role_slot {
-            use crate::storage::RoleSettingScope;
-            for (_, setting) in storage.role_settings() {
-                if setting.visible_to(txid)
-                    && setting.scope == RoleSettingScope::RoleAllDatabases(role_slot as u16)
-                {
-                    let rendered = stack_format!(
-                        322,
-                        "{}={}",
-                        setting.name.as_str(),
-                        setting.value_to(txid).as_str()
-                    );
-                    configs[config_count] = text(rendered.as_str(), arena)?;
-                    config_count += 1;
-                }
-            }
-        }
-        rows[count] = row(
-            &[
-                auth[1],
-                auth[0],
-                auth[5],
-                auth[2],
-                auth[7],
-                auth[8],
-                if mask_password {
-                    text("********", arena)?
-                } else {
-                    auth[10]
-                },
-                auth[11],
-                if config_count == 0 {
-                    Datum::Null
-                } else {
-                    Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&configs[..config_count], arena)?,
-                    }
-                },
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(definition, &rows[..count], arena)
 }
 
 fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {
@@ -30344,6 +30480,22 @@ fn append_base64<const N: usize>(bytes: &[u8], output: &mut StackStr<N>) {
     }
 }
 
+fn require_authid_read(storage: &Storage, txid: u32) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if !storage.role(current).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table pg_authid"
+        ));
+    }
+    Ok(())
+}
+
 fn pg_authid<'a>(
     storage: &Storage,
     txid: u32,
@@ -30351,18 +30503,7 @@ fn pg_authid<'a>(
     require_superuser: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
     if require_superuser {
-        let current = storage.current_role_slot(txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            )
-        })?;
-        if !storage.role(current).attributes_to(txid).superuser {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for table pg_authid"
-            ));
-        }
+        require_authid_read(storage, txid)?;
     }
     let def = schema::require("pg_authid", false);
     let output = arena
@@ -31301,223 +31442,13 @@ fn info_user_mapping_options<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn routine_specific_name(
-    routine: &crate::storage::RoutineDef,
-    txid: u32,
-) -> crate::util::StackStr<96> {
-    use core::fmt::Write;
-    let mut name = crate::util::StackStr::new();
-    let _ = write!(
-        name,
-        "{}_{}",
-        routine.name_for(txid).as_str(),
-        crate::storage::routine_oid(routine)
-    );
-    name
-}
-
-fn info_routines<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("routines", true);
-    let count = (0..storage.routine_count())
-        .filter(|slot| {
-            storage.routine_slot_visible_to(*slot, txid)
-                && !matches!(
-                    storage.routine_for(*slot, txid).kind,
-                    crate::storage::RoutineKind::Aggregate(_)
-                )
-        })
-        .count();
-    let output = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut row_index = 0;
-    for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
-        if !storage.routine_slot_visible_to(slot, txid)
-            || matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
-        {
-            continue;
-        }
-        let specific_name = routine_specific_name(&routine, txid);
-        output[row_index] = row(
-            &[
-                text("postgres", arena)?,
-                text(routine.schema_for(txid).as_str(), arena)?,
-                text(specific_name.as_str(), arena)?,
-                text("postgres", arena)?,
-                text(routine.schema_for(txid).as_str(), arena)?,
-                text(routine.name_for(txid).as_str(), arena)?,
-                text(
-                    if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
-                        "PROCEDURE"
-                    } else {
-                        "FUNCTION"
-                    },
-                    arena,
-                )?,
-                match routine.kind.function_result() {
-                    Some(result) => text(result.name(), arena)?,
-                    None => Datum::Null,
-                },
-                text("SQL", arena)?,
-                text(routine.body.as_str(), arena)?,
-            ],
-            arena,
-        )?;
-        row_index += 1;
+fn routine_specific_name(name: &str, oid: u32) -> crate::util::StackStr<63> {
+    let suffix = stack_format!(12, "_{}", oid);
+    let mut end = name.len().min(63 - suffix.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
     }
-    finish(definition, output, arena)
-}
-
-fn info_routine_privileges<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    include_public: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require(
-        if include_public {
-            "routine_privileges"
-        } else {
-            "role_routine_grants"
-        },
-        true,
-    );
-    let capacity = storage.routine_count() + storage.acl_entry_count();
-    let output = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut append =
-        |slot: usize, grantor: u16, grantee: u16, grantable: bool| -> Result<(), SqlError> {
-            if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
-                || (!storage.role_is_enabled(grantor, txid)
-                    && !storage.role_is_enabled(grantee, txid))
-            {
-                return Ok(());
-            }
-            if count == output.len() {
-                return Err(catalog_capacity_exceeded(
-                    "information_schema.routine_privileges",
-                ));
-            }
-            let routine = storage.routine_for(slot, txid);
-            let specific_name = routine_specific_name(&routine, txid);
-            let grantor_name = storage.role_name(grantor as usize, txid);
-            let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
-                SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
-            } else {
-                storage.role_name(grantee as usize, txid)
-            };
-            output[count] = row(
-                &[
-                    text(grantor_name.as_str(), arena)?,
-                    text(grantee_name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(routine.schema_for(txid).as_str(), arena)?,
-                    text(specific_name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(routine.schema_for(txid).as_str(), arena)?,
-                    text(routine.name_for(txid).as_str(), arena)?,
-                    text("EXECUTE", arena)?,
-                    text(if grantable { "YES" } else { "NO" }, arena)?,
-                ],
-                arena,
-            )?;
-            count += 1;
-            Ok(())
-        };
-    for slot in 0..storage.routine_count() {
-        if !storage.routine_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let object = Storage::routine_access_object(slot);
-        let owner = storage.object_owner(object, txid) as u16;
-        append(slot, owner, owner, true)?;
-        let public_defined = storage.acl_entries().any(|(acl_slot, entry)| {
-            entry.object == object
-                && storage.acl_identity(acl_slot, txid).0 == crate::storage::PUBLIC_ROLE
-        });
-        if !public_defined {
-            append(slot, owner, crate::storage::PUBLIC_ROLE, false)?;
-        }
-        for (acl_slot, entry) in storage.acl_entries() {
-            if entry.object != object {
-                continue;
-            }
-            let (privileges, options) = storage.acl_state(acl_slot, txid);
-            if !privileges.contains(crate::storage::PrivilegeSet::EXECUTE) {
-                continue;
-            }
-            let (grantee, grantor) = storage.acl_identity(acl_slot, txid);
-            if grantee == owner && grantor == owner {
-                continue;
-            }
-            append(
-                slot,
-                grantor,
-                grantee,
-                options.contains(crate::storage::PrivilegeSet::EXECUTE),
-            )?;
-        }
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_parameters<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("parameters", true);
-    let count = (0..storage.routine_count())
-        .filter(|slot| storage.routine_slot_visible_to(*slot, txid))
-        .map(|slot| storage.routine_for(slot, txid).parameter_count)
-        .sum();
-    let output = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut row_index = 0;
-    for slot in 0..storage.routine_count() {
-        let routine = storage.routine_for(slot, txid);
-        if !storage.routine_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let specific_name = routine_specific_name(&routine, txid);
-        for (argument_index, argument) in routine.parameters().iter().enumerate() {
-            let mode = match argument.mode {
-                crate::storage::RoutineParameterMode::In { .. }
-                | crate::storage::RoutineParameterMode::Variadic { .. } => "IN",
-                crate::storage::RoutineParameterMode::Out => "OUT",
-                crate::storage::RoutineParameterMode::InOut { .. } => "INOUT",
-            };
-            output[row_index] = row(
-                &[
-                    text("postgres", arena)?,
-                    text(routine.schema_for(txid).as_str(), arena)?,
-                    text(specific_name.as_str(), arena)?,
-                    Datum::Int4((argument_index + 1) as i32),
-                    text(mode, arena)?,
-                    if argument.name.as_str().is_empty() {
-                        Datum::Null
-                    } else {
-                        text(argument.name.as_str(), arena)?
-                    },
-                    text(argument.ctype.name(), arena)?,
-                    text("postgres", arena)?,
-                    text("pg_catalog", arena)?,
-                    text(argument.ctype.name(), arena)?,
-                ],
-                arena,
-            )?;
-            row_index += 1;
-        }
-    }
-    finish(definition, output, arena)
+    stack_format!(63, "{}{}", &name[..end], suffix.as_str())
 }
 
 fn view_column_catalog_type(
@@ -31539,629 +31470,6 @@ fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> SqlName {
         .column_index(column.name.as_str())
         .expect("constraint column exists")]
     .expect("stored NOT NULL constraint has a durable name")
-}
-
-fn info_table_privileges<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    info_relation_privileges(storage, txid, arena, "table_privileges", true)
-}
-
-fn info_role_table_grants<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    info_relation_privileges(storage, txid, arena, "role_table_grants", false)
-}
-
-fn info_usage_privileges<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("usage_privileges", true);
-    let capacity = storage
-        .sequence_count()
-        .saturating_add(storage.domain_count().saturating_mul(2))
-        .saturating_add(storage.acl_entry_count());
-    let output = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut append = |object: crate::storage::AccessObject,
-                      object_type: &str,
-                      grantor: u16,
-                      grantee: u16,
-                      grantable: bool|
-     -> Result<(), SqlError> {
-        if !storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid) {
-            return Ok(());
-        }
-        if count == output.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "usage_privileges exceeds its catalog-derived capacity"
-            ));
-        }
-        let (schema, name) = storage.access_object_name_to(object, txid);
-        let grantor_name = storage.role_name(grantor as usize, txid);
-        let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
-            SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
-        } else {
-            storage.role_name(grantee as usize, txid)
-        };
-        output[count] = row(
-            &[
-                text(grantor_name.as_str(), arena)?,
-                text(grantee_name.as_str(), arena)?,
-                text("postgres", arena)?,
-                text(schema.as_str(), arena)?,
-                text(name.as_str(), arena)?,
-                text(object_type, arena)?,
-                text("USAGE", arena)?,
-                text(if grantable { "YES" } else { "NO" }, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    let mut append_object = |object: crate::storage::AccessObject,
-                             object_type: &str,
-                             public_default: bool|
-     -> Result<(), SqlError> {
-        let owner = storage.object_owner(object, txid) as u16;
-        append(object, object_type, owner, owner, true)?;
-        let public_defined = storage.acl_entries().any(|(slot, entry)| {
-            entry.object == object
-                && storage.acl_identity(slot, txid).0 == crate::storage::PUBLIC_ROLE
-        });
-        if public_default && !public_defined {
-            append(
-                object,
-                object_type,
-                owner,
-                crate::storage::PUBLIC_ROLE,
-                false,
-            )?;
-        }
-        for (slot, entry) in storage.acl_entries() {
-            if entry.object != object {
-                continue;
-            }
-            let (privileges, options) = storage.acl_state(slot, txid);
-            if !privileges.contains(crate::storage::PrivilegeSet::USAGE) {
-                continue;
-            }
-            let (grantee, grantor) = storage.acl_identity(slot, txid);
-            if grantee == owner && grantor == owner {
-                continue;
-            }
-            append(
-                object,
-                object_type,
-                grantor,
-                grantee,
-                options.contains(crate::storage::PrivilegeSet::USAGE),
-            )?;
-        }
-        Ok(())
-    };
-    for slot in 0..storage.sequence_count() {
-        if !storage.sequence_slot_visible_to(slot, txid) {
-            continue;
-        }
-        append_object(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Sequence,
-                slot: slot as u16,
-            },
-            "SEQUENCE",
-            false,
-        )?;
-    }
-    for slot in 0..storage.domain_count() {
-        if !storage.domain_slot_visible_to(slot, txid) {
-            continue;
-        }
-        append_object(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Domain,
-                slot: slot as u16,
-            },
-            "DOMAIN",
-            true,
-        )?;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_relation_privileges<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    relation_name: &str,
-    include_public: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require(relation_name, true);
-    let capacity = 8usize.saturating_mul(
-        storage
-            .table_count()
-            .saturating_add(storage.view_count())
-            .saturating_add(storage.acl_entry_count()),
-    );
-    let output = arena
-        .alloc_slice_with(capacity, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut append = |object: crate::storage::AccessObject,
-                      grantor: u16,
-                      grantee: u16,
-                      privilege_mask: crate::storage::PrivilegeSet,
-                      grant_options: crate::storage::PrivilegeSet|
-     -> Result<(), SqlError> {
-        if !include_public && grantee == crate::storage::PUBLIC_ROLE {
-            return Ok(());
-        }
-        if !storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid) {
-            return Ok(());
-        }
-        let (schema, name) = storage.access_object_name_to(object, txid);
-        let privilege_names = [
-            (crate::storage::PrivilegeSet::SELECT, "SELECT"),
-            (crate::storage::PrivilegeSet::INSERT, "INSERT"),
-            (crate::storage::PrivilegeSet::UPDATE, "UPDATE"),
-            (crate::storage::PrivilegeSet::DELETE, "DELETE"),
-            (crate::storage::PrivilegeSet::TRUNCATE, "TRUNCATE"),
-            (crate::storage::PrivilegeSet::REFERENCES, "REFERENCES"),
-            (crate::storage::PrivilegeSet::TRIGGER, "TRIGGER"),
-        ];
-        for (privilege, privilege_name) in privilege_names {
-            if !privilege_mask.contains(privilege) {
-                continue;
-            }
-            if count == output.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table_privileges exceeds its catalog-derived capacity"
-                ));
-            }
-            let grantor_name = storage.role_name(grantor as usize, txid);
-            let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
-                SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
-            } else {
-                storage.role_name(grantee as usize, txid)
-            };
-            output[count] = row(
-                &[
-                    text(grantor_name.as_str(), arena)?,
-                    text(grantee_name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(schema.as_str(), arena)?,
-                    text(name.as_str(), arena)?,
-                    text(privilege_name, arena)?,
-                    text(
-                        if grant_options.contains(privilege) {
-                            "YES"
-                        } else {
-                            "NO"
-                        },
-                        arena,
-                    )?,
-                    text(
-                        if privilege == crate::storage::PrivilegeSet::SELECT {
-                            "YES"
-                        } else {
-                            "NO"
-                        },
-                        arena,
-                    )?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
-        Ok(())
-    };
-    let mut append_object = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
-        let owner = storage.object_owner(object, txid) as u16;
-        append(
-            object,
-            owner,
-            owner,
-            crate::storage::PrivilegeSet::TABLE_ALL,
-            crate::storage::PrivilegeSet::TABLE_ALL,
-        )?;
-        for (slot, entry) in storage.acl_entries() {
-            if entry.object != object {
-                continue;
-            }
-            let (privileges, options) = storage.acl_state(slot, txid);
-            if privileges.0 == 0 {
-                continue;
-            }
-            let (grantee, grantor) = storage.acl_identity(slot, txid);
-            if grantee == owner && grantor == owner {
-                continue;
-            }
-            append(object, grantor, grantee, privileges, options)?;
-        }
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        let (class, object_slot) =
-            match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
-                Some(matview) => (crate::storage::AccessClass::MaterializedView, matview),
-                None => (crate::storage::AccessClass::Table, slot),
-            };
-        append_object(crate::storage::AccessObject {
-            class,
-            slot: object_slot as u16,
-        })?;
-    }
-    for (slot, _) in storage.views_visible_to(txid) {
-        append_object(crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: slot as u16,
-        })?;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn column_privilege_count(
-    storage: &Storage,
-    txid: u32,
-    object: crate::storage::AccessObject,
-    include_public: bool,
-) -> usize {
-    let visible_privileges = [
-        crate::storage::PrivilegeSet::SELECT,
-        crate::storage::PrivilegeSet::INSERT,
-        crate::storage::PrivilegeSet::UPDATE,
-        crate::storage::PrivilegeSet::REFERENCES,
-    ];
-    let owner = storage.object_owner(object, txid) as u16;
-    let mut count = storage.role_is_enabled(owner, txid) as usize * visible_privileges.len();
-    for (slot, entry) in storage.acl_entries() {
-        if entry.object != object {
-            continue;
-        }
-        let (grantee, grantor) = storage.acl_identity(slot, txid);
-        if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
-            || (!storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid))
-            || (grantee == owner && grantor == owner)
-        {
-            continue;
-        }
-        let (privileges, _) = storage.acl_state(slot, txid);
-        count += visible_privileges
-            .iter()
-            .filter(|privilege| privileges.contains(**privilege))
-            .count();
-    }
-    count
-}
-
-fn info_column_privileges<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    include_public: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require(
-        if include_public {
-            "column_privileges"
-        } else {
-            "role_column_grants"
-        },
-        true,
-    );
-    let mut output_count = 0usize;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        let object = crate::storage::AccessObject {
-            class: match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
-                Some(_) => crate::storage::AccessClass::MaterializedView,
-                None => crate::storage::AccessClass::Table,
-            },
-            slot: storage
-                .matview_slot(table.schema.as_str(), table.name.as_str(), txid)
-                .unwrap_or(slot) as u16,
-        };
-        output_count = output_count
-            .checked_add(
-                table
-                    .columns()
-                    .len()
-                    .checked_mul(column_privilege_count(
-                        storage,
-                        txid,
-                        object,
-                        include_public,
-                    ))
-                    .ok_or_else(|| {
-                        catalog_capacity_exceeded("information_schema.column_privileges")
-                    })?,
-            )
-            .ok_or_else(|| catalog_capacity_exceeded("information_schema.column_privileges"))?;
-    }
-    for (slot, _) in storage.column_acl_entries() {
-        let (grantee, grantor) = storage.column_acl_identity(slot, txid);
-        if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
-            || (!storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid))
-        {
-            continue;
-        }
-        let (privileges, _) = storage.column_acl_state(slot, txid);
-        output_count = output_count
-            .checked_add(
-                [
-                    crate::storage::PrivilegeSet::SELECT,
-                    crate::storage::PrivilegeSet::INSERT,
-                    crate::storage::PrivilegeSet::UPDATE,
-                    crate::storage::PrivilegeSet::REFERENCES,
-                ]
-                .iter()
-                .filter(|privilege| privileges.contains(**privilege))
-                .count(),
-            )
-            .ok_or_else(|| catalog_capacity_exceeded("information_schema.column_privileges"))?;
-    }
-    for (view_slot, view) in storage.views_visible_to(txid) {
-        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let column_count = describe_view(storage, txid, &view, arena, &mut columns)?;
-        output_count = output_count
-            .checked_add(
-                column_count
-                    .checked_mul(column_privilege_count(
-                        storage,
-                        txid,
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::View,
-                            slot: view_slot as u16,
-                        },
-                        include_public,
-                    ))
-                    .ok_or_else(|| {
-                        catalog_capacity_exceeded("information_schema.column_privileges")
-                    })?,
-            )
-            .ok_or_else(|| catalog_capacity_exceeded("information_schema.column_privileges"))?;
-    }
-    let output = arena
-        .alloc_slice_with(output_count, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut append = |schema: &str,
-                      table: &str,
-                      column: &str,
-                      grantor: u16,
-                      grantee: u16,
-                      privileges: crate::storage::PrivilegeSet,
-                      grant_options: crate::storage::PrivilegeSet|
-     -> Result<(), SqlError> {
-        if (!include_public && grantee == crate::storage::PUBLIC_ROLE)
-            || (!storage.role_is_enabled(grantor, txid) && !storage.role_is_enabled(grantee, txid))
-        {
-            return Ok(());
-        }
-        let grantor_name = storage.role_name(grantor as usize, txid);
-        let grantee_name = if grantee == crate::storage::PUBLIC_ROLE {
-            SqlName::parse("PUBLIC").expect("PUBLIC fits a SQL name")
-        } else {
-            storage.role_name(grantee as usize, txid)
-        };
-        for (privilege, privilege_name) in [
-            (crate::storage::PrivilegeSet::SELECT, "SELECT"),
-            (crate::storage::PrivilegeSet::INSERT, "INSERT"),
-            (crate::storage::PrivilegeSet::UPDATE, "UPDATE"),
-            (crate::storage::PrivilegeSet::REFERENCES, "REFERENCES"),
-        ] {
-            if !privileges.contains(privilege) {
-                continue;
-            }
-            debug_assert!(count < output.len());
-            output[count] = row(
-                &[
-                    text(grantor_name.as_str(), arena)?,
-                    text(grantee_name.as_str(), arena)?,
-                    text("postgres", arena)?,
-                    text(schema, arena)?,
-                    text(table, arena)?,
-                    text(column, arena)?,
-                    text(privilege_name, arena)?,
-                    text(
-                        if grant_options.contains(privilege) {
-                            "YES"
-                        } else {
-                            "NO"
-                        },
-                        arena,
-                    )?,
-                ],
-                arena,
-            )?;
-            count += 1;
-        }
-        Ok(())
-    };
-    let mut append_relation = |object: crate::storage::AccessObject,
-                               schema: &str,
-                               table: &str,
-                               columns: &[ColumnMeta]|
-     -> Result<(), SqlError> {
-        let owner = storage.object_owner(object, txid) as u16;
-        for column in columns {
-            append(
-                schema,
-                table,
-                column.name.as_str(),
-                owner,
-                owner,
-                crate::storage::PrivilegeSet::SELECT
-                    .union(crate::storage::PrivilegeSet::INSERT)
-                    .union(crate::storage::PrivilegeSet::UPDATE)
-                    .union(crate::storage::PrivilegeSet::REFERENCES),
-                crate::storage::PrivilegeSet::SELECT
-                    .union(crate::storage::PrivilegeSet::INSERT)
-                    .union(crate::storage::PrivilegeSet::UPDATE)
-                    .union(crate::storage::PrivilegeSet::REFERENCES),
-            )?;
-            for (slot, entry) in storage.acl_entries() {
-                if entry.object != object {
-                    continue;
-                }
-                let (grantee, grantor) = storage.acl_identity(slot, txid);
-                if grantee == owner && grantor == owner {
-                    continue;
-                }
-                let (privileges, grant_options) = storage.acl_state(slot, txid);
-                append(
-                    schema,
-                    table,
-                    column.name.as_str(),
-                    grantor,
-                    grantee,
-                    privileges,
-                    grant_options,
-                )?;
-            }
-        }
-        Ok(())
-    };
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        let object = match storage.matview_slot(table.schema.as_str(), table.name.as_str(), txid) {
-            Some(matview_slot) => crate::storage::AccessObject {
-                class: crate::storage::AccessClass::MaterializedView,
-                slot: matview_slot as u16,
-            },
-            None => crate::storage::AccessObject {
-                class: crate::storage::AccessClass::Table,
-                slot: slot as u16,
-            },
-        };
-        append_relation(
-            object,
-            table.schema.as_str(),
-            table.name.as_str(),
-            table.columns(),
-        )?;
-    }
-    for (slot, view) in storage.views_visible_to(txid) {
-        let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let description_count = describe_view(storage, txid, &view, arena, &mut descriptions)?;
-        let mut columns = [ColumnMeta::EMPTY; super::exec::MAX_PROJ];
-        for (index, description) in descriptions[..description_count].iter().enumerate() {
-            let (ctype, user_type) = view_column_catalog_type(storage, txid, description.type_oid)?;
-            columns[index] = ColumnMeta {
-                name: SqlName::parse(description.name)?,
-                ctype,
-                type_mod: description.type_mod,
-                collation: if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
-                storage: crate::sql::ast::ColumnStorage::Plain,
-                compression: crate::sql::ast::ColumnCompression::Default,
-                not_null: crate::storage::NotNullOrigin::Nullable,
-                not_null_inheritable: true,
-                unique: false,
-                primary: false,
-                auto_increment: false,
-                default: crate::storage::ColumnDefault::NONE,
-                is_identity: false,
-                identity_always: false,
-                auto_increment_step: 1,
-                user_type,
-                statistics_target: -1,
-                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
-            };
-        }
-        append_relation(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: slot as u16,
-            },
-            view.schema_for(txid).as_str(),
-            view.name_for(txid).as_str(),
-            &columns[..description_count],
-        )?;
-    }
-    for (slot, entry) in storage.column_acl_entries() {
-        let relation = entry.target.relation();
-        if !storage.access_object_visible_to(relation, txid) {
-            continue;
-        }
-        let (grantee, grantor) = storage.column_acl_identity(slot, txid);
-        let (privileges, grant_options) = storage.column_acl_state(slot, txid);
-        if privileges.0 == 0 {
-            continue;
-        }
-        let (schema, table) = storage.access_object_name_to(relation, txid);
-        let column = match relation.class {
-            crate::storage::AccessClass::Table => {
-                storage.table_def(relation.slot as usize, txid).columns()
-                    [entry.target.column() as usize]
-                    .name
-            }
-            crate::storage::AccessClass::MaterializedView => {
-                let table_slot = storage
-                    .find_table(schema.as_str(), table.as_str())
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "materialized view column privilege has no table row"
-                        )
-                    })?;
-                storage.table_def(table_slot, txid).columns()[entry.target.column() as usize].name
-            }
-            crate::storage::AccessClass::View => {
-                let view = storage.view(relation.slot as usize);
-                let mut descriptions =
-                    [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-                let described = describe_view(storage, txid, &view, arena, &mut descriptions)?;
-                if entry.target.column() as usize >= described {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "view column privilege refers to an absent column"
-                    ));
-                }
-                SqlName::parse(descriptions[entry.target.column() as usize].name)?
-            }
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "invalid column privilege target"
-                ));
-            }
-        };
-        append(
-            schema.as_str(),
-            table.as_str(),
-            column.as_str(),
-            grantor,
-            grantee,
-            privileges,
-            grant_options,
-        )?;
-    }
-    debug_assert_eq!(count, output.len());
-    finish(definition, &output[..count], arena)
 }
 
 fn info_domains<'a>(
@@ -32486,80 +31794,6 @@ fn information_schema_interval_type(type_mod: TypeMod) -> Option<StackStr<48>> {
     Some(output)
 }
 
-fn info_schemata<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let def = schema::require("schemata", true);
-    let out = arena
-        .alloc_slice_with(storage.schema_count() + 2, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut n = 0;
-    for (slot, schema) in storage.visible_schemas(txid) {
-        out[n] = row(
-            &[
-                text("postgres", arena)?,
-                text(
-                    arena
-                        .alloc_str(schema.name.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?,
-                    arena,
-                )?,
-                text(
-                    catalog_owner_name(
-                        storage,
-                        catalog_owner(
-                            storage,
-                            crate::storage::AccessObject {
-                                class: crate::storage::AccessClass::Schema,
-                                slot: slot as u16,
-                            },
-                            txid,
-                        ),
-                        txid,
-                    )
-                    .as_str(),
-                    arena,
-                )?,
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
-    out[n] = row(
-        &[
-            text("postgres", arena)?,
-            text("pg_catalog", arena)?,
-            text("postgres", arena)?,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-        ],
-        arena,
-    )?;
-    n += 1;
-    out[n] = row(
-        &[
-            text("postgres", arena)?,
-            text("information_schema", arena)?,
-            text("postgres", arena)?,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-        ],
-        arena,
-    )?;
-    n += 1;
-    finish(def, &out[..n], arena)
-}
-
 fn info_collations<'a>(
     storage: &Storage,
     txid: u32,
@@ -32646,88 +31880,6 @@ fn info_collation_character_set_applicability<'a>(
             arena,
         )?;
         count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_enabled_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require("enabled_roles", true);
-    let output = arena
-        .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    for slot in 0..storage.role_count() {
-        if !storage.role(slot).visible_to(txid) || !storage.role_is_enabled(slot as u16, txid) {
-            continue;
-        }
-        output[count] = row(
-            &[text(storage.role_name(slot, txid).as_str(), arena)?],
-            arena,
-        )?;
-        count += 1;
-    }
-    finish(definition, &output[..count], arena)
-}
-
-fn info_applicable_roles<'a>(
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    administrators_only: bool,
-) -> Result<SynthTable<'a>, SqlError> {
-    let definition = schema::require(
-        if administrators_only {
-            "administrable_role_authorizations"
-        } else {
-            "applicable_roles"
-        },
-        true,
-    );
-    let output = arena
-        .alloc_slice_with(storage.role_membership_count() + 1, |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    let mut append = |grantee: &str, role: &str, admin: bool| -> Result<(), SqlError> {
-        if administrators_only && !admin {
-            return Ok(());
-        }
-        if count == output.len() {
-            return Err(catalog_capacity_exceeded(
-                "information_schema.applicable_roles",
-            ));
-        }
-        output[count] = row(
-            &[
-                text(grantee, arena)?,
-                text(role, arena)?,
-                text(if admin { "YES" } else { "NO" }, arena)?,
-            ],
-            arena,
-        )?;
-        count += 1;
-        Ok(())
-    };
-    for slot in 0..storage.role_membership_count() {
-        let membership = storage.role_membership(slot);
-        if !membership.visible_to(txid) || !storage.role_is_enabled(membership.member, txid) {
-            continue;
-        }
-        append(
-            storage.role_name(membership.member as usize, txid).as_str(),
-            storage.role_name(membership.role as usize, txid).as_str(),
-            membership.options_to(txid).admin,
-        )?;
-    }
-    if storage.role_count() > 0 && storage.role_is_enabled(0, txid) {
-        append(
-            storage.role_name(0, txid).as_str(),
-            "pg_database_owner",
-            false,
-        )?;
     }
     finish(definition, &output[..count], arena)
 }

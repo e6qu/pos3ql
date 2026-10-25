@@ -30,6 +30,12 @@ pub(super) enum Base {
     Trigger,
     Constraint,
     Index,
+    RoleMembers,
+    Procedure,
+    Language,
+    Database,
+    ForeignDataWrapper,
+    ForeignServer,
 }
 
 pub(super) fn indexes<'a>(
@@ -133,6 +139,12 @@ impl Read {
             Base::Trigger => "pg_trigger",
             Base::Constraint => "pg_constraint",
             Base::Index => "pg_index",
+            Base::RoleMembers => "pg_auth_members",
+            Base::Procedure => "pg_proc",
+            Base::Language => "pg_language",
+            Base::Database => "pg_database",
+            Base::ForeignDataWrapper => "pg_foreign_data_wrapper",
+            Base::ForeignServer => "pg_foreign_server",
         };
         match self {
             Self::Statement => super::synthesize(
@@ -154,7 +166,7 @@ impl Read {
         }
     }
 
-    fn authid_for_view<'a>(
+    pub(super) fn authid_for_view<'a>(
         self,
         storage: &Storage,
         transaction: u32,
@@ -367,6 +379,227 @@ pub(super) fn roles<'a>(
         }
     }
     finish(schema::require("pg_roles", false), output, arena)
+}
+
+pub(super) fn groups<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::{CatalogRow, boolean};
+    let roles = read.authid_for_view(storage, transaction, arena)?;
+    let membership = read.base(storage, Base::RoleMembers, transaction, arena)?;
+    let [role, member] = columns(&membership, ["roleid", "member"]);
+    let membership = Index::new(membership, arena, |values| {
+        Ok(Some((integer(values[role])? as u32, 0)))
+    })?;
+    let mut output = Output::new(arena);
+    for values in roles.rows {
+        let account = CatalogRow {
+            definition: roles.def,
+            values,
+        };
+        if boolean(account.get("rolcanlogin")?)? {
+            continue;
+        }
+        let key = (account.integer("oid")? as u32, 0);
+        let count = membership.matching(key).count();
+        let mut matching = membership.matching(key);
+        let members = arena
+            .alloc_slice_with(count, |_| {
+                matching.next().expect("counted selected membership")[member]
+            })
+            .map_err(|_| arena_full())?;
+        output.push(&[
+            account.get("rolname")?,
+            account.get("oid")?,
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Oid,
+                raw: crate::sql::array::build(members, arena)?,
+            },
+        ])?;
+    }
+    output.finish("pg_group", false)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AccountView {
+    Users,
+    Shadow,
+}
+
+pub(super) fn enabled_roles<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::CatalogRow;
+    let roles = read.authid_for_view(storage, transaction, arena)?;
+    let mut output = Output::new(arena);
+    for values in roles.rows {
+        let role = CatalogRow {
+            definition: roles.def,
+            values,
+        };
+        if super::information::owner_is_enabled(storage, transaction, role.integer("oid")?) {
+            output.push(&[role.get("rolname")?])?;
+        }
+    }
+    output.finish("enabled_roles", true)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MembershipView {
+    Applicable,
+    Administrable,
+}
+
+pub(super) fn applicable_roles<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    view: MembershipView,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::CatalogRow;
+    let roles = Index::oid(read.authid_for_view(storage, transaction, arena)?, arena)?;
+    let membership = read.base(storage, Base::RoleMembers, transaction, arena)?;
+    let databases = read.base(storage, Base::Database, transaction, arena)?;
+    let database = storage.current_database_name(transaction);
+    let mut union = crate::mem::arena::ArenaList::new(arena);
+    for values in membership.rows {
+        let membership = CatalogRow {
+            definition: membership.def,
+            values,
+        };
+        union
+            .push((
+                membership.integer("member")? as u32,
+                membership.integer("roleid")? as u32,
+                membership.boolean("admin_option")?,
+            ))
+            .map_err(|_| arena_full())?;
+    }
+    for values in databases.rows {
+        let stored_database = CatalogRow {
+            definition: databases.def,
+            values,
+        };
+        if stored_database.string("datname")? != database.as_str() {
+            continue;
+        }
+        for values in roles.table.rows {
+            let role = CatalogRow {
+                definition: roles.table.def,
+                values,
+            };
+            if role.string("rolname")? == "pg_database_owner" {
+                union
+                    .push((
+                        stored_database.integer("datdba")? as u32,
+                        role.integer("oid")? as u32,
+                        false,
+                    ))
+                    .map_err(|_| arena_full())?;
+            }
+        }
+    }
+    let union = union.into_mut_slice().map_err(|_| arena_full())?;
+    union.sort_unstable();
+    let mut prior = None;
+    let mut output = Output::new(arena);
+    for &(member, role, admin) in union.iter() {
+        if prior == Some((member, role, admin)) {
+            continue;
+        }
+        prior = Some((member, role, admin));
+        if (matches!(view, MembershipView::Administrable) && !admin)
+            || !super::information::owner_is_enabled(storage, transaction, member as i32)
+        {
+            continue;
+        }
+        for values in roles.matching((member, 0)) {
+            let member = CatalogRow {
+                definition: roles.table.def,
+                values,
+            };
+            for values in roles.matching((role, 0)) {
+                let role = CatalogRow {
+                    definition: roles.table.def,
+                    values,
+                };
+                output.push(&[
+                    member.get("rolname")?,
+                    role.get("rolname")?,
+                    text(if admin { "YES" } else { "NO" }, arena)?,
+                ])?;
+            }
+        }
+    }
+    output.finish(
+        match view {
+            MembershipView::Applicable => "applicable_roles",
+            MembershipView::Administrable => "administrable_role_authorizations",
+        },
+        true,
+    )
+}
+
+pub(super) fn accounts<'a>(
+    storage: &Storage,
+    transaction: u32,
+    read: Read,
+    view: AccountView,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use super::view_rows::CatalogRow;
+    if matches!(view, AccountView::Shadow) {
+        super::require_authid_read(storage, transaction)?;
+    }
+    let roles = read.authid_for_view(storage, transaction, arena)?;
+    let settings = read.base(storage, Base::RoleSettings, transaction, arena)?;
+    let [setting_role, setting_database, setting_config] =
+        columns(&settings, ["setrole", "setdatabase", "setconfig"]);
+    let password = text("********", arena)?;
+    let mut output = Output::new(arena);
+    for values in roles.rows {
+        let account = CatalogRow {
+            definition: roles.def,
+            values,
+        };
+        if !account.boolean("rolcanlogin")? {
+            continue;
+        }
+        let oid = account.integer("oid")?;
+        for setting in left_rows(settings.rows, move |values| {
+            integer(values[setting_role]).expect("built-in setting role OID") == oid
+                && integer(values[setting_database]).expect("built-in database OID") == 0
+        }) {
+            output.push(&[
+                account.get("rolname")?,
+                account.get("oid")?,
+                account.get("rolcreatedb")?,
+                account.get("rolsuper")?,
+                account.get("rolreplication")?,
+                account.get("rolbypassrls")?,
+                match view {
+                    AccountView::Users => password,
+                    AccountView::Shadow => account.get("rolpassword")?,
+                },
+                account.get("rolvaliduntil")?,
+                setting.map_or(Datum::Null, |values| values[setting_config]),
+            ])?;
+        }
+    }
+    output.finish(
+        match view {
+            AccountView::Users => "pg_user",
+            AccountView::Shadow => "pg_shadow",
+        },
+        false,
+    )
 }
 
 #[derive(Clone, Copy)]

@@ -31,8 +31,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v26` | yes | yes | Retains object-permission grant order, explicitly empty permission lists, per-table index-presence hints and catalog identities, including parameter permission rows, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `14` at header byte 17; bytes 18–23 are zero | yes | yes | Catalog images use declared field types and hidden system-column positions, including retained rewrite bodies. They retain selected source identities and explicit object-permission grant order. Prepared catalog images retain comment tuple roots, which restart rebinds to the restored committed source. Parameter permissions retain complete rows and the identity being replaced. Sequence restart records retain their transaction ownership; materialized-view records retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v27` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Journal record | Version `15` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -49,7 +49,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v24 and older manifests are rejected before their references are used.
+Manifest v26 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -67,6 +67,24 @@ replacement account cannot give the replacement permission to finish that
 transaction. This remains true after checkpoint or journal recovery, even if
 a deleted account's slot is reused. A superuser can still finish the abandoned transaction.
 
+Schemas retain their creation identity through renames, database cloning and
+recovery. For example, after renaming `public` to `archive` and creating a new
+`public`, `archive` keeps identifier 2200 and the replacement gets its own
+identifier. An explicit owner change is preserved separately from the special
+`pg_database_owner` role of an initial public schema.
+
+Manifest `nsp` records contain the creation stamp, a database-owner flag (`0`
+or `1`), and the hexadecimal name. Every schema is explicit, including initial
+public schemas; stamp zero identifies an initial public schema. Other schema
+identifiers are 80,000 plus their positive creation stamp, below the temporary
+namespace range starting at 2,000,000. The shared `catalog_sequence` field retains
+the highest reservation, including deleted objects. Schema creation returns
+`54000` before changing the catalog if that sequence reaches 1,920,000. Schema
+journal records begin with the eight-byte creation stamp and validate it before
+renaming or dropping an existing object. Missing, duplicate or mismatched
+identities are rejected. A restored object must also have a schema in its own
+database; missing schema records stop restoration before writer promotion.
+
 ## Why the storage layout matters
 
 **User example:** an orders table has an ID, status, and a large description.
@@ -83,7 +101,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v26, journal v14, and table-definition payload v9.
+and readers use manifest v27, journal v15, and table-definition payload v9.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.

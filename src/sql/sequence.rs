@@ -10,7 +10,7 @@
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
 use crate::mem::arena::{Arena, ArenaHandle, ArenaList};
-use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
+use crate::sql::eval::{SequenceAccess, SequenceReference, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
 use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
@@ -302,30 +302,76 @@ impl<'a> SeqEval<'a> {
     /// Resolves a `nextval('name')` argument to a live sequence slot. The name
     /// may be schema-qualified (`schema.seq`); resolution otherwise walks the
     /// search path, exactly as relation resolution does.
-    fn resolve(&self, name: &str) -> Result<usize, SqlError> {
-        let (qualifier, base) = match name.rsplit_once('.') {
-            Some((q, b)) => (Some(q), b),
-            None => (None, name),
+    fn resolve(&self, name: SequenceReference<'_>) -> Result<usize, SqlError> {
+        let reference = match name {
+            SequenceReference::Name(name) => crate::sql::identifiers::ObjectReference::parse(name)?,
+            SequenceReference::Oid(oid) => crate::sql::identifiers::ObjectReference::Oid(oid),
         };
-        if let Some(slot) = self.storage.sequence_on_path(qualifier, base, self.txid) {
+        let slot = match reference {
+            crate::sql::identifiers::ObjectReference::Oid(oid) => {
+                let slot = (0..self.storage.sequence_count()).find(|slot| {
+                    self.storage.sequence_slot_visible_to(*slot, self.txid)
+                        && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
+                });
+                if let Some(slot) = slot {
+                    return Ok(slot);
+                }
+                if crate::sql::catalog::relation_oid_visibility(self.storage, self.txid, oid as i32)
+                    .is_some()
+                {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "object {} is not a sequence",
+                        oid
+                    ));
+                }
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "could not open relation with OID {}",
+                    oid
+                ));
+            }
+            crate::sql::identifiers::ObjectReference::Name(parsed) => {
+                if parsed.database.is_some_and(|database| {
+                    database != self.storage.current_database_name(self.txid)
+                }) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cross-database sequence references are not supported"
+                    ));
+                }
+                let qualifier = parsed.schema.as_ref().map(crate::storage::SqlName::as_str);
+                if let Some(schema) = qualifier
+                    && self
+                        .storage
+                        .find_schema_visible(schema, self.txid)
+                        .is_some()
+                {
+                    self.storage.require_schema_usage(schema, self.txid)?;
+                }
+                let base = parsed.name.as_str();
+                let slot = self.storage.sequence_on_path(qualifier, base, self.txid);
+                if slot.is_none()
+                    && self
+                        .storage
+                        .resolve_relation(qualifier, base, self.txid)
+                        .is_some()
+                {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not a sequence",
+                        base
+                    ));
+                }
+                slot
+            }
+        };
+        if let Some(slot) = slot {
             self.storage.require_schema_usage(
                 self.storage.sequence_for(slot, self.txid).schema.as_str(),
                 self.txid,
             )?;
             return Ok(slot);
-        }
-        // Match PostgreSQL's phrasing: a relation of another kind is a type
-        // error; nothing at all is an undefined relation.
-        if self
-            .storage
-            .resolve_relation(qualifier, base, self.txid)
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a sequence",
-                base
-            ));
         }
         Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
@@ -400,7 +446,7 @@ pub(crate) fn next_cached(
 }
 
 impl SequenceAccess for SeqEval<'_> {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;
         if self.dry {
@@ -409,7 +455,7 @@ impl SequenceAccess for SeqEval<'_> {
         next_cached(self.storage, self.session, slot, self.txid)
     }
 
-    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::SELECT))?;
         let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
@@ -456,7 +502,12 @@ impl SequenceAccess for SeqEval<'_> {
         )
     }
 
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
         let (source, seq) = self.storage.select_sequence_for_replay(slot, self.txid)?;
@@ -487,16 +538,21 @@ impl SequenceAccess for SeqEval<'_> {
 }
 
 impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
+    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.nextval(name))
     }
-    fn currval(&self, name: &str) -> Result<i64, SqlError> {
+    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.currval(name))
     }
     fn lastval(&self) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.lastval())
     }
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
+    fn setval(
+        &self,
+        name: SequenceReference<'_>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64, SqlError> {
         self.state
             .invoke(|| self.base.setval(name, value, is_called))
     }

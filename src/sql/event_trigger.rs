@@ -1677,7 +1677,7 @@ fn primary_object(
             let schema = storage.schema_def(slot).name;
             base_object(
                 catalog::PG_NAMESPACE_OID,
-                catalog::namespace_oid_for_slot(slot),
+                catalog::namespace_oid_for_slot(storage, slot),
                 "schema",
                 None,
                 Some(schema.as_str()),
@@ -2583,7 +2583,7 @@ fn existing_catalog_object(
         catalog::PG_NAMESPACE_OID => {
             if let Some(slot) = (0..storage.schema_count()).find(|slot| {
                 storage.schema_def(*slot).visible_to(txid)
-                    && catalog::namespace_oid_for_slot(*slot) == object_id
+                    && catalog::namespace_oid_for_slot(storage, *slot) == object_id
             }) {
                 EventObjectRef::Primary(ObjectRef::Schema(slot))
             } else {

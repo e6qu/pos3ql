@@ -506,87 +506,26 @@ pub(crate) fn parse_qualified_ident<'a>(
     arena: &'a Arena,
     strict: bool,
 ) -> Result<usize, SqlError> {
-    let bad = || {
-        sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "string is not a valid identifier: \"{}\"",
-            input
-        )
-    };
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    let mut n = 0usize;
-    loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return Err(bad());
-        }
-        if n == out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "identifier has too many parts"
-            ));
-        }
-        let part = if bytes[i] == b'"' {
-            // Quoted part: read to the closing quote, collapsing `""` to `"`.
-            i += 1;
-            let mut buffer = crate::util::StackStr::<1024>::new();
-            use core::fmt::Write as _;
-            loop {
-                match bytes.get(i) {
-                    None => return Err(bad()),
-                    Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
-                        let _ = buffer.write_char('"');
-                        i += 2;
-                    }
-                    Some(b'"') => {
-                        i += 1;
-                        break;
-                    }
-                    Some(&c) => {
-                        let _ = buffer.write_char(c as char);
-                        i += 1;
-                    }
-                }
+    let mut count = 0;
+    crate::sql::identifiers::for_each_qualified_identifier(
+        input,
+        crate::sql::identifiers::IdentifierGrammar::Sql,
+        strict,
+        |part| {
+            if count == out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "identifier has too many parts"
+                ));
             }
-            arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?
-        } else {
-            // Unquoted identifiers cannot start with a digit. PostgreSQL also
-            // permits `$` after the first character.
-            let start = i;
-            if !matches!(bytes[i], b'_' | b'A'..=b'Z' | b'a'..=b'z' | 0x80..=0xff) {
-                return Err(bad());
-            }
-            while i < bytes.len()
-                && (matches!(bytes[i], b'_' | b'$')
-                    || bytes[i].is_ascii_alphanumeric()
-                    || bytes[i] >= 0x80)
-            {
-                i += 1;
-            }
-            if i == start {
-                return Err(bad());
-            }
-            let raw = &input[start..i];
-            let lower = arena
-                .alloc_slice_with(raw.len(), |k| raw.as_bytes()[k].to_ascii_lowercase())
+            let bytes = arena
+                .alloc_slice_with(part.decoded_len(), |_| 0u8)
                 .map_err(|_| arena_full())?;
-            unsafe { core::str::from_utf8_unchecked(lower) }
-        };
-        out[n] = Datum::Text(part);
-        n += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        match bytes.get(i) {
-            Some(b'.') => i += 1,
-            None => return Ok(n),
-            _ if !strict => return Ok(n),
-            _ => return Err(bad()),
-        }
-    }
+            out[count] = Datum::Text(part.decode_into(bytes)?);
+            count += 1;
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn datum_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {

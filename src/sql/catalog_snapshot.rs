@@ -210,7 +210,8 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
         | IndexRenamed { .. }
         | IndexAltered { .. }
         | MatviewChanged(_)
-        | MatviewPopulationChanged(_) => &[
+        | MatviewPopulationChanged(_)
+        | MatviewQueryChanged(_) => &[
             "pg_class",
             "pg_attribute",
             "pg_attrdef",
@@ -405,7 +406,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
             "pg_shdepend",
             "pg_shdescription",
         ],
-        SchemaCreated(_) | SchemaDropped(_) | SchemaRenamed { .. } => {
+        SchemaCreated(_) | SchemaDropped(_) | SchemaRenamed(_) => {
             &["pg_namespace", "pg_depend", "pg_shdepend", "pg_description"]
         }
         ExtensionCreated(_)
@@ -447,7 +448,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
         ColumnAclChanged { .. } => &["pg_attribute", "pg_shdepend"],
         DefaultAclChanged { .. } => &["pg_default_acl", "pg_shdepend"],
         ParameterAclChanged { .. } => &["pg_parameter_acl", "pg_shdepend"],
-        CommentSet { .. } | ConstraintCommentRenamed { .. } => {
+        CommentSet { .. } | CommentIdentityChanged { .. } => {
             &["pg_description", "pg_shdescription"]
         }
         SequenceReset { .. } | SystemSettingChanged { .. } => &[],

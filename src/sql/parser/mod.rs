@@ -313,7 +313,9 @@ pub(crate) enum CatalogLiteralKind {
 impl CatalogLiteralKind {
     pub(super) fn for_cast(name: &str) -> Option<Self> {
         match name {
-            "regclass" | "regproc" | "regcollation" | "regconfig" | "regdictionary" => Some(Self::QualifiedName),
+            "regclass" | "regproc" | "regcollation" | "regconfig" | "regdictionary" => {
+                Some(Self::QualifiedName)
+            }
             "regnamespace" => Some(Self::SchemaName),
             "regtype" => Some(Self::TypeName),
             "regprocedure" => Some(Self::RoutineIdentity),
@@ -359,16 +361,20 @@ pub(crate) fn schema_namespace_sources<'arena>(
     kind: StoredSqlKind,
     arena: &'arena Arena,
 ) -> Result<SchemaSqlSources<'arena>, super::eval::SqlError> {
+    let sql = arena.alloc_str(sql).map_err(|_| super::query::arena_full_pub())?;
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.namespace_sources = Some(core::cell::RefCell::new(SchemaSqlSourceCollector {
-        namespaces: ArenaList::new(arena), catalog_literals: ArenaList::new(arena),
+        namespaces: ArenaList::new(arena),
+        catalog_literals: ArenaList::new(arena),
         string_literals: ArenaList::new(arena),
     }));
     let parsed = match kind {
         StoredSqlKind::Expression => parser.expression(0).map(|_| ()),
         StoredSqlKind::TypeName => parser.type_name_mod().map(|_| ()),
         StoredSqlKind::RoutineIdentity => parser.routine_identity().map(|_| ()),
-        StoredSqlKind::OperatorName => parser.operator_qual_name("stored operator name is invalid").map(|_| ()),
+        StoredSqlKind::OperatorName => parser
+            .operator_qual_name("stored operator name is invalid")
+            .map(|_| ()),
         StoredSqlKind::OperatorIdentity => parser.operator_identity().map(|_| ()),
         StoredSqlKind::Statements => (|| {
             while parser.peeked != Tok::Eof {
@@ -394,9 +400,11 @@ pub(crate) fn schema_namespace_sources<'arena>(
         .borrow();
     // The returned positions own no references into the source being edited.
     Ok(SchemaSqlSources {
-        namespaces: arena.alloc_slice_copy(sources.namespaces.as_slice())
+        namespaces: arena
+            .alloc_slice_copy(sources.namespaces.as_slice())
             .map_err(|_| super::query::arena_full_pub())?,
-        catalog_literals: arena.alloc_slice_copy(sources.catalog_literals.as_slice())
+        catalog_literals: arena
+            .alloc_slice_copy(sources.catalog_literals.as_slice())
             .map_err(|_| super::query::arena_full_pub())?,
     })
 }
@@ -8114,22 +8122,47 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn record_string_literal(&self, expression: &'a Expr<'a>, source: NamespaceSource) -> Result<(), ParseError> {
+    fn record_string_literal(
+        &self,
+        expression: &'a Expr<'a>,
+        source: NamespaceSource,
+    ) -> Result<(), ParseError> {
         if let Some(sources) = &self.namespace_sources {
-            sources.borrow_mut().string_literals.push((expression, source))
+            sources
+                .borrow_mut()
+                .string_literals
+                .push((expression, source))
                 .map_err(|_| self.arena_full("literal source map exceeds SQL arena"))?;
         }
         Ok(())
     }
 
-    fn record_catalog_literal(&self, expression: &'a Expr<'a>, kind: CatalogLiteralKind) -> Result<(), ParseError> {
-        if let Some(sources) = &self.namespace_sources && let Expr::Str(value) = expression {
-            let source = sources.borrow().string_literals.as_slice().iter()
-                .find_map(|(candidate, source)| core::ptr::eq(*candidate, expression).then_some(*source));
-            let Some(source) = source else { return Ok(()); };
-            let value = self.arena.alloc_str(value)
+    fn record_catalog_literal(
+        &self,
+        expression: &'a Expr<'a>,
+        kind: CatalogLiteralKind,
+    ) -> Result<(), ParseError> {
+        if let Some(sources) = &self.namespace_sources
+            && let Expr::Str(value) = expression
+        {
+            let source = sources.borrow().string_literals.as_slice().iter().find_map(
+                |(candidate, source)| core::ptr::eq(*candidate, expression).then_some(*source),
+            );
+            let Some(source) = source else {
+                return Ok(());
+            };
+            let value = self
+                .arena
+                .alloc_str(value)
                 .map_err(|_| self.arena_full("bound literal source exceeds SQL arena"))?;
-            sources.borrow_mut().catalog_literals.push(CatalogLiteralSource { kind, position: source, value })
+            sources
+                .borrow_mut()
+                .catalog_literals
+                .push(CatalogLiteralSource {
+                    kind,
+                    position: source,
+                    value,
+                })
                 .map_err(|_| self.arena_full("bound literal source map exceeds SQL arena"))?;
         }
         Ok(())

@@ -509,9 +509,13 @@ pub(crate) fn parse_qualified_ident<'a>(
     let mut count = 0;
     crate::sql::identifiers::for_each_qualified_identifier(input, strict, |part| {
         if count == out.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "identifier has too many parts"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "identifier has too many parts"
+            ));
         }
-        let bytes = arena.alloc_slice_with(part.decoded_len(), |_| 0u8)
+        let bytes = arena
+            .alloc_slice_with(part.decoded_len(), |_| 0u8)
             .map_err(|_| arena_full())?;
         out[count] = Datum::Text(part.decode_into(bytes)?);
         count += 1;

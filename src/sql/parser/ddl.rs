@@ -1659,7 +1659,10 @@ impl<'a> Parser<'a> {
         Ok(types.as_slice())
     }
 
-    pub(super) fn operator_qual_name(&mut self, what: &'static str) -> Result<QualName<'a>, ParseError> {
+    pub(super) fn operator_qual_name(
+        &mut self,
+        what: &'static str,
+    ) -> Result<QualName<'a>, ParseError> {
         let wrapped = self.eat_ident("operator")?;
         if wrapped {
             self.expect_op("(")?;

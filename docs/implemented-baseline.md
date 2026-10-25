@@ -862,6 +862,13 @@ SQL routine bodies bound at creation follow the change. A string body such as
 `AS 'SELECT * FROM orders.items'` keeps its text and can fail when called after
 the rename, as in PostgreSQL.
 
+Stored object references follow the rename too. For example, a saved view that
+calls `nextval('orders.ticket')` keeps using that sequence after `orders` becomes
+`sales`. PostgreSQL's object-reference casts, such as
+`'orders.items'::regclass`, follow the object. Ordinary text stays unchanged;
+`nextval('orders.ticket'::text)` resolves its text when called and can fail after
+the rename. Quoted names preserve their Unicode characters, dots and quotes.
+
 A schema keeps its object identifier through renames and recovery. Renaming
 `public` to `archive`, then creating another `public`, gives the replacement a
 different identifier and ordinary ownership; `archive` retains identifier 2200

@@ -26,7 +26,9 @@ fn schema_rename_preserves_typed_reference_literals_and_leaves_text_unchanged() 
           'typed_before.byte_order'::regcollation AS collation_id,
           'typed_before.items'::text AS ordinary_text;
     "#, true);
-    let check = |schema: &str| format!("SELECT
+    let check = |schema: &str| {
+        format!(
+            "SELECT
         relation_id='{schema}.items'::regclass,
         schema_id='{schema}'::regnamespace,
         type_id='{schema}.amount[]'::regtype,
@@ -35,14 +37,25 @@ fn schema_rename_preserves_typed_reference_literals_and_leaves_text_unchanged() 
         operator_id='{schema}.+'::regoper,
         operator_signature='{schema}.+(integer,integer)'::regoperator,
         collation_id='{schema}.byte_order'::regcollation,
-        ordinary_text='typed_before.items' FROM typed_reference_view");
+        ordinary_text='typed_before.items' FROM typed_reference_view"
+        )
+    };
     for (change, schema) in [
-        ("BEGIN; ALTER SCHEMA typed_before RENAME TO typed_after", "typed_after"),
+        (
+            "BEGIN; ALTER SCHEMA typed_before RENAME TO typed_after",
+            "typed_after",
+        ),
         ("ROLLBACK", "typed_before"),
-        ("ALTER SCHEMA typed_before RENAME TO typed_after", "typed_after"),
+        (
+            "ALTER SCHEMA typed_before RENAME TO typed_after",
+            "typed_after",
+        ),
     ] {
         session.success(&mut engine, change, true);
-        assert_eq!(data_rows(&session.success(&mut engine, &check(schema), true)), ["t|t|t|t|t|t|t|t|t"]);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &check(schema), true)),
+            ["t|t|t|t|t|t|t|t|t"]
+        );
     }
 }
 
@@ -53,22 +66,33 @@ fn schema_name_sql_literals_preserve_unicode_quotes_and_long_identifiers() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, r#"
+    session.success(
+        &mut engine,
+        r#"
         CREATE SCHEMA "Séquence.Before";
         CREATE SEQUENCE "Séquence.Before"."tick""et" START WITH 7;
         CREATE VIEW quoted_ticket_view AS SELECT nextval('"Séquence.Before"."tick""et"') AS id;
         CREATE FUNCTION quoted_ticket() RETURNS bigint LANGUAGE SQL
           BEGIN ATOMIC SELECT nextval('"Séquence.Before"."tick""et"'); END;
         ALTER SCHEMA "Séquence.Before" RENAME TO "Après,'Schema";
-    "#, true);
-    assert_eq!(data_rows(&session.success(&mut engine, r#"
+    "#,
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            r#"
         SELECT id FROM quoted_ticket_view;
         SELECT quoted_ticket();
         SELECT currval('"Après,''Schema"."tick""et"');
         SELECT nextval('"Après,''Schema"."tick""et"'::regclass::oid);
         SELECT parse_ident('"élève"."a""b"',true)=ARRAY['élève','a"b'];
         SELECT parse_ident('"'||repeat('é',600)||'"',true)=ARRAY[repeat('é',600)];
-    "#, true)), ["7", "8", "8", "9", "t", "t"]);
+    "#,
+            true
+        )),
+        ["7", "8", "8", "9", "t", "t"]
+    );
 }
 
 #[test]
@@ -78,22 +102,51 @@ fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback()
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     engine.commit_progress = CommitProgressMode::Reactor;
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE SCHEMA sequence_before;
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA sequence_before;
         CREATE SEQUENCE sequence_before.ticket START WITH 100;
         CREATE VIEW bound_sequence_view AS SELECT nextval('sequence_before.ticket') AS id;
         CREATE FUNCTION bound_sequence() RETURNS bigint LANGUAGE SQL
           BEGIN ATOMIC SELECT nextval('sequence_before.ticket'); END;
         CREATE VIEW late_sequence_view AS SELECT nextval('sequence_before.ticket'::text) AS id;
-        BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["100", "101"]);
+        BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id FROM bound_sequence_view; SELECT bound_sequence()",
+            true
+        )),
+        ["100", "101"]
+    );
     session.success(&mut engine, "ROLLBACK", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["102", "103"]);
-    session.success(&mut engine, "ALTER SCHEMA sequence_before RENAME TO sequence_after", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT id FROM bound_sequence_view; SELECT bound_sequence()", true)), ["104", "105"]);
-    assert_eq!(error_sqlstates(&session.execute(&mut engine, "SELECT id FROM late_sequence_view", true)), ["42P01"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id FROM bound_sequence_view; SELECT bound_sequence()",
+            true
+        )),
+        ["102", "103"]
+    );
+    session.success(
+        &mut engine,
+        "ALTER SCHEMA sequence_before RENAME TO sequence_after",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id FROM bound_sequence_view; SELECT bound_sequence()",
+            true
+        )),
+        ["104", "105"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "SELECT id FROM late_sequence_view", true)),
+        ["42P01"]
+    );
 }
 
 #[test]
@@ -632,8 +685,15 @@ fn schema_rename_prepared_decisions_preserve_private_definitions_after_disk_loss
                 ["8", "8|ready", "prepared namespace"],
                 "{name}"
             );
-            assert_eq!(data_rows(&session.success(&mut cold,
-                &format!("SELECT {schema}.next_ticket()"), false)), ["40"], "{name}");
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut cold,
+                    &format!("SELECT {schema}.next_ticket()"),
+                    false
+                )),
+                ["40"],
+                "{name}"
+            );
             // View materialization writes simulator objects, whose fixture
             // vectors grow. The rename and direct metadata reads stay guarded.
             assert_eq!(

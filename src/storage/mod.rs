@@ -15590,7 +15590,10 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     arena: &crate::mem::arena::Arena,
 ) -> Result<bool, SqlError> {
     if old.as_str().is_empty() {
-        return Err(sql_err!(sqlstate::INVALID_SCHEMA_NAME, "schema name is empty"));
+        return Err(sql_err!(
+            sqlstate::INVALID_SCHEMA_NAME,
+            "schema name is empty"
+        ));
     }
     let mark = arena.mark();
     let result = (|| {
@@ -15601,7 +15604,10 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
             spans,
             old,
             new,
-            NamespaceRewriteScope::Parsed { sources: namespaces, arena },
+            NamespaceRewriteScope::Parsed {
+                sources: namespaces,
+                arena,
+            },
         )
     })();
     // SAFETY: parsing contributes only byte positions to an inline SQL buffer.
@@ -15611,18 +15617,31 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
 }
 
 enum NamespaceRewriteScope<'a> {
-    Parsed { sources: crate::sql::parser::SchemaSqlSources<'a>, arena: &'a crate::mem::arena::Arena },
+    Parsed {
+        sources: crate::sql::parser::SchemaSqlSources<'a>,
+        arena: &'a crate::mem::arena::Arena,
+    },
     #[cfg(test)]
     Lexical,
 }
 
 impl NamespaceRewriteScope<'_> {
     fn rewrite_catalog_literal<const N: usize>(
-        &self, start: usize, old: SqlName, new: SqlName,
+        &self,
+        start: usize,
+        old: SqlName,
+        new: SqlName,
     ) -> Result<Option<(usize, &str)>, SqlError> {
-        let Self::Parsed { sources, arena } = self else { return Ok(None); };
-        let Some(literal) = sources.catalog_literals.iter().find(|literal| literal.position.start == start)
-            else { return Ok(None); };
+        let Self::Parsed { sources, arena } = self else {
+            return Ok(None);
+        };
+        let Some(literal) = sources
+            .catalog_literals
+            .iter()
+            .find(|literal| literal.position.start == start)
+        else {
+            return Ok(None);
+        };
         use crate::sql::parser::{CatalogLiteralKind, StoredSqlKind};
         let mut name = StackStr::<N>::new();
         use core::fmt::Write as _;
@@ -15635,13 +15654,20 @@ impl NamespaceRewriteScope<'_> {
                 match literal.kind {
                     CatalogLiteralKind::SchemaName => {
                         if parsed.database.is_some() || parsed.schema.is_some() {
-                            return Err(sql_err!(sqlstate::INVALID_NAME, "schema reference has more than one identifier"));
+                            return Err(sql_err!(
+                                sqlstate::INVALID_NAME,
+                                "schema reference has more than one identifier"
+                            ));
                         }
-                        if parsed.name != old { return Ok(None); }
+                        if parsed.name != old {
+                            return Ok(None);
+                        }
                         write_schema_identifier(&mut name, new);
                     }
                     CatalogLiteralKind::QualifiedName => {
-                        if parsed.schema != Some(old) { return Ok(None); }
+                        if parsed.schema != Some(old) {
+                            return Ok(None);
+                        }
                         if let Some(database) = parsed.database {
                             write_schema_identifier(&mut name, database);
                             let _ = name.write_char('.');
@@ -15654,7 +15680,9 @@ impl NamespaceRewriteScope<'_> {
                 }
             }
             kind => {
-                if !literal.value.is_empty() && literal.value.bytes().all(|byte| byte.is_ascii_digit()) {
+                if !literal.value.is_empty()
+                    && literal.value.bytes().all(|byte| byte.is_ascii_digit())
+                {
                     return Ok(None);
                 }
                 let _ = name.write_str(literal.value);
@@ -15671,7 +15699,10 @@ impl NamespaceRewriteScope<'_> {
             }
         }
         if name.is_truncated() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "schema rename exceeds the stored reference literal limit"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "schema rename exceeds the stored reference literal limit"
+            ));
         }
         let quoted = crate::sql::eval::quote_literal_str(name.as_str(), arena)?;
         Ok(Some((literal.position.end, quoted)))
@@ -15679,7 +15710,8 @@ impl NamespaceRewriteScope<'_> {
 
     fn includes(&self, start: usize, end: usize, _followed_by_dot: bool) -> bool {
         match self {
-            Self::Parsed { sources, .. } => sources.namespaces
+            Self::Parsed { sources, .. } => sources
+                .namespaces
                 .iter()
                 .any(|source| source.start == start && source.end == end),
             #[cfg(test)]

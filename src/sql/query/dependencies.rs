@@ -2455,7 +2455,11 @@ fn collect_expression<'a>(
         && matches!(*name, "nextval" | "currval" | "setval")
         && let Some(sequence_name) = args.first().and_then(|argument| match argument {
             Expr::Str(value) => Some(*value),
-            Expr::Cast { operand, type_name: "regclass", .. } => match operand {
+            Expr::Cast {
+                operand,
+                type_name: "regclass",
+                ..
+            } => match operand {
                 Expr::Str(value) => Some(*value),
                 _ => None,
             },
@@ -2837,39 +2841,62 @@ fn collect_sequence(
     path: &PathContext,
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
-    let (slot, referenced_schema, referenced_name) = match crate::sql::identifiers::ObjectReference::parse(sequence_name)? {
-        crate::sql::identifiers::ObjectReference::Oid(oid) => {
-            let slot = (0..storage.sequence_count()).find(|slot|
-                storage.sequence_slot_visible_to(*slot, txid)
-                    && crate::sql::catalog::sequence_oid(*slot) as u32 == oid);
-            (slot, SqlName::EMPTY, SqlName::parse(crate::stack_format!(16, "{}", oid).as_str())?)
-        }
-        crate::sql::identifiers::ObjectReference::Name(parsed) => {
-            if parsed.database.is_some_and(|database| database != storage.current_database_name(txid)) {
-                return Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "cross-database sequence references are not supported"));
+    let (slot, referenced_schema, referenced_name) =
+        match crate::sql::identifiers::ObjectReference::parse(sequence_name)? {
+            crate::sql::identifiers::ObjectReference::Oid(oid) => {
+                let slot = (0..storage.sequence_count()).find(|slot| {
+                    storage.sequence_slot_visible_to(*slot, txid)
+                        && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
+                });
+                (
+                    slot,
+                    SqlName::EMPTY,
+                    SqlName::parse(crate::stack_format!(16, "{}", oid).as_str())?,
+                )
             }
-            let name = parsed.name.as_str();
-            let slot = if let Some(schema) = parsed.schema {
-                if schema.as_str() == "pg_temp" {
-                    storage.temporary_schema().ok()
+            crate::sql::identifiers::ObjectReference::Name(parsed) => {
+                if parsed
+                    .database
+                    .is_some_and(|database| database != storage.current_database_name(txid))
+                {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cross-database sequence references are not supported"
+                    ));
+                }
+                let name = parsed.name.as_str();
+                let slot = if let Some(schema) = parsed.schema {
+                    if schema.as_str() == "pg_temp" {
+                        storage
+                            .temporary_schema()
+                            .ok()
+                            .and_then(|schema| storage.sequence_slot(schema.as_str(), name, txid))
+                    } else if schema.as_str().starts_with("pg_temp_")
+                        && !storage.is_current_temporary_schema(schema.as_str())
+                    {
+                        None
+                    } else {
+                        storage.sequence_slot(schema.as_str(), name, txid)
+                    }
+                } else {
+                    storage
+                        .temporary_schema()
+                        .ok()
                         .and_then(|schema| storage.sequence_slot(schema.as_str(), name, txid))
-                } else if schema.as_str().starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema.as_str()) {
-                    None
-                } else { storage.sequence_slot(schema.as_str(), name, txid) }
-            } else {
-                storage.temporary_schema().ok()
-                    .and_then(|schema| storage.sequence_slot(schema.as_str(), name, txid))
-                    .or_else(|| path.entries().iter().find_map(|entry| match entry {
-                        PathEntry::Schema(schema_slot) => {
-                            let schema = storage.schema_def_for(*schema_slot as usize, txid).name;
-                            storage.sequence_slot(schema.as_str(), name, txid)
-                        }
-                        PathEntry::Catalog => None,
-                    }))
-            };
-            (slot, parsed.schema.unwrap_or(SqlName::EMPTY), parsed.name)
-        }
-    };
+                        .or_else(|| {
+                            path.entries().iter().find_map(|entry| match entry {
+                                PathEntry::Schema(schema_slot) => {
+                                    let schema =
+                                        storage.schema_def_for(*schema_slot as usize, txid).name;
+                                    storage.sequence_slot(schema.as_str(), name, txid)
+                                }
+                                PathEntry::Catalog => None,
+                            })
+                        })
+                };
+                (slot, parsed.schema.unwrap_or(SqlName::EMPTY), parsed.name)
+            }
+        };
     if let Some(slot) = slot {
         let sequence = storage.sequence_for(slot, txid);
         dependencies.push(StoredQueryDependency {

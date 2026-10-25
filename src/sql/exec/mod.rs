@@ -4287,8 +4287,12 @@ fn copy_like_comments(
                         source_column.name.as_str()
                     )
                 })?;
-            let source_name = source.not_null_names[source.column_index(source_column.name.as_str()).expect("source column exists")].expect("required source column has a durable constraint name");
-            let target_name = target.not_null_names[target_column].expect("required target column has a durable constraint name");
+            let source_name = source.not_null_names[source
+                .column_index(source_column.name.as_str())
+                .expect("source column exists")]
+            .expect("required source column has a durable constraint name");
+            let target_name = target.not_null_names[target_column]
+                .expect("required target column has a durable constraint name");
             copy_comment_if_present(
                 storage,
                 wal,
@@ -65685,7 +65689,10 @@ fn alter_table_inner(
             } => {
                 let Some(column) = definition.columns().iter().find(|column| {
                     column.not_null.is_required()
-                        && definition.not_null_names[definition.column_index(column.name.as_str()).expect("constraint column exists")].is_some_and(|stored| stored.as_str() == *name)
+                        && definition.not_null_names[definition
+                            .column_index(column.name.as_str())
+                            .expect("constraint column exists")]
+                        .is_some_and(|stored| stored.as_str() == *name)
                 }) else {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -67540,7 +67547,10 @@ fn alter_table_relation(
                     crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit } => {
                         let column = new_def.columns().iter().position(|column| {
                             column.not_null.is_required()
-                                && new_def.not_null_names[new_def.column_index(column.name.as_str()).expect("constraint column exists")].is_some_and(|stored| stored.as_str() == *name)
+                                && new_def.not_null_names[new_def
+                                    .column_index(column.name.as_str())
+                                    .expect("constraint column exists")]
+                                .is_some_and(|stored| stored.as_str() == *name)
                         });
                         if let Some(column) = column {
                             new_def.columns[column].not_null_inheritable = *inherit;
@@ -67941,7 +67951,9 @@ fn alter_table_relation(
             return sql_fail(error);
         }
     }
-    if let Err(error) = crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping) {
+    if let Err(error) =
+        crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping)
+    {
         return sql_fail(error);
     }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];

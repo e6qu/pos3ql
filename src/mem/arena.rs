@@ -169,15 +169,19 @@ impl Arena {
             }
             cursor = previous.previous;
         }
-        let allocated = self.alloc(InternedValue { value, identity: InternedAllocation {
-            value_type: core::any::TypeId::of::<T>(),
-            value: core::ptr::null(),
-            end: 0,
-            previous: self.interned.get(),
-        }})?;
+        let allocated = self.alloc(InternedValue {
+            value,
+            identity: InternedAllocation {
+                value_type: core::any::TypeId::of::<T>(),
+                value: core::ptr::null(),
+                end: 0,
+                previous: self.interned.get(),
+            },
+        })?;
         allocated.identity.value = (&allocated.value as *const T).cast();
         allocated.identity.end = self.offset.get();
-        self.interned.set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
+        self.interned
+            .set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
         Ok(&allocated.value)
     }
 
@@ -932,7 +936,10 @@ mod tests {
             ));
             let different = arena.alloc_interned(9u64, PartialEq::eq).unwrap();
             assert!(!core::ptr::eq(first, different));
-            assert!(core::ptr::eq(first, arena.alloc_interned(7u64, PartialEq::eq).unwrap()));
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+            ));
             let typed = arena
                 .alloc_interned((1u32, 2u32), |_, _| {
                     panic!("different types cannot share a cache entry")

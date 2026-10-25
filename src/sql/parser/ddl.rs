@@ -145,7 +145,10 @@ impl<'a> Parser<'a> {
             let mut depth = 0;
             let mut grouped = false;
             loop {
-                match lexer.next_token().map_err(|_| self.err_here("invalid index expression"))? {
+                match lexer
+                    .next_token()
+                    .map_err(|_| self.err_here("invalid index expression"))?
+                {
                     Tok::Op("(") => depth += 1,
                     Tok::Op(")") => {
                         depth -= 1;
@@ -167,7 +170,10 @@ impl<'a> Parser<'a> {
         let mut depth = 0;
         let mut collation = None;
         loop {
-            match lexer.next_token().map_err(|_| self.err_here("invalid index expression"))? {
+            match lexer
+                .next_token()
+                .map_err(|_| self.err_here("invalid index expression"))?
+            {
                 Tok::Op("(" | "[") => depth += 1,
                 Tok::Op(")" | "]") => depth -= 1,
                 Tok::Ident("collate") if depth == 0 => collation = Some(lexer.token_start()),
@@ -175,7 +181,9 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        collation.map(|at| source[..at].trim_end()).ok_or_else(|| self.err_here("index collation source is missing"))
+        collation
+            .map(|at| source[..at].trim_end())
+            .ok_or_else(|| self.err_here("index collation source is missing"))
     }
 
     fn event_trigger_event(&mut self) -> Result<EventTriggerEvent, ParseError> {

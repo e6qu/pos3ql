@@ -242,25 +242,38 @@ fn bind_policy<'a>(
     if relation.is_truncated() {
         return Err(arena_full());
     }
-    let query = arena.alloc_str_display(format_args!("SELECT {source} FROM {}", relation.as_str()))
+    let query = arena
+        .alloc_str_display(format_args!("SELECT {source} FROM {}", relation.as_str()))
         .map_err(|_| arena_full())?;
     let (select, sources) = parser::parse_query_with_column_sources(query, arena)?;
     let bindings = super::super::query::catalog_expression_bindings(
-        select, sources.columns, storage, transaction, slot, arena,
+        select,
+        sources.columns,
+        storage,
+        transaction,
+        slot,
+        arena,
     )?;
     let mut sites = crate::mem::arena::ArenaList::new(arena);
     for (column, binding) in sources.columns.iter().zip(bindings) {
         if let Some(position) = binding.get() {
-            sites.push(Site {
-                start: column.start - 7,
-                end: column.end - 7,
-                column: usize::from(definition.attribute_number(position)),
-            }).map_err(|_| arena_full())?;
+            sites
+                .push(Site {
+                    start: column.start - 7,
+                    end: column.end - 7,
+                    column: usize::from(definition.attribute_number(position)),
+                })
+                .map_err(|_| arena_full())?;
         }
     }
     let mut output = ArenaString::new(arena);
     output.write_str(HEADER).map_err(|_| arena_full())?;
-    encode(source, Kind::Expression, sites.into_mut_slice().map_err(|_| arena_full())?, output)
+    encode(
+        source,
+        Kind::Expression,
+        sites.into_mut_slice().map_err(|_| arena_full())?,
+        output,
+    )
 }
 
 fn encode<'a>(

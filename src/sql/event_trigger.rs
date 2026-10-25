@@ -1405,7 +1405,13 @@ fn not_null_name(
     table: &crate::storage::TableDef,
     column: &crate::storage::ColumnMeta,
 ) -> StackStr<128> {
-    StackStr::from_str(table.not_null_names[table.column_index(column.name.as_str()).expect("constraint column exists")].expect("required column has a durable constraint name").as_str())
+    StackStr::from_str(
+        table.not_null_names[table
+            .column_index(column.name.as_str())
+            .expect("constraint column exists")]
+        .expect("required column has a durable constraint name")
+        .as_str(),
+    )
 }
 
 fn routine_object(storage: &Storage, txid: u32, slot: usize) -> Result<EventObject, SqlError> {

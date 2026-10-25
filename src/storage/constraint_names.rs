@@ -145,9 +145,14 @@ pub(crate) fn remap_table(
     let mut names = [None; super::MAX_COLUMNS];
     for (column, destination) in mapping[..previous.n_columns].iter().enumerate() {
         if let Some(destination) = destination {
-            let target = definition.column_index(destination.as_str()).ok_or_else(|| {
-                sql_err!(sqlstate::DATA_EXCEPTION, "constraint column mapping has no destination")
-            })?;
+            let target = definition
+                .column_index(destination.as_str())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "constraint column mapping has no destination"
+                    )
+                })?;
             names[target] = previous.not_null_names[column];
         }
     }
@@ -182,8 +187,7 @@ impl Storage {
     pub(crate) fn validate_not_null_names(definition: &TableDef) -> Result<(), SqlError> {
         for (position, column) in definition.columns().iter().enumerate() {
             if column.not_null.is_required() != definition.not_null_names[position].is_some()
-                || definition.not_null_names[position]
-                    .is_some_and(|name| name.as_str().is_empty())
+                || definition.not_null_names[position].is_some_and(|name| name.as_str().is_empty())
             {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
@@ -198,7 +202,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{ColumnMeta, NotNullOrigin, MAX_COLUMNS};
+    use crate::storage::{ColumnMeta, MAX_COLUMNS, NotNullOrigin};
 
     #[test]
     fn catalog_snapshot_not_null_names_follow_columns_through_compaction() {
@@ -223,7 +227,10 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             remap_table(&original, &mut replacement, &mapping).unwrap();
             assert_eq!(replacement.not_null_names[0], retained_name);
-            assert_eq!(replacement.not_null_names[1].unwrap().as_str(), "renamed_removed_not_null");
+            assert_eq!(
+                replacement.not_null_names[1].unwrap().as_str(),
+                "renamed_removed_not_null"
+            );
             Storage::validate_not_null_names(&replacement).unwrap();
             assert_eq!(original.not_null_names[0], None);
             assert_eq!(original.not_null_names[1], retained_name);

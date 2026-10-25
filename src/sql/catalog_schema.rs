@@ -1588,7 +1588,9 @@ mod tests {
 
     #[test]
     fn every_exposed_catalog_has_a_bounded_shared_definition() {
-        let bytes = core::mem::size_of::<crate::mem::arena::InternedValue<(crate::storage::TableDef, usize)>>();
+        let bytes = core::mem::size_of::<
+            crate::mem::arena::InternedValue<(crate::storage::TableDef, usize)>,
+        >();
         let mut budget = crate::mem::budget::Budget::new(bytes);
         let arena =
             crate::mem::arena::Arena::new(&mut budget, "schema definition only", bytes).unwrap();

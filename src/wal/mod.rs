@@ -4624,7 +4624,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
                 ok &= name_bytes(
                     buffer,
-                    def.not_null_names[column].as_ref().map_or("", |name| name.as_str()),
+                    def.not_null_names[column]
+                        .as_ref()
+                        .map_or("", |name| name.as_str()),
                 );
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
@@ -14501,10 +14503,7 @@ mod tests {
                 let (_, restored) = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.uniques[0].kind, kind);
                 assert_eq!(restored.attributes, definition.attributes);
-                assert_eq!(
-                    restored.not_null_names[0],
-                    definition.not_null_names[0]
-                );
+                assert_eq!(restored.not_null_names[0], definition.not_null_names[0]);
                 let name = definition.uniques[0].name.as_str().as_bytes();
                 let kind_at = payload
                     .readable()

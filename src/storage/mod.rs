@@ -1340,7 +1340,7 @@ impl OwnedDatum {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnMeta {
     pub name: SqlName,
     pub ctype: ColType,

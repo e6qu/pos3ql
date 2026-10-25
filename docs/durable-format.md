@@ -94,6 +94,8 @@ Table columns and domains store their NOT NULL constraint names. Renaming
 name. Manifest `col4` and `dom5` records include its hexadecimal name, and the
 journal stores its length and bytes. Nullable columns and domains store an
 empty name. A missing required name or an unexpected name is corrupt data.
+Column names are hexadecimal fields too, preserving spaces and avoiding
+position-dependent parsing of the rest of a line. Extra fields are rejected.
 Domain journal payloads use marker 253 and reject earlier payload layouts.
 
 Retained catalog expressions use `pos3ql-catalog-expression-v1` nodes. They

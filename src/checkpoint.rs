@@ -4091,7 +4091,10 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 17)?;
+                    let name = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt("column name missing"))?)?;
+                    if name.is_empty() || words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid column name or trailing fields"));
+                    }
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -4104,7 +4107,7 @@ impl Checkpointer {
                         "invalid column default state",
                     ))?;
                     def.columns[*seen] = ColumnMeta {
-                        name: sql_name(name)?,
+                        name: sql_name(&name)?,
                         user_type,
                         ctype,
                         type_mod,
@@ -10014,6 +10017,8 @@ impl Checkpointer {
                 if let Some(name) = c.not_null_name {
                     for byte in name.as_str().as_bytes() { let _ = write!(not_null_name_hex, "{byte:02x}"); }
                 } else { let _ = write!(not_null_name_hex, "0"); }
+                let mut column_name_hex = StackStr::<128>::new();
+                for byte in c.name.as_str().as_bytes() { let _ = write!(column_name_hex, "{byte:02x}"); }
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
@@ -10035,7 +10040,7 @@ impl Checkpointer {
                         c.collation.code(),
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
-                        c.name.as_str()
+                        column_name_hex.as_str()
                     ),
                 )?;
             }
@@ -17178,9 +17183,7 @@ fn finish_pending(
                     || definition.has_toast != expected.has_toast
                     || definition.columns().iter().zip(expected.columns()).any(
                         |(actual, expected)| {
-                            actual.name != expected.name
-                                || actual.ctype != expected.ctype
-                                || actual.not_null != expected.not_null
+                            actual != expected
                         },
                     )
                 {

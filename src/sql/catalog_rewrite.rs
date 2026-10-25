@@ -94,7 +94,7 @@ pub(super) fn current<'a>(
     let hidden = if bodies { PRIVATE_COLUMNS } else { &[] };
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), hidden)?;
-    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
+    let definition = super::allocate_definition(definition, hidden_columns, arena)?;
     let output = super::catalog_rows(arena, storage.rules_visible_to(transaction).count())?;
     for (target, (_, rule)) in output.iter_mut().zip(storage.rules_visible_to(transaction)) {
         *target = rule_row(storage, rule, transaction, bodies, arena)?;
@@ -123,7 +123,7 @@ pub(super) fn selected<'a>(
     )?;
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), &[])?;
-    let definition = arena.alloc(definition).map_err(|_| arena_full())?;
+    let definition = super::allocate_definition(definition, hidden_columns, arena)?;
     let rows = arena
         .alloc_slice_with(retained.rows.len(), |at| {
             &retained.rows[at][..PUBLIC_COLUMNS]

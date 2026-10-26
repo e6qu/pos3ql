@@ -388,7 +388,7 @@ pub(crate) fn populate_record_from_json<'a>(
                 *value,
                 field.type_oid,
                 catalog
-                    .composite_field_type_mod(base_type_oid, index)
+                    .composite_field_type_mod(base_type_oid, index, arena)?
                     .unwrap_or(-1),
                 field.value,
                 arena,
@@ -495,7 +495,7 @@ pub(crate) fn json_value_to_type<'a>(
                     *child,
                     field.type_oid,
                     catalog
-                        .composite_field_type_mod(type_oid, index)
+                        .composite_field_type_mod(type_oid, index, arena)?
                         .unwrap_or(-1),
                     field.value,
                     arena,

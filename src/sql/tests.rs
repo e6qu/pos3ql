@@ -4821,6 +4821,48 @@ fn json_populate_record_uses_table_rowtype_fields() {
 }
 
 #[test]
+fn relation_identity_view_rowtype_json_preserves_field_limits() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW json_identity_view AS SELECT 1 AS id, 'ok'::varchar(2) AS label",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        r#"SELECT (jsonb_populate_record(NULL::json_identity_view,
+                  '{"id":9,"label":"hi"}'::jsonb)).id,
+                  (jsonb_populate_record(NULL::json_identity_view,
+                  '{"id":9,"label":"hi"}'::jsonb)).label"#,
+        4 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["9|hi"]);
+    let rejected = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        r#"SELECT jsonb_populate_record(NULL::json_identity_view,
+                  '{"id":9,"label":"long"}'::jsonb)"#,
+        4 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("22001"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
 fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
     use crate::storage::MAX_TABLE_CATALOG_SLOTS;
     crate::mem::guard::forbid_alloc(|| {

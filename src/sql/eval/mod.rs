@@ -1045,11 +1045,16 @@ pub trait CatalogAccess {
     fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
         matches!(ColType::from_oid(type_oid), Some(ColType::Composite(_))).then_some(type_oid)
     }
-    /// Declared modifier for one active field of a named composite. JSON row
-    /// conversion must apply character/numeric limits exactly as assignment
+    /// Declared modifier for one active field of a table, view or named composite.
+    /// JSON row conversion must apply character/numeric limits exactly as assignment
     /// to that field would.
-    fn composite_field_type_mod(&self, _type_oid: i32, _field: usize) -> Option<i32> {
-        None
+    fn composite_field_type_mod(
+        &self,
+        _type_oid: i32,
+        _field: usize,
+        _arena: &Arena,
+    ) -> Result<Option<i32>, SqlError> {
+        Ok(None)
     }
     /// Whether a SQL type name resolves to a named composite. SQL/JSON query
     /// conversion must preserve an object/array value for composites instead

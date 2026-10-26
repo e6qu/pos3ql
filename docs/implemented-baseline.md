@@ -476,7 +476,9 @@ SQL identifiers for tables, views, sequences and indexes follow the object's
 lifetime. Renaming an object keeps its identifier; dropping it and creating
 another object gives the replacement a fresh identifier, even when storage
 reuses the same slot. Tables and views also keep separate identifiers for their
-row types and arrays. Journal and checkpoint recovery preserve these values.
+row types and arrays. JSON-to-row conversion accepts table and view row types
+and enforces their declared field limits. Journal and checkpoint recovery
+preserve these values.
 
 **User example:** an application can save a table's identifier before replacing
 it. The old value cannot give permission to read the replacement:

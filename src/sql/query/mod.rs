@@ -2622,7 +2622,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         use super::types::oid;
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&type_oid) {
             return self.rowtype_fields(type_oid, arena).map(Some);
         }
         let Ok(slot) = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE) else {
@@ -2674,7 +2674,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return Some(type_oid);
         }
         // Table/view rowtypes and named composites are their own base type.
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid)
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&type_oid)
             || (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE_ARRAY).contains(&type_oid)
         {
             return Some(type_oid);
@@ -2695,32 +2695,69 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         Some(super::types::oid::composite_oid(composite_slot))
     }
 
-    fn composite_field_type_mod(&self, type_oid: i32, field: usize) -> Option<i32> {
+    fn composite_field_type_mod(
+        &self,
+        type_oid: i32,
+        field: usize,
+        arena: &Arena,
+    ) -> Result<Option<i32>, SqlError> {
         use super::types::oid;
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = super::catalog::table_slot_by_row_type_oid(
-                self.storage,
-                self.txid,
-                type_oid,
-                false,
-            )?;
-            if slot >= self.storage.table_count() {
-                return None;
-            }
-            return self
+        if let Some(slot) = super::catalog::table_slot_by_row_type_oid(
+            self.storage,
+            self.txid,
+            type_oid,
+            false,
+        ) {
+            return Ok(self
                 .storage
                 .table_def(slot, self.txid)
                 .columns()
                 .get(field)
-                .map(|column| column.type_mod);
+                .map(|column| column.type_mod));
         }
-        let slot = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE).ok()?;
-        self.storage
+        if let Some(slot) = super::catalog::view_slot_by_row_type_oid(
+            self.storage,
+            self.txid,
+            type_oid,
+            false,
+        ) {
+            let mark = arena.mark();
+            let result = (|| {
+                let view = self.storage.view(slot);
+                let columns = arena
+                    .alloc_slice_with(view.columns_for(self.txid).names().len(), |_| {
+                        super::types::ColDesc::new("", 0, 0)
+                    })
+                    .map_err(|_| arena_full())?;
+                let count = super::catalog::describe_view(
+                    self.storage,
+                    self.txid,
+                    &view,
+                    arena,
+                    columns,
+                )?;
+                Ok(columns[..count].get(field).map(|column| column.type_mod))
+            })();
+            // Only an owned modifier or error escapes the temporary description.
+            unsafe { arena.rewind_to(mark) };
+            return result;
+        }
+        let Some(slot) = type_oid
+            .checked_sub(oid::FIRST_COMPOSITE)
+            .and_then(|slot| usize::try_from(slot).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .storage
             .composites_with_slots_visible_to(self.txid)
-            .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))?
-            .active_fields()
-            .nth(field)
-            .map(|field| field.type_mod)
+            .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))
+            .and_then(|definition| {
+                definition
+                    .active_fields()
+                    .nth(field)
+                    .map(|field| field.type_mod)
+            }))
     }
 
     fn is_composite_type_name(&self, type_name: &str) -> bool {

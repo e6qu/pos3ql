@@ -34,28 +34,50 @@ impl RelationIdentity {
 }
 
 impl TableDef {
-    pub(crate) fn implicit_index_identities(&self) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
-        self.columns().iter().filter(|column| column.primary || column.unique)
+    pub(crate) fn implicit_index_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
+        self.columns()
+            .iter()
+            .filter(|column| column.primary || column.unique)
             .map(|column| column.index_identity)
             .chain(self.uniques().iter().map(|key| key.index_identity))
             .chain(self.exclusions().iter().map(|key| key.index_identity))
     }
 
-    pub(crate) fn implicit_index_identities_mut(&mut self) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
-        self.columns[..self.n_columns].iter_mut().filter(|column| column.primary || column.unique)
+    pub(crate) fn implicit_index_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+        self.columns[..self.n_columns]
+            .iter_mut()
+            .filter(|column| column.primary || column.unique)
             .map(|column| &mut column.index_identity)
-            .chain(self.uniques[..self.n_uniques].iter_mut().map(|key| &mut key.index_identity))
-            .chain(self.exclusions[..self.n_exclusions].iter_mut().map(|key| &mut key.index_identity))
+            .chain(
+                self.uniques[..self.n_uniques]
+                    .iter_mut()
+                    .map(|key| &mut key.index_identity),
+            )
+            .chain(
+                self.exclusions[..self.n_exclusions]
+                    .iter_mut()
+                    .map(|key| &mut key.index_identity),
+            )
     }
 
     pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
-        self.implicit_index_identities().nth(position).flatten()
-            .expect("admitted implicit index has a durable identity").oid()
+        self.implicit_index_identities()
+            .nth(position)
+            .flatten()
+            .expect("admitted implicit index has a durable identity")
+            .oid()
     }
 }
 
 impl Storage {
-    pub(crate) fn reserve_implicit_index_identities(&self, definition: &mut TableDef) -> Result<(), SqlError> {
+    pub(crate) fn reserve_implicit_index_identities(
+        &self,
+        definition: &mut TableDef,
+    ) -> Result<(), SqlError> {
         for column in &mut definition.columns[..definition.n_columns] {
             if !column.primary && !column.unique {
                 column.index_identity = None;
@@ -63,18 +85,38 @@ impl Storage {
         }
         for identity in definition.implicit_index_identities_mut() {
             if identity.is_none() {
-                *identity = Some(RelationIdentity::parse(self.catalog_sequence.next_bounded(MAX_RELATION_GENERATION, "relation")?)
-                    .expect("bounded creation stamp is a relation identity"));
+                *identity = Some(
+                    RelationIdentity::parse(
+                        self.catalog_sequence
+                            .next_bounded(MAX_RELATION_GENERATION, "relation")?,
+                    )
+                    .expect("bounded creation stamp is a relation identity"),
+                );
             }
         }
         Ok(())
     }
 
-    pub(super) fn validate_implicit_index_identities(&self, definition: &TableDef) -> Result<(), SqlError> {
+    pub(super) fn validate_implicit_index_identities(
+        &self,
+        definition: &TableDef,
+    ) -> Result<(), SqlError> {
         for (position, identity) in definition.implicit_index_identities().enumerate() {
-            let identity = identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "saved implicit index has no creation identity"))?;
-            if definition.implicit_index_identities().take(position).any(|earlier| earlier == Some(identity)) {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved implicit index creation identity is duplicated"));
+            let identity = identity.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "saved implicit index has no creation identity"
+                )
+            })?;
+            if definition
+                .implicit_index_identities()
+                .take(position)
+                .any(|earlier| earlier == Some(identity))
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "saved implicit index creation identity is duplicated"
+                ));
             }
         }
         for identity in definition.implicit_index_identities().flatten() {

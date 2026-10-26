@@ -4736,7 +4736,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 def.replica_identity.code(),
             ]);
             for identity in def.implicit_index_identities() {
-                ok &= identity.is_some() && buffer.append(&identity.map_or(0, |identity| identity.created_at()).to_le_bytes());
+                ok &= identity.is_some()
+                    && buffer.append(
+                        &identity
+                            .map_or(0, |identity| identity.created_at())
+                            .to_le_bytes(),
+                    );
             }
             ok
         }
@@ -7983,7 +7988,11 @@ fn decode_op_inner<'a>(
                 *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
             }
             for (position, identity) in def.implicit_index_identities().enumerate() {
-                if def.implicit_index_identities().take(position).any(|earlier| earlier == identity) {
+                if def
+                    .implicit_index_identities()
+                    .take(position)
+                    .any(|earlier| earlier == identity)
+                {
                     return None;
                 }
             }
@@ -14547,6 +14556,9 @@ mod tests {
         def.n_exclusions = 1;
         def.attributes.initialize(def.n_columns).unwrap();
         crate::storage::constraint_names::table(&mut def).unwrap();
+        for (position, identity) in def.implicit_index_identities_mut().enumerate() {
+            *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
+        }
         def
     }
 

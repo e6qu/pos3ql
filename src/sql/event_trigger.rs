@@ -2371,7 +2371,9 @@ pub(crate) fn catalog_object_address(
 
 fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && catalog::user_table_oid(storage, slot) == object_id {
+        if storage.table_slot_visible_to(slot, txid)
+            && catalog::user_table_oid(storage, slot) == object_id
+        {
             return Some(EventObjectRef::Primary(
                 storage
                     .matview_slot_for_table(slot, txid)
@@ -2380,12 +2382,14 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
         }
     }
     for slot in 0..storage.view_count() {
-        if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(storage, slot) == object_id {
+        if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(storage, slot) == object_id
+        {
             return Some(EventObjectRef::Primary(ObjectRef::View(slot)));
         }
     }
     for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) && catalog::sequence_oid(storage, slot) == object_id
+        if storage.sequence_slot_visible_to(slot, txid)
+            && catalog::sequence_oid(storage, slot) == object_id
         {
             return Some(EventObjectRef::Primary(ObjectRef::Sequence(slot)));
         }
@@ -3380,7 +3384,8 @@ fn push_alter_table_drops(
                             .is_some_and(|generated| generated.as_str() == *name)
                         {
                             if column.primary || column.unique {
-                                let index_oid = catalog::index_oid(old,
+                                let index_oid = catalog::index_oid(
+                                    old,
                                     usize::from(
                                         inline_positions[column_index].ok_or_else(graph_full)?,
                                     ),
@@ -3493,7 +3498,8 @@ fn push_alter_table_drops(
             } else {
                 inline_unique_name(old, column)
             };
-            let index_oid = catalog::index_oid(old,
+            let index_oid = catalog::index_oid(
+                old,
                 usize::from(inline_positions[column_index].ok_or_else(graph_full)?),
             );
             push_drop_once(

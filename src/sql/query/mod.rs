@@ -1497,10 +1497,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
         };
         let mut columns = ArenaList::new(arena);
         if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-                })?;
+            let slot = super::catalog::table_slot_by_row_type_oid(
+                self.storage,
+                self.txid,
+                type_oid,
+                false,
+            )
+            .ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
+            })?;
             for column in self.storage.table_def(slot, self.txid).columns() {
                 let name = arena
                     .alloc_str(column.name.as_str())
@@ -1516,8 +1521,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             return Ok(columns.as_slice());
         }
-        let slot = super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
+        let slot =
+            super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view")
+                })?;
         let view = self.storage.view(slot);
         let count = view.columns_for(self.txid).names().len();
         let described = arena
@@ -2061,7 +2069,8 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
         return Ok(slot);
     }
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && super::catalog::user_table_oid(self.storage, slot) == oid
+        if storage.table_slot_visible_to(slot, txid)
+            && super::catalog::user_table_oid(storage, slot) == oid
         {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -2689,7 +2698,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn composite_field_type_mod(&self, type_oid: i32, field: usize) -> Option<i32> {
         use super::types::oid;
         if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)?;
+            let slot = super::catalog::table_slot_by_row_type_oid(
+                self.storage,
+                self.txid,
+                type_oid,
+                false,
+            )?;
             if slot >= self.storage.table_count() {
                 return None;
             }
@@ -3808,9 +3822,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let owner = {
             let row_type = [false, true].into_iter().find_map(|array| {
                 super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, array)
-                    .map(|slot| AccessObject { class: AccessClass::Table, slot: slot as u16 })
-                    .or_else(|| super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, array)
-                        .map(|slot| AccessObject { class: AccessClass::View, slot: slot as u16 }))
+                    .map(|slot| AccessObject {
+                        class: AccessClass::Table,
+                        slot: slot as u16,
+                    })
+                    .or_else(|| {
+                        super::catalog::view_slot_by_row_type_oid(
+                            self.storage,
+                            self.txid,
+                            type_oid,
+                            array,
+                        )
+                        .map(|slot| AccessObject {
+                            class: AccessClass::View,
+                            slot: slot as u16,
+                        })
+                    })
             });
             if let Some(object) = row_type {
                 let slot = usize::from(object.slot);

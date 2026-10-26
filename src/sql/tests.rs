@@ -1292,6 +1292,60 @@ fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
 }
 
 #[test]
+fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("relation-identities-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, include_str!("../../tests/external/differential_exact/21_relation_identities.sql"), true);
+        assert_eq!(data_rows(&output), ["t", "t", "t", "t", "t", "t", "t", "81", "t", "t", "t", "t", "t"]);
+    }
+}
+
+#[test]
+fn relation_identity_cold_recovery_preserves_replacements_and_surviving_indexes() {
+    for checkpoint in [false, true] {
+        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+            let name = format!("relation-identities-recovery-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine, "CREATE TABLE identity_cold(id integer PRIMARY KEY, first_value integer UNIQUE, second_value integer UNIQUE, label text); CREATE TABLE identity_cold_saved AS SELECT oid, reltype, reltoastrelid FROM pg_class WHERE oid = 'identity_cold'::regclass; CREATE TABLE identity_cold_key AS SELECT oid FROM pg_class WHERE oid = 'identity_cold_second_value_key'::regclass", false);
+            let slot = engine.storage.find_table("public", "identity_cold").unwrap();
+            let original = catalog::user_table_oid(&engine.storage, slot);
+            session.success(&mut engine, "ALTER TABLE identity_cold DROP CONSTRAINT identity_cold_first_value_key; ALTER TABLE identity_cold RENAME CONSTRAINT identity_cold_second_value_key TO identity_cold_kept; CREATE VIEW identity_cold_view AS SELECT id FROM identity_cold; CREATE SEQUENCE identity_cold_sequence START WITH 101", false);
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT oid = 'identity_cold_kept'::regclass FROM identity_cold_key", false)), ["t"]);
+            let before = data_rows(&session.success(&mut engine, "SELECT 'identity_cold'::regclass::oid, 'identity_cold'::regtype::oid, 'identity_cold[]'::regtype::oid, 'identity_cold_kept'::regclass::oid, 'identity_cold_view'::regclass::oid, 'identity_cold_view'::regtype::oid, 'identity_cold_sequence'::regclass::oid", false));
+            if checkpoint { assert!(engine.checkpoint().unwrap()); }
+            drop(session);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT 'identity_cold'::regclass::oid, 'identity_cold'::regtype::oid, 'identity_cold[]'::regtype::oid, 'identity_cold_kept'::regclass::oid, 'identity_cold_view'::regclass::oid, 'identity_cold_view'::regtype::oid, 'identity_cold_sequence'::regclass::oid", false)), before);
+            session.success(&mut cold, "DROP VIEW identity_cold_view; DROP TABLE identity_cold; CREATE TABLE identity_cold(id integer PRIMARY KEY, label text)", false);
+            let new_slot = cold.storage.find_table("public", "identity_cold").unwrap();
+            assert_eq!(new_slot, slot);
+            assert_ne!(catalog::user_table_oid(&cold.storage, new_slot), original);
+            assert_eq!(data_rows(&session.success(&mut cold, "SELECT count(*) FROM pg_class c JOIN identity_cold_saved s ON c.oid = s.oid OR c.oid = s.reltoastrelid; SELECT count(*) FROM pg_type t JOIN identity_cold_saved s ON t.oid = s.reltype; SELECT nextval('identity_cold_sequence')", false)), ["0", "0", "101"]);
+        }
+    }
+}
+
+#[test]
 fn metadata_recovery_reuses_populated_retired_table_positions() {
     for checkpoint in [false, true] {
         for mode in [

@@ -2459,10 +2459,11 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     }
     // A table or view rowtype contributes its own columns.
     if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
-        let slot = crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
-            .ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-            })?;
+        let slot =
+            crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
+                })?;
         for column in storage.table_def(slot, txid).columns() {
             push(table_function_column(
                 column.name,
@@ -2475,8 +2476,11 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         return Ok(count);
     }
     if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&composite_oid) {
-        let slot = crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
+        let slot =
+            crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view")
+                })?;
         let view = storage.view(slot);
         let width = view.columns_for(txid).names().len();
         let described = arena

@@ -3488,6 +3488,7 @@ fn execute_row_trigger_body<'a>(
         .then(|| super::guc::enter_active_routine_configs(routine.configs()))
         .transpose()?;
     let invocation = TriggerInvocation::new(
+        storage,
         trigger,
         TriggerRelationIdentity {
             target,
@@ -15797,6 +15798,7 @@ fn plpgsql_context_field(kind: PlpgsqlProgramKind, name: &str) -> Option<Trigger
 
 impl<'a> TriggerInvocation<'a> {
     fn new(
+        storage: &Storage,
         trigger: &crate::storage::TriggerDef,
         relation: TriggerRelationIdentity,
         event: u8,
@@ -27162,6 +27164,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
         let invocation = TriggerInvocation::new(
+        storage,
             &trigger,
             TriggerRelationIdentity {
                 target,
@@ -40548,16 +40551,13 @@ fn rewrite_sequence_default_references(
                 column_mapping: wal_mapping,
             },
         )?;
-        if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
-            return Err(error);
-        }
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_slot),
-                definition: &altered,
+                definition: &storage.table_def(table_slot, txn.txid),
             },
         )?;
     }
@@ -63464,6 +63464,7 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
     if name == pkey.as_str()
         && let Some(c) = def.columns[..def.n_columns].iter_mut().find(|c| c.primary)
     {
+        c.index_identity = None;
         c.primary = false;
         c.unique = false;
         return true;
@@ -63478,6 +63479,7 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
                 def.columns[i].name.as_str()
             );
             if name == key.as_str() {
+                def.columns[i].index_identity = None;
                 def.columns[i].unique = false;
                 return true;
             }
@@ -64594,6 +64596,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(
             child,
@@ -64672,6 +64675,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.index_identity = None;
         inherited.columns = columns;
         child.fkeys[child.n_fkeys] = inherited;
         child.n_fkeys += 1;
@@ -64693,6 +64697,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(child, &columns[..constraint.n_cols], "excl", true)?;
         child.exclusions[child.n_exclusions] = inherited;
@@ -69284,6 +69289,8 @@ fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
             },
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
+        def.uniques[def.n_uniques - 1].index_identity = metadata.index_identity;
+        def.columns[column].index_identity = None;
         def.columns[column].primary = false;
         def.columns[column].unique = false;
     }
@@ -69332,6 +69339,8 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
                 },
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
+            def.uniques[def.n_uniques - 1].index_identity = col.index_identity;
+            def.columns[i].index_identity = None;
             return Ok(true);
         }
     }

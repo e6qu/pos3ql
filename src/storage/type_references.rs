@@ -182,7 +182,7 @@ impl StoredTypeIdentity {
                 ));
             }
         };
-        if created_at == 0 {
+        if created_at == 0 || created_at > super::MAX_RELATION_GENERATION {
             return Err(sql_err!(
                 sqlstate::PROTOCOL_VIOLATION,
                 "invalid stored type identity"
@@ -1333,7 +1333,7 @@ impl super::Storage {
         if created_at == 0 {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "stored type creation identity is zero"
+                "stored type creation identity is invalid"
             ));
         }
         let invalid = || {

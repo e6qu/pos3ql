@@ -59,7 +59,7 @@ pub(crate) use type_edits::{
 };
 mod domain_validation;
 mod relation_identities;
-pub(crate) use relation_identities::{RelationIdentity, MAX_RELATION_GENERATION};
+pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -14136,7 +14136,10 @@ impl CatalogSequence {
     }
 
     fn next(&self) -> Result<u64, SqlError> {
-        self.next_bounded(relation_identities::MAX_RELATION_GENERATION, "catalog sequence")
+        self.next_bounded(
+            relation_identities::MAX_RELATION_GENERATION,
+            "catalog sequence",
+        )
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
@@ -16818,7 +16821,11 @@ impl Storage {
         let statistics = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < statistics.len() {
-            if definition.implicit_index_identities().flatten().any(|identity| identity.oid() == statistics[position].oid) {
+            if definition
+                .implicit_index_identities()
+                .flatten()
+                .any(|identity| identity.oid() == statistics[position].oid)
+            {
                 statistics.swap_remove(position);
             } else {
                 position += 1;

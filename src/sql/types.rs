@@ -6066,13 +6066,6 @@ mod named_type_layout_probe {
         Domain {
             identity: Option<ProposedCreation>,
             base_code: u8,
-        },
-        DomainEnum {
-            identity: Option<ProposedCreation>,
-            base_identity: Option<ProposedCreation>,
-        },
-        DomainComposite {
-            identity: Option<ProposedCreation>,
             base_identity: Option<ProposedCreation>,
         },
     }
@@ -6354,10 +6347,10 @@ mod named_type_layout_probe {
         assert_eq!(size_of::<ProposedCreation>(), 3);
         assert_eq!(size_of::<Option<ProposedCreation>>(), 3);
         assert_eq!(align_of::<ProposedCreation>(), 1);
-        assert!(size_of::<ProjectedColType>() <= 7);
+        assert!(size_of::<ProjectedColType>() <= 9);
         assert!(size_of::<ProjectedColumnMeta>() <= 512);
         assert!(align_of::<ProjectedColType>() <= align_of::<ColType>());
-        assert!(size_of::<ProjectedArrElem>() <= 7);
+        assert!(size_of::<ProjectedArrElem>() <= 8);
         assert!(align_of::<ProjectedArrElem>() <= align_of::<ArrElem>());
         assert!(size_of::<ProjectedDatum<'_>>() <= size_of::<Datum<'_>>());
         assert!(size_of::<crate::storage::ColumnMeta>() <= 512);

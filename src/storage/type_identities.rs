@@ -318,15 +318,20 @@ impl CachedArrayElement {
     const END: u64 = Self::DOMAIN_COMPOSITE + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
 
     fn builtin(code: u8) -> bool {
-        crate::sql::types::ArrElem::from_code(code)
-            .is_some_and(|element| element.user_type_slot().is_none())
+        use crate::sql::types::ArrElem;
+        ArrElem::from_code(code).is_some_and(|element| !matches!(
+            element, ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. }
+        ))
     }
 
     fn builtin_base(code: u8) -> bool {
         use crate::sql::types::ColType;
         crate::sql::types::ColType::from_code(code).is_some_and(|base| match base {
             ColType::Enum(_) | ColType::Composite(_) => false,
-            ColType::Array(element) => element.user_type_slot().is_none(),
+            ColType::Array(element) => !matches!(element,
+                crate::sql::types::ArrElem::Enum(_)
+                | crate::sql::types::ArrElem::Composite(_)
+                | crate::sql::types::ArrElem::Domain { .. }),
             _ => true,
         })
     }
@@ -436,6 +441,14 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             for element in crate::sql::types::ArrElem::BUILTIN {
                 check(ArrayElementIdentity::Builtin(element.code()));
+            }
+            for code in u8::MIN..=u8::MAX {
+                let encoded = CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(code));
+                let builtin = crate::sql::types::ArrElem::BUILTIN.iter().any(|element| element.code() == code);
+                assert_eq!(encoded.is_some(), builtin, "array opcode {code}");
+                if let Some(encoded) = encoded {
+                    assert_eq!(encoded.identity(), ArrayElementIdentity::Builtin(code));
+                }
             }
             for domain in [1, 255, 256, 65_535, MAX_TYPE_CREATION] {
                 let domain = TypeCreation::parse(domain).unwrap();

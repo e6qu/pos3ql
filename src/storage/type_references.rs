@@ -1,7 +1,7 @@
 //! Captured references identify a type's lifetime independently of its name.
 
-use super::type_names::NamedTypeSlot;
 use super::type_identities::TypeCreation;
+use super::type_names::NamedTypeSlot;
 use super::{
     ArrElem, ColType, DatabaseOid, PolymorphicType, RoutineResult, SqlName, TypeCatalog,
     UserTypeName,
@@ -183,10 +183,9 @@ impl StoredTypeIdentity {
                 ));
             }
         };
-        let created_at = TypeCreation::parse(created_at).ok_or_else(|| sql_err!(
-            sqlstate::PROTOCOL_VIOLATION,
-            "invalid stored type identity"
-        ))?;
+        let created_at = TypeCreation::parse(created_at).ok_or_else(|| {
+            sql_err!(sqlstate::PROTOCOL_VIOLATION, "invalid stored type identity")
+        })?;
         Ok(Self { source, created_at })
     }
 }
@@ -401,11 +400,19 @@ mod tests {
         ] {
             let origin = CatalogOrigin(u64::MAX);
             let database = DatabaseOid::parse(i32::MAX).unwrap();
-            let identity = TypeIdentity::new(origin, database, source, super::super::type_identities::MAX_TYPE_CREATION);
+            let identity = TypeIdentity::new(
+                origin,
+                database,
+                source,
+                super::super::type_identities::MAX_TYPE_CREATION,
+            );
             assert_eq!(identity.slot(), source);
             assert_eq!(identity.origin(), origin);
             assert_eq!(identity.database(), database);
-            assert_eq!(identity.created_at(), super::super::type_identities::MAX_TYPE_CREATION);
+            assert_eq!(
+                identity.created_at(),
+                super::super::type_identities::MAX_TYPE_CREATION
+            );
         }
     }
 

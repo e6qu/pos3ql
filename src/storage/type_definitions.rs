@@ -1428,25 +1428,49 @@ mod tests {
             let original = reference(&storage, source);
             storage.restore_catalog_identity_sequence(maximum);
             crate::mem::guard::forbid_alloc(|| {
-                assert_eq!(create(&mut storage, source).unwrap_err().sqlstate,
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(
+                    create(&mut storage, source).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
                 assert_eq!(reference(&storage, source), original);
                 assert_eq!(storage.catalog_identity_sequence(), maximum);
                 for rejected in [0, maximum + 1, u64::MAX] {
-                    assert_eq!(storage.restore_type_identity(source, source, rejected).unwrap_err().sqlstate,
-                        sqlstate::DATA_EXCEPTION);
+                    assert_eq!(
+                        storage
+                            .restore_type_identity(source, source, rejected)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
                     assert_eq!(reference(&storage, source), original);
                     assert_eq!(storage.catalog_identity_sequence(), maximum);
                 }
-                storage.restore_type_identity(source, source, maximum).unwrap();
+                storage
+                    .restore_type_identity(source, source, maximum)
+                    .unwrap();
                 let captured = reference(&storage, source);
                 assert_ne!(captured, original);
                 let catalog = storage.type_catalog.lock().unwrap();
                 let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
                 assert_eq!(selected.identity.created_at(), maximum);
-                assert_eq!(catalog.identities.lookup(selected.identity.database(), maximum), Some(source));
-                assert!(catalog.resolve_source_reference(original, selected.identity.database(), 0).unwrap().is_none());
-                assert!(catalog.resolve_source_reference(captured, selected.identity.database(), 0).unwrap().is_some());
+                assert_eq!(
+                    catalog
+                        .identities
+                        .lookup(selected.identity.database(), maximum),
+                    Some(source)
+                );
+                assert!(
+                    catalog
+                        .resolve_source_reference(original, selected.identity.database(), 0)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    catalog
+                        .resolve_source_reference(captured, selected.identity.database(), 0)
+                        .unwrap()
+                        .is_some()
+                );
             });
         }
     }

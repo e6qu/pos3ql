@@ -420,6 +420,11 @@ type to take the name.
 Renaming to the existing name returns PostgreSQL's duplicate error; moving to
 the current schema succeeds without changing the object.
 
+Named types use the shared catalog creation counter. When its
+[fixed identifier range](durable-format.md) fills, creation returns `54000`;
+restarting does not reset that counter. Existing types and their recovery use
+the saved values without reserving new ones.
+
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
 and `max_composites`). Statement selection maps and ownership controls are also

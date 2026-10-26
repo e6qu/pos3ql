@@ -69,10 +69,12 @@ mod type_contracts;
 mod type_creation;
 mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
+#[cfg(test)]
 mod type_identities;
 mod type_names;
 mod type_reference_moves;
-pub use type_identities::TypeCreation;
+#[cfg(test)]
+pub(crate) use type_identities::TypeCreation;
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
